@@ -758,6 +758,18 @@ struct Checker {
   }
   // NOQUALRECLIT reverts the record-LITERAL path-directed leg (Pexp_record).
   const bool no_qual_rec_lit_ = std::getenv("NOQUALRECLIT") != nullptr;
+  // NOETASITES reverts the optional-argument erasure at every site that is
+  // not an application argument (expect_arg below).
+  const bool no_eta_sites_ = std::getenv("NOETASITES") != nullptr;
+  bool eta_sites_on() const {
+    return !no_eta_sites_ && (record_kinds_ || record_fmt_lits_);
+  }
+  // The expected type pushed into a constructor at an expected site, taken by
+  // the Pexp_construct case of infer_expr (ocamlc's type_construct unifies the
+  // result with the expectation BEFORE it types the arguments, so `[f1]` at
+  // `(int -> unit) list` erases f1's optional).
+  const Expression* ctor_expected_for_ = nullptr;
+  TypePtr ctor_expected_ = nullptr;
   // No LOCAL record declaration of `label` is in scope at `at_line`: the unit
   // declares none, or every one of them is an inline-record field or sits
   // further down the file.
@@ -9726,6 +9738,79 @@ struct Checker {
     }
   }
 
+  // The erasure test of infer_expr_expected, on an expression `e` of type `t`
+  // at an expected type.
+  void note_erasure(const Expression& e, const TypePtr& t, const TypePtr& expected) {
+    // Optional-argument erasure (ocaml's type_argument): a value of type
+    // `?l:.. -> ..` used where a non-optional arrow is expected is eta-expanded
+    // with None for the omitted optional(s).  Recorded for the Lambda back end;
+    // only in the value-kinds pass (the strict pass uses soft propagation, so the
+    // un-erased type returned here never causes a false-rejection).
+    if (record_kinds_ || record_fmt_lits_) {
+      std::vector<bool> slots;
+      std::vector<EtaSlot> eslots;
+      bool erased = false;
+      TypePtr a = I::Engine::repr(t), ex = I::Engine::repr(expected);
+      while (a->kind == I::Type::Kind::Arrow) {
+        bool ex_arrow = ex->kind == I::Type::Kind::Arrow;
+        if (a->arrow_label == 2 &&
+            !(ex_arrow && ex->arrow_label == 2 && ex->arrow_lbl == a->arrow_lbl)) {
+          slots.push_back(true);  // erase this optional -> None
+          eslots.push_back({true, a->arrow_label, a->arrow_lbl});
+          erased = true;
+          a = I::Engine::repr(a->cod);
+          continue;
+        }
+        if (!ex_arrow) break;
+        slots.push_back(false);  // a kept parameter -> eta param
+        eslots.push_back({false, a->arrow_label, a->arrow_lbl});
+        a = I::Engine::repr(a->cod);
+        ex = I::Engine::repr(ex->cod);
+        // ocamlc's make_args (typecore.ml:6645) collects ONLY the leading run
+        // of OPTIONAL arrows and STOPS at the first Nolabel one; `func` then
+        // eta-expands with exactly ONE parameter (`var_pair "eta" ty_arg`,
+        // typecore.ml:6695) and leaves the rest of the arrow CURRIED.  Taking
+        // every kept parameter builds a wider closure than ocamlc's -- env's
+        // `Predef.build_initial_env (add_type ~check:false) ..` came out
+        // `(function eta eta eta (apply arg 0 eta eta eta))` against ocamlc's
+        // `(function eta (apply arg 0 eta))`, an extra RESTART/GRAB pair.
+        if (!dbg_env("NOETA1")) break;
+      }
+      // Need at least one erased optional and at least one kept (eta) parameter:
+      // a trailing-only optional with nothing after it isn't eta-expandable here.
+      bool has_kept = false;
+      for (bool none_slot : slots) if (!none_slot) has_kept = true;
+      if (erased && has_kept) {
+        if (record_kinds_) erasures_[&e] = std::move(slots);
+        if (record_fmt_lits_) eta_erasures_[&e] = std::move(eslots);
+      }
+    }
+  }
+
+  // ocamlc's type_argument at a site that is NOT an application argument: a
+  // `(e : t)` constraint, a `let x : t = e` binding, a record field's value,
+  // a field assignment, a constructor's argument, a `(e : t :> t')` coercion
+  // and a function body under a return annotation are all typed at an
+  // expected type, and an INFERRED value whose type begins with optional
+  // arrows is let-and-eta-expanded there exactly as it is under `f e`.  The
+  // kinds pass recorded only the application sites, so `let h : int -> unit
+  // = f1` (f1 : ?x:unit -> int -> unit) compiled to `h = f1` raw and `h 1`
+  // landed 1 in the ?x slot (stamp_probes/xeta_a6, a9, a10, a13).  Only the
+  // passes that record erasures take the expected type; `NOETASITES=1`
+  // reverts.
+  TypePtr expect_arg(const Expression& e, const TypePtr& expected) {
+    if (!eta_sites_on() || !expected) return infer_expr(e);
+    if (std::holds_alternative<Pexp_construct>(e.desc)) {
+      ctor_expected_for_ = &e;
+      ctor_expected_ = expected;
+    }
+    TypePtr t = infer_expr(e);
+    ctor_expected_for_ = nullptr;
+    ctor_expected_ = nullptr;
+    note_erasure(e, t, expected);
+    return t;
+  }
+
   // Infer an expression with an expected type pushed down (bidirectional).  A
   // string literal expected at a format type is accepted as that format (OCaml's
   // type_format), with its argument arrow filled in so the consuming application
@@ -9774,57 +9859,22 @@ struct Checker {
     // value flows into make_printf as a raw string — bootstrap bug#13).
     if ((record_fmt_lits_ || record_kinds_) && is_format_constr(expected))
       record_result_fmt_lits(e);
+    // A constructor argument `foo [f1]` is typed at the expectation too (see
+    // expect_arg).
+    if (eta_sites_on() && std::holds_alternative<Pexp_construct>(e.desc)) {
+      ctor_expected_for_ = &e;
+      ctor_expected_ = expected;
+    }
     TypePtr t = infer_expr(e);
+    ctor_expected_for_ = nullptr;
+    ctor_expected_ = nullptr;
     // Type-directed bare-constructor resolution: an unqualified constructor we
     // couldn't resolve (typed Any) whose EXPECTED type is a module-qualified
     // variant -- record that type at the node so infer_value_kinds exposes it via
     // expr_constr and the back end registers the type's ctors, resolving the bare
     // ctor (predef's `decl0 ~immediate:Always`, with immediate : Type_immediacy.t).
     if (record_kinds_) disambig_expr_now(e, expected, /*allow_defer=*/true);
-    // Optional-argument erasure (ocaml's type_argument): a value of type
-    // `?l:.. -> ..` used where a non-optional arrow is expected is eta-expanded
-    // with None for the omitted optional(s).  Recorded for the Lambda back end;
-    // only in the value-kinds pass (the strict pass uses soft propagation, so the
-    // un-erased type returned here never causes a false-rejection).
-    if (record_kinds_ || record_fmt_lits_) {
-      std::vector<bool> slots;
-      std::vector<EtaSlot> eslots;
-      bool erased = false;
-      TypePtr a = I::Engine::repr(t), ex = I::Engine::repr(expected);
-      while (a->kind == I::Type::Kind::Arrow) {
-        bool ex_arrow = ex->kind == I::Type::Kind::Arrow;
-        if (a->arrow_label == 2 &&
-            !(ex_arrow && ex->arrow_label == 2 && ex->arrow_lbl == a->arrow_lbl)) {
-          slots.push_back(true);  // erase this optional -> None
-          eslots.push_back({true, a->arrow_label, a->arrow_lbl});
-          erased = true;
-          a = I::Engine::repr(a->cod);
-          continue;
-        }
-        if (!ex_arrow) break;
-        slots.push_back(false);  // a kept parameter -> eta param
-        eslots.push_back({false, a->arrow_label, a->arrow_lbl});
-        a = I::Engine::repr(a->cod);
-        ex = I::Engine::repr(ex->cod);
-        // ocamlc's make_args (typecore.ml:6645) collects ONLY the leading run
-        // of OPTIONAL arrows and STOPS at the first Nolabel one; `func` then
-        // eta-expands with exactly ONE parameter (`var_pair "eta" ty_arg`,
-        // typecore.ml:6695) and leaves the rest of the arrow CURRIED.  Taking
-        // every kept parameter builds a wider closure than ocamlc's -- env's
-        // `Predef.build_initial_env (add_type ~check:false) ..` came out
-        // `(function eta eta eta (apply arg 0 eta eta eta))` against ocamlc's
-        // `(function eta (apply arg 0 eta))`, an extra RESTART/GRAB pair.
-        if (!dbg_env("NOETA1")) break;
-      }
-      // Need at least one erased optional and at least one kept (eta) parameter:
-      // a trailing-only optional with nothing after it isn't eta-expandable here.
-      bool has_kept = false;
-      for (bool none_slot : slots) if (!none_slot) has_kept = true;
-      if (erased && has_kept) {
-        if (record_kinds_) erasures_[&e] = std::move(slots);
-        if (record_fmt_lits_) eta_erasures_[&e] = std::move(eslots);
-      }
-    }
+    note_erasure(e, t, expected);
     // SIGNATURE pass: the erasure also changes the value's TYPE at this use --
     // `bump @@ x` (bump : ?cap:int -> int -> int, %apply expects 'a -> 'b)
     // views bump as `int -> int`, so _f : int -> int (ocamlc's type_argument).
@@ -9926,6 +9976,15 @@ struct Checker {
                      (it != private_ctor_type_.end() ? it->second : cn));
         }
       }
+      // The expectation an expect_arg / infer_expr_expected caller pushed for
+      // THIS node: unified with the result before the arguments are typed, so
+      // the parameters the arguments meet are the expected ones.
+      TypePtr pushed = nullptr;
+      if (ctor_expected_for_ == &e) {
+        pushed = ctor_expected_;
+        ctor_expected_for_ = nullptr;
+        ctor_expected_ = nullptr;
+      }
       TypePtr* sch = find_ctor(lid_last(k->id.txt));
       // A ctor qualified by a FILE-LOCAL module outranks the bare hit (which
       // can be an unrelated same-named ctor squatting the scope) -- the cmi
@@ -9955,11 +10014,13 @@ struct Checker {
         if (TypePtr scheme = qualified_ctor_scheme(k->id.txt)) {
           TypePtr result;
           auto ps = ctor_params(scheme, result);
+          if (pushed) soft_unify(result, pushed);
           if (k->arg) {
             auto* tup = std::get_if<Pexp_tuple>(&(*k->arg)->desc);
             if (ps.size() > 1 && tup && tup->elems.size() == ps.size())
-              for (size_t i = 0; i < ps.size(); ++i) try_unify(ps[i], infer_expr(*tup->elems[i]));
-            else if (!ps.empty()) try_unify(ps[0], infer_expr(**k->arg));
+              for (size_t i = 0; i < ps.size(); ++i)
+                try_unify(ps[i], expect_arg(*tup->elems[i], ps[i]));
+            else if (!ps.empty()) try_unify(ps[0], expect_arg(**k->arg, ps[0]));
             else infer_expr(**k->arg);
           }
           return result;
@@ -9973,16 +10034,17 @@ struct Checker {
       }
       TypePtr result;
       auto ps = ctor_params(eng.instantiate(*sch), result);
+      if (pushed) soft_unify(result, pushed);
       if (k->arg) {
         auto* tup = std::get_if<Pexp_tuple>(&(*k->arg)->desc);
         if (ps.size() > 1 && tup && tup->elems.size() == ps.size()) {
           flatten_construct.insert(&e);
           for (size_t i = 0; i < ps.size(); ++i) {
-            try_unify(ps[i], infer_expr(*tup->elems[i]));
+            try_unify(ps[i], expect_arg(*tup->elems[i], ps[i]));
             record_ctor_arg_type(tup->elems[i].get(), ps[i]);
           }
         } else if (!ps.empty()) {
-          try_unify(ps[0], infer_expr(**k->arg));
+          try_unify(ps[0], expect_arg(**k->arg, ps[0]));
           record_ctor_arg_type(k->arg->get(), ps[0]);
         } else {
           infer_expr(**k->arg);
@@ -10143,6 +10205,10 @@ struct Checker {
         // string literals type (and lower) as formats, not plain strings.
         at = from_coretype(*ct->t, vars);
         et = infer_expr_expected(*ct->e, at);
+      } else if (eta_sites_on()) {
+        // The annotation is the expression's expected type (type_argument).
+        at = from_coretype(*ct->t, vars);
+        et = expect_arg(*ct->e, at);
       } else {
         et = infer_expr(*ct->e);
         at = from_coretype(*ct->t, vars);
@@ -10171,7 +10237,14 @@ struct Checker {
     }
     if (auto* co = std::get_if<Pexp_coerce>(&e.desc)) {
       // A coercion `(e :> T)` or `(e : T1 :> T2)` has the TARGET type T/T2.
-      TypePtr src = infer_expr(*co->e);  // infer the source for its kinds/effects
+      // A ground type T1 is the source's expected type (type_argument).
+      TypePtr src;  // infer the source for its kinds/effects
+      if (co->from && eta_sites_on()) {
+        std::unordered_map<std::string, TypePtr> gvars;
+        src = expect_arg(*co->e, from_coretype(**co->from, gvars));
+      } else {
+        src = infer_expr(*co->e);
+      }
       // `(a :> c)` for a local class c and a still-unconstrained source:
       // ocamlc types the SOURCE as #c (enlarge_type) -- the OPEN row of c's
       // methods with the abbreviation carried.  A class param var pinned this
@@ -10450,8 +10523,15 @@ struct Checker {
         bool sv = strict; strict = false;
         TypePtr bt = infer_expr(**rc->base);
         std::vector<std::pair<std::string, TypePtr>> overr;
-        for (auto& [lbl, val] : rc->fields)
-          overr.emplace_back(lid_last(lbl.txt), infer_expr(*val));
+        for (auto& [lbl, val] : rc->fields) {
+          // The field's declared type is the value's expected type (see the
+          // literal path below).
+          TypePtr ex = nullptr;
+          if (eta_sites_on())
+            if (TypePtr fs = field_scheme(lid_last(lbl.txt)))
+              ex = I::Engine::repr(eng.instantiate(fs))->cod;
+          overr.emplace_back(lid_last(lbl.txt), ex ? expect_arg(*val, ex) : infer_expr(*val));
+        }
         // Pin the base's record identity through the first resolvable label so
         // the decl lookup below sees a Constr even when the base is a bare var.
         for (auto& [lbl, vt] : overr)
@@ -10534,13 +10614,6 @@ struct Checker {
       TypePtr recTy = nullptr;
       bool qual_rec = false;  // a label was written `M.lab`: M names the record
       for (auto& [lbl, val] : rc->fields) {
-        // Infer the field value for its type, but suppress errors from inside its
-        // body: traversing field values exposes unrelated inference incompleteness
-        // (effect handlers, polymorphic recursion).  The record-shape check below
-        // still records (strict restored).
-        bool sv = strict; strict = false;
-        TypePtr vt = infer_expr(*val);
-        strict = sv;
         // The LITERAL twin of the field-READ's path-directed leg above: a label
         // written `{ Lexing.pos_fname = ..; .. }` names its record's MODULE,
         // and that path is authoritative.  lid_last dropped it, so the literal
@@ -10572,6 +10645,15 @@ struct Checker {
         if (!fsch)
           fsch = shadowing_opened_field(lid_last(lbl.txt), e.loc.start.lnum);
         if (!fsch) fsch = field_scheme(lid_last(lbl.txt));
+        TypePtr s = fsch ? I::Engine::repr(eng.instantiate(fsch)) : nullptr;
+        // Infer the field value for its type, but suppress errors from inside its
+        // body: traversing field values exposes unrelated inference incompleteness
+        // (effect handlers, polymorphic recursion).  The record-shape check below
+        // still records (strict restored).  The field's declared type is the
+        // value's expected type (type_label_exp's type_argument).
+        bool sv = strict; strict = false;
+        TypePtr vt = s ? expect_arg(*val, s->cod) : infer_expr(*val);
+        strict = sv;
         if (!fsch) {
           // `{contents = e}` builds the predefined `'a ref` (non-strict only).
           if (!strict && lid_last(lbl.txt) == "contents") {
@@ -10580,7 +10662,6 @@ struct Checker {
           }
           continue;
         }
-        TypePtr s = I::Engine::repr(eng.instantiate(fsch));
         try_unify(vt, s->cod);
         // A record LITERAL as a field's value: the field's DECLARED type is its
         // expectation, and nothing else pushes one down here.
@@ -10683,7 +10764,7 @@ struct Checker {
         TypePtr s = I::Engine::repr(eng.instantiate(fsch));
         sbt = infer_expr(*sf->obj);
         try_unify(sbt, s->dom);
-        try_unify(infer_expr(*sf->value), s->cod);
+        try_unify(expect_arg(*sf->value, s->cod), s->cod);  // type_label_exp
       } else { sbt = infer_expr(*sf->obj); infer_expr(*sf->value); }
       // The WRITE twin of the ambiguous-field READ resolution above: queue the
       // base's type so the assigned label's index comes from the record the
@@ -11471,7 +11552,17 @@ struct Checker {
     TypePtr body;
     TypePtr constrained = nullptr;  // what f.constraint_ annotates, when not `body`
     if (auto* fb = std::get_if<Pfunction_body>(&f.body->v)) {
-      body = infer_expr(*fb->e);
+      // A return annotation is the body's expected type (type_argument, see
+      // expect_arg); built again below for the unification.
+      const Pconstraint* rpc =
+          f.constraint_ ? std::get_if<Pconstraint>(&*f.constraint_) : nullptr;
+      if (rpc && eta_sites_on() && !strict) {
+        std::unordered_map<std::string, TypePtr> rlocal;
+        body = expect_arg(*fb->e, from_coretype(*rpc->type,
+                                                annot_vars_ ? *annot_vars_ : rlocal));
+      } else {
+        body = infer_expr(*fb->e);
+      }
     } else {
       auto& fc = std::get<Pfunction_cases>(f.body->v);
       TypePtr arg = eng.fresh_var(), rt = eng.fresh_var();
@@ -12007,8 +12098,21 @@ struct Checker {
       if (!strict && !fmt_annot && upc && upc->univars.empty() &&
           std::holds_alternative<Pexp_function>(b.expr->desc))
         pending_binding_annot_ = from_coretype(*upc->typ, avars);
-      TypePtr te = fmt_annot ? infer_expr_expected(*b.expr, fmt_annot)
-                             : infer_expr(*b.expr);
+      // Any other RHS is typed AT the declared type (`let x : t = e` is
+      // `let x = (e : t)` to type_let, and a `let x : t :> t' = e` at t): the
+      // erasure of an optional-arrow value's optionals happens here, see
+      // expect_arg.  Built again below as `annot`, like the function case.
+      TypePtr arg_annot = nullptr;
+      if (eta_sites_on() && !strict && !fmt_annot && !pending_binding_annot_ &&
+          b.constraint_) {
+        if (upc && upc->univars.empty())
+          arg_annot = from_coretype(*upc->typ, avars);
+        else if (auto* co = std::get_if<Pvc_coercion>(&*b.constraint_); co && co->ground)
+          arg_annot = from_coretype(**co->ground, avars);
+      }
+      TypePtr te = fmt_annot  ? infer_expr_expected(*b.expr, fmt_annot)
+                   : arg_annot ? expect_arg(*b.expr, arg_annot)
+                               : infer_expr(*b.expr);
       pending_binding_annot_ = nullptr;
       if (upc && !upc->univars.empty()) --la_scope_;
       TypePtr annot = nullptr;

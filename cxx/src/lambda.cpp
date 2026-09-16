@@ -5727,7 +5727,10 @@ struct Translator {
       // Copy the aliased value's signature so g's call sites reorder/wrap args
       // too -- ocamlbuild's `let caml_transitive_closure =
       // Ocaml_dependencies.caml_transitive_closure` (a functor-result value with
-      // five optionals) was otherwise called raw, dropping an argument.
+      // five optionals) was otherwise called raw, dropping an argument.  Not
+      // where the alias is eta-expanded at a declared plain-arrow type (see
+      // the kinds pass's expect_arg): that function takes ONE plain argument.
+      if (vk.optional_erasures.count(e)) return;
       FnSig s = callee_sig(e);
       for (auto& [k, n] : s) if (k != 0) { fn_sig_[id.stamp] = s; break; }
     } else if (auto* ap = std::get_if<Pexp_apply>(&e->desc)) {
@@ -37723,10 +37726,13 @@ struct Translator {
         if (auto* pv = std::get_if<Ppat_var>(&b.pat.desc)) {
           // alias elimination: `let x = <var v>` binds nothing; x exports as v.
           // Only when the rhs really is a bare var: a name an `open M` shadows
-          // reads M's field instead, which is a binding upstream keeps.
+          // reads M's field instead, which is a binding upstream keeps -- and
+          // so is `let x : int -> unit = v` for a v with a leading optional,
+          // which the kinds pass eta-expands (x IS a new function).
           if (auto* rid = std::get_if<Pexp_ident>(&b.expr->desc))
             if (auto* rl = std::get_if<Lident>(&rid->id.txt.v);
-                rl && !open_shadows_lookup(rl->name))
+                rl && !open_shadows_lookup(rl->name) &&
+                !vk.optional_erasures.count(b.expr.get()))
               if (auto* tgt = lookup(rl->name)) {
                 add_export(pv->name.txt, *tgt);
                 scope.back()[pv->name.txt] = *tgt;
