@@ -20496,6 +20496,10 @@ bool meet_off() {
   static const bool off = dbg_env("NOTYMEET") != nullptr;
   return off;
 }
+bool pipe_off() {
+  static const bool off = dbg_env("NOPIPEAPP") != nullptr;
+  return off;
+}
 
 // ---- WHAT A DISCARDED MODULE DOES NOT PAY --------------------------------
 // `module M : sig end = struct module S = Set.Make (X) end` binds S behind an
@@ -21072,6 +21076,9 @@ struct Cites {
       open_stack_.resize(d);
     } else if (auto* f = std::get_if<Ppat_effect>(&p.desc)) {
       pat(*f->eff); pat(*f->cont);
+    } else if (auto* v = std::get_if<Ppat_var>(&p.desc)) {
+      if (v->name.txt == "|>" || v->name.txt == "@@")
+        pipe_shadow_.insert(v->name.txt);
     }
   }
   void cse(const Case& c) {
@@ -21348,21 +21355,91 @@ struct Cites {
       p = t->elems[1].get();
     }
   }
+  // ---- `x |> f` and `f @@ x` are the application `f x` -------------------
+  // `type_expect_` types `Stdlib.(|>)` and `Stdlib.(@@)` (the `%revapply`
+  // and `%apply` primitives) given two arguments as the application of the
+  // second to the first (of the first to the second): whatever an
+  // application costs -- the unit a parameter's type belongs to forced again,
+  // `ignore` expanding what it is given, a discarded module built where one
+  // of its own functions consumes a parameter -- `x |> f` costs too.  The
+  // `|>` rule asks besides that `f` be INFERRED (`is_inferred`: a name, an
+  // application, a field, an annotation, ...; a `fun` is not), `@@` does not;
+  // and a `|>` or `@@` the file binds itself is not the primitive, so the
+  // rule is off past such a binding.  `NOPIPEAPP=1` reverts.
+  std::set<std::string> pipe_shadow_;
+  static bool is_inferred(const Expression& e) {
+    const Expression* p = &e;
+    for (int i = 0; i < 64; ++i) {
+      if (std::holds_alternative<Pexp_ident>(p->desc) ||
+          std::holds_alternative<Pexp_apply>(p->desc) ||
+          std::holds_alternative<Pexp_field>(p->desc) ||
+          std::holds_alternative<Pexp_constraint>(p->desc) ||
+          std::holds_alternative<Pexp_coerce>(p->desc) ||
+          std::holds_alternative<Pexp_send>(p->desc) ||
+          std::holds_alternative<Pexp_new>(p->desc))
+        return true;
+      if (auto* k = std::get_if<Pexp_pack>(&p->desc)) return k->pkg.has_value();
+      if (auto* s = std::get_if<Pexp_sequence>(&p->desc)) { p = s->e2.get(); continue; }
+      if (auto* i = std::get_if<Pexp_ifthenelse>(&p->desc)) {
+        if (!i->else_ || !is_inferred(*i->then_)) return false;
+        p = i->else_->get();
+        continue;
+      }
+      if (auto* si = std::get_if<Pexp_struct_item>(&p->desc)) {
+        if (!std::holds_alternative<Pstr_open>(si->item->desc)) return false;
+        p = si->body.get();
+        continue;
+      }
+      return false;
+    }
+    return false;
+  }
+  bool prim_apply(const Pexp_apply& a, const Expression*& f,
+                  const Expression*& x) const {
+    if (pipe_off() || a.args.size() != 2) return false;
+    for (auto& arg : a.args)
+      if (!std::holds_alternative<Nolabel>(arg.first)) return false;
+    auto* i = std::get_if<Pexp_ident>(&a.fn->desc);
+    if (!i) return false;
+    std::string n;
+    if (auto* l = std::get_if<Lident>(&i->id.txt.v)) {
+      n = l->name;
+      if (pipe_shadow_.count(n)) return false;
+    } else if (auto* d = std::get_if<Ldot>(&i->id.txt.v)) {
+      auto* h = std::get_if<Lident>(&d->prefix->v);
+      if (!h || h->name != "Stdlib") return false;
+      n = d->name;
+    } else {
+      return false;
+    }
+    if (n == "@@") { f = a.args[0].second.get(); x = a.args[1].second.get(); }
+    else if (n == "|>" && is_inferred(*a.args[1].second)) {
+      f = a.args[1].second.get(); x = a.args[0].second.get();
+    } else {
+      return false;
+    }
+    return true;
+  }
   void ex(const Expression& e) {
     if (auto* i = std::get_if<Pexp_ident>(&e.desc)) {
       cite(i->id, false);
       vread(i->id.txt);
     } else if (auto* a = std::get_if<Pexp_apply>(&e.desc)) {
-      applied_fn(*a->fn, (int)a->args.size());
-      vapp(*a->fn, (int)a->args.size());
-      // `ignore e` expands what it is given, to warn about a partial
-      // application; nothing else about the application does.
-      if (a->args.size() == 1)
-        if (auto* f = std::get_if<Pexp_ident>(&a->fn->desc))
-          if (auto* l = std::get_if<Lident>(&f->id.txt.v))
-            if (l->name == "ignore") xval(*a->args[0].second);
+      const Expression* fn = a->fn.get();
       std::vector<const Expression*> as;
       for (auto& x : a->args) as.push_back(x.second.get());
+      if (const Expression *pf, *px; prim_apply(*a, pf, px)) {
+        fn = pf;
+        as = {px};
+      }
+      applied_fn(*fn, (int)as.size());
+      vapp(*fn, (int)as.size());
+      // `ignore e` expands what it is given, to warn about a partial
+      // application; nothing else about the application does.
+      if (as.size() == 1)
+        if (auto* f = std::get_if<Pexp_ident>(&fn->desc))
+          if (auto* l = std::get_if<Lident>(&f->id.txt.v))
+            if (l->name == "ignore") xval(*as[0]);
       xsame(as);
       ex(*a->fn);
       for (auto& x : a->args) ex(*x.second);
