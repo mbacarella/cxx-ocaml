@@ -20500,6 +20500,10 @@ bool pipe_off() {
   static const bool off = dbg_env("NOPIPEAPP") != nullptr;
   return off;
 }
+bool open_off() {
+  static const bool off = dbg_env("NOOPENKEY") != nullptr;
+  return off;
+}
 
 // ---- WHAT A DISCARDED MODULE DOES NOT PAY --------------------------------
 // `module M : sig end = struct module S = Set.Make (X) end` binds S behind an
@@ -20778,17 +20782,54 @@ struct Cites {
     for (std::size_t i = 1; i < c.size(); ++i) out += "." + c[i];
     return true;
   }
+  // A BARE name an `open` put in scope reads exactly as the dotted spelling
+  // does -- `open S let _ = vf` is `let _ = S.vf` -- and every key above is
+  // a dotted path, so the bare one is re-spelled through the innermost open
+  // in scope that can own it: a LOCAL module (whose signature this walk
+  // cannot read) or a unit whose .cmi declares the name.  A name the file
+  // binds itself shadows every open above it (`bound_` for values, `tbound_`
+  // for types), and one that starts upper-case is a module or a constructor,
+  // never a value or a type.  `NOOPENKEY=1` reverts.
+  std::set<std::string> bound_;
+  std::set<std::string> tbound_;
+  bool unit_declares(const std::string& head, const std::string& n,
+                     bool ty) const {
+    std::string u = unit_of(head);
+    if (u.empty()) return false;
+    std::string p = head_cmi(u);
+    if (p.empty() || !std::filesystem::exists(p)) return false;
+    try {
+      const cmi::Signature& sg = cmi::CmiFile::load(p).sig();
+      return ty ? sig_tdecl(sg, n) != nullptr : find_val(sg, n) != nullptr;
+    } catch (...) {
+    }
+    return false;
+  }
+  bool read_key(const Longident& id, std::string& out, bool ty = false) const {
+    if (dotted_path(id, out)) return true;
+    auto* l = std::get_if<Lident>(&id.v);
+    if (open_off() || !l || l->name.empty() ||
+        std::isupper((unsigned char)l->name[0]) ||
+        (ty ? tbound_ : bound_).count(l->name))
+      return false;
+    for (auto o = open_stack_.rbegin(); o != open_stack_.rend(); ++o)
+      if (local.count(*o) || unit_declares(*o, l->name, ty)) {
+        out = *o + "." + l->name;
+        return true;
+      }
+    return false;
+  }
   void vread(const Longident& id) {
     if (vread_off()) return;
     std::string s;
-    if (dotted_path(id, s)) vreads_.insert(s);
+    if (read_key(id, s)) vreads_.insert(s);
   }
   void vapp(const Expression& f, int nargs) {
     if (vread_off() || nargs <= 0) return;
     auto* i = std::get_if<Pexp_ident>(&f.desc);
     if (!i) return;
     std::string s;
-    if (dotted_path(i->id.txt, s) && areads_[s] < nargs) areads_[s] = nargs;
+    if (read_key(i->id.txt, s) && areads_[s] < nargs) areads_[s] = nargs;
   }
   // What `e` is under the annotations written on it.
   static const Expression* bare_exp(const Expression& e) {
@@ -20800,14 +20841,39 @@ struct Cites {
     }
     return p;
   }
+  // The key of the value `e` names, under the annotations and the LOCAL
+  // opens written on it: `let _ = S.(vf)` is typed as `let _ = S.vf`.  The
+  // opens are in scope for the lookup alone, as the walker below will push
+  // them again over the body.
+  bool ident_key(const Expression& e, std::string& out) {
+    const std::size_t d = open_stack_.size();
+    const Expression* p = &e;
+    for (int i = 0; i < 64; ++i) {
+      if (auto* c = std::get_if<Pexp_constraint>(&p->desc)) {
+        p = c->e.get();
+        continue;
+      }
+      auto* si = std::get_if<Pexp_struct_item>(&p->desc);
+      if (!si || open_off()) break;
+      auto* o = std::get_if<Pstr_open>(&si->item->desc);
+      if (!o) break;
+      auto* mi = std::get_if<Pmod_ident>(&o->expr.desc);
+      auto* l = mi ? std::get_if<Lident>(&mi->id.txt.v) : nullptr;
+      if (!l) break;
+      open_stack_.push_back(l->name);
+      p = si->body.get();
+    }
+    auto* i = std::get_if<Pexp_ident>(&p->desc);
+    const bool ok = i && read_key(i->id.txt, out);
+    open_stack_.resize(d);
+    return ok;
+  }
   // `e` stands where ocamlc expands its type; only the expression ITSELF does,
   // so `ignore (f S.empty)` expands what `f` returns and not `S.empty`.
   void xval(const Expression& e) {
     if (vread_off()) return;
-    auto* i = std::get_if<Pexp_ident>(&bare_exp(e)->desc);
-    if (!i) return;
     std::string s;
-    if (dotted_path(i->id.txt, s)) xreads_.insert(s);
+    if (ident_key(e, s)) xreads_.insert(s);
   }
   // ---- a type that MEETS another ----------------------------------------
   // Where two sibling expressions must carry ONE type -- the branches of an
@@ -20850,10 +20916,8 @@ struct Cites {
     return std::holds_alternative<Pexp_function>(bare_exp(e)->desc);
   }
   void uval(const Expression& e, std::set<std::string>& into) {
-    auto* i = std::get_if<Pexp_ident>(&bare_exp(e)->desc);
-    if (!i) return;
     std::string s;
-    if (dotted_path(i->id.txt, s)) into.insert(s);
+    if (ident_key(e, s)) into.insert(s);
   }
   // `always` where the siblings meet however few of them have a type, `lst`
   // where they are a constructor's arguments besides.
@@ -20883,11 +20947,8 @@ struct Cites {
     // back through here a second time: under `tpos_` NEITHER spelling is a
     // read of the coarse kind, and the dotted one alone says which type.
     if (tpos_ && !discread_off()) {
-      std::vector<std::string> c;
-      if (!lid_comps(id, c) || c.size() < 2) return;
-      std::string s = c[0];
-      for (std::size_t i = 1; i < c.size(); ++i) s += "." + c[i];
-      treads_.insert(s);
+      std::string s;
+      if (read_key(id, s, true)) treads_.insert(s);
       return;
     }
     for (const Longident* q = &id;;) {
@@ -21077,8 +21138,7 @@ struct Cites {
     } else if (auto* f = std::get_if<Ppat_effect>(&p.desc)) {
       pat(*f->eff); pat(*f->cont);
     } else if (auto* v = std::get_if<Ppat_var>(&p.desc)) {
-      if (v->name.txt == "|>" || v->name.txt == "@@")
-        pipe_shadow_.insert(v->name.txt);
+      bound_.insert(v->name.txt);
     }
   }
   void cse(const Case& c) {
@@ -21364,9 +21424,9 @@ struct Cites {
   // of its own functions consumes a parameter -- `x |> f` costs too.  The
   // `|>` rule asks besides that `f` be INFERRED (`is_inferred`: a name, an
   // application, a field, an annotation, ...; a `fun` is not), `@@` does not;
-  // and a `|>` or `@@` the file binds itself is not the primitive, so the
-  // rule is off past such a binding.  `NOPIPEAPP=1` reverts.
-  std::set<std::string> pipe_shadow_;
+  // and a `|>` or `@@` the file binds itself (`bound_`) is not the
+  // primitive, so the rule is off past such a binding.  `NOPIPEAPP=1`
+  // reverts.
   static bool is_inferred(const Expression& e) {
     const Expression* p = &e;
     for (int i = 0; i < 64; ++i) {
@@ -21404,7 +21464,7 @@ struct Cites {
     std::string n;
     if (auto* l = std::get_if<Lident>(&i->id.txt.v)) {
       n = l->name;
-      if (pipe_shadow_.count(n)) return false;
+      if (bound_.count(n)) return false;
     } else if (auto* d = std::get_if<Ldot>(&i->id.txt.v)) {
       auto* h = std::get_if<Lident>(&d->prefix->v);
       if (!h || h->name != "Stdlib") return false;
@@ -21632,6 +21692,7 @@ struct Cites {
     else for (auto& f : std::get<Pcstr_record>(a).fields) ty(*f.type);
   }
   void tdecl(const TypeDeclaration& d) {
+    tbound_.insert(d.name.txt);
     for (auto& p : d.params) ty(*p);
     if (d.manifest) tyx(**d.manifest);
     if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
