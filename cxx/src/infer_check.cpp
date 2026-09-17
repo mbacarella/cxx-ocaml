@@ -20582,6 +20582,15 @@ bool lal_off() {
   static const bool off = dbg_env("NOLALIAS") != nullptr;
   return off;
 }
+// S517: a package type with `with` constraints is checked wherever it is
+// WRITTEN (a type declaration's `constraint`s included), an alias of a
+// submodule is read under a name the file binds elsewhere too, and an
+// abbreviation with a package constraint is expanded at a parameter
+// (`NOPKWRIT=1` reverts all four).
+bool pkwrit_off() {
+  static const bool off = dbg_env("NOPKWRIT") != nullptr;
+  return off;
+}
 bool tofp_off() {
   static const bool off = dbg_env("NOTOFPATH") != nullptr;
   return off;
@@ -20794,7 +20803,40 @@ struct Cites {
              (sb == selfb_.end() ? 0 : sb->second);
     if (sh <= 0) pre.insert(m);
   }
-  void bind_mod(const StrOptLoc& n) { if (n.txt) local[*n.txt]++; }
+  void bind_mod(const StrOptLoc& n) {
+    if (!n.txt) return;
+    local[*n.txt]++;
+    bscope_[*n.txt].push_back(cscope());
+  }
+  // ---- AN ALIAS READ UNDER A NAME BOUND ELSEWHERE TOO (S517) -------------
+  // `module X = struct module Y = .. end  module Y = X.Y  type t = Y.u`
+  // binds `Y` twice, so `used` (typing_ident_count) could not tell the
+  // alias's reads from the inner module's and the alias went unfollowed.
+  // Where the walk stood at every binding and at every read says which is
+  // which: a read of `Y.` belongs to the innermost enclosing structure that
+  // binds `Y`, and is a read of THE binding there when it binds `Y` once.
+  std::map<std::string, std::vector<std::string>> bscope_;
+  static bool scope_under(const std::string& sc, const std::string& b) {
+    return b.empty() || sc == b || sc.compare(0, b.size() + 1, b + ".") == 0;
+  }
+  bool alias_read(const std::string& nm) const {
+    auto bs = bscope_.find(nm);
+    if (bs == bscope_.end()) return false;
+    for (auto& r : fscope) {
+      const std::string& p = r.second;
+      if (p.compare(0, nm.size(), nm) != 0 ||
+          (p.size() > nm.size() && p[nm.size()] != '.'))
+        continue;
+      const std::string* in = nullptr;
+      for (auto& b : bs->second)
+        if (scope_under(r.first, b) && (!in || b.size() > in->size())) in = &b;
+      if (!in) continue;
+      int k = 0;
+      for (auto& b : bs->second) k += b == *in;
+      if (k == 1) return true;
+    }
+    return false;
+  }
   // Is `m` shadowed WHERE THE WALK STANDS?  The bindings are recorded in
   // source order, so the only one a name can carry too early is its own.
   bool shadowed(const std::string& m) const {
@@ -20813,6 +20855,9 @@ struct Cites {
   // or a `let module`, which shadows without being a structure of its own.
   std::vector<std::string> cpath_;
   std::set<std::pair<std::string, std::string>> fscope;
+  // The dotted paths the file OPENS, with their scope: an `open Y.N`
+  // through an alias forces N as a read of `Y.N.w` does (S517).
+  std::set<std::pair<std::string, std::string>> oscope;
   // The module a `let module M = .. in` binds, by the scope its body's reads
   // stand in (S512: `appres_force` reads an applied functor's result there).
   std::map<std::string, const ModuleExpr*> lmods;
@@ -21219,6 +21264,8 @@ struct Cites {
   // so a later `printf "%d"` names one without writing the module.
   bool opened(const Longident& id) {
     force_path(id);
+    if (std::holds_alternative<Ldot>(id.v))
+      oscope.emplace(cscope(), lid_full(id));
     if (auto* l = std::get_if<Lident>(&id.v)) {
       std::string ow = opened_owner(l->name);
       if (ow.empty()) {
@@ -22731,17 +22778,34 @@ const Structure* scope_at(const Structure& s,
 // `ren_mty`).
 long long appres_force(const Structure& s, const ModuleExpr& me,
                        std::set<const ModuleType*>& done);
+// ---- A SUBMODULE READ THROUGH AN ALIAS OF ITS PARENT IS FORCED (S517) ---
+// `module Y = X.Y  type t = Y.N.w`: the alias's components are made by
+// scraping it (env.ml:2063), which STRENGTHENS `X.Y`'s signature at its
+// path (`Mtype.strengthen_lazy`) -- the top items `lal_bind` charges once
+// the alias is read -- and every submodule of that signature becomes an
+// alias of its path, so reading `N` through `Y` scrapes it in turn and
+// forces N's own lazy copy: one ident per top item of each submodule on the
+// read path below the alias's target, once per submodule for the file.  A
+// direct `X.Y.N.w` reads N out of X's components and pays none of this.
+// Defined after `Count` (it uses its `me_top`).
+long long alias_sub_top(const ModuleExpr& me);
 long long modforce_cost(const Structure& s, const Cites& u) {
   if (modforce_off()) return 0;
   long long tot = 0;
   std::set<const ModuleExpr*> done;
+  std::set<const ModuleExpr*> adone;
   std::set<const ModuleType*> rdone;
   std::vector<std::pair<std::string, std::string>> reads;
   if (nestforce_off())
     for (auto& p : u.forced) reads.emplace_back(std::string(), p);
   else
     reads.assign(u.fscope.begin(), u.fscope.end());
-  for (auto& r : reads) {
+  const std::size_t nreads = reads.size();
+  if (!nestforce_off() && !pkwrit_off())
+    reads.insert(reads.end(), u.oscope.begin(), u.oscope.end());
+  for (std::size_t ri = 0; ri < reads.size(); ++ri) {
+    const auto& r = reads[ri];
+    const bool openonly = ri >= nreads;
     const std::string& p = r.second;
     std::vector<std::string> c = split_dotted(p);
     if (c.empty()) continue;
@@ -22772,6 +22836,10 @@ long long modforce_cost(const Structure& s, const Cites& u) {
       std::vector<std::string> sc = split_dotted(r.first);
       // An alias `module A = Simple` names Simple's components: follow it,
       // from the same scope.
+      std::size_t tlen = 0;  // the last alias-of-a-submodule's target
+      // How many components FOLLOW each hop's target: the target itself
+      // is what `lal_bind` charges for the alias, not a submodule below it.
+      std::vector<std::size_t> rests;
       for (int hop = 0; hop < 4; ++hop) {
         me = nullptr;
         for (std::size_t k = sc.size() + 1; k-- > 0 && !me;) {
@@ -22783,11 +22851,25 @@ long long modforce_cost(const Structure& s, const Cites& u) {
         if (!ai) break;
         std::vector<std::string> ac;
         if (!lid_comps(ai->id.txt, ac) || ac.empty()) { me = nullptr; break; }
+        if (ac.size() >= 2 && !pkwrit_off()) tlen = ac.size();
+        rests.push_back(c.size() - 1);
         ac.insert(ac.end(), c.begin() + 1, c.end());
         c = ac;
       }
       auto lb = u.local.find(c[0]);
       if (!me || lb == u.local.end() || lb->second < 1) continue;
+      if (tlen) {
+        const ModuleExpr* sm = me;
+        for (std::size_t i = 1; sm && i < c.size(); ++i) {
+          auto* st = std::get_if<Pmod_structure>(&sm->desc);
+          sm = st ? nar_find(st->items, c[i]) : nullptr;
+          if (!sm || i < tlen) continue;
+          bool target = false;
+          for (auto rs : rests) target = target || c.size() - 1 - i == rs;
+          if (!target && adone.insert(sm).second) tot += alias_sub_top(*sm);
+        }
+      }
+      if (openonly) continue;
     }
     for (std::size_t i = 1; me && i < c.size(); ++i) {
       auto* st = std::get_if<Pmod_structure>(&me->desc);
@@ -23404,6 +23486,82 @@ struct Count {
       k = pack_nodes(*p->type);
     return k;
   }
+  // ---- A PACKAGE TYPE WRITTEN AT A PATTERN OR A RESULT (S517) -----------
+  // `Merge.merge_package` (typemod.ml:970) renames the type each `with`
+  // constraint of a package patches, one ident apiece, wherever the package
+  // is TRANSLATED: an expression constraint and a saved declaration pay it
+  // inside `pack_pkg`, an unpack pattern pays its own, and a PATTERN
+  // annotation or a function's RESULT constraint paid nothing for it, saved
+  // or not, shadowed or not, at every depth of the written type.
+  static long long pk_patches(const CoreType& t) {
+    if (auto* p = std::get_if<Ptyp_package>(&t.desc)) {
+      long long k = (long long)p->constraints.size();
+      for (auto& c : p->constraints) k += pk_patches(*c.second);
+      return k;
+    }
+    long long k = 0;
+    if (auto* a = std::get_if<Ptyp_arrow>(&t.desc))
+      k = pk_patches(*a->dom) + pk_patches(*a->cod);
+    else if (auto* u = std::get_if<Ptyp_tuple>(&t.desc))
+      for (auto& e : u->elems) k += pk_patches(*e);
+    else if (auto* c = std::get_if<Ptyp_constr>(&t.desc))
+      for (auto& a : c->args) k += pk_patches(*a);
+    else if (auto* c = std::get_if<Ptyp_class>(&t.desc))
+      for (auto& a : c->args) k += pk_patches(*a);
+    else if (auto* a = std::get_if<Ptyp_alias>(&t.desc))
+      k = pk_patches(*a->type);
+    else if (auto* p = std::get_if<Ptyp_poly>(&t.desc))
+      k = pk_patches(*p->type);
+    else if (auto* p = std::get_if<Ptyp_open>(&t.desc))
+      k = pk_patches(*p->type);
+    return k;
+  }
+  // ---- AN ABBREVIATION WITH A PACKAGE CONSTRAINT AT A PARAMETER ----------
+  // `type 'a arg_t = 'at constraint 'a = (module S with type t = 'at)`:
+  // translating a written `T arg_t` unifies `T` with an instance of the
+  // constraint (typetexp.ml:557), which meets two package nodes -- 2 --
+  // where `T` is a package or an abbreviation of one, and EVERY expansion
+  // of the abbreviation afterwards re-unifies the constraint through
+  // `Ctype.subst` (ctype.ml:1857) against the argument, a package by then
+  // whatever `T` was: 2 per expansion.  A parameter annotation that IS the
+  // application is expanded once, by `unify_pat_types`.  Left alone (each
+  // costs MORE, never less): the same application under a constructor or an
+  // arrow, in an expression or a result constraint (two instances), in a
+  // manifest or a `val`, and a name bound at it that is returned or passed
+  // on -- every one of them expands the abbreviation again.
+  bool pk_abbrev(const CoreType& t, int fuel = 4) const {
+    if (fuel <= 0) return false;
+    if (std::holds_alternative<Ptyp_package>(t.desc)) return true;
+    auto* c = std::get_if<Ptyp_constr>(&t.desc);
+    if (!c || !std::holds_alternative<Lident>(c->id.txt.v)) return false;
+    auto it = tdecls_.find(lid_last(c->id.txt));
+    if (it == tdecls_.end() || !it->second->manifest) return false;
+    return pk_abbrev(**it->second->manifest, fuel - 1);
+  }
+  long long pk_cabbr(const CoreType& t) const {
+    if (pkwrit_off()) return 0;
+    auto* c = std::get_if<Ptyp_constr>(&t.desc);
+    if (!c || c->args.empty() || !std::holds_alternative<Lident>(c->id.txt.v))
+      return 0;
+    auto it = tdecls_.find(lid_last(c->id.txt));
+    if (it == tdecls_.end()) return 0;
+    const TypeDeclaration& d = *it->second;
+    if (d.params.size() != c->args.size()) return 0;
+    long long k = 0;
+    for (auto& cn : d.constraints) {
+      const CoreType* v = cn.t1.get();
+      const CoreType* pk = cn.t2.get();
+      if (!std::holds_alternative<Ptyp_var>(v->desc)) std::swap(v, pk);
+      auto* var = std::get_if<Ptyp_var>(&v->desc);
+      if (!var || !std::holds_alternative<Ptyp_package>(pk->desc)) continue;
+      for (std::size_t i = 0; i < d.params.size(); ++i) {
+        auto* pv = std::get_if<Ptyp_var>(&d.params[i]->desc);
+        if (!pv || pv->name != var->name) continue;
+        k += 2 + (pk_abbrev(*c->args[i]) ? 2 : 0);
+      }
+    }
+    return k;
+  }
   // `let x : t = e` -- a MONOMORPHIC binding annotation -- names every package
   // type of `t` THREE times over, whether the binding is saved or not; a
   // POLYMORPHIC one (`let x : 'a. t = e`) names it once and is left alone.
@@ -23417,6 +23575,10 @@ struct Count {
   }
   long long pack_decl(const TypeDeclaration& d) const {
     long long k = d.manifest ? pack_ty(**d.manifest) : 0;
+    // A `constraint 'a = (module S with type t = 'at)` is translated like
+    // the manifest (`Typedecl.transl_declaration`), both sides.
+    if (!pkwrit_off())
+      for (auto& c : d.constraints) k += pack_ty(*c.t1) + pack_ty(*c.t2);
     if (auto* v = std::get_if<Ptype_variant>(&d.kind))
       for (auto& c : v->ctors) k += pack_args(c.args, c.res);
     else if (auto* r = std::get_if<Ptype_record>(&d.kind))
@@ -23734,6 +23896,7 @@ struct Count {
     if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) {
       pat(*c->p, out);
       ann_app(*c->t);
+      if (!pkwrit_off()) n += pk_patches(*c->t) + pk_cabbr(*c->t);
       if (auto* v = std::get_if<Ppat_var>(&strip(*c->p).desc))
         vann_[v->name.txt] = c->t.get();  // the scrutinee's type (S507)
       if (auto* v = std::get_if<Ppat_var>(&c->p->desc))
@@ -27192,8 +27355,10 @@ struct Count {
       if (auto* c = std::get_if<Pconstraint>(&*f.constraint_))
         n += (pkmeet_off() ? 4 : 2) * pack_nodes(*c->type);
     if (f.constraint_) {
-      if (auto* c = std::get_if<Pconstraint>(&*f.constraint_)) ann_app(*c->type);
-      else if (auto* c = std::get_if<Pcoerce>(&*f.constraint_)) {
+      if (auto* c = std::get_if<Pconstraint>(&*f.constraint_)) {
+        ann_app(*c->type);
+        if (!pkwrit_off()) n += pk_patches(*c->type);
+      } else if (auto* c = std::get_if<Pcoerce>(&*f.constraint_)) {
         if (c->from) ann_app(**c->from);
         ann_app(*c->to_);
       }
@@ -27529,6 +27694,8 @@ struct Count {
       n += per;
       if (fixed_row(d)) n += per;
       if (d.manifest) ty_app(**d.manifest, 0, false, 2);
+      if (!pkwrit_off())
+        for (auto& c : d.constraints) { ty_app(*c.t1); ty_app(*c.t2); }
       if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
         for (auto& c : v->ctors) { ++n; ctor_args(c.args); }
       } else if (auto* r = std::get_if<Ptype_record>(&d.kind)) {
@@ -31487,7 +31654,38 @@ struct Count {
     if (pkwith_off()) return 0;
     long long k = pk_force(p.path.txt);
     if (!p.constraints.empty()) k += mult * pk_pathwt(p.path.txt);
-    return k;
+    return k + pk_nested(p);
+  }
+  // Each `with type` a package carries is merged by `check_type_decl`
+  // (typemod.ml:292), which substitutes the WHOLE signature item by item
+  // with `Keep` scoping -- and `Keep` still renames what the items hold
+  // inside: every item of every submodule and module type at every depth,
+  // once per constraint, wherever the package type is written (S517).  The
+  // top items stay; a module type `with` (`merge_constraint`) is another
+  // path and was exact already.
+  long long pk_nested(const Ptyp_package& p) const {
+    if (pkwrit_off() || p.constraints.empty()) return 0;
+    const ModuleType* d = std::holds_alternative<Lident>(p.path.txt.v)
+                              ? named_mty(p.path.txt, 8)
+                              : dotted_mty(p.path.txt, 8);
+    long long k = 0;
+    if (const Signature* sg = d ? mty_sig(d) : nullptr) {
+      for (auto& it : *sg) {
+        if (auto* m = std::get_if<Psig_module>(&it.desc))
+          k += ren_mty(*m->md.type);
+        else if (auto* m = std::get_if<Psig_recmodule>(&it.desc))
+          for (auto& r : m->decls) k += ren_mty(*r.type);
+        else if (auto* m = std::get_if<Psig_modtype>(&it.desc))
+          k += m->type ? ren_mty(*m->type) : 0;
+        else if (auto* m = std::get_if<Psig_modtypesubst>(&it.desc))
+          k += ren_mty(m->type);
+      }
+    } else {
+      std::string key;
+      if (const cmi::Signature* cs = xpath_sig(p.path.txt, key))
+        k = flat_csig(*cs) - (long long)cs->order.size();
+    }
+    return k * (long long)p.constraints.size();
   }
   // Follow this file's `module F2 = F` aliases to the path the head finally
   // names; null where the head is not an identifier at all.
@@ -32613,6 +32811,16 @@ struct Count {
         if (auto* g = std::get_if<Otag>(&f)) ty_app(*g->type, d + 1, xonly);
         else if (auto* i = std::get_if<Oinherit>(&f)) ty_app(*i->type, d + 1, xonly);
       }
+    // A package type with `with` constraints is checked where it is WRITTEN
+    // (`check_package_with_type_constraints`, typemod.ml:979): the module
+    // type it names is scraped, which forces a declaration read through a
+    // parent or out of another unit once per file -- the force a pack or an
+    // unpack at the same type pays (`pk_force`), shared, in either order.
+    // A bare `(module X.S)` stays a path and forces nothing.
+    } else if (auto* p = std::get_if<Ptyp_package>(&t.desc)) {
+      if (!pkwrit_off() && !p->constraints.empty())
+        n += pk_force(p->path.txt) + pk_nested(*p);
+      for (auto& c : p->constraints) ty_app(*c.second, d + 1, xonly);
     }
   }  // ---- THE SAME PATH WRITTEN IN AN ANNOTATION ----------------------------
   // `ty_app` was called from type declarations and signature items alone, so
@@ -33537,6 +33745,10 @@ static const std::string* bare_name(const ModuleType* t) {
   auto* li = id ? std::get_if<Lident>(&id->id.txt.v) : nullptr;
   return li ? &li->name : nullptr;
 }
+long long alias_sub_top(const ModuleExpr& me) {
+  Count c;
+  return c.me_top(me);
+}
 long long appres_force(const Structure& s, const ModuleExpr& me,
                        std::set<const ModuleType*>& done) {
   if (incname_off()) return 0;
@@ -33803,6 +34015,9 @@ int typing_ident_count(const ast::Structure& s, std::size_t eta_sites,
   for (auto& nm : u.units) {
     auto lb = u.local.find(nm);
     if (lb != u.local.end() && lb->second == 1) used.insert(nm);
+    else if (lb != u.local.end() && !stampcount::pkwrit_off() &&
+             u.alias_read(nm))
+      used.insert(nm);
   }
   // Which cross-unit functors does the file apply ITSELF?  A bare head one
   // of its `open`s provides is that unit's submodule and names a DIFFERENT
