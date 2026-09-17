@@ -26817,6 +26817,13 @@ struct Count {
         if (b.constraint_)
           if (auto* c = std::get_if<Pvc_constraint>(&*b.constraint_))
             n += (long long)c->univars.size();
+    for (auto& b : bs) {
+      if (std::holds_alternative<Ppat_any>(strip(b.pat).desc))
+        n += appexp_pos(*b.expr);
+      if (b.constraint_)
+        if (auto* c = std::get_if<Pvc_constraint>(&*b.constraint_))
+          n += appexp_con(*b.expr, *c->typ);
+    }
     for (auto& b : bs)
       if (b.constraint_) {
         if (auto* c = std::get_if<Pvc_constraint>(&*b.constraint_)) ann_app(*c->typ);
@@ -27077,6 +27084,7 @@ struct Count {
   void expr(const Expression& e) {
     if (auto* a = std::get_if<Pexp_apply>(&e.desc)) {
       if (!pkmeet_off()) n += pk_app(*a);
+      n += appexp_app(*a);
       expr(*a->fn);
       for (auto& ar : a->args) expr(*ar.second);
     } else if (auto* t = std::get_if<Pexp_tuple>(&e.desc)) {
@@ -27099,6 +27107,7 @@ struct Count {
       if (c->arg) expr(**c->arg);
     } else if (auto* m = std::get_if<Pexp_match>(&e.desc)) {
       if (!pkmeet_off() && !pkexp_.count(&e)) n += pk_arms(nullptr, m->cases);
+      n += appexp_pos(*m->e);
       expr(*m->e);
       n += eff_row(m->cases);
       n += unused_extra(m->cases, true, m->e.get());
@@ -27110,9 +27119,11 @@ struct Count {
       n += unused_extra(t->cases, false);
       for (auto& c : t->cases) cse(c);
     } else if (auto* s = std::get_if<Pexp_sequence>(&e.desc)) {
+      n += appexp_pos(*s->e1);
       expr(*s->e1); expr(*s->e2);
     } else if (auto* c = std::get_if<Pexp_constraint>(&e.desc)) {
       if (!pkmeet_off()) n += pk_rue(*c->e, *c->t);
+      n += appexp_con(*c->e, *c->t);
       expr(*c->e);
       if (!packty_off()) n += pack_ty(*c->t);
       ann_app(*c->t);
@@ -28999,6 +29010,654 @@ struct Count {
       k += alias_exp(*args[args.size() - 1 - i], par_sig(*pt, ds));
     }
     return k;
+  }
+  // ---- A TYPE OF AN APPLIED FUNCTOR IS EXPANDED THROUGH ITS COMPONENTS ---
+  // `module M = F (B)` binds F's result STRENGTHENED (`Mtype.strengthen`,
+  // through `find_strengthened_module` on the functor): every type of it
+  // with no manifest of its own is given one, a path through the
+  // APPLICATION, `M.t = F(B).t`, and a manifest `X.u` becomes `B.u`.
+  // Expanding such a type -- `Ctype.expand_head`, which `lower_args`
+  // (typecore.ml:4310) runs down the arrow spine of every function
+  // APPLIED, `type_argument` (:6632) on the expected type of an INFERRED
+  // argument or of a constrained expression, and `ignore`, a `_` binding,
+  // a statement and a `match` on what they are given -- is `Env.find_type`
+  // on a `Papply`, and that BUILDS what no binding of this file built:
+  //   * the functor's own `Functor_comps` (env.ml:2238), once per functor:
+  //     its declared type forced under `Rescope`, one ident per item at
+  //     every depth of each parameter written as a signature, one for each
+  //     LATER named parameter, and of the result -- nothing for a result
+  //     that is a NAME;
+  //   * the application's components (env.ml:2263), once per applied PATH:
+  //     the result substituted, and for a PARTIAL application of a curried
+  //     functor the functor type it leaves forced once more.
+  // The declaration found is the functor's UNSTRENGTHENED one.  With no
+  // manifest, `try_normalize_type_path` (ctype.ml:1950) walks the path and
+  // builds the components of every functor applied INSIDE the arguments
+  // (env.ml:1129: its Functor_comps and those of each partial application,
+  // the full one left alone); an argument that is an ALIAS `module B = B0`
+  // normalises to a second path, which is then built and found again.  A
+  // manifest `X.u` carries the expansion into the argument's `u`, which
+  // costs again where that argument is an application, and a functor whose
+  // body is an application leaves the inner application's path.  A functor
+  // of another unit is not read here.  What a value's type is has to be read
+  // off the body: a record or a constructor names its type, an annotation
+  // says, and a `let` or a `match` is what it ends in.  `NOAPPEXP=1`
+  // reverts.
+  static bool appexp_off() {
+    static const bool off = dbg_env("NOAPPEXP") != nullptr;
+    return off;
+  }
+  // An application path: the functor and its arguments, each a path of its
+  // own or an application; `spell` keys the path and `nspell` the same with
+  // every alias argument normalised.
+  struct Ap {
+    const ModuleExpr* f = nullptr;
+    std::vector<Ap> args;
+    std::string spell, nspell;
+    bool leaf() const { return !f; }
+  };
+  std::set<const ModuleExpr*> fcomps_;  // functors whose components are built
+  std::set<std::string> acomps_;        // applied paths built
+  using ApEnv = std::map<std::string, const Ap*>;
+  // The alias chain `module B = B0` a name stands for, spelled at its end.
+  std::string alias_spell(const Longident& id) const {
+    std::vector<std::string> c;
+    if (!lid_comps(id, c) || c.size() != 1) return lid_full(id);
+    const Longident* q = &id;
+    for (int i = 0; i < 8; ++i) {
+      const ModuleExpr* m = mfind(*q);
+      auto* p = m ? std::get_if<Pmod_ident>(&m->desc) : nullptr;
+      if (!p) break;
+      q = &p->id.txt;
+    }
+    return lid_full(*q);
+  }
+  bool ap_of(const ModuleExpr& m, const ApEnv& env, Ap& out, int d = 0) const {
+    if (d > 8) return false;
+    if (auto* pi = std::get_if<Pmod_ident>(&m.desc)) {
+      std::vector<std::string> c;
+      if (lid_comps(pi->id.txt, c) && c.size() == 1)
+        if (auto it = env.find(c[0]); it != env.end()) {
+          out = *it->second;
+          return true;
+        }
+      out = Ap{};
+      out.spell = lid_full(pi->id.txt);
+      out.nspell = alias_spell(pi->id.txt);
+      return true;
+    }
+    std::vector<const ModuleExpr*> as;
+    const ModuleExpr* h = &m;
+    while (auto* a = std::get_if<Pmod_apply>(&h->desc)) {
+      if (!has_path(*a->arg)) return false;
+      as.push_back(a->arg.get());
+      h = a->f.get();
+    }
+    auto* hi = std::get_if<Pmod_ident>(&h->desc);
+    if (as.empty() || !hi) return false;
+    bool sub = false;
+    const ModuleExpr* f = lal_res(hi->id.txt, sub);
+    if (!f || !std::holds_alternative<Pmod_functor>(f->desc)) return false;
+    out = Ap{};
+    out.f = f;
+    for (auto a = as.rbegin(); a != as.rend(); ++a) {
+      Ap x;
+      if (!ap_of(**a, env, x, d + 1)) return false;
+      out.args.push_back(std::move(x));
+    }
+    out.spell = std::to_string((std::uintptr_t)f);
+    out.nspell = out.spell;
+    for (auto& x : out.args) {
+      out.spell += "(" + x.spell + ")";
+      out.nspell += "(" + x.nspell + ")";
+    }
+    return true;
+  }
+  static bool ap_renamed(const Ap& a) {
+    return a.spell != a.nspell;
+  }
+  // The functor's parameters in order, an anonymous one unnamed.
+  static void fparams(const ModuleExpr* f, std::vector<std::string>& out) {
+    for (int i = 0; f && i < 16; ++i) {
+      auto* fn = std::get_if<Pmod_functor>(&f->desc);
+      if (!fn) break;
+      auto* nm = std::get_if<Functor_named>(&fn->param);
+      out.push_back(nm && nm->name.txt ? *nm->name.txt : std::string());
+      f = fn->body.get();
+    }
+  }
+  const ModuleExpr* fbody(const ModuleExpr* f, std::size_t n) const {
+    for (std::size_t i = 0; f && i < n; ++i) {
+      auto* fn = std::get_if<Pmod_functor>(&f->desc);
+      if (!fn) return nullptr;
+      f = fn->body.get();
+    }
+    return f ? mderef(f) : nullptr;
+  }
+  // What the result of the functor's type weighs, flat: a structure's items
+  // at every depth, a written signature's, nothing for a name; a body that
+  // is an application weighs what it evaluates to.
+  long long res_items(const ModuleExpr* b) const {
+    if (!b) return 0;
+    if (std::holds_alternative<Pmod_structure>(b->desc))
+      return wt_mexpr(*b, flat());
+    if (auto* c = std::get_if<Pmod_constraint>(&b->desc))
+      return std::holds_alternative<Pmty_signature>(c->mt->desc)
+                 ? ren_mty(*c->mt) : 0;
+    if (std::holds_alternative<Pmod_apply>(b->desc))
+      return res_items(app_res(b));
+    return 0;
+  }
+  // The functor's type from its `from`-th parameter on: the parameters'
+  // written signatures and the result (`lits`), and the named parameters
+  // among them (`ids`), which `Subst` renames and a force does not.
+  long long lits(const ModuleExpr* f, std::size_t from) const {
+    long long k = 0;
+    std::size_t j = 0;
+    for (int i = 0; f && i < 16; ++i, ++j) {
+      auto* fn = std::get_if<Pmod_functor>(&f->desc);
+      if (!fn) break;
+      if (j >= from)
+        if (auto* nm = std::get_if<Functor_named>(&fn->param))
+          if (nm->type &&
+              std::holds_alternative<Pmty_signature>(nm->type->desc))
+            k += ren_mty(*nm->type);
+      f = fn->body.get();
+    }
+    return k + res_items(f ? mderef(f) : nullptr);
+  }
+  static long long ids(const ModuleExpr* f, std::size_t from) {
+    std::vector<std::string> ps;
+    fparams(f, ps);
+    long long k = 0;
+    for (std::size_t j = from; j < ps.size(); ++j)
+      if (!ps[j].empty()) ++k;
+    return k;
+  }
+  long long fcomps(const ModuleExpr* f) {
+    if (!f || !fcomps_.insert(f).second) return 0;
+    return lits(f, 0) + ids(f, 1);
+  }
+  // The components of the path's first `i` applications.
+  long long acomps(const Ap& a, std::size_t i, bool norm) {
+    std::vector<std::string> ps;
+    fparams(a.f, ps);
+    std::string key = std::to_string((std::uintptr_t)a.f);
+    for (std::size_t j = 0; j < i && j < a.args.size(); ++j)
+      key += "(" + (norm ? a.args[j].nspell : a.args[j].spell) + ")";
+    if (!acomps_.insert(key).second) return 0;
+    if (i < ps.size()) return 2 * lits(a.f, i) + ids(a.f, i);
+    return lits(a.f, i);
+  }
+  // `find_structure_components` of the whole path, and what normalising it
+  // builds: everything but the last application, inside every argument.
+  long long ap_build(const Ap& a, bool norm) {
+    long long k = fcomps(a.f);
+    for (std::size_t i = 1; i <= a.args.size(); ++i) k += acomps(a, i, norm);
+    return k;
+  }
+  long long ap_norm(const Ap& a, bool norm, int d = 0) {
+    if (a.leaf() || d > 8) return 0;
+    long long k = fcomps(a.f);
+    for (std::size_t i = 1; i < a.args.size(); ++i) k += acomps(a, i, norm);
+    for (auto& x : a.args) k += ap_norm(x, norm, d + 1);
+    return k;
+  }
+  // The declaration of `t` in the functor's result: none, one with no
+  // manifest, one whose manifest is a type of the `i`-th parameter, one
+  // whose manifest is anything else, or the result of the application the
+  // body is.
+  struct Adecl {
+    enum K { None, Abs, Param, Other, App } k = None;
+    std::size_t i = 0;
+    std::string u;
+  };
+  using Sub = std::vector<std::string>;  // a submodule path of the result
+  Adecl find_adecl(const ModuleExpr* f, std::size_t n, const Sub& sub,
+                   const std::string& t) const {
+    Adecl r;
+    const ModuleExpr* b = fbody(f, n);
+    if (!b) return r;
+    std::vector<std::string> ps;
+    fparams(f, ps);
+    auto head = [&](const std::optional<CoreTypeBox>& m) {
+      if (!m) { r.k = Adecl::Abs; return; }
+      r.k = Adecl::Other;
+      auto* c = std::get_if<Ptyp_constr>(&(*m)->desc);
+      std::vector<std::string> pc;
+      if (!c || !lid_comps(c->id.txt, pc) || pc.size() != 2) return;
+      for (std::size_t j = 0; j < ps.size() && j < n; ++j)
+        if (ps[j] == pc[0]) { r.k = Adecl::Param; r.i = j; r.u = pc[1]; }
+    };
+    if (std::holds_alternative<Pmod_structure>(b->desc)) {
+      for (auto& nm : sub) {
+        b = b ? msub(*b, nm) : nullptr;
+        if (!b || !std::holds_alternative<Pmod_structure>(b->desc)) return r;
+      }
+      for (auto& it : std::get<Pmod_structure>(b->desc).items)
+        if (auto* ty = std::get_if<Pstr_type>(&it.desc))
+          for (auto& d : ty->decls)
+            if (d.name.txt == t) head(d.manifest);
+      return r;
+    }
+    if (auto* c = std::get_if<Pmod_constraint>(&b->desc)) {
+      if (!sub.empty()) return r;
+      if (const Signature* sg = mty_sig(c->mt.get()))
+        for (auto& it : *sg)
+          if (auto* ty = std::get_if<Psig_type>(&it.desc))
+            for (auto& d : ty->decls)
+              if (d.name.txt == t) head(d.manifest);
+      return r;
+    }
+    if (std::holds_alternative<Pmod_apply>(b->desc)) r.k = Adecl::App;
+    return r;
+  }
+  bool ap_inner(const Ap& a, Ap& out) const {
+    const ModuleExpr* b = fbody(a.f, a.args.size());
+    if (!b) return false;
+    std::vector<std::string> ps;
+    fparams(a.f, ps);
+    ApEnv env;
+    for (std::size_t j = 0; j < ps.size() && j < a.args.size(); ++j)
+      if (!ps[j].empty()) env[ps[j]] = &a.args[j];
+    return ap_of(*b, env, out);
+  }
+  // Expanding the type `<a>.<sub>.t`.
+  long long ap_expand(const Ap& a, const Sub& sub, const std::string& t,
+                      int d = 0) {
+    if (a.leaf() || d > 8) return 0;
+    long long k = ap_build(a, false);
+    Adecl dc = find_adecl(a.f, a.args.size(), sub, t);
+    if (dc.k == Adecl::Abs) {
+      k += ap_norm(a, false, d);
+      if (ap_renamed(a)) k += ap_build(a, true) + ap_norm(a, true, d);
+    } else if (dc.k == Adecl::Param) {
+      if (dc.i < a.args.size())
+        k += ap_expand(a.args[dc.i], Sub{}, dc.u, d + 1);
+    } else if (dc.k == Adecl::App) {
+      Ap in;
+      if (ap_inner(a, in)) k += ap_expand(in, sub, t, d + 1);
+    }
+    return k;
+  }
+  // Expanding `M.<sub>.t` where M is bound to the application `a`: the
+  // manifest strengthening gave the type.
+  long long ap_mani(const Ap& a, const Sub& sub, const std::string& t,
+                    int d = 0) {
+    if (a.leaf() || d > 8) return 0;
+    Adecl dc = find_adecl(a.f, a.args.size(), sub, t);
+    if (dc.k == Adecl::Abs) return ap_expand(a, sub, t, d);
+    if (dc.k == Adecl::Param)
+      return dc.i < a.args.size()
+                 ? ap_expand(a.args[dc.i], Sub{}, dc.u, d + 1) : 0;
+    if (dc.k == Adecl::App) {
+      Ap in;
+      return ap_inner(a, in) ? ap_mani(in, sub, t, d + 1) : 0;
+    }
+    return 0;
+  }
+  // The module a path of this file names, where one on the way is bound to
+  // an application: that application, and the path on from it.
+  bool ap_bound(const std::vector<std::string>& c, Ap& out, Sub& sub) const {
+    if (c.empty()) return false;
+    const ModuleExpr* me = mod_named(c[0]);
+    if (!me) me = open_head(c[0]);
+    me = mderef(me);
+    for (std::size_t j = 1; me && j < c.size(); ++j) {
+      if (std::holds_alternative<Pmod_apply>(me->desc)) {
+        sub.assign(c.begin() + j, c.end());
+        return ap_of(*me, ApEnv{}, out);
+      }
+      me = mderef(msub(*me, c[j]));
+    }
+    if (!me || !std::holds_alternative<Pmod_apply>(me->desc)) return false;
+    sub.clear();
+    return ap_of(*me, ApEnv{}, out);
+  }
+  // Is this an application of a functor of this file?
+  bool local_app(const ModuleExpr& m) const {
+    const ModuleExpr* h = &m;
+    int n = 0;
+    while (auto* a = std::get_if<Pmod_apply>(&h->desc)) {
+      ++n;
+      h = a->f.get();
+    }
+    auto* hi = n ? std::get_if<Pmod_ident>(&h->desc) : nullptr;
+    if (!hi) return false;
+    bool sub = false;
+    const ModuleExpr* f = lal_res(hi->id.txt, sub);
+    return f && std::holds_alternative<Pmod_functor>(f->desc);
+  }
+  // A written type headed by such a module's type.
+  long long appexp_ty(const CoreType& ty) {
+    auto* c = std::get_if<Ptyp_constr>(&ty.desc);
+    std::vector<std::string> pc;
+    if (!c || !lid_comps(c->id.txt, pc) || pc.size() < 2) return 0;
+    std::string t = pc.back();
+    pc.pop_back();
+    Ap a;
+    Sub sub;
+    if (!ap_bound(pc, a, sub)) return 0;
+    return ap_mani(a, sub, t);
+  }
+  // A value of the body read off the parsetree: the annotation on each
+  // parameter, and what the body returns -- a type of the structure's own
+  // (`t`), one of a parameter's (`X.u`), or nothing that can be read.
+  struct Vty {
+    std::vector<const CoreType*> params;
+    const CoreType* ret = nullptr;      // written
+    std::string own;                    // the structure's own type
+    std::string px, pu;                 // a parameter's `X.u`
+  };
+  static const std::string* pat_var(const Pattern& p) {
+    if (auto* v = std::get_if<Ppat_var>(&p.desc)) return &v->name.txt;
+    if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) return pat_var(*c->p);
+    return nullptr;
+  }
+  static const CoreType* pat_ann(const Pattern& p) {
+    if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) return c->t.get();
+    return nullptr;
+  }
+  static const ValueBinding* str_val(const Pmod_structure& st,
+                                     const std::string& v) {
+    const ValueBinding* r = nullptr;
+    for (auto& it : st.items)
+      if (auto* pv = std::get_if<Pstr_value>(&it.desc))
+        for (auto& b : pv->bindings)
+          if (const std::string* nm = pat_var(b.pat))
+            if (*nm == v) r = &b;
+    return r;
+  }
+  // The type a record label or a constructor belongs to.
+  static std::string str_owner(const Pmod_structure& st, const std::string& nm,
+                               bool label) {
+    std::string r;
+    for (auto& it : st.items)
+      if (auto* ty = std::get_if<Pstr_type>(&it.desc))
+        for (auto& d : ty->decls) {
+          if (label) {
+            if (auto* rc = std::get_if<Ptype_record>(&d.kind))
+              for (auto& l : rc->fields)
+                if (l.name.txt == nm) r = d.name.txt;
+          } else if (auto* vr = std::get_if<Ptype_variant>(&d.kind)) {
+            for (auto& c : vr->ctors)
+              if (c.name.txt == nm) r = d.name.txt;
+          }
+        }
+    return r;
+  }
+  // The parameters the body is typed under, with their written types and
+  // the arguments they stand for; `aps` keeps those alive.
+  struct Vctx {
+    const Pmod_structure* st = nullptr;
+    std::vector<std::pair<std::string, const ModuleType*>> params;
+    ApEnv env;
+    std::deque<Ap> aps;
+  };
+  // What the expression's type is headed by, read syntactically.
+  void exp_head(const Vctx& cx, const Expression& e, Vty& o, int d) const {
+    if (d > 16) return;
+    const Pmod_structure& st = *cx.st;
+    const Expression* p = &e;
+    if (auto* c = std::get_if<Pexp_constraint>(&p->desc)) {
+      o.ret = c->t.get();
+      return;
+    }
+    if (auto* r = std::get_if<Pexp_record>(&p->desc)) {
+      if (!r->fields.empty())
+        o.own = str_owner(st, lid_last(r->fields[0].first.txt), true);
+      return;
+    }
+    if (auto* c = std::get_if<Pexp_construct>(&p->desc)) {
+      o.own = str_owner(st, lid_last(c->id.txt), false);
+      return;
+    }
+    if (auto* l = std::get_if<Pexp_let>(&p->desc)) {
+      // `let r = .. in r` ends in what it bound.
+      if (auto* bi = std::get_if<Pexp_ident>(&l->body->desc))
+        for (auto& b : l->bindings)
+          if (const std::string* nm = pat_var(b.pat))
+            if (std::holds_alternative<Lident>(bi->id.txt.v) &&
+                lid_last(bi->id.txt) == *nm)
+              return exp_head(cx, *b.expr, o, d + 1);
+      return exp_head(cx, *l->body, o, d + 1);
+    }
+    if (auto* s = std::get_if<Pexp_sequence>(&p->desc))
+      return exp_head(cx, *s->e2, o, d + 1);
+    if (auto* i = std::get_if<Pexp_ifthenelse>(&p->desc))
+      return exp_head(cx, *i->then_, o, d + 1);
+    if (auto* m = std::get_if<Pexp_match>(&p->desc)) {
+      if (!m->cases.empty()) exp_head(cx, *m->cases[0].rhs, o, d + 1);
+      return;
+    }
+    if (auto* si = std::get_if<Pexp_struct_item>(&p->desc))
+      return exp_head(cx, *si->body, o, d + 1);
+    std::size_t nargs = 0;
+    if (auto* a = std::get_if<Pexp_apply>(&p->desc)) {
+      nargs = a->args.size();
+      p = a->fn.get();
+    }
+    auto* i = std::get_if<Pexp_ident>(&p->desc);
+    std::vector<std::string> c;
+    if (!i || !lid_comps(i->id.txt, c)) return;
+    Vty v;
+    if (c.size() == 1) {
+      v = val_ty(cx, c[0], d + 1);
+    } else if (c.size() == 2) {
+      // A value of a PARAMETER, whose written signature says what it
+      // returns: `X.mk ()` is `X.t`.
+      const ModuleType* pt = nullptr;
+      for (auto& pr : cx.params)
+        if (pr.first == c[0]) pt = pr.second;
+      const Signature* sg = pt ? mty_sig(pt) : nullptr;
+      if (!sg) return;
+      const CoreType* ty = nullptr;
+      for (auto& it : *sg)
+        if (auto* vd = std::get_if<Psig_value>(&it.desc))
+          if (vd->vd.name.txt == c[1]) ty = vd->vd.type.get();
+      if (!ty) return;
+      for (int k = 0; k < 32; ++k) {
+        auto* ar = std::get_if<Ptyp_arrow>(&ty->desc);
+        if (!ar) break;
+        v.params.push_back(ar->dom.get());
+        ty = ar->cod.get();
+      }
+      auto* tc = std::get_if<Ptyp_constr>(&ty->desc);
+      std::vector<std::string> tp;
+      if (!tc || !lid_comps(tc->id.txt, tp) || tp.size() != 1) return;
+      v.px = c[0];
+      v.pu = tp[0];
+    } else {
+      return;
+    }
+    if (v.params.size() <= nargs) {
+      o.ret = v.ret;
+      o.own = v.own;
+      o.px = v.px;
+      o.pu = v.pu;
+    }
+  }
+  Vty val_ty(const Vctx& cx, const std::string& v, int d = 0) const {
+    Vty o;
+    const ValueBinding* b = str_val(*cx.st, v);
+    if (!b || d > 16) return o;
+    const Expression* e = b->expr.get();
+    if (auto* f = std::get_if<Pexp_function>(&e->desc)) {
+      for (auto& pm : f->params)
+        if (auto* pv = std::get_if<Pparam_val>(&pm.desc))
+          o.params.push_back(pat_ann(pv->pat));
+      if (f->constraint_)
+        if (auto* c = std::get_if<Pconstraint>(&*f->constraint_))
+          o.ret = c->type.get();
+      if (!o.ret) {
+        if (auto* fb = std::get_if<Pfunction_body>(&f->body->v))
+          exp_head(cx, *fb->e, o, d + 1);
+        else if (auto* fc = std::get_if<Pfunction_cases>(&f->body->v)) {
+          o.params.push_back(nullptr);
+          if (!fc->cases.empty()) exp_head(cx, *fc->cases[0].rhs, o, d + 1);
+        }
+      }
+    } else if (const CoreType* an = pat_ann(b->pat)) {
+      o.ret = an;
+    } else {
+      exp_head(cx, *e, o, d + 1);
+    }
+    // A written type: its arrows are parameters, its end the result.
+    if (o.ret) {
+      const CoreType* r = o.ret;
+      for (int i = 0; i < 32; ++i) {
+        auto* ar = std::get_if<Ptyp_arrow>(&r->desc);
+        if (!ar) break;
+        o.params.push_back(ar->dom.get());
+        r = ar->cod.get();
+      }
+      o.ret = r;
+    }
+    return o;
+  }
+  // What expanding the type `ty` names inside the result of `a` costs: the
+  // structure's own type `t` is `<a>.t`; a parameter's `X.u` is the
+  // argument's.
+  long long appexp_head(const Ap& a, const Sub& sub, const Vctx& cx,
+                        const CoreType* ty, const std::string& own,
+                        const std::string& px, const std::string& pu) {
+    std::string t = own, x = px, u = pu;
+    if (ty) {
+      auto* c = std::get_if<Ptyp_constr>(&ty->desc);
+      std::vector<std::string> pc;
+      if (!c || !lid_comps(c->id.txt, pc)) return 0;
+      if (pc.size() == 1) t = pc[0];
+      else if (pc.size() == 2) { x = pc[0]; u = pc[1]; }
+      else return 0;
+    }
+    if (!t.empty()) return ap_mani(a, sub, t);
+    auto it = x.empty() ? cx.env.end() : cx.env.find(x);
+    return it == cx.env.end() ? 0 : ap_expand(*it->second, Sub{}, u);
+  }
+  // The structure the application evaluates to, under the functor's
+  // parameters.  A body that is an application is read at the functor it
+  // applies, whose parameters are the ones in scope there.
+  bool ap_ctx(const Ap& a, const Sub& sub, Vctx& cx) const {
+    cx.aps.push_back(a);
+    for (int i = 0; i < 8; ++i) {
+      const Ap& cur = cx.aps.back();
+      cx.params.clear();
+      cx.env.clear();
+      const ModuleExpr* b = cur.f;
+      for (std::size_t j = 0; b && j < cur.args.size(); ++j) {
+        auto* fn = std::get_if<Pmod_functor>(&b->desc);
+        if (!fn) return false;
+        if (auto* nm = std::get_if<Functor_named>(&fn->param))
+          if (nm->name.txt && nm->type) {
+            cx.params.emplace_back(*nm->name.txt, &*nm->type);
+            cx.env[*nm->name.txt] = &cur.args[j];
+          }
+        b = fn->body.get();
+      }
+      b = b ? mderef(b) : nullptr;
+      if (!b) return false;
+      if (std::holds_alternative<Pmod_structure>(b->desc)) {
+        for (auto& nm : sub) {
+          b = b ? msub(*b, nm) : nullptr;
+          if (!b || !std::holds_alternative<Pmod_structure>(b->desc))
+            return false;
+        }
+        cx.st = &std::get<Pmod_structure>(b->desc);
+        return true;
+      }
+      Ap in;
+      if (!std::holds_alternative<Pmod_apply>(b->desc) || !ap_inner(cur, in))
+        return false;
+      cx.aps.push_back(std::move(in));
+    }
+    return false;
+  }
+  // A value `M.v` of such a module, applied to `nargs` arguments
+  // (`inferred` says which of them are): the result is expanded whatever
+  // the number, an argument's expected type where it is inferred.
+  long long appexp_val(const Longident& id, std::size_t nargs,
+                       const std::vector<bool>& inferred) {
+    std::vector<std::string> c;
+    if (!lid_comps(id, c) || c.size() < 2) return 0;
+    std::string v = c.back();
+    c.pop_back();
+    Ap a;
+    Sub sub;
+    Vctx cx;
+    if (!ap_bound(c, a, sub) || !ap_ctx(a, sub, cx)) return 0;
+    Vty vt = val_ty(cx, v);
+    long long k = 0;
+    if (nargs > 0 || vt.params.empty())
+      k += appexp_head(a, sub, cx, vt.ret, vt.own, vt.px, vt.pu);
+    for (std::size_t j = 0; j < nargs && j < vt.params.size(); ++j)
+      if (vt.params[j] && j < inferred.size() && inferred[j])
+        k += appexp_head(a, sub, cx, vt.params[j], "", "", "");
+    return k;
+  }
+  // A record or a constructor written with a QUALIFIED label is
+  // disambiguated against the expected type (`disambiguate_by_type`,
+  // typecore.ml:1541), whose path `expand_path` (:1461) follows -- an
+  // unqualified one has no candidate in scope to compare.
+  static bool qual_data(const Expression& e) {
+    const Expression* p = Cites::bare_exp(e);
+    if (auto* r = std::get_if<Pexp_record>(&p->desc))
+      return !r->fields.empty() &&
+             std::holds_alternative<Ldot>(r->fields[0].first.txt.v);
+    if (auto* c = std::get_if<Pexp_construct>(&p->desc))
+      return std::holds_alternative<Ldot>(c->id.txt.v);
+    return false;
+  }
+  static bool expands(const Expression& e) {
+    return Cites::is_inferred(e) || qual_data(e);
+  }
+  // An application of a function.
+  long long appexp_app(const Pexp_apply& ap) {
+    if (appexp_off()) return 0;
+    long long k = 0;
+    auto* i = std::get_if<Pexp_ident>(&ap.fn->desc);
+    if (i && lid_last(i->id.txt) == "ignore" && ap.args.size() == 1)
+      k += appexp_pos(*ap.args[0].second);
+    if (!i) return k;
+    std::vector<bool> inf;
+    for (auto& ar : ap.args) inf.push_back(expands(*ar.second));
+    return k + appexp_val(i->id.txt, ap.args.size(), inf);
+  }
+  // A record or a constructor written with a qualified label is of the
+  // type that declares the label in that module.
+  long long appexp_data(const Longident& id, bool label) {
+    std::vector<std::string> c;
+    if (!lid_comps(id, c) || c.size() < 2) return 0;
+    std::string nm = c.back();
+    c.pop_back();
+    Ap a;
+    Sub sub;
+    Vctx cx;
+    if (!ap_bound(c, a, sub) || !ap_ctx(a, sub, cx)) return 0;
+    std::string t = str_owner(*cx.st, nm, label);
+    return t.empty() ? 0 : ap_mani(a, sub, t);
+  }
+  // An expression standing where ocamlc expands its type.
+  long long appexp_pos(const Expression& e) {
+    if (appexp_off()) return 0;
+    const Expression* p = Cites::bare_exp(e);
+    if (auto* r = std::get_if<Pexp_record>(&p->desc))
+      return r->fields.empty() ? 0 : appexp_data(r->fields[0].first.txt, true);
+    if (auto* k = std::get_if<Pexp_construct>(&p->desc))
+      return appexp_data(k->id.txt, false);
+    auto* i = std::get_if<Pexp_ident>(&p->desc);
+    if (!i) return 0;
+    std::vector<std::string> c;
+    if (!lid_comps(i->id.txt, c)) return 0;
+    if (c.size() == 1) {
+      auto it = vann_.find(c[0]);
+      return it != vann_.end() && it->second ? appexp_ty(*it->second) : 0;
+    }
+    return appexp_val(i->id.txt, 0, {});
+  }
+  // An expression constrained to a written type.
+  long long appexp_con(const Expression& e, const CoreType& ty) {
+    if (appexp_off() || !expands(e)) return 0;
+    return appexp_ty(ty);
   }
   long long inc_items(const ModuleExpr& m, const Lvl& l) {
     bool dotted = false;
@@ -31683,7 +32342,13 @@ struct Count {
         if (m->binding.name.txt) mdiscpre_ += *m->binding.name.txt + ".";
       }
       ascr_sig_ = nullptr;
-      mexpr(m->binding.expr, ml);
+      // What an ascription ABOVE saves is its own signature: a LOCAL
+      // functor's application bound under one leaves no strengthened
+      // manifest in the saved signature for the compunit check to expand,
+      // so `app_charge`'s rebuild lumps are not owed there (S509).  A
+      // cross-unit one is `cross_charge`'s, measured with them.
+      mexpr(m->binding.expr, ml,
+            appexp_off() || saved_ || !local_app(m->binding.expr));
       ascr_sig_ = asv;
       mdiscard_ = dsv;
       mdisctop_ = dtv;
