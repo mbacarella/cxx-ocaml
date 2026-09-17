@@ -29380,14 +29380,27 @@ struct Count {
         if (const ModuleType* d = par_mty(ds, l->name)) return mty_sig(d);
     return mty_sig(&t);
   }
+  // What a parameter's written type is renamed as: a signature's items,
+  // and a `with` over a NAME is the signature it merges written out
+  // (`transl_modtype` builds it, and `Functor_comps` and the force rename
+  // it as one written in full, `par_items`), where a bare name is left a
+  // path.
+  long long par_ren(const ModuleType& pt) const {
+    if (std::holds_alternative<Pmty_signature>(pt.desc)) return ren_mty(pt);
+    if (ltchk_off()) return 0;
+    return mty_lit(pt) ? ren_mty(pt) : par_items(pt);
+  }
   // Every submodule `sg` declares that the path `pm` names is expanded.
   long long alias_exp(const ModuleExpr& pm, const Signature* sg,
                       const std::set<std::string>* skip = nullptr) {
-    if (!sg || lfun_off()) return 0;
     auto* pi = std::get_if<Pmod_ident>(&pm.desc);
-    if (!pi) return 0;
+    return pi ? alias_exp(pi->id.txt, sg, skip) : 0;
+  }
+  long long alias_exp(const Longident& pid, const Signature* sg,
+                      const std::set<std::string>* skip = nullptr) {
+    if (!sg || lfun_off()) return 0;
     bool sub = false;
-    const ModuleExpr* t = lal_res(pi->id.txt, sub);
+    const ModuleExpr* t = lal_res(pid, sub);
     if (!t) return 0;
     long long k = 0;
     for (auto& it : *sg)
@@ -29464,6 +29477,10 @@ struct Count {
     const ModuleType* fty = nullptr;
     const bool res = lpath(pi->id.txt, f, fty, ds, sub);
     const ModuleExpr* home = lhome_;
+    // The parents' module types, for a parameter's `with` over one.
+    TScope ts{*this, tmark()};
+    if (res && !ltchk_off())
+      for (auto& d : ds) tbind(d.first, d.second);
     long long k = 0;
     for (const ModuleExpr* a : args)
       if (auto* ai = std::get_if<Pmod_ident>(&a->desc)) {
@@ -29498,8 +29515,7 @@ struct Count {
               if (nm->name.txt) fps.emplace_back(*nm->name.txt, pt);
             }
           params.push_back(pt);
-          if (pt && std::holds_alternative<Pmty_signature>(pt->desc))
-            force += ren_mty(*pt);
+          if (pt) force += par_ren(*pt);
           e = fn->body.get();
           continue;
         }
@@ -29523,8 +29539,7 @@ struct Count {
         if (auto* nm = std::get_if<Functor_named>(&fn->param))
           if (nm->type) pt = &*nm->type;
         params.push_back(pt);
-        if (pt && std::holds_alternative<Pmty_signature>(pt->desc))
-          force += ren_mty(*pt);
+        if (pt) force += par_ren(*pt);
         mt = fn->body.get();
         continue;
       }
@@ -29716,9 +29731,7 @@ struct Count {
       if (!fn) break;
       if (j >= from)
         if (auto* nm = std::get_if<Functor_named>(&fn->param))
-          if (nm->type &&
-              std::holds_alternative<Pmty_signature>(nm->type->desc))
-            k += ren_mty(*nm->type);
+          if (nm->type) k += par_ren(*nm->type);
       if (!ltapp_off()) k += par_uses(*fn);
       f = fn->body.get();
     }
@@ -29955,6 +29968,53 @@ struct Count {
     }
     return true;
   }
+  // ---- THE APPLICATION IN A TYPE PATH IS CHECKED AS ONE WRITTEN OUT ----
+  // `lookup_apply` checks every argument against its parameter
+  // (`check_functor_application_in_path`, env.ml:3043) with the
+  // `Includemod.modtypes` an applied module expression runs, so the two
+  // forces `lfun_cost` charges there are owed here as well, once per file
+  // between them: a parameter written as a NAME a parent of the functor
+  // declares is expanded (includemod.ml:302; the declaration's items at
+  // every depth, `name_force`), and every submodule the parameter's
+  // signature declares is forced WHOLE out of the argument
+  // (includemod.ml:309, `alias_exp`) -- for a top-level functor too.
+  // `X.F (DUMMY).t` with `SIG` and `F` in `X` read P short of `F (DUMMY).t`
+  // with them at top level, where `Y : X.SIG` at top level had paid it at
+  // the definition (`scrape_for_functor_arg`) and `module N = X.F (DUMMY)`
+  // before the type paid it in `lfun_cost`.  `NOLTCHK=1` reverts.
+  static bool ltchk_off() {
+    static const bool off = dbg_env("NOLTCHK") != nullptr;
+    return off;
+  }
+  // The module types the functor's parents declare are left bound for the
+  // caller's `ap_build` (its `TScope`), as `lfun_head` binds them.
+  long long ap_check(const Longident& id) {
+    if (ltchk_off()) return 0;
+    std::vector<const Longident*> as;
+    const Longident* h = &id;
+    while (auto* a = std::get_if<Lapply>(&h->v)) {
+      as.push_back(a->x.get());
+      h = a->f.get();
+    }
+    bool sub = false;
+    Mtds ds;
+    const ModuleExpr* f = nullptr;
+    const ModuleType* fty = nullptr;
+    if (!lpath(*h, f, fty, ds, sub) || !f) return 0;
+    for (auto& d : ds) tbind(d.first, d.second);
+    long long k = 0;
+    for (auto a = as.rbegin(); a != as.rend() && f; ++a) {
+      auto* fn = std::get_if<Pmod_functor>(&f->desc);
+      if (!fn) break;
+      if (auto* nm = std::get_if<Functor_named>(&fn->param))
+        if (nm->type) {
+          if (sub) k += name_force(*nm->type, ds);
+          k += alias_exp(**a, par_sig(*nm->type, ds));
+        }
+      f = fn->body.get();
+    }
+    return k;
+  }
   long long ltapp_charge(const Longident& id, bool manifest) {
     if (ltapp_off()) return 0;
     auto* top = std::get_if<Ldot>(&id.v);
@@ -29967,7 +30027,8 @@ struct Count {
     }
     Ap a;
     if (!std::holds_alternative<Lapply>(q->v) || !ap_of_lid(*q, a)) return 0;
-    long long k = ap_build(a, false);
+    TScope ts{*this, tmark()};
+    long long k = ap_check(*q) + ap_build(a, false);
     if (manifest && saved_ && !inexpr_) {
       std::swap(fcomps_, cfcomps_);
       std::swap(acomps_, cacomps_);
@@ -32230,7 +32291,7 @@ struct Count {
   // argument brings, and a member declared at a module type the parameter
   // leaves ABSTRACT is only as big as the argument's own declaration of it.
   long long alias_wt(const ModuleType& pt, const ModuleExpr& arg,
-                     const std::string& nm) const {
+                     const std::string& nm) {
     const Lvl al{1, 1, 0, false};
     const Signature* sg = mty_sig(&pt);
     if (!sg) return 0;
@@ -32247,7 +32308,10 @@ struct Count {
         }
     if (!abst) ms = mty_sig(mm);
     if (!ms) return 0;
-    long long k = wt_mexpr(*am, al);
+    // The member is forced WHOLE out of the argument (includemod.ml:309),
+    // flat, and once per file: the force `alias_exp` charges the argument's
+    // check, whichever of the two meets it first.
+    long long k = ltchk_off() ? wt_mexpr(*am, al) : full_force(am);
     for (auto& it : *ms) k += wt_sig_item(it, al);
     return k;
   }
