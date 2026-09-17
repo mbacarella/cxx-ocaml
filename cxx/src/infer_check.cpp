@@ -20616,6 +20616,12 @@ bool readdecl_off() {
   static const bool off = dbg_env("NOREADDECL") != nullptr;
   return off;
 }
+// S522: every `inherit` enters the parent's instance variables again.
+// `NOINHVAR=1` reverts the slice.
+bool inhvar_off() {
+  static const bool off = dbg_env("NOINHVAR") != nullptr;
+  return off;
+}
 bool tofp_off() {
   static const bool off = dbg_env("NOTOFPATH") != nullptr;
   return off;
@@ -24883,13 +24889,16 @@ struct Count {
     return 0;
   }
   // ---- what an `inherit` BRINGS IN ---------------------------------------
-  // `class_field`'s `Pcf_inherit` arm walks the parent's class signature:
-  // every instance VARIABLE of it goes through `enter_val`, exactly as a `val`
-  // written here does and with the same dedup by name, and every CONCRETE
-  // method gets an `Ident.create_local` of its own -- once per `inherit`,
-  // whether or not the class already has a method of that name.  The parent's
-  // methods, virtual ones included, are methods of this class too, so
-  // `class_structure` names them along with the rest.
+  // `class_field`'s `Pcf_inherit` arm (typeclass.ml:643) folds over EVERY
+  // instance variable of the parent's signature, virtual or not, entering it
+  // unbound in the value and the parent environment and naming it once more
+  // -- three apiece, once per `inherit`, with no dedup against the variables
+  // the class already holds (a `val` written here is deduped, an inherited
+  // one is not: `inherit a inherit a` pays a's variables twice, S522) --
+  // and every CONCRETE method gets an `Ident.create_local` of its own,
+  // whether or not the class already has a method of that name.  The
+  // parent's methods, virtual ones included, are methods of this class too,
+  // so `class_structure` names them along with the rest.
   struct Inh {
     std::set<std::string> concr, meths, vars;
     bool ok = true;
@@ -29024,8 +29033,11 @@ struct Count {
       Inh o;
       if (!inh_off()) inh_of(*i->ce, o);
       if (o.ok) {
-        for (auto& v : o.vars)
-          if (vals.insert(v).second) { n += 3; bind(v); }
+        for (auto& v : o.vars) {
+          bool fresh = vals.insert(v).second;
+          if (fresh || !inhvar_off()) n += 3;
+          if (fresh) bind(v);
+        }
         for (auto& m : o.meths) meths.insert(m);
         n += (long long)o.concr.size();
       }
