@@ -20609,6 +20609,13 @@ bool parfun_off() {
   static const bool off = dbg_env("NOPARFUN") != nullptr;
   return off;
 }
+// S521: a class inherited through a module PATH, a read through a module
+// bound at a DOTTED module type name, and an include's rebind of a pathless
+// application.  `NOREADDECL=1` reverts the whole slice.
+bool readdecl_off() {
+  static const bool off = dbg_env("NOREADDECL") != nullptr;
+  return off;
+}
 bool tofp_off() {
   static const bool off = dbg_env("NOTOFPATH") != nullptr;
   return off;
@@ -24949,6 +24956,9 @@ struct Count {
           inh_ct(*t->second.back(), o, d + 1);
           return;
         }
+      } else if (!readdecl_off()) {
+        inh_dot(id->id.txt, o, d + 1);
+        return;
       }
     }
     o.ok = false;
@@ -24984,9 +24994,130 @@ struct Count {
           inh_of(*c2->second.back(), o, d + 1);
           return;
         }
+      } else if (!readdecl_off()) {
+        inh_dot(id->id.txt, o, d + 1);
+        return;
       }
     }
     o.ok = false;
+  }
+  // ---- A PARENT NAMED THROUGH A MODULE PATH (S521) ------------------------
+  // `inherit M.a` and `inherit Basic.agent` bring in what the class declares
+  // exactly as a class of this structure does -- three per instance
+  // variable, two per concrete method, every method named once more -- and
+  // the walk above resolved a bare name alone, so a parent in a module of
+  // this file was charged nothing.  The module is read through this file's
+  // aliases, an application's functor body (`app_res`) and an `include` of
+  // either, and off the ascription's signature where the module has one: a
+  // class the ascription does not declare is hidden, and a class of another
+  // unit resolves to nothing, as before.
+  struct ClsRef {
+    const ClassExpr* ce = nullptr;
+    const ClassType* ct = nullptr;
+  };
+  // A module as the structure it is (`me`) or the signature it is ascribed
+  // or declared at (`mt`).
+  struct MNode {
+    const ModuleExpr* me = nullptr;
+    const ModuleType* mt = nullptr;
+  };
+  // Aliases and applications followed to the structure they stand for.
+  MNode inh_norm(MNode r, int d) const {
+    for (int i = 0; r.me && i < 8; ++i) {
+      if (auto* p = std::get_if<Pmod_ident>(&r.me->desc)) {
+        r = inh_path(p->id.txt, d + 1);
+        continue;
+      }
+      if (std::holds_alternative<Pmod_apply>(r.me->desc)) {
+        r.me = app_res(r.me);
+        continue;
+      }
+      if (auto* c = std::get_if<Pmod_constraint>(&r.me->desc))
+        return MNode{nullptr, c->mt.get()};
+      break;
+    }
+    return r;
+  }
+  MNode inh_path(const Longident& id, int d) const {
+    MNode r;
+    std::vector<std::string> c;
+    if (d > 8 || !lid_path(id, c) || c.empty()) return r;
+    r.me = mod_named(c[0]);
+    for (std::size_t j = 1; j < c.size() && (r.me || r.mt); ++j)
+      r = inh_member(r, c[j], d + 1);
+    return inh_norm(r, d + 1);
+  }
+  MNode inh_member(MNode r, const std::string& nm, int d) const {
+    MNode out;
+    if (d > 8) return out;
+    r = inh_norm(r, d);
+    if (r.me) {
+      if (auto* st = std::get_if<Pmod_structure>(&r.me->desc))
+        for (auto& it : st->items) {
+          if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
+            if (mb->binding.name.txt && *mb->binding.name.txt == nm)
+              out = MNode{&mb->binding.expr, nullptr};
+          } else if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
+            MNode x = inh_member(MNode{&i->expr, nullptr}, nm, d + 1);
+            if (x.me || x.mt) out = x;
+          }
+        }
+      return out;
+    }
+    if (const Signature* sg = mty_sig(r.mt))
+      for (auto& it : *sg) {
+        if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+          if (m->md.name.txt && *m->md.name.txt == nm)
+            out = MNode{nullptr, m->md.type.get()};
+        } else if (auto* i = std::get_if<Psig_include>(&it.desc)) {
+          MNode x = inh_member(MNode{nullptr, &i->mt}, nm, d + 1);
+          if (x.me || x.mt) out = x;
+        }
+      }
+    return out;
+  }
+  ClsRef inh_cls(MNode r, const std::string& nm, int d) const {
+    ClsRef out;
+    if (d > 8) return out;
+    r = inh_norm(r, d);
+    if (r.me) {
+      if (auto* st = std::get_if<Pmod_structure>(&r.me->desc))
+        for (auto& it : st->items) {
+          if (auto* c = std::get_if<Pstr_class>(&it.desc)) {
+            for (auto& dd : c->decls)
+              if (dd.name.txt == nm) out = ClsRef{&dd.expr, nullptr};
+          } else if (auto* c = std::get_if<Pstr_class_type>(&it.desc)) {
+            for (auto& dd : c->decls)
+              if (dd.name.txt == nm) out = ClsRef{nullptr, &dd.expr};
+          } else if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
+            ClsRef x = inh_cls(MNode{&i->expr, nullptr}, nm, d + 1);
+            if (x.ce || x.ct) out = x;
+          }
+        }
+      return out;
+    }
+    if (const Signature* sg = mty_sig(r.mt))
+      for (auto& it : *sg) {
+        if (auto* c = std::get_if<Psig_class>(&it.desc)) {
+          for (auto& dd : c->decls)
+            if (dd.name.txt == nm) out = ClsRef{nullptr, &dd.expr};
+        } else if (auto* c = std::get_if<Psig_class_type>(&it.desc)) {
+          for (auto& dd : c->decls)
+            if (dd.name.txt == nm) out = ClsRef{nullptr, &dd.expr};
+        } else if (auto* i = std::get_if<Psig_include>(&it.desc)) {
+          ClsRef x = inh_cls(MNode{nullptr, &i->mt}, nm, d + 1);
+          if (x.ce || x.ct) out = x;
+        }
+      }
+    return out;
+  }
+  void inh_dot(const Longident& id, Inh& o, int d) const {
+    auto* dt = std::get_if<Ldot>(&id.v);
+    if (!dt) { o.ok = false; return; }
+    ClsRef r = inh_cls(inh_path(*dt->prefix, d), dt->name, d);
+    if (r.ce) inh_of(*r.ce, o, d + 1);
+    else if (r.ct) inh_ct(*r.ct, o, d + 1);
+    else o.ok = false;
   }
   // The MODULE bindings of this file that are in scope, so a functor
   // application can find the functor it names.  Nothing outside the file can
@@ -25024,6 +25155,58 @@ struct Count {
   // `include X` inside it can be weighed.
   std::unordered_map<std::string, std::vector<const ModuleType*>> fmods;
   std::vector<std::string> fpnames;
+  // The modules a SIGNATURE being walked declares, at their written types,
+  // so that a read through one of them can be followed (S521).
+  std::unordered_map<std::string, std::vector<const ModuleType*>> smods;
+  std::vector<std::string> snames;
+  std::size_t smark() const { return snames.size(); }
+  void srelease(std::size_t m) {
+    while (snames.size() > m) {
+      auto it = smods.find(snames.back());
+      if (it != smods.end() && !it->second.empty()) it->second.pop_back();
+      snames.pop_back();
+    }
+  }
+  void sbind(const ModuleDeclaration& md) {
+    if (!md.name.txt) return;
+    smods[*md.name.txt].push_back(md.type.get());
+    snames.push_back(*md.name.txt);
+  }
+  // The modules an `open` of a path puts in scope, each with the path it
+  // is read through: `open Priority` then `N.s` reads `Priority.N.s`.
+  std::unordered_map<std::string, std::vector<std::vector<std::string>>>
+      sopens;
+  std::vector<std::string> sonames;
+  std::size_t somark() const { return sonames.size(); }
+  void sorelease(std::size_t m) {
+    while (sonames.size() > m) {
+      auto it = sopens.find(sonames.back());
+      if (it != sopens.end() && !it->second.empty()) it->second.pop_back();
+      sonames.pop_back();
+    }
+  }
+  long long sopen(const Longident& id) {
+    std::vector<std::string> c;
+    if (readdecl_off() || !lid_path(id, c) || c.empty()) return 0;
+    const ModuleType* t = nullptr;
+    long long k = read_force(c, c.size(), 0, &t);
+    const Signature* sg = mty_sig(t);
+    if (!sg) return k;
+    for (auto& it : *sg)
+      if (auto* m = std::get_if<Psig_module>(&it.desc))
+        if (m->md.name.txt) {
+          sopens[*m->md.name.txt].push_back(c);
+          sonames.push_back(*m->md.name.txt);
+        }
+    return k;
+  }
+  // `include S` declares S's modules here.
+  void sinclude(const ModuleType& mt) {
+    if (readdecl_off()) return;
+    if (const Signature* sg = mty_sig(&mt))
+      for (auto& it : *sg)
+        if (auto* m = std::get_if<Psig_module>(&it.desc)) sbind(m->md);
+  }
   std::size_t fmark() const { return fpnames.size(); }
   void frelease(std::size_t m) {
     while (fpnames.size() > m) {
@@ -25724,21 +25907,173 @@ struct Count {
   // The declarations already read, so that `X.Y.S` and an alias's `W.S`
   // share the one force, and a second use of either pays nothing.
   mutable std::set<const ModuleType*> dscraped;
-  long long dforce(const ModuleType& mt, int fuel = 8) const {
+  // ---- A READ THROUGH A MODULE AT A DOTTED NAME FORCES THE DECLARATION --
+  // (S521) `module Priority : Order.Total` leaves Priority at `Mty_ident
+  // Order.Total`, and the first read through it -- `Priority.t`, `open
+  // Priority`, a class type's `Priority.t` -- builds its components by
+  // scraping the name: the declaration is Order's LAZY copy, so its top
+  // items are renamed once (`prefix_idents`, env.ml:1770), and a submodule
+  // of it read through (`Priority.N.s`) forces its own lazy copy in turn.
+  // Once for the file per declaration and per submodule, shared with the
+  // deep force an ascription, a functor parameter, a `with` or an `include`
+  // of the name pays (`dforce`): what those paid first a read finds forced,
+  // and what a read paid first comes off their price.  A name declared at
+  // the top of the file is eager and costs nothing; a `with` over the path
+  // writes the declaration out where it stands, and its modules read as
+  // eager.  A functor parameter or an ascription at a NAME whose signature
+  // declares modules at dotted names is scraped whole (`remove_aliases`,
+  // mtype.ml:483; the check's `expand_modtype_path`), so every such
+  // declaration is forced deep at the binding: `dforce` recurses into the
+  // signature a name stands for.
+  mutable std::map<const ModuleType*, long long> dpaid_;
+  mutable std::map<const ModuleType*, std::set<std::string>> dtops_;
+  // `deep` is the scrape: an include of the name and a package type only
+  // force the declaration itself (`force_modtype` expands no path inside).
+  long long dforce(const ModuleType& mt, int fuel = 8,
+                   bool deep = true) const {
     if (dmty_off() || fuel <= 0) return 0;
     if (auto* w = std::get_if<Pmty_with>(&mt.desc))
-      return w->mt ? dforce(*w->mt, fuel - 1) : 0;
+      return w->mt ? dforce(*w->mt, fuel - 1, deep) : 0;
+    if (deep && !readdecl_off())
+      if (auto* s = std::get_if<Pmty_signature>(&mt.desc))
+        return dforce_sig(s->items, fuel - 1);
     auto* id = std::get_if<Pmty_ident>(&mt.desc);
     if (!id) return 0;
     // A bare name is read where it stands and costs nothing of its own;
     // what it was declared to be may still be a path.
     if (std::holds_alternative<Lident>(id->id.txt.v)) {
       const ModuleType* d = named_mty(id->id.txt, fuel);
-      return d ? dforce(*d, fuel - 1) : 0;
+      return d ? dforce(*d, fuel - 1, deep) : 0;
     }
     const ModuleType* d = dotted_mty(id->id.txt, fuel);
     if (!d || !dscraped.insert(d).second) return 0;
-    return ren_mty(*d);
+    long long k = ren_mty(*d);
+    if (readdecl_off()) return k;
+    auto p = dpaid_.find(d);
+    if (p != dpaid_.end()) k -= p->second;
+    if (deep)
+      if (const Signature* sg = mty_sig(d)) k += dforce_sig(*sg, fuel - 1);
+    return k;
+  }
+  long long dforce_sig(const Signature& s, int fuel) const {
+    long long k = 0;
+    for (auto& it : s) {
+      if (auto* m = std::get_if<Psig_module>(&it.desc))
+        k += dforce(*m->md.type, fuel);
+      else if (auto* m = std::get_if<Psig_recmodule>(&it.desc))
+        for (auto& d : m->decls) k += dforce(*d.type, fuel);
+      else if (auto* i = std::get_if<Psig_include>(&it.desc))
+        k += dforce(i->mt, fuel);
+    }
+    return k;
+  }
+  // The top items of the declaration `d` (`path` empty), or of the
+  // submodule of it at `path`, whose type is `at`.
+  long long dtop_force(const ModuleType& d, const std::string& path,
+                       const ModuleType& at) const {
+    if (dscraped.count(&d) || !dtops_[&d].insert(path).second) return 0;
+    long long k = mt_top(at);
+    dpaid_[&d] += k;
+    return k;
+  }
+  // The module a name in scope is declared at: the signature being walked
+  // first, then a functor parameter, then a structure binding -- its
+  // ascription, or the alias it is.
+  const ModuleType* head_mty(const std::string& nm,
+                             const ModuleExpr** alias) const {
+    if (auto it = smods.find(nm); it != smods.end() && !it->second.empty())
+      return it->second.back();
+    if (auto it = fmods.find(nm); it != fmods.end() && !it->second.empty())
+      return it->second.back();
+    if (const ModuleExpr* me = mod_named(nm)) {
+      if (auto* c = std::get_if<Pmod_constraint>(&me->desc))
+        return c->mt.get();
+      if (std::holds_alternative<Pmod_ident>(me->desc)) *alias = me;
+    }
+    return nullptr;
+  }
+  // The module `nm` a signature declares, an included one too.
+  const ModuleType* sig_mod_inc(const Signature& sg, const std::string& nm,
+                                int d = 0) const {
+    if (d > 8) return nullptr;
+    const ModuleType* r = nullptr;
+    for (auto& it : sg) {
+      if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+        if (m->md.name.txt && *m->md.name.txt == nm) r = m->md.type.get();
+      } else if (auto* m = std::get_if<Psig_recmodule>(&it.desc)) {
+        for (auto& dd : m->decls)
+          if (dd.name.txt && *dd.name.txt == nm) r = dd.type.get();
+      } else if (auto* i = std::get_if<Psig_include>(&it.desc)) {
+        if (const Signature* s2 = mty_sig(&i->mt))
+          if (const ModuleType* x = sig_mod_inc(*s2, nm, d + 1)) r = x;
+      }
+    }
+    return r;
+  }
+  // A read of `c[0].c[1]...`, the first `nm` of them modules: each module on
+  // the way at a dotted name forces that declaration's top, and each
+  // submodule of such a declaration read through forces its own.
+  long long read_force(std::vector<std::string> c, std::size_t nm, int d = 0,
+                       const ModuleType** at = nullptr) const {
+    if (readdecl_off() || d > 8 || nm == 0 || c.empty()) return 0;
+    const ModuleExpr* alias = nullptr;
+    const ModuleType* t = head_mty(c[0], &alias);
+    if (!t && !alias)
+      if (auto it = sopens.find(c[0]);
+          it != sopens.end() && !it->second.empty()) {
+        std::vector<std::string> a = it->second.back();
+        a.insert(a.end(), c.begin(), c.end());
+        return read_force(a, a.size() - (c.size() - nm), d + 1, at);
+      }
+    long long k = 0;
+    const ModuleType* lazy = nullptr;
+    std::string path;
+    for (std::size_t j = 0; j < nm; ++j) {
+      if (j) {
+        const Signature* sg = mty_sig(t);
+        t = sg ? sig_mod_inc(*sg, c[j]) : nullptr;
+        path += (path.empty() ? "" : ".") + c[j];
+      }
+      std::vector<std::string> a;
+      if (alias) {
+        auto* p = std::get_if<Pmod_ident>(&alias->desc);
+        if (!p || !lid_path(p->id.txt, a)) return k;
+      } else if (t) {
+        if (auto* al = std::get_if<Pmty_alias>(&t->desc))
+          if (!lid_path(al->id.txt, a)) return k;
+      }
+      if (!a.empty()) {  // `module Q = Priority`: the target's components
+        a.insert(a.end(), c.begin() + j + 1, c.end());
+        return k + read_force(a, a.size() - (c.size() - nm), d + 1, at);
+      }
+      if (!t) return k;
+      if (at) *at = t;
+      if (auto* id = std::get_if<Pmty_ident>(&t->desc)) {
+        if (std::holds_alternative<Lident>(id->id.txt.v)) {
+          lazy = nullptr;
+          continue;
+        }
+        const ModuleType* dd = dotted_mty(id->id.txt, 8);
+        if (!dd) return k;  // another unit's: S450's business
+        lazy = dd;
+        path.clear();
+        k += dtop_force(*dd, "", *dd);
+        t = dd;
+        if (at) *at = t;
+      } else if (std::holds_alternative<Pmty_signature>(t->desc)) {
+        if (lazy && j) k += dtop_force(*lazy, path, *t);
+      } else if (std::holds_alternative<Pmty_with>(t->desc)) {
+        lazy = nullptr;
+      } else {
+        return k;
+      }
+    }
+    return k;
+  }
+  long long read_lid(const Longident& id, bool mods_only) const {
+    std::vector<std::string> c;
+    if (readdecl_off() || !lid_path(id, c)) return 0;
+    return read_force(c, mods_only ? c.size() : c.size() - 1);
   }
   // The pieces of ONE constraint: the path it names, whether it removes the
   // item, and the declaration a `with type` gives.
@@ -28748,6 +29083,7 @@ struct Count {
     } else if (auto* o = std::get_if<Pcl_open>(&c.desc)) {
       cexpr(*o->body);
     } else if (auto* k = std::get_if<Pcl_constr>(&c.desc)) {
+      n += read_lid(k->id.txt, false);
       for (auto& a : k->args) ann_app(*a);
     }
   }
@@ -33087,7 +33423,8 @@ struct Count {
   long long pk_force(const Longident& id) const {
     if (!dmty_off()) {
       if (std::holds_alternative<Lident>(id.v)) {
-        if (const ModuleType* d = named_mty(id, 8)) return dforce(*d, 7);
+        if (const ModuleType* d = named_mty(id, 8))
+          return dforce(*d, 7, false);
       } else if (const ModuleType* d = dotted_mty(id, 8)) {
         return dscraped.insert(d).second ? ren_mty(*d) : 0;
       }
@@ -34229,11 +34566,13 @@ struct Count {
     if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
       n += (xonly ? 0 : lapp_path(c->id.txt)) +
            xtapp_charge(c->id.txt, inst != 0 || !c->args.empty()) +
-           ltapp_charge(c->id.txt, inst == 2 && d == 0);
+           ltapp_charge(c->id.txt, inst == 2 && d == 0) +
+           read_lid(c->id.txt, false);
       for (auto& a : c->args) ty_app(*a, d + 1, xonly, sub);
     } else if (auto* c = std::get_if<Ptyp_class>(&t.desc)) {
       n += (xonly ? 0 : lapp_path(c->id.txt)) +
-           xtapp_charge(c->id.txt, inst != 0 || !c->args.empty());
+           xtapp_charge(c->id.txt, inst != 0 || !c->args.empty()) +
+           read_lid(c->id.txt, false);
       for (auto& a : c->args) ty_app(*a, d + 1, xonly, sub);
     } else if (auto* a = std::get_if<Ptyp_arrow>(&t.desc)) {
       ty_app(*a->dom, d + 1, xonly, sub);
@@ -34305,6 +34644,7 @@ struct Count {
     } else if (auto* o = std::get_if<Pcty_open>(&t.desc)) {
       cty_app(*o->body, d + 1);
     } else if (auto* c = std::get_if<Pcty_constr>(&t.desc)) {
+      n += read_lid(c->id.txt, false);
       for (auto& a : c->args) ann_app(*a);
     }
   }
@@ -34421,7 +34761,11 @@ struct Count {
     // The rebuild is `type_one_application`'s and is owed whether the
     // result is saved or not: an ascribed `module N : S = F (struct .. end)`
     // and a `let module` pay it the same (S515).
-    if (pathless && (saved || !ltapp_off()) && !pbody) {
+    // An include's rebind is `Env.enter_signature`'s one substitution of
+    // the result the application left: the rebuild was paid at the
+    // application (S521; z27 +1, z2 +2 per nested level before).
+    if (pathless && (saved || !ltapp_off()) && !pbody &&
+        !(rebind && !readdecl_off())) {
       k += me ? ext_mexpr(*me, Ext{}) : ext_mty(*mt, Ext{});
       if (me && !ltapp_off()) k += ext_inc(*me, Ext{}, fps);
     }
@@ -34980,6 +35324,8 @@ struct Count {
   std::set<std::string>* vseen_ = nullptr;
   void sig_items(const Signature& s, const Lvl& l) {
     auto tk = tmark();
+    auto sk = smark();
+    auto ok = somark();
     std::set<std::string> vs;
     std::set<std::string>* vsv = vseen_;
     vseen_ = &vs;
@@ -35003,6 +35349,8 @@ struct Count {
       tof_all_ = sa;
     }
     vseen_ = vsv;
+    sorelease(ok);
+    srelease(sk);
     trelease(tk);
   }
   void sig_item(const SignatureItem& it, const Lvl& l) {
@@ -35067,7 +35415,12 @@ struct Count {
         n += pfun_checks(l) * pfun_mty_params(*m->md.type);
       mty(*m->md.type, sub(l));
       if (fxp) fxpath_.pop_back();
+      // `module Q = Priority.N` looks the path up: Priority's components.
+      if (auto* al = std::get_if<Pmty_alias>(&m->md.type->desc))
+        n += read_lid(al->id.txt, false);
+      sbind(m->md);
     } else if (auto* m = std::get_if<Psig_recmodule>(&it.desc)) {
+      for (auto& d : m->decls) sbind(d);
       for (auto& d : m->decls) { n += per; mty(*d.type, sub(l)); }
       n += recmodule_sig_extra(*m);
     } else if (auto* m = std::get_if<Psig_modtype>(&it.desc)) {
@@ -35091,6 +35444,10 @@ struct Count {
     // through (`mty_sig`), a nested include of another name inside it is
     // not (`wt_mty` reads the parsetree).
     } else if (auto* i = std::get_if<Psig_include>(&it.desc)) {
+      // An include of a dotted name scrapes it: the declaration forced
+      // deep, once for the file (S521).
+      if (!readdecl_off()) n += dforce(i->mt, 8, false);
+      sinclude(i->mt);
       if (depth_off()) {
         mty(i->mt, Lvl{1, l.u, l.depth + 1, l.root});
         n += per * sig_exports(i->mt);
@@ -35116,6 +35473,8 @@ struct Count {
       if (!cls_off())
         n += (3 + 2 * (per - 1)) * (long long)c->decls.size();
       for (auto& d : c->decls) cty_app(d.expr);
+    } else if (auto* o = std::get_if<Psig_open>(&it.desc)) {
+      n += sopen(o->id.txt);
     }
   }
 
@@ -35273,6 +35632,8 @@ struct Count {
       // `open M` of a path enters no signature and pays neither.
       bool gen =
           !gopen_off() && !std::holds_alternative<Pmod_ident>(o->expr.desc);
+      if (auto* oi = std::get_if<Pmod_ident>(&o->expr.desc))
+        n += read_lid(oi->id.txt, true);
       mexpr(o->expr, gen ? flat() : Lvl{1, 1, 0, true}, false);
       reg_open(o->expr);
       popen_reg(o->expr);

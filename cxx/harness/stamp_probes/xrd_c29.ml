@@ -1,0 +1,10 @@
+module Order = struct
+    module type Total = sig
+        type t
+        val compare: t -> t -> int
+        module N : sig type s val x : s end
+    end
+end
+
+module N = struct module type P = sig module Priority: Order.Total end end
+module F (X : N.P) = struct end
