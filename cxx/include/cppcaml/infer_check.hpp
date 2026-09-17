@@ -234,11 +234,15 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
 // is how many argument sites the value-kinds pass eta-expanded for an erased
 // optional argument (translate_implementation's out-parameter).
 int typing_ident_count(const ast::Structure& s, std::size_t eta_sites = 0,
-                       long long pkg_sig = 0);
+                       long long pkg_sig = 0,
+                       const std::set<std::string>* fexp = nullptr);
 // The idents the inferred-signature check allocates for the package types the
 // saved signature's values carry -- `pkg_sig` above, computed off the items
 // the .cmi writer is handed.
 long long package_sig_idents(const std::vector<cmi::cmiw::SigItem>& items);
+// The paths of the functors whose result names, in a type the check
+// compares, a parameterized type of its own -- `fexp` above.
+std::set<std::string> fexp_paths(const std::vector<cmi::cmiw::SigItem>& items);
 int typing_ident_count(const ast::Signature& s);
 
 // Build the .cmi signature from a hand-written interface (.mli).  Unlike

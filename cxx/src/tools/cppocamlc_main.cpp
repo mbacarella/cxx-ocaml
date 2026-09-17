@@ -237,6 +237,7 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
         // reverts to the flat 300).
       {
         auto sig = cppcaml::infer_signature(structure);
+        const std::set<std::string> fexp = cppcaml::fexp_paths(sig);
         cppcaml::cmi::cmiw::write_cmi(
             cmi_path.string(), mod, sig, {},
             /*intf=*/false,
@@ -246,7 +247,7 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
                 ? 300
                 : 274 + cppcaml::typing_ident_count(
                             structure, eta_sites,
-                            cppcaml::package_sig_idents(sig)));
+                            cppcaml::package_sig_idents(sig), &fexp));
       }
     } catch (const std::exception& e) {
       if (prof) std::cerr << "  (.cmi emission skipped: " << e.what() << ")\n";

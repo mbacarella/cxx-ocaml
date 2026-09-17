@@ -27082,6 +27082,7 @@ struct Count {
     }
   }
   void expr(const Expression& e) {
+    n += appexp_any(e);
     if (auto* a = std::get_if<Pexp_apply>(&e.desc)) {
       if (!pkmeet_off()) n += pk_app(*a);
       n += appexp_app(*a);
@@ -29140,13 +29141,31 @@ struct Count {
   long long res_items(const ModuleExpr* b) const {
     if (!b) return 0;
     if (std::holds_alternative<Pmod_structure>(b->desc))
-      return wt_mexpr(*b, flat());
+      return wt_mexpr(*b, flat()) + psigs(b);
     if (auto* c = std::get_if<Pmod_constraint>(&b->desc))
       return std::holds_alternative<Pmty_signature>(c->mt->desc)
                  ? ren_mty(*c->mt) : 0;
     if (std::holds_alternative<Pmod_apply>(b->desc))
       return res_items(app_res(b));
     return 0;
+  }
+  // The written signatures of the parameters of every functor NESTED in a
+  // structure, which `Subst` writes out with the functor's declaration and
+  // `wt_mexpr` does not count.
+  long long psigs(const ModuleExpr* b, int d = 0) const {
+    if (!b || d > 8 || fexp_off()) return 0;
+    long long k = 0;
+    if (auto* st = std::get_if<Pmod_structure>(&b->desc)) {
+      for (auto& it : st->items)
+        if (auto* mb = std::get_if<Pstr_module>(&it.desc))
+          k += psigs(&mb->binding.expr, d + 1);
+    } else if (auto* fn = std::get_if<Pmod_functor>(&b->desc)) {
+      if (auto* nm = std::get_if<Functor_named>(&fn->param))
+        if (nm->type && std::holds_alternative<Pmty_signature>(nm->type->desc))
+          k += ren_mty(*nm->type);
+      k += psigs(fn->body.get(), d + 1);
+    }
+    return k;
   }
   // The functor's type from its `from`-th parameter on: the parameters'
   // written signatures and the result (`lits`), and the named parameters
@@ -29186,8 +29205,13 @@ struct Count {
     for (std::size_t j = 0; j < i && j < a.args.size(); ++j)
       key += "(" + (norm ? a.args[j].nspell : a.args[j].spell) + ")";
     if (!acomps_.insert(key).second) return 0;
-    if (i < ps.size()) return 2 * lits(a.f, i) + ids(a.f, i);
-    return lits(a.f, i);
+    return i < ps.size() ? partial(a.f, i) : lits(a.f, i);
+  }
+  // A partial application's components: the functor type it leaves
+  // substituted (its parameters renamed) and then built as Functor_comps
+  // (the parameters after the next renamed again).
+  long long partial(const ModuleExpr* f, std::size_t i) const {
+    return 2 * lits(f, i) + ids(f, i) + (fexp_off() ? 0 : ids(f, i + 1));
   }
   // `find_structure_components` of the whole path, and what normalising it
   // builds: everything but the last application, inside every argument.
@@ -29482,7 +29506,13 @@ struct Count {
     const ValueBinding* b = str_val(*cx.st, v);
     if (!b || d > 16) return o;
     const Expression* e = b->expr.get();
-    if (auto* f = std::get_if<Pexp_function>(&e->desc)) {
+    const Pvc_constraint* vc =
+        b->constraint_ ? std::get_if<Pvc_constraint>(&*b->constraint_)
+                       : nullptr;
+    if (vc && vc->typ && !fexp_off()) {
+      // `let f : a -> b = ..`: the written type says, arrows and all.
+      o.ret = vc->typ.get();
+    } else if (auto* f = std::get_if<Pexp_function>(&e->desc)) {
       for (auto& pm : f->params)
         if (auto* pv = std::get_if<Pparam_val>(&pm.desc))
           o.params.push_back(pat_ann(pv->pat));
@@ -29654,10 +29684,194 @@ struct Count {
     }
     return appexp_val(i->id.txt, 0, {});
   }
+  // An expression whose type IS `<args> M.t` is expanded wherever it stands:
+  // `Ctype.unify` sends a `Tvar` meeting a `Tconstr` WITH ARGUMENTS to
+  // `unify2` (ctype.ml:3309), which expands both sides, and every `let y =
+  // M.x`, `f (M.A 1)`, `[M.x]` meets one.  A value whose type is an ARROW
+  // (`M.mk`) is not, nor is a constructor or a record of a type without
+  // parameters (`unify1_var`), nor a type with a public manifest, which is
+  // never strengthened.
+  bool own_poly(const Vctx& cx, const std::string& t) const {
+    for (auto& it : cx.st->items)
+      if (auto* ty = std::get_if<Pstr_type>(&it.desc))
+        for (auto& d : ty->decls)
+          if (d.name.txt == t)
+            return !d.params.empty() &&
+                   (!d.manifest || d.priv == PrivateFlag::Private);
+    return false;
+  }
+  long long appexp_any(const Expression& e) {
+    if (appexp_off() || fexp_off()) return 0;
+    const Longident* id = nullptr;
+    bool label = false, value = false;
+    if (auto* i = std::get_if<Pexp_ident>(&e.desc)) {
+      id = &i->id.txt;
+      value = true;
+    } else if (auto* k = std::get_if<Pexp_construct>(&e.desc)) {
+      id = &k->id.txt;
+    } else if (auto* r = std::get_if<Pexp_record>(&e.desc)) {
+      if (r->fields.empty()) return 0;
+      id = &r->fields[0].first.txt;
+      label = true;
+    } else {
+      return 0;
+    }
+    std::vector<std::string> c;
+    if (!lid_comps(*id, c) || c.size() < 2) return 0;
+    std::string nm = c.back();
+    c.pop_back();
+    Ap a;
+    Sub sub;
+    Vctx cx;
+    if (!ap_bound(c, a, sub) || !ap_ctx(a, sub, cx)) return 0;
+    std::string t;
+    if (value) {
+      Vty vt = val_ty(cx, nm);
+      if (!vt.params.empty()) return 0;
+      if (vt.ret) {
+        auto* tc = std::get_if<Ptyp_constr>(&vt.ret->desc);
+        std::vector<std::string> pc;
+        if (!tc || tc->args.empty() || !lid_comps(tc->id.txt, pc) ||
+            pc.size() != 1)
+          return 0;
+        t = pc[0];
+      } else {
+        t = vt.own;
+      }
+    } else {
+      t = str_owner(*cx.st, nm, label);
+    }
+    if (t.empty() || !own_poly(cx, t)) return 0;
+    return ap_mani(a, sub, t);
+  }
   // An expression constrained to a written type.
   long long appexp_con(const Expression& e, const CoreType& ty) {
     if (appexp_off() || !expands(e)) return 0;
     return appexp_ty(ty);
+  }
+  // ---- THE SIGNATURE CHECK EXPANDS A TYPE OF A FUNCTOR'S OWN RESULT ------
+  // `Includemod.compunit` checks the inferred signature against itself, and
+  // every module it pairs is STRENGTHENED (includemod.ml:697): a functor's
+  // declared type is strengthened at its own path, which, for a NAMED
+  // parameter, is the result strengthened at `F(X)` (mtype.ml:53) -- every
+  // type of it with no manifest (abstract, a variant, a record, a private
+  // abbreviation) gets one, `F(X).t`.  The check then compares the items of
+  // the two results with `Ctype.equal` (a manifest, a constructor's
+  // arguments and its GADT result, a record's labels, an extension's) and
+  // `Ctype.moregeneral` (a value), and both EXPAND every `Tconstr` carrying
+  // ARGUMENTS they meet (ctype.ml:5008, :4600; a nullary one is compared by
+  // path), so a result that NAMES one of its own PARAMETERIZED manifest-less
+  // types in any compared type -- `type 'a t = V : int t`, `type u = int t`,
+  // `let x = A 1` -- is `Env.find_type` on the `Papply`, and that builds, in
+  // the check's env, exactly what S509's read builds in the typing env: the
+  // functor's `Functor_comps` and the components of `F(X)` (the partial
+  // applications of a curried one on the way).  The functor's own lump is
+  // the one `app_charge` hangs on the first SAVED application (`lseen`),
+  // built once whichever comes first in signature order, so it is taken
+  // here and given back there.  A functor NESTED in the result (`F(X).G`) is
+  // reached through those components: its declaration is substituted on
+  // the way (one ident per NAMED parameter, the first included) before its
+  // own components are built; and reaching it builds the enclosing path
+  // whatever the enclosing result names.  A generative functor is not
+  // strengthened, a result written as a NAME is compared by path, and a type
+  // of the PARAMETER (`int X.w`) is the parameter's.  Whether a value's
+  // INFERRED type names such a type is read off the signature the writer
+  // emits (`fexp_paths`, at the end of this file), by the functor's path.
+  // `NOFEXP=1` reverts.
+  static bool fexp_off() {
+    static const bool off = dbg_env("NOFEXP") != nullptr;
+    return off;
+  }
+  const std::set<std::string>* fexp_ = nullptr;  // the paths of such functors
+  std::vector<std::string> fxpath_;              // the module path walked
+  std::set<const ModuleExpr*> fexp_done_;        // functors charged here
+  std::set<const ModuleExpr*> fexp_chain_;       // every level of those
+  int fxin_ = 0;                                 // functor results entered
+  std::string fxkey() const {
+    std::string k;
+    for (auto& s : fxpath_) k += (k.empty() ? "" : ".") + s;
+    return k;
+  }
+  // What building the path `F($X)..($Z)` of the functor's own parameters
+  // costs: `lits`/`ids` as for any application (S509).
+  long long fexp_self(const ModuleExpr* f) const {
+    std::vector<std::string> ps;
+    fparams(f, ps);
+    const ModuleExpr* h = f;
+    for (std::size_t i = 0; i < ps.size(); ++i) {
+      auto* fn = std::get_if<Pmod_functor>(&h->desc);
+      if (!fn || std::holds_alternative<Functor_unit>(fn->param)) return 0;
+      h = fn->body.get();
+    }
+    long long k = lits(f, 0) + ids(f, 1);
+    for (std::size_t i = 1; i < ps.size(); ++i) k += partial(f, i);
+    return k + lits(f, ps.size());
+  }
+  // The same off a functor TYPE the binding is ascribed to.
+  long long fexp_self_mty(const ModuleType* t) const {
+    std::vector<const Functor_named*> ps;
+    for (int i = 0; t && i < 16; ++i) {
+      auto* fn = std::get_if<Pmty_functor>(&t->desc);
+      if (!fn) break;
+      auto* nm = std::get_if<Functor_named>(&fn->param);
+      if (!nm) return 0;
+      ps.push_back(nm);
+      t = fn->body.get();
+    }
+    if (ps.empty() || !t) return 0;
+    long long res = std::holds_alternative<Pmty_signature>(t->desc)
+                        ? ren_mty(*t) : 0;
+    auto lit = [&](std::size_t from) {
+      long long k = 0;
+      for (std::size_t j = from; j < ps.size(); ++j)
+        if (ps[j]->type &&
+            std::holds_alternative<Pmty_signature>(ps[j]->type->desc))
+          k += ren_mty(*ps[j]->type);
+      return k + res;
+    };
+    auto id = [&](std::size_t from) {
+      long long k = 0;
+      for (std::size_t j = from; j < ps.size(); ++j)
+        if (ps[j]->name.txt) ++k;
+      return k;
+    };
+    long long k = lit(0) + id(1);
+    for (std::size_t i = 1; i < ps.size(); ++i)
+      k += 2 * lit(i) + id(i) + id(i + 1);
+    return k + res;
+  }
+  long long fexp_charge(const ModuleExpr& me) {
+    if (fexp_off() || !fexp_ || !fexp_->count(fxkey())) return 0;
+    if (auto* c = std::get_if<Pmod_constraint>(&me.desc)) {
+      if (!std::holds_alternative<Pmty_functor>(c->mt->desc)) return 0;
+      fexp_done_.insert(&me);
+      return fexp_self_mty(c->mt.get());
+    }
+    auto* fn = std::get_if<Pmod_functor>(&me.desc);
+    if (!fn) return 0;
+    // A body an ascription inside rebuilds is S492's, charged at the
+    // declaration already, and a result that is a `with` over a NAME leaving
+    // a parameterized abstract type another item names is S490's, which
+    // reads the name out.  A result written out as a literal signature was
+    // S490's too (`fdecl_poly` charged it `2 * fl + 1`, right where the
+    // parameter's written signature has one item, and a curried functor only
+    // at its last parameter): it is this law's now, whole, and `fdecl_poly`
+    // stands aside.
+    std::vector<const ModuleExpr*> chain;
+    for (const ModuleExpr* h = &me;;) {
+      auto* f = std::get_if<Pmod_functor>(&h->desc);
+      if (!f) break;
+      if (fbody_asc(*f)) return 0;
+      if (auto* c = std::get_if<Pmod_constraint>(&f->body->desc))
+        if (!std::holds_alternative<Pmty_signature>(c->mt->desc) &&
+            fdecl_poly(*h, *f))
+          return 0;
+      chain.push_back(h);
+      h = f->body.get();
+    }
+    fexp_done_.insert(&me);
+    for (const ModuleExpr* h : chain) fexp_chain_.insert(h);
+    return (fxin_ ? ids(&me, 0) : 0) + fexp_self(&me);
   }
   long long inc_items(const ModuleExpr& m, const Lvl& l) {
     bool dotted = false;
@@ -31791,7 +32005,8 @@ struct Count {
         // Where the result leaves a parameterized abstract type an item
         // names, this lump is the DECLARATION's (`fdecl_poly`) and not the
         // first application's.
-        if (lseen.insert(key).second && !poly_fres(fdef, res_mty(me, mt)))
+        if (lseen.insert(key).second &&
+            !poly_fres(fdef, res_mty(me, mt)) && !fexp_done_.count(fdef))
           k += fl + (named_param(fdef) ? 0 : 1);
       }
     }
@@ -31900,12 +32115,14 @@ struct Count {
       // A functor's RESULT is never strengthened (`strengthen_lazy`,
       // mtype.ml:42, leaves a `Unit` one alone and walks a named one with
       // `aliasable:false`), so its body starts the cascade over.
-      if (!locpoly_off()) n += fdecl_poly(m, *f);
+      if (!locpoly_off() && !fexp_chain_.count(&m)) n += fdecl_poly(m, *f);
       n += fbody_asc(*f);
       fparam(f->param, l);
       auto fk = fmark();
       fbind(f->param);
+      ++fxin_;
       mexpr(*f->body, Lvl{1, 1, 0, true});
+      --fxin_;
       frelease(fk);
     } else if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) {
       // What an ascribed module SAVES is the ascription, so that is what the
@@ -32347,8 +32564,12 @@ struct Count {
       // manifest in the saved signature for the compunit check to expand,
       // so `app_charge`'s rebuild lumps are not owed there (S509).  A
       // cross-unit one is `cross_charge`'s, measured with them.
+      const bool fxp = m->binding.name.txt.has_value();
+      if (fxp) fxpath_.push_back(*m->binding.name.txt);
+      if (fxp && saved_ && !inexpr_) n += fexp_charge(m->binding.expr);
       mexpr(m->binding.expr, ml,
             appexp_off() || saved_ || !local_app(m->binding.expr));
+      if (fxp) fxpath_.pop_back();
       ascr_sig_ = asv;
       mdiscard_ = dsv;
       mdisctop_ = dtv;
@@ -32488,8 +32709,110 @@ long long package_sig_idents(const std::vector<cmi::cmiw::SigItem>& items) {
   return pkg_sig_nodes(items, 2);
 }
 
+// ---- THE SIGNATURE CHECK EXPANDS A TYPE OF A FUNCTOR'S OWN RESULT --------
+// The functors of the emitted signature whose result names, in a type the
+// inferred-signature check compares, one of its own PARAMETERIZED types with
+// no manifest (or a private one) -- see `Count::fexp_charge`.  A functor's
+// types are those at every depth of its result through plain submodules; a
+// nested functor's are its own, and reaching them builds the enclosing path,
+// so a hit marks every functor on the way.  A constructor is matched by the
+// declaration's stamp or by its spelled name (a nested declaration's stamp
+// is not carried).
+namespace {
+struct Fx {
+  std::set<int> stamps;
+  std::set<std::string> names;
+  bool hit = false;
+};
+using FxItems = std::vector<cmi::cmiw::SigItem>;
+void fx_types(const FxItems& items, Fx& fx, const std::string& pre, int d) {
+  if (d > 16) return;
+  for (auto& si : items) {
+    if (si.k == cmi::cmiw::SigItem::Type) {
+      if (si.params.empty() || (si.manifest && !si.type_private)) continue;
+      if (si.engine_stamp) fx.stamps.insert(si.engine_stamp);
+      fx.names.insert(pre + si.name);
+      fx.names.insert(si.name);
+    } else if (si.k == cmi::cmiw::SigItem::Module && !si.is_functor &&
+               si.alias.empty() && si.modtype_ref.empty()) {
+      fx_types(si.sub, fx, pre + si.name + ".", d + 1);
+    }
+  }
+}
+// A type graph can be CYCLIC (an object's self type), so every node is
+// visited once.
+void fx_ty(const cmi::cmiw::TyPtr& t, std::vector<Fx*>& st,
+           std::set<const cmi::cmiw::Ty*>& seen) {
+  if (!t || !seen.insert(t.get()).second) return;
+  if (t->k == cmi::cmiw::Ty::Constr && !t->args.empty())
+    for (std::size_t i = st.size(); i-- > 0;) {
+      if (!st[i]->stamps.count(t->engine_stamp) &&
+          !st[i]->names.count(t->name))
+        continue;
+      for (std::size_t j = 0; j <= i; ++j) st[j]->hit = true;
+      break;
+    }
+  for (auto& a : t->args) fx_ty(a, st, seen);
+  for (auto& a : t->row_name_args) fx_ty(a, st, seen);
+}
+void fx_top(const cmi::cmiw::TyPtr& t, std::vector<Fx*>& st) {
+  std::set<const cmi::cmiw::Ty*> seen;
+  fx_ty(t, st, seen);
+}
+void fx_ctors(const std::vector<cmi::cmiw::Ctor>& cs, std::vector<Fx*>& st) {
+  for (auto& c : cs) {
+    for (auto& a : c.args) fx_top(a, st);
+    for (auto& l : c.inline_record) fx_top(l.ty, st);
+    fx_top(c.res, st);
+  }
+}
+void fx_items(const FxItems& items, const std::string& path,
+              std::vector<Fx*>& st, std::set<std::string>& out, int d) {
+  if (d > 16) return;
+  for (auto& si : items) {
+    using K = cmi::cmiw::SigItem;
+    if (si.k == K::Value) {
+      fx_top(si.ty, st);
+    } else if (si.k == K::Type) {
+      fx_top(si.manifest, st);
+      fx_ctors(si.ctors, st);
+      for (auto& l : si.labels) fx_top(l.ty, st);
+    } else if (si.k == K::Exception) {
+      fx_ctors(si.ctors, st);
+      fx_top(si.ext_ret, st);
+    } else if (si.k == K::Modtype) {
+      if (!si.modtype_abstract && si.modtype_ref.empty())
+        fx_items(si.sub, path + si.name + ".", st, out, d + 1);
+    } else if (si.k == K::Module) {
+      if (!si.alias.empty() || !si.modtype_ref.empty()) continue;
+      std::string p = path + si.name;
+      bool gen = si.functor_unit;
+      for (char u : si.more_param_units) gen = gen || u;
+      if (!si.is_functor || gen || !si.functor_result_ref.empty()) {
+        fx_items(si.sub, p + ".", st, out, d + 1);
+        continue;
+      }
+      Fx fx;
+      fx_types(si.sub, fx, "", 0);
+      st.push_back(&fx);
+      fx_items(si.sub, p + ".", st, out, d + 1);
+      st.pop_back();
+      if (fx.hit) out.insert(p);
+    }
+  }
+}
+}  // namespace
+std::set<std::string> fexp_paths(const std::vector<cmi::cmiw::SigItem>& items) {
+  std::set<std::string> out;
+  std::vector<Fx*> st;
+  fx_items(items, "", st, out, 0);
+  if (dbg_env("FEXPDBG"))
+    for (auto& p : out) std::fprintf(stderr, "FEXP %s\n", p.c_str());
+  return out;
+}
 int typing_ident_count(const ast::Structure& s, std::size_t eta_sites,
-                       long long pkg_sig) {
+                       long long pkg_sig,
+                       const std::set<std::string>* fexp) {
   // The citation walk runs FIRST: whether a `module M = A.N` alias is ever
   // READ is what says the path has to be resolved, and only a name this file
   // binds ONCE can be followed to the module it stands for.
@@ -32536,6 +32859,7 @@ int typing_ident_count(const ast::Structure& s, std::size_t eta_sites,
   c.ureads_ = &u.ureads_;
   c.lreads_ = &u.lreads_;
   c.areads_ = &u.areads_;
+  c.fexp_ = fexp;
   c.pk_push();
   for (auto& it : s) c.item(it);
   c.pk_pop();
