@@ -17951,6 +17951,16 @@ static void strengthen_abstract(std::vector<cmi::cmiw::SigItem>& items,
         !si.type_open && !si.type_empty_variant) {
       std::vector<cmi::cmiw::TyPtr> as(si.params.begin(), si.params.end());
       si.manifest = cmi::cmiw::ty_constr(app + "." + si.name, std::move(as));
+    } else if (si.k == cmi::cmiw::SigItem::Type && si.manifest &&
+               si.type_private && si.ctors.empty() && si.labels.empty() &&
+               !si.type_open && !dbg_env("NOPARUSE")) {
+      // A PRIVATE ABBREVIATION is rebuilt too (mtype.ml:101): the manifest
+      // becomes the path and, the kind being abstract, the privacy goes --
+      // `include X` of an `X : sig type t = private int end` records
+      // `type t = X.t`.  A private record or variant keeps its own.
+      std::vector<cmi::cmiw::TyPtr> as(si.params.begin(), si.params.end());
+      si.manifest = cmi::cmiw::ty_constr(app + "." + si.name, std::move(as));
+      si.type_private = false;
     } else if (si.k == cmi::cmiw::SigItem::Module && !si.is_functor &&
                si.alias.empty()) {
       // With `aliasable` (a nameable module path -- `include M`), a
@@ -20549,6 +20559,15 @@ bool privfx_off() {
 // functor names it (`NOSUBAPP=1` reverts all three).
 bool subapp_off() {
   static const bool off = dbg_env("NOSUBAPP") != nullptr;
+  return off;
+}
+// S514: a functor body that hands its PARAMETER back, `include`s it or
+// aliases it leaves the parameter's signature in its result, which the
+// inferred-signature check forces where the functor is nested and a
+// `module rec` bound to its application substitutes (`NOPARUSE=1`
+// reverts).
+bool paruse_off() {
+  static const bool off = dbg_env("NOPARUSE") != nullptr;
   return off;
 }
 bool tof_off() {
@@ -27875,6 +27894,68 @@ struct Count {
     static const bool off = dbg_env("NOFUNDEPTH") != nullptr;
     return off;
   }
+  // ---- A PARAMETER USED AS A MODULE IS IN THE RESULT --------------------
+  // A functor parameter is not aliasable (`Env.is_aliasable`), so a body
+  // that hands it back (`= X`), `include`s it or binds it (`module Z = X`)
+  // is typed with its STRENGTHENED signature written out, and that is what
+  // the result carries: `(X : MyT) -> sig type t = X.t end`.  Forcing the
+  // result renames every item of it, the nested ones included, so each
+  // such use is worth the parameter's signature flat -- the destructive
+  // `with` constraints on it taken out -- where a body reading `X.t` in a
+  // type, opening X or naming it under a `let module` leaves nothing.
+  long long par_flat(const ModuleType& mt) const {
+    long long k = 0;
+    const ModuleType* b = &mt;
+    for (int i = 0; i < 8; ++i) {
+      auto* w = std::get_if<Pmty_with>(&b->desc);
+      if (!w) break;
+      for (auto& cn : w->constraints) {
+        Wc x;
+        if (wc_parts(cn, x) && x.destr && x.path.size() == 1) --k;
+      }
+      b = w->mt.get();
+    }
+    if (const Signature* sg = mty_sig(b)) {
+      for (auto& it : *sg) k += ren_sig_item(it);
+      return k;
+    }
+    std::string key;
+    if (const cmi::Signature* sg = xmty_sig(b, key)) return k + flat_csig(*sg);
+    return 0;
+  }
+  static bool par_named(const ModuleExpr& m, const std::string& x) {
+    auto* p = std::get_if<Pmod_ident>(&m.desc);
+    auto* l = p ? std::get_if<Lident>(&p->id.txt.v) : nullptr;
+    return l && l->name == x;
+  }
+  long long par_uses(const std::string& x, const ModuleType& xt,
+                     const ModuleExpr& body, int d = 0) const {
+    if (paruse_off() || d > 16) return 0;
+    if (par_named(body, x)) return par_flat(xt);
+    if (auto* f = std::get_if<Pmod_functor>(&body.desc)) {
+      // An inner parameter of the same name shadows this one.
+      auto* nm = std::get_if<Functor_named>(&f->param);
+      if (nm && nm->name.txt && *nm->name.txt == x) return 0;
+      return par_uses(x, xt, *f->body, d + 1);
+    }
+    auto* st = std::get_if<Pmod_structure>(&body.desc);
+    if (!st) return 0;
+    long long k = 0;
+    for (auto& it : st->items) {
+      if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
+        if (par_named(i->expr, x)) k += par_flat(xt);
+      } else if (auto* md = std::get_if<Pstr_module>(&it.desc)) {
+        if (md->binding.name.txt && *md->binding.name.txt == x) break;
+        k += par_uses(x, xt, md->binding.expr, d + 1);
+      }
+    }
+    return k;
+  }
+  long long par_uses(const Pmod_functor& f) const {
+    auto* nm = std::get_if<Functor_named>(&f.param);
+    if (!nm || !nm->name.txt || !nm->type) return 0;
+    return par_uses(*nm->name.txt, *nm->type, *f.body);
+  }
   // An `include <path>` in the body brings the path's TOP items into the
   // result (`Env.enter_signature`), and those are renamed with the rest of
   // it when the strengthened declaration is forced (`expand_module_alias`,
@@ -27882,7 +27963,7 @@ struct Count {
   // here the way `include` reads them where it stands (`inc_top`).
   long long fcas(const ModuleExpr& m) const {
     if (auto* f = std::get_if<Pmod_functor>(&m.desc)) {
-      long long k = fcas(*f->body);
+      long long k = fcas(*f->body) + par_uses(*f);
       if (auto* nm = std::get_if<Functor_named>(&f->param))
         if (nm->name.txt) ++k;
       return k;
@@ -28407,8 +28488,85 @@ struct Count {
     }
     return flat_cmty(scrape_cmty(mt, root));
   }
+  // The VALUE names a functor's result binds: what its body `let`s, and what
+  // an `include X` of its parameter brings in.
+  void app_val_names(const ModuleExpr& app, std::vector<std::string>& out,
+                     int d = 0) const {
+    if (d > 8) return;
+    int nargs = 0;
+    const ModuleExpr* h = &app;
+    while (auto* a = std::get_if<Pmod_apply>(&h->desc)) { ++nargs; h = a->f.get(); }
+    const ModuleExpr* me = mderef(h);
+    const Pmod_functor* lf = nullptr;
+    for (int i = 0; me && i < nargs; ++i) {
+      lf = std::get_if<Pmod_functor>(&me->desc);
+      me = lf ? mderef(lf->body.get()) : nullptr;
+    }
+    auto* st = me ? std::get_if<Pmod_structure>(&me->desc) : nullptr;
+    if (!st || !lf) return;
+    auto* nm = std::get_if<Functor_named>(&lf->param);
+    for (auto& it : st->items) {
+      if (auto* v = std::get_if<Pstr_value>(&it.desc)) {
+        Count c;
+        for (auto& b : v->bindings) c.pat(b.pat, &out);
+      } else if (auto* pr = std::get_if<Pstr_primitive>(&it.desc)) {
+        out.push_back(pr->prim.name.txt);
+      } else if (auto* v = std::get_if<Pstr_val>(&it.desc)) {
+        out.push_back(v->vd.name.txt);
+      } else if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
+        if (std::holds_alternative<Pmod_apply>(i->expr.desc)) {
+          app_val_names(i->expr, out, d + 1);
+        } else if (nm && nm->name.txt && nm->type &&
+                   par_named(i->expr, *nm->name.txt)) {
+          if (const Signature* sg = mty_sig(&*nm->type)) {
+            for (auto& si : *sg) {
+              if (auto* v = std::get_if<Psig_value>(&si.desc))
+                out.push_back(v->vd.name.txt);
+              else if (auto* pv = std::get_if<Psig_primitive>(&si.desc))
+                out.push_back(pv->pd.name.txt);
+            }
+          } else {
+            std::string key;
+            if (const cmi::Signature* xs = xmty_sig(&*nm->type, key))
+              for (auto& v : xs->values) out.push_back(v.name);
+          }
+        }
+      }
+    }
+  }
   long long recapp(const ModuleExpr& m, const ModuleType* decl) const {
     if (recapp_off()) return 0;
+    // `module rec M : S = struct include F (M) .. end`: the actual signature
+    // holds the application's result too, less the values the structure
+    // rebinds after the include (the signature keeps the last binding, and
+    // `ren_mexpr` has charged that one).
+    if (auto* st = std::get_if<Pmod_structure>(&m.desc); st && !paruse_off()) {
+      long long k = 0;
+      std::vector<std::string> own;
+      for (auto& it : st->items) {
+        if (auto* v = std::get_if<Pstr_value>(&it.desc)) {
+          Count c;
+          for (auto& b : v->bindings) c.pat(b.pat, &own);
+        } else if (auto* pr = std::get_if<Pstr_primitive>(&it.desc)) {
+          own.push_back(pr->prim.name.txt);
+        } else if (auto* v = std::get_if<Pstr_val>(&it.desc)) {
+          own.push_back(v->vd.name.txt);
+        }
+      }
+      for (auto& it : st->items) {
+        auto* i = std::get_if<Pstr_include>(&it.desc);
+        if (!i || !std::holds_alternative<Pmod_apply>(i->expr.desc)) continue;
+        k += recapp(i->expr, nullptr);
+        std::vector<std::string> inc;
+        app_val_names(i->expr, inc);
+        std::set<std::string> seen;
+        for (auto& n : inc)
+          if (seen.insert(n).second &&
+              std::find(own.begin(), own.end(), n) != own.end())
+            --k;
+      }
+      return k;
+    }
     int nargs = 0;
     const ModuleExpr* h = &m;
     while (auto* a = std::get_if<Pmod_apply>(&h->desc)) {
@@ -28418,6 +28576,7 @@ struct Count {
     if (!nargs) return 0;
     const ModuleExpr* me = mderef(h);
     if (!me) return mty_named(decl) ? xrecapp(*h, nargs) : 0;
+    long long uses = 0;
     for (int i = 0; i < nargs; ++i) {
       if (!me) return 0;
       auto* f = std::get_if<Pmod_functor>(&me->desc);
@@ -28428,9 +28587,13 @@ struct Count {
         const ModuleType* pt = param_body(*f);
         return pt && i + 1 == nargs ? ren_mty(*pt) : 0;
       }
+      // What the body took from the parameter is substituted with the
+      // rest of the result (`par_uses`), where `ren_mexpr` reads the
+      // `include X` as an item-less path.
+      uses = b == f->body.get() ? par_uses(*f) : 0;
       me = b;
     }
-    return dupval_free(*me) ? ren_mexpr(*me, Sibs{}) : 0;
+    return dupval_free(*me) ? ren_mexpr(*me, Sibs{}) + uses : 0;
   }
   // QUADRATIC: `check_recmodule_inclusion` (typemod.ml:2182) runs one round per
   // binding and each round names a fresh Y_i for EVERY binding, while
@@ -28900,8 +29063,32 @@ struct Count {
     dotted = false;
     if (auto* li = std::get_if<Lident>(&id->v)) {
       auto f = fmods.find(li->name);
-      if (f != fmods.end() && !f->second.empty())
-        return mt_top(*f->second.back(), d);
+      if (f != fmods.end() && !f->second.empty()) {
+        // A parameter declared by ANOTHER unit's module type (`X :
+        // Set.OrderedType`) is entered item by item like a local one.
+        const ModuleType& pt = *f->second.back();
+        const ModuleType* b = &pt;
+        for (int i = 0; i < 8; ++i) {
+          auto* w = std::get_if<Pmty_with>(&b->desc);
+          if (!w) break;
+          b = w->mt.get();
+        }
+        std::string key;
+        const cmi::Signature* xs = nullptr;
+        if (!paruse_off() && !mty_sig(b)) xs = xmty_sig(b, key);
+        if (!xs) return mt_top(pt, d);
+        long long k = (long long)xs->order.size();
+        for (b = &pt;;) {
+          auto* w = std::get_if<Pmty_with>(&b->desc);
+          if (!w) break;
+          for (auto& cn : w->constraints) {
+            Wc x;
+            if (wc_parts(cn, x) && x.destr && x.path.size() == 1) --k;
+          }
+          b = w->mt.get();
+        }
+        return k;
+      }
     }
     std::vector<std::string> c;
     if (!lid_path(*id, c) || c.empty() || mods.count(c[0])) return 0;
@@ -32953,6 +33140,14 @@ struct Count {
         inm_ = &nm;
         n += inc_items(i->expr, l);
         inm_ = nullptr;
+        for (auto& s : nm) bind(s);
+      }
+      // The values an included APPLICATION binds are in scope too: a later
+      // `let create x = create x` rebinds one and gets no missing-`rec`
+      // ghost for it.
+      if (!paruse_off() && std::holds_alternative<Pmod_apply>(i->expr.desc)) {
+        std::vector<std::string> nm;
+        app_val_names(i->expr, nm);
         for (auto& s : nm) bind(s);
       }
     } else if (auto* o = std::get_if<Pstr_open>(&it.desc)) {
