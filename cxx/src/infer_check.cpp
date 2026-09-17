@@ -20741,6 +20741,13 @@ bool sig_binds_mty(const Signature& sg, const std::string& nm,
   return false;
 }
 
+// S523: an open of a functor APPLICATION (see `nd_open` below).
+// `NOOPENAPP=1` reverts the slice.
+bool opapp_off() {
+  static const bool off = dbg_env("NOOPENAPP") != nullptr;
+  return off;
+}
+
 struct Cites {
   std::set<std::string> units;  // heads that may name a persistent unit
   // Module names the file binds itself, with how MANY times: a name bound
@@ -22996,7 +23003,15 @@ struct Cites {
     } else if (auto* o = std::get_if<Pstr_open>(&it.desc)) {
       auto* mi = std::get_if<Pmod_ident>(&o->expr.desc);
       if (mi && opened(mi->id)) return;
+      // What an open of an APPLICATION brings in is hidden, never saved, so
+      // the units its result's types name are not loaded for it -- exactly
+      // as for a `let open F (X) in ..` (S523).
+      bool ie = inexpr_;
+      if (!opapp_off() &&
+          std::holds_alternative<Pmod_apply>(o->expr.desc))
+        inexpr_ = true;
       mexp(o->expr);
+      inexpr_ = ie;
     } else if (auto* c = std::get_if<Pstr_class>(&it.desc)) {
       for (auto& d : c->decls) cdecl(d);
     } else if (auto* c = std::get_if<Pstr_class_type>(&it.desc)) {
@@ -26854,6 +26869,9 @@ struct Count {
   std::optional<Cd> local_ctor(const Longident& pre, const std::string& nm) {
     bool sub = false;
     if (const ModuleExpr* me = lal_res(pre, sub)) {
+      // `Q.C` with `module Q = F (X)`: the functor's body declares C (S523).
+      if (!opapp_off() && std::holds_alternative<Pmod_apply>(me->desc))
+        if (const ModuleExpr* r = app_res(me)) me = r;
       if (auto* c = std::get_if<Pmod_constraint>(&me->desc)) {
         if (const Signature* s = mty_sig(c->mt.get())) return sig_ctor(*s, nm);
         me = c->me.get();
@@ -26969,8 +26987,20 @@ struct Count {
       ebind(c.name.txt, k);
     }
   }
-  void reg_open(const ModuleExpr& m) {
+  void reg_open(const ModuleExpr& m0) {
     if (exist_off()) return;
+    // S523: `open F (X)` and `open Q` with Q a module of this file bring the
+    // constructors the functor's body (`app_res`) or Q's structure declares.
+    const ModuleExpr* mp = &m0;
+    if (!opapp_off()) {
+      if (auto* i = std::get_if<Pmod_ident>(&mp->desc)) {
+        bool sub = false;
+        if (const ModuleExpr* r = lal_res(i->id.txt, sub)) mp = r;
+      }
+      if (std::holds_alternative<Pmod_apply>(mp->desc))
+        if (const ModuleExpr* r = app_res(mp)) mp = r;
+    }
+    const ModuleExpr& m = *mp;
     // `open struct .. end` (S507): the structure's own constructors stay in
     // scope, where `mexpr` released them with the structure.
     if (!cexty_off())
@@ -29810,6 +29840,12 @@ struct Count {
     static const bool off = dbg_env("NONDEPOPEN") != nullptr;
     return off;
   }
+  // S523: an APPLICATION opened or bound in such a structure is read through
+  // the functor it applies (`app_res`): its result is a signature of its own,
+  // so the open hides what the functor's body declares, the nondep pass
+  // enters the result where a module is bound to it, and the open itself
+  // re-binds the result as an include does.  `NOOPENAPP=1` reverts
+  // (`opapp_off`, a free hook: the citation walk shares it).
   static long long nd_mty(const ModuleType& mt) {
     if (auto* s = std::get_if<Pmty_signature>(&mt.desc)) {
       long long k = 0;
@@ -29880,27 +29916,31 @@ struct Count {
     Sibs none;
     return ren_str_item(it, none);
   }
-  static long long nd_mexpr(const ModuleExpr& m) {
+  long long nd_mexpr(const ModuleExpr& m, int d = 0) const {
     if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
       long long k = 0;
-      for (auto& it : st->items) k += nd_ren_str_item(it) + nd_str_item(it);
+      for (auto& it : st->items)
+        k += nd_ren_str_item(it) + nd_str_item(it, d);
       return k;
     }
     if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) return nd_mty(*c->mt);
     if (auto* f = std::get_if<Pmod_functor>(&m.desc)) {
-      long long k = nd_mexpr(*f->body);
+      long long k = nd_mexpr(*f->body, d);
       if (auto* nm = std::get_if<Functor_named>(&f->param))
         k += nd_mty(*nm->type);
       return k;
     }
-    return 0;  // an ALIAS and an application are not signatures of their own
+    // An application's type is the signature its functor's body leaves.
+    if (!opapp_off() && d < 8 && std::holds_alternative<Pmod_apply>(m.desc))
+      if (const ModuleExpr* r = app_res(&m)) return nd_mexpr(*r, d + 1);
+    return 0;  // an ALIAS is not a signature of its own
   }
-  static long long nd_str_item(const StructureItem& it) {
+  long long nd_str_item(const StructureItem& it, int d = 0) const {
     if (auto* m = std::get_if<Pstr_module>(&it.desc))
-      return nd_mexpr(m->binding.expr);
+      return nd_mexpr(m->binding.expr, d);
     if (auto* m = std::get_if<Pstr_recmodule>(&it.desc)) {
       long long k = 0;
-      for (auto& b : m->bindings) k += nd_mexpr(b.expr);
+      for (auto& b : m->bindings) k += nd_mexpr(b.expr, d);
       return k;
     }
     if (auto* m = std::get_if<Pstr_modtype>(&it.desc))
@@ -29909,7 +29949,7 @@ struct Count {
       auto* st = std::get_if<Pmod_structure>(&i->expr.desc);
       if (!st) return 0;
       long long k = 0;
-      for (auto& x : st->items) k += nd_str_item(x);
+      for (auto& x : st->items) k += nd_str_item(x, d);
       return k;
     }
     return 0;
@@ -29936,8 +29976,12 @@ struct Count {
   bool nd_hides(const ModuleExpr& m, int fuel = 8) const {
     if (auto* c = std::get_if<Pmod_constraint>(&m.desc))
       return nd_hides_mty(*c->mt, fuel);
+    if (!opapp_off() && std::holds_alternative<Pmod_apply>(m.desc)) {
+      const ModuleExpr* r = app_res(&m);
+      return r && fuel > 0 && nd_hides(*r, fuel - 1);
+    }
     auto* st = std::get_if<Pmod_structure>(&m.desc);
-    if (!st) return false;  // a path and an application are not ours to read
+    if (!st) return false;  // a path is not ours to read
     for (auto& it : st->items) {
       if (std::holds_alternative<Pstr_value>(it.desc) ||
           std::holds_alternative<Pstr_primitive>(it.desc) ||
@@ -29967,6 +30011,400 @@ struct Count {
     long long k = 0;
     for (auto& it : items) k += nd_str_item(it);
     return k;
+  }
+
+  // ---- WHAT A READ THROUGH SUCH AN OPEN BUILDS (S523) ---------------------
+  // The types `open F (P)` brings in are paths THROUGH THE APPLICATION,
+  // `F (P).u`, and expanding one looks the application up by that path:
+  // `Env.find_type_expansion` -> `find_structure_components` on the Papply,
+  // which builds the FUNCTOR's components first (`components_of_module_maker`
+  // forces its whole module type, the parameters' items and the result's)
+  // and then the application's (`components_of_functor_appl`, the result's
+  // items once more): p + 2r.  Both are cached, but in TWO environments --
+  // the typing one, and the one the inferred signature is checked in after
+  // `Signature_names.simplify` re-entered every declaration -- so the file
+  // pays p + 2r for the first expansion while TYPING (an application of a
+  // value that returns such a type, `lower_args`; an argument of such a
+  // type, `check_partial_application`; a constructor or an annotation of a
+  // PARAMETERIZED one, `unify2_expand`) and again for the CHECK (`moregen`)
+  // of any saved value whose type names a type of the result with no
+  // manifest -- less the functor's share when the result declares a
+  // parameterized GADT, whose `Includecore` comparison built it already.
+  // Once per open; a `let open` at the expression level pays neither.
+  struct Oapp {
+    std::set<std::string> types;   // the result's types with no manifest
+    std::set<std::string> ptypes;  // ... the parameterized ones
+    std::set<std::string> ctors;   // their constructors
+    std::set<std::string> pctors;  // ... of the parameterized ones
+    std::set<std::string> rets;    // values that return one of `types`
+    std::set<std::string> bares;   // values OF one of `types`
+    std::set<std::string> vals;    // every value
+    long long p = 0, r = 0;
+    bool vd = false;
+  };
+  static const std::string* tyhead(const CoreType& t) {
+    if (auto* c = std::get_if<Ptyp_constr>(&t.desc))
+      if (auto* l = std::get_if<Lident>(&c->id.txt.v)) return &l->name;
+    return nullptr;
+  }
+  static const CoreType& tyret(const CoreType& t) {
+    const CoreType* c = &t;
+    for (int i = 0; i < 64; ++i) {
+      auto* a = std::get_if<Ptyp_arrow>(&c->desc);
+      if (!a) break;
+      c = a->cod.get();
+    }
+    return *c;
+  }
+  static bool ty_names(const CoreType& t, const std::set<std::string>& ns) {
+    if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
+      if (auto* l = std::get_if<Lident>(&c->id.txt.v))
+        if (ns.count(l->name)) return true;
+      for (auto& a : c->args) if (ty_names(*a, ns)) return true;
+      return false;
+    }
+    if (auto* a = std::get_if<Ptyp_arrow>(&t.desc))
+      return ty_names(*a->dom, ns) || ty_names(*a->cod, ns);
+    if (auto* u = std::get_if<Ptyp_tuple>(&t.desc)) {
+      for (auto& e : u->elems) if (ty_names(*e, ns)) return true;
+      return false;
+    }
+    if (auto* a = std::get_if<Ptyp_alias>(&t.desc)) return ty_names(*a->type, ns);
+    if (auto* q = std::get_if<Ptyp_poly>(&t.desc)) return ty_names(*q->type, ns);
+    return false;
+  }
+  // The expression a binding's body ends in, through its `fun` parameters,
+  // lets, sequences and the arms of a match.
+  static bool tail_of(const Expression& e, const Oapp& o,
+                      const std::set<std::string>& rparams, int d = 0) {
+    if (d > 32) return false;
+    if (auto* f = std::get_if<Pexp_function>(&e.desc)) {
+      if (f->constraint_)
+        if (auto* c = std::get_if<Pconstraint>(&*f->constraint_))
+          if (const std::string* h = tyhead(*c->type)) return o.types.count(*h);
+      std::set<std::string> rp = rparams;
+      for (auto& pr : f->params)
+        if (auto* pv = std::get_if<Pparam_val>(&pr.desc))
+          if (auto* pc = std::get_if<Ppat_constraint>(&pv->pat.desc))
+            if (auto* v = std::get_if<Ppat_var>(&pc->p->desc))
+              if (const std::string* h = tyhead(*pc->t); h && o.types.count(*h))
+                rp.insert(v->name.txt);
+      if (auto* fb = std::get_if<Pfunction_body>(&f->body->v))
+        return tail_of(*fb->e, o, rp, d + 1);
+      auto& fc = std::get<Pfunction_cases>(f->body->v);
+      for (auto& c : fc.cases) if (tail_of(*c.rhs, o, rp, d + 1)) return true;
+      return false;
+    }
+    if (auto* l = std::get_if<Pexp_let>(&e.desc)) return tail_of(*l->body, o, rparams, d + 1);
+    if (auto* q = std::get_if<Pexp_sequence>(&e.desc)) return tail_of(*q->e2, o, rparams, d + 1);
+    if (auto* n = std::get_if<Pexp_newtype>(&e.desc)) return tail_of(*n->body, o, rparams, d + 1);
+    if (auto* si = std::get_if<Pexp_struct_item>(&e.desc)) return tail_of(*si->body, o, rparams, d + 1);
+    if (auto* m = std::get_if<Pexp_match>(&e.desc)) {
+      for (auto& c : m->cases) if (tail_of(*c.rhs, o, rparams, d + 1)) return true;
+      return false;
+    }
+    if (auto* i = std::get_if<Pexp_ifthenelse>(&e.desc))
+      return tail_of(*i->then_, o, rparams, d + 1) ||
+             (i->else_ && tail_of(**i->else_, o, rparams, d + 1));
+    if (auto* c = std::get_if<Pexp_constraint>(&e.desc)) {
+      if (const std::string* h = tyhead(*c->t)) return o.types.count(*h);
+      return tail_of(*c->e, o, rparams, d + 1);
+    }
+    if (auto* c = std::get_if<Pexp_construct>(&e.desc))
+      if (auto* l = std::get_if<Lident>(&c->id.txt.v)) return o.ctors.count(l->name);
+    if (auto* i = std::get_if<Pexp_ident>(&e.desc))
+      if (auto* l = std::get_if<Lident>(&i->id.txt.v))
+        return o.vals.count(l->name) || rparams.count(l->name);
+    if (auto* a = std::get_if<Pexp_apply>(&e.desc))
+      if (auto* i = std::get_if<Pexp_ident>(&a->fn->desc))
+        if (auto* l = std::get_if<Lident>(&i->id.txt.v)) return o.rets.count(l->name);
+    return false;
+  }
+  // What the functor's body declares, read off the structure or the literal
+  // signature the application evaluates to.
+  bool oapp_of(const ModuleExpr& app, Oapp& o) const {
+    int n = 0;
+    const ModuleExpr* h = &app;
+    while (auto* a = std::get_if<Pmod_apply>(&h->desc)) { ++n; h = a->f.get(); }
+    const ModuleExpr* me = mderef(h);
+    for (int i = 0; i < n; ++i) {
+      if (!me) return false;
+      auto* f = std::get_if<Pmod_functor>(&me->desc);
+      if (!f) return false;
+      if (auto* nm = std::get_if<Functor_named>(&f->param))
+        o.p += ren_mty(*nm->type);
+      me = mderef(f->body.get());
+      if (me && std::get_if<Pmod_apply>(&me->desc)) me = app_res(me);
+    }
+    if (!me) return false;
+    auto reg_ty = [&](const TypeDeclaration& d) {
+      if (d.manifest) return;
+      o.types.insert(d.name.txt);
+      const bool par = !d.params.empty();
+      if (par) o.ptypes.insert(d.name.txt);
+      if (auto* v = std::get_if<Ptype_variant>(&d.kind))
+        for (auto& c : v->ctors) {
+          o.ctors.insert(c.name.txt);
+          if (par) o.pctors.insert(c.name.txt);
+          if (par && c.res) o.vd = true;
+        }
+    };
+    if (auto* st = std::get_if<Pmod_structure>(&me->desc)) {
+      for (auto& it : st->items) {
+        o.r += ren_str_item(it, Sibs{});
+        if (auto* t = std::get_if<Pstr_type>(&it.desc))
+          for (auto& d : t->decls) reg_ty(d);
+      }
+      for (auto& it : st->items) {
+        auto* v = std::get_if<Pstr_value>(&it.desc);
+        if (!v) continue;
+        for (auto& b : v->bindings) {
+          auto* pv = std::get_if<Ppat_var>(&b.pat.desc);
+          if (!pv) continue;
+          o.vals.insert(pv->name.txt);
+          const CoreType* ann = nullptr;
+          if (b.constraint_)
+            if (auto* c = std::get_if<Pvc_constraint>(&*b.constraint_)) ann = c->typ.get();
+          if (ann) {
+            const std::string* h = tyhead(tyret(*ann));
+            if (h && o.types.count(*h)) {
+              if (std::holds_alternative<Ptyp_arrow>(ann->desc)) o.rets.insert(pv->name.txt);
+              else o.bares.insert(pv->name.txt);
+            }
+          } else if (std::holds_alternative<Pexp_function>(b.expr->desc)) {
+            if (tail_of(*b.expr, o, {})) o.rets.insert(pv->name.txt);
+          } else if (tail_of(*b.expr, o, {})) {
+            o.bares.insert(pv->name.txt);
+          }
+        }
+      }
+      return true;
+    }
+    if (auto* c = std::get_if<Pmod_constraint>(&me->desc)) {
+      auto* sg = std::get_if<Pmty_signature>(&c->mt->desc);
+      if (!sg) return false;
+      for (auto& it : sg->items) {
+        o.r += ren_sig_item(it);
+        if (auto* t = std::get_if<Psig_type>(&it.desc))
+          for (auto& d : t->decls) reg_ty(d);
+      }
+      for (auto& it : sg->items) {
+        auto* sv = std::get_if<Psig_value>(&it.desc);
+        if (!sv) continue;
+        const ValueDescription& v = sv->vd;
+        o.vals.insert(v.name.txt);
+        const std::string* h = tyhead(tyret(*v.type));
+        if (h && o.types.count(*h)) {
+          if (std::holds_alternative<Ptyp_arrow>(v.type->desc)) o.rets.insert(v.name.txt);
+          else o.bares.insert(v.name.txt);
+        }
+      }
+      return true;
+    }
+    return false;
+  }
+  // The typing-time trigger, over one expression.
+  static bool oapp_typ_ex(const Expression& e, const Oapp& o, int d = 0);
+  static bool oapp_typ_pat(const Pattern& p, const Oapp& o, int d = 0) {
+    if (d > 64) return false;
+    if (auto* c = std::get_if<Ppat_construct>(&p.desc)) {
+      if (auto* l = std::get_if<Lident>(&c->id.txt.v))
+        if (o.pctors.count(l->name)) return true;
+      return c->arg && oapp_typ_pat(**c->arg, o, d + 1);
+    }
+    if (auto* c = std::get_if<Ppat_constraint>(&p.desc))
+      return ty_names(*c->t, o.ptypes) || oapp_typ_pat(*c->p, o, d + 1);
+    if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
+      for (auto& e : t->elems) if (oapp_typ_pat(*e, o, d + 1)) return true;
+      return false;
+    }
+    if (auto* a = std::get_if<Ppat_alias>(&p.desc)) return oapp_typ_pat(*a->p, o, d + 1);
+    if (auto* r = std::get_if<Ppat_or>(&p.desc))
+      return oapp_typ_pat(*r->l, o, d + 1) || oapp_typ_pat(*r->r, o, d + 1);
+    if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
+      for (auto& f : r->fields) if (oapp_typ_pat(*f.second, o, d + 1)) return true;
+      return false;
+    }
+    if (auto* a = std::get_if<Ppat_array>(&p.desc)) {
+      for (auto& e : a->elems) if (oapp_typ_pat(*e, o, d + 1)) return true;
+      return false;
+    }
+    if (auto* l = std::get_if<Ppat_lazy>(&p.desc)) return oapp_typ_pat(*l->p, o, d + 1);
+    if (auto* x = std::get_if<Ppat_exception>(&p.desc)) return oapp_typ_pat(*x->p, o, d + 1);
+    if (auto* x = std::get_if<Ppat_open>(&p.desc)) return oapp_typ_pat(*x->p, o, d + 1);
+    if (auto* v = std::get_if<Ppat_variant>(&p.desc)) return v->arg && oapp_typ_pat(**v->arg, o, d + 1);
+    if (auto* f = std::get_if<Ppat_effect>(&p.desc))
+      return oapp_typ_pat(*f->eff, o, d + 1) || oapp_typ_pat(*f->cont, o, d + 1);
+    return false;
+  }
+  // Is the expression of one of the result's types where an ARGUMENT of it
+  // is expanded: a constructor, a value of the type, an application that
+  // returns it?
+  static bool oapp_arg_of(const Expression& e, const Oapp& o) {
+    if (auto* c = std::get_if<Pexp_construct>(&e.desc))
+      if (auto* l = std::get_if<Lident>(&c->id.txt.v)) return o.ctors.count(l->name);
+    if (auto* i = std::get_if<Pexp_ident>(&e.desc))
+      if (auto* l = std::get_if<Lident>(&i->id.txt.v)) return o.bares.count(l->name);
+    if (auto* a = std::get_if<Pexp_apply>(&e.desc))
+      if (auto* i = std::get_if<Pexp_ident>(&a->fn->desc))
+        if (auto* l = std::get_if<Lident>(&i->id.txt.v)) return o.rets.count(l->name);
+    if (auto* c = std::get_if<Pexp_constraint>(&e.desc)) return oapp_arg_of(*c->e, o);
+    return false;
+  }
+  static bool oapp_typ_cases(const std::vector<Case>& cs, const Oapp& o, int d) {
+    for (auto& c : cs) {
+      if (oapp_typ_pat(c.lhs, o, d + 1)) return true;
+      if (c.guard && oapp_typ_ex(**c.guard, o, d + 1)) return true;
+      if (oapp_typ_ex(*c.rhs, o, d + 1)) return true;
+    }
+    return false;
+  }
+  // The check-time trigger, over one binding: its type names a type of the
+  // result -- an annotation, a constructor pattern, or a tail of that type.
+  static bool oapp_chk_pat(const Pattern& p, const Oapp& o, int d = 0) {
+    if (d > 64) return false;
+    if (auto* c = std::get_if<Ppat_construct>(&p.desc)) {
+      if (auto* l = std::get_if<Lident>(&c->id.txt.v))
+        if (o.ctors.count(l->name)) return true;
+      return c->arg && oapp_chk_pat(**c->arg, o, d + 1);
+    }
+    if (auto* c = std::get_if<Ppat_constraint>(&p.desc))
+      return ty_names(*c->t, o.types) || oapp_chk_pat(*c->p, o, d + 1);
+    if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
+      for (auto& e : t->elems) if (oapp_chk_pat(*e, o, d + 1)) return true;
+      return false;
+    }
+    if (auto* a = std::get_if<Ppat_alias>(&p.desc)) return oapp_chk_pat(*a->p, o, d + 1);
+    if (auto* r = std::get_if<Ppat_or>(&p.desc))
+      return oapp_chk_pat(*r->l, o, d + 1) || oapp_chk_pat(*r->r, o, d + 1);
+    if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
+      for (auto& f : r->fields) if (oapp_chk_pat(*f.second, o, d + 1)) return true;
+      return false;
+    }
+    if (auto* a = std::get_if<Ppat_array>(&p.desc)) {
+      for (auto& e : a->elems) if (oapp_chk_pat(*e, o, d + 1)) return true;
+      return false;
+    }
+    if (auto* l = std::get_if<Ppat_lazy>(&p.desc)) return oapp_chk_pat(*l->p, o, d + 1);
+    if (auto* x = std::get_if<Ppat_open>(&p.desc)) return oapp_chk_pat(*x->p, o, d + 1);
+    if (auto* v = std::get_if<Ppat_variant>(&p.desc)) return v->arg && oapp_chk_pat(**v->arg, o, d + 1);
+    return false;
+  }
+  // Every pattern and annotation the binding's own type is read off: its
+  // parameters and the matches on them, and any constraint on the way.
+  static bool oapp_chk_ex(const Expression& e, const Oapp& o, int d = 0) {
+    if (d > 64) return false;
+    if (auto* f = std::get_if<Pexp_function>(&e.desc)) {
+      if (f->constraint_)
+        if (auto* c = std::get_if<Pconstraint>(&*f->constraint_))
+          if (ty_names(*c->type, o.types)) return true;
+      for (auto& pr : f->params)
+        if (auto* pv = std::get_if<Pparam_val>(&pr.desc))
+          if (oapp_chk_pat(pv->pat, o, d + 1)) return true;
+      if (auto* fb = std::get_if<Pfunction_body>(&f->body->v))
+        return oapp_chk_ex(*fb->e, o, d + 1);
+      auto& fc = std::get<Pfunction_cases>(f->body->v);
+      for (auto& c : fc.cases)
+        if (oapp_chk_pat(c.lhs, o, d + 1) || oapp_chk_ex(*c.rhs, o, d + 1)) return true;
+      return false;
+    }
+    if (auto* l = std::get_if<Pexp_let>(&e.desc)) return oapp_chk_ex(*l->body, o, d + 1);
+    if (auto* q = std::get_if<Pexp_sequence>(&e.desc)) return oapp_chk_ex(*q->e2, o, d + 1);
+    if (auto* n = std::get_if<Pexp_newtype>(&e.desc)) return oapp_chk_ex(*n->body, o, d + 1);
+    if (auto* si = std::get_if<Pexp_struct_item>(&e.desc)) return oapp_chk_ex(*si->body, o, d + 1);
+    if (auto* m = std::get_if<Pexp_match>(&e.desc)) {
+      // A match on a NAME is a match on a parameter, whose type the
+      // patterns fix; one on any other expression fixes nothing saved.
+      const bool named = std::holds_alternative<Pexp_ident>(m->e->desc);
+      for (auto& c : m->cases) {
+        if (named && oapp_chk_pat(c.lhs, o, d + 1)) return true;
+        if (oapp_chk_ex(*c.rhs, o, d + 1)) return true;
+      }
+      return false;
+    }
+    if (auto* i = std::get_if<Pexp_ifthenelse>(&e.desc))
+      return oapp_chk_ex(*i->then_, o, d + 1) ||
+             (i->else_ && oapp_chk_ex(**i->else_, o, d + 1));
+    if (auto* c = std::get_if<Pexp_constraint>(&e.desc))
+      return ty_names(*c->t, o.types) || oapp_chk_ex(*c->e, o, d + 1);
+    // `ignore (match x with ..)`: the parameter is matched inside.
+    if (auto* a = std::get_if<Pexp_apply>(&e.desc)) {
+      for (auto& [_, x] : a->args)
+        if (oapp_chk_ex(*x, o, d + 1)) return true;
+      return false;
+    }
+    return false;
+  }
+  static bool oapp_chk_binding(const ValueBinding& b, const Oapp& o) {
+    if (b.constraint_)
+      if (auto* c = std::get_if<Pvc_constraint>(&*b.constraint_))
+        if (ty_names(*c->typ, o.types)) return true;
+    if (oapp_chk_pat(b.pat, o)) return true;
+    if (oapp_chk_ex(*b.expr, o)) return true;
+    return tail_of(*b.expr, o, {});
+  }
+  // The scan over what follows the open: `typ` and `chk` are set when the
+  // triggers are met.
+  struct OappHit { bool typ = false, chk = false; };
+  static void oapp_scan_ex(const Expression& e, const Oapp& o, OappHit& h, int d = 0);
+  static void oapp_scan_items(const std::vector<StructureItem>& items, size_t from,
+                              const Oapp& o, OappHit& h, int d);
+  static void oapp_scan_mexpr(const ModuleExpr& m, const Oapp& o, OappHit& h, int d) {
+    if (d > 64) return;
+    if (auto* st = std::get_if<Pmod_structure>(&m.desc))
+      oapp_scan_items(st->items, 0, o, h, d + 1);
+    else if (auto* f = std::get_if<Pmod_functor>(&m.desc))
+      oapp_scan_mexpr(*f->body, o, h, d + 1);
+    else if (auto* c = std::get_if<Pmod_constraint>(&m.desc))
+      oapp_scan_mexpr(*c->me, o, h, d + 1);
+  }
+  static void oapp_scan_item(const StructureItem& it, const Oapp& o, OappHit& h, int d) {
+    if (auto* v = std::get_if<Pstr_value>(&it.desc)) {
+      for (auto& b : v->bindings) {
+        if (!h.chk && oapp_chk_binding(b, o)) h.chk = true;
+        if (!h.typ && b.constraint_)
+          if (auto* c = std::get_if<Pvc_constraint>(&*b.constraint_))
+            if (ty_names(*c->typ, o.ptypes)) h.typ = true;
+        if (!h.typ) oapp_scan_ex(*b.expr, o, h, d + 1);
+      }
+    } else if (auto* e = std::get_if<Pstr_eval>(&it.desc)) {
+      if (!h.typ) oapp_scan_ex(*e->e, o, h, d + 1);
+    } else if (auto* m = std::get_if<Pstr_module>(&it.desc)) {
+      oapp_scan_mexpr(m->binding.expr, o, h, d + 1);
+    } else if (auto* m = std::get_if<Pstr_recmodule>(&it.desc)) {
+      for (auto& b : m->bindings) oapp_scan_mexpr(b.expr, o, h, d + 1);
+    } else if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
+      oapp_scan_mexpr(i->expr, o, h, d + 1);
+    }
+  }
+  // The whole charge for one structure's opens of applications.
+  long long oapp_open(const std::vector<StructureItem>& items, int d = 0) const {
+    if (opapp_off() || d > 32) return 0;
+    long long k = 0;
+    for (size_t i = 0; i < items.size(); ++i) {
+      if (auto* o = std::get_if<Pstr_open>(&items[i].desc)) {
+        if (!std::holds_alternative<Pmod_apply>(o->expr.desc)) continue;
+        Oapp a;
+        if (!oapp_of(o->expr, a) || a.types.empty()) continue;
+        OappHit h;
+        oapp_scan_items(items, i + 1, a, h, 0);
+        if (h.typ) k += a.p + 2 * a.r;
+        if (h.chk) k += a.vd ? a.r : a.p + 2 * a.r;
+      } else if (auto* m = std::get_if<Pstr_module>(&items[i].desc)) {
+        k += oapp_open_mexpr(m->binding.expr, d + 1);
+      } else if (auto* m = std::get_if<Pstr_recmodule>(&items[i].desc)) {
+        for (auto& b : m->bindings) k += oapp_open_mexpr(b.expr, d + 1);
+      } else if (auto* inc = std::get_if<Pstr_include>(&items[i].desc)) {
+        k += oapp_open_mexpr(inc->expr, d + 1);
+      }
+    }
+    return k;
+  }
+  long long oapp_open_mexpr(const ModuleExpr& m, int d) const {
+    if (auto* st = std::get_if<Pmod_structure>(&m.desc)) return oapp_open(st->items, d);
+    if (auto* f = std::get_if<Pmod_functor>(&m.desc)) return oapp_open_mexpr(*f->body, d + 1);
+    if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) return oapp_open_mexpr(*c->me, d + 1);
+    return 0;
   }
 
   // ---- WHAT A `with` COSTS A SECOND TIME UNDER A `module rec` -------------
@@ -35657,6 +36095,9 @@ struct Count {
               opmods.push_back(ot);
         }
       n += gen ? ren_mexpr(o->expr, Sibs{}) : exports(o->expr);
+      // `ren_mexpr` cannot read an application; the open re-binds its
+      // result exactly as an include does.
+      if (gen && !opapp_off()) n += app_charge(o->expr, flat(), false, true);
     // A class costs three idents before anything of it is read:
     // `type_classes` (typeclass.ml:1897) creates the class, its class type
     // and its object type in one go, for a declaration and a description
@@ -35831,6 +36272,97 @@ long long appres_force(const Structure& s, const ModuleExpr& me,
     return 0;
   return Count::ren_mty(*decl);
 }
+bool Count::oapp_typ_ex(const Expression& e, const Oapp& o, int d) {
+  if (d > 64) return false;
+  auto go = [&](const Expression& x) { return oapp_typ_ex(x, o, d + 1); };
+  if (auto* a = std::get_if<Pexp_apply>(&e.desc)) {
+    if (auto* i = std::get_if<Pexp_ident>(&a->fn->desc))
+      if (auto* l = std::get_if<Lident>(&i->id.txt.v))
+        if (o.rets.count(l->name)) return true;
+    for (auto& [_, x] : a->args) if (oapp_arg_of(*x, o)) return true;
+    if (go(*a->fn)) return true;
+    for (auto& [_, x] : a->args) if (go(*x)) return true;
+    return false;
+  }
+  if (auto* c = std::get_if<Pexp_construct>(&e.desc)) {
+    if (auto* l = std::get_if<Lident>(&c->id.txt.v))
+      if (o.pctors.count(l->name)) return true;
+    return c->arg && go(**c->arg);
+  }
+  if (auto* c = std::get_if<Pexp_constraint>(&e.desc))
+    return ty_names(*c->t, o.ptypes) || go(*c->e);
+  if (auto* f = std::get_if<Pexp_function>(&e.desc)) {
+    if (f->constraint_)
+      if (auto* c = std::get_if<Pconstraint>(&*f->constraint_))
+        if (ty_names(*c->type, o.ptypes)) return true;
+    for (auto& pr : f->params)
+      if (auto* pv = std::get_if<Pparam_val>(&pr.desc)) {
+        if (oapp_typ_pat(pv->pat, o, d + 1)) return true;
+        if (pv->default_ && go(**pv->default_)) return true;
+      }
+    if (auto* fb = std::get_if<Pfunction_body>(&f->body->v)) return go(*fb->e);
+    return oapp_typ_cases(std::get<Pfunction_cases>(f->body->v).cases, o, d);
+  }
+  if (auto* l = std::get_if<Pexp_let>(&e.desc)) {
+    for (auto& b : l->bindings) {
+      if (oapp_typ_pat(b.pat, o, d + 1) || go(*b.expr)) return true;
+      if (b.constraint_)
+        if (auto* c = std::get_if<Pvc_constraint>(&*b.constraint_))
+          if (ty_names(*c->typ, o.ptypes)) return true;
+    }
+    return go(*l->body);
+  }
+  if (auto* m = std::get_if<Pexp_match>(&e.desc))
+    return go(*m->e) || oapp_typ_cases(m->cases, o, d);
+  if (auto* t = std::get_if<Pexp_try>(&e.desc))
+    return go(*t->e) || oapp_typ_cases(t->cases, o, d);
+  if (auto* t = std::get_if<Pexp_tuple>(&e.desc)) {
+    for (auto& x : t->elems) if (go(*x)) return true;
+    return false;
+  }
+  if (auto* i = std::get_if<Pexp_ifthenelse>(&e.desc))
+    return go(*i->cond) || go(*i->then_) || (i->else_ && go(**i->else_));
+  if (auto* q = std::get_if<Pexp_sequence>(&e.desc)) return go(*q->e1) || go(*q->e2);
+  if (auto* r = std::get_if<Pexp_record>(&e.desc)) {
+    for (auto& [_, x] : r->fields) if (go(*x)) return true;
+    return r->base && go(**r->base);
+  }
+  if (auto* f = std::get_if<Pexp_field>(&e.desc)) return go(*f->e);
+  if (auto* a = std::get_if<Pexp_assert>(&e.desc)) return go(*a->e);
+  if (auto* z = std::get_if<Pexp_lazy>(&e.desc)) return go(*z->e);
+  if (auto* w = std::get_if<Pexp_while>(&e.desc)) return go(*w->cond) || go(*w->body);
+  if (auto* f = std::get_if<Pexp_for>(&e.desc)) return go(*f->lo) || go(*f->hi) || go(*f->body);
+  if (auto* v = std::get_if<Pexp_variant>(&e.desc)) return v->arg && go(**v->arg);
+  if (auto* n = std::get_if<Pexp_newtype>(&e.desc)) return go(*n->body);
+  if (auto* si = std::get_if<Pexp_struct_item>(&e.desc)) {
+    OappHit h;
+    oapp_scan_item(*si->item, o, h, d + 1);
+    return h.typ || go(*si->body);
+  }
+  if (auto* s = std::get_if<Pexp_setfield>(&e.desc)) return go(*s->obj) || go(*s->value);
+  if (auto* c = std::get_if<Pexp_coerce>(&e.desc)) return go(*c->e);
+  if (auto* s = std::get_if<Pexp_send>(&e.desc)) return go(*s->obj);
+  if (auto* a = std::get_if<Pexp_array>(&e.desc)) {
+    for (auto& x : a->elems) if (go(*x)) return true;
+    return false;
+  }
+  if (auto* lo = std::get_if<Pexp_letop>(&e.desc)) {
+    if (go(*lo->let_.exp)) return true;
+    for (auto& a : lo->ands) if (go(*a.exp)) return true;
+    return go(*lo->body);
+  }
+  if (auto* p = std::get_if<Pexp_poly>(&e.desc)) return go(*p->e);
+  return false;
+}
+void Count::oapp_scan_ex(const Expression& e, const Oapp& o, OappHit& h, int d) {
+  if (!h.typ && oapp_typ_ex(e, o, d)) h.typ = true;
+}
+void Count::oapp_scan_items(const std::vector<StructureItem>& items, size_t from,
+                            const Oapp& o, OappHit& h, int d) {
+  if (d > 64) return;
+  for (size_t i = from; i < items.size(); ++i) oapp_scan_item(items[i], o, h, d);
+}
+
 }  // namespace stampcount
 
 // The package nodes the SAVED signature's values carry, at the weight the
@@ -36070,7 +36602,8 @@ int typing_ident_count(const ast::Structure& s, std::size_t eta_sites,
   c.pk_push();
   for (auto& it : s) c.item(it);
   c.pk_pop();
-  long long k = c.n + c.nd_open(s) + stampcount::modforce_cost(s, u);
+  long long k = c.n + c.nd_open(s) + c.oapp_open(s) +
+                stampcount::modforce_cost(s, u);
   if (!dbg_env("NOUNITLOAD"))
     k += u.cost(!dbg_env("NOEXTRALOAD"), !dbg_env("NOSUBLOAD"),
                 !dbg_env("NOAPPRES"));
