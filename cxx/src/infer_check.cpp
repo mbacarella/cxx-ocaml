@@ -20599,6 +20599,16 @@ bool chkarrow_off() {
   static const bool off = dbg_env("NOCHKARROW") != nullptr;
   return off;
 }
+// S520: a functor type written inline in a functor parameter's type is
+// renamed and compared with no shape at every check that pairs the functor,
+// and an application of a functor PARAMETER is read off the parameter's
+// declared type -- substituted, cascaded, expanded by the inferred-signature
+// check and walked by a `module rec`'s rounds.  `NOPARFUN=1` reverts the
+// whole slice.
+bool parfun_off() {
+  static const bool off = dbg_env("NOPARFUN") != nullptr;
+  return off;
+}
 bool tofp_off() {
   static const bool off = dbg_env("NOTOFPATH") != nullptr;
   return off;
@@ -25032,6 +25042,11 @@ struct Count {
   // result signature the .cmi carries is paid once per (functor, argument);
   // the parameter and the strengthening are paid once per functor.
   std::set<std::string> fpar, farg, fstr, fseen;
+  // Which functor PARAMETERS the inferred-signature check has built the
+  // components of (`pfcomps_`, by the parameter's declared type) and which
+  // applications of them (`pfappl_`, by the argument paths on top).
+  std::set<const ModuleType*> pfcomps_;
+  std::set<std::string> pfappl_;
   // Which LOCAL functors this file has applied already: the strengthening
   // of a result is paid once per (functor, argument), and once more --
   // and one ident over -- for the FIRST application of the functor.
@@ -29398,8 +29413,10 @@ struct Count {
   long long fcas(const ModuleExpr& m) const {
     if (auto* f = std::get_if<Pmod_functor>(&m.desc)) {
       long long k = fcas(*f->body) + par_uses(*f);
-      if (auto* nm = std::get_if<Functor_named>(&f->param))
+      if (auto* nm = std::get_if<Functor_named>(&f->param)) {
         if (nm->name.txt) ++k;
+        if (nm->type) k += pfun_named(*nm->type);
+      }
       return k;
     }
     if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
@@ -29908,6 +29925,128 @@ struct Count {
     }
     return false;
   }
+  // ---- AN APPLICATION OF A FUNCTOR PARAMETER (S520) ----------------------
+  // `module Z = F (A)` where F is a parameter of an enclosing functor: the
+  // head is typed strengthened (`type_module ~strengthen`, every argument a
+  // path), which scrapes a result written as a NAME into its signature and
+  // hands every manifest-less type of it `F (X).t`; the application then
+  // substitutes the result (`type_one_application`, typemod.ml:2704: eager,
+  // one ident per item at every depth), and the cascade renames what it
+  // bound where it stands.  An `include` binds it once more, in full.  Where
+  // the binding is SAVED at that type the inferred-signature check compares
+  // the strengthened manifests (`Includecore.type_manifest` expands both
+  // sides), and `Env.find_type` on `F (A).t` builds, in the check's own
+  // environment, F's `Functor_comps` -- its result forced in full, and a
+  // literal parameter signature with it -- once per parameter, and the
+  // components of `F (A)` -- the result substituted once more -- once per
+  // argument; a result written as a name has nothing there to rename, and a
+  // result with no manifest-less type is never expanded.  A `module rec`
+  // binding's rounds substitute the actual signature once apiece
+  // (`recapp`).  An argument with no path takes `nondep_supertype` and is
+  // left alone; a partial application is not modelled.  `NOPARFUN=1`
+  // reverts.
+  // The result of applying the parameter's type to `nargs` arguments, the
+  // module type names on the way resolved; null where the type is not that
+  // functor, or where the result is one (a partial application).
+  const ModuleType* pf_result(const ModuleType& pt, int nargs) const {
+    const ModuleType* t = &pt;
+    for (int i = 0; i < nargs; ++i) {
+      if (auto* id = std::get_if<Pmty_ident>(&t->desc))
+        t = named_mty(id->id.txt, 8);
+      auto* f = t ? std::get_if<Pmty_functor>(&t->desc) : nullptr;
+      if (!f || !std::holds_alternative<Functor_named>(f->param))
+        return nullptr;
+      t = f->body.get();
+    }
+    const ModuleType* r = t;
+    if (auto* id = std::get_if<Pmty_ident>(&t->desc))
+      if (const ModuleType* d = named_mty(id->id.txt, 8)) r = d;
+    return std::holds_alternative<Pmty_functor>(r->desc) ? nullptr : t;
+  }
+  // The declared type of the functor a head names through an enclosing
+  // functor's parameter: the parameter itself, or a module a signature it
+  // is written at declares.
+  const ModuleType* pf_head(const ModuleExpr& head) const {
+    auto* pi = std::get_if<Pmod_ident>(&head.desc);
+    if (!pi) return nullptr;
+    std::vector<std::string> c;
+    if (!lid_path(pi->id.txt, c) || c.empty()) return nullptr;
+    auto f = fmods.find(c[0]);
+    if (f == fmods.end() || f->second.empty()) return nullptr;
+    const ModuleType* t = f->second.back();
+    for (std::size_t i = 1; t && i < c.size(); ++i) {
+      const Signature* sg = mty_sig(t);
+      t = nullptr;
+      if (!sg) return nullptr;
+      for (auto& it : *sg)
+        if (auto* m = std::get_if<Psig_module>(&it.desc))
+          if (m->md.name.txt && *m->md.name.txt == c[i]) t = m->md.type.get();
+    }
+    return t;
+  }
+  static bool pf_paths(const ModuleExpr& m, std::string& key) {
+    for (const ModuleExpr* h = &m;;) {
+      auto* a = std::get_if<Pmod_apply>(&h->desc);
+      if (!a) return true;
+      if (!has_path(*a->arg)) return false;
+      if (auto* pi = std::get_if<Pmod_ident>(&a->arg->desc))
+        key += "(" + lid_full(pi->id.txt) + ")";
+      else
+        key += "(" + std::to_string((std::uintptr_t)a->arg.get()) + ")";
+      h = a->f.get();
+    }
+  }
+  // The result's items in full, the destructive constraints taken out.
+  long long pf_deep(const ModuleType& r) const {
+    if (const Signature* sg = mty_sig(&r)) return w_ren(*sg, res_gone(r));
+    std::string key;
+    if (const cmi::Signature* cs = xmty_sig(&r, key)) return flat_csig(*cs);
+    return 0;
+  }
+  // What one round of a `module rec` substitutes of the application.
+  long long pf_rounds(const ModuleExpr& m, const ModuleType& pt,
+                      int nargs) const {
+    std::string key;
+    const ModuleType* r = pf_result(pt, nargs);
+    return r && pf_paths(m, key) ? pf_deep(*r) : 0;
+  }
+  long long pfapp_charge(const ModuleExpr& m, const ModuleType& pt, int nargs,
+                         const Lvl& l, bool rebind) {
+    const ModuleType* r = pf_result(pt, nargs);
+    std::string key = std::to_string((std::uintptr_t)&pt);
+    if (!r || !pf_paths(m, key)) return 0;
+    if (rebind) return pf_deep(*r);
+    const Signature* sg = mty_sig(r);
+    long long k = 0;
+    if (sg) {
+      k = w_wt(*sg, l, res_gone(*r));
+    } else {
+      std::string xk;
+      const cmi::Signature* cs = xmty_sig(r, xk);
+      if (!cs) return 0;
+      k = wt_csig(*cs, l);
+    }
+    if (!saved_ || inexpr_ || mdiscard_ ||
+        std::holds_alternative<Pmty_ident>(r->desc))
+      return k;
+    // A type a `with` hands a manifest to is not rebuilt; one it takes out
+    // is not there.
+    std::set<std::string> conc;
+    res_conc(*r, conc);
+    for (auto& g : res_gone(*r))
+      if (g.size() == 1) conc.insert(g[0]);
+    if (sg ? !str_sigc(*sg, conc) : true) return k;
+    const long long deep = pf_deep(*r);
+    if (pfcomps_.insert(&pt).second) {
+      k += deep;
+      if (auto* f = std::get_if<Pmty_functor>(&pt.desc))
+        if (auto* nm = std::get_if<Functor_named>(&f->param))
+          if (nm->type && !std::holds_alternative<Pmty_ident>(nm->type->desc))
+            k += pf_deep(*nm->type);
+    }
+    if (pfappl_.insert(key).second) k += deep;
+    return k;
+  }
   // The functor of ANOTHER unit is read out of its `.cmi` the same way: one
   // ident per item of the result, at every depth.
   long long xrecapp(const ModuleExpr& head, int nargs) const {
@@ -30009,6 +30148,8 @@ struct Count {
     }
     if (!nargs) return 0;
     const ModuleExpr* me = mderef(h);
+    if (!me && !parfun_off())
+      if (const ModuleType* pt = pf_head(*h)) return pf_rounds(m, *pt, nargs);
     if (!me) return mty_named(decl) ? xrecapp(*h, nargs) : 0;
     long long uses = 0;
     for (int i = 0; i < nargs; ++i) {
@@ -30027,7 +30168,15 @@ struct Count {
       uses = b == f->body.get() ? par_uses(*f) : 0;
       me = b;
     }
-    return dupval_free(*me) ? ren_mexpr(*me, Sibs{}) + uses : 0;
+    if (!dupval_free(*me)) return 0;
+    // A result ascribed by a module type NAME is scraped where the head is
+    // strengthened, and the rounds then rename the signature the name
+    // stands for (S520; `ren_mty` reads a name as nothing).
+    long long named = 0;
+    if (!parfun_off())
+      if (auto* c = std::get_if<Pmod_constraint>(&me->desc))
+        if (mty_named(c->mt.get())) named = pf_deep(*c->mt);
+    return ren_mexpr(*me, Sibs{}) + uses + named;
   }
   // QUADRATIC: `check_recmodule_inclusion` (typemod.ml:2182) runs one round per
   // binding and each round names a fresh Y_i for EVERY binding, while
@@ -30199,8 +30348,10 @@ struct Count {
     }
     if (auto* f = std::get_if<Pmty_functor>(&mt.desc)) {
       long long k = wt_mty(*f->body, l);
-      if (auto* nm = std::get_if<Functor_named>(&f->param))
+      if (auto* nm = std::get_if<Functor_named>(&f->param)) {
         if (nm->name.txt) k += l.a;
+        if (nm->type) k += l.a * pfun_named(*nm->type);
+      }
       return k;
     }
     if (auto* w = std::get_if<Pmty_with>(&mt.desc)) return wt_mty(*w->mt, l);
@@ -30248,8 +30399,10 @@ struct Count {
       return wt_mty(*c->mt, l);
     if (auto* f = std::get_if<Pmod_functor>(&m.desc)) {
       long long k = wt_mexpr(*f->body, l);
-      if (auto* nm = std::get_if<Functor_named>(&f->param))
+      if (auto* nm = std::get_if<Functor_named>(&f->param)) {
         if (nm->name.txt) k += l.a;
+        if (nm->type) k += l.a * pfun_named(*nm->type);
+      }
       return k;
     }
     return 0;
@@ -30308,8 +30461,10 @@ struct Count {
     }
     if (auto* f = std::get_if<Pmty_functor>(&mt.desc)) {
       long long k = ext_mty(*f->body, x);
-      if (auto* nm = std::get_if<Functor_named>(&f->param))
+      if (auto* nm = std::get_if<Functor_named>(&f->param)) {
         if (nm->name.txt) k += x.e;
+        if (nm->type) k += x.e * pfun_named(*nm->type);
+      }
       return k;
     }
     if (auto* w = std::get_if<Pmty_with>(&mt.desc)) return ext_mty(*w->mt, x);
@@ -30341,8 +30496,10 @@ struct Count {
       return ext_mty(*c->mt, x);
     if (auto* f = std::get_if<Pmod_functor>(&m.desc)) {
       long long k = ext_mexpr(*f->body, x);
-      if (auto* nm = std::get_if<Functor_named>(&f->param))
+      if (auto* nm = std::get_if<Functor_named>(&f->param)) {
         if (nm->name.txt) k += x.e;
+        if (nm->type) k += x.e * pfun_named(*nm->type);
+      }
       return k;
     }
     return 0;
@@ -34186,6 +34343,9 @@ struct Count {
       lfun_head(*head, me, mt);
       home = lhome_;
     }
+    if (!me && !mt && !ngen && !parfun_off())
+      if (const ModuleType* pt = pf_head(*head))
+        return pfapp_charge(m, *pt, nargs, l, rebind);
     if (!me && !mt)
       return ngen ? 0 : cross_charge(m, *head, nargs, l, saved, rebind);
     const ModuleExpr* fdef = me;
@@ -34466,6 +34626,8 @@ struct Count {
       if (std::holds_alternative<Pmod_ident>(c->me->desc) &&
           !same_named(*c->me, *c->mt))
         n += anon_path(*c->me) + arrows_in(*c->mt, 8, c->me.get());
+      if (!parfun_off() && !std::holds_alternative<Pmod_ident>(c->me->desc))
+        n += pfun_mty_params(*c->mt);
       asc_mty_ = amv;
       ascr_sig_ = asv;
       MtCtx sv = mtctx_;
@@ -34632,6 +34794,92 @@ struct Count {
       return anon_mty(i->mt, false, d);
     return 0;
   }
+  // ---- A FUNCTOR TYPE IN A PARAMETER IS CHECKED WITH NO SHAPE (S520) ------
+  // `Includemod.functor_param` (includemod.ml:659) substitutes a named
+  // parameter's declared type (`Subst.modtype Keep`, eager: it forces every
+  // signature it spans) and compares it against itself with
+  // `Shape.dummy_mod`.  A functor type written INLINE in that type -- the
+  // type itself, one nested in its parameter or its result, one a module or
+  // a module type of a literal signature in it declares -- is therefore one
+  // fresh shape variable per arrow (`try_modtypes`, includemod.ml:614: a
+  // dummy shape has no abstraction to decompose) and one rename per NAMED
+  // arrow (subst.ml:696), at every check that pairs the functor: the unit's
+  // own inclusion check for a saved binding, an ascription at a functor
+  // type, a signature an ascription declares the functor in (its own check,
+  // and the inferred-signature check where that is what is saved) and a
+  // module type declaration (the equivalence check, both ways).  A parameter
+  // typed by a module type NAME is `Mty_ident` against `Mty_ident` and pays
+  // nothing.  The cascade that renames the binding renames a named arrow
+  // nested in its parameter's type with it -- through functor types only, a
+  // signature on the way being left lazy.  `NOPARFUN=1` reverts.
+  // `e` is how many signature-typed modules enclose the arrow inside the
+  // type: the check strengthens each into an alias and expands it, which
+  // builds its components and forces its signature -- and a functor type
+  // declared in there is renamed once more for each.
+  static long long pfun_arrows(const ModuleType& mt, bool sigs, bool shapes,
+                               int e = 0, int d = 0) {
+    if (d > 24) return 0;
+    if (auto* f = std::get_if<Pmty_functor>(&mt.desc)) {
+      long long k =
+          (shapes ? 1 : 0) + pfun_arrows(*f->body, sigs, shapes, e, d + 1);
+      if (auto* nm = std::get_if<Functor_named>(&f->param)) {
+        if (nm->name.txt) k += 1 + e;
+        if (nm->type) k += pfun_arrows(*nm->type, sigs, shapes, e, d + 1);
+      }
+      return k;
+    }
+    if (auto* w = std::get_if<Pmty_with>(&mt.desc))
+      return pfun_arrows(*w->mt, sigs, shapes, e, d + 1);
+    auto* s = std::get_if<Pmty_signature>(&mt.desc);
+    if (!s || !sigs) return 0;
+    long long k = 0;
+    for (auto& it : s->items) {
+      if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+        k += pfun_arrows(*m->md.type, sigs, shapes, pfun_in(*m->md.type, e),
+                         d + 1);
+      } else if (auto* m = std::get_if<Psig_recmodule>(&it.desc)) {
+        for (auto& dc : m->decls)
+          k += pfun_arrows(*dc.type, sigs, shapes, pfun_in(*dc.type, e), d + 1);
+      } else if (auto* m = std::get_if<Psig_modtype>(&it.desc)) {
+        if (m->type) k += pfun_arrows(*m->type, sigs, shapes, e, d + 1);
+      } else if (auto* i = std::get_if<Psig_include>(&it.desc)) {
+        k += pfun_arrows(i->mt, sigs, shapes, e, d + 1);
+      }
+    }
+    return k;
+  }
+  static int pfun_in(const ModuleType& mt, int e) {
+    return std::holds_alternative<Pmty_functor>(mt.desc) ? e : e + 1;
+  }
+  // The named arrows a cascade rename reaches in a parameter's type.
+  static long long pfun_named(const ModuleType& mt) {
+    return parfun_off() ? 0 : pfun_arrows(mt, false, false);
+  }
+  // What one check of a functor TYPE costs for its parameters' types.
+  static long long pfun_mty_params(const ModuleType& mt) {
+    long long k = 0;
+    for (const ModuleType* t = &mt;;) {
+      auto* f = std::get_if<Pmty_functor>(&t->desc);
+      if (!f) break;
+      if (auto* nm = std::get_if<Functor_named>(&f->param))
+        if (nm->type) k += pfun_arrows(*nm->type, true, true);
+      t = f->body.get();
+    }
+    return k;
+  }
+  // The same for a functor BINDING, at the type the binding saves: an
+  // ascription's where there is one, the functor's own parameters otherwise.
+  static long long pfun_params(const ModuleExpr& m, int d = 0) {
+    if (d > 24) return 0;
+    if (auto* c = std::get_if<Pmod_constraint>(&m.desc))
+      return pfun_mty_params(*c->mt);
+    auto* f = std::get_if<Pmod_functor>(&m.desc);
+    if (!f) return 0;
+    long long k = pfun_params(*f->body, d + 1);
+    if (auto* nm = std::get_if<Functor_named>(&f->param))
+      if (nm->type) k += pfun_arrows(*nm->type, true, true);
+    return k;
+  }
   // The same "Arg" ident, where the unit's OWN inclusion check strengthens a
   // functor BINDING of a structure: one apiece, flat, at any depth.  A
   // `module rec` binding and a structure an ascription HIDES pay nothing.
@@ -34647,6 +34895,15 @@ struct Count {
     if (auto* nm = std::get_if<Functor_named>(&f->param))
       if (!nm->name.txt) ++k;
     return k;
+  }
+  // How many checks pair a functor declared in the module type being
+  // walked: a declared module type is checked for equivalence both ways,
+  // an ascription once by its own check and once more by the
+  // inferred-signature check where the ascription is what is saved.
+  long long pfun_checks(const Lvl& l) const {
+    if (mtctx_ == MtCtx::Decl) return 2;
+    if (mtctx_ != MtCtx::Ascr) return 0;
+    return 1 + (saved_ && !inexpr_ && !is_dead(l) ? 1 : 0);
   }
   long long mtfun_wt(const Pmty_functor& f, const Lvl& l) const {
     if (mtctx_ == MtCtx::Other) return 0;
@@ -34680,6 +34937,9 @@ struct Count {
       sig_items(s->items, l);
     } else if (auto* f = std::get_if<Pmty_functor>(&mt.desc)) {
       n += mtfun_wt(*f, l);
+      if (mtctx_ != MtCtx::Other)
+        if (auto* nm = std::get_if<Functor_named>(&f->param))
+          if (nm->type) n += (l.a - 1) * pfun_named(*nm->type);
       fparam(f->param, l);
       mty(*f->body, l);
     } else if (auto* w = std::get_if<Pmty_with>(&mt.desc)) {
@@ -34802,6 +35062,9 @@ struct Count {
           std::holds_alternative<Pmty_functor>(m->md.type->desc) &&
           fexp_->count(fxkey()))
         n += fexp_self_mty(m->md.type.get());
+      if (!parfun_off() &&
+          std::holds_alternative<Pmty_functor>(m->md.type->desc))
+        n += pfun_checks(l) * pfun_mty_params(*m->md.type);
       mty(*m->md.type, sub(l));
       if (fxp) fxpath_.pop_back();
     } else if (auto* m = std::get_if<Psig_recmodule>(&it.desc)) {
@@ -34906,6 +35169,10 @@ struct Count {
                           sig_binds_mod(*chkd_sig_, *m->binding.name.txt);
       if (!anonfun_off() && ((saved_ && !inexpr_) || paired))
         n += anon_mexpr(m->binding.expr);
+      // A binding an ascription pairs is charged with the signature's
+      // item: one substitution of the declared type per check.
+      if (!parfun_off() && saved_ && !inexpr_)
+        n += pfun_params(m->binding.expr);
       const Signature* asv = ascr_sig_;
       const bool dsv = mdiscard_;
       const bool dtv = mdisctop_;
