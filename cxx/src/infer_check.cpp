@@ -20542,6 +20542,15 @@ bool privfx_off() {
   static const bool off = dbg_env("NOPRIVFX") != nullptr;
   return off;
 }
+// S513: a functor applied out of a SUBMODULE of another unit builds that
+// submodule's components a second time, a submodule reached under the
+// unit's own name is forced once with its parameters renamed twice, and a
+// parameter's module type is expanded once per file whichever unit's
+// functor names it (`NOSUBAPP=1` reverts all three).
+bool subapp_off() {
+  static const bool off = dbg_env("NOSUBAPP") != nullptr;
+  return off;
+}
 bool tof_off() {
   static const bool off = dbg_env("NOTYPEOF") != nullptr;
   return off;
@@ -22114,6 +22123,21 @@ struct Cites {
         if (has(name)) return true;
     return false;
   }
+  // Does the file APPLY a functor of this submodule -- `Ephemeron.K1.Make
+  // (S)`, `MoreLabels.Hashtbl.Make (S)`?
+  bool sub_applied(const std::string& src, const std::string& sub,
+                   const cmi::Signature& sg) const {
+    for (auto& fa : fapps) {
+      std::vector<std::string> c = fa.first;
+      if (c.size() > 2 && c[0] == "Stdlib") c.erase(c.begin());
+      if (c.size() < 3 || c[0] != src || c[1] != sub) continue;
+      for (auto& md : sg.modules)
+        if (md.name == c[2] && md.type &&
+            md.type->kind == cmi::ModuleType::Functor)
+          return true;
+    }
+    return false;
+  }
   // Which submodules of `c` does the file NAME -- the `Deep` of
   // `Effect.Deep.try_with` or of `open Effect.Deep`?  Naming one forces its
   // own signature in turn AND forces the parent's a second time: `open
@@ -22432,10 +22456,20 @@ struct Cites {
         for (auto& au : alias_subs(m, c.sig()))
           if (more[au] < 1) more[au] = 1;
         for (auto& s : subs) {
-          k += load_cost(*s.second, extra);
+          // Through one of Stdlib's aliases a submodule is STRENGTHENED
+          // where the path is looked up (one rename per item, its functors'
+          // parameters once) and its components are built again, by path,
+          // where a type of it is expanded or a functor of it is applied
+          // (`Env.normalize_module_path` on the strengthened alias
+          // `Ephemeron.K1.Make`, typemod.ml:2484): items once more, the
+          // parameters twice.  Under the unit's own name the two paths share
+          // one components tree, built once with the parameters twice.
+          k += load_cost(*s.second, extra, aliased || subapp_off() ? 1 : 2);
           Applied b;
           scan_applied(m + "." + s.first, true, *s.second, b, app);
-          if (b.self && aliased) k += load_cost(*s.second, extra, 2);
+          if (aliased && (b.self || (!subapp_off() &&
+                                     sub_applied(m, s.first, *s.second))))
+            k += load_cost(*s.second, extra, 2);
           for (auto& e : b.units)
             if (more[e.first] < e.second) more[e.first] = e.second;
         }
@@ -31464,17 +31498,20 @@ struct Count {
       if (mt->functor_param && fpar.insert(key + std::to_string(i)).second) {
         const cmi::ModuleType* pt =
             scrape_cmty(mt->functor_param_type.get(), root);
-        // The parameter's own signature is the expansion `xforce` caches,
-        // but only where the .cmi names it out of the functor's OWN unit:
-        // `Ephemeron.K1.MakeSeeded (H : Hashtbl.SeededHashedType)` builds it
-        // again for every functor that reaches ACROSS a unit boundary for
-        // it, where `Map.Make` and a `module F (X : Map.OrderedType)` beside
-        // it build `Map.OrderedType` once between them.
+        // The parameter's own signature is the expansion `xforce` caches:
+        // `Env.find_modtype_expansion` hands every functor the ONE lazy
+        // declaration the .cmi was decoded into, whichever unit the functor
+        // is in, so `Weak.Make (S)` beside `Hashtbl.Make (S)` builds
+        // `Hashtbl.HashedType` once between them, as `Map.Make` and a
+        // `module F (X : Map.OrderedType)` build `Map.OrderedType` once.
+        // S491 excepted a functor that reaches ACROSS a unit boundary
+        // (`Ephemeron.K1.MakeSeeded`) -- what it measured was the
+        // submodule's second components pass, charged in `Cites::cost` now.
         const cmi::ModuleType* praw = mt->functor_param_type.get();
         const bool own = praw && praw->kind == cmi::ModuleType::Ident &&
                          praw->path && praw->path->kind == cmi::Path::Pident;
         if (pt && pt->kind == cmi::ModuleType::Sig && pt->sig &&
-            (xparshare_off() || !own ||
+            (xparshare_off() || (!own && subapp_off()) ||
              wscraped.insert(sig_key(pt->sig.get())).second))
           k += wt_csig(*pt->sig, Lvl{1, 1, 0, false});
       }
