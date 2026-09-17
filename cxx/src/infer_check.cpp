@@ -21298,6 +21298,491 @@ struct Cites {
   }
   bool opened(const LongidentLoc& id) { return opened(id.txt); }
 
+  // ---- A FIXED EXPECTED TYPE MEETS WHAT IS WRITTEN AT IT -----------------
+  // A type read through one of Stdlib's aliases is a MANIFEST: the alias's
+  // components are the unit's signature strengthened at its own path, so
+  // `Marshal.extern_flags` there stands for `Stdlib__Marshal.extern_flags`,
+  // and following that manifest (`Env.find_type` on the unit's own path)
+  // builds the persistent unit's OWN components -- one ident per top-level
+  // item, once per unit per file -- where the name lookup built only the
+  // alias's.  Typing follows it in two places.  A CONSTRUCTOR or a LABEL
+  // that is in lexical scope (qualified, or bare under an `open` or beside a
+  // local one) is disambiguated against a FIXED expected type by
+  // `expand_path` (typecore.ml:1461); and an INFERRED argument -- an
+  // identifier, an application, a field, a constraint, a method call --
+  // typed by `type_argument` (typecore.ml:6625) expands the expected type it
+  // meets, where `type_expect` alone links equal paths without a look.  So
+  // `Marshal.to_string 0 [Marshal.Closures]` is 11 + 11 where the tuple
+  // `(Marshal.to_string, Marshal.Closures)` is 11, `x = x` with
+  // `x : Marshal.extern_flags` written is 11 + 11 where `(x, x)` and `[x]`
+  // are 11 -- and the branches of an `if`, the arms of a `match` and the
+  // elements of an array, which `type_expect` types, meet nothing unless a
+  // later one is a constructor.  What FIXES the expected type is what the
+  // syntax says: a cited unit's value applied (its .cmi parameter types,
+  // with a type variable fixed by the first argument that carries a unit's
+  // own type), a local function's annotated parameters, a `let x : t`, a
+  // `(e : t)`, a function's result constraint, a constructor's declared
+  // arguments, a record label's field type; and a local binder annotated
+  // `(x : U.t)` -- or bound to what denotes one -- is an expression of that
+  // unit's type wherever it is read (`denotes`).  A statement, a `let _ = e`,
+  // an `ignore e` and a `for`/`while` body expand the expression's OWN type
+  // besides (`check_partial_application`, typecore.ml:4015).  `NOFIXMEET=1`
+  // reverts.
+  static bool fixmeet_off() {
+    static const bool off = dbg_env("NOFIXMEET") != nullptr;
+    return off;
+  }
+  // The expected type, as far as it is known: a .cmi type of a cited head's
+  // signature, a type written in this file, or just a unit's own type.
+  struct Exp {
+    const cmi::TypeExpr* c;
+    const cmi::Signature* sg;
+    std::string head;
+    const CoreType* p;
+    std::string unit;
+    std::shared_ptr<std::vector<Exp>> tup;  // what a tuple's components are
+    Exp() : c(nullptr), sg(nullptr), p(nullptr) {}
+    bool known() const { return c || p || !unit.empty() || tup; }
+  };
+  static Exp exp_c(const cmi::TypePtr& t, const cmi::Signature* sg,
+                   const std::string& head) {
+    Exp x;
+    x.c = spine(t);
+    x.sg = sg;
+    x.head = head;
+    return x;
+  }
+  static Exp exp_p(const CoreType* t) {
+    for (int i = 0; t && i < 8; ++i) {
+      if (auto* a = std::get_if<Ptyp_alias>(&t->desc)) t = a->type.get();
+      else if (auto* q = std::get_if<Ptyp_poly>(&t->desc)) t = q->type.get();
+      else break;
+    }
+    Exp x;
+    x.p = t;
+    return x;
+  }
+  static Exp exp_u(const std::string& u) {
+    Exp x;
+    x.unit = u;
+    return x;
+  }
+  // What an expression says of its OWN type: a unit's own type, or a tuple
+  // of what its components say -- `("-v", Arg.Set v, "doc")` beside another
+  // such triple fixes the second's `Arg.spec` component.
+  Exp exp_of(const Expression& e) const {
+    std::string u = denotes(e);
+    if (!u.empty()) return exp_u(u);
+    auto* t = std::get_if<Pexp_tuple>(&bare_exp(e)->desc);
+    if (!t) return Exp();
+    Exp x;
+    x.tup = std::make_shared<std::vector<Exp>>();
+    bool any = false;
+    for (auto& q : t->elems) {
+      x.tup->push_back(exp_of(*q));
+      any = any || x.tup->back().known();
+    }
+    return any ? x : Exp();
+  }
+  // Local values whose type the syntax fixes (binder -> unit head), local
+  // functions with annotated parameters or result, and the local
+  // constructors' argument types and record labels' field types.
+  std::map<std::string, std::string> vunit_;
+  struct LocalFn {
+    std::vector<std::pair<std::string, const CoreType*>> params;
+    const CoreType* res = nullptr;
+  };
+  std::map<std::string, LocalFn> lfns_;
+  std::map<std::string, std::vector<const CoreType*>> lctors_;
+  std::map<std::string, const CoreType*> llabels_;
+  // A .cmi type variable fixed by an earlier argument of the application
+  // being walked.
+  std::map<const cmi::TypeExpr*, std::string> tvar_;
+  // What a .cmi-typed meet asks to be forced, per cited head.
+  std::map<std::string, Applied> xmeets_;
+  bool dloc_ = true;  // `denotes` may read past what S450's rules read
+  static bool own_tdecl(const cmi::TypeDecl& d) {
+    return !d.manifest || (d.priv && d.kind == cmi::TypeDecl::Abstract);
+  }
+  const cmi::Signature* head_sig(const std::string& head) const {
+    std::string u = unit_of(head);
+    if (u.empty()) return nullptr;
+    std::string p = head_cmi(u);
+    if (p.empty() || !std::filesystem::exists(p)) return nullptr;
+    try {
+      return &cmi::CmiFile::load(p).sig();
+    } catch (...) {
+    }
+    return nullptr;
+  }
+  // The head a dotted path is written under, `Stdlib.` stripped: "" for a
+  // bare name or a deeper path.
+  static std::string path_head(const Longident& id, std::string& last) {
+    auto* d = std::get_if<Ldot>(&id.v);
+    if (!d) return {};
+    last = d->name;
+    if (auto* h = std::get_if<Lident>(&d->prefix->v))
+      return h->name == "Stdlib" ? std::string() : h->name;
+    if (auto* q = std::get_if<Ldot>(&d->prefix->v)) {
+      auto* h = std::get_if<Lident>(&q->prefix->v);
+      if (h && h->name == "Stdlib") return q->name;
+    }
+    return {};
+  }
+  bool unit_owns_type(const std::string& head, const std::string& n) const {
+    const cmi::Signature* sg = head_sig(head);
+    const cmi::TypeDecl* d = sg ? sig_tdecl(*sg, n) : nullptr;
+    return d && own_tdecl(*d);
+  }
+  bool unit_has_ctor(const std::string& head, const std::string& n) const {
+    const cmi::Signature* sg = head_sig(head);
+    if (!sg) return false;
+    for (auto& d : sg->types)
+      for (auto& k : d.ctors)
+        if (k.name == n) return true;
+    return false;
+  }
+  bool unit_has_label(const std::string& head, const std::string& n) const {
+    const cmi::Signature* sg = head_sig(head);
+    if (!sg) return false;
+    for (auto& d : sg->types)
+      for (auto& l : d.labels)
+        if (l.name == n) return true;
+    return false;
+  }
+  // The unit whose own type a WRITTEN type's head is, as the file cites it.
+  std::string unit_type(const CoreType& t) const {
+    const CoreType* q = exp_p(&t).p;
+    auto* c = q ? std::get_if<Ptyp_constr>(&q->desc) : nullptr;
+    if (!c) return {};
+    if (auto* l = std::get_if<Lident>(&c->id.txt.v)) {
+      if (!bare_ || tbound_.count(l->name)) return {};
+      for (auto o = open_stack_.rbegin(); o != open_stack_.rend(); ++o)
+        if (unit_owns_type(*o, l->name)) return *o;
+      return {};
+    }
+    std::string last, h = path_head(c->id.txt, last);
+    return !h.empty() && unit_owns_type(h, last) ? h : std::string();
+  }
+  // The same of an expected type of any form.
+  std::string exp_unit(const Exp& x, int d = 0) const {
+    if (!x.unit.empty()) return x.unit;
+    if (x.p) return unit_type(*x.p);
+    const cmi::TypeExpr* t = x.c;
+    if (!t || d > 4) return {};
+    if (t->kind == cmi::TypeExpr::Tvar) {
+      auto it = tvar_.find(t);
+      return it == tvar_.end() ? std::string() : it->second;
+    }
+    if (t->kind != cmi::TypeExpr::Tconstr || !t->path) return {};
+    if (t->path->kind == cmi::Path::Pident) {
+      auto* td = x.sg ? sig_tdecl(*x.sg, t->path->id.name) : nullptr;
+      if (!td) return {};
+      if (own_tdecl(*td)) return x.head;
+      return exp_unit(exp_c(td->manifest, x.sg, x.head), d + 1);
+    }
+    bool al = false;
+    std::string u = path_unit(t->path.get(), &al);
+    return al && !u.empty() && !unit_abbrev(u, t->path->s) ? u
+                                                           : std::string();
+  }
+  // The expected head is expanded where it stands.
+  void meet_head(const Exp& x) {
+    if (fixmeet_off() || !x.known()) return;
+    if (x.c && x.c->kind != cmi::TypeExpr::Tvar) {
+      if (x.sg && x.c->kind == cmi::TypeExpr::Tconstr)
+        head_load(x.c, *x.sg, xmeets_[x.head], 1);
+      return;
+    }
+    xmeet(exp_unit(x));
+  }
+  // The head constructor, a .cmi abbreviation of the signature followed.
+  Exp exp_head(const Exp& x, int d = 0) const {
+    if (d > 4 || !x.c || !x.sg || x.c->kind != cmi::TypeExpr::Tconstr ||
+        !x.c->path || x.c->path->kind != cmi::Path::Pident)
+      return x;
+    auto* td = sig_tdecl(*x.sg, x.c->path->id.name);
+    if (!td || own_tdecl(*td) || !td->manifest) return x;
+    return exp_head(exp_c(td->manifest, x.sg, x.head), d + 1);
+  }
+  std::string exp_name(const Exp& x0) const {
+    Exp x = exp_head(x0);
+    if (x.c) {
+      if (x.c->kind != cmi::TypeExpr::Tconstr || !x.c->path) return {};
+      const cmi::Path* p = x.c->path.get();
+      return p->kind == cmi::Path::Pident ? p->id.name : p->s;
+    }
+    if (x.p)
+      if (auto* c = std::get_if<Ptyp_constr>(&x.p->desc))
+        return lid_last(c->id.txt);
+    return {};
+  }
+  Exp exp_arg(const Exp& x0, std::size_t i) const {
+    Exp x = exp_head(x0);
+    if (x.c) {
+      if (x.c->kind == cmi::TypeExpr::Tconstr && i < x.c->args.size())
+        return exp_c(x.c->args[i], x.sg, x.head);
+      return Exp();
+    }
+    if (x.p)
+      if (auto* c = std::get_if<Ptyp_constr>(&x.p->desc))
+        if (i < c->args.size()) return exp_p(c->args[i].get());
+    return Exp();
+  }
+  std::size_t exp_tuple_n(const Exp& x) const {
+    if (x.tup) return x.tup->size();
+    if (x.c) return x.c->kind == cmi::TypeExpr::Ttuple ? x.c->elems.size() : 0;
+    if (x.p)
+      if (auto* t = std::get_if<Ptyp_tuple>(&x.p->desc)) return t->elems.size();
+    return 0;
+  }
+  Exp exp_tuple(const Exp& x, std::size_t i) const {
+    if (x.tup) return (*x.tup)[i];
+    if (x.c) return exp_c(x.c->elems[i].second, x.sg, x.head);
+    return exp_p(std::get<Ptyp_tuple>(x.p->desc).elems[i].get());
+  }
+  bool exp_arrow(const Exp& x, Exp& dom, Exp& cod) const {
+    if (x.c) {
+      if (x.c->kind != cmi::TypeExpr::Tarrow) return false;
+      dom = exp_c(x.c->dom, x.sg, x.head);
+      cod = exp_c(x.c->cod, x.sg, x.head);
+      return true;
+    }
+    if (x.p)
+      if (auto* a = std::get_if<Ptyp_arrow>(&x.p->desc)) {
+        dom = exp_p(a->dom.get());
+        cod = exp_p(a->cod.get());
+        return true;
+      }
+    return false;
+  }
+  // Is the constructor / label in LEXICAL scope, so that its disambiguation
+  // against an expected type compares the two type paths?
+  bool ctor_in_scope(const Longident& id) const {
+    auto* l = std::get_if<Lident>(&id.v);
+    if (!l) return true;
+    if (lctors_.count(l->name)) return true;
+    for (auto o = open_stack_.rbegin(); o != open_stack_.rend(); ++o)
+      if (unit_has_ctor(*o, l->name)) return true;
+    return false;
+  }
+  bool label_in_scope(const Longident& id) const {
+    auto* l = std::get_if<Lident>(&id.v);
+    if (!l) return true;
+    if (llabels_.count(l->name)) return true;
+    for (auto o = open_stack_.rbegin(); o != open_stack_.rend(); ++o)
+      if (unit_has_label(*o, l->name)) return true;
+    return false;
+  }
+  // The declared argument types of the constructor `id` names, and the
+  // declared type of the field `id` names.
+  std::vector<Exp> ctor_args(const Longident& id) const {
+    std::vector<Exp> out;
+    std::string n = lid_last(id), h;
+    if (auto* l = std::get_if<Lident>(&id.v)) {
+      auto it = lctors_.find(l->name);
+      if (it != lctors_.end()) {
+        for (auto* t : it->second) out.push_back(exp_p(t));
+        return out;
+      }
+      for (auto o = open_stack_.rbegin(); o != open_stack_.rend(); ++o)
+        if (unit_has_ctor(*o, n)) { h = *o; break; }
+    } else {
+      std::string last;
+      h = path_head(id, last);
+    }
+    const cmi::Signature* sg = h.empty() ? nullptr : head_sig(h);
+    if (!sg) return out;
+    for (auto& d : sg->types)
+      for (auto& k : d.ctors)
+        if (k.name == n) {
+          for (auto& a : k.args) out.push_back(exp_c(a, sg, h));
+          return out;
+        }
+    return out;
+  }
+  Exp label_type(const Longident& id) const {
+    std::string n = lid_last(id), h;
+    if (auto* l = std::get_if<Lident>(&id.v)) {
+      auto it = llabels_.find(l->name);
+      if (it != llabels_.end()) return exp_p(it->second);
+      for (auto o = open_stack_.rbegin(); o != open_stack_.rend(); ++o)
+        if (unit_has_label(*o, n)) { h = *o; break; }
+    } else {
+      std::string last;
+      h = path_head(id, last);
+    }
+    const cmi::Signature* sg = h.empty() ? nullptr : head_sig(h);
+    if (!sg) return Exp();
+    for (auto& d : sg->types)
+      for (auto& l : d.labels)
+        if (l.name == n) return exp_c(l.type, sg, h);
+    return Exp();
+  }
+  // `e` is typed by `type_argument` at `x`.
+  void targ(const Exp& x, const Expression& e) {
+    if (!fixmeet_off() && x.known() && is_inferred(e)) meet_head(x);
+    ex(e, x);
+  }
+  // What the argument written at a .cmi type variable fixes it to.
+  void learn(const Exp& x, const Expression& e) {
+    if (!x.c || fixmeet_off()) return;
+    if (x.c->kind == cmi::TypeExpr::Tvar) {
+      if (tvar_.count(x.c)) return;
+      std::string u = denotes(e);
+      if (!u.empty()) tvar_[x.c] = u;
+      return;
+    }
+    const Expression* b = bare_exp(e);
+    std::string nm = exp_name(x);
+    if (auto* c = std::get_if<Pexp_construct>(&b->desc)) {
+      std::string cn = lid_last(c->id.txt);
+      if (cn == "::" && nm == "list") {
+        std::vector<const Expression*> es;
+        list_elems(*b, es);
+        for (auto* q : es) learn(exp_arg(x, 0), *q);
+      } else if (cn == "Some" && nm == "option" && c->arg) {
+        learn(exp_arg(x, 0), **c->arg);
+      }
+    } else if (auto* t = std::get_if<Pexp_tuple>(&b->desc)) {
+      if (exp_tuple_n(x) == t->elems.size())
+        for (std::size_t i = 0; i < t->elems.size(); ++i)
+          learn(exp_tuple(x, i), *t->elems[i]);
+    } else if (auto* a = std::get_if<Pexp_array>(&b->desc)) {
+      if (nm == "array")
+        for (auto& q : a->elems) learn(exp_arg(x, 0), *q);
+    }
+  }
+  static std::pair<int, std::string> label_of(const ArgLabel& l) {
+    if (auto* n = std::get_if<Labelled>(&l)) return {1, n->name};
+    if (auto* n = std::get_if<Optional>(&l)) return {2, n->name};
+    return {0, std::string()};
+  }
+  // The callee's parameter types, as the syntax says: a local function's
+  // annotations, or a cited unit's .cmi (Stdlib's own for a bare name no
+  // open provides).  True when the arguments were walked here.
+  bool meet_apply(
+      const Expression& fn,
+      const std::vector<std::pair<ArgLabel, const Expression*>>& args) {
+    if (fixmeet_off()) return false;
+    auto* i = std::get_if<Pexp_ident>(&fn.desc);
+    if (!i) return false;
+    const Longident& id = i->id.txt;
+    std::string v = lid_last(id), h;
+    if (auto* l = std::get_if<Lident>(&id.v)) {
+      auto lf = lfns_.find(l->name);
+      if (lf != lfns_.end()) {
+        auto& ps = lf->second.params;
+        bool typed = false;
+        for (auto& q : ps) typed = typed || q.second;
+        if (!typed) return false;
+        std::vector<bool> used(ps.size(), false);
+        for (auto& a : args) {
+          auto [k, nm] = label_of(a.first);
+          const CoreType* t = nullptr;
+          for (std::size_t j = 0; j < ps.size(); ++j)
+            if (!used[j] &&
+                (k == 0 ? ps[j].first.empty() : ps[j].first == nm)) {
+              used[j] = true;
+              t = ps[j].second;
+              break;
+            }
+          targ(exp_p(t), *a.second);
+        }
+        return true;
+      }
+      if (bound_.count(v)) return false;
+      for (auto o = open_stack_.rbegin(); o != open_stack_.rend(); ++o)
+        if (unit_declares(*o, v, false)) { h = *o; break; }
+      if (h.empty()) h = "Stdlib";
+    } else {
+      std::string last;
+      h = path_head(id, last);
+      if (h.empty()) return false;
+    }
+    const cmi::Signature* sg = head_sig(h);
+    const cmi::SigValue* vd = sg ? find_val(*sg, v) : nullptr;
+    if (!vd) return false;
+    std::vector<const cmi::TypeExpr*> arrows;
+    for (const cmi::TypeExpr* p = spine(vd->type);
+         p && p->kind == cmi::TypeExpr::Tarrow && arrows.size() < 64;
+         p = spine(p->cod))
+      arrows.push_back(p);
+    std::vector<bool> used(arrows.size(), false);
+    auto saved = tvar_;
+    for (auto& a : args) {
+      auto [k, nm] = label_of(a.first);
+      Exp x;
+      for (std::size_t j = 0; j < arrows.size(); ++j) {
+        if (used[j]) continue;
+        if (k == 0 ? arrows[j]->label_kind == 0 : arrows[j]->label == nm) {
+          used[j] = true;
+          x = exp_c(arrows[j]->dom, sg, h);
+          // `~x:e` at an optional parameter meets the type under the option.
+          if (arrows[j]->label_kind == 2 && k == 1) x = exp_arg(x, 0);
+          break;
+        }
+      }
+      targ(x, *a.second);
+      learn(x, *a.second);
+    }
+    tvar_ = saved;
+    return true;
+  }
+  // The unit a PATTERN's type fixes, as far as the syntax says.
+  std::string pat_denotes(const Pattern& p) const {
+    if (auto* c = std::get_if<Ppat_construct>(&p.desc)) {
+      std::string last, h = path_head(c->id.txt, last);
+      if (h.empty()) {
+        auto* l = std::get_if<Lident>(&c->id.txt.v);
+        return l ? bare_owner(l->name, true) : std::string();
+      }
+      return unit_owns(h, last, true) ? h : std::string();
+    }
+    if (auto* c = std::get_if<Ppat_constraint>(&p.desc))
+      return unit_type(*c->t);
+    if (auto* a = std::get_if<Ppat_alias>(&p.desc)) return pat_denotes(*a->p);
+    if (auto* o = std::get_if<Ppat_or>(&p.desc)) return pat_denotes(*o->l);
+    return {};
+  }
+  // Typecore.pattern_needs_partial_application_check (typecore.ml:4027).
+  static bool pat_needs_check(const Pattern& p) {
+    if (std::holds_alternative<Ppat_any>(p.desc)) return true;
+    if (std::holds_alternative<Ppat_exception>(p.desc)) return true;
+    if (auto* o = std::get_if<Ppat_or>(&p.desc))
+      return pat_needs_check(*o->l) && pat_needs_check(*o->r);
+    return false;
+  }
+  // A binder takes the unit its expected type fixes, or shadows an older
+  // one; one annotated at an arrow is a function whose parameters are typed.
+  void bind_var(const std::string& n, const Exp& x) {
+    if (fixmeet_off()) return;
+    vunit_.erase(n);
+    lfns_.erase(n);
+    std::string u = exp_unit(x);
+    if (!u.empty()) vunit_[n] = u;
+    if (x.p && std::holds_alternative<Ptyp_arrow>(x.p->desc)) {
+      LocalFn lf;
+      arrow_fn(x.p, lf);
+      lfns_[n] = lf;
+    }
+  }
+  // The parameters a written arrow gives a function, filling in what its
+  // own parameters leave unannotated.
+  static void arrow_fn(const CoreType* t, LocalFn& lf) {
+    std::size_t i = 0;
+    for (; t && i < 32; ++i) {
+      auto* a = std::get_if<Ptyp_arrow>(&t->desc);
+      if (!a) break;
+      if (i < lf.params.size()) {
+        if (!lf.params[i].second) lf.params[i].second = a->dom.get();
+      } else {
+        lf.params.emplace_back(label_of(a->label).second, a->dom.get());
+      }
+      t = exp_p(a->cod.get()).p;
+    }
+    if (i > 0 && !lf.res) lf.res = t;
+  }
   void pkg(const Ptyp_package& p) {
     cite(p.path, false);
     for (auto& c : p.constraints) { cite(c.first, false); ty(*c.second); }
@@ -21344,20 +21829,58 @@ struct Cites {
       ty(*f->body);
     }
   }
-  void pat(const Pattern& p) {
+  void pat(const Pattern& p, Exp x = Exp()) {
     if (auto* c = std::get_if<Ppat_construct>(&p.desc)) {
+      const std::string cn = lid_last(c->id.txt);
       cite(c->id, false);
-      if (c->arg) pat(**c->arg);
+      if (!c->arg) {
+        if (x.known() && cn != "[]" && cn != "None" && ctor_in_scope(c->id.txt))
+          meet_head(x);
+        return;
+      }
+      auto* t = std::get_if<Ppat_tuple>(&(*c->arg)->desc);
+      if (cn == "::") {
+        const bool lst = exp_name(x) == "list";
+        if (t && t->elems.size() == 2) {
+          pat(*t->elems[0], lst ? exp_arg(x, 0) : Exp());
+          pat(*t->elems[1], lst ? x : Exp());
+        } else {
+          pat(**c->arg);
+        }
+        return;
+      }
+      if (cn == "Some") {
+        pat(**c->arg, exp_name(x) == "option" ? exp_arg(x, 0) : Exp());
+        return;
+      }
+      if (x.known() && ctor_in_scope(c->id.txt)) meet_head(x);
+      std::vector<Exp> as = ctor_args(c->id.txt);
+      if (t && as.size() >= 2 && t->elems.size() == as.size()) {
+        for (std::size_t i = 0; i < as.size(); ++i) pat(*t->elems[i], as[i]);
+      } else if (as.size() == 1 && !t) {
+        pat(**c->arg, as[0]);
+      } else {
+        pat(**c->arg);
+      }
     } else if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
-      for (auto& x : t->elems) pat(*x);
+      const bool tup = exp_tuple_n(x) == t->elems.size();
+      for (std::size_t i = 0; i < t->elems.size(); ++i)
+        pat(*t->elems[i], tup ? exp_tuple(x, i) : Exp());
     } else if (auto* o = std::get_if<Ppat_or>(&p.desc)) {
-      pat(*o->l); pat(*o->r);
+      pat(*o->l, x); pat(*o->r, x);
     } else if (auto* a = std::get_if<Ppat_alias>(&p.desc)) {
-      pat(*a->p);
+      pat(*a->p, x);
+      bind_var(a->name.txt, x);
     } else if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) {
-      pat(*c->p); ty(*c->t);
+      pat(*c->p, exp_p(c->t.get())); ty(*c->t);
     } else if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
-      for (auto& f : r->fields) { cite(f.first, false); pat(*f.second); }
+      if (x.known())
+        for (auto& f : r->fields)
+          if (label_in_scope(f.first.txt)) { meet_head(x); break; }
+      for (auto& f : r->fields) {
+        cite(f.first, false);
+        pat(*f.second, label_type(f.first.txt));
+      }
     } else if (auto* l = std::get_if<Ppat_lazy>(&p.desc)) {
       pat(*l->p);
     } else if (auto* v = std::get_if<Ppat_variant>(&p.desc)) {
@@ -21380,12 +21903,29 @@ struct Cites {
       pat(*f->eff); pat(*f->cont);
     } else if (auto* v = std::get_if<Ppat_var>(&p.desc)) {
       bound_.insert(v->name.txt);
+      bind_var(v->name.txt, x);
     }
   }
-  void cse(const Case& c) {
-    pat(c.lhs);
+  // `px` is what the pattern is matched at, `x` what the body is expected
+  // to be; the pattern's binders are in scope over the guard and the body.
+  void cse(const Case& c, Exp px = Exp(), Exp x = Exp()) {
+    auto sv = vunit_;
+    auto sf = lfns_;
+    pat(c.lhs, px);
     if (c.guard) ex(**c.guard);
-    ex(*c.rhs);
+    ex(*c.rhs, x);
+    vunit_ = sv;
+    lfns_ = sf;
+  }
+  // The arms of a `match`, `try` or `function`: the patterns and the bodies
+  // are typed in order at one type each, and the first that carries a unit's
+  // own type fixes it for those after it.
+  void arms(const std::vector<Case>& cs, Exp px, Exp x) {
+    for (auto& c : cs) {
+      cse(c, px, x);
+      if (!px.known()) px = exp_u(pat_denotes(c.lhs));
+      if (!x.known()) x = exp_of(*c.rhs);
+    }
   }
   // Does the ascription this structure carries give a `val` of this name a
   // type of its own?  Then the coercion has the two types meet, and the body's
@@ -21402,9 +21942,26 @@ struct Cites {
     pat(b.pat);
     // `let _ = e` runs the same check a statement does; `let y = e` does not
     // -- unless the ascription above writes y's type out itself.
-    if (std::holds_alternative<Ppat_any>(b.pat.desc) || asc_val(b.pat))
+    if (std::holds_alternative<Ppat_any>(b.pat.desc) || asc_val(b.pat)) {
       xval(*b.expr);
-    ex(*b.expr);
+      if (!fixmeet_off()) xmeet(denotes(*b.expr));
+    }
+    // `let x : t = e` is `let x = (e : t)`; `let (x : t) = e` expects t.
+    Exp x;
+    if (b.constraint_)
+      if (auto* c = std::get_if<Pvc_constraint>(&*b.constraint_))
+        x = exp_p(c->typ.get());
+    Exp px;
+    if (auto* pc = std::get_if<Ppat_constraint>(&b.pat.desc))
+      px = exp_p(pc->t.get());
+    auto* v = std::get_if<Ppat_var>(&b.pat.desc);
+    if (v && !fixmeet_off()) local_fn(v->name.txt, *b.expr, x);
+    if (x.known()) targ(x, *b.expr);
+    else ex(*b.expr, px);
+    if (v && !fixmeet_off()) {
+      std::string u = x.known() ? exp_unit(x) : denotes(*b.expr);
+      if (!u.empty()) vunit_[v->name.txt] = u;
+    }
     if (!b.constraint_) return;
     if (auto* c = std::get_if<Pvc_constraint>(&*b.constraint_)) tyx(*c->typ);
     else {
@@ -21413,27 +21970,74 @@ struct Cites {
       tyx(*co.coercion);
     }
   }
-  void fn(const Pexp_function& f) {
+  // `let g (a : t) ~l:(b : u) : r = ..` and `let g : t -> u = ..` bind a
+  // function whose parameters the syntax types; in scope over its own body
+  // too, for a `let rec`.
+  void local_fn(const std::string& n, const Expression& e, const Exp& x) {
+    LocalFn lf;
+    bool any = false;
+    if (auto* f = std::get_if<Pexp_function>(&e.desc)) {
+      for (auto& pm : f->params) {
+        auto* pv = std::get_if<Pparam_val>(&pm.desc);
+        if (!pv) continue;
+        const CoreType* t = nullptr;
+        if (auto* c = std::get_if<Ppat_constraint>(&pv->pat.desc))
+          t = c->t.get();
+        lf.params.emplace_back(label_of(pv->label).second, t);
+        any = true;
+      }
+      if (f->constraint_)
+        if (auto* c = std::get_if<Pconstraint>(&*f->constraint_))
+          lf.res = c->type.get();
+    }
+    if (x.p && std::holds_alternative<Ptyp_arrow>(x.p->desc)) {
+      arrow_fn(x.p, lf);
+      any = true;
+    }
+    if (any) lfns_[n] = lf;
+  }
+  void fn(const Pexp_function& f, Exp x = Exp()) {
+    auto sv = vunit_;
+    auto sf = lfns_;
+    // The parameters take the expected arrows' domains, the body what is
+    // left; a result constraint types the body as an argument at it.
+    Exp cur = x;
     for (auto& pm : f.params) {
       auto* pv = std::get_if<Pparam_val>(&pm.desc);
       if (!pv) continue;
-      pat(pv->pat);
+      Exp dom, cod;
+      const bool ok = cur.known() && exp_arrow(cur, dom, cod);
+      pat(pv->pat, ok ? dom : Exp());
       if (pv->default_) ex(**pv->default_);
+      cur = ok ? cod : Exp();
     }
+    const CoreType* rt = nullptr;
     if (f.constraint_) {
-      if (auto* c = std::get_if<Pconstraint>(&*f.constraint_)) tyx(*c->type);
-      else {
+      if (auto* c = std::get_if<Pconstraint>(&*f.constraint_)) {
+        tyx(*c->type);
+        rt = c->type.get();
+      } else {
         auto& co = std::get<Pcoerce>(*f.constraint_);
         if (co.from) tyx(**co.from);
         tyx(*co.to_);
+        cur = Exp();
       }
     }
-    if (auto* fb = std::get_if<Pfunction_body>(&f.body->v)) { ex(*fb->e); return; }
-    auto& cs = std::get<Pfunction_cases>(f.body->v).cases;
-    std::vector<const Expression*> bs;
-    case_exps(cs, bs);
-    umeet(bs, false, false);
-    for (auto& c : cs) cse(c);
+    if (auto* fb = std::get_if<Pfunction_body>(&f.body->v)) {
+      if (rt) targ(exp_p(rt), *fb->e);
+      else ex(*fb->e, cur);
+    } else {
+      auto& cs = std::get<Pfunction_cases>(f.body->v).cases;
+      std::vector<const Expression*> bs;
+      case_exps(cs, bs);
+      umeet(bs, false, false);
+      Exp dom, cod;
+      const bool ok = cur.known() && exp_arrow(cur, dom, cod);
+      if (rt) cod = exp_p(rt);
+      arms(cs, ok ? dom : Exp(), (ok || rt) ? cod : Exp());
+    }
+    vunit_ = sv;
+    lfns_ = sf;
   }
   // ---- a type that meets a type ------------------------------------------
   // `Ctype.unify` links a VARIABLE to whatever it meets without looking it up,
@@ -21490,8 +22094,13 @@ struct Cites {
   // the source can say?  Empty when it cannot be read off the syntax.
   std::string denotes(const Expression& e) const {
     if (auto* i = std::get_if<Pexp_ident>(&e.desc)) {
-      if (auto* l = std::get_if<Lident>(&i->id.txt.v))
+      if (auto* l = std::get_if<Lident>(&i->id.txt.v)) {
+        if (dloc_ && !fixmeet_off()) {
+          auto it = vunit_.find(l->name);
+          if (it != vunit_.end()) return it->second;
+        }
         return bare_owner(l->name, false);
+      }
       auto* d = std::get_if<Ldot>(&i->id.txt.v);
       if (!d) return {};
       auto* h = std::get_if<Lident>(&d->prefix->v);
@@ -21507,7 +22116,105 @@ struct Cites {
       if (!h || h->name == "Stdlib") return {};
       return unit_owns(h->name, d->name, true) ? h->name : std::string();
     }
-    if (auto* c = std::get_if<Pexp_constraint>(&e.desc)) return denotes(*c->e);
+    if (auto* c = std::get_if<Pexp_constraint>(&e.desc)) {
+      std::string u =
+          fixmeet_off() || !dloc_ ? std::string() : unit_type(*c->t);
+      return u.empty() ? denotes(*c->e) : u;
+    }
+    if (fixmeet_off() || !dloc_) return {};
+    if (auto* f = std::get_if<Pexp_field>(&e.desc))
+      return exp_unit(label_type(f->field.txt));
+    if (auto* l = std::get_if<Pexp_let>(&e.desc)) return denotes(*l->body);
+    if (auto* s = std::get_if<Pexp_sequence>(&e.desc)) return denotes(*s->e2);
+    if (auto* i = std::get_if<Pexp_ifthenelse>(&e.desc)) {
+      std::string u = denotes(*i->then_);
+      return !u.empty() || !i->else_ ? u : denotes(**i->else_);
+    }
+    if (auto* s = std::get_if<Pexp_struct_item>(&e.desc))
+      return denotes(*s->body);
+    if (auto* a = std::get_if<Pexp_apply>(&e.desc)) return apply_denotes(*a);
+    return {};
+  }
+  // What an application's RESULT is, as far as the callee's annotations or
+  // .cmi say: the arrows the arguments consume are peeled off.
+  std::string apply_denotes(const Pexp_apply& a) const {
+    auto* i = std::get_if<Pexp_ident>(&a.fn->desc);
+    if (!i) return {};
+    const Longident& id = i->id.txt;
+    std::string v = lid_last(id), h;
+    if (auto* l = std::get_if<Lident>(&id.v)) {
+      auto lf = lfns_.find(l->name);
+      if (lf != lfns_.end())
+        return lf->second.res && a.args.size() >= lf->second.params.size()
+                   ? unit_type(*lf->second.res)
+                   : std::string();
+      if (bound_.count(v)) return {};
+      for (auto o = open_stack_.rbegin(); o != open_stack_.rend(); ++o)
+        if (unit_declares(*o, v, false)) { h = *o; break; }
+      if (h.empty()) h = "Stdlib";
+    } else {
+      std::string last;
+      h = path_head(id, last);
+      if (h.empty()) return {};
+    }
+    const cmi::Signature* sg = head_sig(h);
+    const cmi::SigValue* vd = sg ? find_val(*sg, v) : nullptr;
+    if (!vd) return {};
+    const cmi::TypeExpr* p = spine(vd->type);
+    std::vector<const cmi::TypeExpr*> doms;
+    for (std::size_t n = 0; n < a.args.size() && p; ++n) {
+      while (p && p->kind == cmi::TypeExpr::Tarrow && p->label_kind == 2 &&
+             label_of(a.args[n].first).first != 2)
+        p = spine(p->cod);
+      if (!p || p->kind != cmi::TypeExpr::Tarrow) return {};
+      doms.push_back(spine(p->dom));
+      p = spine(p->cod);
+    }
+    Exp x;
+    x.c = p;
+    x.sg = sg;
+    x.head = h;
+    // A result that is a type variable is what the argument at that
+    // variable carried.
+    if (p && p->kind == cmi::TypeExpr::Tvar) {
+      for (std::size_t n = 0; n < doms.size(); ++n) {
+        Exp d;
+        d.c = doms[n];
+        d.sg = sg;
+        d.head = h;
+        std::string u = var_unit(d, *a.args[n].second, p);
+        if (!u.empty()) return u;
+      }
+      return {};
+    }
+    return exp_unit(x);
+  }
+  // What the argument written at `x` says the type variable `v` in it is.
+  std::string var_unit(const Exp& x, const Expression& e,
+                       const cmi::TypeExpr* v, int d = 0) const {
+    if (!x.c || d > 6) return {};
+    if (x.c == v) return denotes(e);
+    const Expression* b = bare_exp(e);
+    std::string nm = exp_name(x);
+    if (auto* c = std::get_if<Pexp_construct>(&b->desc)) {
+      std::string cn = lid_last(c->id.txt);
+      if (cn == "::" && nm == "list") {
+        std::vector<const Expression*> es;
+        list_elems(*b, es);
+        for (auto* q : es) {
+          std::string u = var_unit(exp_arg(x, 0), *q, v, d + 1);
+          if (!u.empty()) return u;
+        }
+      } else if (cn == "Some" && nm == "option" && c->arg) {
+        return var_unit(exp_arg(x, 0), **c->arg, v, d + 1);
+      }
+    } else if (auto* t = std::get_if<Pexp_tuple>(&b->desc)) {
+      if (exp_tuple_n(x) == t->elems.size())
+        for (std::size_t i = 0; i < t->elems.size(); ++i) {
+          std::string u = var_unit(exp_tuple(x, i), *t->elems[i], v, d + 1);
+          if (!u.empty()) return u;
+        }
+    }
     return {};
   }
   void xmeet(const std::string& u) {
@@ -21721,17 +22428,22 @@ struct Cites {
     }
     return true;
   }
-  void ex(const Expression& e) {
+  void ex(const Expression& e, Exp x = Exp()) {
     if (auto* i = std::get_if<Pexp_ident>(&e.desc)) {
       cite(i->id, false);
       vread(i->id.txt);
     } else if (auto* a = std::get_if<Pexp_apply>(&e.desc)) {
       const Expression* fn = a->fn.get();
       std::vector<const Expression*> as;
-      for (auto& x : a->args) as.push_back(x.second.get());
+      std::vector<std::pair<ArgLabel, const Expression*>> las;
+      for (auto& x : a->args) {
+        as.push_back(x.second.get());
+        las.emplace_back(x.first, x.second.get());
+      }
       if (const Expression *pf, *px; prim_apply(*a, pf, px)) {
         fn = pf;
         as = {px};
+        las = {{ArgLabel{Nolabel{}}, px}};
       }
       applied_fn(*fn, (int)as.size());
       vapp(*fn, (int)as.size());
@@ -21740,80 +22452,160 @@ struct Cites {
       if (as.size() == 1)
         if (auto* f = std::get_if<Pexp_ident>(&fn->desc))
           if (auto* l = std::get_if<Lident>(&f->id.txt.v))
-            if (l->name == "ignore") xval(*as[0]);
-      xsame(as);
+            if (l->name == "ignore") {
+              xval(*as[0]);
+              if (!fixmeet_off()) xmeet(denotes(*as[0]));
+            }
       ex(*a->fn);
-      for (auto& x : a->args) ex(*x.second);
+      const bool piped = fn != a->fn.get();
+      if (piped) ex(*fn);
+      if (!meet_apply(*fn, las)) {
+        // Nothing says what the callee expects: only what the OPERANDS say
+        // of themselves is left to meet.
+        dloc_ = false;
+        xsame(as);
+        dloc_ = true;
+        if (piped) ex(*as[0]);
+        else for (auto& x : a->args) ex(*x.second);
+      }
     } else if (auto* l = std::get_if<Pexp_let>(&e.desc)) {
+      auto sv = vunit_;
+      auto sf = lfns_;
       for (auto& b : l->bindings) vbind(b);
-      ex(*l->body);
+      ex(*l->body, x);
+      vunit_ = sv;
+      lfns_ = sf;
     } else if (auto* f = std::get_if<Pexp_function>(&e.desc)) {
-      fn(*f);
+      fn(*f, x);
     } else if (auto* t = std::get_if<Pexp_tuple>(&e.desc)) {
-      for (auto& x : t->elems) ex(*x);
+      const bool tup = exp_tuple_n(x) == t->elems.size();
+      for (std::size_t i = 0; i < t->elems.size(); ++i)
+        ex(*t->elems[i], tup ? exp_tuple(x, i) : Exp());
     } else if (auto* i = std::get_if<Pexp_ifthenelse>(&e.desc)) {
       if (i->else_) {
-        xsame({i->then_.get(), (*i->else_).get()});
+        if (fixmeet_off()) xsame({i->then_.get(), (*i->else_).get()});
         umeet({i->then_.get(), (*i->else_).get()}, false, false);
       }
-      ex(*i->cond); ex(*i->then_);
-      if (i->else_) ex(**i->else_);
+      ex(*i->cond); ex(*i->then_, x);
+      // The `else` branch is typed at what the `then` branch left.
+      if (i->else_) ex(**i->else_, x.known() ? x : exp_of(*i->then_));
     } else if (auto* c = std::get_if<Pexp_construct>(&e.desc)) {
+      const std::string cn = lid_last(c->id.txt);
       std::vector<const Expression*> es;
       list_elems(e, es);
-      xsame(es);
+      if (fixmeet_off()) xsame(es);
       if (es.size() >= 2) umeet(es, false, true);
       cite(c->id, false);
-      if (c->arg) ex(**c->arg);
+      if (!c->arg) {
+        if (x.known() && cn != "[]" && cn != "None" && ctor_in_scope(c->id.txt))
+          meet_head(x);
+      } else if (cn == "::") {
+        // A list is a chain of `::` applications: each element is an
+        // argument at the element type, which the first element that
+        // carries a unit's own type fixes for those after it.
+        Exp elt = exp_name(x) == "list" ? exp_arg(x, 0) : Exp();
+        const Expression* p = &e;
+        for (int i = 0; i < 4096; ++i) {
+          auto* k = std::get_if<Pexp_construct>(&p->desc);
+          auto* t = k && k->arg ? std::get_if<Pexp_tuple>(&(*k->arg)->desc)
+                                : nullptr;
+          if (!k || lid_last(k->id.txt) != "::" || !t || t->elems.size() != 2) {
+            ex(*p, x);
+            break;
+          }
+          if (p != &e) cite(k->id, false);
+          targ(elt, *t->elems[0]);
+          if (!elt.known()) elt = exp_of(*t->elems[0]);
+          p = t->elems[1].get();
+        }
+      } else if (cn == "Some") {
+        targ(exp_name(x) == "option" ? exp_arg(x, 0) : Exp(), **c->arg);
+      } else {
+        if (x.known() && ctor_in_scope(c->id.txt)) meet_head(x);
+        // The arguments are typed as arguments at the declared types.
+        std::vector<Exp> as = ctor_args(c->id.txt);
+        auto* t = std::get_if<Pexp_tuple>(&(*c->arg)->desc);
+        if (t && as.size() >= 2 && t->elems.size() == as.size()) {
+          for (std::size_t i = 0; i < as.size(); ++i) targ(as[i], *t->elems[i]);
+        } else if (as.size() == 1 && !t) {
+          targ(as[0], **c->arg);
+        } else {
+          ex(**c->arg);
+        }
+      }
     } else if (auto* m = std::get_if<Pexp_match>(&e.desc)) {
-      // `type_cases` expands the scrutinee's type whatever the patterns are.
-      xmeet(denotes(*m->e));
+      // The scrutinee's type is expanded to warn of a partial application
+      // (typecore.ml:4768) -- where every pattern is a wildcard, an
+      // `exception` or an `|` of those, and none is annotated.
+      bool wild = true;
+      for (auto& c : m->cases) wild = wild && pat_needs_check(c.lhs);
+      if (wild || fixmeet_off()) xmeet(denotes(*m->e));
       xval(*m->e);
       ex(*m->e);
       std::vector<const Expression*> bs;
       case_exps(m->cases, bs);
       umeet(bs, false, false);
-      for (auto& c : m->cases) cse(c);
+      arms(m->cases, fixmeet_off() ? Exp() : exp_of(*m->e), x);
     } else if (auto* t = std::get_if<Pexp_try>(&e.desc)) {
       std::vector<const Expression*> bs{t->e.get()};
       case_exps(t->cases, bs);
       umeet(bs, true, false);
-      ex(*t->e);
-      for (auto& c : t->cases) cse(c);
+      ex(*t->e, x);
+      arms(t->cases, Exp(), x.known() || fixmeet_off() ? x : exp_of(*t->e));
     } else if (auto* s = std::get_if<Pexp_sequence>(&e.desc)) {
       xval(*s->e1);
-      ex(*s->e1); ex(*s->e2);
+      if (!fixmeet_off()) xmeet(denotes(*s->e1));
+      ex(*s->e1); ex(*s->e2, x);
     } else if (auto* c = std::get_if<Pexp_constraint>(&e.desc)) {
       // An annotation fixes the expected type before the expression is typed.
       xmeet(denotes(*c->e));
-      ex(*c->e); tyx(*c->t);
+      targ(exp_p(c->t.get()), *c->e); tyx(*c->t);
     } else if (auto* c = std::get_if<Pexp_coerce>(&e.desc)) {
       ex(*c->e);
       if (c->from) tyx(**c->from);
       tyx(*c->to_);
     } else if (auto* f = std::get_if<Pexp_field>(&e.desc)) {
       ex(*f->e); cite(f->field, false);
+      // A label in scope is disambiguated against the record's fixed type.
+      if (!fixmeet_off() && label_in_scope(f->field.txt))
+        xmeet(denotes(*f->e));
     } else if (auto* r = std::get_if<Pexp_record>(&e.desc)) {
-      for (auto& f : r->fields) { cite(f.first, false); ex(*f.second); }
+      // `{ b with .. }` fixes the record's type from `b` where nothing else
+      // did.
+      if (!x.known() && r->base && !fixmeet_off())
+        x = exp_u(denotes(**r->base));
+      if (x.known())
+        for (auto& f : r->fields)
+          if (label_in_scope(f.first.txt)) { meet_head(x); break; }
+      for (auto& f : r->fields) {
+        cite(f.first, false);
+        targ(label_type(f.first.txt), *f.second);
+      }
       if (r->base) ex(**r->base);
     } else if (auto* a = std::get_if<Pexp_assert>(&e.desc)) {
       ex(*a->e);
     } else if (auto* l = std::get_if<Pexp_lazy>(&e.desc)) {
       ex(*l->e);
     } else if (auto* w = std::get_if<Pexp_while>(&e.desc)) {
+      if (!fixmeet_off()) xmeet(denotes(*w->body));
       ex(*w->cond); ex(*w->body);
     } else if (auto* f = std::get_if<Pexp_for>(&e.desc)) {
+      if (!fixmeet_off()) xmeet(denotes(*f->body));
       pat(f->var); ex(*f->lo); ex(*f->hi); ex(*f->body);
     } else if (auto* a = std::get_if<Pexp_array>(&e.desc)) {
       std::vector<const Expression*> es;
       for (auto& x : a->elems) es.push_back(x.get());
-      xsame(es);
+      if (fixmeet_off()) xsame(es);
       umeet(es, true, false);
-      for (auto& x : a->elems) ex(*x);
+      Exp elt = exp_name(x) == "array" ? exp_arg(x, 0) : Exp();
+      for (auto& q : a->elems) {
+        ex(*q, elt);
+        if (!elt.known() && !fixmeet_off()) elt = exp_of(*q);
+      }
     } else if (auto* v = std::get_if<Pexp_variant>(&e.desc)) {
       if (v->arg) ex(**v->arg);
     } else if (auto* t = std::get_if<Pexp_newtype>(&e.desc)) {
-      ex(*t->body);
+      ex(*t->body, x);
     } else if (auto* s = std::get_if<Pexp_struct_item>(&e.desc)) {
       // `let open M in e` and `let module M = .. in e`: M is in scope over
       // the body alone.
@@ -21828,11 +22620,14 @@ struct Cites {
         cpath_.push_back("$" + *lm->binding.name.txt);
         lmods[cscope()] = &lm->binding.expr;
       }
-      ex(*s->body);
+      ex(*s->body, x);
       if (named) cpath_.pop_back();
       open_stack_.resize(d);
     } else if (auto* s = std::get_if<Pexp_setfield>(&e.desc)) {
-      ex(*s->obj); cite(s->field, false); ex(*s->value);
+      ex(*s->obj); cite(s->field, false);
+      if (!fixmeet_off() && label_in_scope(s->field.txt))
+        xmeet(denotes(*s->obj));
+      targ(label_type(s->field.txt), *s->value);
     } else if (auto* s = std::get_if<Pexp_setinstvar>(&e.desc)) {
       ex(*s->value);
     } else if (auto* s = std::get_if<Pexp_send>(&e.desc)) {
@@ -21944,11 +22739,19 @@ struct Cites {
     for (auto& p : d.params) ty(*p);
     if (d.manifest) tyx(**d.manifest);
     if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
-      for (auto& c : v->ctors) { cargs(c.args); if (c.res) ty(**c.res); }
+      for (auto& c : v->ctors) {
+        cargs(c.args);
+        if (c.res) ty(**c.res);
+        std::vector<const CoreType*>& as = lctors_[c.name.txt];
+        as.clear();
+        if (auto* t = std::get_if<Pcstr_tuple>(&c.args))
+          for (auto& x : t->elems) as.push_back(x.get());
+      }
     } else if (auto* r = std::get_if<Ptype_record>(&d.kind)) {
       // A record's fields are expanded besides, to decide whether the whole
       // of it is a float record; a VARIANT's arguments are not.
       for (auto& f : r->fields) tyx(*f.type);
+      for (auto& f : r->fields) llabels_[f.name.txt] = f.type.get();
     }
     for (auto& c : d.constraints) { ty(*c.t1); ty(*c.t2); }
     if (!tdecl_off()) tf_tdecl(d);
@@ -22526,6 +23329,13 @@ struct Cites {
         // `Stdlib__Atomic.get` costs 13 where `Atomic.get` costs 13 + 13.
         Applied a;
         scan_applied(m, false, c.sig(), a, app);
+        // What a meet at one of the member's .cmi types expanded.
+        auto xm = xmeets_.find(m);
+        if (xm != xmeets_.end()) {
+          a.self = a.self || xm->second.self;
+          for (auto& e : xm->second.units)
+            if (a.units[e.first] < e.second) a.units[e.first] = e.second;
+        }
         auto subs = named_subs(m, c.sig());
         for (auto& au : alias_subs(m, c.sig()))
           if (more[au] < 1) more[au] = 1;
@@ -22558,6 +23368,12 @@ struct Cites {
       } catch (...) {
       }
     }
+    // A meet at one of Stdlib's OWN values' types: Stdlib is built with the
+    // initial environment, so only the units its types name are forced.
+    auto xs = xmeets_.find("Stdlib");
+    if (xs != xmeets_.end())
+      for (auto& e : xs->second.units)
+        if (more[e.first] < e.second) more[e.first] = e.second;
     // A unit reached only through a .cmi's own path is forced ONCE,
     // directly; the ordinary first load is what a SOURCE citation pays.
     std::set<std::string> noload;

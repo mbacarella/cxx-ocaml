@@ -1,0 +1,3 @@
+let r = ref 0;;
+let f (x : Marshal.extern_flags) = List.iter (fun y -> ignore (y =
+  Marshal.Closures)) [x]
