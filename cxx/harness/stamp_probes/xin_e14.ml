@@ -1,0 +1,4 @@
+module String_id : sig module type S = sig type t end
+module Make (M : sig end) : S end = struct module type S = sig type t end
+module Make (M : sig end) = struct type t = string end end
+type u = String_id.Make(String_id).t
