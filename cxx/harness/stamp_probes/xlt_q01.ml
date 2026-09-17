@@ -1,0 +1,37 @@
+module F (X :sig end ) = struct module M = X end
+module N = F(struct end)
+module O = N.M
+include O
+include N
+
+module Id (X : sig type t end) = X
+module type S = sig val s : unit end
+module G (X : sig type t = int val x : t module M : S end) = struct
+  type t = X.t
+  let y = X.x
+
+  module Y = X (* FIXME: this "alias" shape  is not a shape alias  *)
+
+  let _ = Y.x
+
+  let () = X.M.s
+
+  type u = Id (X).t
+end
+
+type e = ..
+module type T = sig
+  type s =
+    | A
+    | B of { r:unit }
+  type r =
+    { x:unit }
+  type e +=
+      | E
+end
+module I (X:T) = struct
+  let x = X.A
+  let y = X.B { r = () }
+  let z = { X.x = () }
+  let w = X.E
+end

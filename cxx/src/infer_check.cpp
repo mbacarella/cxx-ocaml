@@ -27956,6 +27956,47 @@ struct Count {
     if (!nm || !nm->name.txt || !nm->type) return 0;
     return par_uses(*nm->name.txt, *nm->type, *f.body);
   }
+  // What a parameter's signature costs at level `l` BELOW its top items:
+  // the items of its submodules, at the levels the cascade gives them (the
+  // top ones are `inc_top`'s).  `alias` is `module M = X`, which is
+  // `struct include X end` less the include's enter -- one ident per item
+  // fewer.  A submodule typed by a NAME is resolved like any other; one of
+  // another unit is left alone.
+  long long par_lvl(const ModuleType& mt, const Lvl& l, bool alias,
+                    int d = 0) const {
+    if (d > 8) return 0;
+    const Signature* sg = mty_sig(&mt);
+    if (!sg) return 0;
+    long long k = 0;
+    for (auto& it : *sg) {
+      if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+        k += l.a - (alias ? 1 : 0) +
+             par_lvl(*m->md.type, sub(l), alias, d + 1);
+      } else {
+        k += wt_sig_item(it, l);
+        if (alias) k -= ren_sig_item(it);
+      }
+    }
+    return k;
+  }
+  long long par_nested(const ModuleType& mt, const Lvl& l, bool alias) const {
+    if (ltapp_off()) return 0;
+    const Signature* sg = mty_sig(&mt);
+    if (!sg) return 0;
+    long long k = 0;
+    for (auto& it : *sg)
+      if (auto* m = std::get_if<Psig_module>(&it.desc))
+        k += par_lvl(*m->md.type, sub(l), alias, 1);
+    return k;
+  }
+  // The parameter a bare name in module position stands for, if any.
+  const ModuleType* par_of(const ModuleExpr& m) const {
+    auto* pi = std::get_if<Pmod_ident>(&m.desc);
+    auto* li = pi ? std::get_if<Lident>(&pi->id.txt.v) : nullptr;
+    if (!li) return nullptr;
+    auto f = fmods.find(li->name);
+    return f != fmods.end() && !f->second.empty() ? f->second.back() : nullptr;
+  }
   // An `include <path>` in the body brings the path's TOP items into the
   // result (`Env.enter_signature`), and those are renamed with the rest of
   // it when the strengthened declaration is forced (`expand_module_alias`,
@@ -29035,6 +29076,10 @@ struct Count {
     }
     if (auto* c = std::get_if<Pmod_constraint>(&m.desc))
       return mt_top(*c->mt, d);
+    // A module bound to an APPLICATION has the functor's result for its
+    // signature, and an `include` of it enters that result's top items.
+    if (!ltapp_off() && std::holds_alternative<Pmod_apply>(m.desc))
+      if (const ModuleExpr* r = app_res(&m)) return me_top(*r, d + 1);
     bool dt = false;
     return std::holds_alternative<Pmod_ident>(m.desc) ? inc_top(m, dt, d + 1)
                                                       : 0;
@@ -29467,7 +29512,8 @@ struct Count {
         // (S512), read as the substitution reads them.
         if (std::holds_alternative<Pmod_structure>(e->desc)) {
           force += wt_mexpr(*e, flat());
-          if (!incname_off()) force += inc_wt(*e, flat(), fps, home);
+          if (!incname_off())
+            force += inc_wt(*e, flat(), fps, home, 0, false);
         }
         break;
       }
@@ -29658,7 +29704,10 @@ struct Count {
   }
   // The functor's type from its `from`-th parameter on: the parameters'
   // written signatures and the result (`lits`), and the named parameters
-  // among them (`ids`), which `Subst` renames and a force does not.
+  // among them (`ids`), which `Subst` renames and a force does not.  A
+  // parameter the body uses AS A MODULE (`= X`, `include X`, `module M =
+  // X`) is in the result written out (S514's `par_uses`), whichever
+  // parameter it is.
   long long lits(const ModuleExpr* f, std::size_t from) const {
     long long k = 0;
     std::size_t j = 0;
@@ -29670,6 +29719,7 @@ struct Count {
           if (nm->type &&
               std::holds_alternative<Pmty_signature>(nm->type->desc))
             k += ren_mty(*nm->type);
+      if (!ltapp_off()) k += par_uses(*fn);
       f = fn->body.get();
     }
     return k + res_items(f ? mderef(f) : nullptr);
@@ -29840,6 +29890,92 @@ struct Count {
     bool sub = false;
     const ModuleExpr* f = lal_res(hi->id.txt, sub);
     return f && std::holds_alternative<Pmod_functor>(f->desc);
+  }
+  // ---- A LOCAL FUNCTOR APPLIED IN A TYPE PATH ----------------------------
+  // `Id (A).t` is no name in scope: `Env.lookup_dot_type` builds the applied
+  // path's components (`lookup_apply`, env.ml:3033 -- the functor's own
+  // `Functor_comps` once per functor and the application's once per path,
+  // which is `ap_build` over the typing environment's one tree, the tree
+  // `appexp` above fills) wherever the path is written.  A type
+  // declaration's MANIFEST is expanded once more where the unit's signature
+  // is checked against itself: `Includecore.type_manifest` runs
+  // `expand_head_nolink` on the head alone, which is `Env.find_type` on the
+  // `Papply` in the check's OWN environment (`Includemod.signatures` adds
+  // the items afresh), whose components are a tree of their own -- so the
+  // functor and the path are built a second time there, again once per
+  // file each.  Measured over a parameter of P items and a result of R:
+  // `type u = Id (A).t` is P + 2R twice; a record field, a constructor
+  // argument, a `val`, an annotation and an argument of the manifest's head
+  // (`Id (A).t list`) once; a second path of the same functor R more per
+  // pass; a curried `Id (X) (Y).t` `ap_build`'s 10 twice; a manifest an
+  // ascription hides, or one typed in an expression, pays the lookup alone
+  // (the ascription's own check expands it in the tree the lookup filled);
+  // and the same parameter NAME of two functors is two paths.  `NOLTAPP=1`
+  // reverts.
+  static bool ltapp_off() {
+    static const bool off = dbg_env("NOLTAPP") != nullptr;
+    return off;
+  }
+  std::set<const ModuleExpr*> cfcomps_;  // the check's own tree
+  std::set<std::string> cacomps_;
+  bool ap_of_lid(const Longident& id, Ap& out, int d = 0) const {
+    if (d > 8) return false;
+    if (!std::holds_alternative<Lapply>(id.v)) {
+      out = Ap{};
+      out.spell = lid_full(id);
+      out.nspell = alias_spell(id);
+      // An enclosing functor's parameter is the BINDING, not its name.
+      if (auto* li = std::get_if<Lident>(&id.v))
+        if (auto f = fmods.find(li->name);
+            f != fmods.end() && !f->second.empty())
+          out.spell += "@" + std::to_string((std::uintptr_t)f->second.back());
+      return true;
+    }
+    std::vector<const Longident*> as;
+    const Longident* h = &id;
+    while (auto* a = std::get_if<Lapply>(&h->v)) {
+      as.push_back(a->x.get());
+      h = a->f.get();
+    }
+    bool sub = false;
+    const ModuleExpr* f = lal_res(*h, sub);
+    if (!f || !std::holds_alternative<Pmod_functor>(f->desc)) return false;
+    out = Ap{};
+    out.f = f;
+    for (auto a = as.rbegin(); a != as.rend(); ++a) {
+      Ap x;
+      if (!ap_of_lid(**a, x, d + 1)) return false;
+      out.args.push_back(std::move(x));
+    }
+    out.spell = std::to_string((std::uintptr_t)f);
+    out.nspell = out.spell;
+    for (auto& x : out.args) {
+      out.spell += "(" + x.spell + ")";
+      out.nspell += "(" + x.nspell + ")";
+    }
+    return true;
+  }
+  long long ltapp_charge(const Longident& id, bool manifest) {
+    if (ltapp_off()) return 0;
+    auto* top = std::get_if<Ldot>(&id.v);
+    if (!top) return 0;
+    Sub sub;
+    const Longident* q = top->prefix.get();
+    while (auto* dd = std::get_if<Ldot>(&q->v)) {
+      sub.insert(sub.begin(), dd->name);
+      q = dd->prefix.get();
+    }
+    Ap a;
+    if (!std::holds_alternative<Lapply>(q->v) || !ap_of_lid(*q, a)) return 0;
+    long long k = ap_build(a, false);
+    if (manifest && saved_ && !inexpr_) {
+      std::swap(fcomps_, cfcomps_);
+      std::swap(acomps_, cacomps_);
+      k += ap_expand(a, sub, top->name);
+      std::swap(fcomps_, cfcomps_);
+      std::swap(acomps_, cacomps_);
+    }
+    return k;
   }
   // A written type headed by such a module's type.
   long long appexp_ty(const CoreType& ty) {
@@ -31883,20 +32019,27 @@ struct Count {
   long long inc_wt(const ModuleExpr& b, const Lvl& l,
                    const std::vector<std::pair<std::string,
                                                const ModuleType*>>& ps,
-                   const ModuleExpr* home = nullptr, int d = 0) const {
+                   const ModuleExpr* home = nullptr, int d = 0,
+                   bool nested = true) const {
     auto* st = std::get_if<Pmod_structure>(&b.desc);
     if (!st || d > 4) return 0;
     long long k = 0;
     for (auto& it : st->items) {
       if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
         auto* pi = std::get_if<Pmod_ident>(&i->expr.desc);
-        if (!pi) { k += inc_wt(i->expr, l, ps, home, d + 1); continue; }
+        if (!pi) {
+          k += inc_wt(i->expr, l, ps, home, d + 1, nested);
+          continue;
+        }
         const ModuleType* pt = nullptr;
         auto* li = std::get_if<Lident>(&pi->id.txt.v);
         if (li)
           for (auto& p : ps)
             if (p.first == li->name) { pt = p.second; break; }
-        if (pt) { k += l.a * mt_top(*pt); continue; }
+        if (pt) {
+          k += l.a * mt_top(*pt) + (nested ? inc_nested(*pt, l) : 0);
+          continue;
+        }
         bool dotted = false;
         long long t = inc_top(i->expr, dotted, d + 1);
         if (!t && li && home && !incname_off())
@@ -31905,9 +32048,105 @@ struct Count {
               t = me_top(*q, d + 1);
         k += l.a * t;
       } else if (auto* md = std::get_if<Pstr_module>(&it.desc)) {
-        k += inc_wt(md->binding.expr, sub(l), ps, home, d + 1);
+        // `module M = X` is `module M = struct include X end` here: a
+        // parameter is not aliasable, so M carries X's signature written
+        // out (S514), and it is renamed with the rest of the result.
+        const ModuleType* pt = nullptr;
+        if (auto* pi = std::get_if<Pmod_ident>(&md->binding.expr.desc);
+            pi && !ltapp_off())
+          if (auto* li = std::get_if<Lident>(&pi->id.txt.v))
+            for (auto& p : ps)
+              if (p.first == li->name) { pt = p.second; break; }
+        if (pt)
+          k += sub(l).a * mt_top(*pt) +
+               (nested ? inc_nested(*pt, sub(l)) : 0);
+        else
+          k += inc_wt(md->binding.expr, sub(l), ps, home, d + 1, nested);
       }
     }
+    return k;
+  }
+  // The items a parameter's signature holds below its top, where the
+  // application's result is renamed: at the levels the cascade gives them
+  // -- measured one nested type at 2, 3 and 4 with the include at the top of
+  // the body, one and two modules down, 4 again with the application one
+  // module down, and 1 under an ascription.  The force of the functor's
+  // declaration (`lfun_cost`) does not reach them.
+  long long inc_lvl(const ModuleType& mt, const Lvl& l, int d) const {
+    if (d > 8) return 0;
+    const Signature* sg = mty_sig(&mt);
+    if (!sg) return 0;
+    long long k = 0;
+    for (auto& it : *sg) {
+      if (auto* m = std::get_if<Psig_module>(&it.desc))
+        k += l.a + inc_lvl(*m->md.type, sub(l), d + 1);
+      else
+        k += wt_sig_item(it, l);
+    }
+    return k;
+  }
+  long long inc_nested(const ModuleType& mt, const Lvl& l) const {
+    if (ltapp_off()) return 0;
+    const Signature* sg = mty_sig(&mt);
+    if (!sg) return 0;
+    long long k = 0;
+    for (auto& it : *sg)
+      if (auto* m = std::get_if<Psig_module>(&it.desc))
+        k += inc_lvl(*m->md.type, sub(l), 1);
+    return k;
+  }
+  // The same for the rebuild an argument with no path asks for (`ext_mexpr`
+  // above): a parameter's items brought in by `include X` or `module M = X`
+  // are nested where the include stands and are renamed `2k - 1` times more
+  // like the structure's own.
+  long long ext_inc(const ModuleExpr& b, const Ext& x,
+                    const std::vector<std::pair<std::string,
+                                                const ModuleType*>>& ps,
+                    int d = 0) const {
+    auto* st = std::get_if<Pmod_structure>(&b.desc);
+    if (!st || d > 4) return 0;
+    auto par = [&](const ModuleExpr& m) -> const ModuleType* {
+      auto* pi = std::get_if<Pmod_ident>(&m.desc);
+      auto* li = pi ? std::get_if<Lident>(&pi->id.txt.v) : nullptr;
+      if (li)
+        for (auto& p : ps)
+          if (p.first == li->name) return p.second;
+      return nullptr;
+    };
+    long long k = 0;
+    for (auto& it : st->items) {
+      if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
+        if (const ModuleType* pt = par(i->expr))
+          k += x.e * mt_top(*pt) + ext_nested(*pt, x);
+        else k += ext_inc(i->expr, x, ps, d + 1);
+      } else if (auto* md = std::get_if<Pstr_module>(&it.desc)) {
+        if (const ModuleType* pt = par(md->binding.expr))
+          k += esub(x).e * mt_top(*pt) + ext_nested(*pt, esub(x));
+        else k += ext_inc(md->binding.expr, esub(x), ps, d + 1);
+      }
+    }
+    return k;
+  }
+  long long ext_lvl(const ModuleType& mt, const Ext& x, int d) const {
+    if (d > 8) return 0;
+    const Signature* sg = mty_sig(&mt);
+    if (!sg) return 0;
+    long long k = 0;
+    for (auto& it : *sg) {
+      if (auto* m = std::get_if<Psig_module>(&it.desc))
+        k += x.e + ext_lvl(*m->md.type, esub(x), d + 1);
+      else
+        k += x.e * ren_sig_item(it);
+    }
+    return k;
+  }
+  long long ext_nested(const ModuleType& mt, const Ext& x) const {
+    const Signature* sg = mty_sig(&mt);
+    if (!sg) return 0;
+    long long k = 0;
+    for (auto& it : *sg)
+      if (auto* m = std::get_if<Psig_module>(&it.desc))
+        k += ext_lvl(*m->md.type, esub(x), 1);
     return k;
   }
   // What a parameter STILL TO BE APPLIED costs at every substitution BEFORE
@@ -32280,7 +32519,8 @@ struct Count {
     const int sub = inst == 2 ? 2 : 0;
     if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
       n += (xonly ? 0 : lapp_path(c->id.txt)) +
-           xtapp_charge(c->id.txt, inst != 0 || !c->args.empty());
+           xtapp_charge(c->id.txt, inst != 0 || !c->args.empty()) +
+           ltapp_charge(c->id.txt, inst == 2 && d == 0);
       for (auto& a : c->args) ty_app(*a, d + 1, xonly, sub);
     } else if (auto* c = std::get_if<Ptyp_class>(&t.desc)) {
       n += (xonly ? 0 : lapp_path(c->id.txt)) +
@@ -32456,8 +32696,13 @@ struct Count {
     k += me ? wt_mexpr(*me, l) : wt_mty(*mt, l);
     if (rnm) k += res_wt(*rnm, l);
     if (me && !incwt_off()) k += inc_wt(*me, l, fps, home);
-    if (pathless && saved && !pbody)
+    // The rebuild is `type_one_application`'s and is owed whether the
+    // result is saved or not: an ascribed `module N : S = F (struct .. end)`
+    // and a `let module` pay it the same (S515).
+    if (pathless && (saved || !ltapp_off()) && !pbody) {
       k += me ? ext_mexpr(*me, Ext{}) : ext_mty(*mt, Ext{});
+      if (me && !ltapp_off()) k += ext_inc(*me, Ext{}, fps);
+    }
     // A result whose type declarations `Mtype.strengthen` must REBUILD is
     // substituted again where it is saved -- but ONCE PER ARGUMENT, not once
     // per application, and once more (one ident over) for the FIRST
@@ -33097,6 +33342,16 @@ struct Count {
       const bool fxp = m->binding.name.txt.has_value();
       if (fxp) fxpath_.push_back(*m->binding.name.txt);
       if (fxp && saved_ && !inexpr_) n += fexp_charge(m->binding.expr);
+      // `module M = X` of an enclosing functor's PARAMETER is `module M =
+      // struct include X end` less the include's own enter: X is not
+      // aliasable, so M carries X's signature written out, and the cascade
+      // renames its items at M's level like any other structure's.
+      if (!ltapp_off())
+        if (const ModuleType* pt = par_of(m->binding.expr)) {
+          bool dt = false;
+          n += (ml.a - 1) * inc_top(m->binding.expr, dt) +
+               par_nested(*pt, ml, true);
+        }
       mexpr(m->binding.expr, ml,
             appexp_off() || saved_ || !local_app(m->binding.expr));
       if (fxp) fxpath_.pop_back();
@@ -33141,6 +33396,8 @@ struct Count {
         n += inc_items(i->expr, l);
         inm_ = nullptr;
         for (auto& s : nm) bind(s);
+        if (const ModuleType* pt = par_of(i->expr))
+          n += par_nested(*pt, l, false);
       }
       // The values an included APPLICATION binds are in scope too: a later
       // `let create x = create x` rebinds one and gets no missing-`rec`
