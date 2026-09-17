@@ -22754,11 +22754,25 @@ struct Count {
     static const bool off = dbg_env("NOPKMEET") != nullptr;
     return off;
   }
+  // A function's parameter: its label, whether its type is WRITTEN as a
+  // package at the top (the S505 test), the patterns that fix its type (one
+  // for a parameter, every case's for a `function`) and whether a DEFAULT
+  // fixes it as a package (`?(m = (module M1 : S))`).
+  struct PkParam {
+    std::string label;
+    char pk = 0;
+    std::vector<const Pattern*> pats;
+    char def_pk = 0;
+  };
   struct Pk {
     char pk = 0;                       // bound to a package-typed expression
     const Ptyp_package* ty = nullptr;  // the package type WRITTEN for it
-    std::vector<std::pair<std::string, char>> params;  // (label, is-package)
+    std::vector<PkParam> params;
   };
+  // A parameter whose pattern is an unpack meets its arguments at a package
+  // type it never wrote out; `pkleaf_` stands for that type where `pk_rue`
+  // wants one (only its shape is read).
+  CoreType pkleaf_{Ptyp_package{}, {}, {}};
   std::unordered_map<std::string, std::vector<Pk>> pkv_;
   std::unordered_map<std::string, Pk> pkpend_;
   std::unordered_set<const Expression*> pkexp_;  // rued at a package type
@@ -22793,20 +22807,8 @@ struct Count {
       }
       auto* d = std::get_if<Ldot>(&i->id.txt.v);
       if (!d) return false;
-      auto* m = std::get_if<Lident>(&d->prefix->v);
-      if (!m) return false;
-      auto it = mods.find(m->name);
-      if (it == mods.end() || it->second.empty() || !it->second.back())
-        return false;
-      auto* st = std::get_if<Pmod_structure>(&it->second.back()->desc);
-      if (!st) return false;
-      const Expression* found = nullptr;
-      for (auto& si : st->items)
-        if (auto* v = std::get_if<Pstr_value>(&si.desc))
-          for (auto& b : v->bindings)
-            if (const std::string* nm = pk_name(b.pat))
-              if (*nm == d->name) found = b.expr.get();
-      return found && pkg_typed(*found, ty, fuel - 1);
+      const ValueBinding* found = mod_value(*d);
+      return found && pkg_typed(*found->expr, ty, fuel - 1);
     }
     if (auto* i = std::get_if<Pexp_ifthenelse>(&e.desc))
       return pkg_typed(*i->then_, ty, fuel - 1) ||
@@ -22835,6 +22837,23 @@ struct Count {
       return pkg_typed(*t->body, ty, fuel - 1);
     return false;
   }
+  // `N.x`: the binding of `x` in the local structure `N`, if any.
+  const ValueBinding* mod_value(const Ldot& d) const {
+    auto* m = std::get_if<Lident>(&d.prefix->v);
+    if (!m) return nullptr;
+    auto it = mods.find(m->name);
+    if (it == mods.end() || it->second.empty() || !it->second.back())
+      return nullptr;
+    auto* st = std::get_if<Pmod_structure>(&it->second.back()->desc);
+    if (!st) return nullptr;
+    const ValueBinding* found = nullptr;
+    for (auto& si : st->items)
+      if (auto* v = std::get_if<Pstr_value>(&si.desc))
+        for (auto& b : v->bindings)
+          if (const std::string* nm = pk_name(b.pat))
+            if (*nm == d.name) found = &b;
+    return found;
+  }
   // What a binding says about its name: annotated or bound at a package
   // type, and which of a function's parameters are written as packages.
   Pk pk_info(const ValueBinding& b) {
@@ -22851,20 +22870,89 @@ struct Count {
       k.ty = t;
     }
     if (auto* f = std::get_if<Pexp_function>(&b.expr->desc)) fn_params(*f, k.params);
+    // `let g = f`: g's parameters are f's (u12).
+    if (!pkarg_off() && k.params.empty())
+      if (auto* i = std::get_if<Pexp_ident>(&b.expr->desc))
+        if (auto* l = std::get_if<Lident>(&i->id.txt.v)) {
+          auto it = pkv_.find(l->name);
+          if (it != pkv_.end() && !it->second.empty()) k.params = it->second.back().params;
+        }
     return k;
   }
-  static void fn_params(const Pexp_function& f,
-                        std::vector<std::pair<std::string, char>>& out) {
+  void fn_params(const Pexp_function& f, std::vector<PkParam>& out) {
     for (auto& pm : f.params)
       if (auto* v = std::get_if<Pparam_val>(&pm.desc)) {
-        std::string lb;
-        if (auto* l = std::get_if<Labelled>(&v->label)) lb = l->name;
-        else if (auto* o = std::get_if<Optional>(&v->label)) lb = "?" + o->name;
-        char pk = 0;
+        PkParam o;
+        if (auto* l = std::get_if<Labelled>(&v->label)) o.label = l->name;
+        else if (auto* x = std::get_if<Optional>(&v->label)) o.label = "?" + x->name;
         if (auto* c = std::get_if<Ppat_constraint>(&v->pat.desc))
-          pk = pk_of_ty(*c->t) != nullptr;
-        out.emplace_back(lb, pk);
+          o.pk = pk_of_ty(*c->t) != nullptr;
+        o.pats.push_back(&v->pat);
+        if (v->default_ && pkg_typed(**v->default_)) o.def_pk = 1;
+        out.push_back(std::move(o));
       }
+    // `function (module M : S) -> ..`: the cases' patterns are the
+    // parameter's (t13).
+    if (!pkarg_off() && f.params.empty())
+      if (auto* cs = std::get_if<Pfunction_cases>(&f.body->v)) {
+        PkParam o;
+        for (auto& c : cs->cases) o.pats.push_back(&c.lhs);
+        out.push_back(std::move(o));
+      }
+  }
+  // ---- AN ARGUMENT MEETS THE PACKAGE ITS PARAMETER'S PATTERN FIXES (S511) --
+  // syntactic_arity.ml: `binding1 (module M1)` at `let binding1 (module M :
+  // S) ..` was charged nothing -- the S505 test read only a parameter WRITTEN
+  // `(x : (module S))`.  `type_argument` types the argument at the
+  // parameter's type, and an unpack pattern fixed that as `(module S)` just
+  // as a written type would (typecore.ml:2146), a default fixed an optional
+  // parameter's as the default's own type, a tuple pattern each component's;
+  // the argument's `rue` then meets a package with a package, 2 per meet,
+  // wherever it stands (r2 2, t1 a tuple 2, t5 `?m:(Some p)` 2, u1 `Some p`
+  // at `(module S) option` 2, u2 an `if` 6 with its branches' own meet).
+  // `NOPKARG=1` reverts to the S505 test.
+  static bool pkarg_off() {
+    static const bool off = dbg_env("NOPKARG") != nullptr;
+    return off;
+  }
+  long long pk_parg(const Pattern& p, const Expression& e, int fuel = 24) {
+    if (fuel <= 0) return 0;
+    if (auto* c = std::get_if<Ppat_constraint>(&p.desc))
+      return pk_rue(e, *c->t, false, fuel - 1);
+    if (auto* u = std::get_if<Ppat_unpack>(&p.desc))
+      return u->pkg ? pk_rue(e, pkleaf_, false, fuel - 1) : 0;
+    if (auto* a = std::get_if<Ppat_alias>(&p.desc)) return pk_parg(*a->p, e, fuel - 1);
+    if (auto* o = std::get_if<Ppat_open>(&p.desc)) return pk_parg(*o->p, e, fuel - 1);
+    if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
+      auto* u = std::get_if<Pexp_tuple>(&e.desc);
+      if (!u || u->elems.size() != t->elems.size()) return 0;
+      long long k = 0;
+      for (std::size_t i = 0; i < u->elems.size(); ++i)
+        k += pk_parg(*t->elems[i], *u->elems[i], fuel - 1);
+      return k;
+    }
+    return 0;
+  }
+  // What the argument `e`, passed with `opt` (`?m:e`, an option) to the
+  // parameter `pm`, meets.
+  bool pk_inst_ = false;  // `pk_rue` at a parameter's (instance) type
+  long long pk_parg(const PkParam& pm, const Expression& e, bool opt) {
+    const Expression* a = &e;
+    if (opt) {
+      auto* c = std::get_if<Pexp_construct>(&e.desc);
+      if (!c || !c->arg || lid_last(c->id.txt) != "Some") return 0;
+      a = c->arg->get();
+    }
+    pk_inst_ = true;
+    long long k = 0;
+    if (pm.def_pk) {
+      k = pk_rue(*a, pkleaf_, false);
+    } else {
+      for (const Pattern* p : pm.pats)
+        if ((k = pk_parg(*p, *a))) break;
+    }
+    pk_inst_ = false;
+    return k;
   }
   // Enter a `let`'s names for a look INSIDE an expression (`pkg_typed` and
   // `pk_rue` under a `let .. in`); `bindings` proper goes through `pkpend_`.
@@ -22892,8 +22980,12 @@ struct Count {
     if (auto* i = std::get_if<Pexp_ifthenelse>(&e.desc)) {
       if (!i->else_) return 0;
       pkexp_.insert(&e);
+      // Each branch is rued at an `instance` of the expectation: copies of
+      // a WRITTEN (generic) type, which then meet each other in the "keep
+      // sharing" unify (typecore.ml:5107); a parameter's type is one node
+      // the branches share, and that unify is a no-op (u2).
       return pk_rue(*i->then_, t, top, fuel - 1) +
-             pk_rue(**i->else_, t, top, fuel - 1) + 2 * nodes;
+             pk_rue(**i->else_, t, top, fuel - 1) + (pk_inst_ ? 0 : 2 * nodes);
     }
     if (auto* m = std::get_if<Pexp_match>(&e.desc)) {
       pkexp_.insert(&e);
@@ -23004,12 +23096,17 @@ struct Count {
   // An argument at a parameter this file WROTE as a package meets it; the
   // second operand of a polymorphic comparison meets the first.
   long long pk_app(const Pexp_apply& a) {
-    std::vector<std::pair<std::string, char>> lam;
+    std::vector<PkParam> lam;
     if (auto* lf = std::get_if<Pexp_function>(&a.fn->desc)) fn_params(*lf, lam);
     auto* f = std::get_if<Pexp_ident>(&a.fn->desc);
     if (!f && lam.empty()) return 0;
     auto* l = f ? std::get_if<Lident>(&f->id.txt.v) : nullptr;
-    if (f && !l) return 0;
+    // `N.f (module M1)`: f's parameters read off N's structure (u6).
+    if (f && !l && !pkarg_off())
+      if (auto* d = std::get_if<Ldot>(&f->id.txt.v))
+        if (const ValueBinding* vb = mod_value(*d))
+          if (auto* lf = std::get_if<Pexp_function>(&vb->expr->desc)) fn_params(*lf, lam);
+    if (f && !l && lam.empty()) return 0;
     auto it = l ? pkv_.find(l->name) : pkv_.end();
     const bool local = it != pkv_.end() && !it->second.empty();
     if (!lam.empty() || (local && !it->second.back().params.empty())) {
@@ -23020,20 +23117,25 @@ struct Count {
         std::string lb;
         if (auto* x = std::get_if<Labelled>(&ar.first)) lb = x->name;
         else if (auto* x = std::get_if<Optional>(&ar.first)) lb = "?" + x->name;
-        const std::pair<std::string, char>* pm = nullptr;
+        const PkParam* pm = nullptr;
         if (lb.empty()) {
           std::size_t j = 0;
           for (auto& p : ps)
-            if (p.first.empty()) {
+            if (p.label.empty()) {
               if (j == pos) { pm = &p; break; }
               ++j;
             }
           ++pos;
         } else {
           for (auto& p : ps)
-            if (p.first == lb || p.first == "?" + lb) { pm = &p; break; }
+            if (p.label == lb || p.label == "?" + lb) { pm = &p; break; }
         }
-        if (pm && pm->second && pkg_typed(*ar.second)) k += 2;
+        if (!pm) continue;
+        if (pkarg_off()) {
+          if (pm->pk && pkg_typed(*ar.second)) k += 2;
+        } else {
+          k += pk_parg(*pm, *ar.second, std::holds_alternative<Optional>(ar.first));
+        }
       }
       return k;
     }
@@ -26935,6 +27037,13 @@ struct Count {
         // name_pattern (typecore.ml:6083).
         ++n;
         expr(**pv->default_);
+        // `?opt:((module M) = (module M1 : S))`: M's type is the default's,
+        // so `M.E` in a later parameter is S's extensible constructor (v1).
+        if (!pkarg_off())
+          if (auto* u = std::get_if<Ppat_unpack>(&pv->pat.desc); u && u->name.txt && !u->pkg) {
+            const Ptyp_package* ty = nullptr;
+            if (pkg_typed(**pv->default_, &ty) && ty) pkpend_[*u->name.txt] = Pk{0, ty, {}};
+          }
         pat(pv->pat, &nm);
         continue;
       }
