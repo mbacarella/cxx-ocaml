@@ -20675,6 +20675,11 @@ bool anondep_off() {
   static const bool off = dbg_env("NOANONDEP") != nullptr;
   return off;
 }
+// S536: a local functor whose result is another unit's application.
+bool xbody_off() {
+  static const bool off = dbg_env("NOXBODY") != nullptr;
+  return off;
+}
 // S534: a class type named through a functor APPLICATION (`F (M).t`, an
 // extended module path) is looked up as a type is: `Env.lookup_dot_cltype`
 // (env.ml:3138) reads the application's components through the same
@@ -20750,7 +20755,11 @@ const Longident* xrd_head(const StructureItem& it, std::string* name) {
     h = a->f.get();
   }
   auto* pi = nargs ? std::get_if<Pmod_ident>(&h->desc) : nullptr;
-  if (!pi || !std::holds_alternative<Ldot>(pi->id.txt.v)) return nullptr;
+  if (!pi) return nullptr;
+  // A bare name is a functor of this file, read the same way where its
+  // result is another unit's application (S536, `xbody_walk`).
+  if (!std::holds_alternative<Ldot>(pi->id.txt.v) && xbody_off())
+    return nullptr;
   if (name) *name = *lm->binding.name.txt;
   return &pi->id.txt;
 }
@@ -22898,7 +22907,8 @@ struct Cites {
         lmods[cscope()] = &lm->binding.expr;
       }
       std::string xn;
-      const bool xrd = !xrd_off() && xrd_head(*s->item, &xn);
+      const Longident* xh = xrd_off() ? nullptr : xrd_head(*s->item, &xn);
+      const bool xrd = xh != nullptr;
       if (xrd) {
         lmscope_.emplace_back(xn, "@" + std::to_string((std::uintptr_t)s) +
                                       "/");
@@ -22913,7 +22923,9 @@ struct Cites {
           if (it != rs->end() && it->compare(0, pre.size(), pre) == 0)
             read = true;
         }
-        if (read && fi < fread.size()) fread[fi] = true;
+        if (read && fi < fread.size() &&
+            std::holds_alternative<Ldot>(xh->v))
+          fread[fi] = true;
         lmscope_.pop_back();
       }
       if (named) cpath_.pop_back();
@@ -26186,6 +26198,21 @@ struct Count {
     ps.assign(nargs, nullptr);
     const ModuleExpr* me = mderef(head);
     const ModuleType* mt = nullptr;
+    // An alias of a PARTIAL application names the functor left after its
+    // own arguments (S536).
+    if (me && !xbody_off() && std::holds_alternative<Pmod_apply>(me->desc)) {
+      int k = 0;
+      const ModuleExpr* g = me;
+      while (auto* a = std::get_if<Pmod_apply>(&g->desc)) {
+        ++k;
+        g = a->f.get();
+      }
+      me = mderef(g);
+      for (int j = 0; me && j < k; ++j) {
+        auto* f = std::get_if<Pmod_functor>(&me->desc);
+        me = f ? f->body.get() : nullptr;
+      }
+    }
     // A head an enclosing functor's parameter names is read off the
     // parameter's type (S533).
     if (!me && !hoapp_off() && !parfun_off()) mt = pf_head(*head);
@@ -33544,8 +33571,12 @@ struct Count {
       return mt_top(*c->mt, d);
     // A module bound to an APPLICATION has the functor's result for its
     // signature, and an `include` of it enters that result's top items.
-    if (!ltapp_off() && std::holds_alternative<Pmod_apply>(m.desc))
+    if (!ltapp_off() && std::holds_alternative<Pmod_apply>(m.desc)) {
       if (const ModuleExpr* r = app_res(&m)) return me_top(*r, d + 1);
+      // .. and a local functor's result of another unit's (S536)
+      if (const cmi::ModuleType* r = xbody_res(m))
+        return shal_csig(r->sig.get());
+    }
     bool dt = false;
     return std::holds_alternative<Pmod_ident>(m.desc) ? inc_top(m, dt, d + 1)
                                                       : 0;
@@ -36474,25 +36505,33 @@ struct Count {
       ++nargs;
       head = a->f.get();
     }
-    // A functor of this file, of a parent of it, or of an enclosing
-    // functor's parameter is not the unit's.
-    if (mderef(head)) return 0;
-    {
-      TScope ts{*this, tmark()};
-      const ModuleExpr* me = nullptr;
-      const ModuleType* mt = nullptr;
-      lfun_head(*head, me, mt);
-      if (me || mt) return 0;
-    }
-    if (!parfun_off() && pf_head(*head)) return 0;
-    const cmi::Signature* root = nullptr;
-    const cmi::ModuleType* mt = cmi_module(*id, &root);
-    for (int i = 0; i < nargs; ++i) {
+    // A functor of this file whose result is another unit's application
+    // has that result read (S536); one of a parent of it, or of an
+    // enclosing functor's parameter, is not the unit's.
+    const ModuleExpr* xapp = nullptr;
+    int xsc = -1;
+    const cmi::ModuleType* mt = nullptr;
+    if (mderef(head)) {
+      mt = xbody_of(m, &xapp, &xsc);
+      if (!xapp) return 0;
+    } else {
+      {
+        TScope ts{*this, tmark()};
+        const ModuleExpr* me = nullptr;
+        const ModuleType* lmt = nullptr;
+        lfun_head(*head, me, lmt);
+        if (me || lmt) return 0;
+      }
+      if (!parfun_off() && pf_head(*head)) return 0;
+      const cmi::Signature* root = nullptr;
+      mt = cmi_module(*id, &root);
+      for (int i = 0; i < nargs; ++i) {
+        mt = scrape_cmty(mt, root);
+        if (!mt || mt->kind != cmi::ModuleType::Functor) return 0;
+        mt = mt->functor_body.get();
+      }
       mt = scrape_cmty(mt, root);
-      if (!mt || mt->kind != cmi::ModuleType::Functor) return 0;
-      mt = mt->functor_body.get();
     }
-    mt = scrape_cmty(mt, root);
     if (!mt || mt->kind != cmi::ModuleType::Sig || !mt->sig) return 0;
     const std::string pre =
         "@" + std::to_string((std::uintptr_t)&si) + "/" + nm + ".";
@@ -36523,7 +36562,10 @@ struct Count {
         }
         if (t && names_param_abs(t, *mt->sig, 0)) builds = true;
       }
+    // A read expands the type it meets, the head's manifest: the
+    // applications inside the argument are not reached (S536).
     if (!builds) return 0;
+    if (xapp) return xnodes(xapp, xsc, true, false);
     const long long r = flat_cmty(mt);
     const std::string fk = xtapp_key(*id);
     if (fk.empty()) return 0;
@@ -37559,6 +37601,423 @@ struct Count {
     }
   }
 
+  // ---- A LOCAL FUNCTOR WHOSE RESULT IS ANOTHER UNIT'S APPLICATION (S536) --
+  // `module F (X : Set.OrderedType) = Set.Make (X)` hands every application
+  // the strengthened result of `Set.Make (X)` with the argument put in for
+  // the parameter.  One application pays `Subst.modtype`'s rename of that
+  // result (typemod.ml:2704), one ident per item, ONCE PER STEP -- an
+  // argument with no path enters the same items through `Mtype.nondep_sig`
+  // (mtype.ml:249) instead -- and, where the binding is saved, the
+  // inferred-signature check expands the result's manifests through the
+  // substituted path (`Includecore.type_manifest`, includecore.ml:897, the
+  // FIND side): `Set.Make (A)`'s components once per distinct argument path,
+  // twice where the argument is an ALIAS (S487's normalized second path),
+  // shared with every direct `Set.Make (A)` of the file (`fargp`), and a
+  // direct unit argument's signature read out once besides (`fargu`); the
+  // functor's own components were built by the definition's check.  An
+  // argument that is itself a LOCAL functor applied inside the result
+  // (`PowerSet (IntSet) (Id)` over `Set.Make (SetOrd (BaseSet))`) has Id's
+  // components built once per file and `Id (IntSet)`'s once per path, at the
+  // weight of Id's result; a functor LITERAL has both built at every
+  // application.  A path that mentions a parameter an argument WITHOUT a
+  // path left in place is expanded by the nondep pass at the application,
+  // saved or not; one that does not is the check's.  A path nothing was put
+  // into is the definition's own node, built already.  A partial
+  // application saved as a functor has each parameter left checked as the
+  // definition's are (`pfun_arrows`).  `NOXBODY=1` reverts (`xbody_off`, a
+  // free function: `xrd_head` shares it).
+  // The parameters of one functor on the way to the body, each with the
+  // argument it was given (null: none, a partial application or one with no
+  // path), read in the scope of the application that gave it.
+  struct XScope {
+    std::vector<std::pair<std::string, const ModuleExpr*>> binds;
+    int parent;
+    const void* owner;
+  };
+  mutable std::vector<XScope> xsc_;
+  // Which local functors the find side has built the components of.
+  std::set<std::string> xffc_;
+  // What a name resolves to through the scopes: the expression it stands
+  // for and the scope that reads it, or the parameter it is left as.
+  struct XRes {
+    const ModuleExpr* e = nullptr;
+    int sc = -1;
+    bool param = false;   // left a parameter (given nothing, or no path)
+    bool subst = false;   // an argument was put in on the way
+    bool nondep = false;  // .. and one of them had no path
+    std::string name;     // the parameter's name
+    const void* owner = nullptr;
+  };
+  XRes xresolve(const ModuleExpr* e, int sc) const {
+    XRes r;
+    for (int d = 0; e && d < 16; ++d) {
+      r.e = e;
+      r.sc = sc;
+      auto* pi = std::get_if<Pmod_ident>(&e->desc);
+      auto* li = pi ? std::get_if<Lident>(&pi->id.txt.v) : nullptr;
+      if (!li) return r;
+      const std::pair<std::string, const ModuleExpr*>* b = nullptr;
+      int bs = -1;
+      for (int s = sc; s >= 0 && !b; s = xsc_[s].parent)
+        for (auto& x : xsc_[s].binds)
+          if (x.first == li->name) {
+            b = &x;
+            bs = s;
+            break;
+          }
+      if (b) {
+        if (!b->second || !has_path(*b->second)) {
+          r.param = true;
+          r.name = li->name;
+          r.owner = xsc_[bs].owner;
+          if (b->second) {  // left in place over this argument
+            r.nondep = true;
+            r.e = b->second;
+          }
+          return r;
+        }
+        r.subst = true;
+        e = b->second;
+        sc = xsc_[bs].parent;
+        continue;
+      }
+      auto f = fmods.find(li->name);
+      if (f != fmods.end() && !f->second.empty()) {
+        r.param = true;
+        r.name = li->name;
+        r.owner = f->second.back();
+      }
+      return r;
+    }
+    return r;
+  }
+  // The key of an argument, the way `cross_charge` spells a path.
+  std::string xkey(const ModuleExpr* e, int sc, XRes* out) const {
+    XRes r = xresolve(e, sc);
+    if (out) {
+      out->subst |= r.subst;
+      out->nondep |= r.nondep;
+    }
+    // a parameter left in place is the ident of the functor VALUE applied:
+    // the application's own, or the alias of a partial application's
+    if (r.param)
+      return "@" + r.name + "#" + std::to_string((std::uintptr_t)r.owner);
+    if (auto* pi = std::get_if<Pmod_ident>(&r.e->desc)) {
+      std::vector<std::string> ac;
+      std::string k;
+      if (lid_comps(pi->id.txt, ac))
+        for (auto& s : ac) k += s + ".";
+      return k;
+    }
+    if (std::holds_alternative<Pmod_apply>(r.e->desc)) {
+      std::vector<const ModuleExpr*> as;
+      const ModuleExpr* h = r.e;
+      while (auto* a = std::get_if<Pmod_apply>(&h->desc)) {
+        as.push_back(a->arg.get());
+        h = a->f.get();
+      }
+      std::string k = xkey(h, r.sc, out);
+      for (auto it = as.rbegin(); it != as.rend(); ++it)
+        k += "(" + xkey(*it, r.sc, out) + ")";
+      return k;
+    }
+    return "<" + std::to_string((std::uintptr_t)r.e) + ">";
+  }
+  // The flat weight of a module type: a signature's items, a name's.
+  long long xmty_flat(const ModuleType& t, int d = 0) const {
+    if (d > 8) return 0;
+    if (auto* w = std::get_if<Pmty_with>(&t.desc))
+      return xmty_flat(*w->mt, d + 1);
+    if (auto* id = std::get_if<Pmty_ident>(&t.desc)) {
+      if (const ModuleType* m = named_mty(id->id.txt, 8))
+        return m == &t ? 0 : xmty_flat(*m, d + 1);
+      std::string key;
+      if (const cmi::Signature* cs = xmty_sig(&t, key)) return flat_csig(*cs);
+      return 0;
+    }
+    return wt_mty(t, flat());
+  }
+  // The result of another unit's functor applied to `n` arguments, scraped.
+  const cmi::ModuleType* xapp_cres(const ModuleExpr& head, int n) const {
+    const Longident* id = mpath(&head);
+    if (!id || mderef(&head)) return nullptr;
+    const cmi::Signature* root = nullptr;
+    const cmi::ModuleType* mt = scrape_cmty(cmi_module(*id, &root), root);
+    for (int i = 0; i < n; ++i) {
+      if (!mt || mt->kind != cmi::ModuleType::Functor) return nullptr;
+      mt = scrape_cmty(mt->functor_body.get(), root);
+    }
+    if (!mt || mt->kind != cmi::ModuleType::Sig || !mt->sig) return nullptr;
+    return mt;
+  }
+  // The flat weight of a local functor's result after `n` arguments: what
+  // the find side forces for its components.
+  long long xlres_flat(const ModuleExpr* f, int n, int d = 0) const {
+    if (!f || d > 8) return 0;
+    std::vector<std::pair<std::string, const ModuleType*>> ps;
+    const ModuleExpr* cur = f;
+    for (int i = 0; i < n; ++i) {
+      auto* fn = std::get_if<Pmod_functor>(&cur->desc);
+      if (!fn) return 0;
+      if (auto* nm = std::get_if<Functor_named>(&fn->param))
+        if (nm->name.txt && nm->type)
+          ps.emplace_back(*nm->name.txt, &*nm->type);
+      const ModuleExpr* b = mderef(fn->body.get());
+      cur = b ? b : fn->body.get();  // a parameter's name is no binding
+    }
+    if (auto* c = std::get_if<Pmod_constraint>(&cur->desc))
+      return xmty_flat(*c->mt);
+    if (std::holds_alternative<Pmod_structure>(cur->desc))
+      return wt_mexpr(*cur, flat());
+    if (auto* pi = std::get_if<Pmod_ident>(&cur->desc)) {
+      if (auto* li = std::get_if<Lident>(&pi->id.txt.v))
+        for (auto& p : ps)
+          if (p.first == li->name) return xmty_flat(*p.second);
+      return 0;
+    }
+    if (std::holds_alternative<Pmod_apply>(cur->desc)) {
+      int m = 0;
+      const ModuleExpr* h = cur;
+      while (auto* a = std::get_if<Pmod_apply>(&h->desc)) {
+        ++m;
+        h = a->f.get();
+      }
+      if (const ModuleExpr* lf = mderef(h)) return xlres_flat(lf, m, d + 1);
+      return flat_cmty(xapp_cres(*h, m));
+    }
+    return 0;
+  }
+  // The body of `fdef` applied to `actual` (outermost parameter first), read
+  // through the local functors applied on the way: the application of
+  // another unit's functor it comes to, with `sc` the scope it is read in;
+  // null where the body is anything else.
+  const ModuleExpr* xbody_walk(const ModuleExpr* fdef,
+                               const std::vector<const ModuleExpr*>& actual,
+                               int parent, int& sc, const void* owner,
+                               int d = 0) const {
+    if (!fdef || d > 8) return nullptr;
+    xsc_.push_back(XScope{{}, parent, owner});
+    sc = (int)xsc_.size() - 1;
+    const ModuleExpr* cur = fdef;
+    std::size_t i = 0;
+    for (;; ++i) {
+      auto* f = std::get_if<Pmod_functor>(&cur->desc);
+      if (!f) break;
+      auto* nm = std::get_if<Functor_named>(&f->param);
+      if (!nm || !nm->name.txt) return nullptr;
+      xsc_[sc].binds.emplace_back(*nm->name.txt,
+                                  i < actual.size() ? actual[i] : nullptr);
+      cur = mderef(f->body.get());
+      if (!cur) return nullptr;
+    }
+    if (i < actual.size()) return nullptr;
+    return xbody_app(cur, sc, d);
+  }
+  const ModuleExpr* xbody_app(const ModuleExpr* cur, int& sc, int d) const {
+    if (!std::holds_alternative<Pmod_apply>(cur->desc)) return nullptr;
+    std::vector<const ModuleExpr*> as;
+    const ModuleExpr* h = cur;
+    while (auto* a = std::get_if<Pmod_apply>(&h->desc)) {
+      as.push_back(a->arg.get());
+      h = a->f.get();
+    }
+    std::reverse(as.begin(), as.end());
+    XRes hr = xresolve(h, sc);
+    if (hr.param) return nullptr;
+    if (const ModuleExpr* lf = mderef(hr.e)) {
+      if (std::holds_alternative<Pmod_apply>(lf->desc)) {
+        // an alias of a partial application: its arguments come first
+        std::vector<const ModuleExpr*> pre;
+        const ModuleExpr* g = lf;
+        while (auto* a = std::get_if<Pmod_apply>(&g->desc)) {
+          pre.push_back(a->arg.get());
+          g = a->f.get();
+        }
+        std::reverse(pre.begin(), pre.end());
+        pre.insert(pre.end(), as.begin(), as.end());
+        const ModuleExpr* gf = mderef(g);
+        if (!gf || !std::holds_alternative<Pmod_functor>(gf->desc))
+          return nullptr;
+        int sc2 = -1;
+        const ModuleExpr* r = xbody_walk(gf, pre, sc, sc2, lf, d + 1);
+        if (r) sc = sc2;
+        return r;
+      }
+      if (!std::holds_alternative<Pmod_functor>(lf->desc)) return nullptr;
+      int sc2 = -1;
+      const ModuleExpr* r = xbody_walk(lf, as, sc, sc2, cur, d + 1);
+      if (r) sc = sc2;
+      return r;
+    }
+    if (std::holds_alternative<Pmod_functor>(hr.e->desc)) return nullptr;
+    return xapp_cres(*hr.e, (int)as.size()) ? cur : nullptr;
+  }
+  // What the find side builds for the application `e` read in scope `sc`
+  // and the applications inside its arguments: nothing for the definition's
+  // own path, the check's only where `chk`.
+  long long xnodes(const ModuleExpr* e, int sc, bool chk, bool inner = true) {
+    XRes r = xresolve(e, sc);
+    if (r.param || !std::holds_alternative<Pmod_apply>(r.e->desc)) return 0;
+    std::vector<const ModuleExpr*> as;
+    const ModuleExpr* h = r.e;
+    while (auto* a = std::get_if<Pmod_apply>(&h->desc)) {
+      as.push_back(a->arg.get());
+      h = a->f.get();
+    }
+    std::reverse(as.begin(), as.end());
+    long long k = 0;
+    XRes flags;
+    std::string ak;
+    for (auto* a : as) {
+      ak += "(" + xkey(a, r.sc, &flags) + ")";
+      if (inner)
+        k += xnodes(a, r.sc, chk);
+      else
+        k += xarg_ffc(a, r.sc);
+    }
+    XRes hr = xresolve(h, r.sc);
+    if (!flags.subst || (!flags.nondep && !hr.nondep && !chk)) return k;
+    if (hr.param && !hr.nondep) return k;
+    // the argument's alias, and a direct unit's own path
+    int al = 0;
+    std::vector<std::string> uargc;
+    for (auto* a : as) {
+      XRes ar = xresolve(a, r.sc);
+      auto* pi = ar.param ? nullptr : std::get_if<Pmod_ident>(&ar.e->desc);
+      std::vector<std::string> ac;
+      if (!pi || !lid_comps(pi->id.txt, ac) || ac.empty()) continue;
+      if (arg_alias(ac)) {
+        al = 1;
+      } else if (!mods.count(ac[0])) {
+        const std::string ap = head_cmi(ac[0]);
+        if (!ap.empty() && std::filesystem::exists(ap)) uargc = ac;
+      }
+    }
+    const int n = (int)as.size();
+    // a functor LITERAL, or a parameter left in place over one: its
+    // components and the application's, at every application
+    if (std::holds_alternative<Pmod_functor>(hr.e->desc))
+      return k + (2 + al) * xlres_flat(hr.e, n);
+    if (hr.param) return k;
+    if (const ModuleExpr* lf = mderef(hr.e)) {
+      if (!std::holds_alternative<Pmod_functor>(lf->desc)) return k;
+      const long long w = xlres_flat(lf, n);
+      const std::string hk = std::to_string((std::uintptr_t)lf);
+      if (xffc_.insert(hk).second) k += w;
+      if (larg.insert(hk + ak).second) k += (1 + al) * w;
+      return k;
+    }
+    const cmi::ModuleType* res = xapp_cres(*hr.e, n);
+    const Longident* id = mpath(hr.e);
+    if (!res || !id) return k;
+    std::vector<std::string> c;
+    lid_comps(*id, c);
+    std::string hk;
+    for (auto& s : c) hk += s + ".";
+    if (fargp[hk].insert(hk + ak).second) {
+      farg.insert(hk + ak);
+      k += (1 + al) * flat_cmty(res);
+      if (!uargc.empty()) {
+        std::string uk;
+        for (auto& s : uargc) uk += s + ".";
+        if (fargu.insert(uk).second) k += arg_flat(uargc);
+      }
+    }
+    return k;
+  }
+  // The application `m` of a functor of this file -- or of an alias of a
+  // partial application of one, whose own arguments come first and whose
+  // idents the parameters left are -- read through to another unit's
+  // application: its result, with `app` that application and `sc` the
+  // scope it is read in; null where the body is anything else.
+  const cmi::ModuleType* xbody_of(const ModuleExpr& m, const ModuleExpr** app,
+                                  int* sc) const {
+    *app = nullptr;
+    if (xbody_off()) return nullptr;
+    std::vector<const ModuleExpr*> actual;
+    const ModuleExpr* h = &m;
+    while (auto* a = std::get_if<Pmod_apply>(&h->desc)) {
+      actual.push_back(a->arg.get());
+      h = a->f.get();
+    }
+    if (actual.empty()) return nullptr;
+    std::reverse(actual.begin(), actual.end());
+    const ModuleExpr* fdef = mderef(h);
+    if (!fdef) return nullptr;
+    const void* owner = &m;
+    if (std::holds_alternative<Pmod_apply>(fdef->desc)) {
+      std::vector<const ModuleExpr*> pre;
+      const ModuleExpr* g = fdef;
+      while (auto* a = std::get_if<Pmod_apply>(&g->desc)) {
+        pre.push_back(a->arg.get());
+        g = a->f.get();
+      }
+      std::reverse(pre.begin(), pre.end());
+      pre.insert(pre.end(), actual.begin(), actual.end());
+      actual.swap(pre);
+      owner = fdef;
+      fdef = mderef(g);
+    }
+    if (!fdef || !std::holds_alternative<Pmod_functor>(fdef->desc))
+      return nullptr;
+    xsc_.clear();
+    *sc = -1;
+    *app = xbody_walk(fdef, actual, -1, *sc, owner);
+    if (!*app) return nullptr;
+    int n = 0;
+    const ModuleExpr* ah = *app;
+    while (auto* a = std::get_if<Pmod_apply>(&ah->desc)) {
+      ++n;
+      ah = a->f.get();
+    }
+    return xapp_cres(*xresolve(ah, *sc).e, n);
+  }
+  // The same, for what reads the module bound to it (`me_top`).
+  const cmi::ModuleType* xbody_res(const ModuleExpr& m) const {
+    std::vector<XScope> sv;
+    sv.swap(xsc_);
+    const ModuleExpr* app = nullptr;
+    int sc = -1;
+    const cmi::ModuleType* res = xbody_of(m, &app, &sc);
+    xsc_.swap(sv);
+    return res;
+  }
+  // What normalizing an argument that is itself an application costs once
+  // the expansion has failed (`Env.try_normalize`, env.ml:1445): the
+  // functor's components, and not the application's.
+  long long xarg_ffc(const ModuleExpr* a, int sc) {
+    XRes r = xresolve(a, sc);
+    if (r.param || !std::holds_alternative<Pmod_apply>(r.e->desc)) return 0;
+    int n = 0;
+    const ModuleExpr* h = r.e;
+    while (auto* ap = std::get_if<Pmod_apply>(&h->desc)) {
+      ++n;
+      h = ap->f.get();
+    }
+    XRes hr = xresolve(h, r.sc);
+    if (std::holds_alternative<Pmod_functor>(hr.e->desc))
+      return xlres_flat(hr.e, n);
+    if (hr.param) return 0;
+    const ModuleExpr* lf = mderef(hr.e);
+    if (!lf || !std::holds_alternative<Pmod_functor>(lf->desc)) return 0;
+    return xffc_.insert(std::to_string((std::uintptr_t)lf)).second
+               ? xlres_flat(lf, n)
+               : 0;
+  }
+  // The charge of `app_charge`'s arm: a body that is not such an
+  // application gives 0 and leaves `xb` null.
+  long long xbody_charge(const ModuleExpr& m, int nargs, const Lvl& l,
+                         bool saved, bool rebind, const cmi::ModuleType** xb) {
+    const ModuleExpr* app = nullptr;
+    int sc = -1;
+    const cmi::ModuleType* res = xbody_of(m, &app, &sc);
+    *xb = res;
+    if (!res) return 0;
+    long long k = wt_cmty(res, l);
+    if (!rebind) k += (nargs - 1) * wt_cmty(res, flat());
+    if (!rebind) k += xnodes(app, sc, saved && !inexpr_ && !mdiscard_);
+    return k;
+  }
   // `rebind` is the second pass an INCLUDE makes over an application: the
   // walk that precedes it has already charged every substitution but the
   // last, and only the result is bound a second time.
@@ -37615,6 +38074,12 @@ struct Count {
       args.push_back(a->arg.get());
       h = a->f.get();
     }
+    // An alias of a PARTIAL application of a functor of this file, applied
+    // on (S536): the body's rename and its nodes are all that is modelled.
+    if (me && !ngen && std::holds_alternative<Pmod_apply>(me->desc)) {
+      const cmi::ModuleType* xb = nullptr;
+      return xbody_charge(m, nargs, l, saved, rebind, &xb);
+    }
     // A pathless argument to an ANONYMOUS parameter is neither substituted
     // nor rebuilt: `type_one_application` (typemod.ml:2711) has no parameter
     // to eliminate and hands the result on as it is (S533).
@@ -37644,7 +38109,11 @@ struct Count {
         if (auto* nm = std::get_if<Functor_named>(&f->param)) {
           if (nm->name.txt && nm->type)
             fps.emplace_back(*nm->name.txt, &*nm->type);
-          if (cpar && nm->type) k += i * par_wt(*nm->type, fps);
+          // .. less the named arrows of a functor-typed parameter, which the
+          // renames of the levels above count already (S536).
+          if (cpar && nm->type)
+            k += i * (par_wt(*nm->type, fps) -
+                      (xbody_off() ? 0 : pfun_named(*nm->type)));
         }
         const ModuleExpr* b = mderef(f->body.get());
         if (b && !appbody_off() && std::get_if<Pmod_apply>(&b->desc))
@@ -37667,7 +38136,11 @@ struct Count {
         auto* f = std::get_if<Pmty_functor>(&mt->desc);
         if (!f) return 0;
         if (auto* nm = std::get_if<Functor_named>(&f->param))
-          if (cpar && nm->type) k += i * par_wt(*nm->type, fps);
+          // .. less the named arrows of a functor-typed parameter, which the
+          // renames of the levels above count already (S536).
+          if (cpar && nm->type)
+            k += i * (par_wt(*nm->type, fps) -
+                      (xbody_off() ? 0 : pfun_named(*nm->type)));
         mt = f->body.get();
       }
       if (i + 1 < nargs && !reb) {
@@ -37675,10 +38148,19 @@ struct Count {
         if (const ModuleType* r = res_named(me, mt)) k += res_wt(*r, flat());
       }
     }
+    // The body is another unit's functor applied (S536): the result renamed
+    // per step, and its manifests expanded where the binding is checked.
+    const cmi::ModuleType* xb = nullptr;
+    if (!pbody && !thru) k += xbody_charge(m, nargs, l, saved, rebind, &xb);
     const ModuleType* rnm = res_named(me, mt);
     // What a PARTIAL application leaves is a functor: one shape variable per
     // parameter still to come where it is saved (S532).
     const bool multi = !flv.empty() && !thru && !pbody;
+    // .. and each parameter such a partial application leaves is checked as
+    // the definition's are, where it is saved (S536).
+    if (xb && multi && saved && !inexpr_ && !mdiscard_ && !rebind)
+      for (int i = nargs; i < (int)flv.size(); ++i)
+        k += pfun_arrows(*flv[i].type, true, true);
     if (multi && saved && !inexpr_ && (int)flv.size() > nargs)
       k += (long long)flv.size() - nargs;
     // A BARE name is left a PATH, and `Mtype.nondep_supertype` -- what an
