@@ -20685,6 +20685,75 @@ bool ctapp_off() {
   static const bool off = dbg_env("NOCTAPP") != nullptr;
   return off;
 }
+// S535: a `let module N = F (X) in ..` over another unit's functor, its
+// arguments all paths, is bound STRENGTHENED (`type_application`,
+// typemod.ml:2632): its abstract types wear the manifest `F (X).t`, and the
+// first read that expands one -- an argument of one of its functions, the
+// result of such an application, a parameterized type met anywhere -- is
+// `Env.find_type` on the `Papply` (`find_structure_components`, env.ml:1095):
+// the functor's components once per functor and the application's, renamed
+// twice, once per applied path, on the FIND side, which a saved binding of
+// the same path would have built at its check and a written type path at
+// its lookup.  An unread binding builds nothing there.  `NOXRD=1` reverts.
+bool xrd_off() {
+  static const bool off = dbg_env("NOXRD") != nullptr;
+  return off;
+}
+// The key of an application's arguments, outermost application first:
+// "(String.)" for `F (String)`, "()" for an argument with no path.
+std::string xapp_args(const ModuleExpr& m, bool* pathed) {
+  std::string k;
+  if (pathed) *pathed = true;
+  for (const ModuleExpr* h = &m;;) {
+    auto* a = std::get_if<Pmod_apply>(&h->desc);
+    if (!a) break;
+    std::vector<std::string> ac;
+    auto* pi = std::get_if<Pmod_ident>(&a->arg->desc);
+    if (pi) lid_comps(pi->id.txt, ac);
+    if (pathed && !has_path(*a->arg)) *pathed = false;
+    // `Stdlib.String` is the path `String` is looked up as.
+    if (ac.size() > 1 && ac[0] == "Stdlib") ac.erase(ac.begin());
+    k += "(";
+    for (auto& s : ac) k += s + ".";
+    k += ")";
+    h = a->f.get();
+  }
+  return k;
+}
+// The same key for an application written as a PATH (`F (A) (B).t`).
+std::string xlid_args(const Longident& id) {
+  std::string k;
+  const Longident* h = &id;
+  while (auto* a = std::get_if<Lapply>(&h->v)) {
+    std::vector<std::string> ac;
+    lid_comps(*a->x, ac);
+    if (ac.size() > 1 && ac[0] == "Stdlib") ac.erase(ac.begin());
+    k += "(";
+    for (auto& s : ac) k += s + ".";
+    k += ")";
+    h = a->f.get();
+  }
+  return k;
+}
+// The dotted functor a `let module` applies, with every argument a path;
+// null for anything else.
+const Longident* xrd_head(const StructureItem& it, std::string* name) {
+  auto* lm = std::get_if<Pstr_module>(&it.desc);
+  if (!lm || !lm->binding.name.txt) return nullptr;
+  const ModuleExpr* h = &lm->binding.expr;
+  int nargs = 0;
+  for (;;) {
+    auto* a = std::get_if<Pmod_apply>(&h->desc);
+    if (!a) break;
+    if (!has_path(*a->arg)) return nullptr;
+    ++nargs;
+    h = a->f.get();
+  }
+  auto* pi = nargs ? std::get_if<Pmod_ident>(&h->desc) : nullptr;
+  if (!pi || !std::holds_alternative<Ldot>(pi->id.txt.v)) return nullptr;
+  if (name) *name = *lm->binding.name.txt;
+  return &pi->id.txt;
+}
 // S521: a class inherited through a module PATH, a read through a module
 // bound at a DOTTED module type name, and an include's rebind of a pathless
 // application.  `NOREADDECL=1` reverts the whole slice.
@@ -20887,9 +20956,28 @@ struct Cites {
   // and the path from that module down to the binding, read out once the
   // whole file has been walked.
   std::vector<std::pair<std::string, std::string>> fdisc;
+  // ... whether each stands in an expression, and its arguments' key
+  // (`xapp_args`; S535).
+  std::vector<bool> fexpr;
+  std::vector<std::string> fargk;
+  // ... and, for one a `let module` binds, whether its body reads the
+  // module at all: an unread binding has had `Env` build nothing, and a
+  // type path through the same functor pays as if the file bound none.
+  std::vector<bool> fread;
   // `let module M = F (A) in ..`: the result is bound over the body
   // alone and none of the types it names is ever looked up.
   bool inexpr_ = false;
+  // The `let module`s bound to a pathed application of a dotted functor
+  // that are in scope, innermost last: a read through one is keyed under
+  // the binding ("@<item>/N.add"), as `Count` keys it (S535).
+  std::vector<std::pair<std::string, std::string>> lmscope_;
+  // The values such a body RETURNS -- what its type is unified with a
+  // variable of the level outside the binding, where every parameterized
+  // abstract type of the module it names is expanded (S535): the key, and
+  // the arguments it was applied to there.
+  std::map<std::string, int> ereads_;
+  // ... and the types of such a module written in an annotation of any kind.
+  std::set<std::string> yreads_;
   // ---- AN ASCRIPTION THAT HIDES A MODULE LOADS NOTHING FOR IT -----------
   // The same holds of a module an ascription DISCARDS: the result of
   // `module M : sig end = struct module S = Wa.F (X) end` is never read, so
@@ -21166,17 +21254,34 @@ struct Cites {
     return false;
   }
   bool read_key(const Longident& id, std::string& out, bool ty = false) const {
-    if (dotted_path(id, out)) return true;
+    if (dotted_path(id, out)) {
+      if (!xrd_off())
+        for (auto l = lmscope_.rbegin(); l != lmscope_.rend(); ++l)
+          if (out.compare(0, l->first.size() + 1, l->first + ".") == 0) {
+            out = l->second + out;
+            break;
+          }
+      return true;
+    }
     auto* l = std::get_if<Lident>(&id.v);
     if (open_off() || !l || l->name.empty() ||
         std::isupper((unsigned char)l->name[0]) ||
         (ty ? tbound_ : bound_).count(l->name))
       return false;
-    for (auto o = open_stack_.rbegin(); o != open_stack_.rend(); ++o)
+    for (auto o = open_stack_.rbegin(); o != open_stack_.rend(); ++o) {
+      // A `let module` opened over the read: its signature is not here to
+      // ask, so every bare name is keyed to it (S535).
+      if (!xrd_off())
+        for (auto lm = lmscope_.rbegin(); lm != lmscope_.rend(); ++lm)
+          if (lm->first == *o) {
+            out = lm->second + *o + "." + l->name;
+            return true;
+          }
       if (local.count(*o) || unit_declares(*o, l->name, ty)) {
         out = *o + "." + l->name;
         return true;
       }
+    }
     return false;
   }
   void vread(const Longident& id) {
@@ -21275,6 +21380,40 @@ struct Cites {
   static bool is_fn_exp(const Expression& e) {
     return std::holds_alternative<Pexp_function>(bare_exp(e)->desc);
   }
+  // What a `let module` body RETURNS (S535): the value at the tail of its
+  // `let`s, sequences, branches and arms, and the arguments it is applied
+  // to there.
+  void tail_reads(const Expression& e, int d = 0) {
+    if (d > 32) return;
+    const Expression* p = &e;
+    if (auto* c = std::get_if<Pexp_constraint>(&p->desc)) {
+      tail_reads(*c->e, d + 1);
+    } else if (auto* l = std::get_if<Pexp_let>(&p->desc)) {
+      tail_reads(*l->body, d + 1);
+    } else if (auto* q = std::get_if<Pexp_sequence>(&p->desc)) {
+      tail_reads(*q->e2, d + 1);
+    } else if (auto* i = std::get_if<Pexp_ifthenelse>(&p->desc)) {
+      tail_reads(*i->then_, d + 1);
+      if (i->else_) tail_reads(**i->else_, d + 1);
+    } else if (auto* m = std::get_if<Pexp_match>(&p->desc)) {
+      for (auto& c : m->cases) tail_reads(*c.rhs, d + 1);
+    } else if (auto* t = std::get_if<Pexp_try>(&p->desc)) {
+      tail_reads(*t->e, d + 1);
+      for (auto& c : t->cases) tail_reads(*c.rhs, d + 1);
+    } else if (auto* si = std::get_if<Pexp_struct_item>(&p->desc)) {
+      tail_reads(*si->body, d + 1);
+    } else if (auto* i = std::get_if<Pexp_ident>(&p->desc)) {
+      std::string s;
+      if (read_key(i->id.txt, s)) ereads_.emplace(s, 0);
+    } else if (auto* a = std::get_if<Pexp_apply>(&p->desc)) {
+      auto* i = std::get_if<Pexp_ident>(&a->fn->desc);
+      std::string s;
+      if (i && read_key(i->id.txt, s)) {
+        auto it = ereads_.emplace(s, (int)a->args.size()).first;
+        if (it->second > (int)a->args.size()) it->second = (int)a->args.size();
+      }
+    }
+  }
   void uval(const Expression& e, std::set<std::string>& into) {
     std::string s;
     if (ident_key(e, s)) into.insert(s);
@@ -21310,6 +21449,11 @@ struct Cites {
       std::string s;
       if (read_key(id, s, true)) treads_.insert(s);
       return;
+    }
+    // A type of a `let module` written in a pattern's annotation (S535).
+    if (!xrd_off() && !lmscope_.empty()) {
+      std::string s;
+      if (read_key(id, s, true) && s[0] == '@') yreads_.insert(s);
     }
     for (const Longident* q = &id;;) {
       if (auto* d = std::get_if<Ldot>(&q->v)) { q = d->prefix.get(); continue; }
@@ -22081,6 +22225,9 @@ struct Cites {
       px = exp_p(pc->t.get());
     auto* v = std::get_if<Ppat_var>(&b.pat.desc);
     if (v && !fixmeet_off()) local_fn(v->name.txt, *b.expr, x);
+    // An INFERRED expression at a written type has that type's head
+    // expanded (`type_argument`, typecore.ml:6632) (S535).
+    if (!xrd_off() && x.known() && is_inferred(*b.expr)) xval(*b.expr);
     if (x.known()) targ(x, *b.expr);
     else ex(*b.expr, px);
     if (v && !fixmeet_off()) {
@@ -22686,6 +22833,7 @@ struct Cites {
       ex(*s->e1); ex(*s->e2, x);
     } else if (auto* c = std::get_if<Pexp_constraint>(&e.desc)) {
       // An annotation fixes the expected type before the expression is typed.
+      if (!xrd_off() && is_inferred(*c->e)) xval(*c->e);
       xmeet(denotes(*c->e));
       targ(exp_p(c->t.get()), *c->e); tyx(*c->t);
     } else if (auto* c = std::get_if<Pexp_coerce>(&e.desc)) {
@@ -22740,6 +22888,7 @@ struct Cites {
       size_t d = open_stack_.size();
       bool ie = inexpr_;
       inexpr_ = true;
+      const std::size_t fi = fapps.size();
       item(*s->item);
       inexpr_ = ie;
       auto* lm = std::get_if<Pstr_module>(&s->item->desc);
@@ -22748,7 +22897,25 @@ struct Cites {
         cpath_.push_back("$" + *lm->binding.name.txt);
         lmods[cscope()] = &lm->binding.expr;
       }
+      std::string xn;
+      const bool xrd = !xrd_off() && xrd_head(*s->item, &xn);
+      if (xrd) {
+        lmscope_.emplace_back(xn, "@" + std::to_string((std::uintptr_t)s) +
+                                      "/");
+        tail_reads(*s->body);
+      }
       ex(*s->body, x);
+      if (xrd) {
+        const std::string& pre = lmscope_.back().second;
+        bool read = false;
+        for (auto* rs : {&vreads_, &yreads_}) {
+          auto it = rs->lower_bound(pre);
+          if (it != rs->end() && it->compare(0, pre.size(), pre) == 0)
+            read = true;
+        }
+        if (read && fi < fread.size()) fread[fi] = true;
+        lmscope_.pop_back();
+      }
       if (named) cpath_.pop_back();
       open_stack_.resize(d);
     } else if (auto* s = std::get_if<Pexp_setfield>(&e.desc)) {
@@ -22995,6 +23162,9 @@ struct Cites {
         std::vector<std::string> c;
         if (lid_comps(fi->id.txt, c) && c.size() >= 2) {
           fapps.emplace_back(c, inexpr_ && pathed);
+          fexpr.push_back(inexpr_);
+          fargk.push_back(pathed ? xapp_args(m, nullptr) : std::string());
+          fread.push_back(false);
           fopen.push_back(inopen_);
           fdisc.emplace_back(discload_off() ? std::string() : cdname_,
                              cdpre_);
@@ -30649,6 +30819,7 @@ struct Count {
       inexpr_ = true;
       saved_ = false;
       item(*s->item);
+      n += xrd_charge(*s);
       saved_ = sv;
       inexpr_ = ie;
       expr(*s->body);
@@ -36276,6 +36447,117 @@ struct Count {
     }
     return false;
   }
+  // ---- A LET MODULE'S FIRST EXPANDING READ BUILDS THE APPLICATION (S535)
+  // `let module N = Map.Make (String) in ..` is bound strengthened, so its
+  // `'a t` wears the manifest `'a Map.Make (String).t`; the first read of
+  // the body that expands a type of N -- an inferred argument of one of its
+  // functions, the result of such an application, a statement, `ignore`'s
+  // argument, a parameterized type met at all, one returned to the level
+  // outside the binding (`needs_expand`, ctype.ml:900, asks `Env.find_type`
+  // for the variance) -- is `Env.find_type` on the `Papply`: the functor's
+  // components once per functor for the file (R) and the application's,
+  // renamed twice, once per applied path (2R), on the FIND side.  A saved
+  // binding of the same path builds the same at its check and a written
+  // type path at its lookup, so what those have paid is not paid again; an
+  // unread `let module` builds nothing.  Which reads expand is
+  // `vread_builds`, measured on the discarded-module family (S508).
+  long long xrd_charge(const Pexp_struct_item& si) {
+    if (xrd_off() || !ereads_) return 0;
+    std::string nm;
+    const Longident* id = xrd_head(*si.item, &nm);
+    if (!id) return 0;
+    auto* lm = std::get_if<Pstr_module>(&si.item->desc);
+    const ModuleExpr& m = lm->binding.expr;
+    const ModuleExpr* head = &m;
+    int nargs = 0;
+    while (auto* a = std::get_if<Pmod_apply>(&head->desc)) {
+      ++nargs;
+      head = a->f.get();
+    }
+    // A functor of this file, of a parent of it, or of an enclosing
+    // functor's parameter is not the unit's.
+    if (mderef(head)) return 0;
+    {
+      TScope ts{*this, tmark()};
+      const ModuleExpr* me = nullptr;
+      const ModuleType* mt = nullptr;
+      lfun_head(*head, me, mt);
+      if (me || mt) return 0;
+    }
+    if (!parfun_off() && pf_head(*head)) return 0;
+    const cmi::Signature* root = nullptr;
+    const cmi::ModuleType* mt = cmi_module(*id, &root);
+    for (int i = 0; i < nargs; ++i) {
+      mt = scrape_cmty(mt, root);
+      if (!mt || mt->kind != cmi::ModuleType::Functor) return 0;
+      mt = mt->functor_body.get();
+    }
+    mt = scrape_cmty(mt, root);
+    if (!mt || mt->kind != cmi::ModuleType::Sig || !mt->sig) return 0;
+    const std::string pre =
+        "@" + std::to_string((std::uintptr_t)&si) + "/" + nm + ".";
+    bool builds = false;
+    {
+      const std::string dv = mdiscpre_;
+      mdiscpre_ = pre;
+      builds = vread_builds(mt);
+      mdiscpre_ = dv;
+    }
+    // A parameterized abstract type of N written in an annotation meets the
+    // pattern's variable and is expanded (`unify`, ctype.ml:3303).
+    if (!builds && yreads_)
+      for (auto& td : mt->sig->types)
+        if (!td.manifest && td.arity > 0 && yreads_->count(pre + td.name))
+          builds = true;
+    // What the body returns is unified with a variable outside the binding:
+    // every parameterized abstract type of N in it is expanded on the way
+    // down, however deep it sits.
+    if (!builds)
+      for (auto& sv : mt->sig->values) {
+        auto it = ereads_->find(pre + sv.name);
+        if (it == ereads_->end()) continue;
+        const cmi::TypeExpr* t = sv.type.get();
+        for (int i = 0; i < it->second && t; ++i) {
+          t = tskip(t);
+          t = t && t->kind == cmi::TypeExpr::Tarrow ? t->cod.get() : nullptr;
+        }
+        if (t && names_param_abs(t, *mt->sig, 0)) builds = true;
+      }
+    if (!builds) return 0;
+    const long long r = flat_cmty(mt);
+    const std::string fk = xtapp_key(*id);
+    if (fk.empty()) return 0;
+    const std::string ak = fk + xapp_args(m, nullptr);
+    long long k = 0;
+    if (!(xbf_ && xbf_->count(fk)) && xrdf_.insert(fk).second) k += r;
+    if (!(xba_ && xba_->count(ak)) && xrda_.insert(ak).second)
+      k += (1 + xapp_alias(m)) * r;
+    return k;
+  }
+  // Is some argument of the application an ALIAS path (`arg_alias`)?  The
+  // path is then normalized to another (`Stdlib__Set.Make (Stdlib__String)`
+  // for `Set.Make (String)`), and the application's components are built
+  // under both (S487).
+  int xapp_alias(const ModuleExpr& m) const {
+    for (const ModuleExpr* h = &m;;) {
+      auto* a = std::get_if<Pmod_apply>(&h->desc);
+      if (!a) return 0;
+      std::vector<std::string> ac;
+      auto* pi = std::get_if<Pmod_ident>(&a->arg->desc);
+      if (pi && lid_comps(pi->id.txt, ac) && !ac.empty() && arg_alias(ac))
+        return 1;
+      h = a->f.get();
+    }
+  }
+  int xlid_alias(const Longident& id) const {
+    for (const Longident* h = &id;;) {
+      auto* a = std::get_if<Lapply>(&h->v);
+      if (!a) return 0;
+      std::vector<std::string> ac;
+      if (lid_comps(*a->x, ac) && !ac.empty() && arg_alias(ac)) return 1;
+      h = a->f.get();
+    }
+  }
   // `Hashtbl.Make (String)`: the result is Hashtbl's, and applying it costs
   // the PARAMETER's signature once (it is bound while the argument is checked
   // against it), the result's own items once (the .cmi's lazy signature is
@@ -36412,6 +36694,11 @@ struct Count {
     // more for every argument PATH after the first: a pathless argument
     // asks for no build of its own.
     bool firstapp = fseen.insert(key).second;
+    // In an expression, the force is the one a type path through the same
+    // functor shares (S535, `xfs_`).
+    if (!xrd_off() && inexpr_ && firstapp &&
+        !xfs_.insert(xtapp_key(*id)).second)
+      firstapp = false;
     std::set<std::string>& ps = fargp[key];
     std::size_t had = ps.size();
     // An OPEN's application is entered and forgotten (S524): a second open
@@ -36420,7 +36707,11 @@ struct Count {
     const bool opn = !xoapp_off() && opn_app_;
     bool newpath = !xpathless && !opn && ps.insert(ak).second;
     bool newarg = !opn && farg.insert(ak).second;
-    long long nf = (firstapp || (newpath && had >= 1)) ? 1 : 0;
+    // An application bound in an EXPRESSION builds nothing on the find
+    // side until it is read (S535, `xrd_charge`).
+    long long nf =
+        (firstapp || (newpath && had >= 1 && (xrd_off() || !inexpr_))) ? 1
+                                                                        : 0;
     if (unit_arg && newarg) ++nf;
     const bool discarded = !ascrapp_off() && mdiscard_ && !inexpr_;
     // ---- A FUNCTOR OF MORE THAN ONE PARAMETER (S532) --------------------
@@ -37123,13 +37414,25 @@ struct Count {
     // S486's flat 2R whatever the spelling (`module S = Set.Make (X)` beside
     // `type t = Set.Make (X).t` is EXACT, and so is the same pair written
     // `Stdlib__Set`).  Only an UNBOUND functor takes the law below.
-    if (xtapp3_off() || fk.empty() || (xk_ && xk_->count(fk)))
-      return xtapp_.insert(key).second ? r * (xtapp2_off() ? 1 : 2) : 0;
+    if (xtapp3_off() || fk.empty() || (xk_ && xk_->count(fk))) {
+      if (!xtapp_.insert(key).second) return 0;
+      long long k = r * (xtapp2_off() ? 1 : 2);
+      // What the binding built on the find side is the functor's components
+      // and ITS path's: a path the file binds nowhere outside an expression
+      // is built here, renamed twice (S535).
+      if (!xrd_off() && inst && res_abstract(res, ty)) {
+        const std::string ak = fk + xlid_args(id);
+        if (!(xba_ && xba_->count(ak)) && xrda_.insert(ak).second)
+          k += (1 + xlid_alias(id)) * r;
+      }
+      return k;
+    }
     const std::string f = lid_full(*a->f);
     const bool ali = std_alias(*a->f);
     const bool ins = inst && res_abstract(res, ty);
     long long k = 0;
-    if (xtfct_.insert(f).second) k += r;
+    if (xtfct_.insert(f).second && (xrd_off() || xfs_.insert(fk).second))
+      k += r;
     if (ali && xtali_.insert(f).second) k += r;
     if (ali && ins && xtali2_.insert(f).second) k += r;
     if (xtapp_.insert(key).second) k += r;
@@ -37536,6 +37839,19 @@ struct Count {
   const std::set<std::string>* ureads_ = nullptr;
   const std::set<std::string>* lreads_ = nullptr;
   const std::map<std::string, int>* areads_ = nullptr;
+  // S535: the applications the file binds OUTSIDE an expression, saved
+  // (`xbf_` the functors, `xba_` the applied paths), what a `let module`
+  // body returns (`Cites::ereads_`), and what the reads of such bindings
+  // have built on the find side already.
+  const std::set<std::string>* xbf_ = nullptr;
+  const std::set<std::string>* xba_ = nullptr;
+  const std::map<std::string, int>* ereads_ = nullptr;
+  const std::set<std::string>* yreads_ = nullptr;
+  std::set<std::string> xrdf_, xrda_;
+  // The functors whose strengthened type has been forced once, by a
+  // `let module`'s application or by a type path's check of its argument
+  // (`check_functor_application_in_path`), whichever came first (S535).
+  std::set<std::string> xfs_;
   // The module type ascribing the application being walked, `Map.S` in
   // `module S : Map.S = Map.Make (M)` -- null everywhere else, the argument
   // and the head of that very application included.
@@ -38889,6 +39205,9 @@ int typing_ident_count(const ast::Structure& s, std::size_t eta_sites,
   for (std::size_t fi = 0; fi < u.fapps.size(); ++fi) {
     const auto& fa = u.fapps[fi];
     if (fi < u.fopen.size() && u.fopen[fi]) continue;
+    if (!stampcount::xrd_off() && fi < u.fexpr.size() && u.fexpr[fi] &&
+        !u.fread[fi])
+      continue;
     std::vector<std::string> c0 = fa.first;
     if (c0.size() < 2) continue;
     bool shadowed = false;
@@ -38909,9 +39228,29 @@ int typing_ident_count(const ast::Structure& s, std::size_t eta_sites,
     for (auto& t : c0) k += t + ".";
     xkeys.insert(k);
   }
+  // The applications bound outside an expression and saved: what their
+  // check builds on the find side, a `let module`'s read does not (S535).
+  std::set<std::string> xbf, xba;
+  // An open's and a discarded binding's are in: what those build is
+  // charged where they stand.
+  for (std::size_t fi = 0; fi < u.fapps.size(); ++fi) {
+    if (fi >= u.fexpr.size() || u.fargk[fi].empty()) continue;
+    if (u.fexpr[fi] && !(fi < u.fopen.size() && u.fopen[fi])) continue;
+    std::vector<std::string> c0 = u.fapps[fi].first;
+    if (c0[0] == "Stdlib" && c0.size() > 2) c0.erase(c0.begin());
+    if (c0[0].rfind("Stdlib__", 0) == 0) c0[0] = c0[0].substr(8);
+    std::string k;
+    for (auto& t : c0) k += t + ".";
+    xbf.insert(k);
+    xba.insert(k + u.fargk[fi]);
+  }
   stampcount::Count c;
   c.used_ = &used;
   c.xk_ = &xkeys;
+  c.xbf_ = &xbf;
+  c.xba_ = &xba;
+  c.ereads_ = &u.ereads_;
+  c.yreads_ = &u.yreads_;
   c.treads_ = &u.treads_;
   c.oheads_ = &u.oheads_;
   c.vreads_ = &u.vreads_;
