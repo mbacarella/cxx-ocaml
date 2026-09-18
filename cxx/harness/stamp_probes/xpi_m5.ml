@@ -1,0 +1,4 @@
+module A = struct type t = int end
+module type S = sig type t end
+type c = C of (module S with type t = int)
+let _ = C (module A)

@@ -24171,8 +24171,14 @@ struct Count {
     if (fuel <= 0) return 0;
     if (auto* c = std::get_if<Ppat_constraint>(&p.desc))
       return pk_rue(e, *c->t, false, fuel - 1);
-    if (auto* u = std::get_if<Ppat_unpack>(&p.desc))
-      return u->pkg ? pk_rue(e, pkleaf_, false, fuel - 1) : 0;
+    if (auto* u = std::get_if<Ppat_unpack>(&p.desc)) {
+      if (!u->pkg) return 0;
+      const Ptyp_package* was = pkarg_ty_;
+      pkarg_ty_ = &*u->pkg;
+      long long k = pk_rue(e, pkleaf_, false, fuel - 1);
+      pkarg_ty_ = was;
+      return k;
+    }
     if (auto* a = std::get_if<Ppat_alias>(&p.desc)) return pk_parg(*a->p, e, fuel - 1);
     if (auto* o = std::get_if<Ppat_open>(&p.desc)) return pk_parg(*o->p, e, fuel - 1);
     if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
@@ -24214,6 +24220,243 @@ struct Count {
         pkpend_[*nm] = pk_info(b);
         bind(*nm);
       }
+  }
+  // ---- AN INFERRED PACK AT A CONSTRAINED PACKAGE TYPE (S526) --------------
+  // pr6982_ok.ml: `f (module A)` at `let f (type a) (module X : S with type
+  // t = a) = ..` paid A's copy and the `rue` meet and nothing else.  A pack
+  // that writes no package type takes the EXPECTED one (typecore.ml:5427),
+  // and `Typemod.type_package` (typemod.ml:3279) then does with its
+  // constraints what the written twin does with its own: each constrained
+  // `t` is rewritten as the module's `M.t`, the constrained module type is
+  // BUILT (`modtype_of_package`, typemod.ml:2332: `S` scraped, then
+  // `Subst.modtype Keep` over the result, one ident per item at every
+  // depth) and `wrap_constraint_package` (typemod.ml:2368) copies the
+  // module's type (top items, the strengthening aliased its submodules) and
+  // the built type again, flat -- 2 x flat|S| on top of the module's copy
+  // (k2a, k7, k8, k9 twice); a bare `(module S)` stays an `Mty_ident` and
+  // copies nothing (k5).  On top, written or not:
+  //  - the check pairs each constrained type of the module with its own path
+  //    `M.t` (`Includecore.type_manifest`, includecore.ml:934), so where the
+  //    manifest is a PACKAGE two `Tpackage` nodes meet, 2 per node (k2b,
+  //    k23, k3b, k4b) -- a manifest that names another type of the module
+  //    expands to that one's;
+  //  - a module that is not a PATH is entered first (`Env.enter_signature`,
+  //    typemod.ml:3307), its signature flat (k21, k21b, k21c, k21e);
+  //  - a path through a PARENT forces the parent's lazy copy once, as the
+  //    written twin already charged (`top_force`, k20n).
+  // The written twin's two copies are `pk_with`'s and its unify's meets are
+  // `pack_pkg`'s; the module ascribed at a `with` is copied through the
+  // `with` (`pk_wmty`, k17, k18).  Left alone: a package type reached
+  // through an ABBREVIATION, a functor application or a unit packed here
+  // (their own laws), a `let x : (module S with ..) = ..` binding's second
+  // translation of its annotation (k13b -2 before and after).  `NOPKINFER=1`
+  // reverts to S511.
+  static bool pkinfer_off() {
+    static const bool off = dbg_env("NOPKINFER") != nullptr;
+    return off;
+  }
+  const Ptyp_package* pkarg_ty_ = nullptr;  // the unpack parameter's package
+  static const Pexp_pack* bare_pack(const Expression& e) {
+    auto* p = std::get_if<Pexp_pack>(&e.desc);
+    return p && !p->pkg ? p : nullptr;
+  }
+  // The package nodes the manifest of `t` in the module `m` expands to.
+  long long pk_mnodes(const ModuleExpr& m, const std::string& t, int fuel) {
+    if (fuel <= 0) return 0;
+    if (auto* c = std::get_if<Pmod_constraint>(&m.desc))
+      return pk_mtnodes(*c->mt, t, fuel - 1);
+    if (auto* i = std::get_if<Pmod_ident>(&m.desc)) {
+      const ModuleExpr* me = nullptr;
+      const ModuleType* mt = nullptr;
+      Mtds ds;
+      bool sub = false;
+      if (!lpath(i->id.txt, me, mt, ds, sub)) return 0;
+      if (mt) return pk_mtnodes(*mt, t, fuel - 1);
+      return me ? pk_mnodes(*me, t, fuel - 1) : 0;
+    }
+    if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
+      // The last item declaring `t`: its own declaration, or one an
+      // `include` of a path brought in.
+      for (std::size_t i = st->items.size(); i-- > 0;) {
+        if (auto* ty = std::get_if<Pstr_type>(&st->items[i].desc)) {
+          for (auto& td : ty->decls)
+            if (td.name.txt == t) return pk_dnodes(td, &m, nullptr, fuel - 1);
+        } else if (auto* in = std::get_if<Pstr_include>(&st->items[i].desc)) {
+          if (std::holds_alternative<Pmod_ident>(in->expr.desc) ||
+              std::holds_alternative<Pmod_constraint>(in->expr.desc))
+            return pk_mnodes(in->expr, t, fuel - 1);
+        }
+      }
+      return 0;
+    }
+    return 0;
+  }
+  long long pk_mtnodes(const ModuleType& mt, const std::string& t, int fuel) {
+    if (fuel <= 0) return 0;
+    if (auto* w = std::get_if<Pmty_with>(&mt.desc)) {
+      for (auto& cn : w->constraints) {
+        Wc x;
+        if (wc_parts(cn, x) && x.td && x.path.size() == 1 && x.path[0] == t)
+          return pk_dnodes(*x.td, nullptr, w->mt.get(), fuel - 1);
+      }
+      return pk_mtnodes(*w->mt, t, fuel - 1);
+    }
+    if (auto* id = std::get_if<Pmty_ident>(&mt.desc)) {
+      const ModuleType* d = std::holds_alternative<Lident>(id->id.txt.v)
+                                ? named_mty(id->id.txt, fuel)
+                                : dotted_mty(id->id.txt, fuel);
+      return d ? pk_mtnodes(*d, t, fuel - 1) : 0;
+    }
+    if (auto* s = std::get_if<Pmty_signature>(&mt.desc)) {
+      const TypeDeclaration* d = nullptr;
+      for (auto& it : s->items)
+        if (auto* ty = std::get_if<Psig_type>(&it.desc))
+          for (auto& td : ty->decls)
+            if (td.name.txt == t) d = &td;
+      return d ? pk_dnodes(*d, nullptr, &mt, fuel - 1) : 0;
+    }
+    return 0;
+  }
+  // A declaration's manifest: its package nodes, or those of the type of
+  // the same module it names.
+  long long pk_dnodes(const TypeDeclaration& d, const ModuleExpr* home,
+                      const ModuleType* hmt, int fuel) {
+    if (!d.manifest || !d.params.empty()) return 0;
+    const CoreType& mf = **d.manifest;
+    if (auto* c = std::get_if<Ptyp_constr>(&mf.desc); c && c->args.empty())
+      if (auto* l = std::get_if<Lident>(&c->id.txt.v); l && l->name != d.name.txt) {
+        if (home) return pk_mnodes(*home, l->name, fuel);
+        if (hmt) return pk_mtnodes(*hmt, l->name, fuel);
+        return 0;
+      }
+    return pack_nodes(mf);
+  }
+  // The signature a module that is no path is entered at, flat.
+  long long pk_flat(const ModuleExpr& m) const {
+    if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) return pk_wmty(*c->mt, 8);
+    if (std::holds_alternative<Pmod_structure>(m.desc))
+      return wt_mexpr(m, flat()) + pk_incs(m);
+    return 0;
+  }
+  // What checking the packed module `m` against the package type `pk` costs
+  // beyond the copies: the entered signature of a module that is no path
+  // and the meets of the constrained types' package manifests.
+  long long pk_check(const ModuleExpr& m, const Ptyp_package& pk) {
+    if (pkinfer_off() || pk.constraints.empty()) return 0;
+    long long k = std::holds_alternative<Pmod_ident>(m.desc) ? 0 : pk_flat(m);
+    for (auto& c : pk.constraints) {
+      std::vector<std::string> path;
+      if (lid_path(c.first.txt, path) && path.size() == 1)
+        k += 2 * pk_mnodes(m, path[0], 8);
+    }
+    return k;
+  }
+  // A pack that writes no package type, typed at the constrained `pk`.
+  long long pk_infer(const Expression& e, const Ptyp_package& pk) {
+    if (pkinfer_off()) return 0;
+    const Pexp_pack* p = bare_pack(e);
+    if (!p) return 0;
+    long long k = 0;
+    if (auto* pi = std::get_if<Pmod_ident>(&p->me->desc); pi && !chkarrow_off()) {
+      bool sub = false;
+      if (const ModuleExpr* t = lal_res(pi->id.txt, sub); t && sub) k += top_force(t);
+    }
+    if (pk.constraints.empty()) return k;
+    k += pk_force(pk.path.txt) + 2 * pk_pathwt(pk.path.txt);
+    return k + pk_check(*p->me, pk);
+  }
+  // The same meets where the package is a MANIFEST: an ascription's `with
+  // type t = (module ..)` meets the module's own manifest at the check (2
+  // per node) and, saved, meets the simplified copy again at the
+  // inferred-signature check (w03); an `include` of a path copies its
+  // declarations into a saved structure, where that check meets each
+  // package they carry once more (c7).
+  // `rep` gets the nodes of a constraint REPEATING a path: the merge checks
+  // the new declaration against the one before (2 per node, n1d) and only
+  // the last is in the signature.
+  static long long pk_wnodes(const Pmty_with& w, long long* rep = nullptr) {
+    long long k = 0;
+    std::set<std::vector<std::string>> seen;
+    for (auto& cn : w.constraints) {
+      Wc x;
+      if (!wc_parts(cn, x) || !x.td || x.destr || !x.td->manifest) continue;
+      if (!seen.insert(x.path).second) {
+        if (rep) *rep += pack_nodes(**x.td->manifest);
+        continue;
+      }
+      k += pack_nodes(**x.td->manifest);
+    }
+    return k;
+  }
+  // The weight of a package-manifest type where the module type is walked:
+  // a module type DECLARATION is checked for equivalence, both ways (4 per
+  // node, n1), by the ascription it sits behind or by the inferred-signature
+  // check, and by nothing inside an expression (n1x); an ASCRIPTION checks
+  // the module against it (2) and the saved result again (2, n1am, w03); a
+  // functor parameter is paired once (n1fp).  A literal `type t = (module
+  // ..)` there already paid `pack_decl`'s 2 where it is saved (`pk_mtx`).
+  long long pk_mtw() const {
+    if (mtctx_ == MtCtx::Decl) return inexpr_ ? 0 : 4;
+    if (mtctx_ == MtCtx::Ascr) return saved_ ? 4 : 2;
+    return 2;
+  }
+  long long pk_mtx() const {
+    if (mtctx_ == MtCtx::Other) return 0;
+    return std::max(0LL, pk_mtw() - (saved_ ? 2 : 0));
+  }
+  static long long pack_decl_nodes(const TypeDeclaration& d) {
+    long long k = d.manifest ? pack_nodes(**d.manifest) : 0;
+    if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
+      for (auto& c : v->ctors) {
+        if (c.res) k += pack_nodes(**c.res);
+        if (auto* t = std::get_if<Pcstr_tuple>(&c.args))
+          for (auto& e : t->elems) k += pack_nodes(*e);
+        else if (auto* r = std::get_if<Pcstr_record>(&c.args))
+          for (auto& f : r->fields) k += pack_nodes(*f.type);
+      }
+    } else if (auto* r = std::get_if<Ptype_record>(&d.kind)) {
+      for (auto& f : r->fields) k += pack_nodes(*f.type);
+    }
+    return k;
+  }
+  // `bound` says the module was reached through a path: an ascription
+  // written at the include itself is walked at the ascription's weight and
+  // its `with` pays the copy there.
+  long long pk_inc_nodes(const ModuleExpr& m, int fuel, bool bound = false) const {
+    if (fuel <= 0) return 0;
+    if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
+      long long k = 0;
+      for (auto& it : st->items) {
+        if (auto* ty = std::get_if<Pstr_type>(&it.desc))
+          for (auto& d : ty->decls) k += 2 * pack_decl_nodes(d);
+        else if (auto* mb = std::get_if<Pstr_module>(&it.desc))
+          k += pk_inc_nodes(mb->binding.expr, fuel - 1, true);
+        else if (auto* in = std::get_if<Pstr_include>(&it.desc))
+          k += pk_inc_nodes(in->expr, fuel - 1, bound);
+      }
+      return k;
+    }
+    if (auto* i = std::get_if<Pmod_ident>(&m.desc)) {
+      bool sub = false;
+      const ModuleExpr* t = lal_res(i->id.txt, sub);
+      return t ? pk_inc_nodes(*t, fuel - 1, true) : 0;
+    }
+    if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) {
+      long long k = 0;
+      const ModuleType* b = c->mt.get();
+      for (int i = 0; bound && i < 8; ++i) {
+        auto* w = std::get_if<Pmty_with>(&b->desc);
+        if (!w) break;
+        k += 2 * pk_wnodes(*w);
+        b = w->mt.get();
+      }
+      if (const Signature* sg = mty_sig(c->mt.get()))
+        for (auto& it : *sg)
+          if (auto* ty = std::get_if<Psig_type>(&it.desc))
+            for (auto& d : ty->decls) k += 2 * pack_decl_nodes(d);
+      return k;
+    }
+    return 0;
   }
   // What typing `e` at the WRITTEN expectation `t` costs in meets -- the
   // `type_argument` pair is the caller's.  Marks the nodes it rues so the
@@ -24294,20 +24537,29 @@ struct Count {
       }
       return 0;
     }
-    if (!pk_of_ty(t)) return 0;
-    return pkg_typed(e) ? 2 : 0;
+    const Ptyp_package* pk = pk_of_ty(t);
+    if (!pk) return 0;
+    if (&t == &pkleaf_ && pkarg_ty_) pk = pkarg_ty_;
+    return (pkg_typed(e) ? 2 : 0) + pk_infer(e, *pk);
   }
   // The later arms of a `match`/`try` (and a `try`'s body first) meet the
   // result type once a package-typed one has fixed it.
   long long pk_arms(const Expression* body, const std::vector<Case>& cs) {
-    bool seen = body && pkg_typed(*body);
+    const Expression* first = body && pkg_typed(*body) ? body : nullptr;
     long long k = 0;
     for (auto& c : cs) {
       bool pk = pkg_typed(*c.rhs);
-      if (pk && seen) k += 2;
-      seen = seen || pk;
+      if (pk && first) k += 2 + pk_sib(*first, *c.rhs);
+      if (pk && !first) first = c.rhs.get();
     }
     return k;
+  }
+  // A later package-typed sibling is typed at the FIRST one's type: a bare
+  // pack there takes the package the first WROTE (S526, m1-m4).
+  long long pk_sib(const Expression& first, const Expression& e) {
+    const Ptyp_package* ty = nullptr;
+    if (!pkg_typed(first, &ty) || !ty) return 0;
+    return pk_infer(e, *ty);
   }
   // A constructor's argument at a DECLARED package type, and a list's later
   // elements after a package-typed one (the whole spine at once).
@@ -24317,6 +24569,7 @@ struct Count {
       bool seen = false;
       long long k = 0;
       const Expression* cur = &e;
+      const Expression* first = nullptr;
       while (cur) {
         auto* cc = std::get_if<Pexp_construct>(&cur->desc);
         if (!cc || lid_last(cc->id.txt) != "::" || !cc->arg) break;
@@ -24324,7 +24577,8 @@ struct Count {
         if (!u || u->elems.size() != 2) break;
         if (cur != &e) pkexp_.insert(cur);
         bool pk = pkg_typed(*u->elems[0]);
-        if (pk && seen) k += 2;
+        if (pk && seen) k += 2 + pk_sib(*first, *u->elems[0]);
+        if (pk && !seen) first = u->elems[0].get();
         seen = seen || pk;
         cur = u->elems[1].get();
       }
@@ -24337,11 +24591,17 @@ struct Count {
     if (!tup) return 0;
     long long k = 0;
     if (tup->elems.size() == 1) {
-      if (pk_of_ty(*tup->elems[0]) && pkg_typed(**c.arg)) k += 2;
+      if (const Ptyp_package* pk = pk_of_ty(*tup->elems[0])) {
+        if (pkg_typed(**c.arg)) k += 2;
+        k += pk_infer(**c.arg, *pk);
+      }
     } else if (auto* u = std::get_if<Pexp_tuple>(&(*c.arg)->desc)) {
       if (u->elems.size() == tup->elems.size())
         for (std::size_t i = 0; i < u->elems.size(); ++i)
-          if (pk_of_ty(*tup->elems[i]) && pkg_typed(*u->elems[i])) k += 2;
+          if (const Ptyp_package* pk = pk_of_ty(*tup->elems[i])) {
+            if (pkg_typed(*u->elems[i])) k += 2;
+            k += pk_infer(*u->elems[i], *pk);
+          }
     }
     return k;
   }
@@ -24413,6 +24673,15 @@ struct Count {
     }
     if (auto* c = std::get_if<Ppat_constraint>(&b.pat.desc))
       return pk_rue(*b.expr, *c->t);
+    // `let (module X : S with ..) = e`: the pattern fixed the package `e`
+    // is typed at (S526, m8).
+    if (auto* u = std::get_if<Ppat_unpack>(&b.pat.desc); u && u->pkg && !pkinfer_off()) {
+      const Ptyp_package* was = pkarg_ty_;
+      pkarg_ty_ = &*u->pkg;
+      long long k = pk_rue(*b.expr, pkleaf_, false);
+      pkarg_ty_ = was;
+      return k;
+    }
     return 0;
   }
   // The package nodes a WRITTEN signature's values carry, at `pack_ty`'s
@@ -24654,6 +24923,15 @@ struct Count {
       const ModuleType* t = fuel > 0 ? named_mty(id->id.txt, fuel) : nullptr;
       return t ? pk_wmty(*t, fuel - 1) : 0;
     }
+    // A `with` over a name: the name's items, less what `:=` took (S526).
+    if (auto* w = std::get_if<Pmty_with>(&mt.desc); w && !pkinfer_off()) {
+      long long k = pk_wmty(*w->mt, fuel);
+      for (auto& cn : w->constraints) {
+        Wc x;
+        if (wc_parts(cn, x) && x.destr && x.path.size() == 1) --k;
+      }
+      return k;
+    }
     return wt_mty(mt, Lvl{1, 1, 0, true});
   }
   // The substitution is FLAT: one ident per item at every depth, the nested
@@ -24689,8 +24967,22 @@ struct Count {
         return pk_wmty(*ft->second.back(), fuel - 1);
       return 0;
     }
-    return wt_mexpr(m, chkarrow_off() ? Lvl{1, 1, 0, true} : flat()) +
-           (chkarrow_off() ? 0 : pkw_params(m));
+    long long k = wt_mexpr(m, chkarrow_off() ? Lvl{1, 1, 0, true} : flat()) +
+                  (chkarrow_off() ? 0 : pkw_params(m));
+    // The items an `include` of a path brings in are copied too (S526).
+    return k + pk_incs(m);
+  }
+  long long pk_incs(const ModuleExpr& m) const {
+    auto* st = std::get_if<Pmod_structure>(&m.desc);
+    if (!st || pkinfer_off()) return 0;
+    long long k = 0;
+    for (auto& it : st->items)
+      if (auto* in = std::get_if<Pstr_include>(&it.desc))
+        if (std::holds_alternative<Pmod_ident>(in->expr.desc)) {
+          bool dt = false;
+          k += inc_top(in->expr, dt, 1);
+        }
+    return k;
   }
   // ---- WHAT A CHECK WITH NO SHAPE TO PROJECT MAKES UP (S518) --------------
   // `Includemod.modtypes` (includemod.ml:1368) checks with `Shape.dummy_mod`
@@ -29165,7 +29457,7 @@ struct Count {
     } else if (auto* i = std::get_if<Pexp_ifthenelse>(&e.desc)) {
       if (!pkmeet_off() && i->else_ && !pkexp_.count(&e) &&
           pkg_typed(*i->then_) && pkg_typed(**i->else_))
-        n += 2;
+        n += 2 + pk_sib(*i->then_, **i->else_);
       expr(*i->cond); expr(*i->then_);
       if (i->else_) expr(**i->else_);
     } else if (auto* c = std::get_if<Pexp_construct>(&e.desc)) {
@@ -29201,8 +29493,13 @@ struct Count {
       expr(*f->e);
     } else if (auto* r = std::get_if<Pexp_record>(&e.desc)) {
       if (!pkmeet_off())
-        for (auto& f : r->fields)
-          if (pkfld_.count(lid_last(f.first.txt)) && pkg_typed(*f.second)) n += 2;
+        for (auto& f : r->fields) {
+          auto it = pkfld_.find(lid_last(f.first.txt));
+          if (it == pkfld_.end()) continue;
+          if (pkg_typed(*f.second)) n += 2;
+          if (const Ptyp_package* pk = pk_of_ty(*it->second))
+            n += pk_infer(*f.second, *pk);
+        }
       for (auto& f : r->fields) expr(*f.second);
       if (r->base) expr(**r->base);
     } else if (auto* a = std::get_if<Pexp_assert>(&e.desc)) {
@@ -29278,6 +29575,7 @@ struct Count {
       // nothing is renamed, paired or strengthened at all (S518).
       const bool same = p->pkg && !chkarrow_off() && pk_same(*p->me, *p->pkg);
       if (!same) n += pk_wrap(*p->me);
+      if (p->pkg && !same) n += pk_check(*p->me, *p->pkg);
       if (auto* pi = std::get_if<Pmod_ident>(&p->me->desc); pi && p->pkg) {
         n += anon_path(*p->me);
         // A path through a PARENT packs the lazy copy the parent's
@@ -29305,11 +29603,11 @@ struct Count {
       release(m);
     } else if (auto* a = std::get_if<Pexp_array>(&e.desc)) {
       if (!pkmeet_off() && !pkexp_.count(&e)) {
-        bool seen = false;
+        const Expression* first = nullptr;
         for (auto& x : a->elems) {
           bool pk = pkg_typed(*x);
-          if (pk && seen) n += 2;
-          seen = seen || pk;
+          if (pk && first) n += 2 + pk_sib(*first, *x);
+          if (pk && !first) first = x.get();
         }
       }
       for (auto& x : a->elems) expr(*x);
@@ -36303,6 +36601,10 @@ struct Count {
       if (!xwith_off()) n += xwith_node(*w, l);
       n += twith_node(*w, l);
       n += dforce(mt);
+      if (!pkmeet_off() && !packty_off() && !pkinfer_off()) {
+        long long rep = 0;
+        n += pk_mtw() * pk_wnodes(*w, &rep) + 2 * rep;
+      }
     } else if (auto* t = std::get_if<Pmty_typeof>(&mt.desc)) {
       MtCtx sv = mtctx_;
       mtctx_ = MtCtx::Other;
@@ -36384,6 +36686,8 @@ struct Count {
       type_decls(t->decls, per);
       if (saved_ && !packty_off())
         for (auto& d : t->decls) n += pack_decl(d);
+      if (!pkmeet_off() && !packty_off() && !pkinfer_off())
+        for (auto& d : t->decls) n += pk_mtx() * pack_decl_nodes(d);
     } else if (auto* t = std::get_if<Psig_typesubst>(&it.desc)) {
       type_decls(t->decls, per);
       if (saved_ && !packty_off())
@@ -36607,6 +36911,9 @@ struct Count {
       tbind(m->name.txt, m->type ? &*m->type : nullptr);
     } else if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
       mexpr(i->expr, l);
+      if (saved_ && !pkmeet_off() && !packty_off() && !pkinfer_off() &&
+          !std::holds_alternative<Pmod_structure>(i->expr.desc))
+        n += pk_inc_nodes(i->expr, 8);
       n += depth_off() ? exports(i->expr) : ren_mexpr(i->expr, Sibs{});
       // `ren_mexpr` cannot read an application; its result is re-bound the
       // same way every other included signature is.
