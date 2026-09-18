@@ -1733,9 +1733,9 @@ class Parser {
       check_type_constr_path(name);  // a bare uppercase path is not a valid type
       return box(CoreType{.desc = Ptyp_constr{.id = name, .args = {}}, .loc = name.loc});
     }
-    if (t.kind == Kind::HASH) {  // #class  (no type args)
+    if (t.kind == Kind::HASH) {  // #class  (no type args; path may be F(X).c)
       advance();
-      LongidentLoc name = parse_longident_path();
+      LongidentLoc name = parse_type_path();
       return box(CoreType{Ptyp_class{name, {}}, span(position(t.start), name.loc.end)});
     }
     if (t.kind == Kind::LBRACKETPERCENT) {  // [%id payload]
@@ -4553,7 +4553,7 @@ class Parser {
         tys.push_back(parse_core_type());
         while (cur().kind == Kind::COMMA) { advance(); tys.push_back(parse_core_type()); }
         expect(Kind::RBRACKET, "]");
-        LongidentLoc id = parse_longident_path();
+        LongidentLoc id = parse_type_path();  // clty_longident: F(X).t allowed
         return ClassType{Pcty_constr{id, std::move(tys)}, span(position(t.start), id.loc.end), {}};
       } catch (const ParseError&) { idx_ = save; }
     }

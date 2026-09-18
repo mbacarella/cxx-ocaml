@@ -20675,6 +20675,16 @@ bool anondep_off() {
   static const bool off = dbg_env("NOANONDEP") != nullptr;
   return off;
 }
+// S534: a class type named through a functor APPLICATION (`F (M).t`, an
+// extended module path) is looked up as a type is: `Env.lookup_dot_cltype`
+// (env.ml:3138) reads the application's components through the same
+// `lookup_structure_components` as `lookup_dot_type`, so the functor's
+// components and the application's are forced there once per file
+// (`lookup_apply`, env.ml:3033).  `NOCTAPP=1` reverts.
+bool ctapp_off() {
+  static const bool off = dbg_env("NOCTAPP") != nullptr;
+  return off;
+}
 // S521: a class inherited through a module PATH, a read through a module
 // bound at a DOTTED module type name, and an include's rebind of a pathless
 // application.  `NOREADDECL=1` reverts the whole slice.
@@ -37159,8 +37169,11 @@ struct Count {
            read_lid(c->id.txt, false) + upk_read(c->id.txt);
       for (auto& a : c->args) ty_app(*a, d + 1, xonly, sub);
     } else if (auto* c = std::get_if<Ptyp_class>(&t.desc)) {
+      // `#F (M).t` is looked up through the application's components as
+      // `F (M).t` is (S534).
       n += (xonly ? 0 : lapp_path(c->id.txt)) +
            xtapp_charge(c->id.txt, inst != 0 || !c->args.empty()) +
+           (ctapp_off() ? 0 : ltapp_charge(c->id.txt, false)) +
            read_lid(c->id.txt, false);
       for (auto& a : c->args) ty_app(*a, d + 1, xonly, sub);
     } else if (auto* a = std::get_if<Ptyp_arrow>(&t.desc)) {
@@ -37233,6 +37246,11 @@ struct Count {
     } else if (auto* o = std::get_if<Pcty_open>(&t.desc)) {
       cty_app(*o->body, d + 1);
     } else if (auto* c = std::get_if<Pcty_constr>(&t.desc)) {
+      // A class type path through an application is read as a type path
+      // written in an annotation (S534).
+      if (!ctapp_off())
+        n += xtapp_charge(c->id.txt, !c->args.empty()) +
+             ltapp_charge(c->id.txt, false);
       n += read_lid(c->id.txt, false);
       for (auto& a : c->args) ann_app(*a);
     }
