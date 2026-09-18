@@ -23733,8 +23733,68 @@ long long appres_force(const Structure& s, const ModuleExpr& me,
 // forces N's own lazy copy: one ident per top item of each submodule on the
 // read path below the alias's target, once per submodule for the file.  A
 // direct `X.Y.N.w` reads N out of X's components and pays none of this.
-// Defined after `Count` (it uses its `me_top`).
-long long alias_sub_top(const ModuleExpr& me);
+// Defined after `Count` (it uses its `me_top`).  A module bound to the
+// application of ANOTHER UNIT's functor, or of one bound at the top of the
+// file `s`, forces that functor's result (S529).
+long long alias_sub_top(const Structure& s, const ModuleExpr& me);
+// The module an application of a functor bound at the top of the file
+// evaluates to: the functor's body, one level per argument (S529).
+const ModuleExpr* top_app_res(const Structure& s, const ModuleExpr& m) {
+  int n = 0;
+  const ModuleExpr* h = &m;
+  while (auto* a = std::get_if<Pmod_apply>(&h->desc)) { ++n; h = a->f.get(); }
+  auto* hi = n ? std::get_if<Pmod_ident>(&h->desc) : nullptr;
+  auto* l = hi ? std::get_if<Lident>(&hi->id.txt.v) : nullptr;
+  const ModuleExpr* me = l ? nar_find(s, l->name) : nullptr;
+  for (int i = 0; me && i < n; ++i) {
+    auto* f = std::get_if<Pmod_functor>(&me->desc);
+    me = f ? f->body.get() : nullptr;
+  }
+  return me;
+}
+// The same for a submodule declared by an ASCRIPTION on the way (S529):
+// what is forced is the signature's declaration of it.
+long long alias_sub_mty(const ModuleType& mt);
+// A submodule of a structure, through an `include` of a module bound at
+// the top of the file `top` (S529).
+const ModuleExpr* nar_find_inc(const Structure& top, const Structure& s,
+                               const std::string& nm, int d = 0) {
+  if (const ModuleExpr* r = nar_find(s, nm)) return r;
+  if (d > 4) return nullptr;
+  for (auto& it : s) {
+    auto* i = std::get_if<Pstr_include>(&it.desc);
+    auto* pi = i ? std::get_if<Pmod_ident>(&i->expr.desc) : nullptr;
+    auto* l = pi ? std::get_if<Lident>(&pi->id.txt.v) : nullptr;
+    const ModuleExpr* m = l ? nar_find(top, l->name) : nullptr;
+    auto* st = m ? std::get_if<Pmod_structure>(&m->desc) : nullptr;
+    if (!st) continue;
+    if (const ModuleExpr* r = nar_find_inc(top, st->items, nm, d + 1)) return r;
+  }
+  return nullptr;
+}
+const ModuleType* nar_find_in_sig(const Signature& s, const std::string& nm) {
+  const ModuleType* r = nullptr;
+  for (auto& it : s)
+    if (auto* pm = std::get_if<Psig_module>(&it.desc))
+      if (pm->md.name.txt && *pm->md.name.txt == nm && pm->md.type)
+        r = &*pm->md.type;
+  return r;
+}
+// ---- AN ALIAS OF A MODULE AT THE TOP IS READ THE SAME WAY (S529) ---------
+// `module T = TT` and `let module T = TT in ..` with TT bound at the top of
+// the file: TT's own declaration is what the environment holds, forced
+// already, so strengthening it at the alias costs nothing -- but every
+// submodule of it is again an alias of its path, and reading `T.N.x`
+// scrapes `TT.N` out of TT's components, whose lazy copy (`Subst.Lazy.
+// module_decl`, env.ml:2161) is forced then: one ident per top item of N,
+// once for the file however many aliases reach it, and of every module
+// below it on the read path.  A direct `TT.N.x` reads the components and
+// pays nothing; `let module U = T.N in U.x` is the target of a hop and
+// paid where U is bound.  `NOTOPALIAS=1` reverts.
+bool topalias_off() {
+  static const bool off = dbg_env("NOTOPALIAS") != nullptr;
+  return off;
+}
 // ---- A MODULE BOUND AT A NAME IS READ THROUGH THE DECLARATION (S518) ----
 // `module X : S = ..` and `module X = (val x)` with `x : (module S)` both
 // leave X at `Mty_ident S`; its components are made by scraping the name,
@@ -23807,6 +23867,7 @@ long long modforce_cost(const Structure& s, const Cites& u) {
   long long tot = 0;
   std::set<const ModuleExpr*> done;
   std::set<const ModuleExpr*> adone;
+  std::set<const ModuleType*> atdone;
   std::set<const ModuleType*> rdone;
   std::set<const ModuleType*> hdone;
   std::set<std::string> pdone;
@@ -23855,18 +23916,52 @@ long long modforce_cost(const Structure& s, const Cites& u) {
       // How many components FOLLOW each hop's target: the target itself
       // is what `lal_bind` charges for the alias, not a submodule below it.
       std::vector<std::size_t> rests;
+      // The module a name stands for where the read stands: a `let module
+      // T = TT` on the way is an alias hop like a top-level one (S529).
+      auto find_mod = [&](const std::string& nm) -> const ModuleExpr* {
+        const ModuleExpr* m = nullptr;
+        for (std::size_t k = sc.size() + 1; k-- > 0 && !m;) {
+          if (k < sc.size() && sc[k] == "$" + nm) {
+            if (!topalias_off()) {
+              std::string key;
+              for (std::size_t j = 0; j <= k; ++j)
+                key += (j ? "." : "") + sc[j];
+              auto lm = u.lmods.find(key);
+              if (lm != u.lmods.end() &&
+                  std::holds_alternative<Pmod_ident>(lm->second->desc))
+                m = lm->second;
+            }
+            break;
+          }
+          if (const Structure* st = scope_at(s, sc, k)) m = nar_find(*st, nm);
+        }
+        return m;
+      };
       for (int hop = 0; hop < 4; ++hop) {
-        me = nullptr;
-        for (std::size_t k = sc.size() + 1; k-- > 0 && !me;) {
-          if (k < sc.size() && sc[k] == "$" + c[0]) break;
-          if (const Structure* st = scope_at(s, sc, k))
-            me = nar_find(*st, c[0]);
+        me = find_mod(c[0]);
+        // A head no scope binds is looked up in the `open`s: one of an
+        // ALIAS whose target has a submodule of that name is read through
+        // the alias (S529).
+        if (!me && hop == 0 && !topalias_off()) {
+          for (const std::string& o : u.opens) {
+            const ModuleExpr* om = find_mod(o);
+            auto* oi = om ? std::get_if<Pmod_ident>(&om->desc) : nullptr;
+            std::vector<std::string> oc;
+            if (!oi || !lid_comps(oi->id.txt, oc) || oc.size() != 1) continue;
+            const ModuleExpr* tm = nar_find(s, oc[0]);
+            auto* ts = tm ? std::get_if<Pmod_structure>(&tm->desc) : nullptr;
+            if (!ts || !nar_find_inc(s, ts->items, c[0])) continue;
+            c.insert(c.begin(), o);
+            me = om;
+            break;
+          }
         }
         auto* ai = me ? std::get_if<Pmod_ident>(&me->desc) : nullptr;
         if (!ai) break;
         std::vector<std::string> ac;
         if (!lid_comps(ai->id.txt, ac) || ac.empty()) { me = nullptr; break; }
-        if (ac.size() >= 2 && !pkwrit_off()) tlen = ac.size();
+        if ((ac.size() >= 2 || !topalias_off()) && !pkwrit_off())
+          tlen = ac.size();
         rests.push_back(c.size() - 1);
         ac.insert(ac.end(), c.begin() + 1, c.end());
         c = ac;
@@ -23875,13 +23970,34 @@ long long modforce_cost(const Structure& s, const Cites& u) {
       if (!me || lb == u.local.end() || lb->second < 1) continue;
       if (tlen) {
         const ModuleExpr* sm = me;
-        for (std::size_t i = 1; sm && i < c.size(); ++i) {
-          auto* st = std::get_if<Pmod_structure>(&sm->desc);
-          sm = st ? nar_find(st->items, c[i]) : nullptr;
-          if (!sm || i < tlen) continue;
+        const ModuleType* smt = nullptr;  // met through an ascription
+        std::vector<const Structure*> ascopes;
+        if (!topalias_off())
+          for (std::size_t k = sc.size() + 1; k-- > 0;)
+            if (const Structure* st = scope_at(s, sc, k)) ascopes.push_back(st);
+        for (std::size_t i = 1; (sm || smt) && i < c.size(); ++i) {
           bool target = false;
           for (auto rs : rests) target = target || c.size() - 1 - i == rs;
-          if (!target && adone.insert(sm).second) tot += alias_sub_top(*sm);
+          if (!topalias_off()) {
+            // An application of a functor bound at the top is its result.
+            if (const ModuleExpr* r = sm ? top_app_res(s, *sm) : nullptr)
+              sm = r;
+            auto* cn = sm ? std::get_if<Pmod_constraint>(&sm->desc) : nullptr;
+            if (cn) { smt = &*cn->mt; sm = nullptr; }
+            if (smt) {
+              const Signature* sg = named_sig_at(ascopes, *smt);
+              smt = sg ? nar_find_in_sig(*sg, c[i]) : nullptr;
+              if (!smt || i < tlen || target) continue;
+              if (atdone.insert(smt).second) tot += alias_sub_mty(*smt);
+              continue;
+            }
+          }
+          auto* st = std::get_if<Pmod_structure>(&sm->desc);
+          sm = !st ? nullptr
+               : topalias_off() ? nar_find(st->items, c[i])
+                                : nar_find_inc(s, st->items, c[i]);
+          if (!sm || i < tlen) continue;
+          if (!target && adone.insert(sm).second) tot += alias_sub_top(s, *sm);
         }
       }
       if (openonly) continue;
@@ -30553,6 +30669,24 @@ struct Count {
     const cmi::ModuleType* res = scrape_cmty(mt->functor_body.get(), root);
     if (!res || res->kind != cmi::ModuleType::Sig || !res->sig) return nullptr;
     return res;
+  }
+  // The top items of the result of ANOTHER UNIT's functor applied, to
+  // whatever arguments and however many (S529): what an alias's read of the
+  // module bound to it forces.  0 where the head is not such a functor.
+  long long xapp_top(const ModuleExpr& m) const {
+    int n = 0;
+    const ModuleExpr* h = &m;
+    while (auto* a = std::get_if<Pmod_apply>(&h->desc)) { ++n; h = a->f.get(); }
+    const Longident* id = n ? mpath(h) : nullptr;
+    if (!id || mderef(h)) return 0;
+    const cmi::Signature* root = nullptr;
+    const cmi::ModuleType* mt = scrape_cmty(cmi_module(*id, &root), root);
+    for (int i = 0; i < n; ++i) {
+      if (!mt || mt->kind != cmi::ModuleType::Functor) return 0;
+      mt = scrape_cmty(mt->functor_body.get(), root);
+    }
+    if (!mt || mt->kind != cmi::ModuleType::Sig || !mt->sig) return 0;
+    return shal_csig(mt->sig.get());
   }
   long long nd_mexpr(const ModuleExpr& m, int d = 0) const {
     if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
@@ -37310,9 +37444,17 @@ static const std::string* bare_name(const ModuleType* t) {
   auto* li = id ? std::get_if<Lident>(&id->id.txt.v) : nullptr;
   return li ? &li->name : nullptr;
 }
-long long alias_sub_top(const ModuleExpr& me) {
+long long alias_sub_top(const Structure& s, const ModuleExpr& me) {
   Count c;
+  if (!topalias_off()) {
+    if (long long k = c.xapp_top(me)) return k;
+    if (const ModuleExpr* r = top_app_res(s, me)) return c.me_top(*r);
+  }
   return c.me_top(me);
+}
+long long alias_sub_mty(const ModuleType& mt) {
+  Count c;
+  return c.mt_top(mt);
 }
 long long apphead_force(const ModuleExpr& app,
                         const std::vector<const Structure*>& scopes,
