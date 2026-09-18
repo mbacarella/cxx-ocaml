@@ -20648,6 +20648,33 @@ bool parfun_off() {
   static const bool off = dbg_env("NOPARFUN") != nullptr;
   return off;
 }
+// S533: an application of a HIGHER-ORDER functor -- an enclosing functor's
+// parameter of a functor type, or a module ascribed at one -- is typed as
+// `type_application` types every application: the head is looked up
+// STRENGTHENED when every argument has a path (typemod.ml:2632), which names
+// each anonymous parameter of its type `Arg` (`Mtype.strengthen_lazy`,
+// mtype.ml:56) and scrapes a result written as a name into its signature, so
+// the application's substitution renames the items an `include` of a name in
+// that signature brought in with the rest; the argument's coercion
+// (`Includemod.modtypes`, typemod.ml:2689) pairs the functor type's
+// parameters with no shape (`functor_param`, includemod.ml:659), one fresh
+// shape variable per functor node of the expected parameter's type, none
+// where both sides are the same name; and an ascription at a functor type
+// NAME pairs the parameters the same way once.  `NOHOAPP=1` reverts the
+// checks, `NOINCRES=1` the include, `NOANONDEP=1` the pathless argument to
+// an anonymous parameter (below).
+bool hoapp_off() {
+  static const bool off = dbg_env("NOHOAPP") != nullptr;
+  return off;
+}
+bool incres_off() {
+  static const bool off = dbg_env("NOINCRES") != nullptr;
+  return off;
+}
+bool anondep_off() {
+  static const bool off = dbg_env("NOANONDEP") != nullptr;
+  return off;
+}
 // S521: a class inherited through a module PATH, a read through a module
 // bound at a DOTTED module type name, and an include's rebind of a pathless
 // application.  `NOREADDECL=1` reverts the whole slice.
@@ -25979,11 +26006,17 @@ struct Count {
     ps.assign(nargs, nullptr);
     const ModuleExpr* me = mderef(head);
     const ModuleType* mt = nullptr;
+    // A head an enclosing functor's parameter names is read off the
+    // parameter's type (S533).
+    if (!me && !hoapp_off() && !parfun_off()) mt = pf_head(*head);
     for (int i = 0; i < nargs; ++i) {
       if (auto* c = me ? std::get_if<Pmod_constraint>(&me->desc) : nullptr) {
         mt = c->mt.get();
         me = nullptr;
       }
+      if (mt && !hoapp_off())
+        if (auto* id = std::get_if<Pmty_ident>(&mt->desc))
+          mt = named_mty(id->id.txt, 8);
       if (me) {
         auto* f = std::get_if<Pmod_functor>(&me->desc);
         if (!f) break;
@@ -26016,9 +26049,117 @@ struct Count {
   }
   long long arg_arrows(const ModuleExpr& app) const {
     if (chkarrow_off()) return 0;
+    std::vector<const ModuleExpr*> args;  // outermost application first
+    for (const ModuleExpr* h = &app;;) {
+      if (auto* a = std::get_if<Pmod_apply>(&h->desc)) {
+        args.push_back(a->arg.get());
+        h = a->f.get();
+      } else if (auto* u = std::get_if<Pmod_apply_unit>(&h->desc)) {
+        args.push_back(nullptr);
+        h = u->f.get();
+      } else {
+        break;
+      }
+    }
     long long k = 0;
-    for (const ModuleType* p : arg_params(app))
-      if (p) k += arrows_mty(*p);
+    const std::vector<const ModuleType*> ps = arg_params(app);
+    for (std::size_t i = 0; i < ps.size(); ++i)
+      if (ps[i]) {
+        k += arrows_mty(*ps[i]);
+        if (!hoapp_off() && i < args.size() && args[i])
+          k += arrows_pside(*ps[i], *args[i]);
+      }
+    return k;
+  }
+  // The parameter types of the functor an ARGUMENT is, by level: a path's
+  // declared or written ones, a literal functor's, an enclosing functor's
+  // parameter's; null where one cannot be read.
+  void act_params(const ModuleExpr& arg,
+                  std::vector<const ModuleType*>& out) const {
+    const ModuleExpr* e = &arg;
+    const ModuleType* t = nullptr;
+    if (std::holds_alternative<Pmod_ident>(arg.desc)) {
+      e = mderef(&arg);
+      if (!e || e == &arg) {
+        e = nullptr;
+        t = pf_head(arg);
+      }
+    }
+    for (int i = 0; i < 8; ++i) {
+      if (e) {
+        if (auto* c = std::get_if<Pmod_constraint>(&e->desc)) {
+          t = c->mt.get();
+          e = nullptr;
+        } else if (auto* f = std::get_if<Pmod_functor>(&e->desc)) {
+          auto* nm = std::get_if<Functor_named>(&f->param);
+          out.push_back(nm && nm->type ? &*nm->type : nullptr);
+          e = f->body.get();
+          continue;
+        } else {
+          return;
+        }
+      }
+      if (!t) return;
+      if (auto* id = std::get_if<Pmty_ident>(&t->desc))
+        t = named_mty(id->id.txt, 8);
+      auto* f = t ? std::get_if<Pmty_functor>(&t->desc) : nullptr;
+      if (!f) return;
+      auto* nm = std::get_if<Functor_named>(&f->param);
+      out.push_back(nm && nm->type ? &*nm->type : nullptr);
+      t = f->body.get();
+    }
+  }
+  // `functor_param` (includemod.ml:659) pairs the expected parameter's type
+  // with the actual's under `Shape.dummy_mod`: one fresh variable per
+  // functor node of the expected type, none where both are the same NAME
+  // (`try_modtypes`, includemod.ml:551), and the same below the node on
+  // both sides.  An actual that cannot be read is taken to be spelled as
+  // the expected is.
+  long long arrows_vs(const ModuleType& e, const ModuleType* a,
+                      int fuel) const {
+    if (fuel <= 0) return 0;
+    auto* ei = std::get_if<Pmty_ident>(&e.desc);
+    auto* ai = a ? std::get_if<Pmty_ident>(&a->desc) : nullptr;
+    if (ei && (!a || (ai && lid_full(ei->id.txt) == lid_full(ai->id.txt))))
+      return 0;
+    const ModuleType* er = ei ? named_mty(ei->id.txt, fuel) : &e;
+    auto* ef = er ? std::get_if<Pmty_functor>(&er->desc) : nullptr;
+    if (!ef) return 0;
+    const ModuleType* ar = ai ? named_mty(ai->id.txt, fuel) : a;
+    auto* af = ar ? std::get_if<Pmty_functor>(&ar->desc) : nullptr;
+    long long k = 1;
+    auto* en = std::get_if<Functor_named>(&ef->param);
+    auto* an = af ? std::get_if<Functor_named>(&af->param) : nullptr;
+    if (en && en->type)
+      k += arrows_vs(*en->type, an && an->type ? &*an->type : nullptr,
+                     fuel - 1);
+    return k + arrows_vs(*ef->body, af ? af->body.get() : nullptr, fuel - 1);
+  }
+  // The PARAMETER side of an argument's coercion at a functor type: the
+  // spine's own arrows are `arrows_mty`'s (S533).
+  long long arrows_pside(const ModuleType& e, const ModuleExpr& arg) const {
+    std::vector<const ModuleType*> ap;
+    act_params(arg, ap);
+    long long k = 0;
+    std::size_t lv = 0;
+    const ModuleType* t = &e;
+    for (int i = 0; t && i < 16; ++i) {
+      if (auto* w = std::get_if<Pmty_with>(&t->desc)) {
+        t = w->mt.get();
+        continue;
+      }
+      if (auto* id = std::get_if<Pmty_ident>(&t->desc)) {
+        t = named_mty(id->id.txt, 8);
+        continue;
+      }
+      auto* f = std::get_if<Pmty_functor>(&t->desc);
+      if (!f) break;
+      if (auto* nm = std::get_if<Functor_named>(&f->param))
+        if (nm->type)
+          k += arrows_vs(*nm->type, lv < ap.size() ? ap[lv] : nullptr, 8);
+      ++lv;
+      t = f->body.get();
+    }
     return k;
   }
   // The anonymous parameters of the module a path names, at every depth --
@@ -27391,11 +27532,30 @@ struct Count {
     }
     return d;
   }
+  // The signature an `include` of a NAME inside a literal signature brings
+  // in: the declaration has its items written out, where `wt_sig_item`
+  // weighs the name 0 (S533).
+  const Signature* inc_named(const ModuleType& mt) const {
+    if (incres_off()) return nullptr;
+    const ModuleType* b = &mt;
+    for (int i = 0; i < 8; ++i) {
+      auto* w = std::get_if<Pmty_with>(&b->desc);
+      if (!w) break;
+      b = w->mt.get();
+    }
+    if (!std::holds_alternative<Pmty_ident>(b->desc)) return nullptr;
+    return mty_sig(&mt);
+  }
   // `Subst.signature`: one ident per item at every depth, minus what a
   // destructive constraint took out.
   long long w_ren(const Signature& s, const Gone& g) const {
     long long k = 0;
     for (auto& it : s) {
+      if (auto* i = std::get_if<Psig_include>(&it.desc))
+        if (const Signature* in = inc_named(i->mt)) {
+          k += w_ren(*in, g);
+          continue;
+        }
       if (auto* t = std::get_if<Psig_type>(&it.desc)) {
         for (auto& d : t->decls) {
           bool drop = false;
@@ -27427,6 +27587,11 @@ struct Count {
   long long w_wt(const Signature& s, const Lvl& l, const Gone& g) const {
     long long k = 0;
     for (auto& it : s) {
+      if (auto* i = std::get_if<Psig_include>(&it.desc))
+        if (const Signature* in = inc_named(i->mt)) {
+          k += w_wt(*in, l, g);
+          continue;
+        }
       if (auto* t = std::get_if<Psig_type>(&it.desc)) {
         for (auto& d : t->decls) {
           bool drop = false;
@@ -37129,6 +37294,13 @@ struct Count {
       args.push_back(a->arg.get());
       h = a->f.get();
     }
+    // A pathless argument to an ANONYMOUS parameter is neither substituted
+    // nor rebuilt: `type_one_application` (typemod.ml:2711) has no parameter
+    // to eliminate and hands the result on as it is (S533).
+    if (!anondep_off() && nargs == 1 && pathless && me && !ngen)
+      if (auto* f = std::get_if<Pmod_functor>(&me->desc))
+        if (auto* nm = std::get_if<Functor_named>(&f->param))
+          if (!nm->name.txt) return 0;
     long long k = 0;
     std::vector<std::pair<std::string, const ModuleType*>> fps;
     bool pbody = false;  // the result is the PARAMETER, and so an alias
@@ -37138,6 +37310,12 @@ struct Count {
         if (auto* c = std::get_if<Pmod_constraint>(&me->desc)) {
           mt = c->mt.get();
           me = nullptr;
+          // A module ascribed at a functor type NAME is applied as the
+          // name's functor (S533).
+          if (!hoapp_off())
+            if (auto* id = std::get_if<Pmty_ident>(&mt->desc))
+              if (const ModuleType* d = named_mty(id->id.txt, 8))
+                if (std::holds_alternative<Pmty_functor>(d->desc)) mt = d;
         }
       if (me) {
         auto* f = std::get_if<Pmod_functor>(&me->desc);
@@ -37421,6 +37599,14 @@ struct Count {
         n += anon_path(*c->me) + arrows_in(*c->mt, 8, c->me.get());
       if (!parfun_off() && !std::holds_alternative<Pmod_ident>(c->me->desc))
         n += pfun_mty_params(*c->mt);
+      // An ascription at a functor type NAME expands the name and pairs the
+      // parameters the same way, once: what it saves is the name (S533).
+      if (!hoapp_off() && !parfun_off() &&
+          !std::holds_alternative<Pmod_ident>(c->me->desc))
+        if (auto* id = std::get_if<Pmty_ident>(&c->mt->desc))
+          if (const ModuleType* d = named_mty(id->id.txt, 8))
+            if (std::holds_alternative<Pmty_functor>(d->desc))
+              n += pfun_mty_params(*d);
       asc_mty_ = amv;
       ascr_sig_ = asv;
       MtCtx sv = mtctx_;
@@ -37437,6 +37623,7 @@ struct Count {
       const ModuleExpr* h = &m;
       const ModuleType* amv = asc_mty_;
       asc_mty_ = nullptr;
+      bool allpath = true;
       for (;;) {
         if (auto* a = std::get_if<Pmod_apply>(&h->desc)) {
           chk_ = true;
@@ -37446,14 +37633,20 @@ struct Count {
           chk_sig_ = nullptr;
           if (std::holds_alternative<Pmod_ident>(a->arg->desc))
             n += anon_path(*a->arg);
+          if (!has_path(*a->arg)) allpath = false;
           h = a->f.get();
         } else if (auto* a = std::get_if<Pmod_apply_unit>(&h->desc)) {
+          allpath = false;
           h = a->f.get();
         } else {
           break;
         }
       }
       mexpr(*h, Lvl{1, 1, 0, true}, false);
+      // The head is looked up STRENGTHENED when every argument has a path
+      // (`type_application`, typemod.ml:2632), which names its anonymous
+      // parameters `Arg` (S533).
+      if (!hoapp_off() && allpath) n += anon_path(*h);
       asc_mty_ = amv;
       n += arg_arrows(m);
       n += lfun_cost(m);
