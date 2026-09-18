@@ -24621,6 +24621,439 @@ struct Count {
     }
     return k;
   }
+  // ---- A PACKAGE ABBREVIATION IN A CLASS (S530) ---------------------------
+  // pr7036_ok.ml: `type 'a s = (module S with type a = 'a)` named in a class
+  // type's method and in a class's.  A PARAMETERIZED abbreviation of a
+  // package type is met like the package wherever the type it is in is
+  // compared with a copy of itself: `eqtype`, `moregen` and `unify` expand
+  // the `Tconstr` to its `Tpackage` and `compare_package` pays 2 (a nullary
+  // one meets itself by path and pays nothing, ctype.ml:3320/4601/5049; a
+  // written package node in the same place pays the same).  The sites:
+  //  - a type declaration: `check_constraints_rec` (typedecl.ml:589)
+  //    `matches` each `Tconstr` of its manifest, constructor arguments and
+  //    labels against an instance of its declaration, 2 per node, and each
+  //    check of the signature it is in pays 2 more per node
+  //    (`type_manifest`, includecore.ml:934; `csig_w`: once where it is
+  //    saved, both ways in a module type declaration, an ascription's
+  //    against the module and again where the ascription is saved);
+  //  - a class type declaration: the check's `class_type_declarations`
+  //    (`equal_clsig` and `match_class_types`, ctype.ml:5518/5523, 4 per
+  //    node of a method or a `val`) and the object type it declares
+  //    (`type_manifest`, 2 per node of a public method): 6 a public method,
+  //    4 a private one or a val;
+  //  - a class declaration: `class_declarations` and
+  //    `class_type_declarations` both (8) and the object type (2): 10 a
+  //    public method, 8 a private one or a val; an inherited class pays its
+  //    own once more and 2 per node for the meet; `class c = b` pays b's;
+  //    an ascription `class b : ct = ..` declares ct's and meets the body's
+  //    own, 2 per node; a class in a signature is checked as the signature
+  //    is (`csig_w`), an unpacked bare dotted package type at its first
+  //    read (`upk_head`);
+  //  - typing a method `a : T = e`: `Pexp_poly`'s unify and the wrapping
+  //    function's (typecore.ml:5390, 6031), 4 per node of T, and
+  //    `check_univars` (typecore.ml:3915) 2 more per node a universal
+  //    variable of T is under (`instance_poly_fixed` copies those alone);
+  //    a parameter annotation of the body 4 per node; a `val x : T = e` 4;
+  //    an object expression the same;
+  //  - a module type declaration checks its classes both ways.
+  // Left alone: a method typed by inference alone (`method a = x` with `x`
+  // a package-typed val, q24; r24), a class parameter's annotation (q15,
+  // 2), `super#a` (q21), a method call `x#a` (ct13), a parameter returned
+  // (cl8, the two nodes meet), an object expression's saved type (q14), a
+  // dependent method (r44), an `include` of a module type (s24), the
+  // written package's own patches in a class (e4w), the value-level forms
+  // (a `let` annotation, a parameter, an expression constraint at an
+  // abbreviation: S505's written laws less the patches, e6-e8).
+  // `NOPKCLASS=1` reverts.
+  static bool pkclass_off() {
+    static const bool off = dbg_env("NOPKCLASS") != nullptr;
+    return off;
+  }
+  struct MNode;   // S521's module and class references, below
+  struct ClsRef;
+  // The declaration a type path names: this file's own for a bare name, a
+  // module's last one (through includes, a `with type` on the way) for a
+  // dotted one.
+  const TypeDeclaration* tdecl_at(const Longident& id, int fuel) const {
+    if (fuel <= 0) return nullptr;
+    if (auto* l = std::get_if<Lident>(&id.v)) {
+      auto it = tdecls_.find(l->name);
+      return it == tdecls_.end() ? nullptr : it->second;
+    }
+    auto* d = std::get_if<Ldot>(&id.v);
+    if (!d) return nullptr;
+    return tdecl_in(inh_path(*d->prefix, 0), d->name, fuel - 1);
+  }
+  const TypeDeclaration* tdecl_in(MNode r, const std::string& nm,
+                                  int fuel) const {
+    if (fuel <= 0) return nullptr;
+    r = inh_norm(r, 0);
+    const TypeDeclaration* out = nullptr;
+    if (r.me) {
+      auto* st = std::get_if<Pmod_structure>(&r.me->desc);
+      if (!st) return nullptr;
+      for (auto& it : st->items) {
+        if (auto* t = std::get_if<Pstr_type>(&it.desc)) {
+          for (auto& td : t->decls)
+            if (td.name.txt == nm) out = &td;
+        } else if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
+          if (auto* x = tdecl_in(MNode{&i->expr, nullptr}, nm, fuel - 1))
+            out = x;
+        }
+      }
+      return out;
+    }
+    for (const ModuleType* b = r.mt; b;) {
+      auto* w = std::get_if<Pmty_with>(&b->desc);
+      if (!w) break;
+      for (auto& cn : w->constraints) {
+        Wc x;
+        if (wc_parts(cn, x) && x.td && x.path.size() == 1 && x.path[0] == nm)
+          return x.td;
+      }
+      b = w->mt.get();
+    }
+    if (const Signature* sg = mty_sig(r.mt))
+      for (auto& it : *sg) {
+        if (auto* t = std::get_if<Psig_type>(&it.desc)) {
+          for (auto& td : t->decls)
+            if (td.name.txt == nm) out = &td;
+        } else if (auto* i = std::get_if<Psig_include>(&it.desc)) {
+          if (auto* x = tdecl_in(MNode{nullptr, &i->mt}, nm, fuel - 1))
+            out = x;
+        }
+      }
+    return out;
+  }
+  // Does the declaration's manifest unfold to a package type?
+  bool pk_manifest(const TypeDeclaration& d, int fuel) const {
+    if (fuel <= 0 || !d.manifest) return false;
+    const CoreType& mf = **d.manifest;
+    if (std::holds_alternative<Ptyp_package>(mf.desc)) return true;
+    auto* c = std::get_if<Ptyp_constr>(&mf.desc);
+    if (!c) return false;
+    const TypeDeclaration* t = tdecl_at(c->id.txt, fuel - 1);
+    return t && t != &d && pk_manifest(*t, fuel - 1);
+  }
+  // A parameterized abbreviation of a package type.
+  bool pk_abbr(const CoreType& t) const {
+    auto* c = std::get_if<Ptyp_constr>(&t.desc);
+    if (!c || c->args.empty()) return false;
+    const TypeDeclaration* d = tdecl_at(c->id.txt, 6);
+    return d && pk_manifest(*d, 6);
+  }
+  // Does the type mention one of the variables?
+  static bool ty_has_var(const CoreType& t, const std::vector<std::string>& vs,
+                         int d = 0) {
+    if (d > 24) return false;
+    if (auto* v = std::get_if<Ptyp_var>(&t.desc))
+      return std::find(vs.begin(), vs.end(), v->name) != vs.end();
+    if (auto* a = std::get_if<Ptyp_arrow>(&t.desc))
+      return ty_has_var(*a->dom, vs, d + 1) || ty_has_var(*a->cod, vs, d + 1);
+    if (auto* u = std::get_if<Ptyp_tuple>(&t.desc)) {
+      for (auto& e : u->elems) if (ty_has_var(*e, vs, d + 1)) return true;
+    } else if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
+      for (auto& a : c->args) if (ty_has_var(*a, vs, d + 1)) return true;
+    } else if (auto* p = std::get_if<Ptyp_package>(&t.desc)) {
+      for (auto& c : p->constraints)
+        if (ty_has_var(*c.second, vs, d + 1)) return true;
+    } else if (auto* a = std::get_if<Ptyp_alias>(&t.desc)) {
+      return ty_has_var(*a->type, vs, d + 1);
+    } else if (auto* p = std::get_if<Ptyp_poly>(&t.desc)) {
+      return ty_has_var(*p->type, vs, d + 1);
+    }
+    return false;
+  }
+  // The package nodes of a written type, an abbreviation's counted with the
+  // written ones; with `uv`, only those a variable of `uv` is under.
+  long long cnodes(const CoreType& t, const std::vector<std::string>* uv = nullptr,
+                   int d = 0) const {
+    if (d > 24) return 0;
+    if (std::holds_alternative<Ptyp_package>(t.desc) || pk_abbr(t))
+      return (!uv || ty_has_var(t, *uv)) ? 1 : 0;
+    long long k = 0;
+    if (auto* a = std::get_if<Ptyp_arrow>(&t.desc))
+      k = cnodes(*a->dom, uv, d + 1) + cnodes(*a->cod, uv, d + 1);
+    else if (auto* u = std::get_if<Ptyp_tuple>(&t.desc))
+      for (auto& e : u->elems) k += cnodes(*e, uv, d + 1);
+    else if (auto* c = std::get_if<Ptyp_constr>(&t.desc))
+      for (auto& a : c->args) k += cnodes(*a, uv, d + 1);
+    else if (auto* a = std::get_if<Ptyp_alias>(&t.desc))
+      k = cnodes(*a->type, uv, d + 1);
+    else if (auto* p = std::get_if<Ptyp_poly>(&t.desc))
+      k = cnodes(*p->type, uv, d + 1);
+    else if (auto* p = std::get_if<Ptyp_open>(&t.desc))
+      k = cnodes(*p->type, uv, d + 1);
+    return k;
+  }
+  // The abbreviation nodes alone (the written ones have their own laws).
+  long long anodes(const CoreType& t) const {
+    return cnodes(t) - pack_nodes(t);
+  }
+  long long adecl_nodes(const TypeDeclaration& d) const {
+    long long k = d.manifest ? anodes(**d.manifest) : 0;
+    if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
+      for (auto& c : v->ctors) {
+        if (c.res) k += anodes(**c.res);
+        if (auto* t = std::get_if<Pcstr_tuple>(&c.args))
+          for (auto& e : t->elems) k += anodes(*e);
+        else if (auto* r = std::get_if<Pcstr_record>(&c.args))
+          for (auto& f : r->fields) k += anodes(*f.type);
+      }
+    } else if (auto* r = std::get_if<Ptype_record>(&d.kind)) {
+      for (auto& f : r->fields) k += anodes(*f.type);
+    }
+    return k;
+  }
+  // A method's written type: `method a : T = e` (`Pexp_poly` with T), or a
+  // virtual one's.
+  static const CoreType* cmeth_ty(const ClassFieldKind& k) {
+    if (auto* v = std::get_if<Cfk_virtual>(&k)) return v->type.get();
+    auto* p = std::get_if<Pexp_poly>(&std::get<Cfk_concrete>(k).e->desc);
+    return p && p->t ? p->t->get() : nullptr;
+  }
+  // The package nodes a method's body annotates -- its parameters', its
+  // result constraint's, a constraint on a plain body -- in `chk`, and what
+  // typing them costs.  The method's `type_approx` (typeclass.ml:802)
+  // rebuilds an ABBREVIATION's node for each parameter up to the first
+  // `(type a)` or `(module X)` (typecore.ml:3859; a `function`'s cases
+  // and a written package are not approximated) and, under a written T,
+  // meets it with T's domain (`type_pattern_approx`, typecore.ml:3738);
+  // `solve_Ppat_constraint` (typecore.ml:1386) then meets the annotation
+  // with the domain: T's, or the approximation's own -- 4 either way for
+  // an approximated abbreviation, 2 for one T alone reaches, 0 for one
+  // nothing but a variable meets.  A constrained body pays its constraint
+  // (4) and the approximation's meet with T (2); a result constraint 4 and
+  // 4 more under T (r13c, measured).
+  long long cbody_pk(const ClassFieldKind& k, long long& chk) const {
+    auto* c = std::get_if<Cfk_concrete>(&k);
+    if (!c) return 0;
+    const Expression* e = c->e.get();
+    bool hasT = false;
+    if (auto* p = std::get_if<Pexp_poly>(&e->desc)) {
+      hasT = p->t.has_value();
+      e = p->e.get();
+    }
+    long long n = 0;
+    bool approx = true;
+    for (int d = 0; d < 64; ++d) {
+      if (auto* nt = std::get_if<Pexp_newtype>(&e->desc)) {
+        approx = false;
+        e = nt->body.get();
+        continue;
+      }
+      auto* f = std::get_if<Pexp_function>(&e->desc);
+      if (!f) break;
+      for (auto& pm : f->params) {
+        auto* v = std::get_if<Pparam_val>(&pm.desc);
+        if (!v) { approx = false; continue; }
+        if (auto* u = std::get_if<Ppat_unpack>(&v->pat.desc); u && u->name.txt)
+          approx = false;  // `(module X : S)` too, `((module X) : ..)` not
+        const long long w = cpat_nodes(v->pat, true);
+        const long long a = cpat_nodes(v->pat, false) - w;
+        chk += w + a;
+        n += approx ? 4 * a : 0;
+        if (hasT) n += 2 * (w + (approx ? 0 : a));
+      }
+      if (f->constraint_)
+        if (auto* cn = std::get_if<Pconstraint>(&*f->constraint_)) {
+          const long long a = anodes(*cn->type);
+          chk += a;
+          n += (hasT ? 8 : 4) * a;
+        }
+      if (auto* cs = std::get_if<Pfunction_cases>(&f->body->v)) {
+        long long first = 0;
+        for (auto& x : cs->cases) {
+          const long long a = cpat_nodes(x.lhs, false);
+          if (!first) first = a;
+          if (hasT) n += 2 * a;
+        }
+        chk += first;
+        return n;
+      }
+      e = std::get<Pfunction_body>(f->body->v).e.get();
+    }
+    if (auto* cn = std::get_if<Pexp_constraint>(&e->desc)) {
+      const long long a = anodes(*cn->t);
+      chk += a;
+      n += (hasT ? 6 : 4) * a;
+    }
+    return n;
+  }
+  // A pattern's annotated package nodes, the written ones alone with `w`.
+  long long cpat_nodes(const Pattern& p, bool w) const {
+    if (auto* c = std::get_if<Ppat_constraint>(&p.desc))
+      return (w ? pack_nodes(*c->t) : cnodes(*c->t)) + cpat_nodes(*c->p, w);
+    if (auto* a = std::get_if<Ppat_alias>(&p.desc)) return cpat_nodes(*a->p, w);
+    if (auto* u = std::get_if<Ppat_unpack>(&p.desc)) return u->pkg ? 1 : 0;
+    return 0;
+  }
+  // The nodes the check sees in a method: the written type's, else the
+  // body's annotations'.
+  long long cmeth_nodes(const ClassFieldKind& k) const {
+    if (const CoreType* t = cmeth_ty(k)) return cnodes(*t);
+    long long chk = 0;
+    cbody_pk(k, chk);
+    return chk;
+  }
+  long long cval_nodes(const ClassFieldKind& k) const {
+    if (auto* v = std::get_if<Cfk_virtual>(&k)) return cnodes(*v->type);
+    if (auto* c = std::get_if<Pexp_constraint>(&std::get<Cfk_concrete>(k).e->desc))
+      return cnodes(*c->t);
+    return 0;
+  }
+  // What typing a field costs in meets.
+  long long cfield_pk(const ClassField& f) const {
+    if (auto* m = std::get_if<Pcf_method>(&f.desc)) {
+      long long k = 0;
+      if (!std::holds_alternative<Cfk_concrete>(m->kind)) return 0;
+      if (const CoreType* t = cmeth_ty(m->kind)) {
+        k += 4 * cnodes(*t);
+        if (auto* p = std::get_if<Ptyp_poly>(&t->desc); p && !p->vars.empty())
+          k += 2 * cnodes(*p->type, &p->vars);
+      }
+      long long chk = 0;
+      return k + cbody_pk(m->kind, chk);
+    }
+    if (auto* v = std::get_if<Pcf_val>(&f.desc))
+      return std::holds_alternative<Cfk_concrete>(v->kind) ? 4 * cval_nodes(v->kind) : 0;
+    return 0;
+  }
+  ClsRef cls_ref(const Longident& id) const {
+    ClsRef r;
+    if (auto* li = std::get_if<Lident>(&id.v)) {
+      auto c = clss.find(li->name);
+      if (c != clss.end() && !c->second.empty()) r.ce = c->second.back();
+      auto t = cltys.find(li->name);
+      if (t != cltys.end() && !t->second.empty()) r.ct = t->second.back();
+      return r;
+    }
+    auto* dt = std::get_if<Ldot>(&id.v);
+    return dt ? inh_cls(inh_path(*dt->prefix, 0), dt->name, 0) : r;
+  }
+  // The check's meets over a class type: `pub` per node of a public method,
+  // `prv` a private one, `val` a val.
+  // A method declared TWICE -- redeclared by an heir, inherited twice,
+  // overridden -- is one method of the class: the first declaration met
+  // pays the weight, a later one 2 per node for the meet, and an override
+  // that writes no type of its own meets the declaration it overrides
+  // (q22, q27, q30, q31, q11).  The fields are walked in order, an
+  // inherited parent's in place, `seen` carrying the nodes each name has.
+  struct CtW {
+    long long pub, prv, val, inh;
+  };
+  long long cty_pk(const ClassType& ct, long long pub, long long prv,
+                   long long val, int fuel) const {
+    std::map<std::string, long long> seen;
+    return cty_pkw(ct, CtW{pub, prv, val, 0}, fuel, seen);
+  }
+  static long long cseen(std::map<std::string, long long>& seen,
+                         const std::string& nm, long long nodes, long long w,
+                         long long inh) {
+    auto it = seen.find(nm);
+    if (it == seen.end()) {
+      seen[nm] = nodes;
+      return (w + inh) * nodes;
+    }
+    if (!nodes) return 2 * it->second;
+    return (2 + inh) * nodes;
+  }
+  long long cty_pkw(const ClassType& ct, CtW w, int fuel,
+                    std::map<std::string, long long>& seen) const {
+    if (fuel <= 0) return 0;
+    long long k = 0;
+    if (auto* s = std::get_if<Pcty_signature>(&ct.desc)) {
+      for (auto& f : s->cs.fields) {
+        if (auto* m = std::get_if<Pctf_method>(&f.desc))
+          k += cseen(seen, m->name.txt, cnodes(*m->type),
+                     m->priv == PrivateFlag::Private ? w.prv : w.pub, w.inh);
+        else if (auto* v = std::get_if<Pctf_val>(&f.desc))
+          k += cseen(seen, v->name.txt, cnodes(*v->type), w.val, w.inh);
+        else if (auto* i = std::get_if<Pctf_inherit>(&f.desc))
+          k += cty_pkw(*i->ct, w, fuel - 1, seen);
+      }
+    } else if (auto* a = std::get_if<Pcty_arrow>(&ct.desc)) {
+      k = cty_pkw(*a->cod, w, fuel - 1, seen);
+    } else if (auto* o = std::get_if<Pcty_open>(&ct.desc)) {
+      k = cty_pkw(*o->body, w, fuel - 1, seen);
+    } else if (auto* c = std::get_if<Pcty_constr>(&ct.desc)) {
+      ClsRef r = cls_ref(c->id.txt);
+      if (r.ct) k = cty_pkw(*r.ct, w, fuel - 1, seen);
+      else if (r.ce) k = cexp_pkw(*r.ce, w, fuel - 1, seen);
+    }
+    return k;
+  }
+  // The same over a class expression; an inherited parent's nodes weigh 2
+  // more for the meet.
+  long long cexp_pk(const ClassExpr& ce, long long pub, long long prv,
+                    long long val, int fuel) const {
+    std::map<std::string, long long> seen;
+    return cexp_pkw(ce, CtW{pub, prv, val, 0}, fuel, seen);
+  }
+  long long cexp_pkw(const ClassExpr& ce, CtW w, int fuel,
+                     std::map<std::string, long long>& seen) const {
+    if (fuel <= 0) return 0;
+    long long k = 0;
+    if (auto* s = std::get_if<Pcl_structure>(&ce.desc)) {
+      CtW in = w;
+      in.inh += 2;
+      for (auto& f : s->cs.fields) {
+        if (auto* m = std::get_if<Pcf_method>(&f.desc))
+          k += cseen(seen, m->name.txt, cmeth_nodes(m->kind),
+                     m->priv == PrivateFlag::Private ? w.prv : w.pub, w.inh);
+        else if (auto* v = std::get_if<Pcf_val>(&f.desc))  // no object type
+          k += cseen(seen, v->name.txt, cval_nodes(v->kind), w.val, 0);
+        else if (auto* i = std::get_if<Pcf_inherit>(&f.desc))
+          k += cexp_pkw(*i->ce, in, fuel - 1, seen);
+      }
+    } else if (auto* f = std::get_if<Pcl_fun>(&ce.desc)) {
+      k = cexp_pkw(*f->body, w, fuel - 1, seen);
+    } else if (auto* l = std::get_if<Pcl_let>(&ce.desc)) {
+      k = cexp_pkw(*l->body, w, fuel - 1, seen);
+    } else if (auto* a = std::get_if<Pcl_apply>(&ce.desc)) {
+      k = cexp_pkw(*a->ce, w, fuel - 1, seen);
+    } else if (auto* o = std::get_if<Pcl_open>(&ce.desc)) {
+      k = cexp_pkw(*o->body, w, fuel - 1, seen);
+    } else if (auto* c = std::get_if<Pcl_constraint>(&ce.desc)) {
+      std::map<std::string, long long> own;
+      k = cty_pkw(*c->ct, w, fuel - 1, seen) +
+          2 * cexp_pkw(*c->ce, CtW{1, 1, 1, 0}, fuel - 1, own);
+    } else if (auto* c = std::get_if<Pcl_constr>(&ce.desc)) {
+      ClsRef r = cls_ref(c->id.txt);
+      if (r.ce) k = cexp_pkw(*r.ce, w, fuel - 1, seen);
+      else if (r.ct) k = cty_pkw(*r.ct, w, fuel - 1, seen);
+    }
+    return k;
+  }
+  // How many times a signature item is checked where it stands: a module
+  // type declaration's both ways, an ascription's against the module and,
+  // where it is saved, once more against itself; a structure's once where
+  // it is saved, and never inside an expression (s7, s8).
+  long long csig_w() const {
+    if (mtctx_ == MtCtx::Ascr) return saved_ && !inexpr_ ? 2 : 1;
+    if (inexpr_) return 0;
+    if (mtctx_ == MtCtx::Decl) return 2;
+    return saved_ ? 1 : 0;
+  }
+  // An ascription to a NAMED module type checks the module against its
+  // items once (s14: the type declarations' abbreviations, the classes).
+  long long casc_sig(const Signature& sg, int fuel) const {
+    long long k = 0;
+    for (auto& it : sg) {
+      if (auto* t = std::get_if<Psig_type>(&it.desc)) {
+        for (auto& d : t->decls) k += 2 * adecl_nodes(d);
+      } else if (auto* c = std::get_if<Psig_class>(&it.desc)) {
+        for (auto& d : c->decls) k += cty_pk(d.expr, 10, 8, 8, 8);
+      } else if (auto* c = std::get_if<Psig_class_type>(&it.desc)) {
+        for (auto& d : c->decls) k += cty_pk(d.expr, 6, 4, 4, 8);
+      } else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+        if (fuel > 0)
+          if (const Signature* sub = mty_sig(m->md.type.get()))
+            k += casc_sig(*sub, fuel - 1);
+      }
+    }
+    return k;
+  }
   // `bound` says the module was reached through a path: an ascription
   // written at the include itself is walked at the ascription's weight and
   // its `with` pays the copy there.
@@ -24961,6 +25394,40 @@ struct Count {
         tfforce_.insert(lid_full(id)).second)
       k += k;
     return k;
+  }
+  // The first read through a module unpacked at a BARE dotted package type
+  // scrapes the declaration (S530, t9/t10): the pattern left the path alone,
+  // `Env.lookup` of `X.w` forces `N.T` once for the file.
+  long long upk_read(const Longident& id) const {
+    if (pkclass_off()) return 0;
+    const Longident* q = &id;
+    auto* d = std::get_if<Ldot>(&q->v);
+    if (!d) return 0;
+    for (int i = 0; i < 16 && std::holds_alternative<Ldot>(d->prefix->v); ++i)
+      d = std::get_if<Ldot>(&d->prefix->v);
+    auto* l = std::get_if<Lident>(&d->prefix->v);
+    return l ? upk_head(l->name) : 0;
+  }
+  // ..through a `let module Y = X` alias as well (t17; the alias itself
+  // forces nothing, t20).  A later parameter's annotation reads the module
+  // before it is bound (t12): `pkpend_` still holds it.
+  long long upk_head(const std::string& nm, int d = 0) const {
+    const Ptyp_package* pk = nullptr;
+    auto it = pkv_.find(nm);
+    if (it != pkv_.end() && !it->second.empty()) pk = it->second.back().ty;
+    if (!pk)
+      if (auto pp = pkpend_.find(nm); pp != pkpend_.end()) pk = pp->second.ty;
+    if (!pk) {
+      auto m = mods.find(nm);
+      if (d > 8 || m == mods.end() || m->second.empty()) return 0;
+      auto* i = std::get_if<Pmod_ident>(&m->second.back()->desc);
+      std::vector<std::string> c;
+      if (!i || !lid_path(i->id.txt, c) || c.empty()) return 0;
+      return upk_head(c[0], d + 1);
+    }
+    if (!pk->constraints.empty() || !std::holds_alternative<Ldot>(pk->path.txt.v))
+      return 0;
+    return pk_force(pk->path.txt);
   }
   // An application of the name.
   long long tf_app(const Pexp_apply& a) {
@@ -26040,6 +26507,12 @@ struct Count {
         if (auto* u = std::get_if<Ppat_unpack>(&c->p->desc); u && u->name.txt)
           if (const Ptyp_package* pk = pk_of_ty(*c->t))
             pkpend_[*u->name.txt] = Pk{0, pk, {}, {}};
+      // ..and it is the unpack `(module M : E)` is, forced and merged the
+      // same (S530, h1).
+      if (!pkclass_off())
+        if (auto* u = std::get_if<Ppat_unpack>(&c->p->desc); u && !u->pkg)
+          if (const Ptyp_package* pk = pk_of_ty(*c->t))
+            if (!pk->constraints.empty()) n += pk_with(*pk, 1);
       return;
     }
     if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
@@ -26076,7 +26549,9 @@ struct Count {
     }
     if (auto* o = std::get_if<Ppat_open>(&p.desc)) { pat(*o->p, out); return; }
     if (auto* u = std::get_if<Ppat_unpack>(&p.desc)) {
-      if (u->pkg) n += pk_with(*u->pkg, 1);
+      // A bare `(module M : X.S)` leaves the path alone (S530, t2-t4).
+      if (u->pkg && (!pkclass_off() ? !u->pkg->constraints.empty() : true))
+        n += pk_with(*u->pkg, 1);
       if (!pkmeet_off()) {
         // `Merge.merge_package` (typemod.ml:970) renames the type each
         // `with` constraint of the package patches, one ident apiece.
@@ -29791,9 +30266,11 @@ struct Count {
       if (i->as_) n += 3;
     } else if (auto* v = std::get_if<Pcf_val>(&f.desc)) {
       if (vals.insert(v->name.txt).second) { n += 3; bind(v->name.txt); }
+      if (!pkclass_off()) n += cfield_pk(f);
       if (auto* c = std::get_if<Cfk_concrete>(&v->kind)) expr(*c->e);
     } else if (auto* d = std::get_if<Pcf_method>(&f.desc)) {
       meths.insert(d->name.txt);
+      if (!pkclass_off()) n += cfield_pk(f);
       if (auto* c = std::get_if<Cfk_concrete>(&d->kind)) {
         n += 2;
         expr(*c->e);
@@ -29854,7 +30331,7 @@ struct Count {
       expr(*a->fn);
       for (auto& ar : a->args) expr(*ar.second);
     } else if (auto* i = std::get_if<Pexp_ident>(&e.desc)) {
-      n += tf_read(i->id.txt);
+      n += tf_read(i->id.txt) + upk_read(i->id.txt);
     } else if (auto* t = std::get_if<Pexp_tuple>(&e.desc)) {
       for (auto& x : t->elems) expr(*x);
     } else if (auto* l = std::get_if<Pexp_let>(&e.desc)) {
@@ -29871,6 +30348,7 @@ struct Count {
       expr(*i->cond); expr(*i->then_);
       if (i->else_) expr(**i->else_);
     } else if (auto* c = std::get_if<Pexp_construct>(&e.desc)) {
+      n += upk_read(c->id.txt);
       if (!pkmeet_off()) n += pk_ctor(e, *c);
       if (c->arg) expr(**c->arg);
     } else if (auto* m = std::get_if<Pexp_match>(&e.desc)) {
@@ -36299,7 +36777,7 @@ struct Count {
       n += (xonly ? 0 : lapp_path(c->id.txt)) +
            xtapp_charge(c->id.txt, inst != 0 || !c->args.empty()) +
            ltapp_charge(c->id.txt, inst == 2 && d == 0) +
-           read_lid(c->id.txt, false);
+           read_lid(c->id.txt, false) + upk_read(c->id.txt);
       for (auto& a : c->args) ty_app(*a, d + 1, xonly, sub);
     } else if (auto* c = std::get_if<Ptyp_class>(&t.desc)) {
       n += (xonly ? 0 : lapp_path(c->id.txt)) +
@@ -36691,6 +37169,9 @@ struct Count {
       if (!pkmeet_off() && !packty_off() &&
           !std::holds_alternative<Pmty_signature>(c->mt->desc))
         if (const Signature* sg = mty_sig(c->mt.get())) n += pk_sig_cost(*sg);
+      if (!pkclass_off() && !inexpr_ &&
+          !std::holds_alternative<Pmty_signature>(c->mt->desc))
+        if (const Signature* sg = mty_sig(c->mt.get())) n += casc_sig(*sg, 8);
       chk_ = true;
       chk_sig_ = mty_sig(c->mt.get());
       mexpr(*c->me, Lvl{1, 1, 0, true}, false);
@@ -37116,6 +37597,8 @@ struct Count {
         for (auto& d : t->decls) n += pack_decl(d);
       if (!pkmeet_off() && !packty_off() && !pkinfer_off())
         for (auto& d : t->decls) n += pk_mtx() * pack_decl_nodes(d);
+      if (!pkclass_off())
+        for (auto& d : t->decls) n += (2 + 2 * csig_w()) * adecl_nodes(d);
     } else if (auto* t = std::get_if<Psig_typesubst>(&it.desc)) {
       type_decls(t->decls, per);
       if (saved_ && !packty_off())
@@ -37207,10 +37690,14 @@ struct Count {
       if (!cls_off())
         n += (3 + 3 * (per - 1)) * (long long)c->decls.size();
       for (auto& d : c->decls) cty_app(d.expr);
+      if (!pkclass_off())
+        for (auto& d : c->decls) n += csig_w() * cty_pk(d.expr, 10, 8, 8, 8);
     } else if (auto* c = std::get_if<Psig_class_type>(&it.desc)) {
       if (!cls_off())
         n += (3 + 2 * (per - 1)) * (long long)c->decls.size();
       for (auto& d : c->decls) cty_app(d.expr);
+      if (!pkclass_off())
+        for (auto& d : c->decls) n += csig_w() * cty_pk(d.expr, 6, 4, 4, 8);
     } else if (auto* o = std::get_if<Psig_open>(&it.desc)) {
       n += sopen(o->id.txt);
     }
@@ -37234,6 +37721,8 @@ struct Count {
       type_decls(t->decls, 1);
       if (saved_ && !packty_off())
         for (auto& d : t->decls) n += pack_decl(d);
+      if (!pkclass_off())
+        for (auto& d : t->decls) n += (2 + 2 * csig_w()) * adecl_nodes(d);
     } else if (auto* x = std::get_if<Pstr_typext>(&it.desc)) {
       for (auto& c : x->ext.ctors) { reg_ext(c); ext_ctor(c); }
       if (saved_ && !packty_off())
@@ -37373,8 +37862,12 @@ struct Count {
       // `open M` of a path enters no signature and pays neither.
       bool gen =
           !gopen_off() && !std::holds_alternative<Pmod_ident>(o->expr.desc);
-      if (auto* oi = std::get_if<Pmod_ident>(&o->expr.desc))
+      if (auto* oi = std::get_if<Pmod_ident>(&o->expr.desc)) {
         n += read_lid(oi->id.txt, true);
+        std::vector<std::string> c;  // an open of an unpacked module (t21)
+        if (!pkclass_off() && lid_path(oi->id.txt, c) && !c.empty())
+          n += upk_head(c[0]);
+      }
       opn_app_ = gen;
       mexpr(o->expr, gen ? flat() : Lvl{1, 1, 0, true}, false);
       opn_app_ = false;
@@ -37410,6 +37903,8 @@ struct Count {
         cnames.push_back(d.name.txt);
       }
       for (auto& d : c->decls) { n += 3; cexpr(d.expr); }
+      if (!pkclass_off())
+        for (auto& d : c->decls) n += csig_w() * cexp_pk(d.expr, 10, 8, 8, 8);
     } else if (auto* c = std::get_if<Pstr_class_type>(&it.desc)) {
       if (cls_off()) return;
       for (auto& d : c->decls) {
@@ -37418,6 +37913,8 @@ struct Count {
       }
       n += 3 * (long long)c->decls.size();
       for (auto& d : c->decls) cty_app(d.expr);
+      if (!pkclass_off())
+        for (auto& d : c->decls) n += csig_w() * cty_pk(d.expr, 6, 4, 4, 8);
     }
   }
 };
