@@ -20747,6 +20747,13 @@ bool opapp_off() {
   static const bool off = dbg_env("NOOPENAPP") != nullptr;
   return off;
 }
+// S524: an open of a CROSS-UNIT application -- what a read through it
+// builds, the nondep pass it asks for, and the rebuild-free path of a
+// second one.  `NOXOAPP=1` reverts the slice.
+bool xoapp_off() {
+  static const bool off = dbg_env("NOXOAPP") != nullptr;
+  return off;
+}
 
 struct Cites {
   std::set<std::string> units;  // heads that may name a persistent unit
@@ -20791,6 +20798,10 @@ struct Cites {
   bool fmt_ann = false;  // a written `.. format` / format4 / format6
   // The functor PATHS this file applies, as written; resolved in `cost`.
   std::vector<std::pair<std::vector<std::string>, bool>> fapps;
+  // ... and which of them an `open` applies: entered and forgotten, the
+  // file has not BOUND that application (S524).
+  std::vector<bool> fopen;
+  bool inopen_ = false;
   // For each of them, the name of the module an ascription DISCARDS it into
   // and the path from that module down to the binding, read out once the
   // whole file has been walked.
@@ -22897,6 +22908,7 @@ struct Cites {
         std::vector<std::string> c;
         if (lid_comps(fi->id.txt, c) && c.size() >= 2) {
           fapps.emplace_back(c, inexpr_ && pathed);
+          fopen.push_back(inopen_);
           fdisc.emplace_back(discload_off() ? std::string() : cdname_,
                              cdpre_);
         }
@@ -23007,11 +23019,14 @@ struct Cites {
       // the units its result's types name are not loaded for it -- exactly
       // as for a `let open F (X) in ..` (S523).
       bool ie = inexpr_;
+      const bool io = inopen_;
       if (!opapp_off() &&
           std::holds_alternative<Pmod_apply>(o->expr.desc))
         inexpr_ = true;
+      if (!xoapp_off()) inopen_ = true;
       mexp(o->expr);
       inexpr_ = ie;
+      inopen_ = io;
     } else if (auto* c = std::get_if<Pstr_class>(&it.desc)) {
       for (auto& d : c->decls) cdecl(d);
     } else if (auto* c = std::get_if<Pstr_class_type>(&it.desc)) {
@@ -25271,6 +25286,8 @@ struct Count {
   // Inside `let module M = .. in ..`, where the result is bound over the
   // body alone and is never saved.
   bool inexpr_ = false;
+  // Over the module expression of an `open` (S524, `cross_charge`).
+  bool opn_app_ = false;
   // `chk_` is raised over a module expression an INCLUSION CHECK pairs item
   // by item -- ascribed, packed, given to a functor -- and `chkd_` is what
   // the structure being walked took it down as (S518).
@@ -29308,7 +29325,10 @@ struct Count {
 
   // A type declaration's own name is a signature item, so it costs `per`; its
   // constructors and labels are typing-time idents no rename touches.
+  bool tdecl_ = false;  // inside a type declaration's own types (S524)
   void type_decls(const std::vector<TypeDeclaration>& ds, int per) {
+    const bool td = tdecl_;
+    tdecl_ = true;
     for (auto& d : ds) {
       n += per;
       if (fixed_row(d)) n += per;
@@ -29322,6 +29342,7 @@ struct Count {
         for (auto& f : r->fields) ty_app(*f.type, 0, false, 1);
       }
     }
+    tdecl_ = td;
   }
   void ctor_args(const ConstructorArguments& a) {
     if (auto* t = std::get_if<Pcstr_tuple>(&a))
@@ -29887,7 +29908,15 @@ struct Count {
   // What `Subst` renames of a module EXPRESSION's signature.  `ren_mexpr`
   // answers a structure and an ascription; a FUNCTOR renames its parameter's
   // name and both its parameter's and its body's signatures along with it.
-  static long long nd_ren(const ModuleExpr& m) {
+  long long nd_ren(const ModuleExpr& m, int d = 0) const {
+    // A module bound to an APPLICATION has the result's signature, which
+    // the enter of every enclosing level renames along with it (S524: r2
+    // -2, r4 -47 per level).
+    if (!xoapp_off() && d < 8 && std::holds_alternative<Pmod_apply>(m.desc)) {
+      if (const ModuleExpr* r = app_res(&m)) return nd_ren(*r, d + 1);
+      if (const cmi::ModuleType* res = xapp_res(m)) return flat_cmty(res);
+      return 0;
+    }
     if (auto* f = std::get_if<Pmod_functor>(&m.desc)) {
       long long k = nd_ren(*f->body);
       if (auto* nm = std::get_if<Functor_named>(&f->param)) {
@@ -29904,7 +29933,7 @@ struct Count {
     Sibs none;
     return ren_mexpr(m, none);
   }
-  static long long nd_ren_str_item(const StructureItem& it) {
+  long long nd_ren_str_item(const StructureItem& it) const {
     if (auto* m = std::get_if<Pstr_module>(&it.desc))
       return 1 + nd_ren(m->binding.expr);
     if (auto* m = std::get_if<Pstr_recmodule>(&it.desc)) {
@@ -29915,6 +29944,23 @@ struct Count {
     if (auto* i = std::get_if<Pstr_include>(&it.desc)) return nd_ren(i->expr);
     Sibs none;
     return ren_str_item(it, none);
+  }
+  // The result signature of an application of ANOTHER UNIT's functor, where
+  // it is one applied once to a path (S524); null otherwise.
+  const cmi::ModuleType* xapp_res(const ModuleExpr& m) const {
+    if (xoapp_off()) return nullptr;
+    auto* a = std::get_if<Pmod_apply>(&m.desc);
+    if (!a || !std::holds_alternative<Pmod_ident>(a->f->desc) ||
+        !std::holds_alternative<Pmod_ident>(a->arg->desc))
+      return nullptr;
+    const Longident* id = mpath(a->f.get());
+    if (!id || mderef(a->f.get())) return nullptr;
+    const cmi::Signature* root = nullptr;
+    const cmi::ModuleType* mt = scrape_cmty(cmi_module(*id, &root), root);
+    if (!mt || mt->kind != cmi::ModuleType::Functor) return nullptr;
+    const cmi::ModuleType* res = scrape_cmty(mt->functor_body.get(), root);
+    if (!res || res->kind != cmi::ModuleType::Sig || !res->sig) return nullptr;
+    return res;
   }
   long long nd_mexpr(const ModuleExpr& m, int d = 0) const {
     if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
@@ -29931,8 +29977,11 @@ struct Count {
       return k;
     }
     // An application's type is the signature its functor's body leaves.
-    if (!opapp_off() && d < 8 && std::holds_alternative<Pmod_apply>(m.desc))
+    if (!opapp_off() && d < 8 && std::holds_alternative<Pmod_apply>(m.desc)) {
       if (const ModuleExpr* r = app_res(&m)) return nd_mexpr(*r, d + 1);
+      // ... and another unit's functor leaves its result, flat.
+      if (const cmi::ModuleType* res = xapp_res(m)) return flat_cmty(res);
+    }
     return 0;  // an ALIAS is not a signature of its own
   }
   long long nd_str_item(const StructureItem& it, int d = 0) const {
@@ -29978,6 +30027,10 @@ struct Count {
       return nd_hides_mty(*c->mt, fuel);
     if (!opapp_off() && std::holds_alternative<Pmod_apply>(m.desc)) {
       const ModuleExpr* r = app_res(&m);
+      if (!r)
+        if (const cmi::ModuleType* res = xapp_res(m))
+          return !res->sig->types.empty() || !res->sig->modules.empty() ||
+                 !res->sig->modtypes.empty();
       return r && fuel > 0 && nd_hides(*r, fuel - 1);
     }
     auto* st = std::get_if<Pmod_structure>(&m.desc);
@@ -30041,7 +30094,32 @@ struct Count {
     std::set<std::string> vals;    // every value
     long long p = 0, r = 0;
     bool vd = false;
+    // Another unit's functor, read off its .cmi (S524, `xoapp_of`): the
+    // functor's and the application's keys, whether the argument is an
+    // alias, and for each value which of its parameters are of `types`.
+    bool x = false;
+    int xal = 0;
+    std::string fk, ak;
+    std::map<std::string, std::vector<char>> pars;
+    std::string head;  // the functor's written path, for shadowing
   };
+  // The functor path an application is written at.
+  static std::string app_head(const ModuleExpr& m) {
+    const ModuleExpr* h = &m;
+    while (auto* a = std::get_if<Pmod_apply>(&h->desc)) h = a->f.get();
+    if (auto* i = std::get_if<Pmod_ident>(&h->desc)) return lid_full(i->id.txt);
+    return {};
+  }
+  // An inner `let open F (Q) in ..` of the SAME functor shadows what the
+  // outer open brought in: nothing under it is a read of the outer's.
+  static bool xo_shadow(const StructureItem& it, const Oapp& o) {
+    auto* op = std::get_if<Pstr_open>(&it.desc);
+    return op && std::holds_alternative<Pmod_apply>(op->expr.desc) &&
+           !o.head.empty() && app_head(op->expr) == o.head;
+  }
+  // The functors and the applications a read through such an open has had
+  // built, once each for the file.
+  mutable std::set<std::string> xomk_, xoap_;
   static const std::string* tyhead(const CoreType& t) {
     if (auto* c = std::get_if<Ptyp_constr>(&t.desc))
       if (auto* l = std::get_if<Lident>(&c->id.txt.v)) return &l->name;
@@ -30098,7 +30176,8 @@ struct Count {
     if (auto* l = std::get_if<Pexp_let>(&e.desc)) return tail_of(*l->body, o, rparams, d + 1);
     if (auto* q = std::get_if<Pexp_sequence>(&e.desc)) return tail_of(*q->e2, o, rparams, d + 1);
     if (auto* n = std::get_if<Pexp_newtype>(&e.desc)) return tail_of(*n->body, o, rparams, d + 1);
-    if (auto* si = std::get_if<Pexp_struct_item>(&e.desc)) return tail_of(*si->body, o, rparams, d + 1);
+    if (auto* si = std::get_if<Pexp_struct_item>(&e.desc))
+      return !xo_shadow(*si->item, o) && tail_of(*si->body, o, rparams, d + 1);
     if (auto* m = std::get_if<Pexp_match>(&e.desc)) {
       for (auto& c : m->cases) if (tail_of(*c.rhs, o, rparams, d + 1)) return true;
       return false;
@@ -30110,20 +30189,41 @@ struct Count {
       if (const std::string* h = tyhead(*c->t)) return o.types.count(*h);
       return tail_of(*c->e, o, rparams, d + 1);
     }
-    if (auto* c = std::get_if<Pexp_construct>(&e.desc))
-      if (auto* l = std::get_if<Lident>(&c->id.txt.v)) return o.ctors.count(l->name);
+    if (auto* c = std::get_if<Pexp_construct>(&e.desc)) {
+      if (auto* l = std::get_if<Lident>(&c->id.txt.v))
+        if (o.ctors.count(l->name)) return true;
+      // `Some x`: the type names what the argument's does.
+      return !xoapp_off() && c->arg && tail_of(**c->arg, o, rparams, d + 1);
+    }
+    if (auto* t = std::get_if<Pexp_tuple>(&e.desc)) {
+      if (xoapp_off()) return false;
+      for (auto& x : t->elems) if (tail_of(*x, o, rparams, d + 1)) return true;
+      return false;
+    }
     if (auto* i = std::get_if<Pexp_ident>(&e.desc))
       if (auto* l = std::get_if<Lident>(&i->id.txt.v))
         return o.vals.count(l->name) || rparams.count(l->name);
     if (auto* a = std::get_if<Pexp_apply>(&e.desc))
       if (auto* i = std::get_if<Pexp_ident>(&a->fn->desc))
-        if (auto* l = std::get_if<Lident>(&i->id.txt.v)) return o.rets.count(l->name);
+        if (auto* l = std::get_if<Lident>(&i->id.txt.v)) {
+          if (o.rets.count(l->name)) return true;
+          // A PARTIAL application whose remaining parameters name one.
+          auto p = o.pars.find(l->name);
+          if (p == o.pars.end()) return false;
+          std::size_t k = 0;
+          for (auto& [lab, _] : a->args)
+            if (std::holds_alternative<Nolabel>(lab)) ++k;
+          for (std::size_t j = k; j < p->second.size(); ++j)
+            if (p->second[j]) return true;
+          return false;
+        }
     return false;
   }
   // What the functor's body declares, read off the structure or the literal
   // signature the application evaluates to.
   bool oapp_of(const ModuleExpr& app, Oapp& o) const {
     int n = 0;
+    o.head = app_head(app);
     const ModuleExpr* h = &app;
     while (auto* a = std::get_if<Pmod_apply>(&h->desc)) { ++n; h = a->f.get(); }
     const ModuleExpr* me = mderef(h);
@@ -30202,6 +30302,129 @@ struct Count {
       return true;
     }
     return false;
+  }
+  // ---- THE SAME OFF ANOTHER UNIT'S FUNCTOR (S524) --------------------------
+  // `open Set.Make (Int)`: the components are the PERSISTENT unit's, made
+  // once for the file whoever asks first -- the typing-time expansion, a
+  // type declaration's reachability check (`Typedecl.reachable`), the
+  // check's `moregen` -- and shared by every environment, so T and C are
+  // one charge here.  The functor's own components cost its result once
+  // (its parameter is a named module type, nothing to rename), the
+  // application's cost it once, and once more where the argument is an
+  // ALIAS (`Int` for `Stdlib__Int`, S487's second spelling): r + 2r for
+  // `Set.Make (Int)`, r + r for a local structure.  A second open of the
+  // same functor at another argument pays the application's share alone.
+  // A curried application and a functor of a SUBMODULE (`MoreLabels.Set`,
+  // whose result expands through `Set`'s own) build by other laws.
+  static bool xabs(const cmi::TypeExpr* t, const Oapp& o) {
+    t = tskip(t);
+    return t && t->kind == cmi::TypeExpr::Tconstr && t->path &&
+           t->path->kind == cmi::Path::Pident && o.types.count(t->path->id.name);
+  }
+  static bool xnames(const cmi::TypeExpr* t, const Oapp& o, int d) {
+    if (!t || d > 24) return false;
+    if (xabs(t, o)) return true;
+    if (xnames(t->dom.get(), o, d + 1) || xnames(t->cod.get(), o, d + 1) ||
+        xnames(t->link.get(), o, d + 1))
+      return true;
+    for (auto& a : t->args) if (xnames(a.get(), o, d + 1)) return true;
+    for (auto& e : t->elems) if (xnames(e.second.get(), o, d + 1)) return true;
+    return false;
+  }
+  // The keys of such an application and its result, where it is one.
+  const cmi::ModuleType* xoapp_keys(const ModuleExpr& app, std::string& fk,
+                                    std::string& ak, int& xal) const {
+    if (xoapp_off()) return nullptr;
+    auto* a = std::get_if<Pmod_apply>(&app.desc);
+    if (!a || std::holds_alternative<Pmod_apply>(a->f->desc) ||
+        std::holds_alternative<Pmod_apply_unit>(a->f->desc))
+      return nullptr;
+    const Longident* id = mpath(a->f.get());
+    if (!id || mderef(a->f.get())) return nullptr;
+    fk = xtapp_key(*id);
+    if (std::count(fk.begin(), fk.end(), '.') != 2) return nullptr;
+    auto* pi = std::get_if<Pmod_ident>(&a->arg->desc);
+    if (!pi) return nullptr;
+    std::vector<std::string> ac;
+    if (!lid_comps(pi->id.txt, ac) || ac.empty()) return nullptr;
+    const cmi::Signature* root = nullptr;
+    const cmi::ModuleType* mt = scrape_cmty(cmi_module(*id, &root), root);
+    if (!mt || mt->kind != cmi::ModuleType::Functor) return nullptr;
+    const cmi::ModuleType* res = scrape_cmty(mt->functor_body.get(), root);
+    if (!res || res->kind != cmi::ModuleType::Sig || !res->sig) return nullptr;
+    xal = arg_alias(ac) ? 1 : 0;
+    ak = fk + "(";
+    for (auto& s : ac) ak += s + ".";
+    ak += ")";
+    return res;
+  }
+  bool xoapp_of(const ModuleExpr& app, Oapp& o) const {
+    const cmi::ModuleType* res = xoapp_keys(app, o.fk, o.ak, o.xal);
+    if (!res) return false;
+    const cmi::Signature& sg = *res->sig;
+    o.x = true;
+    o.head = app_head(app);
+    o.r = flat_cmty(res);
+    for (auto& td : sg.types) {
+      if (td.manifest) continue;
+      o.types.insert(td.name);
+      const bool par = td.arity > 0;
+      if (par) o.ptypes.insert(td.name);
+      if (td.kind == cmi::TypeDecl::Variant)
+        for (auto& c : td.ctors) {
+          o.ctors.insert(c.name);
+          if (par) o.pctors.insert(c.name);
+          if (par && c.res) o.vd = true;
+        }
+    }
+    for (auto& sv : sg.values) {
+      const cmi::TypeExpr* t = tskip(sv.type.get());
+      if (!t) continue;
+      if (xnames(t, o, 0)) o.vals.insert(sv.name);
+      std::vector<char> ps;
+      const cmi::TypeExpr* c = t;
+      for (int i = 0; i < 64 && c && c->kind == cmi::TypeExpr::Tarrow; ++i) {
+        ps.push_back(xabs(c->dom.get(), o));
+        c = tskip(c->cod.get());
+      }
+      if (!ps.empty()) o.pars[sv.name] = ps;
+      if (xabs(c, o)) {
+        if (ps.empty()) o.bares.insert(sv.name);
+        else o.rets.insert(sv.name);
+      }
+    }
+    return !o.types.empty();
+  }
+  // A pattern that binds nothing: what `let _ = e` saves is nothing, and
+  // only the statement check's expansion of e's OWN type can build.
+  static bool pat_anon(const Pattern& p) {
+    if (std::holds_alternative<Ppat_any>(p.desc)) return true;
+    if (auto* c = std::get_if<Ppat_construct>(&p.desc)) return !c->arg;
+    if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) return pat_anon(*c->p);
+    return false;
+  }
+  // A type declaration whose definition names one of the result's types:
+  // `Typedecl.reachable` expands it.
+  static bool xty_decl(const TypeDeclaration& d, const Oapp& o) {
+    if (d.manifest && ty_names(**d.manifest, o.types)) return true;
+    if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
+      for (auto& c : v->ctors) if (xty_ctor(c.args, o)) return true;
+    } else if (auto* r = std::get_if<Ptype_record>(&d.kind)) {
+      for (auto& f : r->fields) if (ty_names(*f.type, o.types)) return true;
+    }
+    return false;
+  }
+  static bool xty_ctor(const ConstructorArguments& args, const Oapp& o) {
+    if (auto* t = std::get_if<Pcstr_tuple>(&args)) {
+      for (auto& e : t->elems) if (ty_names(*e, o.types)) return true;
+    } else if (auto* r = std::get_if<Pcstr_record>(&args)) {
+      for (auto& f : r->fields) if (ty_names(*f.type, o.types)) return true;
+    }
+    return false;
+  }
+  static bool xty_ext(const ExtensionConstructor& c, const Oapp& o) {
+    auto* d = std::get_if<Pext_decl>(&c.kind);
+    return d && xty_ctor(d->args, o);
   }
   // The typing-time trigger, over one expression.
   static bool oapp_typ_ex(const Expression& e, const Oapp& o, int d = 0);
@@ -30311,7 +30534,8 @@ struct Count {
     if (auto* l = std::get_if<Pexp_let>(&e.desc)) return oapp_chk_ex(*l->body, o, d + 1);
     if (auto* q = std::get_if<Pexp_sequence>(&e.desc)) return oapp_chk_ex(*q->e2, o, d + 1);
     if (auto* n = std::get_if<Pexp_newtype>(&e.desc)) return oapp_chk_ex(*n->body, o, d + 1);
-    if (auto* si = std::get_if<Pexp_struct_item>(&e.desc)) return oapp_chk_ex(*si->body, o, d + 1);
+    if (auto* si = std::get_if<Pexp_struct_item>(&e.desc))
+      return !xo_shadow(*si->item, o) && oapp_chk_ex(*si->body, o, d + 1);
     if (auto* m = std::get_if<Pexp_match>(&e.desc)) {
       // A match on a NAME is a match on a parameter, whose type the
       // patterns fix; one on any other expression fixes nothing saved.
@@ -30348,7 +30572,8 @@ struct Count {
   struct OappHit { bool typ = false, chk = false; };
   static void oapp_scan_ex(const Expression& e, const Oapp& o, OappHit& h, int d = 0);
   static void oapp_scan_items(const std::vector<StructureItem>& items, size_t from,
-                              const Oapp& o, OappHit& h, int d);
+                              const Oapp& o, OappHit& h, int d,
+                              size_t end = std::string::npos);
   static void oapp_scan_mexpr(const ModuleExpr& m, const Oapp& o, OappHit& h, int d) {
     if (d > 64) return;
     if (auto* st = std::get_if<Pmod_structure>(&m.desc))
@@ -30361,6 +30586,11 @@ struct Count {
   static void oapp_scan_item(const StructureItem& it, const Oapp& o, OappHit& h, int d) {
     if (auto* v = std::get_if<Pstr_value>(&it.desc)) {
       for (auto& b : v->bindings) {
+        if (!xoapp_off() && pat_anon(b.pat)) {
+          if (!h.typ && oapp_arg_of(*b.expr, o)) h.typ = true;
+          if (!h.typ) oapp_scan_ex(*b.expr, o, h, d + 1);
+          continue;
+        }
         if (!h.chk && oapp_chk_binding(b, o)) h.chk = true;
         if (!h.typ && b.constraint_)
           if (auto* c = std::get_if<Pvc_constraint>(&*b.constraint_))
@@ -30369,6 +30599,14 @@ struct Count {
       }
     } else if (auto* e = std::get_if<Pstr_eval>(&it.desc)) {
       if (!h.typ) oapp_scan_ex(*e->e, o, h, d + 1);
+    } else if (auto* t = std::get_if<Pstr_type>(&it.desc)) {
+      if (!xoapp_off() && !h.chk)
+        for (auto& dcl : t->decls) if (xty_decl(dcl, o)) h.chk = true;
+    } else if (auto* x = std::get_if<Pstr_exception>(&it.desc)) {
+      if (!xoapp_off() && !h.chk && xty_ext(x->exn.ctor, o)) h.chk = true;
+    } else if (auto* x = std::get_if<Pstr_typext>(&it.desc)) {
+      if (!xoapp_off() && !h.chk)
+        for (auto& c : x->ext.ctors) if (xty_ext(c, o)) h.chk = true;
     } else if (auto* m = std::get_if<Pstr_module>(&it.desc)) {
       oapp_scan_mexpr(m->binding.expr, o, h, d + 1);
     } else if (auto* m = std::get_if<Pstr_recmodule>(&it.desc)) {
@@ -30378,16 +30616,115 @@ struct Count {
     }
   }
   // The whole charge for one structure's opens of applications.
+  // A module the file BINDS to such an application has the check of the
+  // binding build both (`Includecore.type_manifest`), wherever it stands:
+  // a read then finds them made.
+  void xoapp_seed(const std::vector<StructureItem>& items, int d) const {
+    if (d > 32) return;
+    for (auto& it : items) {
+      const ModuleExpr* m = nullptr;
+      if (auto* b = std::get_if<Pstr_module>(&it.desc)) m = &b->binding.expr;
+      else if (auto* inc = std::get_if<Pstr_include>(&it.desc)) m = &inc->expr;
+      if (!m) continue;
+      if (auto* st = std::get_if<Pmod_structure>(&m->desc)) {
+        xoapp_seed(st->items, d + 1);
+        continue;
+      }
+      std::string fk, ak;
+      int xal = 0;
+      if (xoapp_keys(*m, fk, ak, xal)) {
+        xomk_.insert(fk);
+        xoap_.insert(ak);
+      }
+    }
+  }
+  // The `let open F (A) in ..` of an expression: a typing-time trigger under
+  // it builds, the check never does (its type has left the open's scope and
+  // reads the same on both sides).
+  static void xo_inner(const Expression& e, std::vector<const Pexp_struct_item*>& out, int d) {
+    if (d > 64) return;
+    auto go = [&](const Expression& x) { xo_inner(x, out, d + 1); };
+    if (auto* si = std::get_if<Pexp_struct_item>(&e.desc)) {
+      if (auto* op = std::get_if<Pstr_open>(&si->item->desc))
+        if (std::holds_alternative<Pmod_apply>(op->expr.desc)) out.push_back(si);
+      go(*si->body);
+    } else if (auto* l = std::get_if<Pexp_let>(&e.desc)) {
+      for (auto& b : l->bindings) go(*b.expr);
+      go(*l->body);
+    } else if (auto* f = std::get_if<Pexp_function>(&e.desc)) {
+      if (auto* fb = std::get_if<Pfunction_body>(&f->body->v)) go(*fb->e);
+      else for (auto& c : std::get<Pfunction_cases>(f->body->v).cases) go(*c.rhs);
+    } else if (auto* a = std::get_if<Pexp_apply>(&e.desc)) {
+      go(*a->fn);
+      for (auto& [_, x] : a->args) go(*x);
+    } else if (auto* q = std::get_if<Pexp_sequence>(&e.desc)) {
+      go(*q->e1); go(*q->e2);
+    } else if (auto* m = std::get_if<Pexp_match>(&e.desc)) {
+      go(*m->e);
+      for (auto& c : m->cases) go(*c.rhs);
+    } else if (auto* t = std::get_if<Pexp_try>(&e.desc)) {
+      go(*t->e);
+      for (auto& c : t->cases) go(*c.rhs);
+    } else if (auto* i = std::get_if<Pexp_ifthenelse>(&e.desc)) {
+      go(*i->cond); go(*i->then_);
+      if (i->else_) go(**i->else_);
+    } else if (auto* t = std::get_if<Pexp_tuple>(&e.desc)) {
+      for (auto& x : t->elems) go(*x);
+    } else if (auto* c = std::get_if<Pexp_construct>(&e.desc)) {
+      if (c->arg) go(**c->arg);
+    } else if (auto* c = std::get_if<Pexp_constraint>(&e.desc)) {
+      go(*c->e);
+    } else if (auto* n = std::get_if<Pexp_newtype>(&e.desc)) {
+      go(*n->body);
+    } else if (auto* lo = std::get_if<Pexp_letop>(&e.desc)) {
+      go(*lo->let_.exp);
+      for (auto& a : lo->ands) go(*a.exp);
+      go(*lo->body);
+    }
+  }
+  long long xo_inner_item(const StructureItem& it) const {
+    std::vector<const Pexp_struct_item*> ins;
+    if (auto* v = std::get_if<Pstr_value>(&it.desc)) {
+      for (auto& b : v->bindings) xo_inner(*b.expr, ins, 0);
+    } else if (auto* e = std::get_if<Pstr_eval>(&it.desc)) {
+      xo_inner(*e->e, ins, 0);
+    }
+    long long k = 0;
+    for (const Pexp_struct_item* si : ins) {
+      auto* op = std::get_if<Pstr_open>(&si->item->desc);
+      Oapp a;
+      if (!xoapp_of(op->expr, a) || a.types.empty()) continue;
+      OappHit h;
+      oapp_scan_ex(*si->body, a, h, 0);
+      if (!h.typ) continue;
+      if (xomk_.insert(a.fk).second) k += a.r;
+      if (xoap_.insert(a.ak).second) k += (1 + a.xal) * a.r;
+    }
+    return k;
+  }
   long long oapp_open(const std::vector<StructureItem>& items, int d = 0) const {
     if (opapp_off() || d > 32) return 0;
     long long k = 0;
+    if (d == 0) xoapp_seed(items, 0);
     for (size_t i = 0; i < items.size(); ++i) {
+      if (!xoapp_off()) k += xo_inner_item(items[i]);
       if (auto* o = std::get_if<Pstr_open>(&items[i].desc)) {
         if (!std::holds_alternative<Pmod_apply>(o->expr.desc)) continue;
         Oapp a;
-        if (!oapp_of(o->expr, a) || a.types.empty()) continue;
+        if (!oapp_of(o->expr, a) && !xoapp_of(o->expr, a)) continue;
+        if (a.types.empty()) continue;
         OappHit h;
-        oapp_scan_items(items, i + 1, a, h, 0);
+        size_t end = items.size();
+        for (size_t j = i + 1; j < end; ++j)
+          if (xo_shadow(items[j], a)) { end = j; break; }
+        oapp_scan_items(items, i + 1, a, h, 0, end);
+        if (a.x) {
+          if (h.typ || h.chk) {
+            if (xomk_.insert(a.fk).second) k += a.r;
+            if (xoap_.insert(a.ak).second) k += (1 + a.xal) * a.r;
+          }
+          continue;
+        }
         if (h.typ) k += a.p + 2 * a.r;
         if (h.chk) k += a.vd ? a.r : a.p + 2 * a.r;
       } else if (auto* m = std::get_if<Pstr_module>(&items[i].desc)) {
@@ -34403,8 +34740,12 @@ struct Count {
     bool firstapp = fseen.insert(key).second;
     std::set<std::string>& ps = fargp[key];
     std::size_t had = ps.size();
-    bool newpath = !xpathless && ps.insert(ak).second;
-    bool newarg = farg.insert(ak).second;
+    // An OPEN's application is entered and forgotten (S524): a second open
+    // at another path builds nothing, and a binding after it still reads a
+    // unit argument out for itself and is at the functor's first path.
+    const bool opn = !xoapp_off() && opn_app_;
+    bool newpath = !xpathless && !opn && ps.insert(ak).second;
+    bool newarg = !opn && farg.insert(ak).second;
     long long nf = (firstapp || (newpath && had >= 1)) ? 1 : 0;
     if (unit_arg && newarg) ++nf;
     const bool discarded = !ascrapp_off() && mdiscard_ && !inexpr_;
@@ -34969,6 +35310,18 @@ struct Count {
     const long long r = flat_cmty(res);
     const std::string key = lid_full(id);
     const std::string fk = xtapp_key(*a->f);
+    // A type DECLARATION written through the application has
+    // `Typedecl.reachable` build the unit's components: a read through an
+    // open of it finds them made (S524, `xoapp_seed`).
+    if (tdecl_ && !xoapp_off() && !fk.empty()) {
+      std::vector<std::string> ac;
+      if (lid_comps(*a->x, ac)) {
+        std::string ak = fk + "(";
+        for (auto& s : ac) ak += s + ".";
+        xomk_.insert(fk);
+        xoap_.insert(ak + ")");
+      }
+    }
     // A file that BINDS an application of the functor as a module has had
     // `Env` do this work already, and what a type path of it then costs is
     // S486's flat 2R whatever the spelling (`module S = Set.Make (X)` beside
@@ -36084,7 +36437,9 @@ struct Count {
           !gopen_off() && !std::holds_alternative<Pmod_ident>(o->expr.desc);
       if (auto* oi = std::get_if<Pmod_ident>(&o->expr.desc))
         n += read_lid(oi->id.txt, true);
+      opn_app_ = gen;
       mexpr(o->expr, gen ? flat() : Lvl{1, 1, 0, true}, false);
+      opn_app_ = false;
       reg_open(o->expr);
       popen_reg(o->expr);
       if (!lal_off())
@@ -36097,7 +36452,15 @@ struct Count {
       n += gen ? ren_mexpr(o->expr, Sibs{}) : exports(o->expr);
       // `ren_mexpr` cannot read an application; the open re-binds its
       // result exactly as an include does.
+      opn_app_ = gen;
       if (gen && !opapp_off()) n += app_charge(o->expr, flat(), false, true);
+      opn_app_ = false;
+      // The unit's components are made for the open: a type path written
+      // through the functor afterwards pays S486's law less that (S524).
+      if (gen && !xoapp_off())
+        if (auto* a = std::get_if<Pmod_apply>(&o->expr.desc))
+          if (auto* fi = std::get_if<Pmod_ident>(&a->f->desc))
+            if (!mderef(a->f.get())) xtfct_.insert(lid_full(fi->id.txt));
     // A class costs three idents before anything of it is read:
     // `type_classes` (typeclass.ml:1897) creates the class, its class type
     // and its object type in one go, for a declaration and a description
@@ -36277,8 +36640,20 @@ bool Count::oapp_typ_ex(const Expression& e, const Oapp& o, int d) {
   auto go = [&](const Expression& x) { return oapp_typ_ex(x, o, d + 1); };
   if (auto* a = std::get_if<Pexp_apply>(&e.desc)) {
     if (auto* i = std::get_if<Pexp_ident>(&a->fn->desc))
-      if (auto* l = std::get_if<Lident>(&i->id.txt.v))
+      if (auto* l = std::get_if<Lident>(&i->id.txt.v)) {
         if (o.rets.count(l->name)) return true;
+        // `type_argument` expands the EXPECTED type of an inferred
+        // argument: `cardinal x` builds whatever `x` is.
+        auto p = o.x ? o.pars.find(l->name) : o.pars.end();
+        if (p != o.pars.end()) {
+          std::size_t k = 0;
+          for (auto& [lab, x] : a->args) {
+            if (!std::holds_alternative<Nolabel>(lab)) continue;
+            if (k < p->second.size() && p->second[k] && Cites::is_inferred(*x)) return true;
+            ++k;
+          }
+        }
+      }
     for (auto& [_, x] : a->args) if (oapp_arg_of(*x, o)) return true;
     if (go(*a->fn)) return true;
     for (auto& [_, x] : a->args) if (go(*x)) return true;
@@ -36335,6 +36710,7 @@ bool Count::oapp_typ_ex(const Expression& e, const Oapp& o, int d) {
   if (auto* v = std::get_if<Pexp_variant>(&e.desc)) return v->arg && go(**v->arg);
   if (auto* n = std::get_if<Pexp_newtype>(&e.desc)) return go(*n->body);
   if (auto* si = std::get_if<Pexp_struct_item>(&e.desc)) {
+    if (xo_shadow(*si->item, o)) return false;
     OappHit h;
     oapp_scan_item(*si->item, o, h, d + 1);
     return h.typ || go(*si->body);
@@ -36358,9 +36734,10 @@ void Count::oapp_scan_ex(const Expression& e, const Oapp& o, OappHit& h, int d) 
   if (!h.typ && oapp_typ_ex(e, o, d)) h.typ = true;
 }
 void Count::oapp_scan_items(const std::vector<StructureItem>& items, size_t from,
-                            const Oapp& o, OappHit& h, int d) {
+                            const Oapp& o, OappHit& h, int d, size_t end) {
   if (d > 64) return;
-  for (size_t i = from; i < items.size(); ++i) oapp_scan_item(items[i], o, h, d);
+  if (end > items.size()) end = items.size();
+  for (size_t i = from; i < end; ++i) oapp_scan_item(items[i], o, h, d);
 }
 
 }  // namespace stampcount
@@ -36567,7 +36944,9 @@ int typing_ident_count(const ast::Structure& s, std::size_t eta_sites,
   // of its `open`s provides is that unit's submodule and names a DIFFERENT
   // functor (S438), so `Map.Make` under `open MoreLabels` is not Stdlib's.
   std::set<std::string> xkeys;
-  for (auto& fa : u.fapps) {
+  for (std::size_t fi = 0; fi < u.fapps.size(); ++fi) {
+    const auto& fa = u.fapps[fi];
+    if (fi < u.fopen.size() && u.fopen[fi]) continue;
     std::vector<std::string> c0 = fa.first;
     if (c0.size() < 2) continue;
     bool shadowed = false;
