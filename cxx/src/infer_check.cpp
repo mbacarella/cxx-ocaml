@@ -25798,6 +25798,43 @@ struct Count {
   // A path's nested items are those of the module's COMPONENTS, built once
   // per file (`pkw_once_`): packing the path again renames its top items.
   std::set<const ModuleExpr*> pkw_once_;
+  // ---- A PACK OF A UNIT PATH RENAMES THE UNIT'S TOP ITEMS (S531) ---------
+  // `(module Int : E)` types the path first (typemod.ml:2485: the unit's
+  // signature is strengthened, which is the load `Cites` charges) and then
+  // substitutes the strengthened type whole: one ident per TOP item of the
+  // unit, or of the submodule a dotted path names -- `Int` 41, `Set` 3,
+  // `Ephemeron.K1` 6.  Nothing below the top is renamed, since strengthening
+  // an aliasable path made every submodule an alias and every module type a
+  // path (`Mtype.strengthen_lazy_sig`, mtype.ml:118), and a second pack of
+  // the same path pays the same again: the substitution never memoizes.  A
+  // name the file binds itself is the local module's (above), never the
+  // unit's.  `NOPKUNIT=1` reverts.
+  static bool pkunit_off() {
+    static const bool off = dbg_env("NOPKUNIT") != nullptr;
+    return off;
+  }
+  long long pk_unit(const ModuleExpr& m) {
+    if (pkunit_off()) return 0;
+    // A bare head an `open` of a unit provides is that unit's submodule,
+    // nearest open first (`opened_units_`).
+    std::vector<std::string> c;
+    if (auto* i = std::get_if<Pmod_ident>(&m.desc);
+        i && lid_comps(i->id.txt, c) && !c.empty() && !mods.count(c[0]))
+      for (auto u = opened_units_.rbegin(); u != opened_units_.rend(); ++u) {
+        std::vector<std::string> p{*u};
+        p.insert(p.end(), c.begin(), c.end());
+        const cmi::Signature* r = nullptr;
+        const cmi::ModuleType* t = cmi_module_c(p, &r);
+        if (t && t->kind == cmi::ModuleType::Sig && t->sig)
+          return (long long)t->sig->order.size();
+      }
+    std::vector<std::string>* keep = inm_;
+    inm_ = nullptr;
+    bool dt = false;
+    long long k = inc_top(m, dt);
+    inm_ = keep;
+    return k;
+  }
   long long pk_wrap(const ModuleExpr& m, int fuel = 8) {
     if (fuel <= 0 || pkwrap_off()) return 0;
     if (auto* c = std::get_if<Pmod_constraint>(&m.desc))
@@ -25806,7 +25843,8 @@ struct Count {
       auto* l = std::get_if<Lident>(&i->id.txt.v);
       bool sub = false;
       const ModuleExpr* t = l ? nullptr : lal_res(i->id.txt, sub);
-      if (!l && (!t || chkarrow_off())) return 0;
+      if (!l && !t) return pk_unit(m);
+      if (!l && chkarrow_off()) return 0;
       auto it = l ? mods.find(l->name) : mods.end();
       if (it != mods.end() && !it->second.empty()) t = it->second.back();
       if (t) {
@@ -25825,7 +25863,7 @@ struct Count {
           if (const ModuleType* d =
                   named_mty(pv->second.back().ty->path.txt, 8))
             return pk_wmty(*d, fuel - 1);
-      return 0;
+      return pk_unit(m);
     }
     // A local functor application's strengthened type is its result's top
     // items (S527, e3).
