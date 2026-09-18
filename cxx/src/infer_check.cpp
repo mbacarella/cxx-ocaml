@@ -20267,6 +20267,8 @@ struct Applied {
   bool self = false;                // this signature is forced a second time
   // unit -> 1 load (a manifest names it) or 2 (an applied type does)
   std::map<std::string, int> units;
+  // a SUBMODULE of this signature a type was found in (S528)
+  std::set<std::string> subs;
 };
 void applied_walk(const cmi::TypePtr& t, const cmi::Signature& sg,
                   std::set<const cmi::TypeExpr*>& seen, Applied& out);
@@ -20288,6 +20290,27 @@ bool unif_off() {
 }
 bool unidom_off() {
   static const bool off = dbg_env("NOUNIDOM") != nullptr;
+  return off;
+}
+// ---- A SUBMODULE'S TYPE IS FOUND THROUGH THE UNIT (S528) -----------------
+// A member of the UNIT whose type names a type of one of its SUBMODULES --
+// `Scanf.bscanf : Scanning.in_channel -> ..`, `Random.set_state : State.t ->
+// unit`, `Bigarray.reshape : (..) Genarray.t -> ..` -- is FOUND there
+// wherever the find side meets that path: an INFERRED argument at the
+// domain (`type_argument_`'s `expand_head`, typecore.ml:6624), an
+// application's result, an applied constructor of a read type.
+// `Env.find_type` on `Stdlib__Scanf.Scanning.in_channel` builds the unit's
+// own components (16, once per file: what naming `Scanf.Scanning.x` builds
+// too), strengthens the submodule (15, once, shared with a read of it) and
+// builds the submodule's components (15, once per file: the ones a domain
+// of the submodule's own members forces) -- `Scanf.bscanf x` is 16 + 46
+// where `Scanf.bscanf` alone is 16, and `Scanf.Scanning.close_in x` before
+// it leaves nothing of the 46 to pay.  An argument that is NOT inferred
+// (`assert false`, an `if`, a `let`) is not expanded against its domain at
+// all, at either level: `Buffer.length (assert false)` is 41, not 41 + 41.
+// `NOSUBDOM=1` reverts.
+bool subdom_off() {
+  static const bool off = dbg_env("NOSUBDOM") != nullptr;
   return off;
 }
 // Does unit `u` declare `n` as an ABBREVIATION?  Unknown is taken as one,
@@ -20319,6 +20342,13 @@ void applied_head(const cmi::Path* p, const cmi::Signature& sg,
       applied_walk(d.manifest, sg, seen, out);
       return;
     }
+    return;
+  }
+  // A type of one of the unit's OWN submodules is found through the unit
+  // (S528), whatever it unfolds to.
+  if (!subdom_off() && cross != 0 && p->kind == cmi::Path::Pdot && p->a &&
+      p->a->kind == cmi::Path::Pident && submodule(sg, p->a->id.name)) {
+    out.subs.insert(p->a->id.name);
     return;
   }
   bool al = false;
@@ -20370,19 +20400,28 @@ bool fmt_name(const std::string& n) {
 bool fmt_path(const cmi::Path* p) {
   return p && fmt_name(p->kind == cmi::Path::Pdot ? p->s : p->id.name);
 }
+// An abbreviation of the unit's own is expanded on the way (S528):
+// `Scanf.bscanf`'s `scanner` unfolds to a `format6`.
 bool type_has_format(const cmi::TypePtr& t,
-                     std::set<const cmi::TypeExpr*>& seen) {
+                     std::set<const cmi::TypeExpr*>& seen,
+                     const cmi::Signature* sg = nullptr) {
   if (!t || !seen.insert(t.get()).second) return false;
   if (fmt_path(t->path.get())) return true;
-  if (type_has_format(t->dom, seen) || type_has_format(t->cod, seen) ||
-      type_has_format(t->link, seen))
+  if (sg && !subdom_off() && t->kind == cmi::TypeExpr::Tconstr && t->path &&
+      t->path->kind == cmi::Path::Pident)
+    for (auto& d : sg->types)
+      if (d.name == t->path->id.name && d.manifest &&
+          type_has_format(d.manifest, seen, sg))
+        return true;
+  if (type_has_format(t->dom, seen, sg) || type_has_format(t->cod, seen, sg) ||
+      type_has_format(t->link, seen, sg))
     return true;
   for (auto& e : t->elems)
-    if (type_has_format(e.second, seen)) return true;
+    if (type_has_format(e.second, seen, sg)) return true;
   for (auto& a : t->args)
-    if (type_has_format(a, seen)) return true;
+    if (type_has_format(a, seen, sg)) return true;
   for (auto& a : t->pv_args)
-    if (type_has_format(a, seen)) return true;
+    if (type_has_format(a, seen, sg)) return true;
   return false;
 }
 
@@ -20792,6 +20831,11 @@ struct Cites {
   // "U.S"), and the bare names it applies after an `open`.
   std::map<std::string, std::map<std::string, int>> applied;
   std::map<std::string, int> applied_bares;
+  // The argument positions an INFERRED expression was ever supplied at
+  // (S528), keyed like `applied`: only those are expanded against their
+  // domain.
+  std::map<std::string, std::map<std::string, unsigned>> ainf;
+  std::map<std::string, unsigned> ainf_bares;
   // `module MP = Gc.Memprof` binds a SUBMODULE: resolving the path forces Gc
   // but not Memprof, which is forced only once MP is actually used.
   std::map<std::string, std::string> subalias;
@@ -21284,16 +21328,19 @@ struct Cites {
   // 41, `Gc.stat ()` 29 + 29 and `Format.formatter_of_out_channel stdout`
   // 173 + 173.  The application is the trigger, not the result's arity --
   // `Mutex.create ()` charges the `t` that takes no argument at all.
-  void applied_fn(const Expression& f, int nargs) {
+  void applied_fn(const Expression& f, int nargs, unsigned inf) {
     auto* i = std::get_if<Pexp_ident>(&f.desc);
     if (!i) return;
-    auto note = [&](std::map<std::string, int>& t, const std::string& n) {
-      if (t[n] < nargs) t[n] = nargs;
+    auto note = [&](const std::string& key, const std::string& n) {
+      if (applied[key][n] < nargs) applied[key][n] = nargs;
+      ainf[key][n] |= inf;
     };
     const Longident& id = i->id.txt;
     if (auto* l = std::get_if<Lident>(&id.v)) {
-      if (!l->name.empty() && !std::isupper((unsigned char)l->name[0]))
-        note(applied_bares, l->name);
+      if (!l->name.empty() && !std::isupper((unsigned char)l->name[0])) {
+        if (applied_bares[l->name] < nargs) applied_bares[l->name] = nargs;
+        ainf_bares[l->name] |= inf;
+      }
       return;
     }
     auto* d = std::get_if<Ldot>(&id.v);
@@ -21301,12 +21348,12 @@ struct Cites {
     if (auto* l = std::get_if<Lident>(&d->prefix->v)) {
       if (l->name == "Stdlib") return;  // Stdlib's own members are free
       std::string ow = opened_owner(l->name);
-      note(applied[ow.empty() ? l->name : ow + "." + l->name], d->name);
+      note(ow.empty() ? l->name : ow + "." + l->name, d->name);
     } else if (auto* q = std::get_if<Ldot>(&d->prefix->v)) {
       auto* hd = std::get_if<Lident>(&q->prefix->v);
       if (!hd) return;
-      if (hd->name == "Stdlib") note(applied[q->name], d->name);
-      else note(applied[hd->name + "." + q->name], d->name);
+      if (hd->name == "Stdlib") note(q->name, d->name);
+      else note(hd->name + "." + q->name, d->name);
     }
   }
   // `open Printf` brings its members into scope under their BARE names,
@@ -22486,7 +22533,10 @@ struct Cites {
         as = {px};
         las = {{ArgLabel{Nolabel{}}, px}};
       }
-      applied_fn(*fn, (int)as.size());
+      unsigned inf = 0;
+      for (std::size_t i = 0; i < as.size() && i < 32; ++i)
+        if (is_inferred(*as[i])) inf |= 1u << i;
+      applied_fn(*fn, (int)as.size(), inf);
       vapp(*fn, (int)as.size());
       // `ignore e` expands what it is given, to warn about a partial
       // application; nothing else about the application does.
@@ -23042,7 +23092,7 @@ struct Cites {
       auto* v = c.find_value(name);
       if (!v) return false;
       std::set<const cmi::TypeExpr*> seen;
-      return type_has_format(v->type, seen);
+      return type_has_format(v->type, seen, &c.sig());
     };
     auto it = members.find(src);
     if (it != members.end())
@@ -23113,7 +23163,7 @@ struct Cites {
     // ()` charges the `t` that takes no argument at all -- and the result is
     // the one the ARGUMENTS SUPPLIED leave: `Buffer.add_utf_8_uchar b` is an
     // arrow still, and charges nothing of its own.
-    auto one_app = [&](const std::string& n, int nargs) {
+    auto one_app = [&](const std::string& n, int nargs, unsigned inf) {
       auto* v = find_val(sg, n);
       if (!v) return;
       const cmi::TypeExpr* p = spine(v->type);
@@ -23129,8 +23179,10 @@ struct Cites {
         // belonging to ANOTHER unit is forced there and then, twice through
         // an alias: `Printf.bprintf b` pays Buffer's 41 twice and
         // `Condition.wait c m` Mutex's 6 twice.
-        head_load(spine(p->dom), sg, out,
-                  unif_off() || unidom_off() ? 0 : 1);
+        // Only an INFERRED argument is expanded against it (S528).
+        if (subdom_off() || (i < 32 && ((inf >> i) & 1u)))
+          head_load(spine(p->dom), sg, out,
+                    unif_off() || unidom_off() ? 0 : 1);
         p = spine(p->cod);
       }
       head_load(p, sg, out, 1);
@@ -23140,12 +23192,21 @@ struct Cites {
     if (it != tbl.end())
       for (auto& n : it->second) one(n);
     auto ap = applied.find(key);
+    auto ai = ainf.find(key);
+    auto inf_of = [](const std::map<std::string, unsigned>& t,
+                     const std::string& n) {
+      auto it = t.find(n);
+      return it == t.end() ? 0u : it->second;
+    };
     if (app && ap != applied.end())
-      for (auto& n : ap->second) one_app(n.first, n.second);
+      for (auto& n : ap->second)
+        one_app(n.first, n.second,
+                ai == ainf.end() ? 0u : inf_of(ai->second, n.first));
     if (nested ? subopens.count(key) : opens.count(key)) {
       for (auto& n : bares) one(n);
       if (app)
-        for (auto& n : applied_bares) one_app(n.first, n.second);
+        for (auto& n : applied_bares)
+          one_app(n.first, n.second, inf_of(ainf_bares, n.first));
     }
   }
   // One ident per top-level item (and per functor parameter) of every DISTINCT
@@ -23388,8 +23449,15 @@ struct Cites {
           a.self = a.self || xm->second.self;
           for (auto& e : xm->second.units)
             if (a.units[e.first] < e.second) a.units[e.first] = e.second;
+          a.subs.insert(xm->second.subs.begin(), xm->second.subs.end());
         }
         auto subs = named_subs(m, c.sig());
+        // A submodule a type was FOUND in is named, and its components
+        // are built besides (S528).
+        std::set<std::string> found = a.subs;
+        for (auto& s : subs) found.erase(s.first);
+        for (auto& fs : found)
+          if (auto* ss = submodule(c.sig(), fs)) subs.emplace_back(fs, ss);
         for (auto& au : alias_subs(m, c.sig()))
           if (more[au] < 1) more[au] = 1;
         for (auto& s : subs) {
@@ -23404,8 +23472,9 @@ struct Cites {
           k += load_cost(*s.second, extra, aliased || subapp_off() ? 1 : 2);
           Applied b;
           scan_applied(m + "." + s.first, true, *s.second, b, app);
-          if (aliased && (b.self || (!subapp_off() &&
-                                     sub_applied(m, s.first, *s.second))))
+          if (aliased && (b.self || a.subs.count(s.first) ||
+                          (!subapp_off() &&
+                           sub_applied(m, s.first, *s.second))))
             k += load_cost(*s.second, extra, 2);
           for (auto& e : b.units)
             if (more[e.first] < e.second) more[e.first] = e.second;
