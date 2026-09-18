@@ -24016,10 +24016,22 @@ struct Count {
     std::vector<const Pattern*> pats;
     char def_pk = 0;
   };
+  // A DEPENDENT unpack parameter (S527): `(module P : S)` at position `pos`
+  // of the flattened parameter list, cited as `P.<sub>.t` by the parameters
+  // `cites` names (their positions, the submodule path and the type) or by
+  // a result constraint (`esc` alone).
+  struct TfNode {
+    std::size_t pos = 0;
+    std::string mod;
+    bool esc = false;
+    std::vector<std::tuple<std::size_t, std::vector<std::string>, std::string>>
+        cites;
+  };
   struct Pk {
     char pk = 0;                       // bound to a package-typed expression
     const Ptyp_package* ty = nullptr;  // the package type WRITTEN for it
     std::vector<PkParam> params;
+    std::vector<TfNode> tf;            // its escaping unpack parameters
   };
   // A parameter whose pattern is an unpack meets its arguments at a package
   // type it never wrote out; `pkleaf_` stands for that type where `pk_rue`
@@ -24121,14 +24133,19 @@ struct Count {
       k.pk = pkg_typed(*b.expr, &t);
       k.ty = t;
     }
-    if (auto* f = std::get_if<Pexp_function>(&b.expr->desc)) fn_params(*f, k.params);
+    if (auto* f = std::get_if<Pexp_function>(&b.expr->desc)) {
+      fn_params(*f, k.params);
+      k.tf = tf_nodes(*f);
+    }
     // `let g = f`: g's parameters are f's (u12).
     if (!pkarg_off() && k.params.empty())
-      if (auto* i = std::get_if<Pexp_ident>(&b.expr->desc))
+      if (auto* i = std::get_if<Pexp_ident>(&b.expr->desc)) {
         if (auto* l = std::get_if<Lident>(&i->id.txt.v)) {
           auto it = pkv_.find(l->name);
           if (it != pkv_.end() && !it->second.empty()) k.params = it->second.back().params;
         }
+        k.tf = tf_of(i->id.txt);
+      }
     return k;
   }
   void fn_params(const Pexp_function& f, std::vector<PkParam>& out) {
@@ -24605,6 +24622,189 @@ struct Count {
     }
     return k;
   }
+  // ---- A DEPENDENT FUNCTION IS COPIED WHEREVER ITS TYPE IS (S527) --------
+  // compiling.ml (typing-modular-explicits): `let print (module P : Print)
+  // (x : P.t) = ..` and its uses were charged as a plain package parameter.
+  // A `(module P : S)` parameter whose binder the rest of the type CITES
+  // (`P.t` in a later parameter's or the result's type) is `type_moddep_fun`'s
+  // `Tfunctor` node (typecore.ml:6239): its unscoped ident is REFRESHED by
+  // every copy of the node -- `Ctype.copy` (ctype.ml:1465) of a generic
+  // instance and `Subst.typexp` (subst.ml:292) alike -- and a binder no later
+  // type cites stays a plain arrow and costs nothing beyond the parameter.
+  // Read off the frames, per escaping node:
+  //  - the inferred-signature check of a SAVED value: 2 (`Subst.value_
+  //    description`, includemod.ml:246-247) + 3 (`moregeneral`: instance,
+  //    duplicate_type, generic_instance) = 5, in a submodule too, counted
+  //    off the signature the writer emits (`tf_sig_nodes`, below); a module
+  //    type declaration's is 10 and left alone (b20 -1);
+  //  - the DEFINITION: the outer binder's `instance_funct` (:6242) copies
+  //    every node nested under it, 1 per enclosing escaping binder (b4 +1,
+  //    b13 +3), nested `fun`s included (`tfenc_`);
+  //  - every READ of the name: `instance` (typecore.ml:4563), 1 per node
+  //    (b6, b17);
+  //  - every APPLICATION of it: `lower_args` (typecore.ml:4319) opens each
+  //    node (`open_tfunctor`, one scoped ident) and copies the nodes under
+  //    it once more; each module ARGUMENT supplied at a node substitutes its
+  //    path in twice (`collect_functor_module_arg`, typecore.ml:3246-3250:
+  //    `instance_funct` for `ty_ret` and `ty_ret0`), copying the nodes under
+  //    it twice (b14 +3, b16), and an argument with no path of its own is
+  //    `instance_funct_nondep`'d twice instead, a fresh ident each (g11 +2);
+  //  - a later argument supplied where the parameter's type cites `P.t` is
+  //    typed at `M.t` with the argument's path for P: where M is a LOCAL
+  //    FUNCTOR APPLICATION that is `Env.find_type` on the `Papply`, which
+  //    builds the functor's `Functor_comps` and the application's components
+  //    (S509's `ap_expand`), once per file each, whatever the argument is
+  //    (g1 a constant, g2 an unknown variable, e4 a list; g4 with no later
+  //    argument nothing); a plain path's components are built already.
+  // On top, two pre-existing misses the file meets: the pack's
+  // `wrap_constraint_package` copies the module's STRENGTHENED type (S526)
+  // -- for a local application that is its result's top items (`pk_wrap`,
+  // e3/d6 -3), and for a module an unpack parameter bound, the package's
+  // module type (b8x -2).  What stays unmodelled: an escape only the BODY
+  // infers (`let f (module P : Print) x = P.print x`, a4/a5: the check is
+  // the writer's and right, the uses miss 1 + 1), a module type declaration
+  // of a dependent value, a WRITTEN `(module P : S) -> ..` type (b2z -17,
+  // its own translation), and a `let g = f (module M)` re-read.  `NOTFUN=1`
+  // reverts.
+  static bool tfun_off() {
+    static const bool off = dbg_env("NOTFUN") != nullptr;
+    return off;
+  }
+  long long tfenc_ = 0;  // escaping binders the current `fun` is typed under
+  // Every `P.<sub>.t` the type cites, for the module name `P`.
+  static void ty_cites(const CoreType& t, const std::string& mod,
+                       std::vector<std::pair<std::vector<std::string>,
+                                             std::string>>& out, int d = 0) {
+    if (d > 32) return;
+    if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
+      std::vector<std::string> comps;
+      if (lid_comps(c->id.txt, comps) && comps.size() >= 2 && comps[0] == mod) {
+        std::string ty = comps.back();
+        comps.pop_back();
+        comps.erase(comps.begin());
+        out.emplace_back(std::move(comps), std::move(ty));
+      }
+      for (auto& a : c->args) ty_cites(*a, mod, out, d + 1);
+    } else if (auto* a = std::get_if<Ptyp_arrow>(&t.desc)) {
+      ty_cites(*a->dom, mod, out, d + 1);
+      ty_cites(*a->cod, mod, out, d + 1);
+    } else if (auto* u = std::get_if<Ptyp_tuple>(&t.desc)) {
+      for (auto& e : u->elems) ty_cites(*e, mod, out, d + 1);
+    } else if (auto* p = std::get_if<Ptyp_poly>(&t.desc)) {
+      ty_cites(*p->type, mod, out, d + 1);
+    } else if (auto* al = std::get_if<Ptyp_alias>(&t.desc)) {
+      ty_cites(*al->type, mod, out, d + 1);
+    } else if (auto* op = std::get_if<Ptyp_open>(&t.desc)) {
+      ty_cites(*op->type, mod, out, d + 1);
+    } else if (auto* p = std::get_if<Ptyp_package>(&t.desc)) {
+      for (auto& c : p->constraints) ty_cites(*c.second, mod, out, d + 1);
+    } else if (auto* f = std::get_if<Ptyp_functor>(&t.desc)) {
+      ty_cites(*f->body, mod, out, d + 1);
+    }
+  }
+  // The type a parameter's pattern writes, if any.
+  static const CoreType* pat_ty(const Pattern& p) {
+    if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) return c->t.get();
+    if (auto* a = std::get_if<Ppat_alias>(&p.desc)) return pat_ty(*a->p);
+    return nullptr;
+  }
+  // The escaping unpack parameters of `f` (its own, not a nested `fun`'s),
+  // their citations read off the whole chain of directly nested `fun`s and
+  // every result constraint on the way.
+  std::vector<TfNode> tf_nodes(const Pexp_function& f) const {
+    std::vector<TfNode> out;
+    if (tfun_off()) return out;
+    std::vector<const Pattern*> ps;
+    std::vector<const CoreType*> res;
+    const Pexp_function* g = &f;
+    for (int i = 0; g && i < 16; ++i) {
+      for (auto& pm : g->params)
+        if (auto* pv = std::get_if<Pparam_val>(&pm.desc))
+          ps.push_back(&pv->pat);
+      if (g->constraint_)
+        if (auto* c = std::get_if<Pconstraint>(&*g->constraint_))
+          res.push_back(c->type.get());
+      auto* fb = std::get_if<Pfunction_body>(&g->body->v);
+      g = fb ? std::get_if<Pexp_function>(&fb->e->desc) : nullptr;
+    }
+    std::size_t own = 0;
+    for (auto& pm : f.params)
+      if (std::holds_alternative<Pparam_val>(pm.desc)) ++own;
+    for (std::size_t i = 0; i < own && i < ps.size(); ++i) {
+      auto* u = std::get_if<Ppat_unpack>(&ps[i]->desc);
+      if (!u || !u->name.txt) continue;
+      TfNode nd;
+      nd.pos = i;
+      nd.mod = *u->name.txt;
+      std::vector<std::pair<std::vector<std::string>, std::string>> cs;
+      for (std::size_t j = i + 1; j < ps.size(); ++j) {
+        cs.clear();
+        if (const CoreType* ty = pat_ty(*ps[j])) ty_cites(*ty, nd.mod, cs);
+        for (auto& c : cs) {
+          nd.esc = true;
+          nd.cites.emplace_back(j, c.first, c.second);
+        }
+      }
+      cs.clear();
+      for (auto* r : res) ty_cites(*r, nd.mod, cs);
+      if (!cs.empty()) nd.esc = true;
+      if (nd.esc) out.push_back(std::move(nd));
+    }
+    return out;
+  }
+  // The nodes of the function a name stands for.
+  std::vector<TfNode> tf_of(const Longident& id) {
+    if (tfun_off()) return {};
+    if (auto* l = std::get_if<Lident>(&id.v)) {
+      auto it = pkv_.find(l->name);
+      if (it == pkv_.end() || it->second.empty()) return {};
+      return it->second.back().tf;
+    }
+    if (auto* d = std::get_if<Ldot>(&id.v))
+      if (const ValueBinding* vb = mod_value(*d))
+        if (auto* f = std::get_if<Pexp_function>(&vb->expr->desc))
+          return tf_nodes(*f);
+    return {};
+  }
+  // A read of the name: one instance per node.  A value read THROUGH a
+  // module forces its description out of the module's components first
+  // (`Subst.value_description`, once per file), one more per node (m16f).
+  std::set<std::string> tfforce_;
+  long long tf_read(const Longident& id) {
+    long long k = (long long)tf_of(id).size();
+    if (k && std::holds_alternative<Ldot>(id.v) &&
+        tfforce_.insert(lid_full(id)).second)
+      k += k;
+    return k;
+  }
+  // An application of the name.
+  long long tf_app(const Pexp_apply& a) {
+    if (tfun_off()) return 0;
+    auto* f = std::get_if<Pexp_ident>(&a.fn->desc);
+    if (!f) return 0;
+    std::vector<TfNode> tn = tf_of(f->id.txt);
+    if (tn.empty()) return 0;
+    const std::size_t k = tn.size();
+    const std::size_t nargs = a.args.size();
+    long long r = (long long)k;  // `lower_args` opens every node
+    for (std::size_t i = 0; i < k; ++i) {
+      const long long under = (long long)(k - 1 - i);
+      r += under;  // ... and its `open_tfunctor` copies the nodes under it
+      if (tn[i].pos >= nargs) continue;
+      const Expression* ar = Cites::bare_exp(*a.args[tn[i].pos].second);
+      auto* p = std::get_if<Pexp_pack>(&ar->desc);
+      const bool pathed = p && has_path(*p->me);
+      // The argument's path is put in twice; one with no path costs a fresh
+      // ident per substitution instead.
+      r += 2 * (under + (pathed ? 0 : 1));
+      if (!pathed || !local_app(*p->me)) continue;
+      Ap ap;
+      if (!ap_of(*p->me, ApEnv{}, ap)) continue;
+      for (auto& [j, sub, ty] : tn[i].cites)
+        if (j < nargs) r += ap_expand(ap, sub, ty);
+    }
+    return r;
+  }
   // An argument at a parameter this file WROTE as a package meets it; the
   // second operand of a polymorphic comparison meets the first.
   long long pk_app(const Pexp_apply& a) {
@@ -24965,8 +25165,20 @@ struct Count {
       auto ft = fmods.find(l->name);
       if (ft != fmods.end() && !ft->second.empty() && ft->second.back())
         return pk_wmty(*ft->second.back(), fuel - 1);
+      // A module an unpack parameter bound has the package's module type,
+      // strengthened at the pack like any other (S527, b8x).
+      if (!tfun_off())
+        if (auto pv = pkv_.find(l->name);
+            pv != pkv_.end() && !pv->second.empty() && pv->second.back().ty)
+          if (const ModuleType* d =
+                  named_mty(pv->second.back().ty->path.txt, 8))
+            return pk_wmty(*d, fuel - 1);
       return 0;
     }
+    // A local functor application's strengthened type is its result's top
+    // items (S527, e3).
+    if (!tfun_off() && std::holds_alternative<Pmod_apply>(m.desc))
+      return res_items(app_res(&m));
     long long k = wt_mexpr(m, chkarrow_off() ? Lvl{1, 1, 0, true} : flat()) +
                   (chkarrow_off() ? 0 : pkw_params(m));
     // The items an `include` of a path brings in are copied too (S526).
@@ -25637,12 +25849,12 @@ struct Count {
       if (auto* v = std::get_if<Ppat_var>(&strip(*c->p).desc))
         vann_[v->name.txt] = c->t.get();  // the scrutinee's type (S507)
       if (auto* v = std::get_if<Ppat_var>(&c->p->desc))
-        if (const Ptyp_package* pk = pk_of_ty(*c->t)) pkpend_[v->name.txt] = Pk{1, pk, {}};
+        if (const Ptyp_package* pk = pk_of_ty(*c->t)) pkpend_[v->name.txt] = Pk{1, pk, {}, {}};
       // `((module M) : (module E))`: M's constructors are E's (S506).
       if (!exhmat_off())
         if (auto* u = std::get_if<Ppat_unpack>(&c->p->desc); u && u->name.txt)
           if (const Ptyp_package* pk = pk_of_ty(*c->t))
-            pkpend_[*u->name.txt] = Pk{0, pk, {}};
+            pkpend_[*u->name.txt] = Pk{0, pk, {}, {}};
       return;
     }
     if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
@@ -25691,7 +25903,7 @@ struct Count {
       }
       if (u->name.txt) { ++n; if (out) out->push_back(*u->name.txt); }
       if (!exhmat_off() && u->pkg && u->name.txt)
-        pkpend_[*u->name.txt] = Pk{0, &*u->pkg, {}};  // `(module M : E)`
+        pkpend_[*u->name.txt] = Pk{0, &*u->pkg, {}, {}};  // `(module M : E)`
       return;
     }
     if (auto* f = std::get_if<Ppat_effect>(&p.desc)) {
@@ -29267,6 +29479,14 @@ struct Count {
         ann_app(*c->to_);
       }
     }
+    // Each escaping unpack parameter is copied once by every escaping one
+    // enclosing it (S527), the enclosing `fun`s' counted in.
+    const long long tfenc = tfenc_;
+    {
+      long long enc = tfenc_;
+      for (auto& nd : tf_nodes(f)) { (void)nd; n += enc; ++enc; }
+      tfenc_ = enc;
+    }
     int nla = 0;
     for (auto& pm : f.params) {
       auto* pv = std::get_if<Pparam_val>(&pm.desc);
@@ -29286,7 +29506,7 @@ struct Count {
         if (!pkarg_off())
           if (auto* u = std::get_if<Ppat_unpack>(&pv->pat.desc); u && u->name.txt && !u->pkg) {
             const Ptyp_package* ty = nullptr;
-            if (pkg_typed(**pv->default_, &ty) && ty) pkpend_[*u->name.txt] = Pk{0, ty, {}};
+            if (pkg_typed(**pv->default_, &ty) && ty) pkpend_[*u->name.txt] = Pk{0, ty, {}, {}};
           }
         pat(pv->pat, &nm);
         continue;
@@ -29321,13 +29541,16 @@ struct Count {
     if (auto* fb = std::get_if<Pfunction_body>(&f.body->v)) {
       // `fun x -> fun y -> ..`: the rest of the arrows are the inner fun's.
       if (fa && std::holds_alternative<Pexp_function>(fb->e->desc)) fnann_ = fa;
+      if (!std::holds_alternative<Pexp_function>(fb->e->desc)) tfenc_ = tfenc;
       expr(*fb->e);
+      tfenc_ = tfenc;
       fnann_ = nullptr;
       release(m);
       la_ -= nla;
       las_.resize(las_.size() - nla);
       return;
     }
+    tfenc_ = tfenc;
     const auto& cs = std::get<Pfunction_cases>(f.body->v).cases;
     bool named = false;
     for (auto& c : cs) if (is_named(c.lhs)) { named = true; break; }
@@ -29442,9 +29665,11 @@ struct Count {
     n += appexp_any(e);
     if (auto* a = std::get_if<Pexp_apply>(&e.desc)) {
       if (!pkmeet_off()) n += pk_app(*a);
-      n += appexp_app(*a);
+      n += appexp_app(*a) + tf_app(*a);
       expr(*a->fn);
       for (auto& ar : a->args) expr(*ar.second);
+    } else if (auto* i = std::get_if<Pexp_ident>(&e.desc)) {
+      n += tf_read(i->id.txt);
     } else if (auto* t = std::get_if<Pexp_tuple>(&e.desc)) {
       for (auto& x : t->elems) expr(*x);
     } else if (auto* l = std::get_if<Pexp_let>(&e.desc)) {
@@ -37278,12 +37503,53 @@ static long long pkg_ty_nodes(const cmi::cmiw::TyPtr& t) {
   long long budget = 4096;
   return pkg_ty_nodes(t, path, budget);
 }
+// Does the type cite a module path headed by `b` (`b.t`, `b.P.t`)?  The
+// writer's own test for a binder that escapes.  A cyclic Ty graph (an
+// object's self type) is walked once per node.
+static bool tf_cites(const cmi::cmiw::TyPtr& t, const std::string& b,
+                     std::set<const cmi::cmiw::Ty*>& seen) {
+  if (!t || !seen.insert(t.get()).second) return false;
+  if (t->k == cmi::cmiw::Ty::Constr && t->name.size() > b.size() &&
+      t->name.compare(0, b.size(), b) == 0 && t->name[b.size()] == '.')
+    return true;
+  for (auto& a : t->args)
+    if (tf_cites(a, b, seen)) return true;
+  return false;
+}
+// The `Tfunctor` nodes the writer emits for the type (S527): an arrow whose
+// domain is a package with a binder the codomain cites -- occurrences, as
+// `pkg_ty_nodes` counts them, a cycle stopping the walk.
+static long long tf_ty_nodes(const cmi::cmiw::TyPtr& t,
+                             std::vector<const cmi::cmiw::Ty*>& path,
+                             long long& budget) {
+  if (!t || --budget < 0) return 0;
+  for (auto* p : path) if (p == t.get()) return 0;
+  long long k = 0;
+  if (t->k == cmi::cmiw::Ty::Arrow && t->args.size() == 2 && t->args[0] &&
+      t->args[0]->k == cmi::cmiw::Ty::Package && !t->args[0]->binder.empty()) {
+    std::set<const cmi::cmiw::Ty*> seen;
+    if (tf_cites(t->args[1], t->args[0]->binder, seen)) k = 1;
+  }
+  path.push_back(t.get());
+  for (auto& a : t->args) k += tf_ty_nodes(a, path, budget);
+  path.pop_back();
+  return k;
+}
+static long long tf_ty_nodes(const cmi::cmiw::TyPtr& t) {
+  std::vector<const cmi::cmiw::Ty*> path;
+  long long budget = 4096;
+  return tf_ty_nodes(t, path, budget);
+}
 static long long pkg_sig_nodes(const std::vector<cmi::cmiw::SigItem>& items,
                                long long mult) {
   long long k = 0;
   for (auto& si : items) {
     if (si.k == cmi::cmiw::SigItem::Value) {
       k += mult * pkg_ty_nodes(si.ty);
+      // A dependent arrow of a value is refreshed 5 times by the check
+      // (S527); a module type declaration's is left alone.
+      if (mult == 2 && !stampcount::Count::tfun_off())
+        k += 5 * tf_ty_nodes(si.ty);
     } else if (si.k == cmi::cmiw::SigItem::Module) {
       if (si.modtype_ref.empty() && si.alias.empty())
         k += pkg_sig_nodes(si.sub, mult);
