@@ -26474,6 +26474,8 @@ struct Count {
   // `fcomp_cache`, so the same pair is written out once.
   std::set<std::string> aarg;
   std::map<std::string, std::set<std::string>> fargp;
+  // The nodes `xapp_rounds` has built, by functor (S532).
+  std::map<std::string, std::set<std::string>> xargp;
   // Which DIRECT unit arguments have had their own signature read out: one
   // entry per argument PATH, shared by every functor that takes it.
   std::set<std::string> fargu;
@@ -35887,6 +35889,37 @@ struct Count {
     }
     return k;
   }
+  // `mapp_rounds` for a functor of another unit: a(i) is a parameter's
+  // written-out signature (an ident names nothing), w(i) what is left of the
+  // functor after it (`xrest_wt`); the levels are the .cmi's.
+  long long xapp_rounds(const std::vector<const cmi::ModuleType*>& lv,
+                        const std::vector<std::string>& ak0, int i0,
+                        const std::string& key, const cmi::Signature* root) {
+    const int P = (int)lv.size();
+    const int nargs = (int)ak0.size();
+    std::vector<long long> a(P + 2, 0), w(P + 2, 0);
+    for (int i = 1; i <= P; ++i) {
+      const cmi::ModuleType* pt = lv[i - 1]->functor_param_type.get();
+      if (pt && pt->kind == cmi::ModuleType::Sig && pt->sig)
+        a[i] = flat_csig(*pt->sig);
+      w[i] = xrest_wt(scrape_cmty(lv[i - 1]->functor_body.get(), root), true);
+    }
+    long long k = 0;
+    if (fstr.insert(key).second) k += a[1] + w[1];
+    std::string ak = key;
+    for (int i = 1; i <= P; ++i) {
+      // `ak0` is outermost application first: the i-th parameter's
+      // argument is the (nargs - i)-th.
+      ak += i <= nargs ? ak0[nargs - i] : "($" + std::to_string(i) + ")";
+      if (xargp[key].insert(ak).second) k += w[i];
+      if (i < P && xargp[key].insert(ak + "#").second) k += a[i + 1] + w[i + 1];
+      if (!i0 || i < i0) continue;
+      if (xargp[key].insert("~" + ak).second) k += w[i];
+      if (i < P && xargp[key].insert("~" + ak + "#").second)
+        k += a[i + 1] + w[i + 1];
+    }
+    return k;
+  }
   // What ONE substitution of a cross-unit functor that is still to be applied
   // names: its own parameters, the items of the RESULT, and -- since the
   // parameters are bound over all of it -- the items of the parameters'
@@ -36090,6 +36123,15 @@ struct Count {
     std::string key;
     for (auto& s : c) key += s + ".";
     long long k = 0;
+    // The functor's parameter levels, for one of more than one (S532).
+    std::vector<const cmi::ModuleType*> xlv;
+    for (const cmi::ModuleType* f = scrape_cmty(mt, root);
+         f && f->kind == cmi::ModuleType::Functor && xlv.size() < 16;
+         f = scrape_cmty(f->functor_body.get(), root))
+      xlv.push_back(f);
+    bool xmulti = !mfun_off() && xlv.size() >= 2 && (int)xlv.size() >= nargs &&
+                  !rebind;
+    for (auto* f : xlv) xmulti = xmulti && f->functor_param;
     for (int i = 0; i < nargs; ++i) {
       mt = scrape_cmty(mt, root);
       if (!mt || mt->kind != cmi::ModuleType::Functor) return 0;
@@ -36141,12 +36183,23 @@ struct Count {
     // more where an alias would have the result built instead.
     std::vector<std::string> uargc;
     bool xpathless = false;
+    // The arguments' keys, outermost application first, and the position
+    // (1-based, innermost first) of the first ALIAS argument.
+    std::vector<std::string> xak;
+    int xi0 = 0;
+    int xargs = 0;
     for (const ModuleExpr* h = &m;;) {
       auto* a = std::get_if<Pmod_apply>(&h->desc);
       if (!a) break;
+      ++xargs;
       std::vector<std::string> ac;
       auto* pi = std::get_if<Pmod_ident>(&a->arg->desc);
       if (pi) lid_comps(pi->id.txt, ac);
+      {
+        std::string one = "(";
+        for (auto& s : ac) one += s + ".";
+        xak.push_back(one + ")");
+      }
       // An argument that names ANOTHER UNIT builds the result a second
       // time: `Hashtbl.Make (String)` pays its 26 items twice where
       // `Hashtbl.Make (A)` over a local A pays them once.
@@ -36166,6 +36219,7 @@ struct Count {
       // A local structure costs neither.
       if (!argalias_off() && !ac.empty() && saved && !inexpr_) {
         unit_arg = arg_alias(ac);
+        if (unit_arg) xi0 = nargs - xargs + 1;
         if (!unit_arg && !mods.count(ac[0])) {
           const std::string ap = head_cmi(ac[0]);
           if (!ap.empty() && std::filesystem::exists(ap)) uargc = ac;
@@ -36194,6 +36248,16 @@ struct Count {
     long long nf = (firstapp || (newpath && had >= 1)) ? 1 : 0;
     if (unit_arg && newarg) ++nf;
     const bool discarded = !ascrapp_off() && mdiscard_ && !inexpr_;
+    // ---- A FUNCTOR OF MORE THAN ONE PARAMETER (S532) --------------------
+    // The rebuild is `mapp_rounds`'s, node by node along the applied path
+    // (the .cmi's lazy signature forced once for the functor is the
+    // `firstapp` force alone); a partial application is saved as a functor,
+    // one shape variable per parameter left.
+    xmulti = xmulti && !xpathless && !discarded && saved && !inexpr_;
+    if (xmulti) {
+      nf = firstapp ? 1 : 0;
+      k += (long long)xlv.size() - nargs;
+    }
     if (discarded) {
       // A sibling reads a type of it that cannot expand away: the result is
       // built after all, once for the whole functor and at the argument's
@@ -36214,7 +36278,11 @@ struct Count {
                : 0;
       if (tb && fdread_.insert(key).second) nf += 2 + xalias;
     }
-    k += nf * flat_cmty(mt);
+    // What the strengthening forces is the RESULT, below a partial
+    // application's remaining parameters.
+    const cmi::ModuleType* xres =
+        xmulti ? scrape_cmty(xlv.back()->functor_body.get(), root) : mt;
+    k += nf * flat_cmty(xres);
     // .. and what a DIRECT unit argument reads out instead, once for the
     // argument's own path however many functors this file gives it to.
     if (!discarded && !uargc.empty()) {
@@ -36225,7 +36293,10 @@ struct Count {
     k += wt_cmty(mt, l);
     // An argument with NO PATH leaves the result unstrengthened: it is
     // rebuilt by `nondep_supertype` instead, and never aliased.
-    if (saved && !discarded && !inexpr_ && !xpathless &&
+    if (xmulti && xres && xres->kind == cmi::ModuleType::Sig && xres->sig &&
+        str_csig(*xres->sig)) {
+      k += xapp_rounds(xlv, xak, xi0, key, root);
+    } else if (saved && !discarded && !inexpr_ && !xpathless &&
         mt->kind == cmi::ModuleType::Sig && mt->sig && str_csig(*mt->sig) &&
         fstr.insert(key).second)
       k += 2 * flat_cmty(mt);
@@ -36252,6 +36323,111 @@ struct Count {
     auto* nm = std::get_if<Functor_named>(&f->param);
     return nm && nm->type &&
            std::holds_alternative<Pmty_ident>(nm->type->desc);
+  }
+  // ---- A FUNCTOR OF MORE THAN ONE PARAMETER (S532) ------------------------
+  // The rebuild the check of a saved application pays is one expansion of
+  // the result's manifest (`Includecore.type_manifest` at `compunit`)
+  // through the APPLIED PATH: `Make(A)(B).t` builds the functor's own
+  // components (`Env.components_of_module_maker`'s functor arm: the
+  // parameter's written-out signature, the result with the parameters still
+  // to come renamed), then for every prefix of the path the application's
+  // components (`components_of_functor_appl`: what is left of the functor
+  // after that argument) and, below the last, the intermediate functor's own
+  // (`Make(A)`: its parameter's signature and what is left).  A PARTIAL
+  // application is checked as the whole path, its own parameters standing
+  // for the arguments to come, and is a functor where it is saved: one
+  // shape variable per parameter left (`Includemod.try_modtypes`,
+  // includemod.ml:614).  Every node is cached under its path (`fcomp_cache`),
+  // shared by later applications with the same prefix, and the components
+  // of the functor itself once per file.  An argument whose path is an ALIAS
+  // (a unit `Stdlib` binds, a module bound below the top) normalizes to a
+  // different path (`Env.normalize_module_path` at `type_manifest`), and the
+  // nodes from that argument down are built a second time under it.  With
+  // one parameter this is `lseen` and `larg` above; with more, the nodes
+  // multiply.  `NOMFUN=1` reverts.
+  static bool mfun_off() {
+    static const bool off = dbg_env("NOMFUN") != nullptr;
+    return off;
+  }
+  static bool incunpk_off() {
+    static const bool off = dbg_env("NOINCUNPK") != nullptr;
+    return off;
+  }
+  struct FLevel {
+    std::string name;          // the parameter's name ("" if none)
+    const ModuleType* type;    // its written type
+    const ModuleExpr* rest;    // the functor left after it, or the result
+  };
+  // The parameter levels of a functor of this file, outermost first; false
+  // when some level is not a named functor parameter over an expression.
+  bool fun_levels(const ModuleExpr* me, std::vector<FLevel>& out) const {
+    for (int d = 0; me && d < 16; ++d) {
+      auto* f = std::get_if<Pmod_functor>(&me->desc);
+      if (!f) return true;
+      auto* nm = std::get_if<Functor_named>(&f->param);
+      if (!nm || !nm->name.txt || !nm->type) return false;
+      const ModuleExpr* b = mderef(f->body.get());
+      if (!b) return false;
+      out.push_back({*nm->name.txt, &*nm->type, b});
+      me = b;
+    }
+    return me != nullptr;
+  }
+  // Is the argument's path normalized to another (`arg_extra`'s test)?
+  bool arg_renorm(const ModuleExpr& a) const {
+    auto* pi = std::get_if<Pmod_ident>(&a.desc);
+    std::vector<std::string> c;
+    if (!pi || !lid_comps(pi->id.txt, c) || c.empty()) return false;
+    auto fp = fmods.find(c[0]);
+    if (fp != fmods.end() && !fp->second.empty()) return false;
+    auto it = mods.find(c[0]);
+    if (it != mods.end() && !it->second.empty()) {
+      auto dt = mdepth.find(c[0]);
+      return dt != mdepth.end() && !dt->second.empty() && dt->second.back() > 0;
+    }
+    std::string un = c[0];
+    if (un == "Stdlib" && c.size() > 1) un = c[1];
+    if (un.rfind("Stdlib__", 0) == 0) un = un.substr(8);
+    std::string p = head_cmi(un);
+    return !p.empty() && std::filesystem::exists(p);
+  }
+  // The rebuild of a saved application of a functor of `P >= 2` parameters
+  // (all named), `nargs` of them given, whose result weighs `fl` flat.
+  long long mapp_rounds(const std::vector<FLevel>& lv,
+                        const std::vector<const ModuleExpr*>& args, int nargs,
+                        long long fl, const std::string& key,
+                        const std::vector<std::pair<std::string,
+                                                    const ModuleType*>>& fps,
+                        bool comps) {
+    const int P = (int)lv.size();
+    // a(i): the parameter's own written-out signature; w(i): what is left
+    // of the functor after it.
+    std::vector<long long> a(P + 2, 0), w(P + 2, 0);
+    for (int i = 1; i <= P; ++i) a[i] = par_wt(*lv[i - 1].type, fps);
+    w[P] = fl;
+    for (int i = P - 1; i >= 1; --i) w[i] = w[i + 1] + 1 + a[i + 1];
+    long long k = 0;
+    if (comps && lseen.insert(key).second) k += a[1] + w[1];
+    std::string ak = key;
+    int i0 = 0;  // the first argument whose path is normalized away
+    for (int i = 1; i <= P; ++i) {
+      if (i <= nargs) {
+        const ModuleExpr* g = args[nargs - i];
+        if (auto* pi = std::get_if<Pmod_ident>(&g->desc))
+          ak += "(" + lid_full(pi->id.txt) + ")";
+        else
+          ak += "(" + std::to_string((std::uintptr_t)g) + ")";
+        if (!i0 && arg_renorm(*g)) i0 = i;
+      } else {
+        ak += "($" + lv[i - 1].name + ")";
+      }
+      if (larg.insert(ak).second) k += w[i];
+      if (i < P && larg.insert(ak + "#").second) k += a[i + 1] + w[i + 1];
+      if (!i0) continue;
+      if (larg.insert("~" + ak).second) k += w[i];
+      if (i < P && larg.insert("~" + ak + "#").second) k += a[i + 1] + w[i + 1];
+    }
+    return k;
   }
   // What the ARGUMENT of a local application adds the first time it is
   // applied: a module the enclosing signature does not already name -- one
@@ -36938,6 +37114,10 @@ struct Count {
       return ngen ? 0 : cross_charge(m, *head, nargs, l, saved, rebind);
     const ModuleExpr* fdef = me;
     const void* fkey = me ? (const void*)me : (const void*)mt;
+    std::vector<FLevel> flv;
+    if (mfun_off() || !me || !fun_levels(me, flv) || (int)flv.size() < 2 ||
+        (int)flv.size() < nargs || ngen)
+      flv.clear();
     bool pathless = false;
     // The arguments, innermost application first, so that the one the i-th
     // parameter is given is `args[nargs - 1 - i]`.
@@ -36997,6 +37177,11 @@ struct Count {
       }
     }
     const ModuleType* rnm = res_named(me, mt);
+    // What a PARTIAL application leaves is a functor: one shape variable per
+    // parameter still to come where it is saved (S532).
+    const bool multi = !flv.empty() && !thru && !pbody;
+    if (multi && saved && !inexpr_ && (int)flv.size() > nargs)
+      k += (long long)flv.size() - nargs;
     // A BARE name is left a PATH, and `Mtype.nondep_supertype` -- what an
     // argument with no path of its own asks for -- has no signature there to
     // rebuild, so nothing is renamed at all.  A `with` writes the signature
@@ -37022,11 +37207,19 @@ struct Count {
     // per application, and once more (one ident over) for the FIRST
     // application of the functor: over a base of `items + 1` apiece,
     // `M (A) M (B) M (A)` is 3R+2, 2R+1, R+1.
+    // A partial application's RESULT is below the functor it leaves.
+    const ModuleExpr* mres = multi ? flv.back().rest : nullptr;
+    const ModuleType* mrnm = multi ? res_named(mres, nullptr) : nullptr;
     if (saved && !inexpr_ && !pathless && !pbody && !xapp_off() &&
-        ((me ? str_mexpr(*me) : str_mty(*mt)) ||
-         (rnm && res_str(*rnm)))) {
+        (multi ? (str_mexpr(*mres) || (mrnm && res_str(*mrnm)))
+               : ((me ? str_mexpr(*me) : str_mty(*mt)) ||
+                  (rnm && res_str(*rnm))))) {
       long long fl = me ? wt_mexpr(*me, flat()) : wt_mty(*mt, flat());
       if (rnm) fl += res_wt(*rnm, flat());
+      if (multi) {
+        fl = wt_mexpr(*mres, flat());
+        if (mrnm) fl += res_wt(*mrnm, flat());
+      }
       // An argument that is itself an APPLICATION is not a path the result
       // is shared under: only a NAMED argument is cached below.
       bool named_args = true;
@@ -37048,7 +37241,12 @@ struct Count {
           if (str_app_arg(*a->arg)) spent = true;
           h = a->f.get();
         }
-      if (nargs > 1 || !named_args || lapp_off()) {
+      if (multi && named_args && !lapp_off()) {
+        k += mapp_rounds(flv, args, nargs, fl,
+                         std::to_string((std::uintptr_t)fkey), fps,
+                         !poly_fres(fdef, res_mty(me, mt)) &&
+                             !fexp_done_.count(fdef));
+      } else if (nargs > 1 || !named_args || lapp_off()) {
         k += spent ? fl : 2 * fl;
       } else if (!thru) {
         std::string key = std::to_string((std::uintptr_t)fkey);
@@ -37873,6 +38071,17 @@ struct Count {
       // `ren_mexpr` cannot read an application; its result is re-bound the
       // same way every other included signature is.
       n += app_charge(i->expr, flat(), false, true);
+      // ---- AN INCLUDE OF AN UNPACK ENTERS THE PACKAGE TYPE (S532) --------
+      // `Env.enter_signature` (typemod.ml:3172) substitutes the signature the
+      // package type names: one ident per item at every depth, whether the
+      // unpack writes the type or the value's declaration carries it.
+      // `NOINCUNPK=1` reverts.
+      if (!incunpk_off())
+        if (auto* u = std::get_if<Pmod_unpack>(&i->expr.desc)) {
+          const Ptyp_package* pk = nullptr;
+          pkg_typed(*u->e, &pk);
+          if (pk) n += pk_pathwt(pk->path.txt);
+        }
       if (!incpath_off()) {
         std::vector<std::string> nm;
         inm_ = &nm;
