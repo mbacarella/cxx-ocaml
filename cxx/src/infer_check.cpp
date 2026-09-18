@@ -30341,14 +30341,21 @@ struct Count {
       return nullptr;
     const Longident* id = mpath(a->f.get());
     if (!id || mderef(a->f.get())) return nullptr;
-    fk = xtapp_key(*id);
-    if (std::count(fk.begin(), fk.end(), '.') != 2) return nullptr;
     auto* pi = std::get_if<Pmod_ident>(&a->arg->desc);
     if (!pi) return nullptr;
+    return xoapp_keys_at(*id, pi->id.txt, fk, ak, xal);
+  }
+  // ... of the functor path `f` applied to the module path `x`.
+  const cmi::ModuleType* xoapp_keys_at(const Longident& f, const Longident& x,
+                                       std::string& fk, std::string& ak,
+                                       int& xal) const {
+    if (xoapp_off()) return nullptr;
+    fk = xtapp_key(f);
+    if (std::count(fk.begin(), fk.end(), '.') != 2) return nullptr;
     std::vector<std::string> ac;
-    if (!lid_comps(pi->id.txt, ac) || ac.empty()) return nullptr;
+    if (!lid_comps(x, ac) || ac.empty()) return nullptr;
     const cmi::Signature* root = nullptr;
-    const cmi::ModuleType* mt = scrape_cmty(cmi_module(*id, &root), root);
+    const cmi::ModuleType* mt = scrape_cmty(cmi_module(f, &root), root);
     if (!mt || mt->kind != cmi::ModuleType::Functor) return nullptr;
     const cmi::ModuleType* res = scrape_cmty(mt->functor_body.get(), root);
     if (!res || res->kind != cmi::ModuleType::Sig || !res->sig) return nullptr;
@@ -30361,10 +30368,22 @@ struct Count {
   bool xoapp_of(const ModuleExpr& app, Oapp& o) const {
     const cmi::ModuleType* res = xoapp_keys(app, o.fk, o.ak, o.xal);
     if (!res) return false;
-    const cmi::Signature& sg = *res->sig;
-    o.x = true;
     o.head = app_head(app);
-    o.r = flat_cmty(res);
+    return xoapp_fill(*res, o);
+  }
+  // The same off a signature's `open F (A)`, a Longident.
+  bool xoapp_of_lid(const Longident& app, Oapp& o) const {
+    auto* a = std::get_if<Lapply>(&app.v);
+    if (!a || std::holds_alternative<Lapply>(a->f->v)) return false;
+    const cmi::ModuleType* res = xoapp_keys_at(*a->f, *a->x, o.fk, o.ak, o.xal);
+    if (!res) return false;
+    o.head = lid_full(*a->f);
+    return xoapp_fill(*res, o);
+  }
+  bool xoapp_fill(const cmi::ModuleType& res, Oapp& o) const {
+    const cmi::Signature& sg = *res.sig;
+    o.x = true;
+    o.r = flat_cmty(&res);
     for (auto& td : sg.types) {
       if (td.manifest) continue;
       o.types.insert(td.name);
@@ -30742,6 +30761,190 @@ struct Count {
     if (auto* f = std::get_if<Pmod_functor>(&m.desc)) return oapp_open_mexpr(*f->body, d + 1);
     if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) return oapp_open_mexpr(*c->me, d + 1);
     return 0;
+  }
+
+  // ---- THE SAME OPEN IN A SIGNATURE (S525) --------------------------------
+  // `module type S = sig open Set.Make (Bool) .. end`: `transl_signature`
+  // looks the application up as a PATH (`Env.lookup_module_path`, whose
+  // `lookup_apply` gets the functor's components and checks the argument,
+  // then `Env.open_signature`), which is exactly what a written `Set.Make
+  // (Bool).t` in the same position does -- the functor's components, the
+  // applied signature and the strengthening, each once for the file and
+  // shared with every written path of it, so the open takes `xtapp_at`'s
+  // law and its sets (the functor's home unit, 7, is short there too).  The
+  // open seeds nothing else: a type declaration under it whose manifest
+  // reaches one of the result's types (through an arrow, a tuple or a type
+  // constructor's arguments, or a record field's OWN type), a `type u := t`
+  // and a `with type e = t` has `Typedecl.reachable` build the unit's
+  // components as a structure-level read does (`xomk_`/`xoap_`: once for
+  // the file, in either order with a structure's read, a bound module or a
+  // written declaration); a constructor argument, an exception, a `val`, an
+  // object type or a variant row are not expanded there.  A later open
+  // hides the names it brings in -- all of them for the same functor,
+  // another functor's or a plain module's by name.  Measured with `Set`,
+  // `Hashtbl`, `Weak` and `Map` (stamp_probes/xso_*).  `NOXSIGOPEN=1`
+  // reverts.
+  static bool xsopen_off() {
+    static const bool off = dbg_env("NOXSIGOPEN") != nullptr;
+    return off;
+  }
+  static bool xsig_decl(const TypeDeclaration& d, const std::set<std::string>& ts) {
+    if (d.manifest && ty_names(**d.manifest, ts)) return true;
+    if (auto* r = std::get_if<Ptype_record>(&d.kind))
+      for (auto& f : r->fields)
+        if (const std::string* h = tyhead(*f.type); h && ts.count(*h))
+          return true;
+    return false;
+  }
+  // The type names an open brings into a signature: an application's
+  // result, or another unit's module.
+  void xsig_names(const Longident& id, std::set<std::string>& out) const {
+    if (std::holds_alternative<Lapply>(id.v)) {
+      Oapp a;
+      if (xoapp_of_lid(id, a)) out.insert(a.types.begin(), a.types.end());
+      return;
+    }
+    std::vector<std::string> c;
+    if (!lid_comps(id, c) || c.empty() || mods.count(c[0])) return;
+    const cmi::Signature* sg = nullptr;
+    if (c.size() == 1 || (c.size() == 2 && c[0] == "Stdlib")) {
+      std::string h = c.back();
+      if (h.rfind("Stdlib__", 0) == 0) h = h.substr(8);
+      const std::string p = head_cmi(h);
+      if (!p.empty() && std::filesystem::exists(p))
+        try { sg = &cmi::CmiFile::load(p).sig(); } catch (...) {}
+    } else {
+      const cmi::Signature* root = nullptr;
+      const cmi::ModuleType* mt = scrape_cmty(cmi_module(id, &root), root);
+      if (mt && mt->kind == cmi::ModuleType::Sig && mt->sig) sg = mt->sig.get();
+    }
+    if (sg) for (auto& t : sg->types) out.insert(t.name);
+  }
+  // Does anything from `i` on read one of `ts`?  `head` is the open's
+  // functor: a later open of it hides everything.
+  bool xsig_reads(const Signature& s, size_t i, std::set<std::string> ts,
+                  const std::string& head, int d) const {
+    for (size_t j = i; j < s.size() && !ts.empty(); ++j) {
+      if (xsig_read(s[j], ts, head, d)) return true;
+      if (auto* op = std::get_if<Psig_open>(&s[j].desc)) {
+        if (auto* a = std::get_if<Lapply>(&op->id.txt.v))
+          if (!head.empty() && lid_full(*a->f) == head) return false;
+        std::set<std::string> hid;
+        xsig_names(op->id.txt, hid);
+        for (auto& n : hid) ts.erase(n);
+      }
+    }
+    return false;
+  }
+  bool xsig_read(const SignatureItem& it, const std::set<std::string>& ts,
+                 const std::string& head, int d) const {
+    if (d > 32) return false;
+    if (auto* t = std::get_if<Psig_type>(&it.desc)) {
+      for (auto& dcl : t->decls) if (xsig_decl(dcl, ts)) return true;
+    } else if (auto* t = std::get_if<Psig_typesubst>(&it.desc)) {
+      for (auto& dcl : t->decls) if (xsig_decl(dcl, ts)) return true;
+    } else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+      return xsig_read_mty(*m->md.type, ts, head, d + 1);
+    } else if (auto* m = std::get_if<Psig_recmodule>(&it.desc)) {
+      for (auto& md : m->decls)
+        if (xsig_read_mty(*md.type, ts, head, d + 1)) return true;
+    } else if (auto* m = std::get_if<Psig_modtype>(&it.desc)) {
+      return m->type && xsig_read_mty(*m->type, ts, head, d + 1);
+    } else if (auto* i = std::get_if<Psig_include>(&it.desc)) {
+      return xsig_read_mty(i->mt, ts, head, d + 1);
+    }
+    return false;
+  }
+  bool xsig_read_mty(const ModuleType& mt, const std::set<std::string>& ts,
+                     const std::string& head, int d) const {
+    if (d > 32) return false;
+    if (auto* s = std::get_if<Pmty_signature>(&mt.desc))
+      return xsig_reads(s->items, 0, ts, head, d + 1);
+    if (auto* f = std::get_if<Pmty_functor>(&mt.desc)) {
+      if (auto* nm = std::get_if<Functor_named>(&f->param))
+        if (nm->type && xsig_read_mty(*nm->type, ts, head, d + 1)) return true;
+      return xsig_read_mty(*f->body, ts, head, d + 1);
+    }
+    if (auto* w = std::get_if<Pmty_with>(&mt.desc)) {
+      for (auto& c : w->constraints) {
+        const TypeDeclaration* td = nullptr;
+        if (auto* t = std::get_if<Pwith_type>(&c)) td = t->td.get();
+        else if (auto* t = std::get_if<Pwith_typesubst>(&c)) td = t->td.get();
+        if (td && xsig_decl(*td, ts)) return true;
+      }
+      return xsig_read_mty(*w->mt, ts, head, d + 1);
+    }
+    return false;
+  }
+  long long xsig_open(const Signature& s, int d = 0) {
+    if (opapp_off() || xoapp_off() || xsopen_off() || d > 32) return 0;
+    long long k = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+      if (auto* o = std::get_if<Psig_open>(&s[i].desc)) {
+        Oapp a;
+        if (!xoapp_of_lid(o->id.txt, a)) continue;
+        if (!xtapp_off()) k += xtapp_at(o->id.txt, std::string(), false);
+        if (!xsig_reads(s, i + 1, a.types, a.head, 0)) continue;
+        if (xomk_.insert(a.fk).second) k += a.r;
+        if (xoap_.insert(a.ak).second) k += (1 + a.xal) * a.r;
+      } else if (auto* m = std::get_if<Psig_module>(&s[i].desc)) {
+        k += xsig_open_mty(*m->md.type, d + 1);
+      } else if (auto* m = std::get_if<Psig_recmodule>(&s[i].desc)) {
+        for (auto& md : m->decls) k += xsig_open_mty(*md.type, d + 1);
+      } else if (auto* m = std::get_if<Psig_modtype>(&s[i].desc)) {
+        if (m->type) k += xsig_open_mty(*m->type, d + 1);
+      } else if (auto* inc = std::get_if<Psig_include>(&s[i].desc)) {
+        k += xsig_open_mty(inc->mt, d + 1);
+      }
+    }
+    return k;
+  }
+  long long xsig_open_mty(const ModuleType& mt, int d) {
+    if (d > 32) return 0;
+    if (auto* s = std::get_if<Pmty_signature>(&mt.desc)) return xsig_open(s->items, d + 1);
+    if (auto* f = std::get_if<Pmty_functor>(&mt.desc)) {
+      long long k = 0;
+      if (auto* nm = std::get_if<Functor_named>(&f->param))
+        if (nm->type) k += xsig_open_mty(*nm->type, d + 1);
+      return k + xsig_open_mty(*f->body, d + 1);
+    }
+    if (auto* w = std::get_if<Pmty_with>(&mt.desc)) return xsig_open_mty(*w->mt, d + 1);
+    if (auto* t = std::get_if<Pmty_typeof>(&mt.desc)) return xsig_open_mexpr(*t->me, d + 1);
+    return 0;
+  }
+  long long xsig_open_mexpr(const ModuleExpr& m, int d) {
+    if (d > 32) return 0;
+    if (auto* st = std::get_if<Pmod_structure>(&m.desc)) return xsig_open_str(st->items, d + 1);
+    if (auto* f = std::get_if<Pmod_functor>(&m.desc)) {
+      long long k = 0;
+      if (auto* nm = std::get_if<Functor_named>(&f->param))
+        if (nm->type) k += xsig_open_mty(*nm->type, d + 1);
+      return k + xsig_open_mexpr(*f->body, d + 1);
+    }
+    if (auto* c = std::get_if<Pmod_constraint>(&m.desc))
+      return xsig_open_mexpr(*c->me, d + 1) + xsig_open_mty(*c->mt, d + 1);
+    if (auto* a = std::get_if<Pmod_apply>(&m.desc))
+      return xsig_open_mexpr(*a->f, d + 1) + xsig_open_mexpr(*a->arg, d + 1);
+    return 0;
+  }
+  // Every signature a structure writes.
+  long long xsig_open_str(const std::vector<StructureItem>& items, int d = 0) {
+    if (opapp_off() || xoapp_off() || xsopen_off() || d > 32) return 0;
+    long long k = 0;
+    for (auto& it : items) {
+      if (auto* m = std::get_if<Pstr_module>(&it.desc)) {
+        k += xsig_open_mexpr(m->binding.expr, d + 1);
+      } else if (auto* m = std::get_if<Pstr_recmodule>(&it.desc)) {
+        for (auto& b : m->bindings) k += xsig_open_mexpr(b.expr, d + 1);
+      } else if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
+        k += xsig_open_mexpr(i->expr, d + 1);
+      } else if (auto* o = std::get_if<Pstr_open>(&it.desc)) {
+        k += xsig_open_mexpr(o->expr, d + 1);
+      } else if (auto* t = std::get_if<Pstr_modtype>(&it.desc)) {
+        if (t->type) k += xsig_open_mty(*t->type, d + 1);
+      }
+    }
+    return k;
   }
 
   // ---- WHAT A `with` COSTS A SECOND TIME UNDER A `module rec` -------------
@@ -36981,7 +37184,7 @@ int typing_ident_count(const ast::Structure& s, std::size_t eta_sites,
   c.pk_push();
   for (auto& it : s) c.item(it);
   c.pk_pop();
-  long long k = c.n + c.nd_open(s) + c.oapp_open(s) +
+  long long k = c.n + c.nd_open(s) + c.oapp_open(s) + c.xsig_open_str(s) +
                 stampcount::modforce_cost(s, u);
   if (!dbg_env("NOUNITLOAD"))
     k += u.cost(!dbg_env("NOEXTRALOAD"), !dbg_env("NOSUBLOAD"),
