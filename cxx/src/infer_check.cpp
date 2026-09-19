@@ -20675,6 +20675,13 @@ bool anondep_off() {
   static const bool off = dbg_env("NOANONDEP") != nullptr;
   return off;
 }
+// S538: a pack of a module bound to an application of another unit's
+// functor -- the strengthened result substituted, the units its value types
+// name forced.  `NOPKAPP=1` reverts.
+bool pkapp_off() {
+  static const bool off = dbg_env("NOPKAPP") != nullptr;
+  return off;
+}
 // S537: the checks of a `module type of` -- its functors and nested module
 // types (`tof_checks`, `sig_applied_deep`).
 bool tofchk_off() {
@@ -20979,6 +20986,11 @@ struct Cites {
   // module at all: an unread binding has had `Env` build nothing, and a
   // type path through the same functor pays as if the file bound none.
   std::vector<bool> fread;
+  // ... and whether the body PACKS the module (S538): the pack's check
+  // pairs the result's value types, which forces the units they name.
+  std::vector<bool> fpack;
+  // The `fapps` index of each `lmscope_` entry (`fapps.size()` where none).
+  std::vector<std::size_t> lmfi_;
   // `let module M = F (A) in ..`: the result is bound over the body
   // alone and none of the types it names is ever looked up.
   bool inexpr_ = false;
@@ -21026,15 +21038,21 @@ struct Cites {
     return off;
   }
 
+  // `let module` bindings whose scope the walk has left (S538).
+  std::map<std::string, int> dead_;
+  int live_local(const std::string& m) const {
+    auto lb = local.find(m);
+    auto sb = selfb_.find(m);
+    auto db = dead_.find(m);
+    return (lb == local.end() ? 0 : lb->second) -
+           (sb == selfb_.end() ? 0 : sb->second) -
+           (db == dead_.end() ? 0 : db->second);
+  }
   void add(const std::string& m) {
     if (m.empty() || m == "Stdlib") return;
     if (!std::isupper((unsigned char)m[0])) return;
     units.insert(m);
-    auto lb = local.find(m);
-    auto sb = selfb_.find(m);
-    int sh = (lb == local.end() ? 0 : lb->second) -
-             (sb == selfb_.end() ? 0 : sb->second);
-    if (sh <= 0) pre.insert(m);
+    if (live_local(m) <= 0) pre.insert(m);
   }
   void bind_mod(const StrOptLoc& n) {
     if (!n.txt) return;
@@ -21076,8 +21094,7 @@ struct Cites {
     auto lb = local.find(m);
     if (lb == local.end()) return false;
     if (prebind_off()) return true;
-    auto sb = selfb_.find(m);
-    return lb->second - (sb == selfb_.end() ? 0 : sb->second) > 0;
+    return live_local(m) > 0;
   }
   // Module PATHS the file reads INSIDE: every strict module prefix of a
   // dotted path, and every module it opens.  Reading a member is what forces
@@ -22918,10 +22935,17 @@ struct Cites {
       if (xrd) {
         lmscope_.emplace_back(xn, "@" + std::to_string((std::uintptr_t)s) +
                                       "/");
+        lmfi_.push_back(std::holds_alternative<Ldot>(xh->v) ? fi
+                                                            : fapps.size());
         tail_reads(*s->body);
       }
       ex(*s->body, x);
+      // `let module M = .. in e` binds M over `e` alone: what follows names
+      // the unit again (S538).  `local` keeps the binding for the alias
+      // resolution at `cost`; the shadow tests discount it.
+      if (named && !pkapp_off()) dead_[*lm->binding.name.txt]++;
       if (xrd) {
+        lmfi_.pop_back();
         const std::string& pre = lmscope_.back().second;
         bool read = false;
         for (auto* rs : {&vreads_, &yreads_}) {
@@ -22948,6 +22972,14 @@ struct Cites {
     } else if (auto* p = std::get_if<Pexp_pack>(&e.desc)) {
       mexp(*p->me);
       if (p->pkg) pkg(*p->pkg);
+      // a pack of a `let module` in scope (S538)
+      if (auto* pi = std::get_if<Pmod_ident>(&p->me->desc))
+        if (auto* li = std::get_if<Lident>(&pi->id.txt.v))
+          for (std::size_t i = lmscope_.size(); i-- > 0;)
+            if (lmscope_[i].first == li->name) {
+              if (lmfi_[i] < fpack.size()) fpack[lmfi_[i]] = true;
+              break;
+            }
     } else if (auto* l = std::get_if<Pexp_letop>(&e.desc)) {
       pat(l->let_.pat); ex(*l->let_.exp);
       for (auto& a : l->ands) { pat(a.pat); ex(*a.exp); }
@@ -23183,6 +23215,7 @@ struct Cites {
           fexpr.push_back(inexpr_);
           fargk.push_back(pathed ? xapp_args(m, nullptr) : std::string());
           fread.push_back(false);
+          fpack.push_back(false);
           fopen.push_back(inopen_);
           fdisc.emplace_back(discload_off() ? std::string() : cdname_,
                              cdpre_);
@@ -23193,6 +23226,18 @@ struct Cites {
       mexp(*a->f);
     } else if (auto* u = std::get_if<Pmod_unpack>(&m.desc)) {
       ex(*u->e);
+      // An unpack at a package type WITH constraints expands the module
+      // type (`modtype_of_package` -> `Env.find_modtype_expansion`), which
+      // builds the unit's components; a bare name stays a path (S538).
+      if (!pkapp_off())
+        if (auto* c = std::get_if<Pexp_constraint>(&u->e->desc))
+          if (auto* pk = std::get_if<Ptyp_package>(&c->t->desc))
+            if (!pk->constraints.empty() &&
+                !std::holds_alternative<Lapply>(pk->path.txt.v)) {
+              std::vector<std::string> pc =
+                  split_dotted(lid_full(pk->path.txt));
+              if (pc.size() >= 2 && !shadowed(pc[0])) mtf.insert(pc[0]);
+            }
     }
   }
   void mbind(const ModuleBinding& b) {
@@ -23645,7 +23690,9 @@ struct Cites {
       for (const cmi::ModuleType* f = mt; f;
            f = scrape_cmty(f->functor_body.get(), rt)) {
         if (f->kind != cmi::ModuleType::Functor) {
-          if (f->kind == cmi::ModuleType::Sig && f->sig && !fa.second) {
+          const bool packed = !pkapp_off() && fi < fpack.size() && fpack[fi];
+          if (f->kind == cmi::ModuleType::Sig && f->sig &&
+              (!fa.second || packed)) {
             // A read of ANY kind asks for the build alone, so the units
             // the result's own types name stay unloaded whatever names it.
             const bool disc =
@@ -26169,7 +26216,7 @@ struct Count {
     inm_ = keep;
     return k;
   }
-  long long pk_wrap(const ModuleExpr& m, int fuel = 8) {
+  long long pk_wrap(const ModuleExpr& m, int fuel = 8, bool bound = false) {
     if (fuel <= 0 || pkwrap_off()) return 0;
     if (auto* c = std::get_if<Pmod_constraint>(&m.desc))
       return pk_wmty(*c->mt, fuel);
@@ -26183,7 +26230,7 @@ struct Count {
       if (it != mods.end() && !it->second.empty()) t = it->second.back();
       if (t) {
         if (!chkarrow_off() && !pkw_once_.insert(t).second) return me_top(*t);
-        return pk_wrap(*t, fuel - 1);
+        return pk_wrap(*t, fuel - 1, true);
       }
       if (!l) return 0;
       auto ft = fmods.find(l->name);
@@ -26200,9 +26247,17 @@ struct Count {
       return pk_unit(m);
     }
     // A local functor application's strengthened type is its result's top
-    // items (S527, e3).
-    if (!tfun_off() && std::holds_alternative<Pmod_apply>(m.desc))
-      return res_items(app_res(&m));
+    // items (S527, e3); a module BOUND to another unit's functor's, or to a
+    // local functor's over one, the same (S538: an application packed
+    // where it stands is the S527 over-charge, left as it is).
+    if (!tfun_off() && std::holds_alternative<Pmod_apply>(m.desc)) {
+      if (const ModuleExpr* r = app_res(&m)) return res_items(r);
+      if (pkapp_off() || !bound) return 0;
+      if (long long k = xapp_top(m)) return k;
+      if (const cmi::ModuleType* r = xbody_res(m))
+        return shal_csig(r->sig.get());
+      return 0;
+    }
     long long k = wt_mexpr(m, chkarrow_off() ? Lvl{1, 1, 0, true} : flat()) +
                   (chkarrow_off() ? 0 : pkw_params(m));
     // The items an `include` of a path brings in are copied too (S526).
@@ -26831,6 +26886,10 @@ struct Count {
     while (mnames.size() > m) {
       auto it = mods.find(mnames.back());
       if (it != mods.end() && !it->second.empty()) it->second.pop_back();
+      // A name released for good is no binding: `mods.count` is the test
+      // for one everywhere a unit's path is resolved (S538).
+      if (it != mods.end() && it->second.empty() && !pkapp_off())
+        mods.erase(it);
       auto dt = mdepth.find(mnames.back());
       if (dt != mdepth.end() && !dt->second.empty()) dt->second.pop_back();
       mnames.pop_back();
@@ -33684,13 +33743,29 @@ struct Count {
     }
     if (auto* c = std::get_if<Pmod_constraint>(&m.desc))
       return mt_top(*c->mt, d);
+    // A module bound to an UNPACK at a written package type has that
+    // module type's top items (S538).
+    if (auto* u = std::get_if<Pmod_unpack>(&m.desc); u && !pkapp_off()) {
+      const Ptyp_package* pk = nullptr;
+      if (auto* c = std::get_if<Pexp_constraint>(&u->e->desc))
+        pk = pk_of_ty(*c->t);
+      else if (auto* p = std::get_if<Pexp_pack>(&u->e->desc))
+        pk = p->pkg ? &*p->pkg : nullptr;
+      const ModuleType* t = pk ? named_mty(pk->path.txt, 8) : nullptr;
+      if (t) return mt_top(*t, d);
+      std::string key;
+      const cmi::Signature* cs = pk ? xpath_sig(pk->path.txt, key) : nullptr;
+      return cs ? shal_csig(cs) : 0;
+    }
     // A module bound to an APPLICATION has the functor's result for its
     // signature, and an `include` of it enters that result's top items.
     if (!ltapp_off() && std::holds_alternative<Pmod_apply>(m.desc)) {
       if (const ModuleExpr* r = app_res(&m)) return me_top(*r, d + 1);
-      // .. and a local functor's result of another unit's (S536)
+      // .. and a local functor's result of another unit's (S536), or
+      // another unit's functor's own (S538)
       if (const cmi::ModuleType* r = xbody_res(m))
         return shal_csig(r->sig.get());
+      if (!pkapp_off()) return xapp_top(m);
     }
     bool dt = false;
     return std::holds_alternative<Pmod_ident>(m.desc) ? inc_top(m, dt, d + 1)
