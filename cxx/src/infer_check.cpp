@@ -26183,6 +26183,68 @@ struct Count {
       return pack_args(d->args, d->res);
     return 0;
   }
+  // ---- A PACKAGE'S `with type` IS MERGED WHEREVER THE TYPE IS TRANSLATED
+  // (S540) ----------------------------------------------------------------
+  // `pack_decl`/`pack_ext` charge a declaration's package types where the
+  // declaration is SAVED (the two `Pkg` of the check and the merge apiece),
+  // and nothing where it is not; but `Merge.merge_package` patches each
+  // constraint when the declaration is TRANSLATED, saved or not: a struct
+  // behind an ascription that hides it, a signature translated a second time
+  // (a `module rec` declaration's, `transl_recmodule_modtypes`).  One ident
+  // per constraint at every depth of the written type (`pk_patches`).
+  static long long pk_dpatches(const TypeDeclaration& d) {
+    long long k = d.manifest ? pk_patches(**d.manifest) : 0;
+    for (auto& c : d.constraints) k += pk_patches(*c.t1) + pk_patches(*c.t2);
+    if (auto* v = std::get_if<Ptype_variant>(&d.kind))
+      for (auto& c : v->ctors) k += pk_apatches(c.args, c.res);
+    else if (auto* r = std::get_if<Ptype_record>(&d.kind))
+      for (auto& f : r->fields) k += pk_patches(*f.type);
+    return k;
+  }
+  static long long pk_apatches(const ConstructorArguments& a,
+                               const std::optional<CoreTypeBox>& res) {
+    long long k = res ? pk_patches(**res) : 0;
+    if (auto* t = std::get_if<Pcstr_tuple>(&a))
+      for (auto& e : t->elems) k += pk_patches(*e);
+    else if (auto* r = std::get_if<Pcstr_record>(&a))
+      for (auto& f : r->fields) k += pk_patches(*f.type);
+    return k;
+  }
+  static long long pk_epatches(const ExtensionConstructor& c) {
+    if (auto* d = std::get_if<Pext_decl>(&c.kind))
+      return pk_apatches(d->args, d->res);
+    return 0;
+  }
+  // The merges one more translation of a whole module type pays: every type
+  // declaration in it at every depth.
+  static long long pk_mpatches(const ModuleType& mt, int fuel = 8) {
+    if (fuel <= 0) return 0;
+    if (auto* w = std::get_if<Pmty_with>(&mt.desc))
+      return pk_mpatches(*w->mt, fuel - 1);
+    if (auto* f = std::get_if<Pmty_functor>(&mt.desc)) {
+      long long k = pk_mpatches(*f->body, fuel - 1);
+      if (auto* nm = std::get_if<Functor_named>(&f->param))
+        if (nm->type) k += pk_mpatches(*nm->type, fuel - 1);
+      return k;
+    }
+    auto* sg = std::get_if<Pmty_signature>(&mt.desc);
+    if (!sg) return 0;
+    long long k = 0;
+    for (auto& it : sg->items) {
+      if (auto* t = std::get_if<Psig_type>(&it.desc)) {
+        for (auto& d : t->decls) k += pk_dpatches(d);
+      } else if (auto* x = std::get_if<Psig_typext>(&it.desc)) {
+        for (auto& c : x->ext.ctors) k += pk_epatches(c);
+      } else if (auto* e = std::get_if<Psig_exception>(&it.desc)) {
+        k += pk_epatches(e->exn.ctor);
+      } else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+        if (m->md.type) k += pk_mpatches(*m->md.type, fuel - 1);
+      } else if (auto* m = std::get_if<Psig_modtype>(&it.desc)) {
+        if (m->type) k += pk_mpatches(*m->type, fuel - 1);
+      }
+    }
+    return k;
+  }
   // What a value binding puts in the enclosing signature: the annotations on
   // its own pattern and on the parameters and result of the function it binds.
   static long long pack_pat_ann(const Pattern& p) {
@@ -27167,6 +27229,26 @@ struct Count {
       if (exhmat_off() || cexty_off())  // else `cx_row` reads the row (S507)
         n += ctor_reify(c->id.txt);
       if (c->arg) pat(**c->arg, out);
+      // A variable the pattern binds at a constructor's PACKAGE-typed
+      // argument is package-typed by the declaration: an unpack or a
+      // constraint over it later meets that type (S540, fstclassmod's
+      // `Pair p -> let module P = (val p : PAIR with type t = s)`).
+      if (c->arg && !mtyres_off() && !exhmat_off())
+        if (std::optional<Cd> cd = ctor_cd(c->id.txt); cd && cd->args)
+          if (auto* tup = std::get_if<Pcstr_tuple>(cd->args)) {
+            auto bind_pk = [&](const Pattern& ap, const CoreType& t) {
+              auto* v = std::get_if<Ppat_var>(&ap.desc);
+              const Ptyp_package* pk = v ? pk_of_ty(t) : nullptr;
+              if (pk) pkpend_[v->name.txt] = Pk{1, pk, {}, {}};
+            };
+            if (tup->elems.size() == 1) {
+              bind_pk(**c->arg, *tup->elems[0]);
+            } else if (auto* u = std::get_if<Ppat_tuple>(&(*c->arg)->desc)) {
+              if (u->elems.size() == tup->elems.size())
+                for (std::size_t i = 0; i < u->elems.size(); ++i)
+                  bind_pk(*u->elems[i], *tup->elems[i]);
+            }
+          }
       return;
     }
     if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
@@ -27674,8 +27756,87 @@ struct Count {
     auto* b = std::get_if<Lident>(&id.v);
     if (!b) return dotted_mty(id, fuel);
     auto it = mtys.find(b->name);
-    if (it == mtys.end() || it->second.empty()) return nullptr;
+    if (it == mtys.end() || it->second.empty()) return open_mty(b->name);
     return it->second.back();
+  }
+  // ---- A SUBMODULE'S MODULE TYPE READ THROUGH ITS ASCRIPTION OR AN `open`
+  // (S540) ----------------------------------------------------------------
+  // fstclassmod.ml: `module rec Typ : sig module type PAIR = sig .. end ..
+  // end = struct .. end`, `open Typ`, then `(module P : PAIR with type t =
+  // s1 * s2)`.  The package's module type is `Typ.PAIR`, a submodule's
+  // declaration read through its parent -- S449's law: scraped once per file
+  // (`extract_sig`, typemod.ml:120), substituted at every pack
+  // (`type_package` 3332 and `wrap_constraint_package` 2370), one ident per
+  // item each time.  The model had that exact for a dotted name of a plain
+  // structure and resolved NOTHING for a name reached through an
+  // ASCRIPTION's signature (`module Typ : sig .. end = ..`, `module rec` the
+  // same) or through an `open` of the module, so such a pack was charged as
+  // a top-level module type's: 3n short.  The declaration the ascription
+  // WRITES is the one ocamlc reads (the structure's is hidden); an opened
+  // module answers a bare name its `mtys` do not.  `NOMTYRES=1` reverts.
+  static bool mtyres_off() {
+    static const bool off = dbg_env("NOMTYRES") != nullptr;
+    return off;
+  }
+  // The module type `nm` a bound module's ASCRIPTION declares, walking the
+  // signature side of the constraint.
+  static const ModuleType* asc_mty(const ModuleType* mt, const std::string& nm,
+                                   int fuel) {
+    const Signature* sg = mty_sig_s(mt, fuel);
+    const ModuleType* r = nullptr;
+    if (sg)
+      for (auto& it : *sg)
+        if (auto* m = std::get_if<Psig_modtype>(&it.desc))
+          if (m->name.txt == nm && m->type) r = &*m->type;
+    return r;
+  }
+  // `mty_sig` for a written signature alone: a `with` over one, or one.
+  static const Signature* mty_sig_s(const ModuleType* mt, int fuel) {
+    if (!mt || fuel <= 0) return nullptr;
+    if (auto* s = std::get_if<Pmty_signature>(&mt->desc)) return &s->items;
+    if (auto* w = std::get_if<Pmty_with>(&mt->desc))
+      return mty_sig_s(w->mt.get(), fuel - 1);
+    return nullptr;
+  }
+  // A bare module type name an `open` of a local module brought in: the
+  // innermost open first, its ascription's declaration or its structure's.
+  // The same, only where nothing of this file's own binds the name: such
+  // a name IS the submodule's dotted path and is read as one.
+  const ModuleType* opened_mty(const std::string& nm) const {
+    auto it = mtys.find(nm);
+    if (it != mtys.end() && !it->second.empty()) return nullptr;
+    return open_mty(nm);
+  }
+  const ModuleType* open_mty(const std::string& nm) const {
+    if (mtyres_off()) return nullptr;
+    for (auto o = opmods.rbegin(); o != opmods.rend(); ++o) {
+      if (auto* cn = std::get_if<Pmod_constraint>(&(*o)->desc)) {
+        if (const ModuleType* r = asc_mty(cn->mt.get(), nm, 8)) return r;
+        continue;
+      }
+      auto* st = std::get_if<Pmod_structure>(&(*o)->desc);
+      const ModuleType* r = nullptr;
+      if (st)
+        for (auto& it : st->items)
+          if (auto* m = std::get_if<Pstr_modtype>(&it.desc))
+            if (m->name.txt == nm && m->type) r = &*m->type;
+      if (r) return r;
+    }
+    return nullptr;
+  }
+  // The module type a dotted path names through an ASCRIBED head: the
+  // head's written signature, one `Psig_module` per further component.
+  const ModuleType* asc_dotted_mty(const std::vector<std::string>& c,
+                                   int fuel) const {
+    if (mtyres_off() || c.size() < 2) return nullptr;
+    const ModuleExpr* me = mod_named(c[0]);
+    auto* cn = me ? std::get_if<Pmod_constraint>(&me->desc) : nullptr;
+    const ModuleType* mt = cn ? cn->mt.get() : nullptr;
+    for (std::size_t j = 1; mt && j + 1 < c.size(); ++j) {
+      const Signature* sg = mty_sig_s(mt, fuel);
+      mt = sg ? sig_mod(*sg, c[j]) : nullptr;
+    }
+    return mt ? asc_mty(mt, c.back(), fuel) : nullptr;
   }
   // Is the module type a literal signature, or a `with` over one?
   static bool mty_lit(const ModuleType& mt) {
@@ -27741,7 +27902,7 @@ struct Count {
     std::vector<std::string> c;
     if (!lid_path(id, c) || c.size() < 2) return nullptr;
     const Pmod_structure* st = dmod(c, c.size() - 1);
-    if (!st) return nullptr;
+    if (!st) return asc_dotted_mty(c, fuel);
     const ModuleType* r = nullptr;
     for (auto& it : st->items)
       if (auto* m = std::get_if<Pstr_modtype>(&it.desc))
@@ -27785,11 +27946,16 @@ struct Count {
     if (!id) return 0;
     // A bare name is read where it stands and costs nothing of its own;
     // what it was declared to be may still be a path.
-    if (std::holds_alternative<Lident>(id->id.txt.v)) {
-      const ModuleType* d = named_mty(id->id.txt, fuel);
-      return d ? dforce(*d, fuel - 1, deep) : 0;
+    const ModuleType* d = nullptr;
+    if (auto* l = std::get_if<Lident>(&id->id.txt.v)) {
+      d = opened_mty(l->name);  // an opened submodule's name (S540)
+      if (!d) {
+        d = named_mty(id->id.txt, fuel);
+        return d ? dforce(*d, fuel - 1, deep) : 0;
+      }
+    } else {
+      d = dotted_mty(id->id.txt, fuel);
     }
-    const ModuleType* d = dotted_mty(id->id.txt, fuel);
     if (!d || !dscraped.insert(d).second) return 0;
     long long k = ren_mty(*d);
     if (readdecl_off()) return k;
@@ -28858,6 +29024,19 @@ struct Count {
         }
         return;
       }
+    // An ASCRIBED module (`module rec` too) shows its signature's (S540).
+    if (!cexty_off() && !mtyres_off())
+      if (auto* cn = std::get_if<Pmod_constraint>(&m.desc))
+        if (const Signature* sg = mty_sig_s(cn->mt.get(), 8)) {
+          for (auto& it : *sg) {
+            if (auto* t = std::get_if<Psig_type>(&it.desc)) reg_ctors(t->decls);
+            else if (auto* x = std::get_if<Psig_typext>(&it.desc))
+              for (auto& c : x->ext.ctors) reg_ext(c);
+            else if (auto* e = std::get_if<Psig_exception>(&it.desc))
+              reg_ext(e->exn.ctor);
+          }
+          return;
+        }
     auto* i = std::get_if<Pmod_ident>(&m.desc);
     if (!i) return;
     std::string u = mod_unit(i->id.txt);
@@ -33407,7 +33586,37 @@ struct Count {
       k += pass + sub + ctl_mty(*c->mt) + dec_mty(*c->mt) +
            (recfun_off() ? 0 : rfun_mty(*c->mt)) +
            (recfun_off() ? 0 : (rounds + 1) * sibapp(*c->me, sib)) +
-           rounds * (ren_mexpr(*c->me, sib) + recapp(*c->me, c->mt.get()));
+           rounds * (ren_mexpr(*c->me, sib) + recapp(*c->me, c->mt.get())) +
+           (mtyres_off() ? 0 : rec_mtinfos(*c->mt) + pk_mpatches(*c->mt));
+    }
+    return k;
+  }
+  // A recursive binding's actual type is checked against its declaration
+  // TWICE: `modtypes_consistency` at the binding (typemod.ml:3046) and
+  // `modtypes_constraint` at the base case (2257).  Each pairing of a module
+  // type the declaration holds substitutes its body (`modtype_infos`,
+  // includemod.ml:992) -- one ident per item at every depth, at every depth
+  // of the declaration; an ascription pays the one check, a `module rec`
+  // the other on top (S540).
+  // A module type one submodule down is substituted once more: the module
+  // item's pairing strengthens the actual side, and `modtype_infos` then
+  // walks a signature already copied once (b10, one per level).
+  static long long rec_mtinfos(const ModuleType& mt, long long w = 1) {
+    const ModuleType* b = &mt;
+    for (int i = 0; i < 8; ++i) {
+      auto* q = std::get_if<Pmty_with>(&b->desc);
+      if (!q) break;
+      b = q->mt.get();
+    }
+    auto* sg = std::get_if<Pmty_signature>(&b->desc);
+    if (!sg || w > 8) return 0;
+    long long k = 0;
+    for (auto& it : sg->items) {
+      if (auto* m = std::get_if<Psig_modtype>(&it.desc)) {
+        if (m->type) k += w * ren_mty(*m->type);
+      } else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+        if (m->md.type) k += rec_mtinfos(*m->md.type, w + 1);
+      }
     }
     return k;
   }
@@ -36300,7 +36509,10 @@ struct Count {
   // of its own; what it was declared to be may still be a path.
   long long pk_force(const Longident& id) const {
     if (!dmty_off()) {
-      if (std::holds_alternative<Lident>(id.v)) {
+      if (auto* l = std::get_if<Lident>(&id.v)) {
+        // A name an `open` brought in is the submodule's path (S540).
+        if (const ModuleType* d = opened_mty(l->name))
+          return dscraped.insert(d).second ? ren_mty(*d) : 0;
         if (const ModuleType* d = named_mty(id, 8))
           return dforce(*d, 7, false);
       } else if (const ModuleType* d = dotted_mty(id, 8)) {
@@ -39355,6 +39567,8 @@ struct Count {
       type_decls(t->decls, per);
       if (saved_ && !packty_off())
         for (auto& d : t->decls) n += pack_decl(d);
+      else if (!packty_off() && !mtyres_off())
+        for (auto& d : t->decls) n += pk_dpatches(d);
       if (!pkmeet_off() && !packty_off() && !pkinfer_off())
         for (auto& d : t->decls) n += pk_mtx() * pack_decl_nodes(d);
       if (!pkclass_off())
@@ -39363,6 +39577,8 @@ struct Count {
       type_decls(t->decls, per);
       if (saved_ && !packty_off())
         for (auto& d : t->decls) n += pack_decl(d);
+      else if (!packty_off() && !mtyres_off())
+        for (auto& d : t->decls) n += pk_dpatches(d);
     // An EXTENSION CONSTRUCTOR is a signature item of its own -- `Sig_typext`
     // carries one ident per constructor, and an `exception` is one of them --
     // so the cascade renames it at the level's weight exactly as it renames a
@@ -39374,10 +39590,13 @@ struct Count {
       for (auto& c : x->ext.ctors) ext_ctor(c);
       if (saved_ && !packty_off())
         for (auto& c : x->ext.ctors) n += pack_ext(c);
+      else if (!packty_off() && !mtyres_off())
+        for (auto& c : x->ext.ctors) n += pk_epatches(c);
     } else if (auto* e = std::get_if<Psig_exception>(&it.desc)) {
       if (!sigext_off()) n += per - 1;
       ext_ctor(e->exn.ctor);
       if (saved_ && !packty_off()) n += pack_ext(e->exn.ctor);
+      else if (!packty_off() && !mtyres_off()) n += pk_epatches(e->exn.ctor);
     // A functor DECLARED by an ascription is the one the saved signature
     // carries, so the inferred-signature check strengthens and expands it
     // (`fexp_charge`) off its written type, as an ascription at a functor
@@ -39481,16 +39700,21 @@ struct Count {
       type_decls(t->decls, 1);
       if (saved_ && !packty_off())
         for (auto& d : t->decls) n += pack_decl(d);
+      else if (!packty_off() && !mtyres_off())
+        for (auto& d : t->decls) n += pk_dpatches(d);
       if (!pkclass_off())
         for (auto& d : t->decls) n += (2 + 2 * csig_w()) * adecl_nodes(d);
     } else if (auto* x = std::get_if<Pstr_typext>(&it.desc)) {
       for (auto& c : x->ext.ctors) { reg_ext(c); ext_ctor(c); }
       if (saved_ && !packty_off())
         for (auto& c : x->ext.ctors) n += pack_ext(c);
+      else if (!packty_off() && !mtyres_off())
+        for (auto& c : x->ext.ctors) n += pk_epatches(c);
     } else if (auto* e = std::get_if<Pstr_exception>(&it.desc)) {
       reg_ext(e->exn.ctor);
       ext_ctor(e->exn.ctor);
       if (saved_ && !packty_off()) n += pack_ext(e->exn.ctor);
+      else if (!packty_off() && !mtyres_off()) n += pk_epatches(e->exn.ctor);
     } else if (auto* p = std::get_if<Pstr_primitive>(&it.desc)) {
       ++n;
       bind(p->prim.name.txt);
@@ -39648,7 +39872,9 @@ struct Count {
         if (auto* oi = std::get_if<Pmod_ident>(&o->expr.desc)) {
           bool os = false;
           if (const ModuleExpr* ot = lal_res(oi->id.txt, os))
-            if (std::holds_alternative<Pmod_structure>(ot->desc))
+            if (std::holds_alternative<Pmod_structure>(ot->desc) ||
+                (!mtyres_off() &&
+                 std::holds_alternative<Pmod_constraint>(ot->desc)))
               opmods.push_back(ot);
         }
       n += gen ? ren_mexpr(o->expr, Sibs{}) : exports(o->expr);
