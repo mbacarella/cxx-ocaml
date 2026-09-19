@@ -20717,6 +20717,12 @@ bool xrd_off() {
   static const bool off = dbg_env("NOXRD") != nullptr;
   return off;
 }
+// S545: a saved LOCAL application's first expanding read (see
+// `Count::lrd_charge`).  `NOLRD=1` reverts.
+bool lrd_off() {
+  static const bool off = dbg_env("NOLRD") != nullptr;
+  return off;
+}
 // The key of an application's arguments, outermost application first:
 // "(String.)" for `F (String)`, "()" for an argument with no path.
 std::string xapp_args(const ModuleExpr& m, bool* pathed) {
@@ -21314,6 +21320,11 @@ struct Cites {
   // by `type v = P.S.t`.
   bool tpos_ = false;
   std::set<std::string> treads_;
+  // .. of those, the ones a type DECLARATION's manifest names: the one
+  // position whose expansion is forced at the declaration itself, where a
+  // constraint on a value expands only what it meets (S545).
+  bool dpos_ = false;
+  std::set<std::string> dreads_;
   // The same reads with the scope they stand in ("<scope>|<path>"): a
   // NARROWED module's abstract type is read by name outside the ascription
   // too, where it is the declaration's and builds nothing.
@@ -21351,6 +21362,12 @@ struct Cites {
   std::set<std::string> vreads_;
   std::set<std::string> xreads_;
   std::map<std::string, int> areads_;
+  // A value read at a KNOWN expected type -- a typed local function's
+  // parameter, a unit function's, a written annotation -- has that type's
+  // head expanded (`type_argument`, typecore.ml:6632), which for a local
+  // application's strengthened abstract type is a build (S545).  A type
+  // variable nothing has fixed yet expands nothing.
+  std::set<std::string> kreads_;
   static bool dotted_path(const Longident& id, std::string& out) {
     std::vector<std::string> c;
     if (!lid_comps(id, c) || c.size() < 2) return false;
@@ -21609,6 +21626,7 @@ struct Cites {
       if (read_key(id, s, true)) {
         treads_.insert(s);
         treadsc_.insert(bscope() + "|" + s);
+        if (dpos_) dreads_.insert(s);
       }
       return;
     }
@@ -22875,6 +22893,11 @@ struct Cites {
     if (auto* i = std::get_if<Pexp_ident>(&e.desc)) {
       cite(i->id, false);
       vread(i->id.txt);
+      if (!lrd_off() && x.known() &&
+          !(x.c && x.c->kind == cmi::TypeExpr::Tvar)) {
+        std::string s;
+        if (read_key(i->id.txt, s)) kreads_.insert(s);
+      }
     } else if (auto* a = std::get_if<Pexp_apply>(&e.desc)) {
       const Expression* fn = a->fn.get();
       std::vector<const Expression*> as;
@@ -23221,7 +23244,12 @@ struct Cites {
   void tdecl(const TypeDeclaration& d) {
     tbound_.insert(d.name.txt);
     for (auto& p : d.params) ty(*p);
-    if (d.manifest) tyx(**d.manifest);
+    if (d.manifest) {
+      const bool dv = dpos_;
+      dpos_ = true;
+      tyx(**d.manifest);
+      dpos_ = dv;
+    }
     if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
       for (auto& c : v->ctors) {
         cargs(c.args);
@@ -31907,11 +31935,26 @@ struct Count {
       bool sv = saved_;
       inexpr_ = true;
       saved_ = false;
-      item(*s->item);
+      // Nothing saves a `let module`'s structure, so no cascade renames
+      // the items below it: a submodule's ascription inside one is
+      // translated once, at any depth (S545, `Lvl{1, 0, ..}`).
+      item(*s->item, lrd_off() ? Lvl{1, 1, 0, true} : Lvl{1, 0, 0, true});
       n += xrd_charge(*s);
+      std::size_t lmk = lmods_.size();
+      if (!lrd_off())
+        if (auto* lm = std::get_if<Pstr_module>(&s->item->desc))
+          if (lm->binding.name.txt) {
+            const std::string pre = "@" + std::to_string((std::uintptr_t)s) +
+                                    "/" + *lm->binding.name.txt + ".";
+            n += lrd_charge(lm->binding.expr, {pre});
+            // (a plain alias has no `xrd` scope: its reads are keyed bare)
+            n += lma_charge(lm->binding.expr, *lm->binding.name.txt + ".");
+            lmods_.push_back(*lm->binding.name.txt);
+          }
       saved_ = sv;
       inexpr_ = ie;
       expr(*s->body);
+      lmods_.resize(lmk);
       release(m);
       if (!pkwith_off()) mrelease(mk);
       erelease(ek);
@@ -32308,6 +32351,14 @@ struct Count {
       return ren_mexpr(i->expr, sib);
     if (auto* m = std::get_if<Pstr_module>(&it.desc))
       return 1 + ren_mexpr(m->binding.expr, sib);
+    // A `module rec`'s bindings are `Sig_module` items like any other's
+    // (S545; the arm was missing, and an inner `module rec` in a `module
+    // rec`'s body was 1 + its items short per round).
+    if (auto* m = std::get_if<Pstr_recmodule>(&it.desc); m && !lrd_off()) {
+      long long k = 0;
+      for (auto& b : m->bindings) k += 1 + ren_mexpr(b.expr, sib);
+      return k;
+    }
     if (auto* m = std::get_if<Pstr_modtype>(&it.desc))
       return 1 + (m->type ? ren_mty(*m->type) : 0);
     if (std::holds_alternative<Pstr_primitive>(it.desc) ||
@@ -37946,6 +37997,258 @@ struct Count {
     }
     return false;
   }
+  // ---- A SAVED LOCAL APPLICATION IS BUILT AGAIN BY ITS FIRST EXPANDING
+  // READ (S545) ----------------------------------------------------------
+  // `module C = LH (I)` over a functor of THIS file is bound strengthened,
+  // so its abstract `heap` wears the manifest `LH (I).heap`; the first read
+  // that expands it -- `C.findMin C.empty`, `ignore C.empty`, `let _`, a
+  // scrutinee, a `: C.heap` on a let, `type u = C.heap`, a consumed
+  // parameter of one of its own functions -- is `Env.find_type` on the
+  // `Papply` in the TYPING env: the functor's components (its parameters
+  // written out as signatures and its result, deep: `mapp_rounds`' `a[1] +
+  // w[1]`) once per functor for the file, and the application's (`w[i]`, a
+  // partial's components `a[i+1] + w[i+1]` on the way) once per applied
+  // path.  The compunit check builds the same again in ITS env (that is
+  // what `app_charge`'s lumps stand for), so the two are added: 14 for a
+  // `HEAP with module Elem = Element` result at one parameter, 63 after
+  // `Bootstrap (LeftistHeap) (Ints)`.  Nothing where the binding is
+  // ascribed (the manifests are gone), a function alone is read, a
+  // parameter is annotated, a cross-unit functor is applied (built at the
+  // application), or the result's types carry manifests.  A `let module`
+  // over a local functor reads the same way (`xrd_charge` answered 0 for
+  // it).  Which reads expand is `vread_builds`/`tread_builds` over the
+  // written result.  `NOLRD=1` reverts.
+  struct FLevel;  // the parameter levels of a functor, defined below
+  std::set<std::string> lrdf_, lrda_;  // functors, applied paths built
+  static const CoreType* p_tskip(const CoreType* t) {
+    for (int i = 0; t && i < 64; ++i) {
+      if (auto* p = std::get_if<Ptyp_poly>(&t->desc)) t = p->type.get();
+      else if (auto* a = std::get_if<Ptyp_alias>(&t->desc)) t = a->type.get();
+      else break;
+    }
+    return t;
+  }
+  // The declaration `t`'s head names where it is one of `sg`'s OWN (or of
+  // a submodule of it) and has no manifest to expand away.
+  std::set<std::string> lrdconc_;  // the types a `with` gave a manifest
+  const TypeDeclaration* p_ctor_abs(const CoreType* t,
+                                    const Signature& sg) const {
+    auto* c = t ? std::get_if<Ptyp_constr>(&t->desc) : nullptr;
+    if (!c) return nullptr;
+    std::vector<std::string> p;
+    if (!lid_path(c->id.txt, p) || p.empty()) return nullptr;
+    if (p.size() == 1 && lrdconc_.count(p[0])) return nullptr;
+    const Signature* at = &sg;
+    for (std::size_t i = 0; at && i + 1 < p.size(); ++i)
+      at = mty_sig(sig_mod(*at, p[i]));
+    if (!at) return nullptr;
+    for (auto& it : *at)
+      if (auto* ty = std::get_if<Psig_type>(&it.desc))
+        for (auto& d : ty->decls)
+          if (d.name.txt == p.back()) return d.manifest ? nullptr : &d;
+    return nullptr;
+  }
+  const TypeDeclaration* p_head_abs(const CoreType* t,
+                                    const Signature& sg) const {
+    return p_ctor_abs(p_tskip(t), sg);
+  }
+  const TypeDeclaration* p_spine_abs(const CoreType* t,
+                                     const Signature& sg) const {
+    for (int i = 0; i < 64; ++i) {
+      t = p_tskip(t);
+      auto* a = t ? std::get_if<Ptyp_arrow>(&t->desc) : nullptr;
+      if (!a) return p_ctor_abs(t, sg);
+      t = a->cod.get();
+    }
+    return nullptr;
+  }
+  bool p_names_param_abs(const CoreType* t, const Signature& sg,
+                         int depth) const {
+    if (!t || depth > 24) return false;
+    if (const TypeDeclaration* td = p_ctor_abs(t, sg))
+      if (!td->params.empty()) return true;
+    if (auto* a = std::get_if<Ptyp_arrow>(&t->desc))
+      return p_names_param_abs(a->dom.get(), sg, depth + 1) ||
+             p_names_param_abs(a->cod.get(), sg, depth + 1);
+    if (auto* c = std::get_if<Ptyp_constr>(&t->desc)) {
+      for (auto& x : c->args)
+        if (p_names_param_abs(x.get(), sg, depth + 1)) return true;
+    } else if (auto* u = std::get_if<Ptyp_tuple>(&t->desc)) {
+      for (auto& x : u->elems)
+        if (p_names_param_abs(x.get(), sg, depth + 1)) return true;
+    } else if (auto* p = std::get_if<Ptyp_poly>(&t->desc)) {
+      return p_names_param_abs(p->type.get(), sg, depth + 1);
+    } else if (auto* a = std::get_if<Ptyp_alias>(&t->desc)) {
+      return p_names_param_abs(a->type.get(), sg, depth + 1);
+    }
+    return false;
+  }
+  bool p_tread_builds(const Signature& sg, const std::string& pre) const {
+    if (!dreads_) return false;
+    for (auto& it : sg)
+      if (auto* ty = std::get_if<Psig_type>(&it.desc))
+        for (auto& d : ty->decls)
+          if (!d.manifest && dreads_->count(pre + d.name.txt)) return true;
+    return false;
+  }
+  bool p_vread_builds(const Signature& sg, const std::string& pre) const {
+    if (vread_off() || !vreads_) return false;
+    for (auto& it : sg) {
+      const ValueDescription* vd = nullptr;
+      if (auto* v = std::get_if<Psig_value>(&it.desc)) vd = &v->vd;
+      if (!vd) continue;
+      const std::string key = pre + vd->name.txt;
+      if (!vreads_->count(key)) continue;
+      const CoreType* t = vd->type.get();
+      const TypeDeclaration* h = p_head_abs(t, sg);
+      if (h && (!h->params.empty() || xreads_->count(key) ||
+                (kreads_ && kreads_->count(key))))
+        return true;
+      if (!meet_off()) {
+        if (ureads_->count(key) && p_names_param_abs(t, sg, 0)) return true;
+        if (lreads_->count(key) && p_spine_abs(t, sg)) return true;
+      }
+      auto ar = areads_->find(key);
+      if (ar == areads_->end()) continue;
+      for (int i = 0; i < ar->second && t; ++i) {
+        t = p_tskip(t);
+        auto* a = t ? std::get_if<Ptyp_arrow>(&t->desc) : nullptr;
+        if (!a) { t = nullptr; break; }
+        if (p_head_abs(a->dom.get(), sg)) return true;
+        t = a->cod.get();
+      }
+      if (t && p_head_abs(t, sg)) return true;
+    }
+    return false;
+  }
+  // The read's build of `m` bound as `name` (`pres`: the prefixes its
+  // values are read under).
+  long long lrd_charge(const ModuleExpr& m,
+                       const std::vector<std::string>& pres) {
+    if (lrd_off()) return 0;
+    const ModuleExpr* head = &m;
+    int nargs = 0;
+    std::vector<const ModuleExpr*> args;  // innermost application first
+    while (auto* a = std::get_if<Pmod_apply>(&head->desc)) {
+      if (!has_path(*a->arg)) return 0;
+      args.push_back(a->arg.get());
+      ++nargs;
+      head = a->f.get();
+    }
+    if (!nargs) return 0;
+    const ModuleExpr* fdef = mderef(head);
+    std::vector<FLevel> flv;
+    if (!fdef || !fun_levels(fdef, flv) || (int)flv.size() < nargs) return 0;
+    const int P = (int)flv.size();
+    if (P > nargs) return 0;  // a partial application has no values to read
+    // the written result: the ascription's signature, or the structure's
+    const ModuleExpr* rest = flv[nargs - 1].rest;
+    const ModuleType* rmt = nullptr;
+    const Signature* sg = nullptr;
+    if (auto* c = std::get_if<Pmod_constraint>(&rest->desc)) {
+      rmt = c->mt.get();
+      sg = mty_sig(rmt);
+    } else if (std::holds_alternative<Pmod_structure>(rest->desc)) {
+      return lrd_struct(m, flv, args, rest);
+    }
+    if (!sg) return 0;
+    WScope ws{*this};
+    ws_params(fdef, nullptr, ws);
+    lrdconc_.clear();
+    res_conc(*rmt, lrdconc_);
+    bool builds = false;
+    for (auto& pre : pres)
+      if (p_tread_builds(*sg, pre) || p_vread_builds(*sg, pre)) builds = true;
+    lrdconc_.clear();
+    if (!builds) return 0;
+    // A result at a bare NAME is substituted as the name (nothing); a
+    // `with` over one is written out.
+    long long fl = wt_mty(*rmt, flat());
+    if (std::holds_alternative<Pmty_with>(rmt->desc))
+      if (const ModuleType* rnm = res_named(nullptr, rmt))
+        fl += res_wt(*rnm, flat());
+    return lrd_rounds(fdef, flv, args, nargs, fl);
+  }
+  // An unascribed functor's result carries manifests for what its structure
+  // defines; only a manifest-less type of its own (a variant, a record) is
+  // left abstract, and those are not modelled here.
+  long long lrd_struct(const ModuleExpr&, const std::vector<FLevel>&,
+                       const std::vector<const ModuleExpr*>&,
+                       const ModuleExpr*) const {
+    return 0;
+  }
+  // ---- A READ THROUGH A `let module` ALIAS FORCES THE SUBMODULE (S545)
+  // `let module T = TT in T.N.x`, TT a `let module` structure of the same
+  // expression: the read scrapes the alias (`Env.scrape_alias`, env.ml:1709)
+  // and strengthens TT's signature, which forces N's lazy one -- its top
+  // items renamed, once per structure for the file (the strengthened
+  // components are cached).  A read of a top item (`T.z`), a read through
+  // TT itself, or a top-level TT costs nothing.
+  std::vector<std::string> lmods_;  // the `let module`s in scope
+  std::set<const ModuleExpr*> lmaf_;
+  bool lm_read_under(const std::string& pre) const {
+    for (auto* rs : {vreads_, treads_}) {
+      if (!rs) continue;
+      auto it = rs->lower_bound(pre);
+      if (it != rs->end() && it->compare(0, pre.size(), pre) == 0)
+        return true;
+    }
+    return false;
+  }
+  long long lma_charge(const ModuleExpr& m, const std::string& pre) {
+    // the alias chain, every link a `let module` of this expression, down
+    // to a structure bound as one (a top-level target is eager already)
+    const ModuleExpr* me = &m;
+    const Pmod_structure* st = nullptr;
+    for (int i = 0; me && i < 8; ++i) {
+      auto* pi = std::get_if<Pmod_ident>(&me->desc);
+      auto* li = pi ? std::get_if<Lident>(&pi->id.txt.v) : nullptr;
+      if (!li || std::find(lmods_.begin(), lmods_.end(), li->name) ==
+                     lmods_.end())
+        return 0;
+      me = mod_named(li->name);
+      if ((st = me ? std::get_if<Pmod_structure>(&me->desc) : nullptr)) break;
+    }
+    if (!st) return 0;
+    long long k = 0;
+    for (auto& it : st->items) {
+      auto* sm = std::get_if<Pstr_module>(&it.desc);
+      if (!sm || !sm->binding.name.txt) continue;
+      const ModuleExpr* ne = mderef(&sm->binding.expr);
+      auto* ns = ne ? std::get_if<Pmod_structure>(&ne->desc) : nullptr;
+      if (!ns || !lm_read_under(pre + *sm->binding.name.txt + ".")) continue;
+      if (!lmaf_.insert(ne).second) continue;
+      for (auto& ni : ns->items) k += str_items(ni);  // top items alone
+    }
+    return k;
+  }
+  // `mapp_rounds` over the read's own caches (the typing env's, not the
+  // check's): the functor's components once, each applied path's once.
+  long long lrd_rounds(const ModuleExpr* fdef, const std::vector<FLevel>& lv,
+                       const std::vector<const ModuleExpr*>& args, int nargs,
+                       long long fl) {
+    const int P = (int)lv.size();
+    std::vector<std::pair<std::string, const ModuleType*>> fps;
+    for (auto& l : lv) fps.emplace_back(l.name, l.type);
+    std::vector<long long> a(P + 2, 0), w(P + 2, 0);
+    for (int i = 1; i <= P; ++i) a[i] = par_wt(*lv[i - 1].type, fps);
+    w[P] = fl;
+    for (int i = P - 1; i >= 1; --i) w[i] = w[i + 1] + 1 + a[i + 1];
+    const std::string key = std::to_string((std::uintptr_t)fdef);
+    long long k = 0;
+    if (lrdf_.insert(key).second) k += a[1] + w[1];
+    std::string ak = key;
+    for (int i = 1; i <= nargs; ++i) {
+      const ModuleExpr* g = args[nargs - i];
+      if (auto* pi = std::get_if<Pmod_ident>(&g->desc))
+        ak += "(" + lid_full(pi->id.txt) + ")";
+      else
+        ak += "(" + std::to_string((std::uintptr_t)g) + ")";
+      if (lrda_.insert(ak).second) k += w[i];
+      if (i < P && lrda_.insert(ak + "#").second) k += a[i + 1] + w[i + 1];
+    }
+    return k;
+  }
   // ---- A LET MODULE'S FIRST EXPANDING READ BUILDS THE APPLICATION (S535)
   // `let module N = Map.Make (String) in ..` is bound strengthened, so its
   // `'a t` wears the manifest `'a Map.Make (String).t`; the first read of
@@ -39892,6 +40195,8 @@ struct Count {
   const std::set<std::string>* oheads_ = nullptr;
   const std::set<std::string>* vreads_ = nullptr;
   const std::set<std::string>* xreads_ = nullptr;
+  const std::set<std::string>* kreads_ = nullptr;
+  const std::set<std::string>* dreads_ = nullptr;
   const std::set<std::string>* ureads_ = nullptr;
   const std::set<std::string>* lreads_ = nullptr;
   const std::map<std::string, int>* areads_ = nullptr;
@@ -40953,6 +41258,18 @@ struct Count {
       mexpr(m->binding.expr, ml,
             appexp_off() || saved_ || !local_app(m->binding.expr));
       if (nfw) --nfwalk_;
+      // A saved local application's first expanding read builds it (S545):
+      // the values are read as `C.x` from inside this structure and as
+      // `W.C.x` from outside.
+      if (!lrd_off() && fxp && saved_ && !inexpr_ && !mdiscard_ &&
+          !is_dead(ml) &&
+          std::holds_alternative<Pmod_apply>(m->binding.expr.desc)) {
+        std::string full;
+        for (auto& s : fxpath_) full += s + ".";
+        std::vector<std::string> pres{*m->binding.name.txt + "."};
+        if (full != pres[0]) pres.push_back(full);
+        n += lrd_charge(m->binding.expr, pres);
+      }
       if (fxp) fxpath_.pop_back();
       ascr_sig_ = asv;
       mdiscard_ = dsv;
@@ -40975,6 +41292,20 @@ struct Count {
       }
       recb_ = rbv;
       n += recmodule_extra(*m);
+      // A `module rec` an ascription HIDES is never paired by the compunit
+      // check, so its declarations' submodules are not expanded as aliases
+      // there: one less per item below the top of each declaration (S545).
+      if (!lrd_off())
+        for (auto& b : m->bindings) {
+          const bool hidden =
+              is_dead(l) || mdiscard_ ||
+              (ascr_sig_ && b.name.txt &&
+               !sig_binds_mod(*ascr_sig_, *b.name.txt));
+          auto* c = std::get_if<Pmod_constraint>(&b.expr.desc);
+          if (!hidden || !c) continue;
+          if (const Signature* sg = mty_sig(c->mt.get()))
+            n -= w_nested(*sg, res_gone(*c->mt), res_opens(*c->mt));
+        }
     } else if (auto* m = std::get_if<Pstr_modtype>(&it.desc)) {
       if (m->type) {
         MtCtx sv = mtctx_;
@@ -41670,6 +42001,8 @@ int typing_ident_count(const ast::Structure& s, std::size_t eta_sites,
   c.oheads_ = &u.oheads_;
   c.vreads_ = &u.vreads_;
   c.xreads_ = &u.xreads_;
+  c.kreads_ = &u.kreads_;
+  c.dreads_ = &u.dreads_;
   c.ureads_ = &u.ureads_;
   c.lreads_ = &u.lreads_;
   c.areads_ = &u.areads_;
