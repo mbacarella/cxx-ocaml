@@ -20723,6 +20723,12 @@ bool lrd_off() {
   static const bool off = dbg_env("NOLRD") != nullptr;
   return off;
 }
+// S546: a saved LOCAL application built again where it is an ARGUMENT
+// (see `Count::larg_charge`).  `NOLARG=1` reverts.
+bool larg_off() {
+  static const bool off = dbg_env("NOLARG") != nullptr;
+  return off;
+}
 // The key of an application's arguments, outermost application first:
 // "(String.)" for `F (String)`, "()" for an argument with no path.
 std::string xapp_args(const ModuleExpr& m, bool* pathed) {
@@ -38033,11 +38039,15 @@ struct Count {
   std::set<std::string> lrdconc_;  // the types a `with` gave a manifest
   const TypeDeclaration* p_ctor_abs(const CoreType* t,
                                     const Signature& sg) const {
+    return p_ctor_absc(t, sg, lrdconc_);
+  }
+  const TypeDeclaration* p_ctor_absc(const CoreType* t, const Signature& sg,
+                                     const std::set<std::string>& conc) const {
     auto* c = t ? std::get_if<Ptyp_constr>(&t->desc) : nullptr;
     if (!c) return nullptr;
     std::vector<std::string> p;
     if (!lid_path(c->id.txt, p) || p.empty()) return nullptr;
-    if (p.size() == 1 && lrdconc_.count(p[0])) return nullptr;
+    if (p.size() == 1 && conc.count(p[0])) return nullptr;
     const Signature* at = &sg;
     for (std::size_t i = 0; at && i + 1 < p.size(); ++i)
       at = mty_sig(sig_mod(*at, p[i]));
@@ -38124,7 +38134,10 @@ struct Count {
   // The read's build of `m` bound as `name` (`pres`: the prefixes its
   // values are read under).
   long long lrd_charge(const ModuleExpr& m,
-                       const std::vector<std::string>& pres) {
+                       const std::vector<std::string>& pres,
+                       const Signature* psg = nullptr,
+                       const std::set<std::string>* pconc = nullptr,
+                       const cmi::Signature* cpsg = nullptr) {
     if (lrd_off()) return 0;
     const ModuleExpr* head = &m;
     int nargs = 0;
@@ -38137,6 +38150,8 @@ struct Count {
     }
     if (!nargs) return 0;
     const ModuleExpr* fdef = mderef(head);
+    if (auto* hp = std::get_if<Pmod_ident>(&head->desc); hp && !fdef)
+      fdef = path_mexpr(hp->id.txt);
     std::vector<FLevel> flv;
     if (!fdef || !fun_levels(fdef, flv) || (int)flv.size() < nargs) return 0;
     const int P = (int)flv.size();
@@ -38151,14 +38166,24 @@ struct Count {
     } else if (std::holds_alternative<Pmod_structure>(rest->desc)) {
       return lrd_struct(m, flv, args, rest);
     }
-    if (!sg) return 0;
+    std::string xkey;
+    const cmi::Signature* csg = sg ? nullptr : xmty_sig(rmt, xkey);
+    if (!sg && !(csg && (psg || cpsg))) return 0;
     WScope ws{*this};
     ws_params(fdef, nullptr, ws);
     lrdconc_.clear();
     res_conc(*rmt, lrdconc_);
     bool builds = false;
-    for (auto& pre : pres)
-      if (p_tread_builds(*sg, pre) || p_vread_builds(*sg, pre)) builds = true;
+    la_sg_ = sg;
+    la_csg_ = csg;
+    if (psg) builds = p_arg_builds(*psg, *pconc);
+    if (cpsg) builds = p_arg_builds_c(*cpsg);
+    la_sg_ = nullptr;
+    la_csg_ = nullptr;
+    if (sg)
+      for (auto& pre : pres)
+        if (p_tread_builds(*sg, pre) || p_vread_builds(*sg, pre))
+          builds = true;
     lrdconc_.clear();
     if (!builds) return 0;
     // A result at a bare NAME is substituted as the name (nothing); a
@@ -38247,6 +38272,277 @@ struct Count {
       if (lrda_.insert(ak).second) k += w[i];
       if (i < P && lrda_.insert(ak + "#").second) k += a[i + 1] + w[i + 1];
     }
+    return k;
+  }
+  // ---- A SAVED LOCAL APPLICATION IS BUILT AGAIN WHERE IT IS AN ARGUMENT
+  // (S546) ----------------------------------------------------------------
+  // `module TS1 = Test (HS1)` with `module HS1 = HofM (MS)` over a functor
+  // of this file ascribed `S with type key = M.key`: HS1 is bound
+  // strengthened, so its abstract `'a t` wears the manifest `'a HofM
+  // (MS).t`, and the check of HS1 against Test's parameter
+  // (`Includemod.modtypes`, typemod.ml:2690) `moregen`s every value of the
+  // parameter's signature against HS1's -- `int -> 'a t` against `int ->
+  // 'a t` with `t` an abbreviation is expanded on both sides (ctype.ml:
+  // 4604), and the expansion is `Env.find_type` on the `Papply` in the
+  // TYPING env: the functor's components once per functor for the file and
+  // the application's once per applied path, the caches S545's read shares
+  // (`lrdf_`, `lrda_`: a read before the application pays, the application
+  // then nothing).  A type with no parameter is met by `path_equiv` and
+  // expands nothing (`val k : key`), a manifest of the parameter's
+  // signature (`type 'a u = 'a t`, `type u = t`) is `expand_head`ed at any
+  // arity, a submodule's are read the same way; nothing where the
+  // parameter's type has a manifest, where the argument is ascribed at its
+  // binding, or where the functor applied is another unit's (built at the
+  // application).  Every application typed checks -- a saved one, an
+  // included one, a `let module`, one in a functor body, a second
+  // parameter's, a partial one.  `NOLARG=1` reverts.
+  // The argument's result signature, this file's or another unit's, and
+  // whether `n` is one of its types left abstract (its `with` names are in
+  // `lrdconc_`).
+  const Signature* la_sg_ = nullptr;
+  const cmi::Signature* la_csg_ = nullptr;
+  bool la_abs(const std::string& n) const {
+    if (lrdconc_.count(n)) return false;
+    if (la_sg_) {
+      for (auto& it : *la_sg_)
+        if (auto* ty = std::get_if<Psig_type>(&it.desc))
+          for (auto& d : ty->decls)
+            if (d.name.txt == n) return !d.manifest;
+    } else if (la_csg_) {
+      for (auto& d : la_csg_->types)
+        if (d.name == n) return !d.manifest;
+    }
+    return false;
+  }
+  // A constructor of `t` abstract in the parameter's signature `psg` (its
+  // `with` names in `pconc`) -- parameterized where `params` -- and in the
+  // argument's result alike.
+  bool p_names_abs2(const CoreType* t, const Signature& psg,
+                    const std::set<std::string>& pconc, bool params,
+                    int depth) const {
+    if (!t || depth > 24) return false;
+    if (auto* c = std::get_if<Ptyp_constr>(&t->desc)) {
+      std::vector<std::string> p;
+      if (lid_path(c->id.txt, p) && p.size() == 1) {
+        const TypeDeclaration* pd = p_ctor_absc(t, psg, pconc);
+        if (pd && (!params || !pd->params.empty()) && la_abs(p[0]))
+          return true;
+      }
+      for (auto& x : c->args)
+        if (p_names_abs2(x.get(), psg, pconc, params, depth + 1)) return true;
+    } else if (auto* a = std::get_if<Ptyp_arrow>(&t->desc)) {
+      return p_names_abs2(a->dom.get(), psg, pconc, params, depth + 1) ||
+             p_names_abs2(a->cod.get(), psg, pconc, params, depth + 1);
+    } else if (auto* u = std::get_if<Ptyp_tuple>(&t->desc)) {
+      for (auto& x : u->elems)
+        if (p_names_abs2(x.get(), psg, pconc, params, depth + 1)) return true;
+    } else if (auto* p = std::get_if<Ptyp_poly>(&t->desc)) {
+      return p_names_abs2(p->type.get(), psg, pconc, params, depth + 1);
+    } else if (auto* a = std::get_if<Ptyp_alias>(&t->desc)) {
+      return p_names_abs2(a->type.get(), psg, pconc, params, depth + 1);
+    }
+    return false;
+  }
+  bool p_arg_builds(const Signature& psg, const std::set<std::string>& pconc,
+                    int depth = 0) {
+    if (depth > 8) return false;
+    for (auto& it : psg) {
+      if (auto* v = std::get_if<Psig_value>(&it.desc)) {
+        if (p_names_abs2(v->vd.type.get(), psg, pconc, true, 0)) return true;
+      } else if (auto* ty = std::get_if<Psig_type>(&it.desc)) {
+        for (auto& d : ty->decls)
+          if (d.manifest &&
+              p_names_abs2(d.manifest->get(), psg, pconc, false, 0))
+            return true;
+      } else if (auto* md = std::get_if<Psig_module>(&it.desc)) {
+        if (!md->md.name.txt || !md->md.type) continue;
+        const Signature* ps = mty_sig(&*md->md.type);
+        if (!ps) continue;
+        const Signature* s0 = la_sg_;
+        const cmi::Signature* c0 = la_csg_;
+        const bool b = la_under(*md->md.name.txt) &&
+                       p_arg_builds(*ps, {}, depth + 1);
+        la_sg_ = s0;
+        la_csg_ = c0;
+        if (b) return true;
+      }
+    }
+    return false;
+  }
+  // The same over another unit's parameter signature (`Hashtbl.SeededS`):
+  // its types are the signature's own idents.
+  bool c_names_abs2(const cmi::TypeExpr* t, const cmi::Signature& psg,
+                    bool params, int depth) const {
+    if (!t || depth > 24) return false;
+    switch (t->kind) {
+      case cmi::TypeExpr::Tlink:
+      case cmi::TypeExpr::Tsubst:
+      case cmi::TypeExpr::Tpoly:
+        return c_names_abs2(t->link.get(), psg, params, depth + 1);
+      case cmi::TypeExpr::Tarrow:
+        return c_names_abs2(t->dom.get(), psg, params, depth + 1) ||
+               c_names_abs2(t->cod.get(), psg, params, depth + 1);
+      case cmi::TypeExpr::Ttuple:
+        for (auto& e : t->elems)
+          if (c_names_abs2(e.second.get(), psg, params, depth + 1))
+            return true;
+        return false;
+      case cmi::TypeExpr::Tconstr: {
+        if (t->path && t->path->kind == cmi::Path::Pident) {
+          const std::string& n = t->path->id.name;
+          for (auto& d : psg.types)
+            if (d.name == n && !d.manifest && (!params || !d.params.empty()) &&
+                la_abs(n))
+              return true;
+        }
+        for (auto& x : t->args)
+          if (c_names_abs2(x.get(), psg, params, depth + 1)) return true;
+        return false;
+      }
+      default:
+        return false;
+    }
+  }
+  bool p_arg_builds_c(const cmi::Signature& psg, int depth = 0) {
+    if (depth > 8) return false;
+    for (auto& v : psg.values)
+      if (c_names_abs2(v.type.get(), psg, true, 0)) return true;
+    for (auto& d : psg.types)
+      if (d.manifest && c_names_abs2(d.manifest.get(), psg, false, 0))
+        return true;
+    for (auto& md : psg.modules) {
+      if (!md.type || md.type->kind != cmi::ModuleType::Sig || !md.type->sig)
+        continue;
+      const Signature* s0 = la_sg_;
+      const cmi::Signature* c0 = la_csg_;
+      const bool b =
+          la_under(md.name) && p_arg_builds_c(*md.type->sig, depth + 1);
+      la_sg_ = s0;
+      la_csg_ = c0;
+      if (b) return true;
+    }
+    return false;
+  }
+  // Step the argument's result into its submodule `n` (the caller restores).
+  bool la_under(const std::string& n) {
+    if (la_sg_) {
+      const ModuleType* mt = sig_mod(*la_sg_, n);
+      if (const Signature* s = mty_sig(mt)) { la_sg_ = s; return true; }
+      std::string key;
+      if (const cmi::Signature* cs = xmty_sig(mt, key)) {
+        la_sg_ = nullptr; la_csg_ = cs; return true;
+      }
+    } else if (la_csg_) {
+      for (auto& md : la_csg_->modules)
+        if (md.name == n && md.type && md.type->kind == cmi::ModuleType::Sig &&
+            md.type->sig) {
+          la_csg_ = md.type->sig.get();
+          return true;
+        }
+    }
+    return false;
+  }
+  // The module a path of this file is bound to, through its aliases.
+  const ModuleExpr* path_mexpr(const Longident& id) const {
+    std::vector<std::string> c;
+    if (!lid_path(id, c) || c.empty()) return nullptr;
+    const ModuleExpr* me = mod_named(c[0]);
+    for (std::size_t j = 1; me && j < c.size(); ++j) {
+      me = mderef(me);
+      me = me ? msub(*me, c[j]) : nullptr;
+    }
+    return mderef(me);
+  }
+  // .. and the argument's submodules the parameter's signature pairs are
+  // aliases of its path at the check (`Mtype.strengthen`'s), each expanded
+  // once per binding (`Includemod.expand_module_alias`, memoized): the
+  // declaration forced out of the binding's lazy prefixing renames its
+  // items at every depth, and the check goes on into its own submodules the
+  // same way.  A binding that is a plain structure was entered forced and
+  // expands nothing; an ascribed one and an application expand.
+  struct AView { const Signature* sg = nullptr;
+                 const Pmod_structure* st = nullptr; };
+  struct PView { const Signature* sg = nullptr;
+                 const cmi::Signature* cs = nullptr; };
+  std::set<std::string> largs_;
+  AView aview_of(const ModuleExpr* m) const {
+    AView v;
+    if (!m) return v;
+    if (auto* c = std::get_if<Pmod_constraint>(&m->desc)) {
+      v.sg = mty_sig(c->mt.get());
+    } else if (std::holds_alternative<Pmod_apply>(m->desc)) {
+      const ModuleExpr* head = m;
+      int nargs = 0;
+      while (auto* a = std::get_if<Pmod_apply>(&head->desc)) {
+        ++nargs;
+        head = a->f.get();
+      }
+      std::vector<FLevel> flv;
+      const ModuleExpr* fdef = mderef(head);
+      if (!fdef || !fun_levels(fdef, flv) || (int)flv.size() != nargs)
+        return v;
+      return aview_of(flv[nargs - 1].rest);
+    } else if (auto* st = std::get_if<Pmod_structure>(&m->desc)) {
+      v.st = st;
+    }
+    return v;
+  }
+  long long larg_subs(const AView& a, const PView& p, const std::string& key,
+                      int depth) {
+    if (depth > 8 || (!a.sg && !a.st)) return 0;
+    std::vector<std::pair<std::string, PView>> subs;
+    if (p.sg) {
+      for (auto& it : *p.sg)
+        if (auto* md = std::get_if<Psig_module>(&it.desc))
+          if (md->md.name.txt && md->md.type)
+            subs.push_back({*md->md.name.txt,
+                            PView{mty_sig(&*md->md.type), nullptr}});
+    } else if (p.cs) {
+      for (auto& md : p.cs->modules)
+        if (md.type && md.type->kind == cmi::ModuleType::Sig && md.type->sig)
+          subs.push_back({md.name, PView{nullptr, md.type->sig.get()}});
+    }
+    long long k = 0;
+    for (auto& [n, ps] : subs) {
+      AView an;
+      long long items = 0;
+      if (a.sg) {
+        const ModuleType* mt = sig_mod(*a.sg, n);
+        an.sg = mty_sig(mt);
+        if (an.sg) for (auto& it : *an.sg) items += wt_sig_item(it, flat());
+      } else {
+        const ModuleExpr* e = nullptr;
+        for (auto& it : a.st->items)
+          if (auto* mb = std::get_if<Pstr_module>(&it.desc))
+            if (mb->binding.name.txt && *mb->binding.name.txt == n)
+              e = &mb->binding.expr;
+        if (e) items = wt_mexpr(*e, flat());
+        an = aview_of(e);
+      }
+      if (!items) continue;
+      if (largs_.insert(key + "." + n).second) k += items;
+      k += larg_subs(an, ps, key + "." + n, depth + 1);
+    }
+    return k;
+  }
+  long long larg_charge(const ModuleExpr& arg, const ModuleType& ptype) {
+    if (larg_off() || lrd_off()) return 0;
+    auto* pi = std::get_if<Pmod_ident>(&arg.desc);
+    const ModuleExpr* m = pi ? path_mexpr(pi->id.txt) : &arg;
+    if (!m || (!pi && !std::holds_alternative<Pmod_apply>(m->desc))) return 0;
+    PView pv;
+    std::string xkey;
+    pv.sg = mty_sig(&ptype);
+    if (!pv.sg) pv.cs = xmty_sig(&ptype, xkey);
+    if (!pv.sg && !pv.cs) return 0;
+    long long k = 0;
+    if (std::holds_alternative<Pmod_apply>(m->desc)) {
+      std::set<std::string> pconc;
+      res_conc(ptype, pconc);
+      k += lrd_charge(*m, {}, pv.sg, &pconc, pv.cs);
+    }
+    if (!std::holds_alternative<Pmod_structure>(m->desc))
+      k += larg_subs(aview_of(m), pv, std::to_string((std::uintptr_t)m), 0);
     return k;
   }
   // ---- A LET MODULE'S FIRST EXPANDING READ BUILDS THE APPLICATION (S535)
@@ -39910,11 +40206,19 @@ struct Count {
       args.push_back(a->arg.get());
       h = a->f.get();
     }
+    long long k = 0;
+    // The arguments' own applications, built by their checks (S546).
+    if (me && !ngen) {
+      std::vector<FLevel> alv;
+      if (fun_levels(me, alv))
+        for (int i = 0; i < nargs && i < (int)alv.size(); ++i)
+          k += larg_charge(*args[nargs - 1 - i], *alv[i].type);
+    }
     // An alias of a PARTIAL application of a functor of this file, applied
     // on (S536): the body's rename and its nodes are all that is modelled.
     if (me && !ngen && std::holds_alternative<Pmod_apply>(me->desc)) {
       const cmi::ModuleType* xb = nullptr;
-      return xbody_charge(m, nargs, l, saved, rebind, &xb);
+      return k + xbody_charge(m, nargs, l, saved, rebind, &xb);
     }
     // A pathless argument to an ANONYMOUS parameter is neither substituted
     // nor rebuilt: `type_one_application` (typemod.ml:2711) has no parameter
@@ -39922,8 +40226,7 @@ struct Count {
     if (!anondep_off() && nargs == 1 && pathless && me && !ngen)
       if (auto* f = std::get_if<Pmod_functor>(&me->desc))
         if (auto* nm = std::get_if<Functor_named>(&f->param))
-          if (!nm->name.txt) return 0;
-    long long k = 0;
+          if (!nm->name.txt) return k;
     std::vector<std::pair<std::string, const ModuleType*>> fps;
     WScope ws{*this};  // the result's `with module` names them (S544)
     ws_params(me, mt, ws);
