@@ -24605,6 +24605,7 @@ struct Count {
     // application of it is package-typed at that type (S539).
     char respk = 0;
     const Ptyp_package* res = nullptr;
+    char lpk = 0;  // bound to a LIST whose elements are package-typed (S541)
   };
   // A parameter whose pattern is an unpack meets its arguments at a package
   // type it never wrote out; `pkleaf_` stands for that type where `pk_rue`
@@ -24725,8 +24726,11 @@ struct Count {
           const Ptyp_package* t = nullptr;
           if (pkg_typed(*bd->e, &t)) { k.respk = 1; k.res = t; }
           for (auto& pm : k.params) pk_fix(*bd->e, pm);
+          if (!pkvia_off())
+            for (auto& pm : k.params) pk_fix_via(*bd->e, pm);
         }
     }
+    if (!pkvia_off()) k.lpk = pk_list_typed(*b.expr);
     // `let g = f`: g's parameters are f's (u12).
     if (!pkarg_off() && k.params.empty())
       if (auto* i = std::get_if<Pexp_ident>(&b.expr->desc)) {
@@ -24786,6 +24790,236 @@ struct Count {
       e = si->body.get();
     }
   }
+  // ---- A PARAMETER FIXED THROUGH ANOTHER CALL'S PARAMETER (S541) --------
+  // fstclassmod.ml: `List.map (fun set -> sort set l) [make_set compare;
+  // ..]` and `List.iter print (List.map apply [int; ..])`.  `sort`'s
+  // parameter is fixed at a package type by its own unpack (S539's `fix`);
+  // `fun set -> sort set l` hands `set` to it, so the lambda's parameter is
+  // that package type too, and the list's element type -- the first
+  // element's, a package by inference -- meets it through `List.map`'s
+  // `'a` (`Ctype.unify` on two `Tpackage`s, 2): once per such call, the
+  // later elements being S526's siblings already.  A direct application of
+  // such a function (`f (make_set cmp)`, `(fun set -> ..) (make_set cmp)`)
+  // meets at `type_argument` as a written parameter does (`pk_parg`).
+  // `pk_fix_via` finds the call in the body; `pk_hof` charges the element
+  // meet of a higher-order `List`/`Array`/`Seq` traversal whose function
+  // comes first and whose collection is package-typed (a literal with a
+  // package-typed head, a name bound to one, or another such traversal
+  // whose function returns a package).  `NOPKVIA=1` reverts.
+  static bool pkvia_off() {
+    static const bool off = dbg_env("NOPKVIA") != nullptr;
+    return off;
+  }
+  // The package type a parameter meets its arguments at, from its own
+  // pattern or the call that fixed it.
+  const Ptyp_package* param_pkg(const PkParam& pm) const {
+    if (pm.fix) return pm.fix;
+    if (pm.pats.empty()) return nullptr;
+    if (auto* c = std::get_if<Ppat_constraint>(&pm.pats[0]->desc))
+      return pk_of_ty(*c->t);
+    if (auto* u = std::get_if<Ppat_unpack>(&pm.pats[0]->desc))
+      return u->pkg ? &*u->pkg : nullptr;
+    return nullptr;
+  }
+  // The parameter of a local function an application's argument lands on.
+  const PkParam* pk_param_at(const std::vector<PkParam>& ps, std::size_t pos,
+                             const ArgLabel& al) const {
+    std::string lb;
+    if (auto* x = std::get_if<Labelled>(&al)) lb = x->name;
+    else if (auto* x = std::get_if<Optional>(&al)) lb = "?" + x->name;
+    if (lb.empty()) {
+      std::size_t j = 0;
+      for (auto& p : ps)
+        if (p.label.empty()) {
+          if (j == pos) return &p;
+          ++j;
+        }
+      return nullptr;
+    }
+    for (auto& p : ps)
+      if (p.label == lb || p.label == "?" + lb) return &p;
+    return nullptr;
+  }
+  void pk_fix_via(const Expression& body, PkParam& pm) {
+    if (pm.fix || pm.pk || pm.pats.empty()) return;
+    const std::string* nm = pk_name(*pm.pats[0]);
+    if (!nm) return;
+    pm.fix = pk_via_find(body, *nm, 24);
+  }
+  const Ptyp_package* pk_via_find(const Expression& e, const std::string& nm,
+                                  int fuel) const {
+    if (fuel <= 0) return nullptr;
+    const Ptyp_package* r = nullptr;
+    auto sub = [&](const Expression& x) {
+      if (!r) r = pk_via_find(x, nm, fuel - 1);
+    };
+    if (auto* ap = std::get_if<Pexp_apply>(&e.desc)) {
+      auto* i = std::get_if<Pexp_ident>(&ap->fn->desc);
+      auto* l = i ? std::get_if<Lident>(&i->id.txt.v) : nullptr;
+      auto it = l ? pkv_.find(l->name) : pkv_.end();
+      if (it != pkv_.end() && !it->second.empty() && l->name != nm) {
+        const auto& ps = it->second.back().params;
+        std::size_t pos = 0;
+        for (auto& ar : ap->args) {
+          const PkParam* pm = pk_param_at(ps, pos, ar.first);
+          if (std::holds_alternative<Nolabel>(ar.first)) ++pos;
+          auto* ai = std::get_if<Pexp_ident>(&ar.second->desc);
+          auto* al = ai ? std::get_if<Lident>(&ai->id.txt.v) : nullptr;
+          if (pm && al && al->name == nm)
+            if (const Ptyp_package* t = param_pkg(*pm)) return t;
+        }
+      }
+      sub(*ap->fn);
+      for (auto& ar : ap->args) sub(*ar.second);
+    } else if (auto* l = std::get_if<Pexp_let>(&e.desc)) {
+      for (auto& b : l->bindings) sub(*b.expr);
+      sub(*l->body);
+    } else if (auto* q = std::get_if<Pexp_sequence>(&e.desc)) {
+      sub(*q->e1); sub(*q->e2);
+    } else if (auto* i = std::get_if<Pexp_ifthenelse>(&e.desc)) {
+      sub(*i->cond); sub(*i->then_);
+      if (i->else_) sub(**i->else_);
+    } else if (auto* m = std::get_if<Pexp_match>(&e.desc)) {
+      sub(*m->e);
+      for (auto& c : m->cases) sub(*c.rhs);
+    } else if (auto* t = std::get_if<Pexp_try>(&e.desc)) {
+      sub(*t->e);
+      for (auto& c : t->cases) sub(*c.rhs);
+    } else if (auto* f = std::get_if<Pexp_function>(&e.desc)) {
+      if (auto* bd = std::get_if<Pfunction_body>(&f->body->v)) sub(*bd->e);
+    } else if (auto* c = std::get_if<Pexp_constraint>(&e.desc)) {
+      sub(*c->e);
+    } else if (auto* u = std::get_if<Pexp_tuple>(&e.desc)) {
+      for (auto& x : u->elems) sub(*x);
+    } else if (auto* c = std::get_if<Pexp_construct>(&e.desc)) {
+      if (c->arg) sub(**c->arg);
+    } else if (auto* q = std::get_if<Pexp_struct_item>(&e.desc)) {
+      sub(*q->body);
+    } else if (auto* t = std::get_if<Pexp_newtype>(&e.desc)) {
+      sub(*t->body);
+    }
+    return r;
+  }
+  // A function expression's first parameter's package type: a local name's
+  // or a lambda's, fixed by its own body.
+  const Ptyp_package* pk_fn_first(const Expression& g) {
+    if (auto* i = std::get_if<Pexp_ident>(&g.desc)) {
+      auto* l = std::get_if<Lident>(&i->id.txt.v);
+      auto it = l ? pkv_.find(l->name) : pkv_.end();
+      if (it == pkv_.end() || it->second.empty()) return nullptr;
+      const auto& ps = it->second.back().params;
+      return ps.empty() ? nullptr : param_pkg(ps[0]);
+    }
+    if (auto* f = std::get_if<Pexp_function>(&g.desc)) {
+      std::vector<PkParam> ps;
+      fn_params(*f, ps);
+      if (ps.empty()) return nullptr;
+      if (auto* bd = std::get_if<Pfunction_body>(&f->body->v)) {
+        pk_fix(*bd->e, ps[0]);
+        pk_fix_via(*bd->e, ps[0]);
+      }
+      return param_pkg(ps[0]);
+    }
+    return nullptr;
+  }
+  // `fun x -> x`: the identity, whose result is its argument's type.
+  static bool pk_fn_id(const Expression& g) {
+    auto* f = std::get_if<Pexp_function>(&g.desc);
+    if (!f || f->params.size() != 1) return false;
+    auto* v = std::get_if<Pparam_val>(&f->params[0].desc);
+    const std::string* nm = v ? pk_name(v->pat) : nullptr;
+    auto* bd = std::get_if<Pfunction_body>(&f->body->v);
+    auto* i = bd ? std::get_if<Pexp_ident>(&bd->e->desc) : nullptr;
+    auto* l = i ? std::get_if<Lident>(&i->id.txt.v) : nullptr;
+    return nm && l && l->name == *nm;
+  }
+  // Does a function expression return a package?
+  bool pk_fn_res(const Expression& g) {
+    if (auto* i = std::get_if<Pexp_ident>(&g.desc)) {
+      auto* l = std::get_if<Lident>(&i->id.txt.v);
+      auto it = l ? pkv_.find(l->name) : pkv_.end();
+      return it != pkv_.end() && !it->second.empty() &&
+             it->second.back().respk;
+    }
+    if (auto* f = std::get_if<Pexp_function>(&g.desc))
+      if (auto* bd = std::get_if<Pfunction_body>(&f->body->v))
+        return pkg_typed(*bd->e);
+    return false;
+  }
+  static bool pk_hof_head(const Expression& fn) {
+    static const std::set<std::string> names{
+        "map",  "iter",       "iteri",    "mapi",     "filter",
+        "find", "find_opt",   "find_all", "for_all",  "exists",
+        "filter_map", "concat_map", "partition"};
+    auto* i = std::get_if<Pexp_ident>(&fn.desc);
+    auto* d = i ? std::get_if<Ldot>(&i->id.txt.v) : nullptr;
+    auto* p = d ? std::get_if<Lident>(&d->prefix->v) : nullptr;
+    return p && names.count(d->name) &&
+           (p->name == "List" || p->name == "Array" || p->name == "Seq");
+  }
+  // Is the collection's element type a package?
+  bool pk_list_typed(const Expression& e, int fuel = 8) {
+    if (fuel <= 0) return false;
+    if (auto* c = std::get_if<Pexp_construct>(&e.desc)) {
+      if (lid_last(c->id.txt) != "::" || !c->arg) return false;
+      auto* u = std::get_if<Pexp_tuple>(&(*c->arg)->desc);
+      return u && u->elems.size() == 2 && pkg_typed(*u->elems[0]);
+    }
+    if (auto* a = std::get_if<Pexp_array>(&e.desc))
+      return !a->elems.empty() && pkg_typed(*a->elems[0]);
+    if (auto* i = std::get_if<Pexp_ident>(&e.desc)) {
+      auto* l = std::get_if<Lident>(&i->id.txt.v);
+      auto it = l ? pkv_.find(l->name) : pkv_.end();
+      return it != pkv_.end() && !it->second.empty() &&
+             it->second.back().lpk;
+    }
+    // a `map` makes its elements, a `filter` keeps them
+    if (auto* ap = std::get_if<Pexp_apply>(&e.desc))
+      if (pk_hof_head(*ap->fn) && ap->args.size() >= 2 &&
+          std::holds_alternative<Nolabel>(ap->args[0].first)) {
+        static const std::set<std::string> mk{"map", "mapi", "filter_map",
+                                              "concat_map"};
+        auto* i = std::get_if<Pexp_ident>(&ap->fn->desc);
+        auto* d = std::get_if<Ldot>(&i->id.txt.v);
+        if (mk.count(d->name))
+          return pk_fn_res(*ap->args[0].second) ||
+                 (pk_fn_id(*ap->args[0].second) &&
+                  pk_list_typed(*ap->args[1].second, fuel - 1));
+        static const std::set<std::string> keep{"filter", "find_all"};
+        return keep.count(d->name) &&
+               pk_list_typed(*ap->args[1].second, fuel - 1);
+      }
+    // a rearrangement keeps the element type: its LAST argument's
+    if (auto* ap = std::get_if<Pexp_apply>(&e.desc); ap && !ap->args.empty()) {
+      static const std::set<std::string> same{
+          "rev",     "tl",      "sort",    "stable_sort", "fast_sort",
+          "append",  "concat",  "flatten", "to_list",     "of_list",
+          "to_seq",  "of_seq",  "to_array", "of_array",   "rev_append",
+          "sort_uniq"};
+      auto* i = std::get_if<Pexp_ident>(&ap->fn->desc);
+      auto* d = i ? std::get_if<Ldot>(&i->id.txt.v) : nullptr;
+      auto* pf = d ? std::get_if<Lident>(&d->prefix->v) : nullptr;
+      if (pf && same.count(d->name) &&
+          (pf->name == "List" || pf->name == "Array" || pf->name == "Seq"))
+        return pk_list_typed(*ap->args.back().second, fuel - 1);
+    }
+    if (auto* l = std::get_if<Pexp_let>(&e.desc)) {
+      auto m = mark();
+      pk_scope(l->bindings);
+      bool r = pk_list_typed(*l->body, fuel - 1);
+      release(m);
+      return r;
+    }
+    return false;
+  }
+  long long pk_hof(const Pexp_apply& a) {
+    if (pkvia_off() || !pk_hof_head(*a.fn) || a.args.size() < 2) return 0;
+    if (!std::holds_alternative<Nolabel>(a.args[0].first) ||
+        !std::holds_alternative<Nolabel>(a.args[1].first))
+      return 0;
+    if (!pk_fn_first(*a.args[0].second)) return 0;
+    return pk_list_typed(*a.args[1].second) ? 2 : 0;
+  }
   void fn_params(const Pexp_function& f, std::vector<PkParam>& out) {
     for (auto& pm : f.params)
       if (auto* v = std::get_if<Pparam_val>(&pm.desc)) {
@@ -24843,6 +25077,15 @@ struct Count {
       for (std::size_t i = 0; i < u->elems.size(); ++i)
         k += pk_parg(*t->elems[i], *u->elems[i], fuel - 1);
       return k;
+    }
+    // `function Some (module M : S) -> ..` applied to `Some (module ..)`:
+    // the argument under the same constructor meets the pattern's package
+    // (S541, fstclassmod's PR#6194 `f`).
+    if (auto* c = std::get_if<Ppat_construct>(&p.desc); c && !pkvia_off()) {
+      auto* x = std::get_if<Pexp_construct>(&e.desc);
+      if (!x || !c->arg || !x->arg) return 0;
+      if (lid_last(c->id.txt) != lid_last(x->id.txt)) return 0;
+      return pk_parg(**c->arg, **x->arg, fuel - 1);
     }
     return 0;
   }
@@ -25919,7 +26162,12 @@ struct Count {
   // second operand of a polymorphic comparison meets the first.
   long long pk_app(const Pexp_apply& a) {
     std::vector<PkParam> lam;
-    if (auto* lf = std::get_if<Pexp_function>(&a.fn->desc)) fn_params(*lf, lam);
+    if (auto* lf = std::get_if<Pexp_function>(&a.fn->desc)) {
+      fn_params(*lf, lam);
+      if (!pkvia_off())
+        if (auto* bd = std::get_if<Pfunction_body>(&lf->body->v))
+          for (auto& pm : lam) { pk_fix(*bd->e, pm); pk_fix_via(*bd->e, pm); }
+    }
     auto* f = std::get_if<Pexp_ident>(&a.fn->desc);
     if (!f && lam.empty()) return 0;
     auto* l = f ? std::get_if<Lident>(&f->id.txt.v) : nullptr;
@@ -26397,6 +26645,21 @@ struct Count {
         return shal_csig(r->sig.get());
       return 0;
     }
+    // A module bound to an UNPACK has the package's module type for its
+    // own, and a pack of it substitutes that whole -- its top items (bare
+    // `S` or `S with ..` alike, e1/e6, through an alias e9, a parameter's
+    // written package e7, at every pack e8) (S541).  What the pack's check
+    // forces of another unit through the VALUE types (`Set.S` -> Seq, 130)
+    // is S538's `fpack` family and not charged here.
+    if (auto* u = std::get_if<Pmod_unpack>(&m.desc); u && !pkvia_off()) {
+      if (const ModuleType* t = unpack_mty(*u)) return mt_top(*t, 0);
+      const Ptyp_package* pk = nullptr;
+      if (auto* c = std::get_if<Pexp_constraint>(&u->e->desc))
+        pk = pk_of_ty(*c->t);
+      std::string key;
+      const cmi::Signature* cs = pk ? xpath_sig(pk->path.txt, key) : nullptr;
+      return cs ? shal_csig(cs) : 0;
+    }
     long long k = wt_mexpr(m, chkarrow_off() ? Lvl{1, 1, 0, true} : flat()) +
                   (chkarrow_off() ? 0 : pkw_params(m));
     // The items an `include` of a path brings in are copied too (S526).
@@ -26406,13 +26669,28 @@ struct Count {
     auto* st = std::get_if<Pmod_structure>(&m.desc);
     if (!st || pkinfer_off()) return 0;
     long long k = 0;
+    std::vector<std::string> nm;
+    std::vector<std::string>* sv = inm_;
+    inm_ = pkvia_off() ? sv : &nm;
     for (auto& it : st->items)
       if (auto* in = std::get_if<Pstr_include>(&it.desc))
         if (std::holds_alternative<Pmod_ident>(in->expr.desc)) {
           bool dt = false;
           k += inc_top(in->expr, dt, 1);
         }
-    return k;
+    inm_ = sv;
+    // A value the structure binds under an included name REPLACES it in
+    // the signature the pack substitutes: one item, not two (S541, g3).
+    std::set<std::string> inc(nm.begin(), nm.end()), own;
+    for (auto& it : st->items)
+      if (auto* v = std::get_if<Pstr_value>(&it.desc)) {
+        std::vector<std::string> b;
+        Count c;
+        for (auto& vb : v->bindings) c.pat(vb.pat, &b);
+        for (auto& x : b)
+          if (inc.count(x)) own.insert(x);
+      }
+    return k - (long long)own.size();
   }
   // ---- WHAT A CHECK WITH NO SHAPE TO PROJECT MAKES UP (S518) --------------
   // `Includemod.modtypes` (includemod.ml:1368) checks with `Shape.dummy_mod`
@@ -31168,7 +31446,7 @@ struct Count {
   void expr(const Expression& e) {
     n += appexp_any(e);
     if (auto* a = std::get_if<Pexp_apply>(&e.desc)) {
-      if (!pkmeet_off()) n += pk_app(*a);
+      if (!pkmeet_off()) n += pk_app(*a) + pk_hof(*a);
       n += appexp_app(*a) + tf_app(*a);
       expr(*a->fn);
       for (auto& ar : a->args) expr(*ar.second);
