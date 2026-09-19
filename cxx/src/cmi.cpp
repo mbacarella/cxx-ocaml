@@ -3025,11 +3025,25 @@ static void assign_uids(std::vector<SigItem>& items, const std::string& unit,
   }
 }
 
+std::vector<Import> cmi_imports(const std::set<std::string>& loaded,
+                                const std::string& self, bool pervasives) {
+  std::map<std::string, std::string> crc;
+  std::set<std::string> units = loaded;
+  if (pervasives) units.insert("Stdlib");
+  for (const std::string& g : units)
+    for (auto& [n, c] : read_cmi_crcs(resolve_cmi_global(g)))
+      if (!c.empty() && n != self) crc[n] = c;
+  std::vector<Import> out;
+  for (auto it = crc.rbegin(); it != crc.rend(); ++it)
+    out.push_back({it->first, it->second});
+  return out;
+}
+
 std::string write_cmi(const std::string& path, const std::string& modname,
                       const std::vector<SigItem>& items_in,
                       const std::vector<Import>& imports, bool intf,
                       const std::vector<std::string>& src_files,
-                      int stamp_base) {
+                      int stamp_base, bool cite) {
   g_share.clear();              // the shared-value tables are per-cmi
   g_cmi_src_files = src_files;  // resolve position file_ids to pos_fname (emit_loc)
   std::vector<SigItem> items = items_in;  // mutable copy: uids assigned in place
@@ -3061,7 +3075,7 @@ std::string write_cmi(const std::string& path, const std::string& modname,
   // Stdlib__List without Stdlib__List (built against stdlib.cmi) creating a
   // circular CRC dependency.
   for (const auto& [g, wants_crc] : referenced) {
-    if (!seen.insert(g).second) continue;
+    if (!cite || !seen.insert(g).second) continue;
     if (wants_crc) {
       std::string crc = read_cmi_self_crc(resolve_cmi_global(g));
       if (crc.empty()) continue;  // can't locate it -> omit (still valid)

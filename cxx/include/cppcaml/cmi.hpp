@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -691,11 +692,21 @@ void set_module_dirs(const std::string& stdlib_dir,
 // `stamp_base` is where the signature's fresh Ident stamps start: ocamlc's
 // `rename_bound_idents` continues its global counter, so the base is
 // `274 + <idents typing allocated>` (cppcaml::typing_ident_count).
+// `cite`: also list the units the signature's own types cite (with their
+// CRC; a module alias with none) -- off when `imports` is already the whole
+// list ocamlc would write (cmi_imports below).
 std::string write_cmi(const std::string& path, const std::string& modname,
                       const std::vector<SigItem>& items,
                       const std::vector<Import>& imports = {}, bool intf = true,
                       const std::vector<std::string>& src_files = {},
-                      int stamp_base = 300);
+                      int stamp_base = 300, bool cite = true);
+// The crc list ocamlc's `Env.imports` gives a unit whose typing read the
+// .cmi of every unit in `loaded` (S548): those units with their own CRC,
+// plus every entry with a CRC in each one's crc list (`Persistent_env.
+// import_crcs`), Stdlib among them unless `-nopervasives`; `self` left out;
+// in DESCENDING name order (`Consistbl.extract` folds a sorted list).
+std::vector<Import> cmi_imports(const std::set<std::string>& loaded,
+                                const std::string& self, bool pervasives);
 // Convenience: a values-only signature.
 std::string write_cmi(const std::string& path, const std::string& modname,
                       const std::vector<std::pair<std::string, TyPtr>>& values,

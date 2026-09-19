@@ -21412,6 +21412,9 @@ static bool cmi_poly_used(const cmi::Signature& sg);
 
 struct Cites {
   std::set<std::string> units;  // heads that may name a persistent unit
+  // The units `cost` read a .cmi for, by their module names: what ocamlc's
+  // `Persistent_env` imports (S548, `cmi_imports`).
+  std::set<std::string> loaded;
   // Module names the file binds itself, with how MANY times: a name bound
   // twice (a functor parameter's member and a local structure's, say) is
   // ambiguous, so its alias is not followed.
@@ -24383,6 +24386,7 @@ struct Cites {
       if (!std::filesystem::exists(p)) continue;
       try {
         const cmi::CmiFile& c = cmi::CmiFile::load(p);
+        loaded.insert(c.module_name());
         // Only a reference through one of Stdlib's ALIASES is forced
         // twice, one functor parameter apiece; a DIRECT force renames
         // the parameter TWICE in the one go (S437).
@@ -24463,6 +24467,7 @@ struct Cites {
       if (!std::filesystem::exists(p)) continue;
       try {
         const cmi::CmiFile& cf = cmi::CmiFile::load(p);
+        loaded.insert(cf.module_name());
         const cmi::Signature& sg = cf.sig();
         if (!cited && !noload.count(e.first))
           add(load_cost(sg, extra,
@@ -24472,10 +24477,25 @@ struct Cites {
       } catch (...) {
       }
     }
+    // An alias of a persistent unit by its OWN name (`module M =
+    // Stdlib__List`) reads the unit's .cmi without forcing it (`lookup_module
+    // ~load:true` on a persistent name): imported, at no ident.  `module M =
+    // List` names Stdlib's alias and reads nothing.
+    for (auto& al : alias) {
+      const std::string& t = al.second;
+      if (local.count(t) || loaded.count(t)) continue;
+      std::string p = head_cmi(t);
+      if (!std::filesystem::exists(p)) continue;
+      try {
+        if (cmi::CmiFile::load(p).module_name() == t) loaded.insert(t);
+      } catch (...) {
+      }
+    }
     if (fmt && done.insert("CamlinternalFormatBasics").second) {
       std::string p = head_cmi("CamlinternalFormatBasics");
       if (std::filesystem::exists(p)) try {
           add(load_cost(cmi::CmiFile::load(p).sig(), extra), "fmt", "");
+          loaded.insert("CamlinternalFormatBasics");
         } catch (...) {
         }
     }
@@ -42664,7 +42684,7 @@ std::set<std::string> fexp_paths(const std::vector<cmi::cmiw::SigItem>& items) {
 int typing_ident_count(const ast::Structure& s, std::size_t eta_sites,
                        long long pkg_sig,
                        const std::set<std::string>* fexp,
-                       std::size_t pv_reify) {
+                       std::size_t pv_reify, std::set<std::string>* loaded) {
   // The citation walk runs FIRST: whether a `module M = A.N` alias is ever
   // READ is what says the path has to be resolved, and only a name this file
   // binds ONCE can be followed to the module it stands for.
@@ -42758,6 +42778,7 @@ int typing_ident_count(const ast::Structure& s, std::size_t eta_sites,
   if (!dbg_env("NOUNITLOAD"))
     k += u.cost(!dbg_env("NOEXTRALOAD"), !dbg_env("NOSUBLOAD"),
                 !dbg_env("NOAPPRES"));
+  if (loaded) *loaded = u.loaded;
   // An INFERRED argument whose type begins with optional arrows, used where
   // a plain arrow is expected, is let-and-eta-expanded (typecore.ml's
   // type_argument, `var_pair "eta"` and `var_pair "arg"`): TWO idents per

@@ -190,6 +190,7 @@ static void report_unbound_module(const std::string& in_path, const std::string&
 // standalone c++parse / c++lambda / c++instr tools.
 struct DumpFlags { bool parsetree = false, lambda = false, instr = false; };
 static DumpFlags g_dump;
+static bool g_nopervasives = false;  // -nopervasives: no implicit Stdlib import
 
 static int compile_ml(const std::string& in_path, const std::string& cmo_out,
                       const std::string& stdlib_dir, bool prof) {
@@ -238,17 +239,26 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
       {
         auto sig = cppcaml::infer_signature(structure);
         const std::set<std::string> fexp = cppcaml::fexp_paths(sig);
+        // The crc list is what typing imported: every unit whose .cmi the
+        // stamp count read, each with its own imports (NOCMIIMPORTS reverts
+        // to the signature's citations).
+        std::set<std::string> loaded;
+        const bool imports = !cppcaml::dbg_env("NOCMIIMPORTS");
+        int base = cppcaml::dbg_env("NOSTAMPBASE")
+                       ? 300
+                       : 274 + cppcaml::typing_ident_count(
+                                   structure, eta_sites,
+                                   cppcaml::package_sig_idents(sig), &fexp,
+                                   pv_reify, &loaded);
         cppcaml::cmi::cmiw::write_cmi(
-            cmi_path.string(), mod, sig, {},
+            cmi_path.string(), mod, sig,
+            imports ? cppcaml::cmi::cmiw::cmi_imports(loaded, mod,
+                                                      !g_nopervasives)
+                    : std::vector<cppcaml::cmi::cmiw::Import>{},
             /*intf=*/false,
             cppcaml::dbg_env("NOMLLOC") ? std::vector<std::string>{}
                                         : std::vector<std::string>{in_path},
-            cppcaml::dbg_env("NOSTAMPBASE")
-                ? 300
-                : 274 + cppcaml::typing_ident_count(
-                            structure, eta_sites,
-                            cppcaml::package_sig_idents(sig), &fexp,
-                            pv_reify));
+            base, /*cite=*/!imports);
       }
     } catch (const std::exception& e) {
       if (prof) std::cerr << "  (.cmi emission skipped: " << e.what() << ")\n";
@@ -410,6 +420,7 @@ static int run_main(int argc, char** argv) {
   if (!nocwd && !no_cwd_search) incdirs.insert(incdirs.begin(), ".");
   cppcaml::lambda::set_module_dirs(incdirs);
   cppcaml::lambda::set_nopervasives(nopervasives);
+  g_nopervasives = nopervasives;
   cppcaml::set_infer_module_dirs(incdirs);
   cppcaml::set_infer_stdlib_dir(stdlib_dir);
   cppcaml::cmi::cmiw::set_module_dirs(stdlib_dir, incdirs);
