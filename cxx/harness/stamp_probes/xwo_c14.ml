@@ -1,0 +1,5 @@
+module type ORDERED = sig type t val leq: t -> t -> bool end module type HEAP =
+  sig module Elem: ORDERED type heap val empty: heap val insert: Elem.t -> heap
+  -> heap val findMin: heap -> Elem.t end module Bootstrap (Element: ORDERED) =
+  struct module Elem = Element type heap = int let empty = 0 let insert x h = h
+  let findMin h = raise Not_found end

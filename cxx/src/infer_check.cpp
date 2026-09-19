@@ -28616,14 +28616,190 @@ struct Count {
     if (!std::holds_alternative<Pmty_ident>(b->desc)) return nullptr;
     return mty_sig(&mt);
   }
+  // ---- A CONSTRAINT WRITES THE MODULES ON ITS PATH OUT (S544) ----------
+  // `with type Elem.t = ..` reaches its item through `Elem`, and
+  // `merge_signature` (typemod.ml) scrapes the module's declared type to a
+  // signature on the way (`extract_sig`) and puts THAT back in the item:
+  // `module Elem : ORDERED` is `module Elem : sig type t .. end` in the
+  // merged signature, and every rename after the merge -- the freshen, the
+  // check, the cascade, a `Subst Keep` of the signature it lives in -- walks
+  // its items as a literal submodule's.  `with module Elem = P` puts P's
+  // whole signature (scraped, strengthened, every depth) in Elem's place the
+  // same way (`merge_module`).  A destructive constraint already read the
+  // declared type through (`Gone`); a plain one left the NAME standing and
+  // the items went uncounted: 2 per item of `ORDERED` at a module type
+  // declaration, at every position a `with` lands.  And the `Subst Keep`
+  // renames nothing under a submodule still declared at a NAME: only a
+  // literal signature, a `with`, or an expanded one has items to rename.
+  // `NOWOPEN=1` reverts.
+  static bool wopen_off() {
+    static const bool off = dbg_env("NOWOPEN") != nullptr;
+    return off;
+  }
+  // What stands in for a `with module` target: its declared type, or the
+  // expression it is bound to.
+  struct Wrep {
+    const ModuleType* mt = nullptr;
+    const ModuleExpr* me = nullptr;
+    bool some() const { return mt || me; }
+  };
+  // The constraint paths still to descend, each with the target a `with
+  // module` puts at its end.
+  using Opens = std::vector<std::pair<std::vector<std::string>, Wrep>>;
+  // The entries under `nm`: the tails to descend, and the module `nm` is
+  // replaced by where a `with module` ends here.
+  static Opens ogo(const Opens& o, const std::string& nm, const Wrep*& rep) {
+    Opens e;
+    for (auto& p : o) {
+      if (p.first.empty() || p.first[0] != nm) continue;
+      if (p.first.size() == 1) {
+        if (p.second.some()) rep = &p.second;
+        continue;
+      }
+      e.emplace_back(
+          std::vector<std::string>(p.first.begin() + 1, p.first.end()),
+          p.second);
+    }
+    return e;
+  }
+  static Opens ounder(const Opens& o, const std::vector<std::string>& p) {
+    Opens d = o;
+    for (std::size_t i = 0; i + 1 < p.size(); ++i) {
+      Opens e;
+      for (auto& q : d)
+        if (q.first.size() > 1 && q.first[0] == p[i])
+          e.emplace_back(
+              std::vector<std::string>(q.first.begin() + 1, q.first.end()),
+              q.second);
+      d.swap(e);
+    }
+    return d;
+  }
+  // The parameters of a functor whose RESULT is being read at an
+  // application site -- not in scope there, but what the result's `with
+  // module` names -- innermost last.
+  using Fps = std::vector<std::pair<std::string, const ModuleType*>>;
+  mutable Fps wfps_;
+  struct WScope {
+    const Count& c;
+    std::size_t k;
+    WScope(const Count& c_) : c(c_), k(c_.wfps_.size()) {}
+    void add(const std::string& nm, const ModuleType* t) const {
+      if (t) c.wfps_.emplace_back(nm, t);
+    }
+    ~WScope() { c.wfps_.resize(k); }
+  };
+  // The module a `with module` names: a signature's own declaration or a
+  // functor parameter at its type, a binding of this file at its ascription
+  // or as the expression it is.
+  Wrep wrep_of(const Longident& lid) const {
+    Wrep r;
+    std::vector<std::string> c;
+    if (wopen_off() || !lid_path(lid, c) || c.empty()) return r;
+    if (c.size() == 1) {
+      for (auto it = wfps_.rbegin(); it != wfps_.rend(); ++it)
+        if (it->first == c[0]) {
+          r.mt = it->second;
+          return r;
+        }
+      const ModuleExpr* alias = nullptr;
+      r.mt = head_mty(c[0], &alias);
+      if (!r.mt) r.me = mod_named(c[0]);
+      return r;
+    }
+    const ModuleExpr* me = nullptr;
+    const ModuleType* mt = nullptr;
+    Mtds ds;
+    bool sub = false;
+    if (lpath(lid, me, mt, ds, sub)) {
+      r.me = me;
+      r.mt = mt;
+    }
+    return r;
+  }
+  // What one constraint opens: the modules a dotted path goes through, and
+  // the module a `with module` replaces.
+  void wopen_add(const WithConstraint& c, const Wc& x, Opens& o) const {
+    if (wopen_off() || x.destr) return;
+    Wrep r;
+    if (auto* m = std::get_if<Pwith_module>(&c)) r = wrep_of(m->lid2.txt);
+    if (x.path.size() < 2 && !r.some()) return;
+    o.emplace_back(x.path, r);
+  }
+  static bool w_lit(const ModuleType& mt) {
+    return std::holds_alternative<Pmty_signature>(mt.desc) ||
+           std::holds_alternative<Pmty_with>(mt.desc);
+  }
+  // The constraints a module type carries, its own `with` nodes and then --
+  // a name is the merged signature it was declared as -- the declaration's,
+  // outermost first.  False where one of them does not read.
+  bool wchain(const ModuleType& mt, Gone& g, Opens& o, int fuel = 8) const {
+    for (const ModuleType* p = &mt; p && fuel > 0; --fuel) {
+      if (auto* id = std::get_if<Pmty_ident>(&p->desc)) {
+        if (wopen_off()) return true;
+        p = named_mty(id->id.txt, fuel);
+        continue;
+      }
+      auto* q = std::get_if<Pmty_with>(&p->desc);
+      if (!q) return true;
+      for (auto& c : q->constraints) {
+        Wc x;
+        if (!wc_parts(c, x)) return false;
+        if (x.destr) g.push_back(x.path);
+        wopen_add(c, x, o);
+      }
+      p = q->mt.get();
+    }
+    return true;
+  }
+  // The replacement's items: `w_ren` of the signature it stands for.
+  long long wrep_ren(const Wrep& r, const Gone& d, const Opens& e,
+                     int fuel = 8) const {
+    if (fuel <= 0) return 0;
+    if (r.mt) {
+      const Signature* in = mty_sig(r.mt);
+      return in ? w_ren(*in, d, e) : ren_mty(*r.mt);
+    }
+    if (!r.me) return 0;
+    if (auto* cn = std::get_if<Pmod_constraint>(&r.me->desc)) {
+      Wrep q;
+      q.mt = cn->mt.get();
+      return wrep_ren(q, d, e, fuel - 1);
+    }
+    if (auto* st = std::get_if<Pmod_structure>(&r.me->desc))
+      return t_ren(*st, d);
+    if (auto* id = std::get_if<Pmod_ident>(&r.me->desc))
+      return wrep_ren(wrep_of(id->id.txt), d, e, fuel - 1);
+    return 0;
+  }
+  long long wrep_wt(const Wrep& r, const Lvl& l, const Gone& d,
+                    const Opens& e, int fuel = 8) const {
+    if (fuel <= 0) return 0;
+    if (r.mt) {
+      const Signature* in = mty_sig(r.mt);
+      return in ? w_wt(*in, l, d, e) : wt_mty(*r.mt, l);
+    }
+    if (!r.me) return 0;
+    if (auto* cn = std::get_if<Pmod_constraint>(&r.me->desc)) {
+      Wrep q;
+      q.mt = cn->mt.get();
+      return wrep_wt(q, l, d, e, fuel - 1);
+    }
+    if (auto* st = std::get_if<Pmod_structure>(&r.me->desc))
+      return t_wt(*st, l, d);
+    if (auto* id = std::get_if<Pmod_ident>(&r.me->desc))
+      return wrep_wt(wrep_of(id->id.txt), l, d, e, fuel - 1);
+    return 0;
+  }
   // `Subst.signature`: one ident per item at every depth, minus what a
   // destructive constraint took out.
-  long long w_ren(const Signature& s, const Gone& g) const {
+  long long w_ren(const Signature& s, const Gone& g,
+                  const Opens& o = Opens{}) const {
     long long k = 0;
     for (auto& it : s) {
       if (auto* i = std::get_if<Psig_include>(&it.desc))
         if (const Signature* in = inc_named(i->mt)) {
-          k += w_ren(*in, g);
+          k += w_ren(*in, g, o);
           continue;
         }
       if (auto* t = std::get_if<Psig_type>(&it.desc)) {
@@ -28639,8 +28815,12 @@ struct Count {
         bool drop = false;
         Gone d = wgo(g, *m->md.name.txt, drop);
         if (drop) continue;
-        const Signature* in = d.empty() ? nullptr : mty_sig(m->md.type.get());
-        k += in ? 1 + w_ren(*in, d) : ren_sig_item(it);
+        const Wrep* rep = nullptr;
+        Opens e = ogo(o, *m->md.name.txt, rep);
+        if (rep) { k += 1 + wrep_ren(*rep, d, e); continue; }
+        const Signature* in =
+            d.empty() && e.empty() ? nullptr : mty_sig(m->md.type.get());
+        k += in ? 1 + w_ren(*in, d, e) : ren_sig_item(it);
         continue;
       }
       if (auto* m = std::get_if<Psig_modtype>(&it.desc)) {
@@ -28654,12 +28834,13 @@ struct Count {
     return k;
   }
   // The same, at the weight the level gives each item.
-  long long w_wt(const Signature& s, const Lvl& l, const Gone& g) const {
+  long long w_wt(const Signature& s, const Lvl& l, const Gone& g,
+                 const Opens& o = Opens{}) const {
     long long k = 0;
     for (auto& it : s) {
       if (auto* i = std::get_if<Psig_include>(&it.desc))
         if (const Signature* in = inc_named(i->mt)) {
-          k += w_wt(*in, l, g);
+          k += w_wt(*in, l, g, o);
           continue;
         }
       if (auto* t = std::get_if<Psig_type>(&it.desc)) {
@@ -28675,8 +28856,12 @@ struct Count {
         bool drop = false;
         Gone d = wgo(g, *m->md.name.txt, drop);
         if (drop) continue;
-        const Signature* in = d.empty() ? nullptr : mty_sig(m->md.type.get());
-        k += in ? l.a + w_wt(*in, sub(l), d) : wt_sig_item(it, l);
+        const Wrep* rep = nullptr;
+        Opens e = ogo(o, *m->md.name.txt, rep);
+        if (rep) { k += l.a + wrep_wt(*rep, sub(l), d, e); continue; }
+        const Signature* in =
+            d.empty() && e.empty() ? nullptr : mty_sig(m->md.type.get());
+        k += in ? l.a + w_wt(*in, sub(l), d, e) : wt_sig_item(it, l);
         continue;
       }
       if (auto* m = std::get_if<Psig_modtype>(&it.desc)) {
@@ -28691,15 +28876,23 @@ struct Count {
   }
   // `Subst.signature_item Keep`: the item's own ident is KEPT and everything
   // a submodule or a module type of it spans is renamed.
-  long long w_nested(const Signature& s, const Gone& g) const {
+  long long w_nested(const Signature& s, const Gone& g,
+                     const Opens& o = Opens{}) const {
     long long k = 0;
     for (auto& it : s) {
       if (auto* m = std::get_if<Psig_module>(&it.desc)) {
         bool drop = false;
         Gone d = m->md.name.txt ? wgo(g, *m->md.name.txt, drop) : Gone{};
         if (drop) continue;
-        const Signature* in = mty_sig(m->md.type.get());
-        k += in ? w_ren(*in, d) : ren_mty(*m->md.type);
+        const Wrep* rep = nullptr;
+        Opens e = m->md.name.txt ? ogo(o, *m->md.name.txt, rep) : Opens{};
+        if (rep) { k += wrep_ren(*rep, d, e); continue; }
+        // A name left standing has nothing under it to rename.
+        const Signature* in =
+            wopen_off() || w_lit(*m->md.type) || !e.empty()
+                ? mty_sig(m->md.type.get())
+                : nullptr;
+        k += in ? w_ren(*in, d, e) : ren_mty(*m->md.type);
         continue;
       }
       if (auto* m = std::get_if<Psig_recmodule>(&it.desc)) {
@@ -28717,7 +28910,7 @@ struct Count {
         continue;
       }
       if (auto* i = std::get_if<Psig_include>(&it.desc)) {
-        if (const Signature* in = mty_sig(&i->mt)) k += w_nested(*in, g);
+        if (const Signature* in = mty_sig(&i->mt)) k += w_nested(*in, g, o);
         continue;
       }
     }
@@ -28768,16 +28961,8 @@ struct Count {
     const Signature* sg = mty_sig(w.mt.get());
     if (!sg) return false;
     Gone g;
-    for (const ModuleType* p = w.mt.get();;) {
-      auto* q = std::get_if<Pmty_with>(&p->desc);
-      if (!q) break;
-      for (auto& c : q->constraints) {
-        Wc x;
-        if (!wc_parts(c, x)) return false;
-        if (x.destr) g.push_back(x.path);
-      }
-      p = q->mt.get();
-    }
+    Opens o;
+    if (!wchain(*w.mt, g, o)) return false;
     const bool lit = flat || std::holds_alternative<Pmty_signature>(w.mt->desc);
     long long k = 0, rows = 0, roww = 0;
     for (auto& c : w.constraints) {
@@ -28789,15 +28974,16 @@ struct Count {
       if (x.td) {
         ++k;
         if (is_fixed(*x.td)) { ++k; ++rows; roww += tl.a; }
-        k += w_nested(*tg, wunder(g, x.path));
+        k += w_nested(*tg, wunder(g, x.path), ounder(o, x.path));
       }
       if (x.destr) {
         g.push_back(x.path);
-        k += w_ren(*sg, g) + rows;
+        k += w_ren(*sg, g, o) + rows;
       }
+      wopen_add(c, x, o);
     }
     kout = k;
-    land = lit ? w_ren(*sg, g) + rows : w_wt(*sg, l, g) + roww;
+    land = lit ? w_ren(*sg, g, o) + rows : w_wt(*sg, l, g, o) + roww;
     return true;
   }
   // --- A `with` OVER ANOTHER UNIT'S MODULE TYPE ------------------------
@@ -34058,7 +34244,8 @@ struct Count {
   // The result of applying the parameter's type to `nargs` arguments, the
   // module type names on the way resolved; null where the type is not that
   // functor, or where the result is one (a partial application).
-  const ModuleType* pf_result(const ModuleType& pt, int nargs) const {
+  const ModuleType* pf_result(const ModuleType& pt, int nargs,
+                              const WScope* ws = nullptr) const {
     const ModuleType* t = &pt;
     for (int i = 0; i < nargs; ++i) {
       if (auto* id = std::get_if<Pmty_ident>(&t->desc))
@@ -34066,6 +34253,9 @@ struct Count {
       auto* f = t ? std::get_if<Pmty_functor>(&t->desc) : nullptr;
       if (!f || !std::holds_alternative<Functor_named>(f->param))
         return nullptr;
+      if (ws)
+        if (auto* nm = std::get_if<Functor_named>(&f->param))
+          if (nm->name.txt && nm->type) ws->add(*nm->name.txt, &*nm->type);
       t = f->body.get();
     }
     const ModuleType* r = t;
@@ -34108,7 +34298,8 @@ struct Count {
   }
   // The result's items in full, the destructive constraints taken out.
   long long pf_deep(const ModuleType& r) const {
-    if (const Signature* sg = mty_sig(&r)) return w_ren(*sg, res_gone(r));
+    if (const Signature* sg = mty_sig(&r))
+      return w_ren(*sg, res_gone(r), res_opens(r));
     std::string key;
     if (const cmi::Signature* cs = xmty_sig(&r, key)) return flat_csig(*cs);
     return 0;
@@ -34117,19 +34308,21 @@ struct Count {
   long long pf_rounds(const ModuleExpr& m, const ModuleType& pt,
                       int nargs) const {
     std::string key;
-    const ModuleType* r = pf_result(pt, nargs);
+    WScope ws{*this};
+    const ModuleType* r = pf_result(pt, nargs, &ws);
     return r && pf_paths(m, key) ? pf_deep(*r) : 0;
   }
   long long pfapp_charge(const ModuleExpr& m, const ModuleType& pt, int nargs,
-                         const Lvl& l, bool rebind) {
-    const ModuleType* r = pf_result(pt, nargs);
+                         const Lvl& l, bool rebind, bool saved = true) {
+    WScope ws{*this};
+    const ModuleType* r = pf_result(pt, nargs, &ws);
     std::string key = std::to_string((std::uintptr_t)&pt);
     if (!r || !pf_paths(m, key)) return 0;
     if (rebind) return pf_deep(*r);
     const Signature* sg = mty_sig(r);
     long long k = 0;
     if (sg) {
-      k = w_wt(*sg, l, res_gone(*r));
+      k = w_wt(*sg, l, res_gone(*r), res_opens(*r));
     } else {
       std::string xk;
       const cmi::Signature* cs = xmty_sig(r, xk);
@@ -34139,6 +34332,9 @@ struct Count {
     if (!saved_ || inexpr_ || mdiscard_ ||
         std::holds_alternative<Pmty_ident>(r->desc))
       return k;
+    // An ASCRIBED binding saves the ascription: the check pairs that, and
+    // builds nothing of the application behind it (S544).
+    if (!saved && !wopen_off()) return k;
     // A type a `with` hands a manifest to is not rebuilt; one it takes out
     // is not there.
     std::set<std::string> conc;
@@ -34262,10 +34458,13 @@ struct Count {
       if (const ModuleType* pt = pf_head(*h)) return pf_rounds(m, *pt, nargs);
     if (!me) return mty_named(decl) ? xrecapp(*h, nargs) : 0;
     long long uses = 0;
+    WScope ws{*this};  // the result's `with module` names them (S544)
     for (int i = 0; i < nargs; ++i) {
       if (!me) return 0;
       auto* f = std::get_if<Pmod_functor>(&me->desc);
       if (!f) return 0;
+      if (auto* nm = std::get_if<Functor_named>(&f->param))
+        if (nm->name.txt && nm->type) ws.add(*nm->name.txt, &*nm->type);
       const ModuleExpr* b = mderef(f->body.get());
       if (b && std::get_if<Pmod_apply>(&b->desc)) b = app_res(b);
       if (!b) {
@@ -36751,22 +36950,72 @@ struct Count {
     }
     return mty_named(r) ? r : nullptr;
   }
-  static Gone res_gone(const ModuleType& mt) {
-    Gone g;
-    for (const ModuleType* p = &mt;;) {
-      auto* q = std::get_if<Pmty_with>(&p->desc);
-      if (!q) break;
-      for (auto& c : q->constraints) {
-        Wc x;
-        if (wc_parts(c, x) && x.destr) g.push_back(x.path);
+  // The `with` result a functor still to be applied ends in: through the
+  // parameters left, a constraint's or a functor type's body (S544).
+  const ModuleType* res_rest(const ModuleExpr* me, const ModuleType* mt) const {
+    for (int i = 0; me && i < 16; ++i) {
+      auto* f = std::get_if<Pmod_functor>(&me->desc);
+      if (!f) return nullptr;
+      const ModuleExpr* b = mderef(f->body.get());
+      if (!b) return nullptr;
+      if (auto* c = std::get_if<Pmod_constraint>(&b->desc)) {
+        mt = c->mt.get();
+        me = nullptr;
+      } else {
+        me = b;
       }
-      p = q->mt.get();
     }
+    if (me || !mt) return nullptr;
+    while (auto* f = std::get_if<Pmty_functor>(&mt->desc)) mt = f->body.get();
+    return std::holds_alternative<Pmty_with>(mt->desc) && mty_named(mt)
+               ? mt
+               : nullptr;
+  }
+  // The parameters a functor's chain names, for the `with module` of its
+  // result (S544).
+  void ws_params(const ModuleExpr* me, const ModuleType* mt,
+                 const WScope& ws) const {
+    for (int i = 0; i < 16; ++i) {
+      if (me) {
+        auto* f = std::get_if<Pmod_functor>(&me->desc);
+        if (!f) return;
+        if (auto* nm = std::get_if<Functor_named>(&f->param))
+          if (nm->name.txt && nm->type) ws.add(*nm->name.txt, &*nm->type);
+        const ModuleExpr* b = mderef(f->body.get());
+        if (!b) return;
+        if (auto* c = std::get_if<Pmod_constraint>(&b->desc)) {
+          mt = c->mt.get();
+          me = nullptr;
+        } else {
+          me = b;
+        }
+        continue;
+      }
+      if (!mt) return;
+      auto* f = std::get_if<Pmty_functor>(&mt->desc);
+      if (!f) return;
+      if (auto* nm = std::get_if<Functor_named>(&f->param))
+        if (nm->name.txt && nm->type) ws.add(*nm->name.txt, &*nm->type);
+      mt = f->body.get();
+    }
+  }
+  Gone res_gone(const ModuleType& mt) const {
+    Gone g;
+    Opens o;
+    wchain(mt, g, o);
     return g;
+  }
+  // The modules its constraints wrote out (S544).
+  Opens res_opens(const ModuleType& mt) const {
+    Gone g;
+    Opens o;
+    wchain(mt, g, o);
+    return o;
   }
   long long res_wt(const ModuleType& mt, const Lvl& l) const {
     if (resname_off()) return 0;
-    if (const Signature* sg = mty_sig(&mt)) return w_wt(*sg, l, res_gone(mt));
+    if (const Signature* sg = mty_sig(&mt))
+      return w_wt(*sg, l, res_gone(mt), res_opens(mt));
     std::string key;
     if (const cmi::Signature* cs = xmty_sig(&mt, key))
       return l.a * flat_csig(*cs);
@@ -37178,7 +37427,8 @@ struct Count {
   // One ident per item of it, at `res_wt`'s two sides.
   long long asc_flat(const ModuleType& mt) const {
     const Gone g = res_gone(mt);
-    if (const Signature* sg = mty_sig(&mt)) return w_wt(*sg, flat(), g);
+    if (const Signature* sg = mty_sig(&mt))
+      return w_wt(*sg, flat(), g, res_opens(mt));
     std::string key;
     if (const cmi::Signature* cs = xmty_sig(&mt, key))
       return c_wt(*cs, flat(), g);
@@ -38383,7 +38633,18 @@ struct Count {
     // ... but a `with` over that name writes the signature OUT, and what is
     // written out is renamed like any other parameter's.
     if (mty_named(&mt)) return res_wt(mt, pl);
-    return wt_mty(mt, pl);
+    long long k = wt_mty(mt, pl);
+    // A functor type's `with` result is written out too, its own
+    // parameters in scope for the `with module` (S544).
+    if (!wopen_off() && std::holds_alternative<Pmty_functor>(mt.desc)) {
+      WScope ws{*this};
+      ws_params(nullptr, &mt, ws);
+      const ModuleType* r = &mt;
+      while (auto* f = std::get_if<Pmty_functor>(&r->desc)) r = f->body.get();
+      if (std::holds_alternative<Pmty_with>(r->desc) && mty_named(r))
+        k += res_wt(*r, flat());
+    }
+    return k;
   }
   // `module type of struct include X end` over a PARAMETER of the same
   // functor: that scope is closed by the time the application is walked, so
@@ -39326,7 +39587,7 @@ struct Count {
     }
     if (!me && !mt && !ngen && !parfun_off())
       if (const ModuleType* pt = pf_head(*head))
-        return pfapp_charge(m, *pt, nargs, l, rebind);
+        return pfapp_charge(m, *pt, nargs, l, rebind, saved);
     if (!me && !mt)
       return ngen ? 0 : cross_charge(m, *head, nargs, l, saved, rebind);
     const ModuleExpr* fdef = me;
@@ -39361,6 +39622,8 @@ struct Count {
           if (!nm->name.txt) return 0;
     long long k = 0;
     std::vector<std::pair<std::string, const ModuleType*>> fps;
+    WScope ws{*this};  // the result's `with module` names them (S544)
+    ws_params(me, mt, ws);
     bool pbody = false;  // the result is the PARAMETER, and so an alias
     bool thru = false;   // the result was reached THROUGH an application
     for (int i = 0; i < nargs; ++i) {
@@ -39379,8 +39642,10 @@ struct Count {
         auto* f = std::get_if<Pmod_functor>(&me->desc);
         if (!f) return 0;
         if (auto* nm = std::get_if<Functor_named>(&f->param)) {
-          if (nm->name.txt && nm->type)
+          if (nm->name.txt && nm->type) {
             fps.emplace_back(*nm->name.txt, &*nm->type);
+            ws.add(*nm->name.txt, &*nm->type);
+          }
           // .. less the named arrows of a functor-typed parameter, which the
           // renames of the levels above count already (S536).
           if (cpar && nm->type)
@@ -39407,17 +39672,23 @@ struct Count {
       } else {
         auto* f = std::get_if<Pmty_functor>(&mt->desc);
         if (!f) return 0;
-        if (auto* nm = std::get_if<Functor_named>(&f->param))
+        if (auto* nm = std::get_if<Functor_named>(&f->param)) {
+          if (nm->name.txt && nm->type) ws.add(*nm->name.txt, &*nm->type);
           // .. less the named arrows of a functor-typed parameter, which the
           // renames of the levels above count already (S536).
           if (cpar && nm->type)
             k += i * (par_wt(*nm->type, fps) -
                       (xbody_off() ? 0 : pfun_named(*nm->type)));
+        }
         mt = f->body.get();
       }
       if (i + 1 < nargs && !reb) {
         k += me ? wt_mexpr(*me, flat()) : wt_mty(*mt, flat());
         if (const ModuleType* r = res_named(me, mt)) k += res_wt(*r, flat());
+        // .. and the `with` result the functor still to be applied ends in,
+        // which `wt_mexpr` reads as its bare name (S544).
+        if (!wopen_off())
+          if (const ModuleType* r = res_rest(me, mt)) k += res_wt(*r, flat());
       }
     }
     // The body is another unit's functor applied (S536): the result renamed
@@ -39443,6 +39714,10 @@ struct Count {
       rnm = nullptr;
     k += me ? wt_mexpr(*me, l) : wt_mty(*mt, l);
     if (rnm) k += res_wt(*rnm, l);
+    // A partial application's result is the functor left, its `with`
+    // result written out with it (S544).
+    if (multi && !rnm && !wopen_off())
+      if (const ModuleType* r = res_rest(me, mt)) k += res_wt(*r, flat());
     if (me && !incwt_off()) k += inc_wt(*me, l, fps, home);
     // The rebuild is `type_one_application`'s and is owed whether the
     // result is saved or not: an ascribed `module N : S = F (struct .. end)`
@@ -39834,17 +40109,9 @@ struct Count {
     // A DESTRUCTIVE constraint takes its item out of the signature the
     // parameter is written at, and everything that item spans with it.
     Gone g;
-    for (const ModuleType* p = &pt;;) {
-      auto* q = std::get_if<Pmty_with>(&p->desc);
-      if (!q) break;
-      for (auto& c : q->constraints) {
-        Wc x;
-        if (!wc_parts(c, x)) return 0;
-        if (x.destr) g.push_back(x.path);
-      }
-      p = q->mt.get();
-    }
-    return w_ren(*sg, g);
+    Opens o;
+    if (!wchain(pt, g, o)) return 0;
+    return w_ren(*sg, g, o);
   }
   // ---- AN ANONYMOUS FUNCTOR PARAMETER IS NAMED ANYWAY ---------------------
   // `Includemod.modtypes` (includemod.ml:610) makes a FRESH SHAPE VARIABLE for
@@ -40054,7 +40321,12 @@ struct Count {
         if (auto* nm = std::get_if<Functor_named>(&f->param))
           if (nm->type) n += (l.a - 1) * pfun_named(*nm->type);
       fparam(f->param, l);
+      // The parameter is in scope over the result: a `with module` there
+      // names it (S544).
+      auto fk = fmark();
+      if (!wopen_off()) fbind(f->param);
       mty(*f->body, l);
+      frelease(fk);
     } else if (auto* w = std::get_if<Pmty_with>(&mt.desc)) {
       // A with-node BELOW this one leaves a signature nothing saves, so the
       // cascade stops there: only the outermost result is renamed by it.
@@ -40493,11 +40765,22 @@ struct Count {
         mty(i->mt, Lvl{1, l.u, l.depth + 1, l.root});
         n += per * sig_exports(i->mt);
       } else {
-        mty(i->mt, l);
+        // A `with` over the name lands here as the freshen alone: the
+        // cascade below is the include's, over the merged signature with
+        // the modules the constraints wrote out (S544).
+        Gone g;
+        Opens o;
+        const Signature* isg =
+            !incname_off() && !mty_lit(i->mt) ? mty_sig(&i->mt) : nullptr;
+        const bool nw = !wopen_off() && isg && wchain(i->mt, g, o) &&
+                        (std::holds_alternative<Pmty_with>(i->mt.desc) ||
+                         !(g.empty() && o.empty()));
+        mty(i->mt, nw ? flat() : l);
         n += ren_mty(i->mt);
-        if (!incname_off() && !mty_lit(i->mt))
-          if (const Signature* sg = mty_sig(&i->mt))
-            for (auto& si : *sg) n += wt_sig_item(si, l);
+        if (isg) {
+          if (nw) n += w_wt(*isg, l, g, o);
+          else for (auto& si : *isg) n += wt_sig_item(si, l);
+        }
         // `ren_mty` reads the parsetree, and a `module type of` node has no
         // signature there: the items it brings in are renamed all the same.
         if (auto* pt = std::get_if<Pmty_typeof>(&i->mt.desc))
