@@ -572,7 +572,8 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
                                 const std::string& file_name = "",
                                 std::vector<std::string>* required_globals = nullptr,
                                 const std::vector<std::string>* directive_files = nullptr,
-                                std::size_t* eta_sites = nullptr);
+                                std::size_t* eta_sites = nullptr,
+                                std::size_t* pv_reify = nullptr);
 
 // Print in -dlambda format (stamps normalized by first appearance).
 void print_dlambda(const LamPtr& code, std::ostream& out);

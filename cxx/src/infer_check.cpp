@@ -8989,6 +8989,430 @@ struct Checker {
   // make a match exhaustive, so they contribute no wildcards.  Positions are
   // encoded as step-paths ("/`Abs/0/"); marked nodes are consumed by
   // infer_pat's Ppat_variant/Ppat_type row builders.
+  // A MATCHED POLYMORPHIC-VARIANT TAG CONJOINS ITS ARGUMENT (S547).  A
+  // pattern `` `B r `` typed at a `[<` row that already carries `B of t`
+  // (an earlier match, an annotation) does not unify `r` with `t`: ocamlc
+  // types a match's rows against a partial instance that drops the Reither
+  // fields (ctype.ml:1431), closes and un-marks them (`finalize_variant`),
+  // and only then meets the scrutinee's row, where two un-marked Reither
+  // fields keep both types (ctype.ml:3806, `int & int -> int`); the arms of
+  // ONE match still share one argument.  The kind pass keeps the conjuncts
+  // beside the row, keyed by the tag's slot node (every merge preserves
+  // it), and charges what the counter-examples reify: `check_unused` hands
+  // typecore each clause after the first unguarded one that no earlier
+  // clause covers, `check_partial` the or of the tags no unguarded clause
+  // covers, and a `` `B _ `` typed there (matched again) unifies a fresh
+  // variable with every conjunct -- a disagreeing pair backtracks into
+  // `Ctype.reify` (ctype.ml:3532) on both rows: the pattern's row variable
+  // and argument, the expected row's variable and every free variable in
+  // its fields.  The check is delayed, but its expected type is a
+  // `for_saving` copy taken at the end of the match's own typing
+  // (typecore.ml:7222), so a later match's conjuncts are not seen.
+  // `NOPVREIFY=1` reverts.
+  static bool pvreify_off() {
+    static const bool off = std::getenv("NOPVREIFY") != nullptr;
+    return off;
+  }
+  std::unordered_map<I::Type*, std::vector<TypePtr>> pvconj_;
+  // The charges, by the tag's slot, and the slots a later closed match
+  // left ABSENT (`Rabsent` against `Reither`, ctype.ml:3836): a check
+  // reads the pattern's live row, and an absent tag's clause is Unused.
+  std::vector<std::pair<I::Type*, long long>> pvcharges_;
+  std::set<I::Type*> pvabsent_;
+  long long pv_reify_ = 0;
+  struct PvPre { TypePtr row; std::set<std::string> tags, all; };
+  // The `[<` rows a match's patterns meet before any arm: the scrutinee's
+  // (position 0) and a tuple scrutinee's components (1..n).
+  std::vector<PvPre> pv_pre(const TypePtr& se) {
+    std::vector<PvPre> out;
+    if (!record_kinds_ || pvreify_off()) return out;
+    bool any = false;
+    auto one = [&](const TypePtr& t) {
+      PvPre p;
+      TypePtr r = I::Engine::repr(t);
+      if (r->kind == I::Type::Kind::Variant && r->variant_kind == 1) {
+        p.row = r;
+        for (size_t i = 0; i < r->labels.size(); ++i) {
+          p.all.insert(r->labels[i]);
+          if (i < r->tag_has_arg.size() && r->tag_has_arg[i])
+            p.tags.insert(r->labels[i]);
+        }
+        any = true;
+      }
+      out.push_back(p);
+    };
+    one(se);
+    TypePtr r = I::Engine::repr(se);
+    if (r->kind == I::Type::Kind::Tuple)
+      for (auto& e : r->args) one(e);
+    if (!any) out.clear();
+    return out;
+  }
+  TypePtr pv_slot(const PvPre& p, const std::string& tg) {
+    if (!p.row) return nullptr;
+    TypePtr r = I::Engine::repr(p.row);
+    if (r->kind != I::Type::Kind::Variant) return nullptr;
+    for (size_t i = 0; i < r->labels.size(); ++i)
+      if (r->labels[i] == tg && i < r->tag_has_arg.size() && r->tag_has_arg[i])
+        return r->args[i];
+    return nullptr;
+  }
+  // Before an arm's pattern meets the scrutinee: a tag the row already
+  // carries keeps the row's slot, and the pattern's argument becomes a
+  // conjunct of it -- one per match, the later arms' unified with it.
+  void pv_apply(const TypePtr& pt, const std::vector<PvPre>& pre,
+                std::map<std::string, TypePtr>& mvar) {
+    auto at = [&](const TypePtr& t, size_t pos) {
+      if (pos >= pre.size() || !pre[pos].row) return;
+      TypePtr r = I::Engine::repr(t);
+      if (r->kind != I::Type::Kind::Variant || r->variant_kind != 1) return;
+      for (size_t i = 0; i < r->labels.size(); ++i) {
+        if (i >= r->tag_has_arg.size() || !r->tag_has_arg[i]) continue;
+        const std::string& tg = r->labels[i];
+        if (!pre[pos].tags.count(tg)) continue;
+        TypePtr slot = pv_slot(pre[pos], tg);
+        if (!slot || I::Engine::repr(slot) == I::Engine::repr(r->args[i]))
+          continue;
+        std::string key = std::to_string(pos) + ":" + tg;
+        auto mv = mvar.find(key);
+        if (mv != mvar.end()) soft_unify(r->args[i], mv->second);
+        else {
+          mvar[key] = r->args[i];
+          pvconj_[slot.get()].push_back(r->args[i]);
+        }
+        r->args[i] = slot;
+      }
+    };
+    at(pt, 0);
+    TypePtr r = I::Engine::repr(pt);
+    if (r->kind == I::Type::Kind::Tuple)
+      for (size_t i = 0; i < r->args.size(); ++i) at(r->args[i], i + 1);
+  }
+  // Whether two conjuncts can be one type (`Ctype.mcomp`, by head): a
+  // variable meets anything, an abstract or unknown constructor too; a
+  // predefined type or a variant declared here refuses another head.
+  bool pv_datatype(const std::string& p) const {
+    static const std::set<std::string> base = {
+        "int", "char", "string", "bytes", "float", "bool", "unit", "exn",
+        "array", "list", "option", "nativeint", "int32", "int64", "lazy_t",
+        "floatarray", "extension_constructor"};
+    return base.count(p) > 0 || type_ctor_schemes_.count(p) > 0 ||
+           algebraic_names_.count(p) > 0;
+  }
+  bool pv_compat(const TypePtr& a0, const TypePtr& b0, int depth = 0) const {
+    TypePtr a = I::Engine::repr(a0), b = I::Engine::repr(b0);
+    if (a == b || depth > 12) return true;
+    using K = I::Type::Kind;
+    if (a->kind == K::Var || b->kind == K::Var) return true;
+    if (a->kind == K::Constr && b->kind == K::Constr) {
+      if (a->path != b->path)
+        return !(pv_datatype(a->path) && pv_datatype(b->path));
+      if (a->args.size() != b->args.size()) return true;
+      for (size_t i = 0; i < a->args.size(); ++i)
+        if (!pv_compat(a->args[i], b->args[i], depth + 1)) return false;
+      return true;
+    }
+    if (a->kind == K::Constr) return !pv_datatype(a->path);
+    if (b->kind == K::Constr) return !pv_datatype(b->path);
+    if (a->kind != b->kind) return false;
+    if (a->kind == K::Arrow)
+      return pv_compat(a->dom, b->dom, depth + 1) &&
+             pv_compat(a->cod, b->cod, depth + 1);
+    if (a->kind == K::Tuple) {
+      if (a->args.size() != b->args.size()) return false;
+      for (size_t i = 0; i < a->args.size(); ++i)
+        if (!pv_compat(a->args[i], b->args[i], depth + 1)) return false;
+    }
+    return true;  // rows and objects are never refused here
+  }
+  // The free variables `Ctype.reify` names in a type: a row's own, its
+  // fields' (every conjunct), an object's.
+  void pv_vars(const TypePtr& t0, std::set<I::Type*>& seen, long long& k,
+               int depth) {
+    TypePtr t = I::Engine::repr(t0);
+    if (depth > 12 || !seen.insert(t.get()).second) return;
+    using K = I::Type::Kind;
+    switch (t->kind) {
+      case K::Var: ++k; return;
+      case K::Arrow:
+        pv_vars(t->dom, seen, k, depth + 1);
+        pv_vars(t->cod, seen, k, depth + 1);
+        return;
+      case K::Variant:
+        if (t->variant_kind != 2) ++k;
+        for (size_t i = 0; i < t->args.size(); ++i) {
+          if (i >= t->tag_has_arg.size() || !t->tag_has_arg[i]) continue;
+          pv_vars(t->args[i], seen, k, depth + 1);
+          auto it = pvconj_.find(t->args[i].get());
+          if (it != pvconj_.end())
+            for (auto& c : it->second) pv_vars(c, seen, k, depth + 1);
+        }
+        return;
+      case K::Object: ++k; [[fallthrough]];
+      case K::Tuple:
+      case K::Constr:
+        for (auto& a : t->args) pv_vars(a, seen, k, depth + 1);
+        return;
+      default: return;
+    }
+  }
+  // What the argument sub-pattern of a reified tag costs on top: its own
+  // type meets the fresh `$` in pattern mode and is reified in turn
+  // (ctype.ml:3503) -- a tuple's component variables, a nested row's
+  // variable and argument; a variable or a wildcard is bound to `$`.
+  long long pv_sub(const Pattern& p0) {
+    const Pattern& p = pv_strip(p0);
+    if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
+      long long k = (long long)t->elems.size();
+      for (auto& e : t->elems) k += pv_sub(*e);
+      return k;
+    }
+    if (auto* v = std::get_if<Ppat_variant>(&p.desc))
+      return v->arg ? 2 + pv_sub(**v->arg) : 1;
+    if (auto* c = std::get_if<Ppat_construct>(&p.desc)) {
+      // `unify_head_only`: the constructor's type at fresh parameters.
+      auto it = ctors.find(lid_last(c->id.txt));
+      if (it == ctors.end()) return 0;
+      TypePtr t = I::Engine::repr(it->second);
+      while (t->kind == I::Type::Kind::Arrow) t = I::Engine::repr(t->cod);
+      return t->kind == I::Type::Kind::Constr ? (long long)t->args.size() : 0;
+    }
+    return 0;
+  }
+  // What a counter-example `` `tg q `` costs at the row `p`: nothing while
+  // the conjuncts agree; else the two rows' reification, and `sub` for the
+  // argument's.
+  long long pv_tag_cost(const PvPre& p, const std::string& tg,
+                        long long sub = 0) {
+    if (!p.tags.count(tg)) return 0;
+    TypePtr slot = pv_slot(p, tg);
+    if (!slot) return 0;
+    auto it = pvconj_.find(slot.get());
+    if (it == pvconj_.end()) return 0;
+    std::vector<TypePtr> cs{slot};
+    for (auto& c : it->second) cs.push_back(c);
+    bool bad = false;
+    for (size_t i = 0; i < cs.size() && !bad; ++i)
+      for (size_t j = i + 1; j < cs.size(); ++j)
+        if (!pv_compat(cs[i], cs[j])) { bad = true; break; }
+    if (!bad) return 0;
+    long long k = 2 + sub;  // the pattern's row variable and argument
+    std::set<I::Type*> seen;
+    pv_vars(p.row, seen, k, 0);
+    pvcharges_.push_back({slot.get(), k});
+    return k;
+  }
+  // A closed match (no catch-all at the position) that omits a tag the row
+  // carries leaves it absent.
+  void pv_absent(const std::vector<Case>& cases, const std::vector<PvPre>& pre) {
+    for (size_t pos = 0; pos < pre.size(); ++pos) {
+      if (!pre[pos].row) continue;
+      std::set<std::string> men;
+      bool open = false;
+      for (auto& c : cases) {
+        const Pattern& p = pv_strip(c.lhs);
+        if (std::holds_alternative<Ppat_exception>(p.desc) ||
+            std::holds_alternative<Ppat_effect>(p.desc))
+          continue;
+        const Pattern* q = &p;
+        if (pos != 0) {
+          auto* t = std::get_if<Ppat_tuple>(&p.desc);
+          if (!t) { open = true; break; }
+          if (pos - 1 >= t->elems.size()) { open = true; break; }
+          q = t->elems[pos - 1].get();
+        }
+        if (pv_irref(*q)) { open = true; break; }
+        pv_mention_tags(*q, men);
+      }
+      if (open) continue;
+      for (auto& tg : pre[pos].tags)
+        if (!men.count(tg))
+          if (TypePtr slot = pv_slot(pre[pos], tg)) pvabsent_.insert(slot.get());
+    }
+  }
+  static const Pattern& pv_strip(const Pattern& p) {
+    if (auto* a = std::get_if<Ppat_alias>(&p.desc)) return pv_strip(*a->p);
+    if (auto* c = std::get_if<Ppat_constraint>(&p.desc)) return pv_strip(*c->p);
+    if (auto* o = std::get_if<Ppat_open>(&p.desc)) return pv_strip(*o->p);
+    return p;
+  }
+  static bool pv_irref(const Pattern& p0) {
+    const Pattern& p = pv_strip(p0);
+    if (std::holds_alternative<Ppat_any>(p.desc) ||
+        std::holds_alternative<Ppat_var>(p.desc))
+      return true;
+    if (auto* o = std::get_if<Ppat_or>(&p.desc))
+      return pv_irref(*o->l) || pv_irref(*o->r);
+    if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
+      for (auto& e : t->elems)
+        if (!pv_irref(*e)) return false;
+      return true;
+    }
+    return false;
+  }
+  // Whether the earlier clause `q` matches everything `p` does.
+  bool pv_covers(const Pattern& q0, const Pattern& p0) {
+    const Pattern& q = pv_strip(q0);
+    const Pattern& p = pv_strip(p0);
+    if (pv_irref(q)) return true;
+    if (auto* o = std::get_if<Ppat_or>(&q.desc))
+      return pv_covers(*o->l, p) || pv_covers(*o->r, p);
+    if (auto* h = std::get_if<Ppat_type>(&q.desc)) {
+      auto* pv = std::get_if<Ppat_variant>(&p.desc);
+      TypePtr row = pv ? hash_type_row(h->id.txt) : nullptr;
+      if (!row || (pv->arg && !pv_irref(**pv->arg))) return false;
+      for (auto& l : row->labels)
+        if (l == pv->label) return true;
+      return false;
+    }
+    if (auto* o = std::get_if<Ppat_or>(&p.desc))
+      return pv_covers(q, *o->l) && pv_covers(q, *o->r);
+    if (auto* qv = std::get_if<Ppat_variant>(&q.desc)) {
+      auto* pv = std::get_if<Ppat_variant>(&p.desc);
+      if (!pv || pv->label != qv->label) return false;
+      if (!qv->arg) return !pv->arg;
+      return pv->arg && pv_covers(**qv->arg, **pv->arg);
+    }
+    if (auto* qc = std::get_if<Ppat_construct>(&q.desc)) {
+      auto* pc = std::get_if<Ppat_construct>(&p.desc);
+      if (!pc || lid_last(qc->id.txt) != lid_last(pc->id.txt)) return false;
+      if (!qc->arg) return !pc->arg;
+      return pc->arg && pv_covers(**qc->arg, **pc->arg);
+    }
+    if (auto* qt = std::get_if<Ppat_tuple>(&q.desc)) {
+      auto* pt = std::get_if<Ppat_tuple>(&p.desc);
+      if (!pt || pt->elems.size() != qt->elems.size()) return false;
+      for (size_t i = 0; i < qt->elems.size(); ++i)
+        if (!pv_covers(*qt->elems[i], *pt->elems[i])) return false;
+      return true;
+    }
+    return false;
+  }
+  // The tags an unguarded clause covers whole at the scrutinee's position;
+  // `#t` is the or of t's tags with wildcard arguments.
+  void pv_cover_tags(const Pattern& p0, std::set<std::string>& cov) {
+    const Pattern& p = pv_strip(p0);
+    if (auto* o = std::get_if<Ppat_or>(&p.desc)) {
+      pv_cover_tags(*o->l, cov);
+      pv_cover_tags(*o->r, cov);
+    } else if (auto* v = std::get_if<Ppat_variant>(&p.desc)) {
+      if (!v->arg || pv_irref(**v->arg)) cov.insert(v->label);
+    } else if (auto* h = std::get_if<Ppat_type>(&p.desc)) {
+      if (TypePtr row = hash_type_row(h->id.txt))
+        for (auto& l : row->labels) cov.insert(l);
+    }
+  }
+  // An alternative with a satisfying vector of its own: not a tag the row
+  // lacks (`list_satisfying_vectors`' `is_absent`), not one the prefix
+  // covers.
+  bool pv_tag_alive(const std::string& tg, const std::vector<PvPre>& pre,
+                    size_t pos, const std::set<std::string>& cov) {
+    if (pos < pre.size() && pre[pos].row && !pre[pos].all.count(tg))
+      return false;
+    return pos != 0 || !cov.count(tg);
+  }
+  bool pv_alive(const Pattern& p0, const std::vector<PvPre>& pre, size_t pos,
+                const std::vector<const Pattern*>& pref,
+                const std::set<std::string>& cov) {
+    const Pattern& p = pv_strip(p0);
+    if (auto* o = std::get_if<Ppat_or>(&p.desc))
+      return pv_alive(*o->l, pre, pos, pref, cov) ||
+             pv_alive(*o->r, pre, pos, pref, cov);
+    if (auto* v = std::get_if<Ppat_variant>(&p.desc))
+      if (!pv_tag_alive(v->label, pre, pos, cov)) return false;
+    if (auto* h = std::get_if<Ppat_type>(&p.desc)) {
+      TypePtr row = hash_type_row(h->id.txt);
+      if (!row) return true;
+      for (auto& l : row->labels)
+        if (pv_tag_alive(l, pre, pos, cov)) return true;
+      return false;
+    }
+    for (auto* q : pref)
+      if (pos == 0 && pv_covers(*q, p)) return false;
+    return true;
+  }
+  // What the pred's pattern for a clause costs: `Backtrack_or` types an
+  // or-pattern's first live alternative, and it stands once reified.
+  long long pv_pat_cost(const Pattern& p0, const std::vector<PvPre>& pre,
+                        size_t pos, const std::vector<const Pattern*>& pref,
+                        const std::set<std::string>& cov) {
+    const Pattern& p = pv_strip(p0);
+    if (auto* o = std::get_if<Ppat_or>(&p.desc))
+      return pv_alive(*o->l, pre, pos, pref, cov)
+                 ? pv_pat_cost(*o->l, pre, pos, pref, cov)
+                 : pv_pat_cost(*o->r, pre, pos, pref, cov);
+    if (auto* v = std::get_if<Ppat_variant>(&p.desc))
+      return v->arg && pos < pre.size()
+                 ? pv_tag_cost(pre[pos], v->label, pv_sub(**v->arg))
+                 : 0;
+    if (auto* h = std::get_if<Ppat_type>(&p.desc)) {
+      TypePtr row = hash_type_row(h->id.txt);
+      if (!row || pos >= pre.size()) return 0;
+      for (size_t i = 0; i < row->labels.size(); ++i)
+        if (pv_tag_alive(row->labels[i], pre, pos, cov))
+          return i < row->tag_has_arg.size() && row->tag_has_arg[i]
+                     ? pv_tag_cost(pre[pos], row->labels[i])
+                     : 0;
+      return 0;
+    }
+    if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
+      if (pos != 0) return 0;
+      long long k = 0;
+      for (size_t i = 0; i < t->elems.size(); ++i)
+        k += pv_pat_cost(*t->elems[i], pre, i + 1, pref, cov);
+      return k;
+    }
+    return 0;
+  }
+  // The tags an unguarded clause mentions at all at the scrutinee's position.
+  void pv_mention_tags(const Pattern& p0, std::set<std::string>& men) {
+    const Pattern& p = pv_strip(p0);
+    if (auto* o = std::get_if<Ppat_or>(&p.desc)) {
+      pv_mention_tags(*o->l, men);
+      pv_mention_tags(*o->r, men);
+    } else if (auto* v = std::get_if<Ppat_variant>(&p.desc)) {
+      men.insert(v->label);
+    } else if (std::holds_alternative<Ppat_type>(p.desc)) {
+      pv_cover_tags(p, men);
+    }
+  }
+  long long pv_check(const std::vector<Case>& cases,
+                     const std::vector<PvPre>& pre) {
+    if (pre.empty()) return 0;
+    long long k = 0;
+    std::vector<const Pattern*> pref;
+    std::set<std::string> cov, men;
+    bool total = false;
+    for (auto& c : cases) {
+      const Pattern& p = pv_strip(c.lhs);
+      if (std::holds_alternative<Ppat_exception>(p.desc) ||
+          std::holds_alternative<Ppat_effect>(p.desc))
+        continue;
+      bool dead = false;
+      for (auto* q : pref)
+        if (pv_covers(*q, c.lhs)) { dead = true; break; }
+      if (!pref.empty() && !dead) k += pv_pat_cost(c.lhs, pre, 0, pref, cov);
+      if (c.guard) continue;
+      pref.push_back(&c.lhs);
+      if (pv_irref(c.lhs)) total = true;
+      pv_cover_tags(c.lhs, cov);
+      pv_mention_tags(c.lhs, men);
+    }
+    // The partial check's witness: the or of the tags left, each typed.  A
+    // tag some clause matches at a refutable argument is left to the
+    // clauses' own exhaustiveness (not read here).
+    if (!total && pre.size() == 1 && pre[0].row) {
+      TypePtr r = I::Engine::repr(pre[0].row);
+      if (r->kind == I::Type::Kind::Variant)
+        for (size_t i = 0; i < r->labels.size(); ++i)
+          if (i < r->tag_has_arg.size() && r->tag_has_arg[i] &&
+              !men.count(r->labels[i]))
+            k += pv_tag_cost(pre[0], r->labels[i]);
+    }
+    pv_absent(cases, pre);
+    if (dbg_env("PVDBG")) std::fprintf(stderr, "PVDBG match +%lld\n", k);
+    return k;
+  }
   std::unordered_set<const Pattern*> open_row_pats_;
   void mark_open_row_pats(const std::vector<Case>& cases) {
     if (strict) return;
@@ -10145,11 +10569,16 @@ struct Checker {
       // body side effects persist -- was tried and reverted: arm bodies typed
       // under an un-refined pattern leak wrong bindings; -4/+1 corpus-wide.)
       mark_open_row_pats(m->cases);
+      // The `[<` rows the arms meet, and the conjuncts they add (S547).
+      std::vector<PvPre> pvpre;
+      std::map<std::string, TypePtr> pvvar;
+      if (!gadt && !window) pvpre = pv_pre(se);
       for (auto& c : m->cases) {
         check_case_structure(c);
         venv.emplace_back();
         size_t wm = window ? eng.mark() : 0;
         TypePtr pt = infer_pat(c.lhs);
+        if (!pvpre.empty()) pv_apply(pt, pvpre, pvvar);
         if (window) soft_unify(pt, se);
         else if (!gadt) try_unify(pt, se);
         disambig_pat_by_scrut(c.lhs, se);
@@ -10179,6 +10608,7 @@ struct Checker {
         venv.pop_back();
       }
       if (window && all_ground && !ground_clash && gacc) soft_unify(rt, gacc);
+      if (!pvpre.empty()) pv_check(m->cases, pvpre);
       bool tproven = false;                                         // for the
       // An imported GADT (its ctors live only in the cmi, so gadt/gadt_ctors
       // never fire) is detectable HERE: the arms' full unify has pinned the
@@ -11636,6 +12066,9 @@ struct Checker {
           adoptable_annot_ = saved_ad;
           soft_unify(eng.arrow(arg, rt), at0);
         }
+      std::vector<PvPre> pvpre;  // the `[<` rows the cases meet (S547)
+      std::map<std::string, TypePtr> pvvar;
+      if (!gadt && !window) pvpre = pv_pre(arg);
       for (auto& c : fc.cases) {
         venv.emplace_back();
         size_t wm = window ? eng.mark() : 0;
@@ -11657,7 +12090,9 @@ struct Checker {
             else if (!ground_types_equal(racc, brr)) res_clash = true;
           } else res_all_ground = false;
         } else {
-          try_unify(infer_pat(c.lhs), arg);
+          TypePtr pt = infer_pat(c.lhs);
+          if (!pvpre.empty()) pv_apply(pt, pvpre, pvvar);
+          try_unify(pt, arg);
           disambig_pat_by_scrut(c.lhs, arg);
           retype_pat_binders(c.lhs, arg);
           if (c.guard) infer_expr(**c.guard);  // flows operand kinds; not bool-constrained
@@ -11667,6 +12102,7 @@ struct Checker {
       }
       if (window && pat_all_ground && !pat_clash && pacc) soft_unify(arg, pacc);
       if (window && res_all_ground && !res_clash && racc) soft_unify(rt, racc);
+      if (!pvpre.empty()) pv_check(fc.cases, pvpre);
       // Exhaustiveness of the cases against the parameter type, for the dump's
       // Tfunction_cases (Partial) marker (same conservative check as a match).
       // GADT scrutinees are exempt: refinement (a ctor at an incompatible type
@@ -14035,6 +14471,9 @@ ValueKinds infer_value_kinds(const ast::Structure& s,
                             std::get<3>(fr)};
   vk.format_lits = std::move(ck.fmt_lits_);
   vk.optional_erasures = std::move(ck.erasures_);
+  for (auto& [slot, k] : ck.pvcharges_)  // the delayed checks (S547)
+    if (!ck.pvabsent_.count(slot)) ck.pv_reify_ += k;
+  vk.pv_reify = ck.pv_reify_;
   vk.match_partial = std::move(ck.match_partial);
   vk.function_cases_partial = std::move(ck.function_cases_partial);
   vk.total_proven = std::move(ck.total_proven);
@@ -42224,7 +42663,8 @@ std::set<std::string> fexp_paths(const std::vector<cmi::cmiw::SigItem>& items) {
 }
 int typing_ident_count(const ast::Structure& s, std::size_t eta_sites,
                        long long pkg_sig,
-                       const std::set<std::string>* fexp) {
+                       const std::set<std::string>* fexp,
+                       std::size_t pv_reify) {
   // The citation walk runs FIRST: whether a `module M = A.N` alias is ever
   // READ is what says the path has to be resolved, and only a name this file
   // binds ONCE can be followed to the module it stands for.
@@ -42330,6 +42770,9 @@ int typing_ident_count(const ast::Structure& s, std::size_t eta_sites,
   // no expansion either (stamp_probes/xeta_a6, a9, a10, a13, -2 each).
   // `NOETASTAMP=1` reverts.
   if (!stampcount::etastamp_off()) k += 2 * (long long)eta_sites;
+  // The polymorphic-variant counter-examples the kind pass saw reified
+  // (S547, `Checker::pv_check`; off with the pass's `NOPVREIFY`).
+  k += (long long)pv_reify;
   // The inferred-signature check's package meets (S505, above).
   if (!stampcount::Count::pkmeet_off()) k += pkg_sig;
   return (int)k;

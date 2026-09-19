@@ -215,10 +215,10 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
     if (g_dump.parsetree)
       cppcaml::ast::print_dparsetree(structure, in_path, std::cout, dirfiles);
     std::vector<std::string> required_globals;
-    std::size_t eta_sites = 0;
+    std::size_t eta_sites = 0, pv_reify = 0;
     auto code = cppcaml::lambda::translate_implementation(structure, mod, stdlib_dir, in_path,
                                                           &required_globals, &dirfiles,
-                                                          &eta_sites);
+                                                          &eta_sites, &pv_reify);
     lap("translate (infer+lambda)", tp);
     if (g_dump.lambda) cppcaml::lambda::print_dlambda(code, std::cout);
     auto instrs = cppcaml::bytecode::compile_implementation(code, mod);
@@ -247,7 +247,8 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
                 ? 300
                 : 274 + cppcaml::typing_ident_count(
                             structure, eta_sites,
-                            cppcaml::package_sig_idents(sig), &fexp));
+                            cppcaml::package_sig_idents(sig), &fexp,
+                            pv_reify));
       }
     } catch (const std::exception& e) {
       if (prof) std::cerr << "  (.cmi emission skipped: " << e.what() << ")\n";

@@ -157,6 +157,10 @@ struct ValueKinds {
   // bool vector is the resulting application's argument slots (true = None for an
   // erased optional, false = an eta parameter).
   std::unordered_map<const ast::Expression*, std::vector<bool>> optional_erasures;
+  // How many idents ocamlc's delayed unused/partial checks reify for a
+  // polymorphic-variant counter-example whose tag's conjuncts disagree
+  // (`Checker::pv_check`); the .cmi writer's stamp base charges them.
+  std::size_t pv_reify = 0;
   // For a record-field PROJECTION (`d.untypables`) whose label is AMBIGUOUS
   // across record types, the field resolved through the base's inferred type
   // IDENTITY (its decl stamp) -- which the back end's by-name `find_field`
@@ -232,10 +236,12 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
 // right is their BASE, which is `274 + <this count>`.  See the definition in
 // infer_check.cpp for the rules and for what is not modelled yet.  `eta_sites`
 // is how many argument sites the value-kinds pass eta-expanded for an erased
-// optional argument (translate_implementation's out-parameter).
+// optional argument (translate_implementation's out-parameter), `pv_reify`
+// the idents its polymorphic-variant counter-examples reified (same source).
 int typing_ident_count(const ast::Structure& s, std::size_t eta_sites = 0,
                        long long pkg_sig = 0,
-                       const std::set<std::string>* fexp = nullptr);
+                       const std::set<std::string>* fexp = nullptr,
+                       std::size_t pv_reify = 0);
 // The idents the inferred-signature check allocates for the package types the
 // saved signature's values carry -- `pkg_sig` above, computed off the items
 // the .cmi writer is handed.

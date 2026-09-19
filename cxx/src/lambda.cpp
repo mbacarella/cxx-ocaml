@@ -38184,7 +38184,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
                                 const std::string& stdlib_dir, const std::string& file_name,
                                 std::vector<std::string>* required_globals,
                                 const std::vector<std::string>* directive_files,
-                                std::size_t* eta_sites) {
+                                std::size_t* eta_sites, std::size_t* pv_reify) {
   bool prof = std::getenv("CPPCAML_PROFILE") != nullptr;
   using clk = std::chrono::steady_clock;
   auto tp = clk::now();
@@ -38221,6 +38221,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
   // How many argument sites the pass eta-expanded for an erased optional: the
   // .cmi writer's stamp base charges ocamlc's two idents for each of them.
   if (eta_sites) *eta_sites = t.vk.optional_erasures.size();
+  if (pv_reify) *pv_reify = t.vk.pv_reify;
   lap("infer_value_kinds");
   t.register_predef_ctor_info();
   t.register_stdlib_ctors();
