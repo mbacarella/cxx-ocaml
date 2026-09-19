@@ -20675,6 +20675,12 @@ bool anondep_off() {
   static const bool off = dbg_env("NOANONDEP") != nullptr;
   return off;
 }
+// S537: the checks of a `module type of` -- its functors and nested module
+// types (`tof_checks`, `sig_applied_deep`).
+bool tofchk_off() {
+  static const bool off = dbg_env("NOTOFCHK") != nullptr;
+  return off;
+}
 // S536: a local functor whose result is another unit's application.
 bool xbody_off() {
   static const bool off = dbg_env("NOXBODY") != nullptr;
@@ -23448,6 +23454,34 @@ struct Cites {
       if (md.type && md.type->kind == cmi::ModuleType::Sig && md.type->sig)
         sig_applied(*md.type->sig, out);
   }
+  // The same through the module TYPES and functor results too: what the
+  // check of a `module type of` pairs (S537, `tof_checks`).
+  static void sig_applied_deep(const cmi::Signature& sg, Applied& out,
+                               int d = 0) {
+    if (d > 8) return;
+    std::set<const cmi::TypeExpr*> seen;
+    for (auto& v : sg.values) applied_walk(v.type, sg, seen, out);
+    for (auto& t : sg.types) applied_walk(t.manifest, sg, seen, out);
+    for (auto& md : sg.modules) mty_applied_deep(md.type.get(), out, d + 1);
+    for (auto& md : sg.modtypes) mty_applied_deep(md.type.get(), out, d + 1);
+  }
+  static void mty_applied_deep(const cmi::ModuleType* m, Applied& out, int d) {
+    if (!m || d > 8) return;
+    if (m->kind == cmi::ModuleType::Sig && m->sig)
+      sig_applied_deep(*m->sig, out, d);
+    else if (m->kind == cmi::ModuleType::Functor) {
+      // a parameter at another unit's module type NAME is expanded
+      // (`Env.expand_modtype_path` at `functor_param`): that unit's
+      // signature forced and its components built
+      const cmi::ModuleType* pt = m->functor_param_type.get();
+      if (pt && pt->kind == cmi::ModuleType::Ident && pt->path) {
+        bool al = false;
+        const std::string u = path_unit(pt->path.get(), &al);
+        if (!u.empty() && out.units[u] < 2) out.units[u] = 2;
+      }
+      mty_applied_deep(m->functor_body.get(), out, d + 1);
+    }
+  }
   // A `with` over ANOTHER UNIT's module type SCRAPES it, and scraping reads
   // its declarations: a type constructor APPLIED in the signature forces the
   // unit it belongs to, exactly as a functor's result signature does
@@ -23522,7 +23556,11 @@ struct Cites {
       c = std::vector<std::string>{c.back()};
     if (c.size() != 1 || c[0] == "Stdlib") return;
     incp.insert(c);
+    if (!tofchk_off()) tofc.insert(c);
   }
+  // The citations above that are a `module type of`: their checks reach the
+  // types of every nested module type and functor result (S537).
+  std::set<std::vector<std::string>> tofc;
   void inc_cite(const ModuleExpr& m) {
     auto* p = std::get_if<Pmod_ident>(&m.desc);
     if (!p || std::holds_alternative<Lapply>(p->id.txt.v)) return;
@@ -23549,7 +23587,8 @@ struct Cites {
             walk_path(&cmi::CmiFile::load(p).sig(), c, u, dotted);
         if (!sg) continue;
         Applied a;
-        sig_applied(*sg, a);
+        if (tofc.count(ip)) sig_applied_deep(*sg, a);
+        else sig_applied(*sg, a);
         for (auto& e : a.units)
           if (more[e.first] < e.second) more[e.first] = e.second;
         if (!strengthen_rebuilds(*sg)) continue;
@@ -23639,6 +23678,13 @@ struct Cites {
     const bool xoff = dbg_env("NOXMODAPP") != nullptr;
     const bool mtoff = dbg_env("NOMTYREAD") != nullptr;
     long long k = 0;
+    // `CITETRACE=1` prints every unit-level charge (`$S/chg.sh` sees none
+    // of these: they are summed here, outside `Count`).
+    static const bool trace = dbg_env("CITETRACE") != nullptr;
+    auto add = [&](long long d, const char* what, const std::string& u) {
+      if (trace && d) fprintf(stderr, "CITE %lld %s %s\n", d, what, u.c_str());
+      k += d;
+    };
     bool fmt = extra && fmt_ann;
     std::set<std::string> done;  // two names can alias ONE unit
     std::map<std::string, int> more;  // unit -> loads a READ TYPE asks for
@@ -23653,7 +23699,7 @@ struct Cites {
         // twice, one functor parameter apiece; a DIRECT force renames
         // the parameter TWICE in the one go (S437).
         bool aliased = u != c.module_name();
-        k += load_cost(c.sig(), extra, aliased || xoff ? 1 : 2);
+        add(load_cost(c.sig(), extra, aliased || xoff ? 1 : 2), "unit", u);
         if (extra && !fmt) fmt = reads_format(m, c);
         if (!sub) continue;
         // Only a reference through one of Stdlib's ALIASES is forced twice:
@@ -23688,13 +23734,14 @@ struct Cites {
           // `Ephemeron.K1.Make`, typemod.ml:2484): items once more, the
           // parameters twice.  Under the unit's own name the two paths share
           // one components tree, built once with the parameters twice.
-          k += load_cost(*s.second, extra, aliased || subapp_off() ? 1 : 2);
+          add(load_cost(*s.second, extra, aliased || subapp_off() ? 1 : 2),
+              "sub", m + "." + s.first);
           Applied b;
           scan_applied(m + "." + s.first, true, *s.second, b, app);
           if (aliased && (b.self || a.subs.count(s.first) ||
                           (!subapp_off() &&
                            sub_applied(m, s.first, *s.second))))
-            k += load_cost(*s.second, extra, 2);
+            add(load_cost(*s.second, extra, 2), "sub2", m + "." + s.first);
           for (auto& e : b.units)
             if (more[e.first] < e.second) more[e.first] = e.second;
         }
@@ -23720,7 +23767,7 @@ struct Cites {
     std::set<std::string> noload;
     if (sub && !xoff) functor_loads(more, noload);
     if (sub && dbg_env("NOXWITHC") == nullptr) with_loads(more);
-    if (sub && !incpath_off()) k += inc_loads(more, extra);
+    if (sub && !incpath_off()) add(inc_loads(more, extra), "inc", "");
     for (auto& e : more) {
       bool cited = !done.insert(e.first).second;
       if (cited && e.second < 2) continue;
@@ -23730,16 +23777,17 @@ struct Cites {
         const cmi::CmiFile& cf = cmi::CmiFile::load(p);
         const cmi::Signature& sg = cf.sig();
         if (!cited && !noload.count(e.first))
-          k += load_cost(sg, extra,
-                         !xoff && e.first == cf.module_name() ? 2 : 1);
-        if (e.second >= 2) k += load_cost(sg, extra, 2);
+          add(load_cost(sg, extra,
+                        !xoff && e.first == cf.module_name() ? 2 : 1),
+              "more", e.first);
+        if (e.second >= 2) add(load_cost(sg, extra, 2), "more2", e.first);
       } catch (...) {
       }
     }
     if (fmt && done.insert("CamlinternalFormatBasics").second) {
       std::string p = head_cmi("CamlinternalFormatBasics");
       if (std::filesystem::exists(p)) try {
-          k += load_cost(cmi::CmiFile::load(p).sig(), extra);
+          add(load_cost(cmi::CmiFile::load(p).sig(), extra), "fmt", "");
         } catch (...) {
         }
     }
@@ -23808,6 +23856,59 @@ const ModuleExpr* nar_find(const Structure& s, const std::string& nm) {
         r = &m->binding.expr;
   return r;
 }
+// ---- A `module type of` A UNIT READ THROUGH (S537) -----------------------
+// The components of a module ascribed at `module type of Hashtbl` are built
+// where a member of it is first read (`Env.lookup_structure_components`):
+// one ident per named functor arrow of the unit's own module and module type
+// items, as `nar_sig` counts a written signature's.  The walk below resolves
+// the `module type of`'s path through this file's top structure and its
+// `open`s (`nar_top_`/`nar_opens_`, set around the read walk) to the unit.
+const Structure* nar_top_ = nullptr;
+const std::set<std::string>* nar_opens_ = nullptr;
+long long cnar_mty(const cmi::ModuleType* m, int d = 0) {
+  if (!m || d > 16 || m->kind != cmi::ModuleType::Functor) return 0;
+  return (m->functor_param ? 1 : 0) +
+         cnar_mty(m->functor_param_type.get(), d + 1) +
+         cnar_mty(m->functor_body.get(), d + 1);
+}
+long long cnar_sig(const cmi::Signature& s) {
+  long long k = 0;
+  for (auto& md : s.modules) k += cnar_mty(md.type.get());
+  for (auto& md : s.modtypes) k += cnar_mty(md.type.get());
+  return k;
+}
+// The arrows of the unit a `module type of` names; -1 where the path is not
+// resolvable to a unit.
+long long tof_unit_arrows(const ModuleExpr& me) {
+  if (tofchk_off() || !nar_top_) return -1;
+  auto* pi = std::get_if<Pmod_ident>(&me.desc);
+  if (!pi) return -1;
+  std::vector<std::string> c;
+  if (!lid_comps(pi->id.txt, c) || c.empty()) return -1;
+  for (int i = 0; i < 8; ++i) {
+    const ModuleExpr* m = nar_find(*nar_top_, c[0]);
+    if (!m && nar_opens_)
+      for (auto& o : *nar_opens_) {
+        const ModuleExpr* om = nar_find(*nar_top_, o);
+        auto* os = om ? std::get_if<Pmod_structure>(&om->desc) : nullptr;
+        if (os && (m = nar_find(os->items, c[0]))) break;
+      }
+    if (!m) break;
+    for (std::size_t j = 1; m && j < c.size(); ++j) {
+      auto* st = std::get_if<Pmod_structure>(&m->desc);
+      m = st ? nar_find(st->items, c[j]) : nullptr;
+    }
+    auto* q = m ? std::get_if<Pmod_ident>(&m->desc) : nullptr;
+    if (!q) return -1;
+    c.clear();
+    if (!lid_comps(q->id.txt, c) || c.empty()) return -1;
+  }
+  if (c.size() == 1) c.push_back("");
+  const cmi::Signature* sg = unit_of_path(c);
+  for (std::size_t i = 1; sg && i + 1 < c.size(); ++i)
+    sg = submodule(*sg, c[i]);
+  return sg ? cnar_sig(*sg) : -1;
+}
 // `upto`: the items of `s` before the include, the only ones in scope.
 bool nar_sig_inc(const Signature& s, std::size_t upto, const ModuleType& mt,
                  std::map<std::string, long long>& out, bool& ok, int d = 0) {
@@ -23818,6 +23919,12 @@ bool nar_sig_inc(const Signature& s, std::size_t upto, const ModuleType& mt,
   }
   if (auto* w = std::get_if<Pmty_with>(&mt.desc))
     return nar_sig_inc(s, upto, *w->mt, out, ok, d + 1);
+  if (auto* t = std::get_if<Pmty_typeof>(&mt.desc)) {
+    const long long k = tof_unit_arrows(*t->me);
+    if (k < 0) return false;
+    out["*" + std::to_string((std::uintptr_t)t)] = k;
+    return true;
+  }
   auto* id = std::get_if<Pmty_ident>(&mt.desc);
   auto* li = id ? std::get_if<Lident>(&id->id.txt.v) : nullptr;
   if (!li) return false;
@@ -24238,12 +24345,20 @@ long long modforce_cost(const Structure& s, const Cites& u) {
     if (auto* st = std::get_if<Pmod_structure>(&me->desc)) {
       nar_str(st->items, per, ok);
     } else if (auto* cn = std::get_if<Pmod_constraint>(&me->desc)) {
+      nar_top_ = &s;
+      nar_opens_ = &u.opens;
       if (auto* sg = std::get_if<Pmty_signature>(&cn->mt->desc))
         nar_sig(sg->items, per, ok);
       else if (const Signature* sg = named_sig_at(scopes, *cn->mt))
         nar_sig(*sg, per, ok);
-      else
+      else if (auto* t = std::get_if<Pmty_typeof>(&cn->mt->desc)) {
+        const long long k = tof_unit_arrows(*t->me);
+        if (k < 0) ok = false;
+        else per["*"] = k;
+      } else
         ok = false;
+      nar_top_ = nullptr;
+      nar_opens_ = nullptr;
     } else if (std::holds_alternative<Pmod_apply>(me->desc)) {
       // Only a MEMBER read expands the manifest -- a dotted one, or a bare
       // one under an `open` of the module, which is taken to be followed by
@@ -38764,10 +38879,258 @@ struct Count {
       mtctx_ = MtCtx::Other;
       mexpr(*t->me);
       mtctx_ = sv;
-      if (!tof_off() && !tof_all_)
+      // An ascription's checks are `tof_checks`'s in full (S537).
+      if (!tof_off() && !tof_all_ &&
+          (tofchk_off() || mtctx_ != MtCtx::Ascr))
         n += tof_wt(*t->me, l, tof_sh_) -
              tof_wt(*t->me, flat(), tof_sh_);
+      if (!tof_off()) n += tof_checks(*t->me, l);
     }
+  }
+  // ---- WHAT THE CHECK OF A `module type of` PAIRS (S537) ------------------
+  // `module type T = module type of Hashtbl` is scraped once at typing
+  // (`Mtype.scrape_for_type_of`: the unit's lazy signature strengthened and
+  // forced, every item at every depth) and checked at `compunit` as a
+  // declared module type is -- `Subst.modtype_declaration Keep`
+  // (includemod.ml:990) renames the whole signature once, then
+  // `check_modtype_equiv` pairs it with itself BOTH WAYS.  Each direction
+  // substitutes every nested module type declaration again (the cascade the
+  // `mtd` level already stands for), and for each FUNCTOR makes one shape
+  // variable (includemod.ml:614), renames a LITERAL parameter signature's
+  // items (`functor_param`, includemod.ml:663) and expands the result's
+  // manifests: the scrape reached the unit through Stdlib's ALIAS and so
+  // strengthened it (mtype.ml:167), every functor result by the functor's
+  // own application, and a type that rebuilds (`strengthen_rebuilds`) is
+  // expanded through that path -- the functor's components once per file,
+  // the application's once per parameter ident: the second direction's is
+  // fresh every time, the first's is the scrape's own, shared by every
+  // declaration of the file (`Includecore.type_manifest`, the FIND side).
+  // A local structure is not strengthened by the scrape, and renames
+  // nothing there.  An ASCRIPTION at such a type (`module H : module type
+  // of Hashtbl = Hashtbl`) is checked once by itself and once more at
+  // `compunit` where it is saved; each of those expands a nested module
+  // type on both sides (includemod.ml:569), forces the strengthened functor
+  // member through its alias (includemod.ml:547: the literal parameter's
+  // items and the result's), and builds the saved module's components (one
+  // ident per functor parameter; the unit's own load pays the first).  A
+  // LATER ascription at the same `module type of` checks itself cheaply --
+  // each nested module type substituted once, each functor a shape
+  // variable -- and fully at `compunit`.  The scrape is once per file.  The
+  // lump the cascade level charges already covers the top items twice for a
+  // unit (its shallow load and the extra), the nested module types four
+  // times and a functor's own items twice; what it leaves out is the scrape
+  // of a UNIT's nested items, a literal parameter signature everywhere, and
+  // the checks -- and for an ascription it is dropped for the full account
+  // here.  A read through the ascribed module builds its components too
+  // (`tof_unit_arrows`), and a parameter at another unit's module type name
+  // loads that unit (`sig_applied_deep`).  `NOTOFCHK=1` reverts.
+  std::set<std::string> tofffc_;  // unit functors whose components were built
+  std::set<std::string> tofscr_;  // unit paths scraped already (once per file)
+  std::set<std::string> tofasc_;  // .. ascribed already (a full first check)
+  std::set<std::string> tofcofa_;  // functors applied to the scrape's own param
+  std::set<std::string> tofnp_;    // units whose load built the params once
+  // The functor parameters a signature binds, at every depth.
+  static long long cnpar(const cmi::Signature& s, int d = 0) {
+    if (d > 8) return 0;
+    long long k = 0;
+    for (auto& md : s.modules) k += cnpar_mty(md.type.get(), d + 1);
+    for (auto& md : s.modtypes) k += cnpar_mty(md.type.get(), d + 1);
+    return k;
+  }
+  static long long cnpar_mty(const cmi::ModuleType* m, int d) {
+    if (!m || d > 8) return 0;
+    if (m->kind == cmi::ModuleType::Sig && m->sig) return cnpar(*m->sig, d);
+    if (m->kind == cmi::ModuleType::Functor)
+      return (m->functor_param ? 1 : 0) + cnpar_mty(m->functor_body.get(), d);
+    return 0;
+  }
+  // The checks over a unit's signature: `chk` of them, `asc` where they are
+  // an ascription's.
+  // `chk` full checks, `scr` of them pairing the scraped signature's own
+  // parameter idents (a declaration's first direction, the first
+  // ascription's own check: the application's components they build are
+  // once per file), and `cheap` more that pair a nested module type once
+  // and a functor's shape alone (a later ascription's own check).
+  long long tof_cchecks(const cmi::Signature& s, const cmi::Signature* root,
+                        long long chk, long long scr, bool asc,
+                        const std::string& pre, long long cheap = 0,
+                        int d = 0) {
+    if (d > 6) return 0;
+    long long k = 0;
+    for (auto& md : s.modules) {
+      const cmi::ModuleType* m = md.type.get();
+      if (!m) continue;
+      if (m->kind == cmi::ModuleType::Sig && m->sig) {
+        k += tof_cchecks(*m->sig, root, chk, scr, asc, pre + md.name + ".",
+                         cheap, d + 1);
+        continue;
+      }
+      if (m->kind != cmi::ModuleType::Functor) continue;
+      long long P = 0, R = 0;
+      int np = 0;
+      bool self = false;
+      const cmi::ModuleType* f = m;
+      while (f && f->kind == cmi::ModuleType::Functor) {
+        if (f->functor_param) ++np;
+        const cmi::ModuleType* pt = f->functor_param_type.get();
+        if (pt && pt->kind == cmi::ModuleType::Sig && pt->sig)
+          P += flat_csig(*pt->sig);
+        f = f->functor_body.get();
+      }
+      // the scrape strengthened the result by the functor's own application
+      // (mtype.ml:54): a type it rebuilds is expanded through that path
+      const cmi::ModuleType* res = scrape_cmty(f, root);
+      if (res && res->kind == cmi::ModuleType::Sig && res->sig) {
+        R = flat_csig(*res->sig);
+        self = strengthen_rebuilds(*res->sig);
+      }
+      // the scrape and a declaration's substitution rename the literal
+      // parameter's items
+      k += (asc ? 1 : 2) * P;
+      // each check: a shape variable, the parameter's items, the alias forced
+      // and the components of the saved module where it is an ascription
+      k += chk * (1 + P + (asc ? P + R + np : 0)) + cheap;
+      if (asc && chk && tofnp_.insert(pre + md.name).second)
+        k -= np;  // the one build the unit's own load charges
+      if (self) {
+        k += (chk - scr) * R;
+        // a declaration's first direction meets the scrape's own ident, as
+        // every later declaration's does; the first ascription's check its
+        // own
+        if (scr && tofcofa_.insert(pre + md.name + (asc ? "A" : "D")).second)
+          k += R;
+        if (tofffc_.insert(pre + md.name).second) k += R;
+      }
+    }
+    if (asc)
+      for (auto& mt : s.modtypes) {
+        const cmi::ModuleType* b = mt.type.get();
+        if (b && b->kind == cmi::ModuleType::Sig && b->sig)
+          k += (2 * chk + cheap) * flat_csig(*b->sig);
+      }
+    return k;
+  }
+  // The same over a structure of this file.
+  long long tof_lchecks(const ModuleExpr& m, long long chk, bool asc,
+                        int d = 0, bool cheap = false) {
+    if (d > 6) return 0;
+    auto* st = std::get_if<Pmod_structure>(&m.desc);
+    if (!st) return 0;
+    long long k = 0;
+    for (auto& it : st->items) {
+      // a nested module type is expanded on both sides by an ascription's
+      // check, once by a cheap one
+      if (auto* mt = std::get_if<Pstr_modtype>(&it.desc)) {
+        if (asc && mt->type &&
+            std::holds_alternative<Pmty_signature>(mt->type->desc))
+          k += (2 * chk + (cheap ? 1 : 0)) * wt_mty(*mt->type, flat());
+        continue;
+      }
+      auto* mb = std::get_if<Pstr_module>(&it.desc);
+      if (!mb) continue;
+      const ModuleExpr* e = &mb->binding.expr;
+      if (std::holds_alternative<Pmod_structure>(e->desc)) {
+        k += tof_lchecks(*e, chk, asc, d + 1, cheap);
+        continue;
+      }
+      auto* fn = std::get_if<Pmod_functor>(&e->desc);
+      if (!fn) continue;
+      long long P = 0, R = 0;
+      int np = 0;
+      const ModuleExpr* b = e;
+      while (auto* g = std::get_if<Pmod_functor>(&b->desc)) {
+        if (auto* nm = std::get_if<Functor_named>(&g->param)) {
+          if (nm->name.txt) ++np;
+          if (nm->type &&
+              std::holds_alternative<Pmty_signature>(nm->type->desc))
+            P += wt_mty(*nm->type, flat());
+        }
+        b = g->body.get();
+      }
+      R = wt_mexpr(*b, flat());
+      if (!asc) k += P;  // the substitution renames the parameter's items
+      k += chk * (1 + P + (asc ? P + R + np : 0)) + (cheap ? 1 : 0);
+    }
+    return k;
+  }
+  // The literal parameter signatures' items of a local structure's functors,
+  // which `tof_wt` leaves out and `Env.enter_signature` renames (S537).
+  long long tof_pitems(const ModuleExpr& me, int d = 0) const {
+    if (tofchk_off() || d > 6) return 0;
+    const ModuleExpr* m = &me;
+    if (std::holds_alternative<Pmod_ident>(m->desc)) m = mderef(m);
+    auto* st = m ? std::get_if<Pmod_structure>(&m->desc) : nullptr;
+    if (!st) return 0;
+    long long k = 0;
+    for (auto& it : st->items) {
+      auto* mb = std::get_if<Pstr_module>(&it.desc);
+      if (!mb) continue;
+      const ModuleExpr* b = &mb->binding.expr;
+      if (std::holds_alternative<Pmod_structure>(b->desc)) {
+        k += tof_pitems(*b, d + 1);
+        continue;
+      }
+      while (auto* g = std::get_if<Pmod_functor>(&b->desc)) {
+        if (auto* nm = std::get_if<Functor_named>(&g->param))
+          if (nm->type &&
+              std::holds_alternative<Pmty_signature>(nm->type->desc))
+            k += wt_mty(*nm->type, flat());
+        b = g->body.get();
+      }
+    }
+    return k;
+  }
+  long long tof_checks(const ModuleExpr& me, const Lvl& l) {
+    if (tofchk_off() || mtctx_ == MtCtx::Other) return 0;
+    const bool asc = mtctx_ == MtCtx::Ascr;
+    const long long chk = pfun_checks(l);
+    // the path walked as `tof_wt` walks it: through this file's modules,
+    // an `open`ed structure's, and an alias chain, to a structure of this
+    // file or to another unit's path
+    auto* p0 = std::get_if<Pmod_ident>(&me.desc);
+    if (!p0) return tof_lchecks(me, chk, asc);
+    // a later ascription at the same local structure: its own check is
+    // cheap as a unit's is (`tofasc_`)
+    auto local = [&](const ModuleExpr& lm) {
+      long long full = chk;
+      if (asc && chk > 0 &&
+          !tofasc_.insert(std::to_string((std::uintptr_t)&lm)).second)
+        --full;
+      return tof_lchecks(lm, full, asc) +
+             (full < chk ? tof_lchecks(lm, 0, asc, 0, true) : 0);
+    };
+    const Longident* id = &p0->id.txt;
+    for (int i = 0; i < 8; ++i) {
+      std::vector<std::string> c;
+      if (!lid_path(*id, c) || c.empty()) return 0;
+      auto it = mods.find(c[0]);
+      const ModuleExpr* lm = nullptr;
+      if (it != mods.end() && !it->second.empty()) lm = it->second.back();
+      else if (!tofp_off()) lm = open_head(c[0]);
+      if (!lm) break;
+      for (std::size_t j = 1; lm && j < c.size(); ++j) lm = msub(*lm, c[j]);
+      if (!lm) return 0;
+      auto* q = std::get_if<Pmod_ident>(&lm->desc);
+      if (!q) return local(*lm);
+      id = &q->id.txt;
+    }
+    const cmi::Signature* sg = tof_cmi(*id);
+    if (!sg) return 0;
+    const std::string key = lid_full(*id) + ".";
+    // the scrape is once per file; a later ascription's own check pairs
+    // the nested module types once and the functors' shapes alone
+    long long k = tofscr_.insert(key).second
+                      ? flat_csig(*sg) - shal_csig(sg) - cnpar(*sg)
+                      : 0;
+    long long full = chk, cheap = 0, scr = asc ? 0 : 1;
+    if (asc && chk > 0) {
+      if (tofasc_.insert(key).second) scr = 1;
+      else {
+        --full;
+        cheap = 1;
+      }
+    }
+    return k + tof_cchecks(*sg, sg, full, scr, asc, key, cheap);
   }
   // A later `include (module type of ..)` SHADOWS what an earlier one brought
   // in, and the cascade then never reaches the items it replaced: all they
@@ -38926,7 +39289,7 @@ struct Count {
         // `ren_mty` reads the parsetree, and a `module type of` node has no
         // signature there: the items it brings in are renamed all the same.
         if (auto* pt = std::get_if<Pmty_typeof>(&i->mt.desc))
-          if (!tof_off()) n += tof_wt(*pt->me, flat());
+          if (!tof_off()) n += tof_wt(*pt->me, flat()) + tof_pitems(*pt->me);
       }
     // A DESCRIBED class is those same three idents, and binding it into an
     // environment renames the items it saves -- three of them, where a class
