@@ -32293,6 +32293,9 @@ struct Count {
       }
       return k;
     }
+    // A body that IS another unit's application carries its result (S543).
+    if (!nfapp_off() && std::holds_alternative<Pmod_apply>(m.desc))
+      return nf_app_flat(m);
     if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
       long long k = 0;
       for (auto& it : st->items) {
@@ -32302,6 +32305,36 @@ struct Count {
           bool dt = false;
           k += inc_top(i->expr, dt);
           continue;
+        }
+        // What `ren_str_item` cannot read: an application's result, bound
+        // or included, and a `module rec` binding's declared type (S543).
+        if (!nfapp_off()) {
+          if (auto* i = std::get_if<Pstr_include>(&it.desc);
+              i && std::holds_alternative<Pmod_apply>(i->expr.desc)) {
+            k += nf_app_flat(i->expr);
+            continue;
+          }
+          if (auto* md = std::get_if<Pstr_module>(&it.desc);
+              md && std::holds_alternative<Pmod_apply>(md->binding.expr.desc)) {
+            k += 1 + nf_app_flat(md->binding.expr);
+            continue;
+          }
+          if (auto* mt = std::get_if<Pstr_modtype>(&it.desc); mt && mt->type)
+            k += nf_with_items(*mt->type);
+          // A functor binding's whole type is in the copy, deep.
+          if (auto* md = std::get_if<Pstr_module>(&it.desc);
+              md && std::holds_alternative<Pmod_functor>(md->binding.expr.desc)) {
+            k += 1 + fcas(md->binding.expr);
+            continue;
+          }
+          if (auto* md = std::get_if<Pstr_module>(&it.desc);
+              md && std::holds_alternative<Pmod_constraint>(md->binding.expr.desc))
+            k += nf_with_items(md->binding.expr);
+          if (auto* r = std::get_if<Pstr_recmodule>(&it.desc)) {
+            for (auto& b : r->bindings)
+              k += 1 + ren_mexpr(b.expr, Sibs{}) + nf_with_items(b.expr);
+            continue;
+          }
         }
         // A submodule's structure is read the same way, for the includes
         // in it; what `ren_mexpr` would have made of it otherwise.
@@ -32318,6 +32351,264 @@ struct Count {
     }
     if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) return ren_mty(*c->mt);
     return 0;
+  }
+
+  // ---- A FUNCTOR NESTED IN A SAVED STRUCTURE IS CHECKED AS A COPY ---------
+  // `Includemod.compunit` strengthens every module it pairs at its own path,
+  // ALIASABLE (S510), so a functor bound inside a saved structure meets the
+  // check as `Mty_alias W.F` (includemod.ml:542): the alias is normalised
+  // and expanded, which builds W's components and forces the lazy copy of
+  // F's declaration they hold (`components_of_module_maker`, env.ml:2161)
+  // -- a `Subst.Rescope` copy whose bound idents are all fresh, the
+  // functor's parameters included.  The copy is then paired with the
+  // original: `functor_param` enters the copy's parameter X' and every type
+  // declaration of the result goes through `Includecore.type_manifest`,
+  // which EXPANDS both manifests (includecore.ml:896), so a type path
+  // applied to a parameter, `Set.Make (X).t`, is looked up as `Set.Make
+  // (X').t` and `Env.components_of_functor_appl` finds nothing cached under
+  // X': the application is built again, R idents per SPELLING -- the
+  // written alias spelling first (`Stdlib.Set.Make`) and, for a type
+  // ABSTRACT in the result, the normalised unit spelling (`Stdlib__Set.Make`)
+  // the failed expansion falls back to; a manifest type (`.elt`, `.key`)
+  // stops at the first.  Measured: once per file per (functor, argument
+  // BINDER, spelling) -- the same path in two declarations, an `and`, a
+  // submodule's ascription, a module type declaration or a `module rec`
+  // signature is one build, two parameters are two, a nested functor's own
+  // parameter is another binder and so is a local module bound inside the
+  // functor (renamed with the rest), while a persistent argument (`String`)
+  // and a parameter bound OUTSIDE the copied functor are unchanged and hit
+  // the cache.  Only a manifest's HEAD is expanded: `Set.Make (X).t list`, a
+  // constructor argument, a record field, a `val`, an object or a variant
+  // row cost nothing.  The nesting depth adds nothing (the alias route is
+  // taken once per functor), a functor bound directly in a top-level
+  // functor's body is no alias (a functor's result is strengthened
+  // `aliasable:false`), and a hidden one is checked by nobody.  What an
+  // ascription above DECLARES the functor at is what the check sees.
+  //   The same copy renames everything the functor's type binds
+  // (`expand_module_alias`, includemod.ml:309), which `fcas` charges per
+  // level of the cascade -- except what `ren_str_item` cannot read: an
+  // APPLICATION's result bound in the body (`module N = Set.Make (X)`, R
+  // more per level) and a `module rec` binding's declared type.
+  //   A MODULE TYPE declaration's functor parameter is renamed on the
+  // interface side besides, whatever the depth: `modtype_declarations`
+  // substitutes the declaration it pairs (`Subst.modtype`, subst.ml:695,
+  // renames every named arrow), so a path applied to it is built once at
+  // the top level and once more inside a saved structure, where the impl
+  // side is `Mty_ident W.T` and expands to the copy (mtype.ml:118's
+  // aliasable `SigL_modtype`).  `NONFAPP=1` reverts.
+  static bool nfapp_off() {
+    static const bool off = dbg_env("NONFAPP") != nullptr;
+    return off;
+  }
+  std::set<std::string> nfk_;  // (functor, binders, spelling) the check built
+  int nfwalk_ = 0;             // inside a nested functor's walk
+  int bstr_ = 0;               // structures a module binding is bound to
+  bool fbody_ = false;         // the next structure is a functor's body
+  int nfnext_ = 0;             // binders numbered once per file
+  struct NfBind {
+    int id;
+    const ModuleExpr* expr;  // what a module binding was bound to
+  };
+  struct NfScope {
+    std::map<std::string, std::vector<NfBind>> b;
+    int* next;
+    explicit NfScope(int* n) : next(n) {}
+    void bind(const std::optional<std::string>& n,
+              const ModuleExpr* e = nullptr) {
+      if (n) b[*n].push_back({++*next, e});
+    }
+    void unbind(const std::optional<std::string>& n) {
+      if (n) b[*n].pop_back();
+    }
+    const NfBind* find(const std::string& n) const {
+      auto it = b.find(n);
+      return it != b.end() && !it->second.empty() ? &it->second.back()
+                                                  : nullptr;
+    }
+  };
+  // Another unit's functor `head` applied to `args`, one of them bound in
+  // the copy, whose type `ty` a manifest names: the builds the check owes.
+  // `written` is the spelling the path is written in; a strengthened
+  // manifest is the normalised one.
+  long long nf_app(const Longident& head, const std::vector<std::string>& args,
+                   const std::string& ty, bool written, NfScope& sc) {
+    std::string bk;
+    bool bound = false;
+    for (auto& a : args) {
+      if (const NfBind* nb = sc.find(a)) {
+        bound = true;
+        bk += "#" + std::to_string(nb->id);
+      } else {
+        bk += "#" + a;
+      }
+    }
+    if (!bound) return 0;
+    const cmi::Signature* root = nullptr;
+    const cmi::ModuleType* mt = scrape_cmty(cmi_module(head, &root), root);
+    for (std::size_t i = 0; i < args.size(); ++i) {
+      if (!mt || mt->kind != cmi::ModuleType::Functor) return 0;
+      mt = scrape_cmty(mt->functor_body.get(), root);
+    }
+    if (!mt) return 0;
+    const std::string fk = xtapp_key(head);
+    if (fk.empty()) return 0;
+    const long long r = flat_cmty(mt);
+    const bool ali = written && std_alias(head);
+    const bool abs = res_abstract(mt, ty);
+    long long k = 0;
+    if (written && nfk_.insert(fk + bk + (ali ? "A" : "U")).second) k += r;
+    if (abs && (ali || !written) && nfk_.insert(fk + bk + "U").second) k += r;
+    return k;
+  }
+  // The head of a manifest, where it is another unit's functor applied to
+  // something the copy renamed -- written out, or through a module bound
+  // to the application inside the copy, whose strengthened manifest is the
+  // normalised path (`N.t` with `t` abstract in the result).
+  long long nf_ty(const CoreType& t, NfScope& sc) {
+    auto* c = std::get_if<Ptyp_constr>(&t.desc);
+    if (!c) return 0;
+    auto* d = std::get_if<Ldot>(&c->id.txt.v);
+    if (!d) return 0;
+    std::vector<std::string> args;
+    if (std::holds_alternative<Lapply>(d->prefix->v)) {
+      const Longident* p = d->prefix.get();
+      while (auto* ap = std::get_if<Lapply>(&p->v)) {
+        auto* xi = std::get_if<Lident>(&ap->x->v);
+        args.insert(args.begin(), xi ? xi->name : std::string("?"));
+        p = ap->f.get();
+      }
+      return nf_app(*p, args, d->name, true, sc);
+    }
+    auto* li = std::get_if<Lident>(&d->prefix->v);
+    const NfBind* nb = li ? sc.find(li->name) : nullptr;
+    if (!nb || !nb->expr) return 0;
+    const ModuleExpr* h = nb->expr;
+    while (auto* ap = std::get_if<Pmod_apply>(&h->desc)) {
+      auto* ai = std::get_if<Pmod_ident>(&ap->arg->desc);
+      auto* xi = ai ? std::get_if<Lident>(&ai->id.txt.v) : nullptr;
+      args.insert(args.begin(), xi ? xi->name : std::string("?"));
+      h = ap->f.get();
+    }
+    auto* hi = args.empty() ? nullptr : std::get_if<Pmod_ident>(&h->desc);
+    if (!hi) return 0;
+    return nf_app(hi->id.txt, args, d->name, false, sc);
+  }
+  long long nf_mty(const ModuleType& mt, NfScope& sc) {
+    if (auto* f = std::get_if<Pmty_functor>(&mt.desc)) {
+      auto* nm = std::get_if<Functor_named>(&f->param);
+      if (nm) sc.bind(nm->name.txt);
+      long long k = nf_mty(*f->body, sc);
+      if (nm) sc.unbind(nm->name.txt);
+      return k;
+    }
+    if (auto* w = std::get_if<Pmty_with>(&mt.desc)) {
+      long long k = nf_mty(*w->mt, sc);
+      for (auto& c : w->constraints) {
+        const TypeDeclaration* td = nullptr;
+        if (auto* t = std::get_if<Pwith_type>(&c)) td = &*t->td;
+        else if (auto* t = std::get_if<Pwith_typesubst>(&c)) td = &*t->td;
+        if (td && td->manifest) k += nf_ty(**td->manifest, sc);
+      }
+      return k;
+    }
+    auto* sg = std::get_if<Pmty_signature>(&mt.desc);
+    if (!sg) return 0;
+    long long k = 0;
+    for (auto& it : sg->items) {
+      if (auto* t = std::get_if<Psig_type>(&it.desc)) {
+        for (auto& d : t->decls)
+          if (d.manifest) k += nf_ty(**d.manifest, sc);
+      } else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+        k += nf_mty(*m->md.type, sc);
+        sc.bind(m->md.name.txt);
+      } else if (auto* m = std::get_if<Psig_recmodule>(&it.desc)) {
+        for (auto& d : m->decls) sc.bind(d.name.txt);
+        for (auto& d : m->decls) k += nf_mty(*d.type, sc);
+      } else if (auto* m = std::get_if<Psig_modtype>(&it.desc)) {
+        if (m->type) k += nf_mty(*m->type, sc);
+      } else if (auto* i = std::get_if<Psig_include>(&it.desc)) {
+        k += nf_mty(i->mt, sc);
+      }
+    }
+    return k;
+  }
+  long long nf_mexpr(const ModuleExpr& m, NfScope& sc) {
+    if (auto* f = std::get_if<Pmod_functor>(&m.desc)) {
+      auto* nm = std::get_if<Functor_named>(&f->param);
+      if (nm) sc.bind(nm->name.txt);
+      long long k = nf_mexpr(*f->body, sc);
+      if (nm) sc.unbind(nm->name.txt);
+      return k;
+    }
+    // What an ascribed module SAVES is the ascription.
+    if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) return nf_mty(*c->mt, sc);
+    auto* st = std::get_if<Pmod_structure>(&m.desc);
+    if (!st) return 0;
+    long long k = 0;
+    for (auto& it : st->items) {
+      if (auto* t = std::get_if<Pstr_type>(&it.desc)) {
+        for (auto& d : t->decls)
+          if (d.manifest) k += nf_ty(**d.manifest, sc);
+      } else if (auto* m = std::get_if<Pstr_module>(&it.desc)) {
+        k += nf_mexpr(m->binding.expr, sc);
+        sc.bind(m->binding.name.txt, &m->binding.expr);
+      } else if (auto* m = std::get_if<Pstr_recmodule>(&it.desc)) {
+        for (auto& b : m->bindings) sc.bind(b.name.txt, &b.expr);
+        for (auto& b : m->bindings) k += nf_mexpr(b.expr, sc);
+      } else if (auto* m = std::get_if<Pstr_modtype>(&it.desc)) {
+        if (m->type) k += nf_mty(*m->type, sc);
+      } else if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
+        k += nf_mexpr(i->expr, sc);
+      }
+    }
+    return k;
+  }
+  // An ascription at a `with` over another unit's module type NAME saves
+  // the constrained signature written out (a bare name saves the name):
+  // the items `ren_mty` cannot read behind it.
+  long long nf_with_items(const ModuleType& mt) const {
+    if (!std::holds_alternative<Pmty_with>(mt.desc)) return 0;
+    std::string key;
+    const cmi::Signature* sg = xmty_sig(&mt, key);
+    return sg ? flat_csig(*sg) : 0;
+  }
+  long long nf_with_items(const ModuleExpr& m) const {
+    auto* c = std::get_if<Pmod_constraint>(&m.desc);
+    return c ? nf_with_items(*c->mt) : 0;
+  }
+  // The result of another unit's functor applied, whatever the arguments:
+  // what a module bound to it holds.
+  long long nf_app_flat(const ModuleExpr& m) const {
+    if (const ModuleExpr* r = app_res(&m)) return nd_ren(*r, 1);
+    int n = 0;
+    const ModuleExpr* h = &m;
+    while (auto* a = std::get_if<Pmod_apply>(&h->desc)) { ++n; h = a->f.get(); }
+    const Longident* id = n ? mpath(h) : nullptr;
+    if (!id || mderef(h)) return 0;
+    const cmi::Signature* root = nullptr;
+    const cmi::ModuleType* mt = scrape_cmty(cmi_module(*id, &root), root);
+    for (int i = 0; i < n; ++i) {
+      if (!mt || mt->kind != cmi::ModuleType::Functor) return 0;
+      mt = scrape_cmty(mt->functor_body.get(), root);
+    }
+    return flat_cmty(mt);
+  }
+  // A functor binding's copy: the paths applied to what the copy renames.
+  long long nf_functor(const ModuleExpr& m, const ModuleType* decl) {
+    NfScope sc(&nfnext_);
+    if (decl) return nf_mty(*decl, sc);
+    return nf_mexpr(m, sc);
+  }
+  // A module type declaration's functor parameters, renamed on the
+  // interface side once, and once more where the impl side is a copy: two
+  // copies are two sets of binders.
+  long long nf_modtype(const ModuleType& mt) {
+    long long k = 0;
+    for (int i = 0; i < (bstr_ > 0 && nfwalk_ == 0 ? 2 : 1); ++i) {
+      NfScope sc(&nfnext_);
+      k += nf_mty(mt, sc);
+    }
+    return k;
   }
 
   // ---- WHAT A GENERALIZED OPEN LEAVES BEHIND ------------------------------
@@ -39359,6 +39650,11 @@ struct Count {
       auto ok = omark();
       auto ck = cmark();
       auto ctk = ctmark();
+      // A structure a module is BOUND to is strengthened aliasable at the
+      // check; a functor's body is not (S543).
+      const bool fb = fbody_;
+      fbody_ = false;
+      if (!fb) ++bstr_;
       bool sv = saved_;
       saved_ = saved;
       const bool cv = chkd_;
@@ -39376,6 +39672,7 @@ struct Count {
       chkd_ = cv;
       chkd_sig_ = csv;
       saved_ = sv;
+      if (!fb) --bstr_;
       release(k);
       mrelease(mk);
       erelease(ek);
@@ -39393,7 +39690,13 @@ struct Count {
       auto fk = fmark();
       fbind(f->param);
       ++fxin_;
+      // .. an ascribed body's structure included: the ascription arm hands
+      // it on without entering a structure of its own.
+      const ModuleExpr* fb = f->body.get();
+      while (auto* c = std::get_if<Pmod_constraint>(&fb->desc)) fb = c->me.get();
+      fbody_ = std::holds_alternative<Pmod_structure>(fb->desc);
       mexpr(*f->body, Lvl{1, 1, 0, true});
+      fbody_ = false;
       --fxin_;
       frelease(fk);
     } else if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) {
@@ -40271,6 +40574,25 @@ struct Count {
       if (!fcas_off() && ml.a > 1 &&
           std::holds_alternative<Pmod_functor>(m->binding.expr.desc))
         n += (ml.a - 1) * fcas(m->binding.expr);
+      // A functor bound inside a saved structure is checked as a copy
+      // (S543): the type paths applied to what the copy renames are built
+      // again, once per file; a functor inside the walk is in it already.
+      bool nfw = false;
+      if (!nfapp_off() && bstr_ > 0 && nfwalk_ == 0 && !inexpr_ &&
+          !is_dead(ml) && m->binding.name.txt) {
+        const ModuleExpr* fe = &m->binding.expr;
+        if (auto* c = std::get_if<Pmod_constraint>(&fe->desc)) fe = c->me.get();
+        const ModuleType* nd = nullptr;
+        if (!mdiscard_ && ascr_sig_)
+          nd = sig_narrows_mod(*ascr_sig_, *m->binding.name.txt);
+        const bool fn = std::holds_alternative<Pmod_functor>(fe->desc) ||
+                        (nd && std::holds_alternative<Pmty_functor>(nd->desc));
+        if (fn) {
+          n += nf_functor(m->binding.expr, nd);
+          nfw = true;
+          ++nfwalk_;
+        }
+      }
       if (!ascp_off() && !inexpr_) n += ascp_charge(m->binding.expr);
       const bool paired = chkd_ && !chkarrow_off() && chkd_sig_ &&
                           m->binding.name.txt &&
@@ -40347,6 +40669,7 @@ struct Count {
         }
       mexpr(m->binding.expr, ml,
             appexp_off() || saved_ || !local_app(m->binding.expr));
+      if (nfw) --nfwalk_;
       if (fxp) fxpath_.pop_back();
       ascr_sig_ = asv;
       mdiscard_ = dsv;
@@ -40379,6 +40702,9 @@ struct Count {
         mtctx_ = sv;
         if (!anonarg_off() && saved_ && !inexpr_)
           n += anon_mty(*m->type, false);
+        // Its functor parameters are renamed where it is paired (S543).
+        if (!nfapp_off() && !inexpr_ && !dsc && !is_dead(l))
+          n += nf_modtype(*m->type);
       }
       ++n;
       tbind(m->name.txt, m->type ? &*m->type : nullptr);
