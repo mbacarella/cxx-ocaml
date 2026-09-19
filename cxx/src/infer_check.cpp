@@ -20889,6 +20889,40 @@ bool sig_binds_mod(const Signature& sg, const std::string& nm) {
   return false;
 }
 
+// ---- A MODULE AN ASCRIPTION NARROWS IS BUILT NO MORE THAN ONE IT HIDES --
+// `module M : sig module S : sig type t end end = struct module S = Set.Make
+// (String) end` declares S, but what it saves is the DECLARATION: the
+// application's result is paired against `sig type t end` and read by nobody
+// after, so it is renamed flat where it stands and forced once for the
+// functor, exactly as a hidden one -- neither the alias argument's second
+// build, nor the strengthening's rebuild, nor the units the result's own
+// value types name (`Cites::functor_loads`).  Those are owed by the first
+// SAVED application of the functor, whichever side of the narrowed one it
+// stands, so a narrowed (or hidden, or directly ascribed) application leaves
+// the per-path books alone.  What the declaration itself names is paid where
+// it is written.  `NONARROWAPP=1` reverts.
+static bool narrowapp_off() {
+  static const bool off = dbg_env("NONARROWAPP") != nullptr;
+  return off;
+}
+
+// The module type this signature DECLARES a module of that name at, where
+// it is a written one -- not the module's own (`module type of`) -- and so
+// pairs the structure's binding against something smaller than itself.
+const ModuleType* sig_narrows_mod(const Signature& sg, const std::string& nm) {
+  for (auto& it : sg) {
+    const ModuleType* mt = nullptr;
+    if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+      if (m->md.name.txt && *m->md.name.txt == nm) mt = m->md.type.get();
+    } else if (auto* r = std::get_if<Psig_recmodule>(&it.desc)) {
+      for (auto& d : r->decls)
+        if (d.name.txt && *d.name.txt == nm) mt = d.type.get();
+    }
+    if (mt) return std::holds_alternative<Pmty_typeof>(mt->desc) ? nullptr : mt;
+  }
+  return nullptr;
+}
+
 // The same for a module TYPE name; `manifest` asks that the declaration
 // carry a body, an ABSTRACT `module type S` in the ascription checking
 // nothing of the module's own.
@@ -20921,6 +20955,9 @@ bool xoapp_off() {
   static const bool off = dbg_env("NOXOAPP") != nullptr;
   return off;
 }
+
+// `Count::poly_used`, for `Cites` (defined after it).
+static bool cmi_poly_used(const cmi::Signature& sg);
 
 struct Cites {
   std::set<std::string> units;  // heads that may name a persistent unit
@@ -20989,6 +21026,48 @@ struct Cites {
   // ... and whether the body PACKS the module (S538): the pack's check
   // pairs the result's value types, which forces the units they name.
   std::vector<bool> fpack;
+  // ... and whether an ascription NARROWS it -- declares the binding at a
+  // written module type, or ascribes the application itself: the result is
+  // paired and never read after, so the units its own types name stay
+  // unloaded as a discarded one's do (`narrowapp_off` reverts).
+  // 1 by a declaration (whatever it declares), 2 by an ascription on the
+  // application itself, which rebuilds a `Map`-shaped result all the same
+  // (`unbuilt_app`).
+  std::vector<int> fnarrow;
+  int cnarrow_ = 0;
+  // The functor's result signature, for the `fapps` entry.
+  const cmi::Signature* fapp_result(std::size_t fi) const {
+    std::vector<std::string> c = fapps[fi].first;
+    if (c[0] == "Stdlib" && c.size() > 2) c.erase(c.begin());
+    std::string h = unit_here(c[0]);
+    if (h.empty()) return nullptr;
+    c[0] = h;
+    const cmi::Signature* rt = unit_of_path(c);
+    if (!rt || c.size() < 2) return nullptr;
+    const cmi::Signature* sg = rt;
+    for (std::size_t i = 1; sg && i + 1 < c.size(); ++i)
+      sg = submodule(*sg, c[i]);
+    if (!sg) return nullptr;
+    if (!subfct_off()) rt = sg;
+    const cmi::ModuleType* mt = nullptr;
+    for (auto& md : sg->modules)
+      if (md.name == c.back()) mt = md.type.get();
+    mt = scrape_cmty(mt, rt);
+    for (int i = 0; mt && mt->kind == cmi::ModuleType::Functor && i < 16; ++i)
+      mt = scrape_cmty(mt->functor_body.get(), rt);
+    return mt && mt->kind == cmi::ModuleType::Sig ? mt->sig.get() : nullptr;
+  }
+  // Is the application one Env never built?  Hidden or narrowed by a
+  // declaration, or ascribed directly at a result no ascription rebuilds.
+  bool unbuilt_app(std::size_t fi) const {
+    if (narrowapp_off() || fi >= fnarrow.size()) return false;
+    if (fnarrow[fi] == 1) return true;
+    if (fnarrow[fi] == 2) {
+      const cmi::Signature* r = fapp_result(fi);
+      return r && !cmi_poly_used(*r);
+    }
+    return fi < fdisc.size() && !fdisc[fi].first.empty();
+  }
   // The `fapps` index of each `lmscope_` entry (`fapps.size()` where none).
   std::vector<std::size_t> lmfi_;
   // `let module M = F (A) in ..`: the result is bound over the body
@@ -21116,6 +21195,14 @@ struct Cites {
     for (auto& s : cpath_) r += (r.empty() ? "" : ".") + s;
     return r;
   }
+  // The same by module BINDINGS alone -- a functor parameter's or a `let
+  // module`'s "$" segment left out -- which is the path `Count` walks.
+  std::string bscope() const {
+    std::string r;
+    for (auto& s : cpath_)
+      if (s.empty() || s[0] != '$') r += (r.empty() ? "" : ".") + s;
+    return r;
+  }
   void force_path(const Longident& id) {
     if (auto* d = std::get_if<Ldot>(&id.v)) {
       forced.insert(lid_full(*d->prefix));
@@ -21227,6 +21314,15 @@ struct Cites {
   // by `type v = P.S.t`.
   bool tpos_ = false;
   std::set<std::string> treads_;
+  // The same reads with the scope they stand in ("<scope>|<path>"): a
+  // NARROWED module's abstract type is read by name outside the ascription
+  // too, where it is the declaration's and builds nothing.
+  std::set<std::string> treadsc_, vreadsc_;
+  // The functors a type path APPLIES anywhere (`Set.Make (X).t`, keyed as
+  // `cross_charge` keys the functor): the path builds the functor's result
+  // for itself, and a hidden or narrowed application of the functor beside
+  // it is renamed flat and nothing more.
+  std::set<std::string> tapps_;
   // Every path head read in any OTHER position, which is what S494 had: such
   // a read kept S494's COARSE answer, the result built once over and the
   // units its types name loaded besides.  That answer is retired -- ocamlc
@@ -21319,7 +21415,10 @@ struct Cites {
   void vread(const Longident& id) {
     if (vread_off()) return;
     std::string s;
-    if (read_key(id, s)) vreads_.insert(s);
+    if (read_key(id, s)) {
+      vreads_.insert(s);
+      vreadsc_.insert(bscope() + "|" + s);
+    }
   }
   void vapp(const Expression& f, int nargs) {
     if (vread_off() || nargs <= 0) return;
@@ -21473,13 +21572,44 @@ struct Cites {
     ty(t);
     tpos_ = sv;
   }
+  // Keyed "<functor>:<type>" and "<functor><args>:<type>", as
+  // `cross_charge` spells the functor and its argument paths.
+  void note_tapp(const Longident& id) {
+    auto* t = std::get_if<Ldot>(&id.v);
+    if (!t) return;
+    const Longident* q = t->prefix.get();
+    if (!std::holds_alternative<Lapply>(q->v)) return;
+    std::string args;
+    while (auto* a = std::get_if<Lapply>(&q->v)) {
+      std::vector<std::string> ac;
+      lid_comps(*a->x, ac);
+      args += "(";
+      for (auto& s : ac) args += s + ".";
+      args += ")";
+      q = a->f.get();
+    }
+    std::vector<std::string> c;
+    if (!lid_comps(*q, c) || c.size() < 2 || shadowed(c[0])) return;
+    std::string key;
+    for (auto& s : c) key += s + ".";
+    // ":" for a path anywhere, "!" for one standing where its type is
+    // EXPANDED (a manifest, a constraint): only that one's build absorbs a
+    // sibling read's.
+    const char* m = tpos_ ? "!" : ":";
+    tapps_.insert(key + m + t->name);
+    tapps_.insert(key + args + m + t->name);
+  }
   void note_head(const Longident& id) {
+    if (!narrowapp_off() && !discread_off()) note_tapp(id);
     // `cite` walks a path's own prefixes, so the bare head of `S.t` comes
     // back through here a second time: under `tpos_` NEITHER spelling is a
     // read of the coarse kind, and the dotted one alone says which type.
     if (tpos_ && !discread_off()) {
       std::string s;
-      if (read_key(id, s, true)) treads_.insert(s);
+      if (read_key(id, s, true)) {
+        treads_.insert(s);
+        treadsc_.insert(bscope() + "|" + s);
+      }
       return;
     }
     // A type of a `let module` written in a pattern's annotation (S535).
@@ -22239,11 +22369,20 @@ struct Cites {
         if (sv->vd.name.txt == v->name.txt) return true;
     return false;
   }
+  // .. unless the body reads a value of a module the same ascription
+  // NARROWS: the two types then spell the one path, and nothing expands.
+  bool asc_narrowed(const Expression& e) {
+    std::string s;
+    if (narrowapp_off() || !casc_ || !ident_key(e, s)) return false;
+    const std::size_t d = s.find('.');
+    return d != std::string::npos && sig_narrows_mod(*casc_, s.substr(0, d));
+  }
   void vbind(const ValueBinding& b) {
     pat(b.pat);
     // `let _ = e` runs the same check a statement does; `let y = e` does not
     // -- unless the ascription above writes y's type out itself.
-    if (std::holds_alternative<Ppat_any>(b.pat.desc) || asc_val(b.pat)) {
+    if (std::holds_alternative<Ppat_any>(b.pat.desc) ||
+        (asc_val(b.pat) && !asc_narrowed(*b.expr))) {
       xval(*b.expr);
       if (!fixmeet_off()) xmeet(denotes(*b.expr));
     }
@@ -23197,7 +23336,15 @@ struct Cites {
       const std::string dv = cdname_;
       casc_ = discload_off() ? nullptr : casc_sig(c->mt.get());
       cdname_.clear();
+      const int nv = cnarrow_;
+      if (!narrowapp_off() &&
+          std::holds_alternative<Pmod_apply>(c->me->desc) &&
+          !std::holds_alternative<Pmty_typeof>(c->mt->desc)) {
+        cnarrow_ = 2;
+        with_base(*c->mt);  // the pair scrapes the name it is checked at
+      }
       mexp(*c->me);
+      cnarrow_ = nv;
       casc_ = av;
       cdname_ = dv;
       mty(*c->mt, true);
@@ -23216,6 +23363,7 @@ struct Cites {
           fargk.push_back(pathed ? xapp_args(m, nullptr) : std::string());
           fread.push_back(false);
           fpack.push_back(false);
+          fnarrow.push_back(cnarrow_);
           fopen.push_back(inopen_);
           fdisc.emplace_back(discload_off() ? std::string() : cdname_,
                              cdpre_);
@@ -23303,14 +23451,32 @@ struct Cites {
       const Signature* av = casc_;
       const std::string dv = cdname_;
       const std::string pv = cdpre_;
+      const int nv = cnarrow_;
+      const Signature* ncasc = nullptr;
       if (cdname_.empty() && casc_ && m->binding.name.txt &&
           !sig_binds_mod(*casc_, *m->binding.name.txt)) {
         cdname_ = *m->binding.name.txt;
         cdpre_ = cdname_ + ".";
       } else if (!cdname_.empty() && m->binding.name.txt) {
         cdpre_ += *m->binding.name.txt + ".";
+      } else if (!narrowapp_off() && casc_ && m->binding.name.txt) {
+        if (const ModuleType* d =
+                sig_narrows_mod(*casc_, *m->binding.name.txt)) {
+          cnarrow_ = 1;
+          ncasc = casc_sig(d);
+          with_base(*d);  // the pair scrapes the name it is checked at
+          if (auto* id = std::get_if<Pmty_ident>(&d->desc))
+            if (!std::holds_alternative<Lapply>(id->id.txt.v)) {
+              std::vector<std::string> c = split_dotted(lid_full(id->id.txt));
+              if (c.size() >= 2 && !shadowed(c[0])) mtf.insert(c[0]);
+            }
+          // .. and an ALIAS bound there is scraped too: the unit it names
+          // is loaded, as a read of it would.
+          if (auto* i = std::get_if<Pmod_ident>(&m->binding.expr.desc))
+            cite(i->id.txt, true);
+        }
       }
-      casc_ = nullptr;
+      casc_ = ncasc;
       if (m->binding.name.txt)
         cpath_.push_back((inexpr_ ? "$" : "") + *m->binding.name.txt);
       mbind(m->binding);
@@ -23318,6 +23484,7 @@ struct Cites {
       casc_ = av;
       cdname_ = dv;
       cdpre_ = pv;
+      cnarrow_ = nv;
       if (m->binding.name.txt) selfb_[*m->binding.name.txt]--;
     } else if (auto* m = std::get_if<Pstr_recmodule>(&it.desc)) {
       for (auto& b : m->bindings) {
@@ -23696,9 +23863,10 @@ struct Cites {
             // A read of ANY kind asks for the build alone, so the units
             // the result's own types name stay unloaded whatever names it.
             const bool disc =
-                !dnm.empty() && (!vread_off() ||
-                                 tread_builds_sig(*f->sig, dpre) ||
-                                 !oheads_.count(dnm));
+                (!dnm.empty() && (!vread_off() ||
+                                  tread_builds_sig(*f->sig, dpre) ||
+                                  !oheads_.count(dnm))) ||
+                (fi < fnarrow.size() && fnarrow[fi] && unbuilt_app(fi));
             if (!disc) {
               Applied a;
               sig_applied(*f->sig, a);
@@ -37137,7 +37305,9 @@ struct Count {
     if (!treads_ || !mt || mt->kind != cmi::ModuleType::Sig || !mt->sig)
       return false;
     for (auto& td : mt->sig->types)
-      if (!td.manifest && treads_->count(mdiscpre_ + td.name)) return true;
+      if (!td.manifest && treads_->count(mdiscpre_ + td.name) &&
+          nread(treadsc_, mdiscpre_ + td.name))
+        return true;
     return false;
   }
   // Down to the node that carries the head: an indirection, and the `Tpoly`
@@ -37206,7 +37376,7 @@ struct Count {
       return false;
     for (auto& sv : mt->sig->values) {
       const std::string key = mdiscpre_ + sv.name;
-      if (!vreads_->count(key)) continue;
+      if (!vreads_->count(key) || !nread(vreadsc_, key)) continue;
       const cmi::TypeDecl* h = head_abs(sv.type.get(), *mt->sig);
       // A type that carries parameters is expanded wherever it is named.
       if (h && (h->arity > 0 || xreads_->count(key))) return true;
@@ -37427,6 +37597,12 @@ struct Count {
     const bool named_res =
         idres && idres != mt && idres->kind == cmi::ModuleType::Ident;
     if (!idres_off() && named_res) k -= 2 * flat_cmty(mt);
+    // Ascribed DIRECTLY (`module S : sig type t end = Set.Make (String)`)
+    // at a result no ascription rebuilds -- a `Map`-shaped one, whose
+    // parameterized abstract type the ascription names, is `asc_csig`'s.
+    const bool ascribed = !narrowapp_off() && !saved && asc_mty_ &&
+                          mt->kind == cmi::ModuleType::Sig && mt->sig &&
+                          !poly_used(*mt->sig);
     // A distinct argument builds its own result; the same one is cached.
     std::string ak = key;
     int unit_arg = 0;
@@ -37481,7 +37657,8 @@ struct Count {
           if (!ap.empty() && std::filesystem::exists(ap)) uargc = ac;
         }
       }
-      if (!ac.empty() && !discread_off() && mdiscard_) xalias = arg_alias(ac);
+      if (!ac.empty() && !discread_off() && (mdiscard_ || mnarrow_ || ascribed))
+        xalias = arg_alias(ac);
       // Two arguments with no path at all share the one entry: a second
       // `Map.Make (struct .. end)` pays the cascade and nothing more.
       ak += "(";
@@ -37504,21 +37681,51 @@ struct Count {
     // at another path builds nothing, and a binding after it still reads a
     // unit argument out for itself and is at the functor's first path.
     const bool opn = !xoapp_off() && opn_app_;
-    bool newpath = !xpathless && !opn && ps.insert(ak).second;
-    bool newarg = !opn && farg.insert(ak).second;
+    const bool discarded = !ascrapp_off() && mdiscard_ && !inexpr_;
+    const bool narrowed = !narrowapp_off() && mnarrow_ && !mdiscard_ &&
+                          !inexpr_;
+    // .. or ascribed directly: none of these builds the path.
+    const bool unbuilt =
+        !narrowapp_off() && (discarded || narrowed || ascribed);
+    bool newpath = !xpathless && !opn && !unbuilt && ps.insert(ak).second;
+    bool newarg = !opn && !unbuilt && farg.insert(ak).second;
     // An application bound in an EXPRESSION builds nothing on the find
     // side until it is read (S535, `xrd_charge`).
     long long nf =
         (firstapp || (newpath && had >= 1 && (xrd_off() || !inexpr_))) ? 1
                                                                         : 0;
     if (unit_arg && newarg) ++nf;
-    const bool discarded = !ascrapp_off() && mdiscard_ && !inexpr_;
+    // A type path through the functor (`Set.Make (X).t`, any argument, any
+    // type, anywhere) builds the functor's result for itself
+    // (`xtapp_charge`'s UNBOUND law, the application being no binding Env
+    // built), and its force is the one the application would pay: beside
+    // it a hidden, narrowed or ascribed application is renamed flat where
+    // it stands.  Where the path stands in an EXPANDED position its build
+    // absorbs a sibling read's too (`tappx`).
+    bool tapp = false, tappx = false;
+    if (!narrowapp_off() && tapps_)
+      for (auto it = tapps_->lower_bound(key); it != tapps_->end(); ++it) {
+        if (it->compare(0, key.size(), key) != 0) break;
+        const char m = (*it)[key.size()];
+        if (m == ':') tapp = true;
+        if (m == '!') tapp = tappx = true;
+      }
+    if ((narrowed || discarded) && !asc_mty_ && recb_ && !inexpr_)
+      k += recb_ * flat_cmty(mt);
+    if (narrowed || ascribed) {
+      if (narrowed) nf = firstapp ? 1 : 0;
+      // .. and built where a sibling reads a type of it, as a hidden one.
+      const bool tb = (!discread_off() && tread_builds(mt)) || vread_builds(mt);
+      if (tapp) nf = 0;
+      if (!tappx && tb && fdread_.insert(key).second) nf += 2 + xalias;
+    }
     // ---- A FUNCTOR OF MORE THAN ONE PARAMETER (S532) --------------------
     // The rebuild is `mapp_rounds`'s, node by node along the applied path
     // (the .cmi's lazy signature forced once for the functor is the
     // `firstapp` force alone); a partial application is saved as a functor,
     // one shape variable per parameter left.
-    xmulti = xmulti && !xpathless && !discarded && saved && !inexpr_;
+    xmulti = xmulti && !xpathless && !discarded && !narrowed && saved &&
+             !inexpr_;
     if (xmulti) {
       nf = firstapp ? 1 : 0;
       k += (long long)xlv.size() - nargs;
@@ -37541,7 +37748,8 @@ struct Count {
                    firstapp
                ? 1
                : 0;
-      if (tb && fdread_.insert(key).second) nf += 2 + xalias;
+      if (tapp) nf = 0;
+      if (!tappx && tb && fdread_.insert(key).second) nf += 2 + xalias;
     }
     // What the strengthening forces is the RESULT, below a partial
     // application's remaining parameters.
@@ -37550,7 +37758,7 @@ struct Count {
     k += nf * flat_cmty(xres);
     // .. and what a DIRECT unit argument reads out instead, once for the
     // argument's own path however many functors this file gives it to.
-    if (!discarded && !uargc.empty()) {
+    if (!discarded && !narrowed && !uargc.empty()) {
       std::string uk;
       for (auto& s : uargc) uk += s + ".";
       if (fargu.insert(uk).second) k += arg_flat(uargc);
@@ -37561,7 +37769,7 @@ struct Count {
     if (xmulti && xres && xres->kind == cmi::ModuleType::Sig && xres->sig &&
         str_csig(*xres->sig)) {
       k += xapp_rounds(xlv, xak, xi0, key, root);
-    } else if (saved && !discarded && !inexpr_ && !xpathless &&
+    } else if (saved && !discarded && !narrowed && !inexpr_ && !xpathless &&
         mt->kind == cmi::ModuleType::Sig && mt->sig && str_csig(*mt->sig) &&
         fstr.insert(key).second)
       k += 2 * flat_cmty(mt);
@@ -38194,7 +38402,18 @@ struct Count {
     const cmi::ModuleType* res = scrape_cmty(mt->functor_body.get(), root);
     if (!res) return 0;
     const long long r = flat_cmty(res);
-    const std::string key = lid_full(id);
+    // A path applied to a functor PARAMETER is that functor's own: two
+    // functors' `Set.Make (X).t` are two paths, built once apiece (S542).
+    std::string key = lid_full(id);
+    if (!narrowapp_off())
+      if (auto* xi = std::get_if<Lident>(&a->x->v)) {
+        auto fm = fmods.find(xi->name);
+        if (fm != fmods.end() && !fm->second.empty()) {
+          char b[32];
+          std::snprintf(b, sizeof b, "@%p", (const void*)fm->second.back());
+          key += b;
+        }
+      }
     const std::string fk = xtapp_key(*a->f);
     // A type DECLARATION written through the application has
     // `Typedecl.reachable` build the unit's components: a read through an
@@ -38236,7 +38455,12 @@ struct Count {
     if (ali && ins && xtali2_.insert(f).second) k += r;
     if (xtapp_.insert(key).second) k += r;
     if (ali && ins && xtiapp_.insert(key).second) k += r;
-    if (ali && ins && std_alias(*a->x) && xtiarg_.insert(key).second) k += r;
+    // .. an argument that is a local alias of a unit normalizes as
+    // `String` does (S542).
+    if (ali && ins &&
+        (std_alias(*a->x) || (!narrowapp_off() && xlid_alias(id))) &&
+        xtiarg_.insert(key).second)
+      k += r;
     return k;
   }
   // `papp_charge`'s spelling-insensitive functor key ("Set.Make.").
@@ -39067,11 +39291,38 @@ struct Count {
   // `P.S.t` finds the application bound at S inside a hidden P.
   const Signature* ascr_sig_ = nullptr;
   bool mdiscard_ = false;
+  bool mnarrow_ = false;  // declared by the ascription above, at a written type
+  // Inside a `module rec` of this many bindings: `check_recmodule_inclusion`
+  // (typemod.ml:2140) substitutes every binding's ACTUAL module type once per
+  // binding, and an unsaved application's result in it is renamed flat each
+  // time -- the result's items once more per binding of the group.  A module
+  // ascribed on its own leaves only the ascription in the actual type.
+  int recb_ = 0;
   bool mdisctop_ = false;
   bool mdisccoarse_ = false;
   std::string mdiscpre_;
   std::set<std::string> fdread_;
   const std::set<std::string>* treads_ = nullptr;
+  const std::set<std::string>* treadsc_ = nullptr;
+  const std::set<std::string>* vreadsc_ = nullptr;
+  const std::set<std::string>* tapps_ = nullptr;
+  std::string nscope_;  // the scope the narrowing ascription's structure is
+  // Is a read of `key` at some scope INSIDE the narrowed module's structure?
+  bool nread(const std::set<std::string>* sc, const std::string& key) const {
+    if (!mnarrow_ || mdiscard_) return true;
+    if (!sc) return false;
+    for (auto it = sc->lower_bound(nscope_); it != sc->end(); ++it) {
+      if (it->compare(0, nscope_.size(), nscope_) != 0) break;
+      const std::size_t bar = it->find('|');
+      if (bar == std::string::npos ||
+          it->compare(bar + 1, std::string::npos, key) != 0)
+        continue;
+      if (nscope_.empty() || bar == nscope_.size() ||
+          (*it)[nscope_.size()] == '.')
+        return true;
+    }
+    return false;
+  }
   const std::set<std::string>* oheads_ = nullptr;
   const std::set<std::string>* vreads_ = nullptr;
   const std::set<std::string>* xreads_ = nullptr;
@@ -39511,6 +39762,15 @@ struct Count {
       if (!with_off()) n += with_node(*w, l);
       if (!xwith_off()) n += xwith_node(*w, l);
       n += twith_node(*w, l);
+      // A constraint's manifest is a type written where it is expanded: an
+      // application in its path is built as a declaration's is (S542).
+      if (!narrowapp_off())
+        for (auto& c : w->constraints) {
+          const TypeDeclaration* td = nullptr;
+          if (auto* t = std::get_if<Pwith_type>(&c)) td = t->td.get();
+          else if (auto* t = std::get_if<Pwith_typesubst>(&c)) td = t->td.get();
+          if (td && td->manifest) ty_app(**td->manifest, 0, false, 2);
+        }
       n += dforce(mt);
       if (!pkmeet_off() && !packty_off() && !pkinfer_off()) {
         long long rep = 0;
@@ -40023,9 +40283,38 @@ struct Count {
         n += pfun_params(m->binding.expr);
       const Signature* asv = ascr_sig_;
       const bool dsv = mdiscard_;
+      const bool nsv = mnarrow_;
+      // What a narrowed module's body stands behind is its DECLARATION;
+      // an application bound there is paired against a name it forces.
+      const Signature* nsig = nullptr;
+      if (!narrowapp_off() && !mdiscard_ && ascr_sig_ && m->binding.name.txt)
+        if (const ModuleType* d =
+                sig_narrows_mod(*ascr_sig_, *m->binding.name.txt)) {
+          mnarrow_ = true;
+          nsig = mty_sig(d);
+          // A declaration at another unit's module type NAME is expanded
+          // where the pair is checked, whatever the binding is -- the one
+          // force the file shares, and inside a FUNCTOR's body one more
+          // per declaration (measured: `Set.S` 47, `Set.OrderedType` 2,
+          // `module rec` or not).
+          if (std::holds_alternative<Pmty_ident>(d->desc)) {
+            n += xforce(*d);
+            std::string key;
+            const cmi::Signature* sg = xmty_sig(d, key);
+            if (sg && fxin_ > 0) n += flat_csig(*sg);
+          }
+        }
       const bool dtv = mdisctop_;
       const bool dsd = mdisccoarse_;
       const std::string dpv = mdiscpre_;
+      const std::string nscv = nscope_;
+      if (mnarrow_ && !mdiscard_ && m->binding.name.txt) {
+        mdiscpre_ = (nsv ? mdiscpre_ : "") + *m->binding.name.txt + ".";
+        if (!nsv) {
+          nscope_.clear();
+          for (auto& s : fxpath_) nscope_ += (nscope_.empty() ? "" : ".") + s;
+        }
+      }
       if (!mdiscard_ && ascr_sig_ && m->binding.name.txt &&
           !sig_binds_mod(*ascr_sig_, *m->binding.name.txt)) {
         mdiscard_ = true;
@@ -40037,7 +40326,7 @@ struct Count {
         mdisctop_ = false;
         if (m->binding.name.txt) mdiscpre_ += *m->binding.name.txt + ".";
       }
-      ascr_sig_ = nullptr;
+      ascr_sig_ = nsig;
       // What an ascription ABOVE saves is its own signature: a LOCAL
       // functor's application bound under one leaves no strengthened
       // manifest in the saved signature for the compunit check to expand,
@@ -40061,6 +40350,8 @@ struct Count {
       if (fxp) fxpath_.pop_back();
       ascr_sig_ = asv;
       mdiscard_ = dsv;
+      mnarrow_ = nsv;
+      nscope_ = nscv;
       mdisctop_ = dtv;
       mdisccoarse_ = dsd;
       mdiscpre_ = dpv;
@@ -40069,11 +40360,14 @@ struct Count {
       n += lal_bind(m->binding);
     } else if (auto* m = std::get_if<Pstr_recmodule>(&it.desc)) {
       const Lvl sl = depth_off() ? Lvl{1, 1, 0, true} : sub(l);
+      const int rbv = recb_;
+      recb_ = narrowapp_off() ? 0 : (int)m->bindings.size();
       for (auto& b : m->bindings) {
         mexpr(b.expr, sl);
         if (b.name.txt) ++n;
         mbind(b);
       }
+      recb_ = rbv;
       n += recmodule_extra(*m);
     } else if (auto* m = std::get_if<Pstr_modtype>(&it.desc)) {
       if (m->type) {
@@ -40458,6 +40752,9 @@ void Count::oapp_scan_items(const std::vector<StructureItem>& items, size_t from
   for (size_t i = from; i < end; ++i) oapp_scan_item(items[i], o, h, d);
 }
 
+static bool cmi_poly_used(const cmi::Signature& sg) {
+  return Count::poly_used(sg);
+}
 }  // namespace stampcount
 
 // The package nodes the SAVED signature's values carry, at the weight the
@@ -40703,9 +41000,13 @@ int typing_ident_count(const ast::Structure& s, std::size_t eta_sites,
   // of its `open`s provides is that unit's submodule and names a DIFFERENT
   // functor (S438), so `Map.Make` under `open MoreLabels` is not Stdlib's.
   std::set<std::string> xkeys;
+  // A hidden or narrowed application is one Env never built (S542): what a
+  // type path of the functor then costs is the unbound law's.
+  auto unbuilt = [&](std::size_t fi) { return u.unbuilt_app(fi); };
   for (std::size_t fi = 0; fi < u.fapps.size(); ++fi) {
     const auto& fa = u.fapps[fi];
     if (fi < u.fopen.size() && u.fopen[fi]) continue;
+    if (unbuilt(fi)) continue;
     if (!stampcount::xrd_off() && fi < u.fexpr.size() && u.fexpr[fi] &&
         !u.fread[fi])
       continue;
@@ -40737,6 +41038,7 @@ int typing_ident_count(const ast::Structure& s, std::size_t eta_sites,
   for (std::size_t fi = 0; fi < u.fapps.size(); ++fi) {
     if (fi >= u.fexpr.size() || u.fargk[fi].empty()) continue;
     if (u.fexpr[fi] && !(fi < u.fopen.size() && u.fopen[fi])) continue;
+    if (unbuilt(fi)) continue;
     std::vector<std::string> c0 = u.fapps[fi].first;
     if (c0[0] == "Stdlib" && c0.size() > 2) c0.erase(c0.begin());
     if (c0[0].rfind("Stdlib__", 0) == 0) c0[0] = c0[0].substr(8);
@@ -40753,6 +41055,9 @@ int typing_ident_count(const ast::Structure& s, std::size_t eta_sites,
   c.ereads_ = &u.ereads_;
   c.yreads_ = &u.yreads_;
   c.treads_ = &u.treads_;
+  c.treadsc_ = &u.treadsc_;
+  c.vreadsc_ = &u.vreadsc_;
+  c.tapps_ = &u.tapps_;
   c.oheads_ = &u.oheads_;
   c.vreads_ = &u.vreads_;
   c.xreads_ = &u.xreads_;
