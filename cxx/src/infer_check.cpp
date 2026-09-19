@@ -24581,6 +24581,9 @@ struct Count {
     char pk = 0;
     std::vector<const Pattern*> pats;
     char def_pk = 0;
+    // The package type a `let module M = (val x : P) in ..` in the body
+    // fixed the parameter `x` at (S539).
+    const Ptyp_package* fix = nullptr;
   };
   // A DEPENDENT unpack parameter (S527): `(module P : S)` at position `pos`
   // of the flattened parameter list, cited as `P.<sub>.t` by the parameters
@@ -24598,6 +24601,10 @@ struct Count {
     const Ptyp_package* ty = nullptr;  // the package type WRITTEN for it
     std::vector<PkParam> params;
     std::vector<TfNode> tf;            // its escaping unpack parameters
+    // A FUNCTION whose body ends in a package-typed expression: a saturated
+    // application of it is package-typed at that type (S539).
+    char respk = 0;
+    const Ptyp_package* res = nullptr;
   };
   // A parameter whose pattern is an unpack meets its arguments at a package
   // type it never wrote out; `pkleaf_` stands for that type where `pk_rue`
@@ -24639,6 +24646,17 @@ struct Count {
       if (!d) return false;
       const ValueBinding* found = mod_value(*d);
       return found && pkg_typed(*found->expr, ty, fuel - 1);
+    }
+    if (auto* ap = std::get_if<Pexp_apply>(&e.desc); ap && !pkres_off()) {
+      auto* i = std::get_if<Pexp_ident>(&ap->fn->desc);
+      auto* l = i ? std::get_if<Lident>(&i->id.txt.v) : nullptr;
+      if (!l) return false;
+      auto it = pkv_.find(l->name);
+      if (it == pkv_.end() || it->second.empty()) return false;
+      const Pk& k = it->second.back();
+      if (!k.respk || ap->args.size() < k.params.size()) return false;
+      if (ty) *ty = k.res;
+      return true;
     }
     if (auto* i = std::get_if<Pexp_ifthenelse>(&e.desc))
       return pkg_typed(*i->then_, ty, fuel - 1) ||
@@ -24702,6 +24720,12 @@ struct Count {
     if (auto* f = std::get_if<Pexp_function>(&b.expr->desc)) {
       fn_params(*f, k.params);
       k.tf = tf_nodes(*f);
+      if (!pkres_off())
+        if (auto* bd = std::get_if<Pfunction_body>(&f->body->v)) {
+          const Ptyp_package* t = nullptr;
+          if (pkg_typed(*bd->e, &t)) { k.respk = 1; k.res = t; }
+          for (auto& pm : k.params) pk_fix(*bd->e, pm);
+        }
     }
     // `let g = f`: g's parameters are f's (u12).
     if (!pkarg_off() && k.params.empty())
@@ -24713,6 +24737,54 @@ struct Count {
         k.tf = tf_of(i->id.txt);
       }
     return k;
+  }
+  // ---- A PACKAGE TYPE INFERRED, NOT WRITTEN (S539) ------------------------
+  // fstclassmod.ml: `let make_set (type s) cmp = .. (module S : Set.S with
+  // type elt = s)` and `let sort (type s) set l = let module Set = (val set
+  // : Set.S with type elt = s) in ..`: an application `make_set compare` is
+  // package-typed by inference, so a later list element, an `else`, a later
+  // arm, or an argument to a parameter the body's unpack FIXED at a package
+  // type meets it as a written one would (`Ctype.unify` on two `Tpackage`s,
+  // 2 per node), and the fixed parameter meets any package-typed argument
+  // (`type_argument` at the parameter's type).  `pkg_typed` answers for a
+  // saturated application of such a function; `pk_parg` for such a
+  // parameter.  Not modelled: a parameter fixed through ANOTHER call's
+  // parameter (`List.map (fun set -> sort set l) ..`'s element type).
+  // `NOPKRES=1` reverts.
+  static bool pkres_off() {
+    static const bool off = dbg_env("NOPKRES") != nullptr;
+    return off;
+  }
+  // The `let module M = (val x : P) in ..` chain at the head of `body` that
+  // fixes the parameter `pm`'s (a plain variable's) type.
+  static void pk_fix(const Expression& body, PkParam& pm) {
+    if (pm.pk || pm.pats.empty()) return;
+    const std::string* nm = pk_name(*pm.pats[0]);
+    if (!nm) return;
+    const Expression* e = &body;
+    for (int d = 0; e && d < 24; ++d) {
+      if (auto* nt = std::get_if<Pexp_newtype>(&e->desc)) {
+        e = nt->body.get();
+        continue;
+      }
+      if (auto* l = std::get_if<Pexp_let>(&e->desc)) {
+        e = l->body.get();
+        continue;
+      }
+      auto* si = std::get_if<Pexp_struct_item>(&e->desc);
+      if (!si) return;
+      if (auto* lm = std::get_if<Pstr_module>(&si->item->desc))
+        if (auto* u = std::get_if<Pmod_unpack>(&lm->binding.expr.desc))
+          if (auto* c = std::get_if<Pexp_constraint>(&u->e->desc))
+            if (auto* i = std::get_if<Pexp_ident>(&c->e->desc))
+              if (auto* li = std::get_if<Lident>(&i->id.txt.v);
+                  li && li->name == *nm)
+                if (const Ptyp_package* pk = pk_of_ty(*c->t)) {
+                  pm.fix = pk;
+                  return;
+                }
+      e = si->body.get();
+    }
   }
   void fn_params(const Pexp_function& f, std::vector<PkParam>& out) {
     for (auto& pm : f.params)
@@ -24788,6 +24860,11 @@ struct Count {
     long long k = 0;
     if (pm.def_pk) {
       k = pk_rue(*a, pkleaf_, false);
+    } else if (pm.fix && !pkres_off()) {
+      const Ptyp_package* was = pkarg_ty_;
+      pkarg_ty_ = pm.fix;
+      k = pk_rue(*a, pkleaf_, false);
+      pkarg_ty_ = was;
     } else {
       for (const Pattern* p : pm.pats)
         if ((k = pk_parg(*p, *a))) break;
