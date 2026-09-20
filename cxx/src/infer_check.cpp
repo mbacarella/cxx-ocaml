@@ -42814,4 +42814,371 @@ int typing_ident_count(const ast::Signature& s) {
   return (int)k;
 }
 
+// ==== A DECLARATION'S UID IS THE NUMBER OF `Uid.mk` CALLS BEFORE IT (S551) ====
+//
+// `Uid.mk ~current_unit` (typing/shape.ml) is a per-unit counter from 0, and
+// every declaration typing creates takes the next one -- the SAVED ones that
+// reach the .cmi and the local ones that do not, alike.  Measured against
+// `ocamlc.opt` (the probe grid behind this is `$S/z551`):
+//
+//   * a pattern variable costs 1 (typecore.ml:949 `pv_uid`), an `as` alias its
+//     own 1 on top of its sub-pattern's, an or-pattern's variables once PER
+//     BRANCH, `_` nothing; an unpack pattern `(module M)` costs 2 (940 + 949)
+//     but the same thing as a FUNCTION PARAMETER costs 1 (6206);
+//   * a `let .. and ..` group types ALL its patterns first and its bodies
+//     after, so a body's locals shift only what FOLLOWS the group;
+//   * a `for` index costs 1 (5154), a `(type a)` newtype 1 apiece (ctype.ml
+//     `new_local_type`), a `let exception E` 1, a `let module M = ..` one for
+//     M AFTER its body's, a `let open` nothing;
+//   * a module's contents are numbered before its own uid (post-order), and
+//     `module M : S = struct .. end` types the STRUCTURE first and the module
+//     type after, so the items that reach the .cmi -- the module type's --
+//     carry the LATER uids;
+//   * a functor parameter costs its module type's items plus 1 for the
+//     parameter itself; a `()` parameter costs nothing;
+//   * a `module type S = sig .. end` numbers the signature's items before S.
+//
+// What is NOT modelled leaves `complete` false and the writer keeps its own
+// numbering for the whole file: an `include` (whose items keep their SOURCE
+// unit's uids), a class, a `module rec`, a functor APPLICATION, a module type
+// reached by NAME, an `open struct .. end`, an object expression, an
+// extension node.  A file is thus either fully modelled or exactly as before.
+namespace uidwalk {
+
+struct Walk {
+  int c = 0;                     // the Uid.mk counter
+  bool complete = true;
+  std::map<std::string, int> ids;
+  std::string path;              // dotted path of the enclosing module
+
+  int mk() { return c++; }
+  void give(char kind, const std::string& name) { ids[uidkey(kind, path, name)] = mk(); }
+  void bail() { complete = false; }
+
+  // ---- patterns -----------------------------------------------------------
+  // `save` is set only for the patterns of a STRUCTURE's value bindings: the
+  // variables those bind are the ones the signature saves.
+  void pat(const ast::Pattern& p, bool save) {
+    using namespace ast;
+    if (auto* v = std::get_if<Ppat_var>(&p.desc)) {
+      if (save) give('v', v->name.txt); else mk();
+    } else if (auto* a = std::get_if<Ppat_alias>(&p.desc)) {
+      pat(*a->p, save);
+      if (save) give('v', a->name.txt); else mk();
+    } else if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
+      for (auto& e : t->elems) pat(*e, save);
+    } else if (auto* ct = std::get_if<Ppat_construct>(&p.desc)) {
+      if (ct->arg) pat(**ct->arg, save);
+    } else if (auto* o = std::get_if<Ppat_or>(&p.desc)) {
+      pat(*o->l, save); pat(*o->r, save);       // once per branch
+    } else if (auto* cs = std::get_if<Ppat_constraint>(&p.desc)) {
+      pat(*cs->p, save);
+    } else if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
+      for (auto& f : r->fields) pat(*f.second, save);
+    } else if (auto* l = std::get_if<Ppat_lazy>(&p.desc)) {
+      pat(*l->p, save);
+    } else if (auto* v = std::get_if<Ppat_variant>(&p.desc)) {
+      if (v->arg) pat(**v->arg, save);
+    } else if (auto* e = std::get_if<Ppat_exception>(&p.desc)) {
+      pat(*e->p, save);
+    } else if (auto* a = std::get_if<Ppat_array>(&p.desc)) {
+      for (auto& e : a->elems) pat(*e, save);
+    } else if (auto* u = std::get_if<Ppat_unpack>(&p.desc)) {
+      if (u->name.txt) { mk(); if (save) give('m', *u->name.txt); else mk(); }
+    } else if (auto* o = std::get_if<Ppat_open>(&p.desc)) {
+      pat(*o->p, save);
+    } else if (auto* e = std::get_if<Ppat_effect>(&p.desc)) {
+      pat(*e->eff, save); pat(*e->cont, save);
+    } else if (std::get_if<Ppat_extension>(&p.desc)) {
+      bail();
+    }
+    // Ppat_any / constant / interval / type: no binder.
+  }
+  // A function parameter's unpack costs ONE, not two.
+  void param_pat(const ast::Pattern& p) {
+    if (auto* u = std::get_if<ast::Ppat_unpack>(&p.desc)) {
+      if (u->name.txt) mk();
+      return;
+    }
+    pat(p, false);
+  }
+
+  // ---- expressions --------------------------------------------------------
+  // Nothing an expression binds reaches the signature, so only the COUNT
+  // matters here; the order within one expression never moves a saved uid.
+  void expr(const ast::Expression& e) {
+    using namespace ast;
+    if (auto* l = std::get_if<Pexp_let>(&e.desc)) {
+      for (auto& b : l->bindings) pat(b.pat, false);
+      for (auto& b : l->bindings) if (b.expr) expr(*b.expr);
+      if (l->body) expr(*l->body);
+    } else if (auto* f = std::get_if<Pexp_function>(&e.desc)) {
+      for (auto& pm : f->params) {
+        if (auto* v = std::get_if<Pparam_val>(&pm.desc)) {
+          param_pat(v->pat);
+          if (v->default_) expr(**v->default_);
+        } else {
+          mk();  // Pparam_newtype: `(type a)`
+        }
+      }
+      if (f->body) fbody(*f->body);
+    } else if (auto* m = std::get_if<Pexp_match>(&e.desc)) {
+      if (m->e) expr(*m->e);
+      cases(m->cases);
+    } else if (auto* t = std::get_if<Pexp_try>(&e.desc)) {
+      if (t->e) expr(*t->e);
+      cases(t->cases);
+    } else if (auto* fo = std::get_if<Pexp_for>(&e.desc)) {
+      pat(fo->var, false);
+      if (fo->lo) expr(*fo->lo);
+      if (fo->hi) expr(*fo->hi);
+      if (fo->body) expr(*fo->body);
+    } else if (auto* n = std::get_if<Pexp_newtype>(&e.desc)) {
+      mk();
+      if (n->body) expr(*n->body);
+    } else if (auto* si = std::get_if<Pexp_struct_item>(&e.desc)) {
+      if (si->item) item(*si->item, /*save=*/false);
+      if (si->body) expr(*si->body);
+    } else if (auto* lo = std::get_if<Pexp_letop>(&e.desc)) {
+      pat(lo->let_.pat, false);
+      if (lo->let_.exp) expr(*lo->let_.exp);
+      for (auto& a : lo->ands) {
+        pat(a.pat, false);
+        if (a.exp) expr(*a.exp);
+      }
+      if (lo->body) expr(*lo->body);
+    } else if (auto* a = std::get_if<Pexp_apply>(&e.desc)) {
+      if (a->fn) expr(*a->fn);
+      for (auto& ar : a->args) if (ar.second) expr(*ar.second);
+    } else if (auto* t = std::get_if<Pexp_tuple>(&e.desc)) {
+      for (auto& x : t->elems) if (x) expr(*x);
+    } else if (auto* i = std::get_if<Pexp_ifthenelse>(&e.desc)) {
+      if (i->cond) expr(*i->cond);
+      if (i->then_) expr(*i->then_);
+      if (i->else_) expr(**i->else_);
+    } else if (auto* co = std::get_if<Pexp_construct>(&e.desc)) {
+      if (co->arg) expr(**co->arg);
+    } else if (auto* s = std::get_if<Pexp_sequence>(&e.desc)) {
+      if (s->e1) expr(*s->e1);
+      if (s->e2) expr(*s->e2);
+    } else if (auto* cs = std::get_if<Pexp_constraint>(&e.desc)) {
+      if (cs->e) expr(*cs->e);
+    } else if (auto* fl = std::get_if<Pexp_field>(&e.desc)) {
+      if (fl->e) expr(*fl->e);
+    } else if (auto* r = std::get_if<Pexp_record>(&e.desc)) {
+      for (auto& f : r->fields) if (f.second) expr(*f.second);
+      if (r->base) expr(**r->base);
+    } else if (auto* as = std::get_if<Pexp_assert>(&e.desc)) {
+      if (as->e) expr(*as->e);
+    } else if (auto* lz = std::get_if<Pexp_lazy>(&e.desc)) {
+      if (lz->e) expr(*lz->e);
+    } else if (auto* wh = std::get_if<Pexp_while>(&e.desc)) {
+      if (wh->cond) expr(*wh->cond);
+      if (wh->body) expr(*wh->body);
+    } else if (auto* ar = std::get_if<Pexp_array>(&e.desc)) {
+      for (auto& x : ar->elems) if (x) expr(*x);
+    } else if (auto* v = std::get_if<Pexp_variant>(&e.desc)) {
+      if (v->arg) expr(**v->arg);
+    } else if (auto* sf = std::get_if<Pexp_setfield>(&e.desc)) {
+      if (sf->obj) expr(*sf->obj);
+      if (sf->value) expr(*sf->value);
+    } else if (auto* sv = std::get_if<Pexp_setinstvar>(&e.desc)) {
+      if (sv->value) expr(*sv->value);
+    } else if (auto* cc = std::get_if<Pexp_coerce>(&e.desc)) {
+      if (cc->e) expr(*cc->e);
+    } else if (auto* sd = std::get_if<Pexp_send>(&e.desc)) {
+      if (sd->obj) expr(*sd->obj);
+    } else if (auto* pk = std::get_if<Pexp_pack>(&e.desc)) {
+      if (pk->me) mod_expr(*pk->me, /*save=*/false);
+    } else if (auto* ov = std::get_if<Pexp_override>(&e.desc)) {
+      for (auto& f : ov->fields) if (f.second) expr(*f.second);
+    } else if (auto* po = std::get_if<Pexp_poly>(&e.desc)) {
+      if (po->e) expr(*po->e);
+    } else if (std::get_if<Pexp_object>(&e.desc) ||
+               std::get_if<Pexp_extension>(&e.desc) ||
+               std::get_if<Pexp_new>(&e.desc)) {
+      bail();
+    }
+    // Pexp_ident / constant / unreachable: nothing.
+  }
+  void fbody(const ast::FunctionBody& b) {
+    if (auto* e = std::get_if<ast::Pfunction_body>(&b.v)) {
+      if (e->e) expr(*e->e);
+    } else {
+      cases(std::get<ast::Pfunction_cases>(b.v).cases);
+    }
+  }
+  void cases(const std::vector<ast::Case>& cs) {
+    for (auto& k : cs) {
+      pat(k.lhs, false);
+      if (k.guard) expr(**k.guard);
+      if (k.rhs) expr(*k.rhs);
+    }
+  }
+
+  // ---- type declarations --------------------------------------------------
+  // The group is TWO-PASS: every type_uid first, then the constructors and
+  // labels (an inline-record constructor's labels before its own uid), and
+  // each inline-record constructor burns 5 more on the hidden record
+  // declaration datarepr builds behind it (typing/datarepr.ml ~94).
+  void type_group(const std::vector<ast::TypeDeclaration>& decls, bool save) {
+    for (auto& d : decls) { if (save) give('t', d.name.txt); else mk(); }
+    int inline_ctors = 0;
+    for (auto& d : decls) {
+      if (auto* v = std::get_if<ast::Ptype_variant>(&d.kind)) {
+        for (auto& ct : v->ctors) {
+          if (auto* r = std::get_if<ast::Pcstr_record>(&ct.args)) {
+            for (auto& f : r->fields) {
+              if (save) ids[uidkey('L', path, d.name.txt + "#" + ct.name.txt +
+                                             "." + f.name.txt)] = mk();
+              else mk();
+            }
+            ++inline_ctors;
+          }
+          if (save) ids[uidkey('c', path, d.name.txt + "#" + ct.name.txt)] = mk();
+          else mk();
+        }
+      } else if (auto* r = std::get_if<ast::Ptype_record>(&d.kind)) {
+        for (auto& f : r->fields) {
+          if (save) ids[uidkey('l', path, d.name.txt + "." + f.name.txt)] = mk();
+          else mk();
+        }
+      }
+    }
+    c += 5 * inline_ctors;
+  }
+
+  // ---- module types -------------------------------------------------------
+  void mty(const ast::ModuleType& m, bool save) {
+    using namespace ast;
+    if (auto* sg = std::get_if<Pmty_signature>(&m.desc)) {
+      sig_items(sg->items, save);
+    } else if (std::get_if<Pmty_ident>(&m.desc)) {
+      // `: S` -- the saved items are S's OWN declarations and carry ITS uids.
+      if (save) bail();
+    } else {
+      bail();  // functor / with / typeof / alias / extension
+    }
+  }
+  void sig_items(const ast::Signature& items, bool save) {
+    using namespace ast;
+    for (auto& it : items) {
+      if (auto* v = std::get_if<Psig_value>(&it.desc)) {
+        if (save) give('v', v->vd.name.txt); else mk();
+      } else if (auto* p = std::get_if<Psig_primitive>(&it.desc)) {
+        if (save) give('v', p->pd.name.txt); else mk();
+      } else if (auto* t = std::get_if<Psig_type>(&it.desc)) {
+        type_group(t->decls, save);
+      } else if (auto* e = std::get_if<Psig_exception>(&it.desc)) {
+        exception_decl(e->exn, save);
+      } else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+        if (!m->md.name.txt) { bail(); continue; }
+        std::string n = *m->md.name.txt;
+        std::string save_path = path;
+        if (save) path = path.empty() ? n : path + "." + n;
+        if (m->md.type) mty(*m->md.type, save);
+        path = save_path;
+        if (save) give('m', n); else mk();
+      } else if (auto* mt = std::get_if<Psig_modtype>(&it.desc)) {
+        if (mt->type) mty(*mt->type, /*save=*/false);
+        if (save) give('M', mt->name.txt); else mk();
+      } else if (std::get_if<Psig_open>(&it.desc) ||
+                 std::get_if<Psig_attribute>(&it.desc)) {
+        // nothing
+      } else {
+        bail();
+      }
+    }
+  }
+
+  void exception_decl(const ast::TypeException& x, bool save) {
+    // `exception E of { .. }`: the inline labels are numbered BEFORE E, and
+    // the hidden record costs one more (not the five a type declaration's
+    // does -- measured on `exception E of { a : int }`: a 0, E 1, next 3).
+    const std::string& n = x.ctor.name.txt;
+    bool inl = false;
+    if (auto* d = std::get_if<ast::Pext_decl>(&x.ctor.kind))
+      if (auto* r = std::get_if<ast::Pcstr_record>(&d->args)) {
+        inl = true;
+        for (auto& f : r->fields) {
+          if (save) ids[uidkey('L', path, n + "#" + n + "." + f.name.txt)] = mk();
+          else mk();
+        }
+      }
+    if (save) give('e', n); else mk();
+    if (inl) ++c;
+  }
+
+  // ---- module expressions -------------------------------------------------
+  void mod_expr(const ast::ModuleExpr& m, bool save) {
+    using namespace ast;
+    if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
+      for (auto& it : st->items) item(it, save);
+    } else if (auto* cn = std::get_if<Pmod_constraint>(&m.desc)) {
+      // typemod types the module expression FIRST and the module type after,
+      // so the ascribed signature's items -- the ones that are saved -- carry
+      // the later uids and overwrite what the structure recorded.
+      if (cn->me) mod_expr(*cn->me, save);
+      if (cn->mt) mty(*cn->mt, save);
+    } else if (auto* fn = std::get_if<Pmod_functor>(&m.desc)) {
+      if (auto* nm = std::get_if<Functor_named>(&fn->param)) {
+        if (nm->type) mty(*nm->type, /*save=*/false);
+        mk();  // the parameter itself
+      }
+      if (fn->body) mod_expr(*fn->body, save);
+    } else if (std::get_if<Pmod_ident>(&m.desc)) {
+      // `module M = A.B`: an alias declares nothing of its own.
+    } else {
+      bail();  // apply / apply_unit / unpack / extension
+    }
+  }
+
+  // ---- structure items ----------------------------------------------------
+  void item(const ast::StructureItem& it, bool save) {
+    using namespace ast;
+    if (auto* v = std::get_if<Pstr_value>(&it.desc)) {
+      for (auto& b : v->bindings) pat(b.pat, save);
+      for (auto& b : v->bindings) if (b.expr) expr(*b.expr);
+    } else if (auto* e = std::get_if<Pstr_eval>(&it.desc)) {
+      if (e->e) expr(*e->e);
+    } else if (auto* t = std::get_if<Pstr_type>(&it.desc)) {
+      type_group(t->decls, save);
+    } else if (auto* p = std::get_if<Pstr_primitive>(&it.desc)) {
+      if (save) give('v', p->prim.name.txt); else mk();
+    } else if (auto* x = std::get_if<Pstr_exception>(&it.desc)) {
+      exception_decl(x->exn, save);
+    } else if (auto* m = std::get_if<Pstr_module>(&it.desc)) {
+      if (!m->binding.name.txt) { bail(); return; }
+      std::string n = *m->binding.name.txt;
+      std::string save_path = path;
+      if (save) path = path.empty() ? n : path + "." + n;
+      mod_expr(m->binding.expr, save);
+      path = save_path;
+      if (save) give('m', n); else mk();
+    } else if (auto* mt = std::get_if<Pstr_modtype>(&it.desc)) {
+      if (mt->type) mty(*mt->type, /*save=*/false);
+      if (save) give('M', mt->name.txt); else mk();
+    } else if (auto* o = std::get_if<Pstr_open>(&it.desc)) {
+      // `open M` declares nothing; `open struct .. end` does, and its items
+      // land in the enclosing signature -- not modelled.
+      if (!std::get_if<Pmod_ident>(&o->expr.desc)) bail();
+    } else if (std::get_if<Pstr_attribute>(&it.desc)) {
+      // nothing
+    } else {
+      bail();  // include / class / class type / recmodule / typext / ext / val
+    }
+  }
+};
+
+}  // namespace uidwalk
+
+UidMap typing_uid_map(const ast::Structure& s) {
+  uidwalk::Walk w;
+  for (auto& it : s) w.item(it, /*save=*/true);
+  UidMap m;
+  m.complete = w.complete;
+  m.ids = std::move(w.ids);
+  return m;
+}
+
 }  // namespace cppcaml

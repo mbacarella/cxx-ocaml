@@ -9,6 +9,7 @@
 // per-node types back into the dump (match exhaustiveness, disambiguation).
 #pragma once
 
+#include <map>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -253,6 +254,31 @@ long long package_sig_idents(const std::vector<cmi::cmiw::SigItem>& items);
 // compares, a parameterized type of its own -- `fexp` above.
 std::set<std::string> fexp_paths(const std::vector<cmi::cmiw::SigItem>& items);
 int typing_ident_count(const ast::Signature& s);
+
+// A DECLARATION'S UID IS THE NUMBER OF `Uid.mk` CALLS BEFORE IT (S551).
+// `Uid.mk ~current_unit` is a per-unit counter from 0 advanced in TYPING
+// order, and a declaration keeps the uid typing gave it all the way into the
+// .cmi (`Subst` copies val_uid/type_uid/md_uid; only the idents are renamed at
+// save time).  Numbering the SAVED SIGNATURE's items, as the .cmi writer did
+// before, is right only for a file of plain declarations: every LOCAL binder
+// typed on the way -- a pattern variable, a `for` index, a newtype, a local
+// module -- is a `Uid.mk` too and shifts everything after it.  This walks the
+// parsetree in typing order, counts those, and records the counter at each
+// saved declaration under a `kind:path` key (cmi.hpp's `uidkey`).
+//
+// `complete` is false when the walk met a construct whose uids it does not
+// model (an `include`, a class, a `module rec`, a functor APPLICATION, a named
+// module type, ...); the writer then falls back to its own numbering, so a
+// file is either fully modelled or exactly as it was.
+struct UidMap {
+  bool complete = true;
+  std::map<std::string, int> ids;
+};
+UidMap typing_uid_map(const ast::Structure& s);
+
+// The key scheme lives in cmi.hpp (cppcaml::cmi::cmiw::uidkey), beside the
+// writer pass that reads the map.
+using cppcaml::cmi::cmiw::uidkey;
 
 // Build the .cmi signature from a hand-written interface (.mli).  Unlike
 // infer_signature this reads types verbatim from the declarations (no

@@ -10,6 +10,7 @@
 
 #include "cppcaml/marshal.hpp"
 
+#include <map>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -695,11 +696,26 @@ void set_module_dirs(const std::string& stdlib_dir,
 // `cite`: also list the units the signature's own types cite (with their
 // CRC; a module alias with none) -- off when `imports` is already the whole
 // list ocamlc would write (cmi_imports below).
+// The uid map's key scheme, shared by the pass that builds it
+// (cppcaml::typing_uid_map) and the writer pass that reads it: a kind letter
+// -- v value, t type, c constructor, l label, L inline-record label, m module,
+// M module type, e exception -- then the declaration's dotted path.
+inline std::string uidkey(char kind, const std::string& path,
+                          const std::string& name) {
+  return std::string(1, kind) + (path.empty() ? name : path + "." + name);
+}
+
+// `uids`, when given, is the uid TYPING gave each declaration, keyed the way
+// cppcaml::uidkey does (S551): a `.ml`'s local binders take uids too, so the
+// writer's own item-by-item numbering is right only for a file of plain
+// declarations.  A key the pass did not record makes the writer fall back to
+// that numbering for the whole file.
 std::string write_cmi(const std::string& path, const std::string& modname,
                       const std::vector<SigItem>& items,
                       const std::vector<Import>& imports = {}, bool intf = true,
                       const std::vector<std::string>& src_files = {},
-                      int stamp_base = 300, bool cite = true);
+                      int stamp_base = 300, bool cite = true,
+                      const std::map<std::string, int>* uids = nullptr);
 // The crc list ocamlc's `Env.imports` gives a unit whose typing read the
 // .cmi of every unit in `loaded` (S548): those units with their own CRC,
 // plus every entry with a CRC in each one's crc list (`Persistent_env.

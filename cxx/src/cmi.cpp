@@ -3041,6 +3041,56 @@ static void assign_uids(std::vector<SigItem>& items, const std::string& unit,
   }
 }
 
+// THE UID TYPING GAVE EACH DECLARATION (S551).  `assign_uids` above numbers
+// the saved signature's items, which is the right answer only when nothing
+// LOCAL was typed on the way: a pattern variable, a `for` index, a newtype, a
+// local module are all `Uid.mk` calls too.  `cppcaml::typing_uid_map` replays
+// the parsetree in typing order and records the counter at each saved
+// declaration; this pass hands those uids to the items.  It walks exactly the
+// items `assign_uids` numbers, and returns false -- leaving the signature
+// untouched -- as soon as one of them has no recorded uid, so a file either
+// takes the model whole or keeps the old numbering whole.
+static bool assign_uids_mapped(std::vector<SigItem>& items,
+                               const std::string& unit, bool intf,
+                               const std::map<std::string, int>& uids,
+                               const std::string& path, bool commit) {
+  auto at = [&](char kind, const std::string& name, cmiw::Uid* out) {
+    auto it = uids.find(uidkey(kind, path, name));
+    if (it == uids.end()) return false;
+    if (commit) { out->k = cmiw::Uid::Item; out->unit = unit;
+                  out->id = it->second; out->intf = intf; }
+    return true;
+  };
+  for (SigItem& it : items) {
+    if (it.k == SigItem::Type) {
+      if (!at('t', it.name, &it.uid)) return false;
+      for (auto& ct : it.ctors) {
+        for (auto& l : ct.inline_record)
+          if (!at('L', it.name + "#" + ct.name + "." + l.name, &l.uid)) return false;
+        if (!at('c', it.name + "#" + ct.name, &ct.uid)) return false;
+      }
+      for (auto& l : it.labels)
+        if (!at('l', it.name + "." + l.name, &l.uid)) return false;
+    } else if (it.k == SigItem::Value) {
+      if (!at('v', it.name, &it.uid)) return false;
+    } else if (it.k == SigItem::Exception) {
+      if (!at('e', it.name, &it.uid)) return false;
+      for (auto& ct : it.ctors)
+        for (auto& l : ct.inline_record)
+          if (!at('L', it.name + "#" + ct.name + "." + l.name, &l.uid)) return false;
+    } else if (it.k == SigItem::Module) {
+      const std::string sub = path.empty() ? it.name : path + "." + it.name;
+      if (!assign_uids_mapped(it.sub, unit, intf, uids, sub, commit)) return false;
+      if (!at('m', it.name, &it.uid)) return false;
+    } else if (it.k == SigItem::Modtype) {
+      if (!at('M', it.name, &it.uid)) return false;
+    } else if (it.k == SigItem::Class) {
+      return false;  // a class's three items are not modelled
+    }
+  }
+  return true;
+}
+
 std::vector<Import> cmi_imports(const std::set<std::string>& loaded,
                                 const std::string& self, bool pervasives) {
   std::map<std::string, std::string> crc;
@@ -3262,12 +3312,19 @@ std::string write_cmi(const std::string& path, const std::string& modname,
                       const std::vector<SigItem>& items_in,
                       const std::vector<Import>& imports, bool intf,
                       const std::vector<std::string>& src_files,
-                      int stamp_base, bool cite) {
+                      int stamp_base, bool cite,
+                      const std::map<std::string, int>* uids) {
   g_share.clear();              // the shared-value tables are per-cmi
   g_cmi_src_files = src_files;  // resolve position file_ids to pos_fname (emit_loc)
   std::vector<SigItem> items = items_in;  // mutable copy: uids assigned in place
-  int uid_counter = 0;
-  assign_uids(items, modname, intf, uid_counter);
+  // The uids TYPING gave the declarations, when the model covered the whole
+  // file (S551); its own item numbering otherwise.
+  if (!uids || !assign_uids_mapped(items, modname, intf, *uids, "",
+                                   /*commit=*/false) ||
+      !assign_uids_mapped(items, modname, intf, *uids, "", /*commit=*/true)) {
+    int uid_counter = 0;
+    assign_uids(items, modname, intf, uid_counter);
+  }
   std::map<std::string, bool> referenced;  // cited global unit -> needs real CRC
   int stamp = stamp_base;
   auto sig = emit_sig_items(items, referenced, stamp);

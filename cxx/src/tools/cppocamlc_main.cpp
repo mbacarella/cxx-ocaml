@@ -250,6 +250,10 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
                                    structure, eta_sites,
                                    cppcaml::package_sig_idents(sig), &fexp,
                                    pv_reify, &loaded);
+        // The uid typing gave each declaration -- the local binders on the
+        // way included (NOUIDWALK reverts to numbering the signature).
+        cppcaml::UidMap um;
+        if (!cppcaml::dbg_env("NOUIDWALK")) um = cppcaml::typing_uid_map(structure);
         cppcaml::cmi::cmiw::write_cmi(
             cmi_path.string(), mod, sig,
             imports ? cppcaml::cmi::cmiw::cmi_imports(loaded, mod,
@@ -258,7 +262,7 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
             /*intf=*/false,
             cppcaml::dbg_env("NOMLLOC") ? std::vector<std::string>{}
                                         : std::vector<std::string>{in_path},
-            base, /*cite=*/!imports);
+            base, /*cite=*/!imports, um.complete ? &um.ids : nullptr);
       }
     } catch (const std::exception& e) {
       if (prof) std::cerr << "  (.cmi emission skipped: " << e.what() << ")\n";
