@@ -3039,6 +3039,138 @@ std::vector<Import> cmi_imports(const std::set<std::string>& loaded,
   return out;
 }
 
+// A SAVED SIGNATURE'S type_expr IDS ARE SUBST'S CREATION ORDER (S549).
+// Env.save_signature runs `Subst.signature Make_local (for_saving identity)`
+// over the whole signature after `reset_for_saving` (new_id := -1), and every
+// node Subst CREATES takes `decr new_id` (subst.ml newpersty): a stub for the
+// node itself BEFORE its children (typexp), the children in OCaml's evaluation
+// order -- constructor and record arguments RIGHT-TO-LEFT (a Tarrow's codomain
+// before its domain, a Tfield's rest before its method, a Tpoly's univars
+// before its body, a declaration's manifest before its kind before its
+// params, a constructor's result before its arguments), `List.map`s
+// left-to-right -- and a node reached twice keeps its first id (the copy
+// scope's Tsubst).  Items are walked LAST-TO-FIRST (force_signature_once'
+// `List.rev_map`s the renamed, reversed list) and only then, in order, the
+// lazily substituted module and module-type bodies (force_signature_item), a
+// functor's parameter before its result.  The emitted value graph already has
+// ocamlc's shape, so the ids are assigned by a walk over it in that order;
+// TyEmit's per-item ids stay on any node the walk does not reach.
+struct TyIdWalk {
+  long long next = -1;
+  std::unordered_set<const o::Value*> seen;
+  static bool blk(const o::ValPtr& v) { return v && v->k == o::Value::Block; }
+  static std::vector<o::ValPtr> list(o::ValPtr v) {
+    std::vector<o::ValPtr> out;
+    while (blk(v) && v->fields.size() == 2) { out.push_back(v->fields[0]); v = v->fields[1]; }
+    return out;
+  }
+  void opt(const o::ValPtr& v) { if (blk(v)) ty(v->fields[0]); }
+  void tys(const o::ValPtr& l) { for (auto& t : list(l)) ty(t); }
+  void package(const o::ValPtr& p) {  // {pack_path; pack_constraints}
+    for (auto& c : list(p->fields[1])) ty(c->fields[1]);
+  }
+  void ty(const o::ValPtr& t) {
+    if (!blk(t) || t->fields.size() != 4 || !seen.insert(t.get()).second) return;
+    t->fields[3] = o::vint(--next);
+    const o::ValPtr& d = t->fields[0];
+    if (!blk(d)) return;  // Tnil
+    switch (d->tag) {
+      case 1: ty(d->fields[2]); ty(d->fields[1]); break;             // Tarrow
+      case 2: for (auto& e : list(d->fields[0])) ty(e->fields[1]); break;  // Ttuple
+      case 3: tys(d->fields[1]); break;                              // Tconstr
+      case 4:                                                        // Tobject
+        ty(d->fields[0]);
+        if (blk(d->fields[1]) && blk(d->fields[1]->fields[0]))
+          tys(d->fields[1]->fields[0]->fields[0]->fields[1]);      // ref (Some (p, tl))
+        break;
+      case 5: ty(d->fields[3]); ty(d->fields[2]); break;             // Tfield
+      case 6: {                                                      // Tvariant
+        const o::ValPtr& row = d->fields[0];
+        ty(row->fields[1]);                                          // row_more
+        for (auto& f : list(row->fields[0])) {
+          const o::ValPtr& rf = f->fields[1];
+          if (!blk(rf)) continue;
+          if (rf->tag == 0) opt(rf->fields[0]);                      // RFpresent
+          else if (rf->tag == 1) tys(rf->fields[1]);                 // RFeither arg_type
+        }
+        if (blk(row->fields[4])) tys(row->fields[4]->fields[0]->fields[1]);  // row_name
+        break;
+      }
+      case 8: tys(d->fields[1]); ty(d->fields[0]); break;            // Tpoly
+      case 9: package(d->fields[0]); break;                          // Tpackage
+      case 10: ty(d->fields[3]); package(d->fields[2]); break;       // Tfunctor
+      default: break;                                                // Tvar, Tunivar
+    }
+  }
+  void cargs(const o::ValPtr& a) {
+    if (!blk(a)) return;
+    if (a->tag == 0) tys(a->fields[0]);                              // Cstr_tuple
+    else for (auto& l : list(a->fields[0])) ty(l->fields[3]);        // Cstr_record
+  }
+  void decl(const o::ValPtr& d) {  // type_declaration
+    opt(d->fields[4]);                                               // type_manifest
+    const o::ValPtr& k = d->fields[2];
+    if (blk(k) && k->tag == 1)                                       // Type_record
+      for (auto& l : list(k->fields[0])) ty(l->fields[3]);
+    else if (blk(k) && k->tag == 2)                                  // Type_variant
+      for (auto& c : list(k->fields[0])) { opt(c->fields[2]); cargs(c->fields[1]); }
+    tys(d->fields[0]);                                               // type_params
+  }
+  void map(const o::ValPtr& m) {  // a String Map of (_, _, type_expr), in order
+    if (!blk(m)) return;
+    map(m->fields[0]); ty(m->fields[2]->fields[2]); map(m->fields[3]);
+  }
+  void cty(const o::ValPtr& c) {  // class_type
+    switch (c->tag) {
+      case 0: tys(c->fields[1]); cty(c->fields[2]); break;           // Cty_constr
+      case 1: {                                                      // Cty_signature
+        const o::ValPtr& s = c->fields[0];
+        map(s->fields[4]); map(s->fields[3]); ty(s->fields[1]); ty(s->fields[0]);
+        break;
+      }
+      case 2: cty(c->fields[2]); ty(c->fields[1]); break;            // Cty_arrow
+    }
+  }
+  void mty(const o::ValPtr& m) {
+    if (!blk(m)) return;
+    if (m->tag == 1) sig(list(m->fields[0]));                        // Mty_signature
+    else if (m->tag == 2) {                                          // Mty_functor
+      if (blk(m->fields[0])) mty(m->fields[0]->fields[1]);           // Named (_, mty)
+      mty(m->fields[1]);
+    }
+  }
+  void sig(const std::vector<o::ValPtr>& items) {
+    for (std::size_t i = items.size(); i-- > 0;) {
+      const o::ValPtr& it = items[i];
+      switch (it->tag) {
+        case 0: ty(it->fields[1]->fields[0]); break;                 // Sig_value
+        case 1: decl(it->fields[1]); break;                          // Sig_type
+        case 2: {                                                    // Sig_typext
+          const o::ValPtr& e = it->fields[1];
+          opt(e->fields[3]); cargs(e->fields[2]); tys(e->fields[1]);
+          break;
+        }
+        case 5: {                                                    // Sig_class
+          const o::ValPtr& c = it->fields[1];
+          opt(c->fields[3]); cty(c->fields[1]); tys(c->fields[0]);
+          break;
+        }
+        case 6: {                                                    // Sig_class_type
+          const o::ValPtr& c = it->fields[1];
+          decl(c->fields[3]); cty(c->fields[1]); tys(c->fields[0]);
+          break;
+        }
+        default: break;
+      }
+    }
+    for (auto& it : items) {
+      if (it->tag == 3) mty(it->fields[2]->fields[0]);               // Sig_module
+      else if (it->tag == 4 && blk(it->fields[1]->fields[0]))
+        mty(it->fields[1]->fields[0]->fields[0]);                    // Sig_modtype Some
+    }
+  }
+};
+
 std::string write_cmi(const std::string& path, const std::string& modname,
                       const std::vector<SigItem>& items_in,
                       const std::vector<Import>& imports, bool intf,
@@ -3052,6 +3184,7 @@ std::string write_cmi(const std::string& path, const std::string& modname,
   std::map<std::string, bool> referenced;  // cited global unit -> needs real CRC
   int stamp = stamp_base;
   auto sig = emit_sig_items(items, referenced, stamp);
+  if (!cppcaml::dbg_env("NOTYIDS")) TyIdWalk{}.sig(sig);
   auto header = o::vblock(0, {shared_str(modname), o::vlist(sig)});
   std::vector<std::uint8_t> hbytes = o::marshal(header);
 
