@@ -1609,6 +1609,13 @@ std::string read_cmi_self_crc(const std::string& path) {
 // Build the omarshal value graph for one exported value's type.  `id` is a
 // per-item counter for the cosmetic type_expr id field; `vars` shares Tvar
 // nodes of equal identity (so `'a -> 'a` is one node, used twice).
+// NOROWNORM=1: object fields in source order and every variant row in
+// Typetexp's hash-descending order (the S550 revert hook).
+static bool row_norm_off() {
+  static const bool off = cppcaml::dbg_env("NOROWNORM") != nullptr;
+  return off;
+}
+
 struct TyEmit {
   long long id = -2;
   std::unordered_map<int, o::ValPtr> vars;
@@ -2104,12 +2111,21 @@ struct TyEmit {
         // Each method type is Tpoly-wrapped (ocamlc stores even monomorphic
         // methods as Tpoly(ty, [])); the row terminates in Tnil (closed) or a
         // Tvar for an OPEN row (`< m : t; .. >`, row_kind 0).
-        // The printer sorts fields by name, so emission order is source order.
+        // The fields are chained in ascending NAME order: Typetexp's
+        // transl_fields folds them out of a String.Map, and an inferred
+        // object's row is sorted by Ctype.normalize_type (S550).
+        std::vector<std::size_t> ord(t->pv_tags.size());
+        for (std::size_t i = 0; i < ord.size(); ++i) ord[i] = i;
+        if (!row_norm_off())
+          std::sort(ord.begin(), ord.end(), [&](std::size_t a, std::size_t b) {
+            return t->pv_tags[a] < t->pv_tags[b];
+          });
         o::ValPtr tailvar;  // the OPEN row's terminating Tvar (shared with nm)
         o::ValPtr row = t->row_kind == 0
                             ? (tailvar = texpr(var_none_desc(false)))
                             : texpr(o::vint(0));                 // Tnil (a full type_expr node)
-        for (std::size_t i = t->pv_tags.size(); i-- > 0;) {
+        for (std::size_t k = ord.size(); k-- > 0;) {
+          std::size_t i = ord[k];
           o::ValPtr mty = texpr(o::vblock(8, {emit(t->args[i]), o::vint(0)}));  // Tpoly(ty,[])
           row = texpr(o::vblock(5, {o::vstr(t->pv_tags[i]), o::vint(1) /*FKpublic*/,
                                     mty, row}));  // Tfield
@@ -3039,6 +3055,77 @@ std::vector<Import> cmi_imports(const std::set<std::string>& loaded,
   return out;
 }
 
+// AN INFERRED SIGNATURE'S VALUE TYPES ARE NORMALIZED (S550).  Typemod's
+// type_implementation runs Ctype.normalize_type over every Sig_value of the
+// inferred signature of a .ml WITHOUT an .mli (normalize_modtype: into module
+// bodies and a functor's RESULT; not its parameter, not a module type, not a
+// class) before saving it: a Tvariant's row fields are sorted by LABEL
+// (string compare, ascending) where Typetexp built them hash-descending.
+// The walk covers the emitted value graph like TyIdWalk, before the ids.
+struct RowNormWalk {
+  std::unordered_set<const o::Value*> seen;
+  static bool blk(const o::ValPtr& v) { return v && v->k == o::Value::Block; }
+  static std::vector<o::ValPtr> list(o::ValPtr v) {
+    std::vector<o::ValPtr> out;
+    while (blk(v) && v->fields.size() == 2) { out.push_back(v->fields[0]); v = v->fields[1]; }
+    return out;
+  }
+  void opt(const o::ValPtr& v) { if (blk(v)) ty(v->fields[0]); }
+  void tys(const o::ValPtr& l) { for (auto& t : list(l)) ty(t); }
+  void package(const o::ValPtr& p) {
+    for (auto& c : list(p->fields[1])) ty(c->fields[1]);
+  }
+  void ty(const o::ValPtr& t) {
+    if (!blk(t) || t->fields.size() != 4 || !seen.insert(t.get()).second) return;
+    const o::ValPtr& d = t->fields[0];
+    if (!blk(d)) return;
+    switch (d->tag) {
+      case 1: ty(d->fields[1]); ty(d->fields[2]); break;             // Tarrow
+      case 2: for (auto& e : list(d->fields[0])) ty(e->fields[1]); break;  // Ttuple
+      case 3: tys(d->fields[1]); break;                              // Tconstr
+      case 4:                                                        // Tobject
+        ty(d->fields[0]);
+        if (blk(d->fields[1]) && blk(d->fields[1]->fields[0]))
+          tys(d->fields[1]->fields[0]->fields[0]->fields[1]);
+        break;
+      case 5: ty(d->fields[2]); ty(d->fields[3]); break;             // Tfield
+      case 6: {                                                      // Tvariant
+        const o::ValPtr& row = d->fields[0];
+        std::vector<o::ValPtr> fields = list(row->fields[0]);
+        std::stable_sort(fields.begin(), fields.end(),
+                         [](const o::ValPtr& a, const o::ValPtr& b) {
+                           return a->fields[0]->s < b->fields[0]->s;
+                         });
+        row->fields[0] = fields.empty() ? o::vint(0) : o::vlist(fields);
+        ty(row->fields[1]);
+        for (auto& f : fields) {
+          const o::ValPtr& rf = f->fields[1];
+          if (!blk(rf)) continue;
+          if (rf->tag == 0) opt(rf->fields[0]);
+          else if (rf->tag == 1) tys(rf->fields[1]);
+        }
+        if (blk(row->fields[4])) tys(row->fields[4]->fields[0]->fields[1]);
+        break;
+      }
+      case 8: ty(d->fields[0]); tys(d->fields[1]); break;            // Tpoly
+      case 9: package(d->fields[0]); break;                          // Tpackage
+      case 10: package(d->fields[2]); ty(d->fields[3]); break;       // Tfunctor
+      default: break;
+    }
+  }
+  void mty(const o::ValPtr& m) {
+    if (!blk(m)) return;
+    if (m->tag == 1) sig(list(m->fields[0]));                        // Mty_signature
+    else if (m->tag == 2) mty(m->fields[1]);                         // Mty_functor: the result
+  }
+  void sig(const std::vector<o::ValPtr>& items) {
+    for (auto& it : items) {
+      if (it->tag == 0) ty(it->fields[1]->fields[0]);                // Sig_value
+      else if (it->tag == 3) mty(it->fields[2]->fields[0]);          // Sig_module
+    }
+  }
+};
+
 // A SAVED SIGNATURE'S type_expr IDS ARE SUBST'S CREATION ORDER (S549).
 // Env.save_signature runs `Subst.signature Make_local (for_saving identity)`
 // over the whole signature after `reset_for_saving` (new_id := -1), and every
@@ -3184,6 +3271,7 @@ std::string write_cmi(const std::string& path, const std::string& modname,
   std::map<std::string, bool> referenced;  // cited global unit -> needs real CRC
   int stamp = stamp_base;
   auto sig = emit_sig_items(items, referenced, stamp);
+  if (!intf && !row_norm_off()) RowNormWalk{}.sig(sig);
   if (!cppcaml::dbg_env("NOTYIDS")) TyIdWalk{}.sig(sig);
   auto header = o::vblock(0, {shared_str(modname), o::vlist(sig)});
   std::vector<std::uint8_t> hbytes = o::marshal(header);
