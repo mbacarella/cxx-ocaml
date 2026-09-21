@@ -112,7 +112,7 @@ TypePtr Engine::variant_type(std::vector<std::string> tags, std::vector<TypePtr>
 Engine* Engine::trail_owner_ = nullptr;
 
 void Engine::note(const TypePtr& n) {
-  if (window_depth_) trail_.push_back({n, n->kind, n->link, n->level});
+  if (window_depth_) trail_.push_back({n, n->kind, n->link, n->level, n->plink});
 }
 size_t Engine::mark() {
   ++window_depth_;
@@ -125,6 +125,7 @@ void Engine::undo_to(size_t m) {
     e.node->kind = e.kind;
     e.node->link = e.link;
     e.node->level = e.level;
+    e.node->plink = e.plink;
     trail_.pop_back();
   }
   if (--window_depth_ == 0) {
@@ -372,8 +373,16 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
                  (fa == 1 && fb == 1 &&
                   std::string(family_abbr_of(a->path)) == family_abbr_of(b->path));
       if (differ || tie) {
-        const TypePtr& lo = tie ? a : (fa < fb ? a : b);
-        const TypePtr& hi = tie ? b : (fa < fb ? b : a);
+        // A tie links the ACTUAL to the EXPECTED (ocamlc's link_type t1'
+        // t2'): `a` unless the call site holds them the other way round
+        // (unify_rev -- an application's argument against its parameter).
+        // NOPROV keeps the S554 rule (always `a`).
+        static const bool no_prov = cppcaml::dbg_env("NOPROV") != nullptr;
+        const bool flip = prov_flip_ && !no_prov;
+        const TypePtr& act = flip ? b : a;
+        const TypePtr& exp = flip ? a : b;
+        const TypePtr& lo = tie ? act : (fa < fb ? a : b);
+        const TypePtr& hi = tie ? exp : (fa < fb ? b : a);
         for (size_t i = 0; i < lo->args.size(); ++i)
           unify(lo->args[i], hi->args[i]);
         // Inside a ROW-FIELD unification the nodes keep their own names --
@@ -466,6 +475,7 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
       throw TypeError("type constructor mismatch: " + a->path + " vs " + b->path);
     }
     for (size_t i = 0; i < a->args.size(); ++i) unify(a->args[i], b->args[i]);
+    if (prov_flip_) prov_link(b, a); else prov_link(a, b);
     return;
   }
   if (a->kind == Type::Kind::Object && b->kind == Type::Kind::Object) {
@@ -676,6 +686,52 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
   throw TypeError("cannot unify incompatible types");
 }
 
+TypePtr Engine::prov_rep(TypePtr t) {
+  for (int guard = 0; t && t->plink && guard < 64; ++guard) t = t->plink;
+  return t;
+}
+// ocamlc (ctype.ml unify, the nullary-Tconstr fast path and unify3's
+// link_type) links t1 -> t2 when both are the same constructor, and the saved
+// type then cites t2's path OBJECT -- `let f n = if n = 0 then .. else n - 1`
+// saves n's `int` as `( - )`'s first argument's Pident, not the literal's
+// Predef.path_int.  Our Constr nodes never link (each occurrence keeps its
+// written path for display), so the path object alone follows a shadow link.
+// Only a per-use node links: a node shared across uses (Type::scheme) stands
+// for what ocamlc COPIES per instance, and the copy is what would link.
+void Engine::prov_link(const TypePtr& a, const TypePtr& b) {
+  if (a->path != b->path) return;
+  TypePtr ra = prov_rep(a), rb = prov_rep(b);
+  if (ra == rb || ra->scheme) return;
+  note(ra);
+  ra->plink = b;
+}
+void Engine::mark_scheme(const TypePtr& t0) {
+  std::unordered_set<Type*> seen;
+  std::function<void(const TypePtr&)> go = [&](const TypePtr& x0) {
+    TypePtr t = repr(x0);
+    switch (t->kind) {
+      case Type::Kind::Arrow:
+        if (!seen.insert(t.get()).second) break;
+        go(t->dom);
+        go(t->cod);
+        break;
+      case Type::Kind::Constr:
+        t->scheme = true;
+        [[fallthrough]];
+      case Type::Kind::Tuple:
+      case Type::Kind::Variant:
+      case Type::Kind::Object:
+        if (!seen.insert(t.get()).second) break;
+        for (auto& a : t->args) go(a);
+        break;
+      case Type::Kind::Var:
+      case Type::Kind::Link:
+        break;
+    }
+  };
+  go(t0);
+}
+
 TypePtr Engine::instantiate(const TypePtr& scheme) {
   std::unordered_map<Type*, TypePtr> mapping;  // generic var -> fresh var
   // Copy replacing generic vars with fresh ones, but SHARING any subtree that
@@ -779,7 +835,7 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
       case Type::Kind::Variant: {
         TypePtr r;
         if (t->kind == Type::Kind::Tuple) r = tuple(t->args);
-        else if (t->kind == Type::Kind::Constr) { r = constr(t->path, t->args, t->stamp); r->functor_abbrev = t->functor_abbrev; r->abbrev = t->abbrev; r->labels = t->labels; r->rigid = t->rigid; r->rigid_name = t->rigid_name; }
+        else if (t->kind == Type::Kind::Constr) { r = constr(t->path, t->args, t->stamp); r->functor_abbrev = t->functor_abbrev; r->abbrev = t->abbrev; r->labels = t->labels; r->rigid = t->rigid; r->rigid_name = t->rigid_name; r->prov = t->prov; }
         else if (t->kind == Type::Kind::Object) {
           r = object_type(t->labels, t->args);
           r->variant_kind = t->variant_kind;
@@ -871,6 +927,7 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
           r = constr(t->path, std::move(as), t->stamp);
           r->functor_abbrev = t->functor_abbrev; r->abbrev = t->abbrev;
           r->labels = t->labels; r->rigid = t->rigid; r->rigid_name = t->rigid_name;
+          r->prov = t->prov;  // a copy cites the same path object (ocamlc's copy shares p)
           // Stamp a scheme-head copy with its creation level, so an inner
           // let's generalization can tell an OWNED head (created at its level;
           // becomes a per-use scheme head) from a CAPTURED one (created
@@ -1051,6 +1108,7 @@ void Engine::generalize(const TypePtr& t0) {
         // stays `lazy_t` after later uses; only a same-rec-group flow -- where
         // the node is still unstamped and shared -- adopts `Lazy.t`, hamming).
         // (family-head finalization moved to finalize_family_heads -- top-level only)
+        t->scheme = true;  // a let-bound scheme's node: uses copy it (prov_link)
         if (!seen.insert(t.get()).second) break;
         for (auto& a : t->args) go(a);
         break;
@@ -1107,6 +1165,7 @@ void Engine::demote(const TypePtr& t0) {
         // Weak bindings are FINALIZED too: stamp the lazy head (see generalize)
         // so a later use can't relink the binding's displayed node.
         // (family-head finalization moved to finalize_family_heads -- top-level only)
+        t->scheme = true;  // a let-bound scheme's node: uses copy it (prov_link)
         if (!seen.insert(t.get()).second) break;
         for (auto& a : t->args) go(a);
         break;

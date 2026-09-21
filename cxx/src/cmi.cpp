@@ -113,8 +113,9 @@ public:
   // construction time, so decoding performs no memo allocation: during a
   // region-contained decode the Decoder is constructed BEFORE the region heap
   // takes over, keeping this purely-transient table out of the sealed dump.
-  explicit Decoder(const m::Arena& arena)
-      : arena_(arena), memo_(arena.size()) {}
+  explicit Decoder(const m::Arena& arena, int cmi_id = 0)
+      : arena_(arena), memo_(arena.size()), path_prov_(arena.size(), 0),
+        cmi_id_(cmi_id) {}
 
   // type_expr is the transient_expr record { desc; level; scope; id };
   // field 0 is the type_desc.  Memoize by arena id so shared/cyclic graphs
@@ -500,10 +501,29 @@ private:
     return out;
   }
 
+  // The arena index of a path's head Pident block (a Pdot chain's siblings
+  // share it: prefix_idents built them all over ONE root).
+  int head_blk(std::size_t id) {
+    const m::Value* v = &arena_[id];
+    while (v->kind == m::Value::Kind::Block && v->tag != Path::Pident &&
+           !v->fields.empty()) {
+      id = v->fields[0];
+      v = &arena_[id];
+    }
+    return v->kind == m::Value::Kind::Block && v->tag == Path::Pident
+               ? static_cast<int>(id) : -1;
+  }
   PathPtr path(std::size_t id) {
     const m::Value& v = arena_[id];
     PathPtr p = path_alloc();
     p->kind = static_cast<Path::Kind>(v.tag);
+    // Provenance: one id per path BLOCK of this file (memoised by arena
+    // index, so two citations Marshal shared stay one object for the writer).
+    if (cmi_id_ && id < path_prov_.size()) {
+      int& pv = path_prov_[id];
+      if (!pv) pv = prov_new(cmi_id_, head_blk(id), v.tag != Path::Pident);
+      p->prov = pv;
+    }
     switch (v.tag) {
       case Path::Pident:
         p->id = ident(v.fields.at(0));
@@ -663,9 +683,43 @@ private:
 
   const m::Arena& arena_;
   std::vector<TypePtr> memo_;  // dense by arena id; null = not yet decoded
+  std::vector<int> path_prov_;  // dense by arena id; 0 = no prov yet
+  int cmi_id_ = 0;              // cmi_id_of(this file); 0 = no provenance
 };
 
 }  // namespace
+
+// --- path provenance registry (cmi.hpp) ---------------------------------------
+namespace {
+std::vector<ProvInfo>& prov_table() {
+  static std::vector<ProvInfo> t(1);  // index 0 = the predef global / unknown
+  return t;
+}
+}  // namespace
+int prov_new(int cmi, int head_blk, bool pdot) {
+  auto& t = prov_table();
+  t.push_back(ProvInfo{cmi, head_blk, pdot, {}});
+  return static_cast<int>(t.size()) - 1;
+}
+int prov_new_open(const std::string& open_pfx) {
+  auto& t = prov_table();
+  t.push_back(ProvInfo{0, -1, false, open_pfx});
+  return static_cast<int>(t.size()) - 1;
+}
+const ProvInfo& prov_info(int prov) {
+  auto& t = prov_table();
+  return prov > 0 && static_cast<std::size_t>(prov) < t.size() ? t[prov] : t[0];
+}
+int cmi_id_of(const std::string& filepath) {
+  static std::unordered_map<std::string, int> ids;
+  auto& v = ids[filepath];
+  if (!v) v = static_cast<int>(ids.size());
+  return v;
+}
+bool prov_off() {
+  static const bool off = cppcaml::dbg_env("NOPROV") != nullptr;
+  return off;
+}
 
 namespace {
 // Read a .cmi file, locate its Marshal header, and decode the byte stream into
@@ -980,6 +1034,8 @@ const CmiFile* CmiFile::decode_in_region(const std::string& filepath,
   // everything allocated from here to the restore -- the CmiFile object, its
   // strings/vectors, every graph node slab -- lands in the region.
   CmiFile* cmi = nullptr;
+  // No provenance in a region decode: the dump is reused by later processes
+  // whose prov numbering differs, so a baked-in id would alias a stranger's.
   Decoder dec(arena);
   mi_heap_t* prev = mi_heap_set_default(heap);
   g_graph_arena.fresh();
@@ -1098,7 +1154,7 @@ const CmiFile& CmiFile::load(const std::string& filepath) {
             decode_in_region(filepath, arena, header, cmi->imports_))
       return *cache.emplace(filepath, r).first->second;
 #endif
-  Decoder dec(arena);
+  Decoder dec(arena, cmi_id_of(filepath));
   cmi->module_name_ = arena[tuple.fields.at(0)].str();
   cmi->sig_ = dec.signature(tuple.fields.at(1));
   return *cache.emplace(filepath, cmi.release()).first->second;
@@ -1123,7 +1179,7 @@ const CmiFile& CmiFile::load_types_only(const std::string& filepath) {
   std::size_t header = read_cmi_arena(filepath, arena, &cmi.imports_);
   const m::Value& tuple = arena[header];  // (modname, signature)
 
-  Decoder dec(arena);
+  Decoder dec(arena, cmi_id_of(filepath));
   cmi.module_name_ = arena[tuple.fields.at(0)].str();
   cmi.sig_ = dec.signature_types_only(tuple.fields.at(1));
   return cache.emplace(filepath, std::move(cmi)).first->second;
@@ -1458,12 +1514,20 @@ int predef_stamp(const std::string& n) {
 struct CmiShare {
   std::map<std::string, o::ValPtr> strs;            // pos_fname / unit name
   std::map<std::string, o::ValPtr> poss;   // Lexing.position, by content
-  std::map<std::string, o::ValPtr> ids;    // "tag:stamp:name" -> Ident.t
+  std::map<std::string, o::ValPtr> ids;    // "tag:stamp:name@origin" -> Ident.t
   std::map<const o::Value*, o::ValPtr> pidents;     // Ident.t -> Path.Pident
+  // S555, path PROVENANCE (cmi.hpp prov_new): a predef Pident per path
+  // object, a global unit's head `Pident (Global u)` per origin (the initial
+  // open's root, a unit's own prefix root, a .cmi's unmarshalled block), and
+  // a Pdot component string per path object.  NOPROV=1 reverts.
+  std::map<int, o::ValPtr> ppaths;                  // prov -> Pident(Predef)
+  std::map<std::string, o::ValPtr> heads;           // head key -> Pident(Global)
+  std::map<std::string, o::ValPtr> pstrs;           // "prov:i:s" -> string
   o::ValPtr none;                                   // Location.none
   o::ValPtr tvar_none, tunivar_none;                // the two shared descs
   void clear() {
     strs.clear(); poss.clear(); ids.clear(); pidents.clear(); none = nullptr;
+    ppaths.clear(); heads.clear(); pstrs.clear();
     tvar_none = tunivar_none = nullptr;
   }
 };
@@ -1479,17 +1543,25 @@ bool no_share() {
   static const bool off = cppcaml::dbg_env("NOCMISHARE") != nullptr;
   return off;
 }
+bool prov_off_() { return prov_off(); }
 o::ValPtr shared_str(const std::string& s) {
   if (no_share()) return o::vstr(s);
   auto& v = g_share.strs[s];
   if (!v) v = o::vstr(s);
   return v;
 }
-// Ident.t: Local{name;stamp} is tag 0, Predef{name;stamp} tag 3.
-o::ValPtr ident_val(int tag, const std::string& name, int stamp) {
+// Ident.t: Local{name;stamp} is tag 0, Predef{name;stamp} tag 3.  `origin`
+// (predef only) is the .cmi whose unmarshalled Ident block this is -- another
+// unit's `int` is NOT Predef.ident_int's block -- 0 for Predef's own.
+std::string ident_key(int tag, const std::string& name, int stamp,
+                      int origin = 0) {
+  return std::to_string(tag) + ":" + std::to_string(stamp) + ":" + name + "@" +
+         std::to_string(origin);
+}
+o::ValPtr ident_val(int tag, const std::string& name, int stamp,
+                    int origin = 0) {
   if (no_share()) return o::vblock(tag, {o::vstr(name), o::vint(stamp)});
-  auto& v = g_share.ids[std::to_string(tag) + ":" + std::to_string(stamp) +
-                        ":" + name];
+  auto& v = g_share.ids[ident_key(tag, name, stamp, origin)];
   if (!v) v = o::vblock(tag, {o::vstr(name), o::vint(stamp)});
   return v;
 }
@@ -1502,8 +1574,74 @@ o::ValPtr pident(const o::ValPtr& id) {  // Path.Pident
 o::ValPtr pident_local(const std::string& name, int stamp) {
   return pident(ident_val(0, name, stamp));
 }
-o::ValPtr pident_predef(const std::string& name, int stamp) {
-  return pident(ident_val(3, name, stamp));
+// A predef type's path: prov 0 is `Predef.path_<name>` (one Path.t per
+// process -- a literal, `()`, a predef-typed primitive); prov k > 0 is one
+// distinct `Pident` block (an annotation's lookup, or a .cmi's) over the
+// origin's Ident.
+o::ValPtr pident_predef(const std::string& name, int stamp, int prov = 0) {
+  if (prov_off_()) prov = 0;
+  const ProvInfo& pi = prov_info(prov);
+  o::ValPtr id = ident_val(3, name, stamp, pi.cmi);
+  if (prov == 0 || no_share()) return pident(id);
+  auto& v = g_share.ppaths[prov];
+  if (!v) v = o::vblock(0, {id});
+  return v;
+}
+// The head `Pident (Global unit)` of a Pdot chain, by provenance: prov 0 is a
+// fresh block per citation (as before); an annotation's head is the initial
+// open's root when the name routed through it (`List.t`, `ref`), else fresh
+// per lookup (`Stdlib.List.t`, `Foo.t` -- find_name_module allocates); a .cmi
+// Pident's head is that unit's prefix root (sign_of_cmi's one `Pident id`);
+// a Pdot stored in a .cmi keeps that file's block.
+o::ValPtr global_head(const std::string& unit, int prov, bool explicit_head) {
+  if (prov_off_()) prov = 0;
+  if (prov == 0 || no_share())
+    return o::vblock(0, {o::vblock(2, {o::vstr(unit)})});
+  const ProvInfo& pi = prov_info(prov);
+  std::string key;
+  if (!pi.open_pfx.empty()) explicit_head = false;  // the open's root
+  if (pi.cmi == 0)
+    key = explicit_head ? "prov:" + std::to_string(prov) : "open:" + unit;
+  else if (pi.pdot)
+    key = "cmi:" + std::to_string(pi.cmi) + ":" + std::to_string(pi.head_blk);
+  else
+    key = "unit:" + unit;
+  auto& v = g_share.heads[key];
+  if (!v) v = o::vblock(0, {o::vblock(2, {o::vstr(unit)})});
+  return v;
+}
+// A Pdot component's string: one per path object (a copy of an annotation, or
+// every citation of a .cmi block, cites the same string; Subst.type_path
+// rebuilds the Pdot blocks fresh per citation but hands on `n`).  A component
+// inside the prefix an `open` supplied is the open's own (its root path's
+// string, one per open), shared by every name resolved through that open.
+o::ValPtr comp_str(const std::string& s, int prov, int i) {
+  if (prov_off_()) prov = 0;
+  if (prov == 0 || no_share()) return o::vstr(s);
+  const ProvInfo& pi = prov_info(prov);
+  std::string key;
+  if (!pi.open_pfx.empty()) {
+    int k = 1;  // components in the open prefix
+    for (char c : pi.open_pfx) if (c == '.') ++k;
+    if (i < k) key = "open:" + pi.open_pfx + ":" + std::to_string(i) + ":" + s;
+  }
+  if (key.empty())
+    key = std::to_string(prov) + ":" + std::to_string(i) + ":" + s;
+  auto& v = g_share.pstrs[key];
+  if (!v) v = o::vstr(s);
+  return v;
+}
+// The Stdlib alias member on a `Stdlib.List.t`-style chain: a .cmi Pident's
+// (List's own `t`, reached through Stdlib's components) is the alias ident's
+// name string, one per alias; anything else is the path object's own.
+o::ValPtr alias_str(const std::string& member, int prov) {
+  if (prov_off_()) prov = 0;
+  const ProvInfo& pi = prov_info(prov);
+  if (prov == 0 || no_share() || pi.cmi == 0 || pi.pdot)
+    return comp_str(member, prov, 0);
+  auto& v = g_share.pstrs["alias:" + member];
+  if (!v) v = o::vstr(member);
+  return v;
 }
 // subst.ml's `norm` (:157-162) exists for exactly this: it rewrites every
 // anonymous `Tvar None` / `Tunivar None` desc to one shared value, so a saved
@@ -1803,7 +1941,9 @@ struct TyEmit {
   // and cites Stdlib's CRC too, like ocamlc); predef; sig-local declaration;
   // bare Stdlib-toplevel type (`ref`, resolved through the implicit
   // `open Stdlib`).  Null when the name can't be placed.
-  o::ValPtr type_path(const std::string& name) {
+  // `prov`: the path object this citation is (cmi.hpp prov_new); it decides
+  // which predef Pident / global head / component strings are shared.
+  o::ValPtr type_path(const std::string& name, int prov = 0) {
     if (name.find('(') != std::string::npos) return module_app_path(name);
     if (auto dot = name.find('.'); dot != std::string::npos) {
       std::vector<std::string> comps;
@@ -1849,7 +1989,7 @@ struct TyEmit {
           if (mstamp != self_stamp) {
             o::ValPtr path = pident_local(comps[0], mstamp);
             for (std::size_t i = 1; i < comps.size(); ++i)
-              path = o::vblock(1, {path, o::vstr(comps[i])});  // Pdot
+              path = o::vblock(1, {path, comp_str(comps[i], prov, i)});  // Pdot
             return path;
           }
           // else: the only visible candidate is the module itself -- fall
@@ -1864,13 +2004,13 @@ struct TyEmit {
       // pervasive head routes through the Stdlib alias.
       if (g.rfind("Stdlib__", 0) == 0 && comps[0].rfind("Stdlib__", 0) != 0) {
         if (referenced) (*referenced)["Stdlib"] = true;
-        path = o::vblock(0, {o::vblock(2, {o::vstr("Stdlib")})});  // Pident(Global Stdlib)
-        path = o::vblock(1, {path, o::vstr(g.substr(8))});         // Pdot(_, alias member)
+        path = global_head("Stdlib", prov, false);               // Pident(Global Stdlib)
+        path = o::vblock(1, {path, alias_str(g.substr(8), prov)});  // Pdot(_, alias member)
       } else {
-        path = o::vblock(0, {o::vblock(2, {o::vstr(g)})});  // Pident(Global head)
+        path = global_head(g, prov, true);  // Pident(Global head), written
       }
       for (std::size_t i = 1; i < comps.size(); ++i)
-        path = o::vblock(1, {path, o::vstr(comps[i])});   // Pdot(path, comp)
+        path = o::vblock(1, {path, comp_str(comps[i], prov, i)});   // Pdot(path, comp)
       return path;
     }
     // A same-sig decl SHADOWS a predefined name: typedtree.mli declares its
@@ -1883,11 +2023,11 @@ struct TyEmit {
       return pident_local(name, st);  // Pident(Local)
     }
     if (int st = predef_stamp(name))
-      return pident_predef(name, st);  // Pident(Predef)
+      return pident_predef(name, st, prov);  // Pident(Predef)
     if (stdlib_toplevel_type(name)) {
       if (referenced) (*referenced)["Stdlib"] = true;
-      return o::vblock(1, {o::vblock(0, {o::vblock(2, {o::vstr("Stdlib")})}),
-                           o::vstr(name)});  // Pdot(Pident(Global Stdlib), name)
+      return o::vblock(1, {global_head("Stdlib", prov, false),
+                           comp_str(name, prov, 1)});  // Pdot(Pident(Global Stdlib), name)
     }
     return nullptr;
   }
@@ -1989,7 +2129,7 @@ struct TyEmit {
           if (auto es = engine_types->find(t->engine_stamp);
               es != engine_types->end())
             path = pident_local(t->name, es->second);  // Pident(Local)
-        if (!path) path = type_path(t->name);
+        if (!path) path = type_path(t->name, t->prov);
         if (!path) return texpr(var_none_desc(false));  // unknown -> Tvar None
         std::vector<o::ValPtr> as;
         for (auto& a : t->args) as.push_back(emit(a));
@@ -2502,6 +2642,10 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
     return body;
   };
   std::vector<o::ValPtr> sig;
+  // One `type t += A | B` extension: every constructor's ext_type_path and
+  // ext_type_params are the extension's own (transl_type_extension builds
+  // them once), so a Text_next item cites its Text_first's blocks.
+  std::vector<o::ValPtr> ext_group_params;
   for (std::size_t i = 0; i < items.size(); ++i) {
     const SigItem& it = items[i];
     TyEmit te; te.referenced = &referenced; te.local_types = &visible;
@@ -2631,11 +2775,15 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       o::ValPtr path;
       const std::vector<std::string>* eparams = nullptr;
       int status = 2;  // Text_exception
+      // A Text_next reuses its group's param nodes (the path's Pdot blocks are
+      // Subst's, fresh per citation, over the one lookup's strings: ext_prov).
+      bool group_next = it.text_kind == 1 && !ext_group_params.empty() && !prov_off_();
       if (!it.ext_path.empty()) {
-        path = te.type_path(it.ext_path);
+        path = te.type_path(it.ext_path, it.ext_prov);
         if (path) { eparams = &it.ext_params; status = it.text_kind; }
         // an unplaceable extended type degrades to a plain exception (valid)
       }
+      if (!group_next) ext_group_params.clear();
       if (!path)
         path = o::vblock(0, {o::vblock(3, {o::vstr("exn"), o::vint(7)})});  // Pident(Predef exn)
       o::ValPtr cargs;
@@ -2658,9 +2806,13 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         cargs = o::vblock(0, {args.empty() ? o::vint(0) : o::vlist(args)});  // Cstr_tuple
       }
       std::vector<o::ValPtr> tparams;
-      if (eparams)
+      if (eparams && group_next && ext_group_params.size() == eparams->size())
+        tparams = ext_group_params;
+      else if (eparams) {
         for (const std::string& pn : *eparams)  // Tvar(Some source-name), e.g. "_"
           tparams.push_back(te.texpr(o::vblock(0, {o::vblock(0, {o::vstr(pn)})})));
+        ext_group_params = tparams;
+      }
       auto ret = it.ext_ret ? o::vblock(0, {te.emit(it.ext_ret)}) : o::vint(0);  // Some/None
       auto extcon = o::vblock(0, {path,
                                   tparams.empty() ? o::vint(0) : o::vlist(tparams),  // ext_type_params
@@ -2714,13 +2866,13 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       // string.  Reuse the one an earlier citation (a forward `new b`) built.
       o::ValPtr cname;
       for (int s : {s_class, s_clty, s_ty}) {
-        auto f = g_share.ids.find("0:" + std::to_string(s) + ":" + it.name);
+        auto f = g_share.ids.find(ident_key(0, it.name, s));
         if (f != g_share.ids.end() && f->second) { cname = f->second->fields[0]; break; }
       }
       if (!cname || clsitem_off) cname = o::vstr(it.name);
       auto cident = [&](int s) {
         if (no_share() || clsitem_off) return ident_val(0, it.name, s);
-        auto& v = g_share.ids["0:" + std::to_string(s) + ":" + it.name];
+        auto& v = g_share.ids[ident_key(0, it.name, s)];
         if (!v) v = o::vblock(0, {cname, o::vint(s)});
         return v;
       };

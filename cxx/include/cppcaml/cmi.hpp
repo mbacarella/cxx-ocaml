@@ -66,7 +66,32 @@ struct Path {
   Ident id;          // Pident
   PathPtr a, b;      // Pdot: a.s ; Papply: a(b) ; Pextra_ty: a
   std::string s;     // Pdot field
+  int prov = 0;      // the path OBJECT this cites (see prov_new below)
 };
+
+// --- path PROVENANCE ---------------------------------------------------------
+// A Tconstr's path is a heap object ocamlc's Marshal writes ONCE, so a saved
+// .cmi tells apart the ways one type name reaches a signature: a literal, a
+// predef-typed primitive or `()`/`true`/`[]` cites the process-wide
+// `Predef.path_int` (one Pident); a type ANNOTATION cites a FRESH `Pident id`
+// (or `Pdot (root, name)`) -- Env.lookup_type builds one per lookup, sharing
+// Predef's ident / the open's root; and a value of another unit cites THAT
+// .cmi's unmarshalled path blocks (its own Ident "int", its own heads).  An
+// engine Constr node carries the provenance as an int: 0 = the predef global
+// (or unknown), > 0 = one distinct path object, allocated here.  `cmi` is 0
+// for a source annotation, else the id of the .cmi the path was decoded from
+// (`cmi_id_of`, one per file); `head_blk` is that file's arena index of the
+// path's head Pident (the block a Pdot chain shares with its siblings) and
+// `pdot` whether the path is a Pdot chain (a Pident's head is itself).
+// `open_pfx` (annotations): the name reached the type through `open <pfx>`
+// -- the lookup's `Pdot (root, name)` shares that open's root (its module
+// path block and strings) with every other name resolved through it.
+struct ProvInfo { int cmi = 0; int head_blk = -1; bool pdot = false; std::string open_pfx; };
+int prov_new(int cmi = 0, int head_blk = -1, bool pdot = false);
+int prov_new_open(const std::string& open_pfx);
+const ProvInfo& prov_info(int prov);
+int cmi_id_of(const std::string& filepath);
+bool prov_off();  // NOPROV=1: the writer ignores provenance (S554 behaviour)
 
 struct TypeExpr;
 using TypePtr = GraphPtr<TypeExpr>;
@@ -383,6 +408,8 @@ struct Ty {
   std::string binder;          // Package: the dependent binder (`(module M : T)`
                                // as a parameter) -- when the codomain cites
                                // `M.t`, the writer emits Tfunctor, not Tarrow
+  int prov = 0;                // Constr: the path object this cites (0 = the
+                               // predef global / unknown; see prov_new)
   int engine_stamp = 0;        // Constr: the engine decl's identity stamp
                                // (globally unique across checkers; 0 = none).
                                // Lets the writer cite the RIGHT `t` when a
@@ -500,6 +527,7 @@ struct SigItem {
   // none), text_kind the Sig_typext ext_status (0 Text_first / 1 Text_next /
   // 2 Text_exception).
   std::string ext_path;
+  int ext_prov = 0;  // ext_path's path object (prov_new; 0 = fresh blocks)
   std::vector<std::string> ext_params;
   TyPtr ext_ret;
   int text_kind = 2;

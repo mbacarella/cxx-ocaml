@@ -1168,6 +1168,24 @@ struct Checker {
     return v;
   }
 
+  // A source-written type constructor cites a FRESH path object: Env.lookup_type
+  // builds `Pident id` / `Pdot (root, name)` per lookup (cmi.hpp prov_new).
+  static TypePtr annot(TypePtr t) {
+    t->prov = cmi::prov_new();
+    t->scheme = true;  // generalize_structure'd: every use copies it
+    return t;
+  }
+  // ...reached through `open <pfx>`: `Pdot (that open's root, name)`.
+  static TypePtr annot_open(TypePtr t, const std::string& pfx) {
+    t->prov = cmi::prov_new_open(pfx);
+    t->scheme = true;
+    return t;
+  }
+  // The module prefix of a qualified name ("Bigarray.Array1.t" -> "Bigarray.Array1").
+  static std::string qual_prefix(const std::string& q) {
+    auto d = q.rfind('.');
+    return d == std::string::npos ? std::string() : q.substr(0, d);
+  }
   // cmi type graph -> infer scheme (cmi vars become generic).
   TypePtr from_cmi(const cmi::TypePtr& t0,
                    std::unordered_map<cmi::TypeExpr*, TypePtr>& memo) {
@@ -1219,7 +1237,14 @@ struct Checker {
           if (auto s = cmi_sibling_abbrevs_.find(n->path->id.name);
               s != cmi_sibling_abbrevs_.end())
             return s->second;
-        if (is_format_base(p)) { std::vector<TypePtr> fa; for (auto& a : n->args) fa.push_back(from_cmi(a, memo)); return eng.constr("format6", std::move(fa)); }
+        if (is_format_base(p)) {
+          std::vector<TypePtr> fa;
+          for (auto& a : n->args) fa.push_back(from_cmi(a, memo));
+          TypePtr r = eng.constr("format6", std::move(fa));
+          r->prov = n->path ? n->path->prov : 0;
+          r->scheme = true;
+          return r;
+        }
         // expand a same-module type abbreviation (Float.t = float, Int.t = int) --
         // but NOT in a functor result, where `elt = Ord.t` stays the abstract,
         // binding-qualified name (`IntSet.elt`), not its expansion.  Search the
@@ -1299,6 +1324,10 @@ struct Checker {
         std::vector<TypePtr> as;
         for (auto& a : n->args) as.push_back(from_cmi(a, memo));
         TypePtr r = eng.constr(std::move(p), std::move(as));
+        // The path object is the .cmi's own block (see cmi.hpp prov_new): a
+        // value typed by this scheme cites it, not Predef's / an annotation's.
+        r->prov = n->path ? n->path->prov : 0;
+        r->scheme = true;  // a loaded scheme's node: uses copy it (prov_link)
         // A functor-result type WITH a manifest (`type key = K.t` in
         // Ephemeron.K1.Make's result -> `HW.key`) is a transparent
         // functor-instance abbreviation: TOP priority in unify's family relink
@@ -1421,8 +1450,8 @@ struct Checker {
           if (!predefs.count(l->name)) {
             std::vector<TypePtr> as;
             for (auto& a : c->args) as.push_back(from_coretype(*a, vars));
-            return eng.constr(lid_full(op->mod_.txt) + "." + l->name,
-                              std::move(as));
+            return annot(eng.constr(lid_full(op->mod_.txt) + "." + l->name,
+                                    std::move(as)));
           }
         }
       return from_coretype(*op->type, vars);
@@ -1695,7 +1724,7 @@ struct Checker {
       if (is_format_base(lid_full(c->id.txt))) {
         std::vector<TypePtr> fa;
         for (auto& a : c->args) fa.push_back(from_coretype(*a, vars));
-        return eng.constr("format6", std::move(fa));
+        return annot(eng.constr("format6", std::move(fa)));
       }
       // `_ M.t` where M.t is a cmi type of arity N>1: record N so the dump can
       // fill every parameter slot with Ttyp_any (the local type_arity_ registry
@@ -2031,7 +2060,7 @@ struct Checker {
         if (auto* l = std::get_if<Lident>(&c->id.txt.v))
           if (auto s = functor_param_type_quals_.find(l->name);
               s != functor_param_type_quals_.end())
-            return eng.constr(s->second, std::move(as));
+            return annot(eng.constr(s->second, std::move(as)));
       // A bare reference to a local opaque type carries its identity stamp.
       int stamp = 0;
       if (auto* l = std::get_if<Lident>(&c->id.txt.v)) stamp = tenv_lookup(l->name);
@@ -2041,14 +2070,15 @@ struct Checker {
       // unify and print alike.
       if (!stamp)
         if (auto* l = std::get_if<Lident>(&c->id.txt.v); l && l->name == "eff")
-          return eng.constr("Effect.t", std::move(as));
+          return annot(eng.constr("Effect.t", std::move(as)));
       // A bare type name brought into scope by `open M` (M not Stdlib, not a
       // local type) renders with M's qualification, matching ocamlc (`c_layout`
       // after `open Bigarray` -> `Bigarray.c_layout`).
       if (!stamp)
         if (auto* l = std::get_if<Lident>(&c->id.txt.v))
           if (auto q = opened_type_quals_.find(l->name); q != opened_type_quals_.end())
-            return eng.constr(q->second, std::move(as));
+            return annot_open(eng.constr(q->second, std::move(as)),
+                              qual_prefix(q->second));
       // `Array1.t` after `open Bigarray` -> `Bigarray.Array1.t` (opened submodule).
       std::string path = lid_full(c->id.txt);
       // A bare reference to a module-nested type displays with the module's
@@ -2071,14 +2101,18 @@ struct Checker {
           path = ai->second.display_path;
         }
       }
+      std::string open_pfx;  // `open M` supplied the head: M's own path block
       if (std::holds_alternative<Ldot>(c->id.txt.v)) {
         auto dot = path.find('.');
         if (dot != std::string::npos)
           if (auto q = opened_submod_quals_.find(path.substr(0, dot));
-              q != opened_submod_quals_.end())
+              q != opened_submod_quals_.end()) {
+            open_pfx = qual_prefix(q->second);
             path = q->second + path.substr(dot);
+          }
       }
       TypePtr rc = eng.constr(std::move(path), std::move(as), stamp);
+      rc = open_pfx.empty() ? annot(rc) : annot_open(rc, open_pfx);
       // A SOURCE-WRITTEN path never relinks to a family abbreviation: the user
       // wrote it and ocamlc displays it as written (`(a : int32)` stays int32
       // even after `Int32.unsigned_compare a b`).  Finalize its family heads.
@@ -3641,23 +3675,44 @@ struct Checker {
     return out;
   }
 
+  // A predefined constructor's RESULT type cites the `Pident` block
+  // Env.store_type built when Predef.build_initial_env added its type -- one
+  // per predef type per compile, and NOT `Predef.path_unit` (which `while`,
+  // `assert`, an else-less `if` cite through `instance Predef.type_unit`):
+  // `let a = () let b = ()` share one Pident, `while .. done` another, over
+  // the one ident.  A constructor's ARGUMENT (`::`'s `'a list`) is written
+  // with `type_list` in predef.ml, so it stays the global.
+  static int predef_ctor_prov(const std::string& n) {
+    static std::map<std::string, int> provs;
+    auto& v = provs[n];
+    if (!v) v = cmi::prov_new();
+    return v;
+  }
+  TypePtr predef_ctor_res(const std::string& n, std::vector<TypePtr> as = {}) {
+    TypePtr t = eng.constr(n, std::move(as));
+    t->prov = predef_ctor_prov(n);
+    return t;
+  }
   void register_predef_ctors() {
     auto a = generic_var();
-    ctors["[]"] = eng.constr("list", {a});
+    ctors["[]"] = predef_ctor_res("list", {a});
     ctors["::"] = eng.arrow(a, eng.arrow(eng.constr("list", {a}),
-                                         eng.constr("list", {a})));
+                                         predef_ctor_res("list", {a})));
     auto o = generic_var();
-    ctors["None"] = eng.constr("option", {o});
-    ctors["Some"] = eng.arrow(o, eng.constr("option", {o}));
-    ctors["true"] = eng.constr("bool");
-    ctors["false"] = eng.constr("bool");
-    ctors["()"] = eng.constr("unit");
+    ctors["None"] = predef_ctor_res("option", {o});
+    ctors["Some"] = eng.arrow(o, predef_ctor_res("option", {o}));
+    ctors["true"] = predef_ctor_res("bool");
+    ctors["false"] = predef_ctor_res("bool");
+    ctors["()"] = predef_ctor_res("unit");
     // result (predefined since 4.03): Ok of 'a / Error of 'b : ('a,'b) result.
     auto rok = generic_var(), rerr = generic_var();
-    ctors["Ok"] = eng.arrow(rok, eng.constr("result", {rok, rerr}));
-    ctors["Error"] = eng.arrow(rerr, eng.constr("result", {rok, rerr}));
+    ctors["Ok"] = eng.arrow(rok, predef_ctor_res("result", {rok, rerr}));
+    ctors["Error"] = eng.arrow(rerr, predef_ctor_res("result", {rok, rerr}));
     predef_ctors_ = {"[]", "::", "None", "Some", "true", "false", "()", "Ok", "Error"};
-    for (auto& n : predef_ctors_) predef_ctor_schemes_[n] = ctors[n];
+    for (auto& n : predef_ctors_) {
+      predef_ctor_schemes_[n] = ctors[n];
+      I::Engine::mark_scheme(ctors[n]);  // instance_constructor copies these
+    }
     type_ctors["bool"] = {"false", "true"};
     type_ctors["option"] = {"None", "Some"};
     type_ctors["list"] = {"[]", "::"};
@@ -6096,6 +6151,14 @@ struct Checker {
     try { eng.unify(a, b); }
     catch (const I::TypeError& e) { if (strict) note_error(e.what()); }
   }
+  // (expected, actual) call sites -- see Engine::unify_rev.
+  void try_unify_rev(const TypePtr& expected, const TypePtr& actual) {
+    try { eng.unify_rev(expected, actual); }
+    catch (const I::TypeError& e) { if (strict) note_error(e.what()); }
+  }
+  void soft_unify_rev(const TypePtr& expected, const TypePtr& actual) {
+    try { eng.unify_rev(expected, actual); } catch (const I::TypeError&) {}
+  }
 
   // Like try_unify but never rejects: on clash the two types simply stay
   // unlinked.  Used where unification is for type *propagation* (driving value
@@ -7185,6 +7248,7 @@ struct Checker {
       if (!stamp && t->path.find('.') == std::string::npos)
         stamp = mx_resolve_bare_stamp(t->path, prefix);
       TypePtr n = eng.constr(t->path, {}, stamp);
+      n->prov = t->prov;
       memo[t.get()] = n;  // before recursing: recursive schemes terminate
       for (auto& a : t->args) n->args.push_back(mx_qualify(a, prefix, memo));
       return n;
@@ -9996,6 +10060,25 @@ struct Checker {
   // The argument arrow of a format string (printf "%d %s" -> int -> string -> 'r),
   // so a format-consuming application flows argument value-kinds (x:int in
   // `printf "%d" x`).  %a consumes two args, %t one; unknown directives -> Any.
+  // A format conversion's argument type is the CamlinternalFormatBasics
+  // constructor's own (ocamlc types the fmt_ebb it parsed: `%d` is Int's
+  // `('y, int -> 'a) precision`, `*` Arg_padding's `int -> 'a`, `.*`
+  // Arg_precision's, `%s` String's `string -> 'a` padding, `%(..%)`
+  // Format_subst's format6 ...), so it cites THAT .cmi's path block -- one
+  // per constructor, over the file's own `int` ident -- not Predef.path_int
+  // (a `ref 0` beside `printf "%d"` shows two idents "int").
+  static int format_prov(const std::string& ctor) {
+    static std::map<std::string, int> provs;
+    auto& v = provs[ctor];
+    if (!v)
+      v = cmi::prov_new(cmi::cmi_id_of(stdpath("camlinternalFormatBasics.cmi")));
+    return v;
+  }
+  TypePtr format_arg(const std::string& ty, const std::string& ctor) {
+    TypePtr t = eng.constr(ty);
+    t->prov = format_prov(ctor);
+    return t;
+  }
   TypePtr format_arrow(const std::string& s, const std::vector<TypePtr>& fmtargs) {
     auto isdig = [](char c) { return c >= '0' && c <= '9'; };
     // format6 params: [0]=args-fn (built here), [1]=channel type for %a/%t
@@ -10017,10 +10100,12 @@ struct Checker {
       bool ignored = false;  // `%_d` etc. read-and-discard: consume no argument
       if (s[i] == '_') { ignored = true; ++i; }
       auto add = [&](TypePtr t) { if (!ignored) args.push_back(std::move(t)); };
+      bool prec = false;    // past the `.`: a `*` is Arg_precision's int
       for (; i < n; ++i) {  // flags / width / precision (`*` is an int arg)
         char c = s[i];
-        if (c == '*') add(eng.constr("int"));
-        else if (c != '+' && c != '-' && c != '#' && c != ' ' && c != '.' && !isdig(c)) break;
+        if (c == '*') add(format_arg("int", prec ? "Arg_precision" : "Arg_padding"));
+        else if (c == '.') prec = true;
+        else if (c != '+' && c != '-' && c != '#' && c != ' ' && !isdig(c)) break;
       }
       if (i >= n) break;
       char len = 0;  // l/n/L is a length modifier only before an int conversion;
@@ -10033,13 +10118,15 @@ struct Checker {
       switch (c) {
         case 'd': case 'i': case 'x': case 'X': case 'o': case 'u':
         case 'l': case 'n': case 'L': case 'N':  // Scan_get_counter: one int arg
-          add(eng.constr(len == 'l' ? "int32" : len == 'n' ? "nativeint"
-                         : len == 'L' ? "int64" : "int")); break;
-        case 's': case 'S': add(eng.constr("string")); break;
-        case 'c': case 'C': add(eng.constr("char")); break;
+          add(len == 'l' ? format_arg("int32", "Int32")
+              : len == 'n' ? format_arg("nativeint", "Nativeint")
+              : len == 'L' ? format_arg("int64", "Int64")
+                           : format_arg("int", "Int")); break;
+        case 's': case 'S': add(format_arg("string", c == 's' ? "String" : "Caml_string")); break;
+        case 'c': case 'C': add(format_arg("char", c == 'c' ? "Char" : "Caml_char")); break;
         case 'f': case 'e': case 'E': case 'g': case 'G': case 'F': case 'h': case 'H':
-          add(eng.constr("float")); break;
-        case 'b': case 'B': add(eng.constr("bool")); break;
+          add(format_arg("float", "Float")); break;
+        case 'b': case 'B': add(format_arg("bool", "Bool")); break;
         case 'a': {  // printer `chan -> 'v -> pres` + value `'v` (tied)
           TypePtr v = eng.fresh_var();
           add(eng.arrow(chan, eng.arrow(v, pres)));
@@ -10048,7 +10135,7 @@ struct Checker {
         }
         case 't': add(eng.arrow(chan, pres)); break;  // printer `chan -> pres`
         case '(': {  // %(...%): the argument is itself a format6 (substitution).
-          add(eng.constr("format6"));  // so a string-literal arg is typed as a format
+          add(format_arg("format6", "Format_subst"));  // so a string-literal arg is typed as a format
           int depth = 1;               // skip the inner format up to the matching %)
           while (i < n && depth > 0) {
             if (s[i] == '%' && i + 1 < n) {
@@ -10060,7 +10147,7 @@ struct Checker {
           break;
         }
         case '{': {  // %{...%}: a format6 argument (its type-digest is printed)
-          add(eng.constr("format6"));
+          add(format_arg("format6", "Format_arg"));
           int depth = 1;
           while (i < n && depth > 0) {
             if (s[i] == '%' && i + 1 < n) {
@@ -10443,8 +10530,8 @@ struct Checker {
             auto* tup = std::get_if<Pexp_tuple>(&(*k->arg)->desc);
             if (ps.size() > 1 && tup && tup->elems.size() == ps.size())
               for (size_t i = 0; i < ps.size(); ++i)
-                try_unify(ps[i], expect_arg(*tup->elems[i], ps[i]));
-            else if (!ps.empty()) try_unify(ps[0], expect_arg(**k->arg, ps[0]));
+                try_unify_rev(ps[i], expect_arg(*tup->elems[i], ps[i]));
+            else if (!ps.empty()) try_unify_rev(ps[0], expect_arg(**k->arg, ps[0]));
             else infer_expr(**k->arg);
           }
           return result;
@@ -10464,11 +10551,11 @@ struct Checker {
         if (ps.size() > 1 && tup && tup->elems.size() == ps.size()) {
           flatten_construct.insert(&e);
           for (size_t i = 0; i < ps.size(); ++i) {
-            try_unify(ps[i], expect_arg(*tup->elems[i], ps[i]));
+            try_unify_rev(ps[i], expect_arg(*tup->elems[i], ps[i]));
             record_ctor_arg_type(tup->elems[i].get(), ps[i]);
           }
         } else if (!ps.empty()) {
-          try_unify(ps[0], expect_arg(**k->arg, ps[0]));
+          try_unify_rev(ps[0], expect_arg(**k->arg, ps[0]));
           record_ctor_arg_type(k->arg->get(), ps[0]);
         } else {
           infer_expr(**k->arg);
@@ -10479,7 +10566,9 @@ struct Checker {
     if (auto* it = std::get_if<Pexp_ifthenelse>(&e.desc)) {
       try_unify(infer_expr(*it->cond), eng.constr("bool"));
       TypePtr tt = infer_expr(*it->then_);
-      if (it->else_) { try_unify(tt, infer_expr(**it->else_)); return tt; }
+      // ocamlc types both branches against the expected type, the then-branch
+      // first: the else-branch's node links TO the then-branch's.
+      if (it->else_) { try_unify_rev(tt, infer_expr(**it->else_)); return tt; }
       // No else: the then-branch must be unit and the whole expression is unit
       // (so a unit-returning `if c then e` body annotates `: int`).  Constrain
       // the branch softly in the strict pass to avoid false-rejecting a branch
@@ -10524,7 +10613,7 @@ struct Checker {
         // `with e -> ..` then gives e : exn (not a free var).
         try_unify(infer_pat(c.lhs), eng.constr("exn"));
         if (c.guard) try_unify(infer_expr(**c.guard), eng.constr("bool"));
-        try_unify(t, infer_expr(*c.rhs));
+        try_unify_rev(t, infer_expr(*c.rhs));  // a handler links TO the body's node
         venv.pop_back();
       }
       return t;
@@ -11669,7 +11758,7 @@ struct Checker {
              std::holds_alternative<Pexp_variant>(arg->desc)) &&
             builtin_clash(at, expected))
           note_error("This expression has a type that clashes with the expected type");
-        soft_unify(expected, at);  // propagate; genuine errors via expected_clash
+        soft_unify_rev(expected, at);  // propagate; genuine errors via expected_clash
       }
       // result = unconsumed params chained onto the tail, erasing any leading
       // optional that precedes a consumed positional (it is defaulted).
@@ -11711,7 +11800,7 @@ struct Checker {
       TypePtr dom = eng.fresh_var(), r = eng.fresh_var();
       soft_unify(ft, eng.arrow(dom, r, lk, nm));
       TypePtr at = infer_expr_expected(*arg, dom);
-      soft_unify(dom, at);
+      soft_unify_rev(dom, at);
       ft = I::Engine::repr(r);
     }
     return ft;
@@ -12447,6 +12536,21 @@ struct Checker {
         if (!no_gadtrow_pba && !strict && plain_annot[i] && bound[i] &&
             !is_format_constr(bound[i]) && rhs_gadt_cases(*bs[i].expr))
           pending_binding_annot_ = bound[i];
+        // Otherwise the recursion var's arrow IS the function's expected type
+        // (type_let's type_approx, then type_expect): its parameters are the
+        // approx's domain vars from the start, so a recursive call's argument
+        // meets the parameter's node -- `let rec f n = .. f (n-1)` keeps n at
+        // `( - )`'s first argument, where unifying the two arrows only after
+        // the body linked that path object on to the call's result.  The
+        // folded (signature / writer) passes only -- it is their path
+        // objects; the kind pass keeps its order (a GADT scrutinee met the
+        // approx's outer var and typedtree's split_pattern lost its
+        // totality).  NOPROV keeps the old order.
+        else if (fold_abbrevs_ && !strict &&
+                 !pending_binding_annot_ && tv[i] && !cmi::prov_off() &&
+                 std::holds_alternative<Pexp_function>(bs[i].expr->desc) &&
+                 I::Engine::repr(tv[i])->kind == I::Type::Kind::Arrow)
+          pending_binding_annot_ = tv[i];
         TypePtr te = (bound[i] && is_format_constr(bound[i]))
                          ? infer_expr_expected(*bs[i].expr, bound[i])
                          : infer_expr(*bs[i].expr);
@@ -12459,7 +12563,9 @@ struct Checker {
         // stays the face; an Any body can't erase it.
         if (plain_annot[i] && bound[i]) soft_unify(te, bound[i]);
         if (tv[i]) {
-          try_unify(tv[i], te);
+          // The recursion var's approx is the body's EXPECTED type (type_let's
+          // type_approx / type_expect): the body's nodes link to it.
+          try_unify_rev(tv[i], te);
           // Display slots: while BOTH spines are arrows, take the DOM from the
           // FUN's own arrow (te) -- the recursion var's arrow may have come
           // from a recursive-call fallback embedding an ARG node in the dom
@@ -15599,8 +15705,10 @@ static cmi::cmiw::TyPtr bridge_ty_body(const TypePtr& t,
       // no display back-map is needed here.)
       auto r = cmi::cmiw::ty_constr(path, std::move(as));
       r->engine_stamp = t->stamp;  // decl identity for shadow-aware citation
+      r->prov = I::Engine::prov_rep(t)->prov;  // the path object it cites
       if (getenv("BRIDGEDBG"))
-        fprintf(stderr, "[bridge] constr %s stamp=%d\n", r->name.c_str(), t->stamp);
+        fprintf(stderr, "[bridge] constr %s stamp=%d prov=%d (node %d prov %d)\n",
+                r->name.c_str(), t->stamp, r->prov, t->id, t->prov);
       return r;
     }
     case K::Link: return bridge_ty(t->link, vars, nextvar);
@@ -16952,10 +17060,24 @@ static cmi::cmiw::SigItem cmi_module_to_item(const std::string& name,
 // Bare `eff` stays the predef (ocamlc stores what the source wrote: predef
 // eff for `type _ eff +=`, Stdlib.Effect.t for `type _ Effect.t +=`).  A
 // dotted path is taken verbatim (the writer's ladder resolves its head).
-static std::string typext_path(Checker& ck, const Longident& lid) {
+// `prov` (optional): the path object of this lookup (cmi.hpp prov_new) --
+// fresh per typext, sharing the open's root when an `open` supplied the head.
+static std::string typext_path(Checker& ck, const Longident& lid, int* prov = nullptr) {
+  // One lookup per EXTENSION (transl_type_extension), shared by its
+  // constructors: keyed by the extension's own path node.
+  static std::unordered_map<const void*, int> per_ext;
+  auto fresh = [&](const std::string& pfx) {
+    if (!prov) return;
+    int& v = per_ext[&lid];
+    if (!v) v = pfx.empty() ? cmi::prov_new() : cmi::prov_new_open(pfx);
+    *prov = v;
+  };
   if (auto* l = std::get_if<Lident>(&lid.v)) {
-    if (auto q = ck.opened_type_quals_.find(l->name); q != ck.opened_type_quals_.end())
+    if (auto q = ck.opened_type_quals_.find(l->name); q != ck.opened_type_quals_.end()) {
+      fresh(Checker::qual_prefix(q->second));
       return q->second;
+    }
+    fresh("");
     return l->name;
   }
   // A dotted extended-type path (`User.tag`): if the HEAD module was pulled into
@@ -16965,8 +17087,11 @@ static std::string typext_path(Checker& ck, const Longident& lid) {
   std::string full = lid_full(lid);
   if (auto dot = full.find('.'); dot != std::string::npos)
     if (auto q = ck.opened_submod_quals_.find(full.substr(0, dot));
-        q != ck.opened_submod_quals_.end())
+        q != ck.opened_submod_quals_.end()) {
+      fresh(Checker::qual_prefix(q->second));
       return q->second + full.substr(dot);
+    }
+  fresh("");
   return full;
 }
 
@@ -17098,13 +17223,38 @@ static std::vector<std::string> typext_param_names(const ast::TypeExtension& ext
 // resolves the labels -- otherwise ext_match bails on that arm and the whole
 // match collapses to its first arm (the cause of the bootstrapped
 // includemod_errorprinter's `Includemod.Apply_error {..}` collapse + crash).
+// `ec`: the structure's constructor, whose registered scheme (the checker's
+// own conversion of these argument types) the item then bridges -- a value
+// built or matched with the constructor cites the SAME path objects as the
+// declaration (`exception Error of string` / `let f msg = raise (Error msg)`).
 static cmi::cmiw::SigItem exn_sigitem(Checker& ck, const std::string& name,
                                       const ast::Pext_decl& pd,
                                       const ast::TypeExtension* ext = nullptr,
-                                      bool first = false) {
+                                      bool first = false,
+                                      const ast::ExtensionConstructor* ec = nullptr) {
   std::unordered_map<std::string, TypePtr> tvars;
   std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;
   cmi::cmiw::SigItem item;
+  // The registered scheme's argument nodes, in order, when its arrow spine
+  // has exactly one per written argument (else null: convert afresh).
+  std::vector<TypePtr> sargs;
+  TypePtr sres;  // the scheme's result, for a GADT `: res` (else null)
+  if (ec && !cmi::prov_off())
+    if (auto* tup = std::get_if<Pcstr_tuple>(&pd.args)) {
+      auto& smap = ext ? ck.ext_ctor_scheme_ : ck.exn_decl_scheme_;
+      auto sit = smap.find(ec);
+      if (sit != smap.end() && sit->second) {
+        TypePtr cur = sit->second;
+        for (std::size_t i = 0; i < tup->elems.size(); ++i) {
+          TypePtr r = I::Engine::repr(cur);
+          if (r->kind != I::Type::Kind::Arrow) { sargs.clear(); break; }
+          sargs.push_back(r->dom);
+          cur = r->cod;
+        }
+        if (sargs.size() != tup->elems.size()) sargs.clear();
+        else if (pd.res) sres = cur;
+      }
+    }
   if (auto* rec = std::get_if<Pcstr_record>(&pd.args)) {
     std::vector<cmi::cmiw::Label> labels;
     for (auto& f : rec->fields) {
@@ -17119,14 +17269,17 @@ static cmi::cmiw::SigItem exn_sigitem(Checker& ck, const std::string& name,
   } else {
     std::vector<cmi::cmiw::TyPtr> args;
     if (auto* tup = std::get_if<Pcstr_tuple>(&pd.args))
-      for (auto& a : tup->elems)
-        args.push_back(bridge_ty_named(ck.from_coretype(*a, tvars), bvars, nextvar, tvars));
+      for (std::size_t i = 0; i < tup->elems.size(); ++i)
+        args.push_back(bridge_ty_named(
+            i < sargs.size() ? sargs[i] : ck.from_coretype(*tup->elems[i], tvars),
+            bvars, nextvar, tvars));
     item = cmi::cmiw::sig_exception(name, std::move(args));
   }
   if (pd.res)
-    item.ext_ret = bridge_ty_named(ck.from_coretype(**pd.res, tvars), bvars, nextvar, tvars);
+    item.ext_ret = bridge_ty_named(sres ? sres : ck.from_coretype(**pd.res, tvars),
+                                   bvars, nextvar, tvars);
   if (ext) {
-    item.ext_path = typext_path(ck, ext->path.txt);
+    item.ext_path = typext_path(ck, ext->path.txt, &item.ext_prov);
     item.ext_params = typext_param_names(*ext);
     item.text_kind = first ? 0 : 1;  // Text_first / Text_next
     // `type exn += private In_context of error` (env.mli): ext_private.
@@ -18291,7 +18444,7 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
           out.push_back(exn_sigitem(ck, ec.name.txt, *pd, &px->ext, first));
         } else {
           auto item = cmi::cmiw::sig_exception(ec.name.txt, {});  // rebind `+= C = D`
-          item.ext_path = typext_path(ck, px->ext.path.txt);
+          item.ext_path = typext_path(ck, px->ext.path.txt, &item.ext_prov);
           item.ext_params = typext_param_names(px->ext);
           item.text_kind = first ? 0 : 1;
           out.push_back(std::move(item));
@@ -20022,7 +20175,15 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
       if (pr->prim.type && !pr->prim.prims.empty()) {
         std::unordered_map<std::string, TypePtr> tvars;
         std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;
-        auto ty = bridge_ty_named(ck.from_coretype(*pr->prim.type, tvars), bvars, nextvar, tvars);
+        // The checker's own scheme for the primitive (the annotation it
+        // typed the uses against): a `let uget = unsafe_get` cites the SAME
+        // path objects as the external's declaration (ocamlc's instance
+        // copies the nodes, not the paths), so both must bridge one graph.
+        auto vf = ck.venv.back().find(pr->prim.name.txt);
+        TypePtr scheme = vf != ck.venv.back().end() && vf->second
+                             ? vf->second
+                             : ck.from_coretype(*pr->prim.type, tvars);
+        auto ty = bridge_ty_named(scheme, bvars, nextvar, tvars);
         std::string native = pr->prim.prims.size() > 1 ? pr->prim.prims[1] : "";
         auto item = cmi::cmiw::sig_external(pr->prim.name.txt, ty, pr->prim.prims[0], native);
         apply_prim_attrs(pr->prim, out, item);
@@ -20049,7 +20210,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
       const ExtensionConstructor& ec = pe->exn.ctor;
       if (!ec.name.txt.empty()) {
         if (auto* pd = std::get_if<Pext_decl>(&ec.kind))
-          out.push_back(exn_sigitem(ck, ec.name.txt, *pd));
+          out.push_back(exn_sigitem(ck, ec.name.txt, *pd, nullptr, false, &ec));
         else if (std::holds_alternative<Pext_rebind>(ec.kind))
           // `exception F = E`: a rebind over the predefined exn.  ocamlc records a
           // Sig_typext (Text_exception, Text_rebind) that Printtyp prints as bare
@@ -20063,7 +20224,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
       for (auto& ec : px->ext.ctors) {
         if (ec.name.txt.empty()) continue;
         if (auto* pd = std::get_if<Pext_decl>(&ec.kind)) {
-          out.push_back(exn_sigitem(ck, ec.name.txt, *pd, &px->ext, first));
+          out.push_back(exn_sigitem(ck, ec.name.txt, *pd, &px->ext, first, &ec));
           first = false;
         } else if (auto* rb = std::get_if<Pext_rebind>(&ec.kind)) {
           // `type 'a Msg.tag += String = StrM.C`: clone the target ctor's

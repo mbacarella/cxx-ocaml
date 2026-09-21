@@ -91,6 +91,17 @@ struct Type {
                                     // (`[> 'a lambda]`) -- an exact fixpoint then
                                     // prints `[ | 'a lambda ]`, not unfolded.
   std::string path;          // Constr: type-constructor path (e.g. "int", "list")
+  int prov = 0;              // Constr: the path OBJECT this occurrence cites
+                             // (cmi.hpp's prov_new; 0 = Predef.path_* / unknown).
+                             // A source annotation mints one, a .cmi value's
+                             // type keeps that file's; copies share it.
+  TypePtr plink;             // Constr: a shadow link for the path object ONLY
+                             // (Engine::prov_link): the writer cites
+                             // prov_rep(t)->prov.  Unify never links Constrs.
+  bool scheme = false;       // Constr: shared across uses (a let-bound scheme's,
+                             // an annotation's, a .cmi's, a predef ctor's node
+                             // -- ocamlc copies those per use and links the
+                             // copy), so prov_link never links it
   int stamp = 0;             // Constr: identity of a local type decl (0 = none).
                              // Two constrs with distinct non-zero stamps are
                              // distinct types even if their paths match.
@@ -155,10 +166,26 @@ public:
 
   // Follow Link chains to the representative (path-compressing).
   static TypePtr repr(TypePtr t);
+  // The node whose path OBJECT a Constr cites after its shadow links.
+  static TypePtr prov_rep(TypePtr t);
+  // ocamlc's unify links t1 -> t2 when both are one nullary/same constructor,
+  // so the saved type cites t2's path object; record that on t1 (a per-use
+  // node only -- see Type::scheme) without linking the nodes.
+  void prov_link(const TypePtr& a, const TypePtr& b);
+  // Mark every Constr reachable from t as shared across uses (Type::scheme).
+  static void mark_scheme(const TypePtr& t);
 
   // Make a and b equal, or throw TypeError on a clash.  Updates levels and runs
-  // the occurs-check when binding a variable.
+  // the occurs-check when binding a variable.  `a` is the ACTUAL type and `b`
+  // the EXPECTED one for prov_link (ocamlc's `unify env actual expected`);
+  // a call site that holds them the other way round uses unify_rev.
   void unify(const TypePtr& a, const TypePtr& b);
+  void unify_rev(const TypePtr& expected, const TypePtr& actual) {
+    bool saved = prov_flip_;
+    prov_flip_ = !prov_flip_;
+    try { unify(expected, actual); } catch (...) { prov_flip_ = saved; throw; }
+    prov_flip_ = saved;
+  }
 
   // Copy a generalized type, replacing GENERIC_LEVEL vars with fresh vars at the
   // current level (shared structure for non-generic parts).
@@ -189,13 +216,14 @@ public:
 
 private:
   int next_id_ = 0;
+  bool prov_flip_ = false;  // unify_rev: the second argument is the actual
   // >0 while unifying a merged row's shared-tag ARGUMENTS: same-family constrs
   // then keep their own names (no relink) -- the merged slot's representative
   // was chosen by family priority instead (see unify's Variant merge).
   int row_field_depth_ = 0;
   void occurs_and_lower(const TypePtr& var, const TypePtr& t);
 
-  struct Trail { TypePtr node; Type::Kind kind; TypePtr link; int level; };
+  struct Trail { TypePtr node; Type::Kind kind; TypePtr link; int level; TypePtr plink; };
   std::vector<Trail> trail_;
   int window_depth_ = 0;
   void note(const TypePtr& n);
