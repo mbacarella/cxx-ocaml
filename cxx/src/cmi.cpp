@@ -2797,24 +2797,25 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       if (!it.class_is_type) {
         auto cdecl = o::vblock(0, {cty_params(), cty, cpath, cnew,
                                    cty_variance(), loc_none(),
-                                   o::vint(0) /*attrs*/, o::vint(0) /*uid*/});
+                                   o::vint(0) /*attrs*/, emit_uid(it.uid)});
         sig.push_back(o::vblock(5, {ident, cdecl, o::vint(rs),
                                     o::vint(0) /*Exported*/}));  // Sig_class
       }
-      // ghost type_declaration builder (14 fields, no params)
+      // ghost type_declaration builder (14 fields, no params); the class's
+      // uid is the hash type's and the ghost's too (typeclass.ml `cl_td`)
       auto mk_tdecl = [&](o::ValPtr man) {
         return o::vblock(0, {o::vint(0), o::vint(0),
                              o::vblock(0, {o::vint(0)}) /*Type_abstract*/,
                              o::vint(1) /*Public*/, man,
                              o::vint(0), o::vint(0), o::vint(0), o::vint(0),
                              loc_none(), o::vint(0), o::vint(0), o::vint(0),
-                             o::vint(0) /*uid*/});
+                             emit_uid(it.uid)});
       };
       // Sig_class_type: a ghost after a class, the REAL item for `class type`;
       // shares cty; clty_hash_type is a bare abstract decl
       auto clty = o::vblock(0, {cty_params(), cty, cpath,
                                 mk_tdecl(o::vint(0)), cty_variance(),
-                                loc_none(), o::vint(0), o::vint(0)});
+                                loc_none(), o::vint(0), emit_uid(it.uid)});
       auto clty_ident = ident_val(0, it.name, s_clty);
       sig.push_back(o::vblock(6, {clty_ident, clty, o::vint(rs), o::vint(0)}));  // Sig_class_type
       // ghost Sig_type c = <closed public object> (what `val o : c` cites)
@@ -3085,7 +3086,9 @@ static bool assign_uids_mapped(std::vector<SigItem>& items,
     } else if (it.k == SigItem::Modtype) {
       if (!at('M', it.name, &it.uid)) return false;
     } else if (it.k == SigItem::Class) {
-      return false;  // a class's three items are not modelled
+      // `class c`, `class type c` and `type c` all carry the ONE uid
+      // `type_classes` minted for the class (S553).
+      if (!at('C', it.name, &it.uid)) return false;
     }
   }
   return true;

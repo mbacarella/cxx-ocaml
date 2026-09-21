@@ -42836,13 +42836,18 @@ int typing_ident_count(const ast::Signature& s) {
 //     carry the LATER uids;
 //   * a functor parameter costs its module type's items plus 1 for the
 //     parameter itself; a `()` parameter costs nothing;
-//   * a `module type S = sig .. end` numbers the signature's items before S.
+//   * a `module type S = sig .. end` numbers the signature's items before S;
+//   * a `class .. and ..` group takes ONE uid per class FIRST (typeclass.ml
+//     `type_classes`), shared by the three items the class saves (`class c`,
+//     `class type c`, `type c`), then types the bodies in order; a `class
+//     type` group likewise, its bodies costing nothing (S553).
 //
 // What is NOT modelled leaves `complete` false and the writer keeps its own
 // numbering for the whole file: an `include` (whose items keep their SOURCE
-// unit's uids), a class, a `module rec`, a functor APPLICATION, a module type
-// reached by NAME, an `open struct .. end`, an object expression that
-// INHERITS, an extension node.  A file is thus either fully modelled or exactly as before.
+// unit's uids), a `module rec`, a functor APPLICATION, a module type
+// reached by NAME, an `open struct .. end`, an `inherit` of a class the walk
+// did not see declared, an extension node.  A file is thus either fully
+// modelled or exactly as before.
 namespace uidwalk {
 
 struct Walk {
@@ -42851,6 +42856,10 @@ struct Walk {
   std::map<std::string, int> ids;
   std::string path;              // dotted path of the enclosing module
   bool obj_off = false;          // NOUIDOBJ: keep bailing on `object .. end`
+  bool class_off = false;        // NOUIDCLASS: keep bailing on a class
+  // The instance variables of every class (and class type) declared so far,
+  // by dotted path: what an `inherit` of it costs in the second pass.
+  std::map<std::string, std::set<std::string>> cvars;
 
   int mk() { return c++; }
   void give(char kind, const std::string& name) { ids[uidkey(kind, path, name)] = mk(); }
@@ -42996,9 +43005,10 @@ struct Walk {
     } else if (auto* po = std::get_if<Pexp_poly>(&e.desc)) {
       if (po->e) expr(*po->e);
     } else if (auto* ob = std::get_if<Pexp_object>(&e.desc)) {
-      if (obj_off || !ob->cs) bail(); else object_(*ob->cs);
-    } else if (std::get_if<Pexp_extension>(&e.desc) ||
-               std::get_if<Pexp_new>(&e.desc)) {
+      if (obj_off || !ob->cs) bail(); else structure_(*ob->cs, nullptr);
+    } else if (std::get_if<Pexp_new>(&e.desc)) {
+      if (class_off) bail();  // `new c` looks c up and mints nothing
+    } else if (std::get_if<Pexp_extension>(&e.desc)) {
       bail();
     }
     // Pexp_ident / constant / unreachable: nothing.
@@ -43018,52 +43028,176 @@ struct Walk {
     }
   }
 
-  // ---- object expressions -------------------------------------------------
+  // ---- object expressions and class bodies --------------------------------
   // An `object .. end` binds nothing that reaches the signature, so only its
   // COUNT matters -- but that count is not one per field.  `class_structure`
   // (typing/typeclass.ml) types the self binder as `(<self> as selfpat-*)`,
   // so even an anonymous self has ONE variable, and `add_self_met` numbers
   // every self variable a SECOND time after the first pass: an empty object
   // costs 2, `object (self) end` 4.  Between the two, the first pass types
-  // each `val`'s definition; the second pass then takes one uid per `val`
-  // and types each `method`/`initializer` body -- each wrapped by
-  // `make_method` in a function over `(self-* as self-N)`, whose two
-  // variables it pays for before the body's own binders.
-  void object_(const ast::ClassStructure& cs) {
+  // each `val`'s definition and each `inherit`'s parent class expression;
+  // the second pass then takes one uid per `val` whose label is NEW to the
+  // body (a `val` re-declaring an inherited one is `already_declared` and
+  // costs nothing; a repeated label is rejected outright), one per instance
+  // variable of every inherited parent's signature (`add_instance_vars_met`
+  // -- ALL of them, even those an earlier parent or `val` already brought)
+  // plus one for `as super`, and types each concrete `method` /
+  // `initializer` body -- each wrapped by `make_method` in a function over
+  // `(self-* as self-N)`, whose two variables it pays for before the body's
+  // own binders.  A virtual method costs nothing.  `vars`, when given,
+  // receives the body's instance variables: what an `inherit` of it costs.
+  void structure_(const ast::ClassStructure& cs, std::set<std::string>* vars) {
     using namespace ast;
+    std::set<std::string> own;
+    if (!vars) vars = &own;
     int c0 = c;
     pat(cs.self, false);   // type_self_pattern, over the alias it adds:
     ++c;                   // `selfpat-*`, which an anonymous self has too
     int nself = c - c0;
+    std::vector<int> second;               // the second pass, per field
     for (auto& f : cs.fields) {            // first pass
+      int k = 0;
       if (auto* v = std::get_if<Pcf_val>(&f.desc)) {
-        // `val virtual` is rejected in a final object; so is a repeated
-        // label, so every `val` here is a fresh one and costs exactly 1.
-        auto* k = std::get_if<Cfk_concrete>(&v->kind);
-        if (!k) { bail(); return; }
-        if (k->e) expr(*k->e);
+        if (auto* kc = std::get_if<Cfk_concrete>(&v->kind))
+          if (kc->e) expr(*kc->e);
+        k = vars->insert(v->name.txt).second ? 1 : 0;
       } else if (auto* m = std::get_if<Pcf_method>(&f.desc)) {
-        if (!std::get_if<Cfk_concrete>(&m->kind)) { bail(); return; }
-      } else if (std::get_if<Pcf_constraint>(&f.desc) ||
-                 std::get_if<Pcf_initializer>(&f.desc) ||
-                 std::get_if<Pcf_attribute>(&f.desc)) {
-        // nothing is typed for these in the first pass
-      } else {
-        bail(); return;                    // inherit / extension
+        if (std::get_if<Cfk_concrete>(&m->kind)) k = 2;
+      } else if (auto* in = std::get_if<Pcf_inherit>(&f.desc)) {
+        if (class_off || !in->ce) { bail(); return; }
+        std::set<std::string> pv;
+        class_expr(*in->ce, &pv);
+        if (!complete) return;
+        k = (int)pv.size() + (in->as_ ? 1 : 0);
+        vars->insert(pv.begin(), pv.end());
+      } else if (std::get_if<Pcf_initializer>(&f.desc)) {
+        k = 2;
+      } else if (std::get_if<Pcf_extension>(&f.desc)) {
+        bail(); return;
       }
+      second.push_back(k);                 // constraint / attribute: 0
     }
     c += nself;                            // add_self_met
-    for (auto& f : cs.fields) {            // second pass
-      if (std::get_if<Pcf_val>(&f.desc)) {
-        mk();
-      } else if (auto* m = std::get_if<Pcf_method>(&f.desc)) {
-        auto& k = std::get<Cfk_concrete>(m->kind);
-        c += 2;                            // `(self-* as self-N)`
-        if (k.e) expr(*k.e);
-      } else if (auto* i = std::get_if<Pcf_initializer>(&f.desc)) {
-        c += 2;
-        if (i->e) expr(*i->e);
+    for (std::size_t i = 0; i < cs.fields.size(); ++i) {   // second pass
+      auto& f = cs.fields[i];
+      c += second[i];
+      if (auto* m = std::get_if<Pcf_method>(&f.desc)) {
+        if (auto* kc = std::get_if<Cfk_concrete>(&m->kind))
+          if (kc->e) expr(*kc->e);
+      } else if (auto* in = std::get_if<Pcf_initializer>(&f.desc)) {
+        if (in->e) expr(*in->e);
       }
+    }
+  }
+
+  // ---- classes ------------------------------------------------------------
+  // The instance variables a class expression's signature carries.  A class
+  // reached by NAME is one the walk saw declared -- looked up through the
+  // enclosing module paths, outermost last -- or the walk bails.
+  bool class_vars_of(const ast::Longident& id, std::set<std::string>& out) {
+    std::string n = lid_full(id), p = path;
+    for (;;) {
+      auto it = cvars.find(p.empty() ? n : p + "." + n);
+      if (it != cvars.end()) { out = it->second; return true; }
+      if (p.empty()) return false;
+      auto dot = p.rfind('.');
+      p = dot == std::string::npos ? "" : p.substr(0, dot);
+    }
+  }
+  void declare_class(const std::string& name, std::set<std::string> vars) {
+    cvars[path.empty() ? name : path + "." + name] = std::move(vars);
+  }
+  // A class parameter's variables cost 2 apiece: `type_pat` numbers them,
+  // then `type_class_arg_pattern` (typecore.ml) once more.  An optional
+  // parameter with a default is rewritten (typeclass.ml `Pcl_fun`) to
+  // `fun *opt* -> let <pat> = match *opt* with Some *sth* -> *sth* | None ->
+  // <default> in ..`: 2 for `*opt*`, the pattern's variables once as an
+  // ordinary `let`, 1 for `*sth*`, then the default expression.  `let` and
+  // `open` are the ordinary ones, an application types its arguments, a
+  // constraint's class type costs nothing and REPLACES the variable set.
+  void class_expr(const ast::ClassExpr& ce, std::set<std::string>* vars) {
+    using namespace ast;
+    if (auto* cn = std::get_if<Pcl_constr>(&ce.desc)) {
+      std::set<std::string> v;
+      if (!class_vars_of(cn->id.txt, v)) { bail(); return; }
+      if (vars) *vars = std::move(v);
+    } else if (auto* st = std::get_if<Pcl_structure>(&ce.desc)) {
+      structure_(st->cs, vars);
+    } else if (auto* fn = std::get_if<Pcl_fun>(&ce.desc)) {
+      if (fn->default_) {
+        c += 2;
+        pat(fn->pat, false);
+        ++c;
+        if (*fn->default_) expr(**fn->default_);
+      } else {
+        int c0 = c;
+        pat(fn->pat, false);
+        c += c - c0;
+      }
+      if (fn->body) class_expr(*fn->body, vars);
+    } else if (auto* ap = std::get_if<Pcl_apply>(&ce.desc)) {
+      if (ap->ce) class_expr(*ap->ce, vars);
+      for (auto& a : ap->args) if (a.second) expr(*a.second);
+    } else if (auto* l = std::get_if<Pcl_let>(&ce.desc)) {
+      for (auto& b : l->bindings) pat(b.pat, false);
+      for (auto& b : l->bindings) if (b.expr) expr(*b.expr);
+      if (l->body) class_expr(*l->body, vars);
+    } else if (auto* cs = std::get_if<Pcl_constraint>(&ce.desc)) {
+      if (cs->ce) class_expr(*cs->ce, nullptr);
+      if (cs->ct) class_type_vars(*cs->ct, vars);
+    } else if (auto* o = std::get_if<Pcl_open>(&ce.desc)) {
+      if (o->body) class_expr(*o->body, vars);
+    } else {
+      bail();  // extension
+    }
+  }
+  // A class type mints nothing; only its variable set matters.
+  void class_type_vars(const ast::ClassType& ct, std::set<std::string>* vars) {
+    using namespace ast;
+    std::set<std::string> own;
+    if (!vars) vars = &own;
+    if (auto* cn = std::get_if<Pcty_constr>(&ct.desc)) {
+      std::set<std::string> v;
+      if (!class_vars_of(cn->id.txt, v)) { bail(); return; }
+      *vars = std::move(v);
+    } else if (auto* sg = std::get_if<Pcty_signature>(&ct.desc)) {
+      for (auto& f : sg->cs.fields) {
+        if (auto* v = std::get_if<Pctf_val>(&f.desc)) {
+          vars->insert(v->name.txt);
+        } else if (auto* in = std::get_if<Pctf_inherit>(&f.desc)) {
+          std::set<std::string> pv;
+          if (in->ct) class_type_vars(*in->ct, &pv);
+          vars->insert(pv.begin(), pv.end());
+        } else if (std::get_if<Pctf_extension>(&f.desc)) {
+          bail();
+        }
+      }
+    } else if (auto* ar = std::get_if<Pcty_arrow>(&ct.desc)) {
+      if (ar->cod) class_type_vars(*ar->cod, vars);
+    } else if (auto* o = std::get_if<Pcty_open>(&ct.desc)) {
+      if (o->body) class_type_vars(*o->body, vars);
+    } else {
+      bail();  // extension
+    }
+  }
+  // `class c = .. and d = ..`: one uid per class first, then the bodies.
+  void class_group(const std::vector<ast::ClassDeclaration>& ds, bool save) {
+    if (class_off) { bail(); return; }
+    for (auto& d : ds) { if (save) give('C', d.name.txt); else mk(); }
+    for (auto& d : ds) {
+      std::set<std::string> v;
+      class_expr(d.expr, &v);
+      declare_class(d.name.txt, std::move(v));
+    }
+  }
+  void class_type_group(const std::vector<ast::ClassTypeDeclaration>& ds,
+                        bool save) {
+    if (class_off) { bail(); return; }
+    for (auto& d : ds) { if (save) give('C', d.name.txt); else mk(); }
+    for (auto& d : ds) {
+      std::set<std::string> v;
+      class_type_vars(d.expr, &v);
+      declare_class(d.name.txt, std::move(v));
     }
   }
 
@@ -43133,6 +43267,10 @@ struct Walk {
       } else if (auto* mt = std::get_if<Psig_modtype>(&it.desc)) {
         if (mt->type) mty(*mt->type, /*save=*/false);
         if (save) give('M', mt->name.txt); else mk();
+      } else if (auto* c = std::get_if<Psig_class>(&it.desc)) {
+        class_type_group(c->decls, save);
+      } else if (auto* ct = std::get_if<Psig_class_type>(&it.desc)) {
+        class_type_group(ct->decls, save);
       } else if (std::get_if<Psig_open>(&it.desc) ||
                  std::get_if<Psig_attribute>(&it.desc)) {
         // nothing
@@ -43213,10 +43351,14 @@ struct Walk {
       // `open M` declares nothing; `open struct .. end` does, and its items
       // land in the enclosing signature -- not modelled.
       if (!std::get_if<Pmod_ident>(&o->expr.desc)) bail();
+    } else if (auto* c = std::get_if<Pstr_class>(&it.desc)) {
+      class_group(c->decls, save);
+    } else if (auto* ct = std::get_if<Pstr_class_type>(&it.desc)) {
+      class_type_group(ct->decls, save);
     } else if (std::get_if<Pstr_attribute>(&it.desc)) {
       // nothing
     } else {
-      bail();  // include / class / class type / recmodule / typext / ext / val
+      bail();  // include / recmodule / typext / ext / val
     }
   }
 };
@@ -43226,6 +43368,7 @@ struct Walk {
 UidMap typing_uid_map(const ast::Structure& s) {
   uidwalk::Walk w;
   w.obj_off = dbg_env("NOUIDOBJ");
+  w.class_off = dbg_env("NOUIDCLASS");
   for (auto& it : s) w.item(it, /*save=*/true);
   UidMap m;
   m.complete = w.complete;

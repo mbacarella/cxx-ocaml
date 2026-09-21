@@ -699,7 +699,8 @@ void set_module_dirs(const std::string& stdlib_dir,
 // The uid map's key scheme, shared by the pass that builds it
 // (cppcaml::typing_uid_map) and the writer pass that reads it: a kind letter
 // -- v value, t type, c constructor, l label, L inline-record label, m module,
-// M module type, e exception -- then the declaration's dotted path.
+// M module type, e exception, C class or class type (one key for the two or
+// three items it saves) -- then the declaration's dotted path.
 inline std::string uidkey(char kind, const std::string& path,
                           const std::string& name) {
   return std::string(1, kind) + (path.empty() ? name : path + "." + name);
