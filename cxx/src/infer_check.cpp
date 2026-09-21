@@ -42841,8 +42841,8 @@ int typing_ident_count(const ast::Signature& s) {
 // What is NOT modelled leaves `complete` false and the writer keeps its own
 // numbering for the whole file: an `include` (whose items keep their SOURCE
 // unit's uids), a class, a `module rec`, a functor APPLICATION, a module type
-// reached by NAME, an `open struct .. end`, an object expression, an
-// extension node.  A file is thus either fully modelled or exactly as before.
+// reached by NAME, an `open struct .. end`, an object expression that
+// INHERITS, an extension node.  A file is thus either fully modelled or exactly as before.
 namespace uidwalk {
 
 struct Walk {
@@ -42850,6 +42850,7 @@ struct Walk {
   bool complete = true;
   std::map<std::string, int> ids;
   std::string path;              // dotted path of the enclosing module
+  bool obj_off = false;          // NOUIDOBJ: keep bailing on `object .. end`
 
   int mk() { return c++; }
   void give(char kind, const std::string& name) { ids[uidkey(kind, path, name)] = mk(); }
@@ -42994,8 +42995,9 @@ struct Walk {
       for (auto& f : ov->fields) if (f.second) expr(*f.second);
     } else if (auto* po = std::get_if<Pexp_poly>(&e.desc)) {
       if (po->e) expr(*po->e);
-    } else if (std::get_if<Pexp_object>(&e.desc) ||
-               std::get_if<Pexp_extension>(&e.desc) ||
+    } else if (auto* ob = std::get_if<Pexp_object>(&e.desc)) {
+      if (obj_off || !ob->cs) bail(); else object_(*ob->cs);
+    } else if (std::get_if<Pexp_extension>(&e.desc) ||
                std::get_if<Pexp_new>(&e.desc)) {
       bail();
     }
@@ -43013,6 +43015,55 @@ struct Walk {
       pat(k.lhs, false);
       if (k.guard) expr(**k.guard);
       if (k.rhs) expr(*k.rhs);
+    }
+  }
+
+  // ---- object expressions -------------------------------------------------
+  // An `object .. end` binds nothing that reaches the signature, so only its
+  // COUNT matters -- but that count is not one per field.  `class_structure`
+  // (typing/typeclass.ml) types the self binder as `(<self> as selfpat-*)`,
+  // so even an anonymous self has ONE variable, and `add_self_met` numbers
+  // every self variable a SECOND time after the first pass: an empty object
+  // costs 2, `object (self) end` 4.  Between the two, the first pass types
+  // each `val`'s definition; the second pass then takes one uid per `val`
+  // and types each `method`/`initializer` body -- each wrapped by
+  // `make_method` in a function over `(self-* as self-N)`, whose two
+  // variables it pays for before the body's own binders.
+  void object_(const ast::ClassStructure& cs) {
+    using namespace ast;
+    int c0 = c;
+    pat(cs.self, false);   // type_self_pattern, over the alias it adds:
+    ++c;                   // `selfpat-*`, which an anonymous self has too
+    int nself = c - c0;
+    for (auto& f : cs.fields) {            // first pass
+      if (auto* v = std::get_if<Pcf_val>(&f.desc)) {
+        // `val virtual` is rejected in a final object; so is a repeated
+        // label, so every `val` here is a fresh one and costs exactly 1.
+        auto* k = std::get_if<Cfk_concrete>(&v->kind);
+        if (!k) { bail(); return; }
+        if (k->e) expr(*k->e);
+      } else if (auto* m = std::get_if<Pcf_method>(&f.desc)) {
+        if (!std::get_if<Cfk_concrete>(&m->kind)) { bail(); return; }
+      } else if (std::get_if<Pcf_constraint>(&f.desc) ||
+                 std::get_if<Pcf_initializer>(&f.desc) ||
+                 std::get_if<Pcf_attribute>(&f.desc)) {
+        // nothing is typed for these in the first pass
+      } else {
+        bail(); return;                    // inherit / extension
+      }
+    }
+    c += nself;                            // add_self_met
+    for (auto& f : cs.fields) {            // second pass
+      if (std::get_if<Pcf_val>(&f.desc)) {
+        mk();
+      } else if (auto* m = std::get_if<Pcf_method>(&f.desc)) {
+        auto& k = std::get<Cfk_concrete>(m->kind);
+        c += 2;                            // `(self-* as self-N)`
+        if (k.e) expr(*k.e);
+      } else if (auto* i = std::get_if<Pcf_initializer>(&f.desc)) {
+        c += 2;
+        if (i->e) expr(*i->e);
+      }
     }
   }
 
@@ -43174,6 +43225,7 @@ struct Walk {
 
 UidMap typing_uid_map(const ast::Structure& s) {
   uidwalk::Walk w;
+  w.obj_off = dbg_env("NOUIDOBJ");
   for (auto& it : s) w.item(it, /*save=*/true);
   UidMap m;
   m.complete = w.complete;
