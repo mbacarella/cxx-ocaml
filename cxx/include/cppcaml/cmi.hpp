@@ -419,6 +419,14 @@ struct Import { std::string name; std::string crc; };
 // a Value item emits Sig_value.
 struct Label { std::string name; bool mut = false; bool atomic = false; TyPtr ty; Uid uid; Loc loc; };  // record field
 // One member of a class body: a val (mut/virt) or a method (priv/virt).
+// What Typecore.type_approx materialized of a method's type in the class's
+// FIRST pass -- the nodes Ctype.generalize_class_signature_spine's copy_spine
+// then copies into the csig_meths entry (the self type keeps the originals):
+// 'V' a variable then (the whole body is shared), 'A' an arrow (dom, cod),
+// 'T' a tuple, 'C' a constructor (its args), 'F' fully written (an
+// annotation: every Tarrow/Ttuple/Tconstr/Tpoly of the spine is copied),
+// 'S' no copy at all (a class TYPE's entry is the field's own node).
+struct Approx { char k = 'V'; std::vector<Approx> kids; };
 struct ClassField {
   std::string name; TyPtr ty;
   bool is_method = false, mut = false, virt = false, priv = false;
@@ -426,6 +434,7 @@ struct ClassField {
   // {< >}`): the writer emits the shared csig_self node so Printtyp aliases the
   // self-row proxy and prints `object ('a) .. method m : 'a end`.
   bool self_ref = false;
+  Approx approx;  // the csig_meths entry's copied spine (methods)
 };
 struct Ctor {
   std::string name;
@@ -579,6 +588,9 @@ struct SigItem {
   // `class type ct = object .. end`: emit only Sig_class_type + its ghost
   // Sig_type (TWO stamps); arrows/cty_new don't apply.
   bool class_is_type = false;
+  // Typedecl_variance.update_class_decls' result (one Variance per class
+  // param, computed over the closed object); empty = Variance.unknown.
+  std::vector<int> class_variances;
   // Modtype: an ABSTRACT declaration `module type S` -- mtd_type = None
   // (Printtyp prints it back as bare `module type S`).
   bool modtype_abstract = false;

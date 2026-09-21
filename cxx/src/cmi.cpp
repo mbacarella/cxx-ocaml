@@ -1468,6 +1468,13 @@ struct CmiShare {
   }
 };
 CmiShare g_share;
+// S554: the class item's shape (locations, the nominal self type, the hash
+// type's manifest, the meths-map spine copies, the shared name / loc / uid).
+// NOCLSITEM=1 reverts to the S553 emitter.
+bool clsitem_off_() {
+  static const bool off = cppcaml::dbg_env("NOCLSITEM") != nullptr;
+  return off;
+}
 bool no_share() {
   static const bool off = cppcaml::dbg_env("NOCMISHARE") != nullptr;
   return off;
@@ -2677,22 +2684,120 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       // (class_type, ghost type) at s_class / s_class+1.
       int s_clty = it.class_is_type ? s_class : s_class + 1;
       int s_ty = it.class_is_type ? s_class + 1 : s_class + 2;
+      // A class item is what typeclass.ml's class_infos saves, in the shape
+      // Subst's ONE copy scope leaves it (S554, hook NOCLSITEM=1):
+      //   * the three (two) idents carry ONE name string, and the three
+      //     declarations ONE Location (`cl.pci_loc`) and ONE uid;
+      //   * a method's FIELD type P = Tpoly(ty, []) is shared by the self type,
+      //     the hash type's manifest and the closed object (its nodes never
+      //     reach the row variable, so limited_generalize leaves them
+      //     non-generic and every instance keeps them); the csig_meths entry
+      //     is M = Tpoly(spine, []) -- generalize_class_signature_spine's
+      //     copy_spine of P between the two passes: an ANNOTATED method's
+      //     Tarrow/Tconstr/Ttuple/Tpoly spine is copied, an inferred one's
+      //     body was still a variable then, so the whole body is shared;
+      //   * csig_self = Tobject(fields in SOURCE order -> rv, ref (Some
+      //     (Pident <ghost type>, rv :: params))) (Ctype.set_object_name);
+      //     the hash type's manifest is the same shape over a fresh row
+      //     variable (instance_parameterized_type); the params are the
+      //     class's own nodes (non-generic, shared everywhere);
+      //   * cty_new's result and the ghost type's manifest are ONE closed
+      //     object, its fields SORTED by name (unify_fields' flatten_fields
+      //     rebuilt obj_ty's row) and its name ref None;
+      //   * a private method has no field (Subst drops the Fabsent one) and
+      //     its map entry's privacy is Mprivate (FKvar {field_kind=FKabsent}).
+      const bool clsitem_off = clsitem_off_();
+      o::ValPtr cloc = clsitem_off ? loc_none() : emit_loc(it.loc);
+      auto cuid_ = [&] { return emit_uid(it.uid); };  // the hook: a block per use
+      o::ValPtr cuid = cuid_();
+      // ocamlc's idents are `Ident.create_local cl.pci_name.txt` thrice: one
+      // string.  Reuse the one an earlier citation (a forward `new b`) built.
+      o::ValPtr cname;
+      for (int s : {s_class, s_clty, s_ty}) {
+        auto f = g_share.ids.find("0:" + std::to_string(s) + ":" + it.name);
+        if (f != g_share.ids.end() && f->second) { cname = f->second->fields[0]; break; }
+      }
+      if (!cname || clsitem_off) cname = o::vstr(it.name);
+      auto cident = [&](int s) {
+        if (no_share() || clsitem_off) return ident_val(0, it.name, s);
+        auto& v = g_share.ids["0:" + std::to_string(s) + ":" + it.name];
+        if (!v) v = o::vblock(0, {cname, o::vint(s)});
+        return v;
+      };
+      ident = cident(s_class);
+      auto clty_ident = cident(s_clty);
+      auto ty_ident = cident(s_ty);
+      // Method / instance-variable label strings: one object per label,
+      // cited by every Tfield and map key that names it (pcf_name.txt).
+      std::map<std::string, o::ValPtr> lstr;
+      auto lblstr = [&](const std::string& k) {
+        if (clsitem_off) return o::vstr(k.substr(2));
+        auto& v = lstr[k]; if (!v) v = o::vstr(k.substr(2)); return v;
+      };
       // (mutable/privacy, virtual, ty) String.Map as a balanced marshal tree:
       // Node{l; v; d; r; h} (block tag 0), Empty = int 0.
-      struct MapEnt { std::string name; o::ValPtr d; };
-      auto build_map = [](std::vector<MapEnt> es) -> o::ValPtr {
-        std::sort(es.begin(), es.end(),
-                  [](const MapEnt& a, const MapEnt& b) { return a.name < b.name; });
-        std::function<std::pair<o::ValPtr, int>(std::size_t, std::size_t)> go =
-            [&](std::size_t lo, std::size_t hi) -> std::pair<o::ValPtr, int> {
-          if (lo >= hi) return {o::vint(0), 0};
-          std::size_t mid = lo + (hi - lo) / 2;
-          auto [l, hl] = go(lo, mid);
-          auto [r, hr] = go(mid + 1, hi);
-          int h = 1 + std::max(hl, hr);
-          return {o::vblock(0, {l, o::vstr(es[mid].name), es[mid].d, r, o::vint(h)}), h};
+      // Each map's (_, _, ty) triples are its own (Meths.map allocates).  The
+      // tree is what Map.add built in add_method / add_instance_variable
+      // order -- the fields' SOURCE order -- with Map's AVL `bal` (S554); a
+      // balanced build from the sorted keys put `method a .. method b`'s b
+      // at the root where ocamlc has a.  Node{l; v; d; r; h} (tag 0), Empty 0.
+      struct MapEnt { std::string name; o::ValPtr key, a, b, ty; };
+      struct MapNode { std::string name; o::ValPtr key, d; std::shared_ptr<MapNode> l, r; int h; };
+      auto build_map = [&](std::vector<MapEnt> es) -> o::ValPtr {
+        if (clsitem_off) {
+          std::sort(es.begin(), es.end(),
+                    [](const MapEnt& a, const MapEnt& b) { return a.name < b.name; });
+          std::function<std::pair<o::ValPtr, int>(std::size_t, std::size_t)> go =
+              [&](std::size_t lo, std::size_t hi) -> std::pair<o::ValPtr, int> {
+            if (lo >= hi) return {o::vint(0), 0};
+            std::size_t mid = lo + (hi - lo) / 2;
+            auto [l, hl] = go(lo, mid);
+            auto [r, hr] = go(mid + 1, hi);
+            int h = 1 + std::max(hl, hr);
+            o::ValPtr d = o::vblock(0, {es[mid].a, es[mid].b, es[mid].ty});
+            return {o::vblock(0, {l, es[mid].key, d, r, o::vint(h)}), h};
+          };
+          return go(0, es.size()).first;
+        }
+        using T = std::shared_ptr<MapNode>;
+        auto height = [](const T& t) { return t ? t->h : 0; };
+        auto create = [&](const T& l, const std::string& x, o::ValPtr key, o::ValPtr d, const T& r) {
+          int hl = height(l), hr = height(r);
+          return std::make_shared<MapNode>(MapNode{x, key, d, l, r, hl >= hr ? hl + 1 : hr + 1});
         };
-        return go(0, es.size()).first;
+        auto bal = [&](const T& l, const std::string& x, o::ValPtr key, o::ValPtr d, const T& r) -> T {
+          int hl = height(l), hr = height(r);
+          if (hl > hr + 2) {
+            if (height(l->l) >= height(l->r))
+              return create(l->l, l->name, l->key, l->d, create(l->r, x, key, d, r));
+            const T& lr = l->r;
+            return create(create(l->l, l->name, l->key, l->d, lr->l), lr->name, lr->key, lr->d,
+                          create(lr->r, x, key, d, r));
+          }
+          if (hr > hl + 2) {
+            if (height(r->r) >= height(r->l))
+              return create(create(l, x, key, d, r->l), r->name, r->key, r->d, r->r);
+            const T& rl = r->l;
+            return create(create(l, x, key, d, rl->l), rl->name, rl->key, rl->d,
+                          create(rl->r, r->name, r->key, r->d, r->r));
+          }
+          return create(l, x, key, d, r);
+        };
+        std::function<T(const T&, const std::string&, o::ValPtr, o::ValPtr)> add =
+            [&](const T& m, const std::string& x, o::ValPtr key, o::ValPtr d) -> T {
+          if (!m) return create(nullptr, x, key, d, nullptr);
+          int cmp = x.compare(m->name);
+          if (cmp == 0) return create(m->l, x, key, d, m->r);  // replaced: new key, new data
+          if (cmp < 0) return bal(add(m->l, x, key, d), m->name, m->key, m->d, m->r);
+          return bal(m->l, m->name, m->key, m->d, add(m->r, x, key, d));
+        };
+        T root;
+        for (auto& e : es) root = add(root, e.name, e.key, o::vblock(0, {e.a, e.b, e.ty}));
+        std::function<o::ValPtr(const T&)> emit = [&](const T& t) -> o::ValPtr {
+          if (!t) return o::vint(0);
+          return o::vblock(0, {emit(t->l), t->key, t->d, emit(t->r), o::vint(t->h)});
+        };
+        return emit(root);
       };
       // self type: an OPEN object over the public methods (row ends in a Tvar
       // shared with csig_self_row).  Built up front as a patched placeholder so
@@ -2706,33 +2811,218 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       // back-reference to THIS node -- Printtyp then aliases the self row and
       // prints `object ('a) .. method m : unit -> 'a end` (pr7293).
       if (it.class_self) te.shared_nodes[it.class_self.get()] = self;
+      // copy_spine over the emitted graph, guided by what type_approx had
+      // materialized (f.approx): a fresh Tarrow / Ttuple / Tconstr / Tpoly per
+      // template node, everything the template calls a variable shared.  'F'
+      // copies the whole spine.  A copied Tconstr takes a fresh abbrev ref.
+      static const cmiw::Approx approx_var{};
+      std::function<o::ValPtr(const o::ValPtr&, const cmiw::Approx&)> spine =
+          [&](const o::ValPtr& t, const cmiw::Approx& a) -> o::ValPtr {
+        if (clsitem_off || a.k == 'V' || a.k == 'S' || !t || t->k != o::Value::Block ||
+            t->fields.size() != 4) return t;
+        const o::ValPtr& d = t->fields[0];
+        if (!d || d->k != o::Value::Block) return t;
+        bool full = a.k == 'F';
+        auto kid = [&](std::size_t i) -> const cmiw::Approx& {
+          return full ? a : i < a.kids.size() ? a.kids[i] : approx_var;
+        };
+        switch (d->tag) {
+          case 1: {                                                    // Tarrow
+            if (!full && a.k != 'A') return t;
+            // the domain's Tpoly wrapper is filter_arrow's: on the spine
+            o::ValPtr dom = d->fields[1];
+            if (dom && dom->k == o::Value::Block && dom->fields.size() == 4 &&
+                dom->fields[0]->k == o::Value::Block && dom->fields[0]->tag == 8)
+              dom = te.texpr(o::vblock(8, {spine(dom->fields[0]->fields[0], kid(0)),
+                                           dom->fields[0]->fields[1]}));
+            else dom = spine(dom, kid(0));
+            return te.texpr(o::vblock(1, {d->fields[0], dom, spine(d->fields[2], kid(1)),
+                                          d->fields[3]}));
+          }
+          case 2: {                                                    // Ttuple
+            if (!full && a.k != 'T') return t;
+            std::vector<o::ValPtr> es; std::size_t i = 0;
+            for (o::ValPtr c = d->fields[0]; c && c->k == o::Value::Block; c = c->fields[1], ++i)
+              es.push_back(o::vblock(0, {c->fields[0]->fields[0],
+                                         spine(c->fields[0]->fields[1], kid(i))}));
+            return te.texpr(o::vblock(2, {es.empty() ? o::vint(0) : o::vlist(es)}));
+          }
+          case 3: {                                                    // Tconstr
+            if (!full && a.k != 'C') return t;
+            std::vector<o::ValPtr> as; std::size_t i = 0;
+            for (o::ValPtr c = d->fields[1]; c && c->k == o::Value::Block; c = c->fields[1], ++i)
+              as.push_back(spine(c->fields[0], kid(i)));
+            return te.texpr(o::vblock(3, {d->fields[0], as.empty() ? o::vint(0) : o::vlist(as),
+                                          o::vblock(0, {o::vint(0)})}));
+          }
+          case 8:                                                      // Tpoly
+            if (!full) return t;
+            return te.texpr(o::vblock(8, {spine(d->fields[0], a), d->fields[1]}));
+          case 9:                                                      // Tpackage
+            if (!full) return t;
+            return te.texpr(o::vblock(9, {d->fields[0]}));
+          default: return t;
+        }
+      };
+      // A node from which the self type is reachable is generic (an ancestor
+      // of the row variable under limited_generalize), so every instance of
+      // the class copies it: the closed object's and the hash type's copies
+      // of a self-citing method type (`method s = self`) are fresh nodes over
+      // THEIR object; everything not reaching self stays shared.
+      std::unordered_map<const o::Value*, bool> reach_memo;
+      std::function<bool(const o::ValPtr&)> reaches_self = [&](const o::ValPtr& t) -> bool {
+        if (!t || t->k != o::Value::Block || t->fields.size() != 4) return false;
+        if (t == self) return true;
+        auto f = reach_memo.find(t.get());
+        if (f != reach_memo.end()) return f->second;
+        reach_memo[t.get()] = false;  // a back edge: not through here
+        bool r = false;
+        const o::ValPtr& d = t->fields[0];
+        if (d && d->k == o::Value::Block) {
+          auto each = [&](const o::ValPtr& l) {
+            for (o::ValPtr x = l; x && x->k == o::Value::Block; x = x->fields[1])
+              r = reaches_self(x->fields[0]) || r;
+          };
+          switch (d->tag) {
+            case 1: r = reaches_self(d->fields[1]) | reaches_self(d->fields[2]); break;   // Tarrow
+            case 2: for (o::ValPtr x = d->fields[0]; x && x->k == o::Value::Block; x = x->fields[1])
+                      r = reaches_self(x->fields[0]->fields[1]) || r; break;             // Ttuple
+            case 3: each(d->fields[1]); break;                                            // Tconstr
+            case 4: r = reaches_self(d->fields[0]);                                       // Tobject
+                    if (d->fields[1]->k == o::Value::Block && d->fields[1]->fields[0]->k == o::Value::Block)
+                      each(d->fields[1]->fields[0]->fields[0]->fields[1]);
+                    break;
+            case 5: r = reaches_self(d->fields[2]) | reaches_self(d->fields[3]); break;   // Tfield
+            case 8: r = reaches_self(d->fields[0]); break;                                // Tpoly
+            default: break;
+          }
+        }
+        reach_memo[t.get()] = r;
+        return r;
+      };
+      std::function<o::ValPtr(const o::ValPtr&, const o::ValPtr&,
+                              std::unordered_map<const o::Value*, o::ValPtr>&)> subst_self =
+          [&](const o::ValPtr& t, const o::ValPtr& target,
+              std::unordered_map<const o::Value*, o::ValPtr>& memo) -> o::ValPtr {
+        if (t == self) return target;
+        if (!reaches_self(t)) return t;
+        auto f = memo.find(t.get());
+        if (f != memo.end()) return f->second;
+        o::ValPtr shell = te.texpr(o::vint(0));
+        memo[t.get()] = shell;
+        const o::ValPtr& d = t->fields[0];
+        auto sub = [&](const o::ValPtr& x) { return subst_self(x, target, memo); };
+        auto lst = [&](const o::ValPtr& l) {
+          std::vector<o::ValPtr> out;
+          for (o::ValPtr x = l; x && x->k == o::Value::Block; x = x->fields[1]) out.push_back(sub(x->fields[0]));
+          return out.empty() ? o::vint(0) : o::vlist(out);
+        };
+        o::ValPtr nd;
+        switch (d->tag) {
+          case 1: nd = o::vblock(1, {d->fields[0], sub(d->fields[1]), sub(d->fields[2]), d->fields[3]}); break;
+          case 2: {
+            std::vector<o::ValPtr> es;
+            for (o::ValPtr x = d->fields[0]; x && x->k == o::Value::Block; x = x->fields[1])
+              es.push_back(o::vblock(0, {x->fields[0]->fields[0], sub(x->fields[0]->fields[1])}));
+            nd = o::vblock(2, {es.empty() ? o::vint(0) : o::vlist(es)}); break;
+          }
+          case 3: nd = o::vblock(3, {d->fields[0], lst(d->fields[1]), o::vblock(0, {o::vint(0)})}); break;
+          case 4: {
+            o::ValPtr nm = d->fields[1];
+            if (nm->k == o::Value::Block && nm->fields[0]->k == o::Value::Block) {
+              const o::ValPtr& pr = nm->fields[0]->fields[0];
+              nm = o::vblock(0, {o::vblock(0, {o::vblock(0, {pr->fields[0], lst(pr->fields[1])})})});
+            } else nm = o::vblock(0, {o::vint(0)});
+            nd = o::vblock(4, {sub(d->fields[0]), nm}); break;
+          }
+          case 5: nd = o::vblock(5, {d->fields[0], d->fields[1], sub(d->fields[2]), sub(d->fields[3])}); break;
+          case 8: nd = o::vblock(8, {sub(d->fields[0]), d->fields[1]}); break;
+          default: memo[t.get()] = t; return t;  // a row / package citing self: kept
+        }
+        shell->fields[0] = nd;
+        return shell;
+      };
+      struct Meth { std::string name; o::ValPtr P; bool priv, virt; };
+      std::vector<Meth> meths;             // public methods, source order
       std::vector<MapEnt> vars_m, meths_m;
       std::vector<std::string> mnames;
-      std::vector<o::ValPtr> memit;  // each public method's emitted type node
-      std::vector<TyPtr> mtys;       // for cty_new
+      std::vector<TyPtr> mtys;             // the closed object placeholder
       for (auto& f : it.class_fields) {
         if (f.is_method) {
-          o::ValPtr priv = f.priv ? o::vblock(0, {o::vint(2) /*FKabsent*/})  // Mprivate
-                                  : o::vint(0);                              // Mpublic
           o::ValPtr fty = f.self_ref ? self : te.emit(f.ty);
-          o::ValPtr mty = te.texpr(o::vblock(8, {fty, o::vint(0)}));  // Tpoly(ty,[])
-          meths_m.push_back({f.name, o::vblock(0, {priv, o::vint(f.virt ? 0 : 1), mty})});
-          if (!f.priv) { mnames.push_back(f.name); memit.push_back(fty); mtys.push_back(f.ty); }
+          o::ValPtr P = te.texpr(o::vblock(8, {fty, o::vint(0)}));  // Tpoly(ty,[])
+          o::ValPtr M = f.approx.k == 'S' && !clsitem_off
+              ? P : te.texpr(o::vblock(8, {spine(fty, f.approx), o::vint(0)}));
+          o::ValPtr priv = f.priv
+              ? (clsitem_off ? o::vblock(0, {o::vint(2)})
+                             : o::vblock(0, {o::vblock(0, {o::vint(2)})}))  // Mprivate(FKvar{FKabsent})
+              : o::vint(0);                                                  // Mpublic
+          meths_m.push_back({f.name, lblstr("m:" + f.name), priv, o::vint(f.virt ? 0 : 1), M});
+          if (!f.priv) {
+            meths.push_back({f.name, P, f.priv, f.virt});
+            mnames.push_back(f.name); mtys.push_back(f.ty);
+          }
         } else {
-          vars_m.push_back({f.name, o::vblock(0, {o::vint(f.mut ? 1 : 0),
-                                                  o::vint(f.virt ? 0 : 1), te.emit(f.ty)})});
+          vars_m.push_back({f.name, lblstr("v:" + f.name), o::vint(f.mut ? 1 : 0),
+                            o::vint(f.virt ? 0 : 1), te.emit(f.ty)});
         }
       }
-      o::ValPtr chain = row_var;
-      for (std::size_t m = mnames.size(); m-- > 0;) {
-        o::ValPtr pty = te.texpr(o::vblock(8, {memit[m], o::vint(0)}));  // Tpoly
-        chain = te.texpr(o::vblock(5, {o::vstr(mnames[m]), o::vint(1) /*FKpublic*/,
-                                       pty, chain}));  // Tfield
-      }
-      self->fields[0] = o::vblock(4, {chain, o::vblock(0, {o::vint(0)})});  // Tobject
-      auto csig = o::vblock(0, {self, row_var, o::vint(2) /*dummy FKabsent*/,
-                                build_map(std::move(vars_m)), build_map(std::move(meths_m))});
-      o::ValPtr cty = o::vblock(1, {csig});  // Cty_signature
+      // A field chain over the public methods in `order`, ending in `tail`,
+      // for the object `target` (its self-citing method types re-copied).
+      auto chain_of = [&](const std::vector<std::size_t>& order, o::ValPtr tail,
+                          const o::ValPtr& target) {
+        std::unordered_map<const o::Value*, o::ValPtr> memo;
+        o::ValPtr c = tail;
+        for (std::size_t k = order.size(); k-- > 0;) {
+          const Meth& m = meths[order[k]];
+          o::ValPtr ty = target == self || clsitem_off ? m.P : subst_self(m.P, target, memo);
+          c = te.texpr(o::vblock(5, {lblstr("m:" + m.name), o::vint(1) /*FKpublic*/,
+                                     ty, c}));  // Tfield
+        }
+        return c;
+      };
+
+      std::vector<std::size_t> src_order(meths.size()), sorted_order;
+      for (std::size_t k = 0; k < meths.size(); ++k) src_order[k] = k;
+      sorted_order = src_order;
+      std::sort(sorted_order.begin(), sorted_order.end(), [&](std::size_t a, std::size_t b) {
+        return meths[a].name < meths[b].name;
+      });
+      auto cpath = pident_local(it.name, s_ty);
+      // cty_params: the `['a, _] c` type params -- the class's own nodes,
+      // cited by every item and by the objects' names.
+      std::vector<o::ValPtr> pnodes;
+      for (std::size_t pi = 0; pi < it.class_params.size(); ++pi)
+        // A self-typed param (`object (self : 'a)`) shares the SAME node as
+        // csig_self, so Printtyp aliases it and prints `object ('a) constraint`.
+        pnodes.push_back((int)pi == it.class_self_param ? self
+                                                        : te.emit(it.class_params[pi]));
+      // The class params as `target`'s instance sees them (a self-typed param
+      // is that object).
+      auto params_for = [&](const o::ValPtr& target) {
+        std::vector<o::ValPtr> ps;
+        for (auto& p : pnodes) ps.push_back(p == self ? target : p);
+        return ps;
+      };
+      auto cty_params = [&] {  // a fresh list per item (List.map)
+        if (pnodes.empty()) return o::vint(0);
+        return o::vlist(pnodes);
+      };
+      // ref (Some (Pident ghost, rv :: params)) -- Ctype.set_object_name
+      auto nominal = [&](const o::ValPtr& rv, const o::ValPtr& target) -> o::ValPtr {
+        if (clsitem_off) return o::vblock(0, {o::vint(0)});  // ref None
+        std::vector<o::ValPtr> l{rv};
+        for (auto& p : params_for(target)) l.push_back(p);
+        return o::vblock(0, {o::vblock(0, {o::vblock(0, {cpath, o::vlist(l)})})});
+      };
+      self->fields[0] = o::vblock(4, {chain_of(src_order, row_var, self),
+                                      nominal(row_var, self)});  // Tobject
+      auto csig = [&] {  // a fresh record and fresh maps per item
+        return o::vblock(0, {self, row_var, o::vint(2) /*dummy FKabsent*/,
+                             build_map(vars_m), build_map(meths_m)});
+      };
+      o::ValPtr cty = o::vblock(1, {csig()});  // Cty_signature (Sig_class)
+      o::ValPtr body_cty = clsitem_off ? cty : o::vblock(1, {csig()});  // Btype.class_body (Sig_class_type)
       // An ALIAS class (`class c = with_param args`) or a NAMED class-type
       // annotation (`class b : B.a = object..end`): the stored class type
       // is Cty_constr(target, [], inner) -- Printtyp prints `class c :
@@ -2746,7 +3036,10 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         } else {
           cp = te.type_path(it.class_constr_ref);  // local-mod / global Pdot chain
         }
-        if (cp) cty = o::vblock(0, {cp, o::vint(0) /*[]*/, cty});  // Cty_constr
+        if (cp) {
+          cty = o::vblock(0, {cp, o::vint(0) /*[]*/, cty});  // Cty_constr
+          body_cty = clsitem_off ? cty : o::vblock(0, {cp, o::vint(0), body_cty});
+        }
       }
       for (std::size_t p = it.class_arrow_doms.size(); p-- > 0;) {
         int lk = p < it.class_arrow_lks.size() ? it.class_arrow_lks[p] : 0;
@@ -2759,7 +3052,20 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         if (lk == 2 && !(dom->k == Ty::Constr && dom->name == "option"))
           dom = ty_constr("option", {dom});  // optional param's stored domain
         cty = o::vblock(2, {lbl, te.emit(dom), cty});  // Cty_arrow
+        if (clsitem_off) body_cty = cty;
       }
+      // The CLOSED object of the public methods (sorted, row Tnil, unnamed):
+      // cty_new's result and the ghost type's manifest, one node.
+      TyPtr closed_ty = ty_object(mnames, mtys);  // placeholder Ty for the arrows
+      o::ValPtr closed;
+      if (clsitem_off) {
+        closed = te.emit(closed_ty);
+      } else {
+        closed = te.texpr(o::vint(0));
+        closed->fields[0] = o::vblock(4, {chain_of(sorted_order, te.texpr(o::vint(0)) /*Tnil*/, closed),
+                                          o::vblock(0, {o::vint(0)})});  // Tobject(.., ref None)
+      }
+      te.shared_nodes[closed_ty.get()] = closed;
       // cty_new: None for a virtual class; else the constructor's value type
       // params -> <closed object of public methods>
       o::ValPtr cnew;
@@ -2769,58 +3075,67 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         // alias class: ocamlc stores cty_new = Tconstr(target's ghost type)
         cnew = o::vblock(0, {te.emit(ty_constr(it.class_constr_ref, {}))});
       } else {
-        TyPtr nt = ty_object(mnames, mtys);
+        TyPtr nt = closed_ty;
         for (std::size_t p = it.class_arrow_doms.size(); p-- > 0;)
           nt = ty_arrow_lbl(it.class_arrow_doms[p], nt,
                             p < it.class_arrow_lks.size() ? it.class_arrow_lks[p] : 0,
                             p < it.class_arrow_lbls.size() ? it.class_arrow_lbls[p] : "");
         cnew = o::vblock(0, {te.emit(nt)});
       }
-      auto cpath = pident_local(it.name, s_ty);
-      // cty_params : the `['a, _] c` type params, and one Variance per param
-      // (Variance.unknown = 7 -- Printtyp shows nothing, as the oracle does).
-      auto cty_params = [&] {
+      te.shared_nodes.erase(closed_ty.get());  // the placeholder's address may be reused
+      // The class's variance signature (Typedecl_variance.update_class_decls,
+      // computed by the checker), Variance.unknown (7) per param where it is
+      // not.  ONE list, cited by the four declarations.
+      o::ValPtr variance = [&] {
         if (it.class_params.empty()) return o::vint(0);
-        std::vector<o::ValPtr> ps;
+        std::vector<o::ValPtr> v;
         for (std::size_t pi = 0; pi < it.class_params.size(); ++pi)
-          // A self-typed param (`object (self : 'a)`) shares the SAME node as
-          // csig_self, so Printtyp aliases it and prints `object ('a) constraint`.
-          ps.push_back((int)pi == it.class_self_param ? self
-                                                      : te.emit(it.class_params[pi]));
-        return o::vlist(ps);
-      };
-      auto cty_variance = [&] {
-        if (it.class_params.empty()) return o::vint(0);
-        std::vector<o::ValPtr> v(it.class_params.size(), o::vint(7));
+          v.push_back(o::vint(!clsitem_off && it.class_variances.size() == it.class_params.size()
+                                  ? it.class_variances[pi] : 7));
+        return o::vlist(v);
+      }();
+      auto cty_variance = [&]() -> o::ValPtr {
+        if (it.class_params.empty() || !clsitem_off) return variance;
+        std::vector<o::ValPtr> v(it.class_params.size(), o::vint(7));  // a list per use
         return o::vlist(v);
       };
       if (!it.class_is_type) {
         auto cdecl = o::vblock(0, {cty_params(), cty, cpath, cnew,
-                                   cty_variance(), loc_none(),
-                                   o::vint(0) /*attrs*/, emit_uid(it.uid)});
+                                   cty_variance(), cloc,
+                                   o::vint(0) /*attrs*/, clsitem_off ? cuid_() : cuid});
         sig.push_back(o::vblock(5, {ident, cdecl, o::vint(rs),
                                     o::vint(0) /*Exported*/}));  // Sig_class
       }
-      // ghost type_declaration builder (14 fields, no params); the class's
-      // uid is the hash type's and the ghost's too (typeclass.ml `cl_td`)
-      auto mk_tdecl = [&](o::ValPtr man) {
-        return o::vblock(0, {o::vint(0), o::vint(0),
-                             o::vblock(0, {o::vint(0)}) /*Type_abstract*/,
+      // The hash type (`#c`) and the ghost type (`c`): abstract declarations
+      // over the class's params whose manifests are the open and the closed
+      // object; the class's loc and uid are theirs too (typeclass.ml `cl_td`)
+      auto mk_tdecl = [&](o::ValPtr man, const o::ValPtr& target) {
+        std::size_t n = clsitem_off ? 0 : it.class_params.size();
+        std::vector<o::ValPtr> sep(n, o::vint(2) /*Deepsep*/);
+        return o::vblock(0, {n ? o::vlist(params_for(target)) : o::vint(0), o::vint((long long)n),
+                             o::vblock(0, {o::vint(0)}) /*Type_abstract Definition*/,
                              o::vint(1) /*Public*/, man,
-                             o::vint(0), o::vint(0), o::vint(0), o::vint(0),
-                             loc_none(), o::vint(0), o::vint(0), o::vint(0),
-                             emit_uid(it.uid)});
+                             n ? cty_variance() : o::vint(0),
+                             n ? o::vlist(sep) : o::vint(0),
+                             o::vint(0), o::vint(0),
+                             cloc, o::vint(0), o::vint(0), o::vint(0),
+                             clsitem_off ? cuid_() : cuid});
       };
-      // Sig_class_type: a ghost after a class, the REAL item for `class type`;
-      // shares cty; clty_hash_type is a bare abstract decl
-      auto clty = o::vblock(0, {cty_params(), cty, cpath,
-                                mk_tdecl(o::vint(0)), cty_variance(),
-                                loc_none(), o::vint(0), emit_uid(it.uid)});
-      auto clty_ident = ident_val(0, it.name, s_clty);
+      o::ValPtr hash_man = o::vint(0);  // None
+      o::ValPtr hself = self;
+      if (!clsitem_off) {
+        o::ValPtr hrow = te.texpr(var_none_desc(false));
+        hself = te.texpr(o::vint(0));
+        hself->fields[0] = o::vblock(4, {chain_of(src_order, hrow, hself), nominal(hrow, hself)});
+        hash_man = o::vblock(0, {hself});
+      }
+      // Sig_class_type: a ghost after a class, the REAL item for `class type`
+      auto clty = o::vblock(0, {cty_params(), body_cty, cpath,
+                                mk_tdecl(hash_man, hself), cty_variance(),
+                                cloc, o::vint(0), clsitem_off ? cuid_() : cuid});
       sig.push_back(o::vblock(6, {clty_ident, clty, o::vint(rs), o::vint(0)}));  // Sig_class_type
       // ghost Sig_type c = <closed public object> (what `val o : c` cites)
-      auto ty_ident = ident_val(0, it.name, s_ty);
-      auto g_tdecl = mk_tdecl(o::vblock(0, {te.emit(ty_object(mnames, mtys))}));
+      auto g_tdecl = mk_tdecl(o::vblock(0, {closed}), closed);
       sig.push_back(o::vblock(1, {ty_ident, g_tdecl, o::vint(rs), o::vint(0)}));  // Sig_type
     } else {
       // type_declaration (14 fields).  Type_abstract kind; a manifest makes it an

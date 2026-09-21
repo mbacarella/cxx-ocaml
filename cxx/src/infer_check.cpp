@@ -15988,6 +15988,241 @@ static std::vector<int> compute_decl_variance(
 
 static cmi::cmiw::Loc conv_loc(const ast::Location& l);  // defined below
 
+// --- what Typecore.type_approx materializes of a method's type ---------------
+// The class's first pass runs type_approx over each concrete method's body
+// (typeclass.ml class_field_first), so the csig_meths entry that copy_spine
+// then takes (generalize_class_signature_spine, between the passes) copies
+// exactly the arrows, tuples and constructors approx could see; the rest of
+// the type is one variable then, unified in the second pass, and stays SHARED
+// with the self type's field.  These mirror type_approx / approx_type.
+using cmi::cmiw::Approx;
+static Approx approx_merge(Approx a, Approx b) {  // both unified into one node
+  if (a.k == 'V') return b;
+  if (b.k == 'V' || a.k == 'F') return a;
+  if (b.k == 'F') return b;
+  if (a.k != b.k || a.kids.size() != b.kids.size()) return a;
+  for (std::size_t i = 0; i < a.kids.size(); ++i)
+    a.kids[i] = approx_merge(a.kids[i], b.kids[i]);
+  return a;
+}
+static Approx approx_of_type(const ast::CoreType& t) {  // Typecore.approx_type
+  Approx r;
+  if (auto* ar = std::get_if<ast::Ptyp_arrow>(&t.desc)) {
+    bool opt = std::holds_alternative<ast::Optional>(ar->label);
+    if (std::holds_alternative<ast::Ptyp_poly>(ar->dom->desc)) {
+      if (opt) return r;                       // newvar
+      r.k = 'A'; r.kids = {Approx{'F', {}}, approx_of_type(*ar->cod)};
+      return r;
+    }
+    r.k = 'A';
+    Approx dom;                                // newmono ty1: a var, or `_ option`
+    if (opt) { dom.k = 'C'; dom.kids = {Approx{}}; }
+    r.kids = {dom, approx_of_type(*ar->cod)};
+    return r;
+  }
+  if (auto* tu = std::get_if<ast::Ptyp_tuple>(&t.desc)) {
+    r.k = 'T';
+    for (auto& e : tu->elems) r.kids.push_back(approx_of_type(*e));
+    return r;
+  }
+  if (auto* c = std::get_if<ast::Ptyp_constr>(&t.desc)) {
+    r.k = 'C';
+    for (auto& a : c->args) r.kids.push_back(approx_of_type(*a));
+    return r;
+  }
+  return r;
+}
+static Approx approx_of_pattern(const ast::Pattern& p) {  // type_pattern_approx
+  if (auto* pc = std::get_if<ast::Ppat_constraint>(&p.desc)) {
+    if (std::holds_alternative<ast::Ptyp_poly>(pc->t->desc)) return Approx{'F', {}};
+    return approx_of_type(*pc->t);
+  }
+  return Approx{};
+}
+static bool is_unpack_pat(const ast::Pattern& p) {  // Typecore.is_unpack
+  auto* u = std::get_if<ast::Ppat_unpack>(&p.desc);
+  return u && u->name.txt.has_value();
+}
+static Approx approx_of_expr(const ast::Expression& e);
+static Approx approx_of_function(const ast::Pexp_function& f, std::size_t from) {
+  if (from < f.params.size()) {
+    auto* pv = std::get_if<ast::Pparam_val>(&f.params[from].desc);
+    if (!pv) return Approx{};                  // (type a): give up
+    bool opt = std::holds_alternative<ast::Optional>(pv->label);
+    if (!opt && is_unpack_pat(pv->pat)) return Approx{};
+    Approx dom = approx_of_pattern(pv->pat);
+    if (opt) {                                 // the stored domain is `d option`
+      Approx o; o.k = 'C'; o.kids = {dom};
+      dom = o;
+    }
+    Approx r; r.k = 'A'; r.kids = {dom, approx_of_function(f, from + 1)};
+    return r;
+  }
+  Approx res;
+  if (f.constraint_) {
+    if (auto* pc = std::get_if<ast::Pconstraint>(&*f.constraint_)) res = approx_of_type(*pc->type);
+    else if (auto* co = std::get_if<ast::Pcoerce>(&*f.constraint_)) return approx_of_type(*co->to_);
+  }
+  if (auto* b = std::get_if<ast::Pfunction_body>(&f.body->v)) return approx_merge(res, approx_of_expr(*b->e));
+  if (auto* cs = std::get_if<ast::Pfunction_cases>(&f.body->v)) {
+    if (cs->cases.empty()) return res;
+    Approx r; r.k = 'A'; r.kids = {Approx{}, approx_of_expr(*cs->cases.front().rhs)};
+    return approx_merge(res, r);
+  }
+  return res;
+}
+static Approx approx_of_expr(const ast::Expression& e) {  // Typecore.type_approx
+  if (auto* l = std::get_if<ast::Pexp_let>(&e.desc)) return approx_of_expr(*l->body);
+  if (auto* f = std::get_if<ast::Pexp_function>(&e.desc)) return approx_of_function(*f, 0);
+  if (auto* m = std::get_if<ast::Pexp_match>(&e.desc))
+    return m->cases.empty() ? Approx{} : approx_of_expr(*m->cases.front().rhs);
+  if (auto* t = std::get_if<ast::Pexp_try>(&e.desc)) return approx_of_expr(*t->e);
+  if (auto* tu = std::get_if<ast::Pexp_tuple>(&e.desc)) {
+    Approx r; r.k = 'T';
+    for (auto& x : tu->elems) r.kids.push_back(approx_of_expr(*x));
+    return r;
+  }
+  if (auto* i = std::get_if<ast::Pexp_ifthenelse>(&e.desc)) return approx_of_expr(*i->then_);
+  if (auto* s = std::get_if<ast::Pexp_sequence>(&e.desc)) return approx_of_expr(*s->e2);
+  if (auto* c = std::get_if<ast::Pexp_constraint>(&e.desc))
+    return approx_merge(approx_of_type(*c->t), approx_of_expr(*c->e));
+  if (auto* c = std::get_if<ast::Pexp_coerce>(&e.desc)) return approx_of_type(*c->to_);
+  return Approx{};
+}
+// --- Typedecl_variance.update_class_decls --------------------------------
+// A class's variance signature is compute_variance_type over its GHOST type:
+// the params and, as the manifest, the closed object of its public methods,
+// walked with `covariant`; a param that is a variable takes exactly its
+// occurrences' variance, the self-typed param (`object (s : 'a)`) is the
+// object itself and adds May_pos|May_neg; nothing is strengthened (the
+// declaration is abstract with a manifest).  The group (`class a .. and b`)
+// iterates to a fixed point, a class citing a group member's ghost type
+// composing through the current iterate.
+static void class_ty_variance(Checker& ck, const cmi::cmiw::TyPtr& t, int v,
+                              const std::unordered_map<int, std::size_t>& slot,
+                              std::vector<int>& vari,
+                              const std::map<std::string, std::vector<int>>& group,
+                              std::unordered_map<const cmi::cmiw::Ty*, int>& tvl,
+                              int depth) {
+  using cmi::cmiw::Ty;
+  if (!t || depth > 80) return;
+  int& seen = tvl[t.get()];
+  if ((v & seen) == v) return;          // Variance.subset vari vari'
+  v |= seen; seen = v;
+  auto same = [&](const cmi::cmiw::TyPtr& u) {
+    class_ty_variance(ck, u, v, slot, vari, group, tvl, depth + 1);
+  };
+  switch (t->k) {
+    case Ty::Var:
+      if (auto s = slot.find(t->var); s != slot.end()) vari[s->second] |= v;
+      break;
+    case Ty::Arrow:
+      class_ty_variance(ck, t->args[0], vrn::conjugate(v), slot, vari, group, tvl, depth + 1);
+      same(t->args[1]);
+      break;
+    case Ty::Tuple: for (auto& a : t->args) same(a); break;
+    case Ty::Constr: {
+      if (t->args.empty()) break;
+      std::vector<int> sig;
+      if (auto g = group.find(t->name); g != group.end() && g->second.size() == t->args.size())
+        sig = g->second;
+      if (sig.empty()) {
+        Ptyp_constr pc;
+        auto dot = t->name.rfind('.');
+        if (dot == std::string::npos) pc.id.txt.v = Lident{t->name};
+        else {
+          // M.N.t -> Ldot(Ldot(Lident M, N), t)
+          LongidentBox lid; std::size_t p = 0;
+          for (;;) {
+            auto d = t->name.find('.', p);
+            std::string comp = t->name.substr(p, d == std::string::npos ? std::string::npos : d - p);
+            if (!lid) lid = std::make_shared<Longident>(Longident{Lident{comp}});
+            else lid = std::make_shared<Longident>(Longident{Ldot{lid, comp}});
+            if (d == std::string::npos) break;
+            p = d + 1;
+          }
+          pc.id.txt = *lid;
+        }
+        sig = ck.external_type_variance_sig(pc, t->args.size());
+      }
+      for (std::size_t i = 0; i < t->args.size(); ++i)
+        class_ty_variance(ck, t->args[i],
+                          sig.size() == t->args.size() ? vrn::compose(v, sig[i]) : vrn::UNKNOWN,
+                          slot, vari, group, tvl, depth + 1);
+      break;
+    }
+    case Ty::Object: for (auto& a : t->args) if (a) same(a); break;
+    case Ty::Variant: {
+      std::set<std::string> present(t->pv_present.begin(), t->pv_present.end());
+      bool upper = t->row_kind == 1;
+      for (std::size_t i = 0; i < t->args.size(); ++i) {
+        if (!t->args[i]) continue;
+        int fv = (upper && !present.count(i < t->pv_tags.size() ? t->pv_tags[i] : "")) ? (v & vrn::UNKNOWN) : v;
+        class_ty_variance(ck, t->args[i], fv, slot, vari, group, tvl, depth + 1);
+      }
+      break;
+    }
+    case Ty::Poly: same(t->args[0]); break;
+    case Ty::Package:
+      for (auto& a : t->args)
+        class_ty_variance(ck, a, vrn::compose(v, vrn::INV), slot, vari, group, tvl, depth + 1);
+      break;
+  }
+}
+static void class_group_variances(Checker& ck, std::vector<cmi::cmiw::SigItem>& out,
+                                  std::size_t first) {
+  if (cppcaml::dbg_env("NOCLSITEM")) return;
+  std::map<std::string, std::vector<int>> cur;
+  bool any = false;
+  for (std::size_t i = first; i < out.size(); ++i)
+    if (out[i].k == cmi::cmiw::SigItem::Class && !out[i].class_params.empty()) {
+      cur[out[i].name] = std::vector<int>(out[i].class_params.size(), 0);
+      any = true;
+    }
+  if (!any) return;
+  auto compute = [&](const cmi::cmiw::SigItem& ci) {
+    std::unordered_map<int, std::size_t> slot;
+    std::vector<int> vari(ci.class_params.size(), 0);
+    for (std::size_t pi = 0; pi < ci.class_params.size(); ++pi)
+      if (ci.class_params[pi]->k == cmi::cmiw::Ty::Var && (int)pi != ci.class_self_param)
+        slot[ci.class_params[pi]->var] = pi;
+    std::unordered_map<const cmi::cmiw::Ty*, int> tvl;
+    // the closed object (the bridged self node stands for it): visited
+    // covariant first, then each public method's type
+    if (ci.class_self) tvl[ci.class_self.get()] = vrn::POS;
+    for (auto& f : ci.class_fields)
+      if (f.is_method && !f.priv && f.ty)
+        class_ty_variance(ck, f.ty, vrn::POS, slot, vari, cur, tvl, 1);
+    for (std::size_t pi = 0; pi < ci.class_params.size(); ++pi)
+      if ((int)pi == ci.class_self_param)  // not a Tvar: its occurrences + required (p,n)
+        vari[pi] = (ci.class_self ? tvl[ci.class_self.get()] : vrn::POS) |
+                   vrn::make(true, true, false);
+    return vari;
+  };
+  for (int iter = 0; iter < 16; ++iter) {
+    bool changed = false;
+    for (std::size_t i = first; i < out.size(); ++i) {
+      auto& ci = out[i];
+      if (ci.k != cmi::cmiw::SigItem::Class || ci.class_params.empty()) continue;
+      auto v = compute(ci);
+      auto& slotv = cur[ci.name];
+      for (std::size_t pi = 0; pi < v.size(); ++pi) v[pi] |= slotv[pi];  // property.merge = union
+      if (slotv != v) { slotv = v; changed = true; }
+    }
+    if (!changed) break;
+  }
+  for (std::size_t i = first; i < out.size(); ++i)
+    if (out[i].k == cmi::cmiw::SigItem::Class && !out[i].class_params.empty())
+      out[i].class_variances = cur[out[i].name];
+}
+// A concrete method's entry: the annotation (`method m : t = ..`) is fully
+// written, else what type_approx saw of the body.
+static Approx approx_of_method(const ast::Expression& e) {
+  if (auto* pp = std::get_if<ast::Pexp_poly>(&e.desc))
+    return pp->t ? Approx{'F', {}} : approx_of_expr(*pp->e);
+  return approx_of_expr(e);
+}
+
 static void rewrite_eff_back(const cmi::cmiw::TyPtr& t);  // defined below
 
 // Typedecl_immediacy.compute_decl's abstract-with-manifest arm: the manifest's
@@ -17970,6 +18205,7 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
         ci.k = cmi::cmiw::SigItem::Class;
         ci.class_is_type = !pcd;
         ci.name = d.name.txt;
+        ci.loc = conv_loc(d.loc);
         ci.rec_status = crs; crs = 2;
         ci.class_virtual = (d.virt == VirtualFlag::Virtual);
         std::unordered_map<const I::Type*, int> cvars; int cnext = 0;
@@ -18004,6 +18240,7 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
             f.priv = (pm->priv == PrivateFlag::Private);
             f.virt = (pm->virt == VirtualFlag::Virtual);
             f.ty = bridge_ty_named(ck.from_coretype(*pm->type, tv), cvars, cnext, tv);
+            f.approx.k = 'S';  // a class description's entry IS the field's node
             own_meths.insert(f.name);
             ci.class_fields.push_back(std::move(f));
           } else if (auto* inh = std::get_if<Pctf_inherit>(&cf.desc)) {
@@ -19940,6 +20177,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
       // (mutable/private/virtual) from the AST fields.  Type-parameterized
       // classes (['a] c) aren't representable yet -- skipped.
       int class_rs = 1;  // Trec_first, then Trec_next for the `and` members
+      std::size_t class_first = out.size();
       for (auto& d : pc->decls) {
         const ast::ClassExpr* ce = &d.expr;
         std::vector<const Pcl_fun*> cparams;
@@ -19968,6 +20206,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
           cmi::cmiw::SigItem ci;
           ci.k = cmi::cmiw::SigItem::Class;
           ci.name = d.name.txt;
+          ci.loc = conv_loc(d.loc);
           ci.rec_status = class_rs; class_rs = 2;
           ci.class_virtual = (d.virt == VirtualFlag::Virtual);
           ci.class_constr_ref = ar->second;
@@ -19990,6 +20229,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         cmi::cmiw::SigItem ci;
         ci.k = cmi::cmiw::SigItem::Class;
         ci.name = d.name.txt;
+        ci.loc = conv_loc(d.loc);  // cl.pci_loc: the three items' locations
         ci.rec_status = class_rs; class_rs = 2;
         ci.class_virtual = (d.virt == VirtualFlag::Virtual);
         ci.class_constr_ref = annot_ref;
@@ -20032,7 +20272,15 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         // inferred object's abbrev_args.  Bridge them FIRST (sharing cvars) so a
         // method's `'a` resolves to the same printed var as the class param.
         if (!d.params.empty() && obj && obj->kind == I::Type::Kind::Object &&
-            obj->abbrev_args.size() == d.params.size())
+            obj->abbrev_args.size() == d.params.size()) {
+          // A named param keeps its name at EVERY occurrence (Tvar (Some
+          // "a"), S554): the bridge names a var from cctx.var_names.
+          if (!cppcaml::dbg_env("NOCLSITEM"))
+            for (std::size_t pi = 0; pi < obj->abbrev_args.size(); ++pi)
+              if (auto* pn = std::get_if<Ptyp_var>(&d.params[pi]->desc))
+                if (auto rv = I::Engine::repr(obj->abbrev_args[pi]);
+                    rv && rv->kind == I::Type::Kind::Var)
+                  cctx.var_names[rv.get()] = pn->name;
           for (std::size_t pi = 0; pi < obj->abbrev_args.size(); ++pi) {
             auto pv = cbridge(obj->abbrev_args[pi]);
             // An anonymous param `_` is stored as Tvar(Some "_") so Printtyp
@@ -20041,6 +20289,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
               pv->var_name = "_";
             ci.class_params.push_back(pv);
           }
+        }
         // `object (self : 'a)` or `(self : T as 'a)` where 'a is a class param:
         // the self type IS that param, so record its index -- the writer then
         // shares csig_self with cty_params[idx] and Printtyp shows `object ('a)
@@ -20089,6 +20338,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
             f.priv = (pm->priv == PrivateFlag::Private);
             if (auto* cv = std::get_if<Cfk_virtual>(&pm->kind)) {
               f.virt = true;
+              f.approx.k = 'F';  // the written type is the whole spine
               std::unordered_map<std::string, TypePtr> tv;
               f.ty = cbridge(ck.from_coretype(*cv->type, tv));
             } else if (auto m = mtypes.find(f.name); m != mtypes.end()) {
@@ -20097,6 +20347,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
               // (Printtyp then prints `object ('a) .. method m : 'a end`).
               f.self_ref = object_cites_self(m->second);
               f.ty = cbridge(m->second);
+              f.approx = approx_of_method(*std::get<Cfk_concrete>(pm->kind).e);
             } else {
               f.ty = cmi::cmiw::ty_var(cnext++);
             }
@@ -20129,10 +20380,12 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         }
         out.push_back(std::move(ci));
       }
+      class_group_variances(ck, out, class_first);
     } else if (auto* pct = std::get_if<Pstr_class_type>(&it.desc)) {
       // `class type ct = object .. end`: Sig_class_type + its ghost Sig_type.
       // Member types come straight from the written coretypes.
       int ct_rs = 1;
+      std::size_t class_first = out.size();
       for (auto& d : pct->decls) {
         auto* cs = std::get_if<Pcty_signature>(&d.expr.desc);
         if (!cs) continue;
@@ -20140,6 +20393,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         ci.k = cmi::cmiw::SigItem::Class;
         ci.class_is_type = true;
         ci.name = d.name.txt;
+        ci.loc = conv_loc(d.loc);
         ci.rec_status = ct_rs; ct_rs = 2;
         ci.class_virtual = (d.virt == VirtualFlag::Virtual);
         std::unordered_map<const I::Type*, int> cvars; int cnext = 0;
@@ -20168,6 +20422,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
             f.priv = (pm->priv == PrivateFlag::Private);
             f.virt = (pm->virt == VirtualFlag::Virtual);
             f.ty = bridge_ty_named(ck.from_coretype(*pm->type, tv), cvars, cnext, tv);
+            f.approx.k = 'S';  // a class type's entry IS the field's node
             ci.class_fields.push_back(std::move(f));
           } else if (std::holds_alternative<Pctf_inherit>(cf.desc) ||
                      std::holds_alternative<Pctf_constraint>(cf.desc)) {
@@ -20189,6 +20444,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
                 ci.class_self_param = (int)pi;
         if (ok) out.push_back(std::move(ci));
       }
+      class_group_variances(ck, out, class_first);
     } else if (auto* mb = std::get_if<Pstr_module>(&it.desc)) {
       // A submodule: emit Sig_module so the oracle can resolve `Outer.Inner.x`
       // and so the submodule's runtime field keeps the surrounding value layout
