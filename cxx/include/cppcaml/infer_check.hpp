@@ -241,11 +241,15 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
 // the idents its polymorphic-variant counter-examples reified (same source).
 // `loaded`, when given, receives the units the count read a .cmi for -- what
 // ocamlc's typing imported (cmi::cmiw::cmi_imports builds the crc list).
+// `stamps`, when given, receives the count at each constructor's and label's
+// ident creation, under the writer's uid key (S557): Subst keeps those
+// idents, so their saved stamps are 274 + that count.
 int typing_ident_count(const ast::Structure& s, std::size_t eta_sites = 0,
                        long long pkg_sig = 0,
                        const std::set<std::string>* fexp = nullptr,
                        std::size_t pv_reify = 0,
-                       std::set<std::string>* loaded = nullptr);
+                       std::set<std::string>* loaded = nullptr,
+                       std::map<std::string, long long>* stamps = nullptr);
 // The idents the inferred-signature check allocates for the package types the
 // saved signature's values carry -- `pkg_sig` above, computed off the items
 // the .cmi writer is handed.

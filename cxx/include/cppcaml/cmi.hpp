@@ -448,7 +448,10 @@ struct Import { std::string name; std::string crc; };
 // One signature item, in source order.  A Type item emits Sig_type (it takes no
 // runtime field, so it doesn't shift the value field layout the .cmo expects);
 // a Value item emits Sig_value.
-struct Label { std::string name; bool mut = false; bool atomic = false; TyPtr ty; Uid uid; Loc loc; };  // record field
+struct Label {  // record field
+  std::string name; bool mut = false; bool atomic = false; TyPtr ty; Uid uid; Loc loc;
+  int stamp = 0;  // ld_id's stamp, the one typing created (0: the writer's placeholder)
+};
 // One member of a class body: a val (mut/virt) or a method (priv/virt).
 // What Typecore.type_approx materialized of a method's type in the class's
 // FIRST pass -- the nodes Ctype.generalize_class_signature_spine's copy_spine
@@ -476,6 +479,7 @@ struct Ctor {
                                      // null = ordinary constructor
   Uid uid;
   Loc loc;
+  int stamp = 0;  // cd_id's stamp, the one typing created (0: the writer's placeholder)
 };
 struct SigItem;
 struct SigItem {
@@ -759,12 +763,16 @@ inline std::string uidkey(char kind, const std::string& path,
 // writer's own item-by-item numbering is right only for a file of plain
 // declarations.  A key the pass did not record makes the writer fall back to
 // that numbering for the whole file.
+// `stamps`, when given, is the stamp typing gave each constructor's and
+// label's ident, keyed like `uids` (S557): Subst renames a saved signature's
+// bound idents but keeps those, so they are not the writer's to number.
 std::string write_cmi(const std::string& path, const std::string& modname,
                       const std::vector<SigItem>& items,
                       const std::vector<Import>& imports = {}, bool intf = true,
                       const std::vector<std::string>& src_files = {},
                       int stamp_base = 300, bool cite = true,
-                      const std::map<std::string, int>* uids = nullptr);
+                      const std::map<std::string, int>* uids = nullptr,
+                      const std::map<std::string, int>* stamps = nullptr);
 // The crc list ocamlc's `Env.imports` gives a unit whose typing read the
 // .cmi of every unit in `loaded` (S548): those units with their own CRC,
 // plus every entry with a CRC in each one's crc list (`Persistent_env.

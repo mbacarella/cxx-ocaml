@@ -2813,7 +2813,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         int lstamp = 290;
         std::vector<o::ValPtr> lds;
         for (auto& l : it.ctors[0].inline_record) {
-          auto lid = o::vblock(0, {o::vstr(l.name), o::vint(lstamp++)});  // ld_id
+          auto lid = o::vblock(0, {o::vstr(l.name), o::vint(l.stamp ? l.stamp : lstamp++)});  // ld_id
           lds.push_back(o::vblock(0, {lid, o::vint(l.mut ? 1 : 0) /*ld_mutable*/,
                                       o::vint(l.atomic ? 1 : 0) /*ld_atomic*/, te.emit(l.ty),
                                       loc_none(), o::vint(0) /*attrs*/, emit_uid(l.uid)}));
@@ -3334,13 +3334,13 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         int cstamp = 270;
         std::vector<o::ValPtr> cds;
         for (auto& c : it.ctors) {
-          auto cid = o::vblock(0, {o::vstr(c.name), o::vint(cstamp++)});  // cd_id = Ident.Local
+          auto cid = o::vblock(0, {o::vstr(c.name), o::vint(c.stamp ? c.stamp : cstamp++)});  // cd_id = Ident.Local
           o::ValPtr cargs;
           if (!c.inline_record.empty()) {  // Cstr_record of label_declaration list
             int lstamp = 290;
             std::vector<o::ValPtr> lds;
             for (auto& l : c.inline_record) {
-              auto lid = o::vblock(0, {o::vstr(l.name), o::vint(lstamp++)});  // ld_id
+              auto lid = o::vblock(0, {o::vstr(l.name), o::vint(l.stamp ? l.stamp : lstamp++)});  // ld_id
               lds.push_back(o::vblock(0, {lid, o::vint(l.mut ? 1 : 0) /*ld_mutable*/,
                                           o::vint(l.atomic ? 1 : 0) /*ld_atomic*/, te.emit(l.ty),
                                           emit_loc(l.loc), o::vint(0) /*attrs*/, emit_uid(l.uid)}));
@@ -3362,7 +3362,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         int lstamp = 280;
         std::vector<o::ValPtr> lds;
         for (auto& l : it.labels) {
-          auto lid = o::vblock(0, {o::vstr(l.name), o::vint(lstamp++)});  // ld_id
+          auto lid = o::vblock(0, {o::vstr(l.name), o::vint(l.stamp ? l.stamp : lstamp++)});  // ld_id
           lds.push_back(o::vblock(0, {lid, o::vint(l.mut ? 1 : 0) /*ld_mutable*/,
                                       o::vint(l.atomic ? 1 : 0) /*ld_atomic*/, te.emit(l.ty),
                                       emit_loc(l.loc), o::vint(0) /*attrs*/, emit_uid(l.uid)}));
@@ -3797,12 +3797,48 @@ struct TyIdWalk {
   }
 };
 
+// THE STAMP TYPING GAVE EACH CONSTRUCTOR AND LABEL (S557).  `Subst.signature`
+// renames a saved signature's BOUND idents (`rename_bound_idents`: the types,
+// values, modules ..), which is why those stamps are the writer's contiguous
+// run from `stamp_base`; a constructor's `cd_id` and a label's `ld_id` it
+// copies as they are, so they keep the stamp Typedecl's `Ident.create_local`
+// gave them, in the middle of whatever typing allocated around them.  The
+// counting walk (cppcaml::typing_ident_count) records the counter at each
+// one; this pass hands them to the items, and an item the walk did not
+// record keeps the writer's placeholder.
+static void assign_stamps_mapped(std::vector<SigItem>& items,
+                                 const std::map<std::string, int>& stamps,
+                                 const std::string& path) {
+  auto at = [&](char kind, const std::string& name, int* out) {
+    auto it = stamps.find(uidkey(kind, path, name));
+    if (it != stamps.end()) *out = it->second;
+  };
+  for (SigItem& it : items) {
+    if (it.k == SigItem::Type) {
+      for (auto& ct : it.ctors) {
+        at('c', it.name + "#" + ct.name, &ct.stamp);
+        for (auto& l : ct.inline_record)
+          at('L', it.name + "#" + ct.name + "." + l.name, &l.stamp);
+      }
+      for (auto& l : it.labels) at('l', it.name + "." + l.name, &l.stamp);
+    } else if (it.k == SigItem::Exception) {
+      for (auto& ct : it.ctors)
+        for (auto& l : ct.inline_record)
+          at('L', it.name + "#" + ct.name + "." + l.name, &l.stamp);
+    } else if (it.k == SigItem::Module || it.k == SigItem::Modtype) {
+      assign_stamps_mapped(it.sub, stamps,
+                           path.empty() ? it.name : path + "." + it.name);
+    }
+  }
+}
+
 std::string write_cmi(const std::string& path, const std::string& modname,
                       const std::vector<SigItem>& items_in,
                       const std::vector<Import>& imports, bool intf,
                       const std::vector<std::string>& src_files,
                       int stamp_base, bool cite,
-                      const std::map<std::string, int>* uids) {
+                      const std::map<std::string, int>* uids,
+                      const std::map<std::string, int>* stamps) {
   g_share.clear();              // the shared-value tables are per-cmi
   g_cmi_src_files = src_files;  // resolve position file_ids to pos_fname (emit_loc)
   std::vector<SigItem> items = items_in;  // mutable copy: uids assigned in place
@@ -3814,6 +3850,7 @@ std::string write_cmi(const std::string& path, const std::string& modname,
     int uid_counter = 0;
     assign_uids(items, modname, intf, uid_counter);
   }
+  if (stamps) assign_stamps_mapped(items, *stamps, "");
   std::map<std::string, bool> referenced;  // cited global unit -> needs real CRC
   int stamp = stamp_base;
   auto sig = emit_sig_items(items, referenced, stamp);

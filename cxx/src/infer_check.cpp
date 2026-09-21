@@ -21884,6 +21884,15 @@ bool etastamp_off() {
   static const bool off = dbg_env("NOETASTAMP") != nullptr;
   return off;
 }
+// S557: a label's / constructor's ident is the one Typedecl created, so its
+// stamp is the counter's value at that point of the walk -- the unit loads a
+// citation pays are charged where the citation stands, and a type
+// declaration is walked in transl_declaration's order (`NOLDSTAMP=1`
+// reverts: the placeholder stamps, every load summed at the end).
+bool ldstamp_off() {
+  static const bool off = dbg_env("NOLDSTAMP") != nullptr;
+  return off;
+}
 
 // ---- WHAT A DISCARDED MODULE DOES NOT PAY --------------------------------
 // `module M : sig end = struct module S = Set.Make (X) end` binds S behind an
@@ -21982,6 +21991,85 @@ static bool cmi_poly_used(const cmi::Signature& sg);
 
 struct Cites {
   std::set<std::string> units;  // heads that may name a persistent unit
+  // ---- WHERE A UNIT IS FIRST CITED (S557) ----------------------------------
+  // The .cmi a citation reads is forced where the citation is TYPED, so the
+  // idents that costs come before whatever typing creates next: `type t = {
+  // x : int list; y : Hashtbl.statistics }` gives x 275 and y 317.  Every
+  // structure item, constructor, label and manifest the walk enters is an
+  // anchor (its parsetree node); a unit remembers the anchor it was first
+  // cited under, `cost` sums each anchor's charges into `acost_`, and the
+  // counting walk pays them when it reaches the node.
+  // A second force of the unit -- an applied member's result, a constructor
+  // met at a fixed type -- is paid where the TRIGGER stands: the first
+  // application of one of its members (`app_anchor_`), the first meet
+  // (`xf_anchor_`), whichever the walk reached first.
+  struct At { long long ord = 0; const void* node = nullptr; };
+  long long anchor_ord_ = 0;
+  At anchor_;
+  std::map<std::string, At> first_anchor_, app_anchor_, xf_anchor_;
+  std::map<std::string, At> bare_app_anchor_;  // a bare name's first application
+  std::map<const void*, long long> acost_;
+  struct Anchor {
+    Cites& c; At sv;
+    Anchor(Cites& c, const void* a) : c(c), sv(c.anchor_) {
+      if (a != sv.node) c.anchor_ = At{++c.anchor_ord_, a};
+    }
+    ~Anchor() { c.anchor_ = sv; }
+  };
+  void anchor_first(const std::string& k) {
+    if (!ldstamp_off()) first_anchor_.emplace(k, anchor_);
+    static const bool trace = dbg_env("CITETRACE") != nullptr;
+    if (trace) fprintf(stderr, "ANCHOR first %s @%p #%lld\n", k.c_str(), anchor_.node, anchor_.ord);
+  }
+  static const At* at_of(const std::map<std::string, At>& m,
+                         const std::string& k) {
+    auto it = m.find(k);
+    return it == m.end() ? nullptr : &it->second;
+  }
+  static const At* earlier(const At* a, const At* b) {
+    return !a ? b : !b ? a : a->ord <= b->ord ? a : b;
+  }
+  static const void* node(const At* a) { return a ? a->node : nullptr; }
+  // The first citation of `k` (a unit, or `unit.sub`), else of `back`.
+  const At* cite_at(const std::string& k, const std::string& back = "") const {
+    if (auto* a = at_of(first_anchor_, k)) return a;
+    // A submodule reached only through a local alias is read where the
+    // alias is first used (`module MP = Gc.Memprof` loads Memprof at the
+    // first `MP.`).
+    const At* best = nullptr;
+    for (auto* am : {&subalias, &alias})
+      for (auto& e : *am)
+        if (e.second == k) best = earlier(best, at_of(first_anchor_, e.first));
+    return best ? best : at_of(first_anchor_, back);
+  }
+  const void* cite_anchor(const std::string& k,
+                          const std::string& back = "") const {
+    return node(cite_at(k, back));
+  }
+  // The earliest trigger of a second force of `k`: a member applied by its
+  // qualified name, a meet, or -- under an `open` of it (`sg` its
+  // signature) -- a member applied by its bare name.  Null when none.
+  const At* force_at(const std::string& k,
+                     const cmi::Signature* sg = nullptr) const {
+    const At* best = nullptr;
+    for (auto* m : {&app_anchor_, &xf_anchor_}) best = earlier(best, at_of(*m, k));
+    // .. or through a local alias of it (`module MP = Gc.Memprof`).
+    for (auto* am : {&subalias, &alias})
+      for (auto& e : *am)
+        if (e.second == k)
+          for (auto* m : {&app_anchor_, &xf_anchor_})
+            best = earlier(best, at_of(*m, e.first));
+    if (sg)
+      for (auto& b : bare_app_anchor_)
+        if (find_val(*sg, b.first)) best = earlier(best, &b.second);
+    return best;
+  }
+  const void* force_anchor(const std::string& k,
+                           const std::string& back = "",
+                           const cmi::Signature* sg = nullptr) const {
+    const At* a = force_at(k, sg);
+    return a ? a->node : cite_anchor(k, back);
+  }
   // The units `cost` read a .cmi for, by their module names: what ocamlc's
   // `Persistent_env` imports (S548, `cmi_imports`).
   std::set<std::string> loaded;
@@ -22155,6 +22243,7 @@ struct Cites {
     if (m.empty() || m == "Stdlib") return;
     if (!std::isupper((unsigned char)m[0])) return;
     units.insert(m);
+    anchor_first(m);
     if (live_local(m) <= 0) pre.insert(m);
   }
   void bind_mod(const StrOptLoc& n) {
@@ -22681,6 +22770,7 @@ struct Cites {
         // the same as the dotted spelling: `Effect.Deep.get_callstack`.
         add(ow);
         members[ow].insert(hd->name);
+        anchor_first(ow + "." + hd->name);
         submembers[ow + "." + hd->name].insert(d->name);
         return;
       }
@@ -22688,11 +22778,17 @@ struct Cites {
       if (auto* l = hd) {
         // `Stdlib.List.map` loads Stdlib__List though Stdlib is free.
         if (l->name == "Stdlib") add(d->name);
-        else members[l->name].insert(d->name);
+        else {
+          members[l->name].insert(d->name);
+          anchor_first(l->name + "." + d->name);
+        }
       } else if (auto* q = std::get_if<Ldot>(&d->prefix->v)) {
         auto* h = std::get_if<Lident>(&q->prefix->v);
         if (h && h->name == "Stdlib") members[q->name].insert(d->name);
-        else if (h) submembers[h->name + "." + q->name].insert(d->name);
+        else if (h) {
+          submembers[h->name + "." + q->name].insert(d->name);
+          anchor_first(h->name + "." + q->name);
+        }
       }
     } else if (modpos) {
       add(std::get<Lident>(id.v).name);
@@ -22713,11 +22809,15 @@ struct Cites {
     auto note = [&](const std::string& key, const std::string& n) {
       if (applied[key][n] < nargs) applied[key][n] = nargs;
       ainf[key][n] |= inf;
+      if (!ldstamp_off()) app_anchor_.emplace(key, anchor_);
+      static const bool trace = dbg_env("CITETRACE") != nullptr;
+      if (trace) fprintf(stderr, "ANCHOR app %s.%s @%p #%lld\n", key.c_str(), n.c_str(), anchor_.node, anchor_.ord);
     };
     const Longident& id = i->id.txt;
     if (auto* l = std::get_if<Lident>(&id.v)) {
       if (!l->name.empty() && !std::isupper((unsigned char)l->name[0])) {
         if (applied_bares[l->name] < nargs) applied_bares[l->name] = nargs;
+        if (!ldstamp_off()) bare_app_anchor_.emplace(l->name, anchor_);
         ainf_bares[l->name] |= inf;
       }
       return;
@@ -22957,8 +23057,12 @@ struct Cites {
   void meet_head(const Exp& x) {
     if (fixmeet_off() || !x.known()) return;
     if (x.c && x.c->kind != cmi::TypeExpr::Tvar) {
-      if (x.sg && x.c->kind == cmi::TypeExpr::Tconstr)
+      if (x.sg && x.c->kind == cmi::TypeExpr::Tconstr) {
         head_load(x.c, *x.sg, xmeets_[x.head], 1);
+        if (!ldstamp_off()) xf_anchor_.emplace(x.head, anchor_);
+        static const bool trace = dbg_env("CITETRACE") != nullptr;
+        if (trace) fprintf(stderr, "ANCHOR xmeets %s @%p #%lld\n", x.head.c_str(), anchor_.node, anchor_.ord);
+      }
       return;
     }
     xmeet(exp_unit(x));
@@ -23697,7 +23801,12 @@ struct Cites {
     return {};
   }
   void xmeet(const std::string& u) {
-    if (!u.empty() && !xuni_off()) xforce.insert(u);
+    if (!u.empty() && !xuni_off()) {
+      xforce.insert(u);
+      if (!ldstamp_off()) xf_anchor_.emplace(u, anchor_);
+      static const bool trace = dbg_env("CITETRACE") != nullptr;
+      if (trace) fprintf(stderr, "ANCHOR xmeet %s @%p #%lld\n", u.c_str(), anchor_.node, anchor_.ord);
+    }
   }
   static bool tdecl_off() {
     static const bool off = dbg_env("NOTDECLF") != nullptr;
@@ -24257,19 +24366,37 @@ struct Cites {
     if (auto* t = std::get_if<Pcstr_tuple>(&a)) {
       for (auto& x : t->elems) ty(*x);
     }
-    else for (auto& f : std::get<Pcstr_record>(a).fields) ty(*f.type);
+    else for (auto& f : std::get<Pcstr_record>(a).fields) {
+      // an inline label's type is read before its ident is created
+      Anchor an(*this, ldstamp_off() ? anchor_.node : (const void*)&f);
+      ty(*f.type);
+    }
   }
-  void tdecl(const TypeDeclaration& d) {
+  // `tf_later`: the caller runs `tf_tdecl` itself, under the item's end
+  // anchor (a structure's `item` below).
+  void tdecl(const TypeDeclaration& d, bool tf_later = false) {
     tbound_.insert(d.name.txt);
     for (auto& p : d.params) ty(*p);
-    if (d.manifest) {
+    // transl_declaration's order (S557): the constraints, the kind (a
+    // constructor's ident before its arguments, a label's type before its
+    // ident), the manifest last.
+    const bool ord = !ldstamp_off();
+    auto manifest = [&] {
+      if (!d.manifest) return;
+      Anchor an(*this, ord ? (const void*)&d : anchor_.node);
       const bool dv = dpos_;
       dpos_ = true;
       tyx(**d.manifest);
       dpos_ = dv;
-    }
+    };
+    auto constraints = [&] {
+      for (auto& c : d.constraints) { ty(*c.t1); ty(*c.t2); }
+    };
+    if (!ord) manifest();
+    if (ord) constraints();
     if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
       for (auto& c : v->ctors) {
+        Anchor an(*this, ord ? (const void*)&c : anchor_.node);
         cargs(c.args);
         if (c.res) ty(**c.res);
         std::vector<const CoreType*>& as = lctors_[c.name.txt];
@@ -24280,13 +24407,25 @@ struct Cites {
     } else if (auto* r = std::get_if<Ptype_record>(&d.kind)) {
       // A record's fields are expanded besides, to decide whether the whole
       // of it is a float record; a VARIANT's arguments are not.
-      for (auto& f : r->fields) tyx(*f.type);
+      for (auto& f : r->fields) {
+        Anchor an(*this, ord ? (const void*)&f : anchor_.node);
+        tyx(*f.type);
+      }
       for (auto& f : r->fields) llabels_[f.name.txt] = f.type.get();
     }
-    for (auto& c : d.constraints) { ty(*c.t1); ty(*c.t2); }
-    if (!tdecl_off()) tf_tdecl(d);
+    if (!ord) constraints();
+    if (ord) manifest();
+    // The second lookups come after the group is translated: under the
+    // item's END anchor (`item` below) when the caller takes them.
+    if (!tdecl_off() && !tf_later) tf_tdecl(d);
+  }
+  // The node the charges of what a structure item does AFTER its
+  // declarations' idents are paid under.
+  static const void* item_end(const StructureItem& it) {
+    return (const char*)&it + 1;
   }
   void ext(const ExtensionConstructor& c) {
+    Anchor an(*this, ldstamp_off() ? anchor_.node : (const void*)&c);
     if (auto* d = std::get_if<Pext_decl>(&c.kind)) {
       cargs(d->args);
       if (!tdecl_off()) tf_args(d->args);
@@ -24477,12 +24616,18 @@ struct Cites {
     }
   }
   void item(const StructureItem& it) {
+    Anchor an(*this, ldstamp_off() ? anchor_.node : (const void*)&it);
     if (auto* e = std::get_if<Pstr_eval>(&it.desc)) {
       ex(*e->e);
     } else if (auto* v = std::get_if<Pstr_value>(&it.desc)) {
       for (auto& b : v->bindings) vbind(b);
     } else if (auto* t = std::get_if<Pstr_type>(&it.desc)) {
-      for (auto& d : t->decls) tdecl(d);
+      const bool later = !tdecl_off() && !ldstamp_off();
+      for (auto& d : t->decls) tdecl(d, later);
+      if (later) {
+        Anchor ae(*this, item_end(it));
+        for (auto& d : t->decls) tf_tdecl(d);
+      }
     } else if (auto* x = std::get_if<Pstr_typext>(&it.desc)) {
       typext(x->ext);
     } else if (auto* e = std::get_if<Pstr_exception>(&it.desc)) {
@@ -24616,16 +24761,17 @@ struct Cites {
     return v;
   }
   // The units the file reaches through a submodule that is only an ALIAS.
-  std::vector<std::string> alias_subs(const std::string& src,
-                                      const cmi::Signature& sg) const {
-    std::vector<std::string> v;
+  // (unit, the member name that aliases it)
+  std::vector<std::pair<std::string, std::string>> alias_subs(
+      const std::string& src, const cmi::Signature& sg) const {
+    std::vector<std::pair<std::string, std::string>> v;
     auto it = members.find(src);
     if (it == members.end()) return v;
     for (auto& n : it->second)
       for (auto& m : sg.modules)
         if (m.name == n && m.type && m.type->kind == cmi::ModuleType::Alias) {
           std::string u = alias_unit(m.type->path.get());
-          if (!u.empty()) v.push_back(u);
+          if (!u.empty()) v.emplace_back(u, n);
         }
     return v;
   }
@@ -24942,11 +25088,27 @@ struct Cites {
     // `CITETRACE=1` prints every unit-level charge (`$S/chg.sh` sees none
     // of these: they are summed here, outside `Count`).
     static const bool trace = dbg_env("CITETRACE") != nullptr;
-    auto add = [&](long long d, const char* what, const std::string& u) {
-      if (trace && d) fprintf(stderr, "CITE %lld %s %s\n", d, what, u.c_str());
+    // The node a charge is paid under (S557): the citation that first read
+    // the unit, or the trigger of its second force.  A unit forced through
+    // another's .cmi is charged under the one that pulled it in.
+    std::map<std::string, const std::string*> more_src;
+    // .. and the node a SECOND force of it is paid under: the earliest of
+    // the triggers that raised its level.
+    std::map<std::string, const At*> more2_at;
+    std::map<std::string, const At*> more1_at;  // .. and of its first load
+    auto raise2 = [&](const std::string& un, const At* at) {
+      auto it = more2_at.find(un);
+      if (it == more2_at.end()) more2_at[un] = at;
+      else it->second = earlier(it->second, at);
+    };
+    auto add = [&](long long d, const char* what, const std::string& u,
+                   const void* at = nullptr) {
+      if (trace && d) fprintf(stderr, "CITE %lld %s %s @%p\n", d, what, u.c_str(), at);
       k += d;
+      if (!ldstamp_off()) acost_[at] += d;
     };
     bool fmt = extra && fmt_ann;
+    const At* fmt_at = nullptr;
     std::set<std::string> done;  // two names can alias ONE unit
     std::map<std::string, int> more;  // unit -> loads a READ TYPE asks for
     for (auto& m : units) {
@@ -24961,8 +25123,15 @@ struct Cites {
         // twice, one functor parameter apiece; a DIRECT force renames
         // the parameter TWICE in the one go (S437).
         bool aliased = u != c.module_name();
-        add(load_cost(c.sig(), extra, aliased || xoff ? 1 : 2), "unit", u);
-        if (extra && !fmt) fmt = reads_format(m, c);
+        add(load_cost(c.sig(), extra, aliased || xoff ? 1 : 2), "unit", u,
+            cite_anchor(m));
+        // CamlinternalFormatBasics is loaded by the first format LITERAL
+        // typed, which is where a format-typed member is first applied.
+        if (extra && (!fmt || !ldstamp_off()) && reads_format(m, c)) {
+          fmt = true;
+          const At* fa = force_at(m, opens.count(m) ? &c.sig() : nullptr);
+          fmt_at = earlier(fmt_at, fa ? fa : cite_at(m));
+        }
         if (!sub) continue;
         // Only a reference through one of Stdlib's ALIASES is forced twice:
         // `open Float.Array` costs 82 + 82 + 48 where the same signature
@@ -24985,8 +25154,14 @@ struct Cites {
         for (auto& s : subs) found.erase(s.first);
         for (auto& fs : found)
           if (auto* ss = submodule(c.sig(), fs)) subs.emplace_back(fs, ss);
+        // An alias member (`open StdLabels` then `List.map`) loads the
+        // unit it names where the member is first read.
         for (auto& au : alias_subs(m, c.sig()))
-          if (more[au] < 1) more[au] = 1;
+          if (more[au.first] < 1) {
+            more[au.first] = 1;
+            more_src.emplace(au.first, &m);
+            more1_at.emplace(au.first, cite_at(m + "." + au.second));
+          }
         for (auto& s : subs) {
           // Through one of Stdlib's aliases a submodule is STRENGTHENED
           // where the path is looked up (one rename per item, its functors'
@@ -24997,24 +25172,55 @@ struct Cites {
           // parameters twice.  Under the unit's own name the two paths share
           // one components tree, built once with the parameters twice.
           add(load_cost(*s.second, extra, aliased || subapp_off() ? 1 : 2),
-              "sub", m + "." + s.first);
+              "sub", m + "." + s.first, cite_anchor(m + "." + s.first, m));
           Applied b;
           scan_applied(m + "." + s.first, true, *s.second, b, app);
           if (aliased && (b.self || a.subs.count(s.first) ||
                           (!subapp_off() &&
                            sub_applied(m, s.first, *s.second))))
-            add(load_cost(*s.second, extra, 2), "sub2", m + "." + s.first);
+            add(load_cost(*s.second, extra, 2), "sub2", m + "." + s.first,
+                force_anchor(m + "." + s.first, m,
+                             subopens.count(m + "." + s.first) ? s.second
+                                                               : nullptr));
           for (auto& e : b.units)
-            if (more[e.first] < e.second) more[e.first] = e.second;
+            if (more[e.first] < e.second) {
+              more[e.first] = e.second;
+              more_src.emplace(e.first, &m);
+              if (e.second >= 2)
+                raise2(e.first, force_at(m + "." + s.first,
+                                         subopens.count(m + "." + s.first)
+                                             ? s.second : nullptr));
+            }
         }
         // A submodule of the unit was named, a type of the unit was read
         // applied, or a type of the unit met one that was already fixed:
         // either way its signature is forced a second time.
         if (aliased && (!subs.empty() || a.self || xforce.count(m) ||
-                        (mtoff ? false : mtf.count(m) != 0)))
+                        (mtoff ? false : mtf.count(m) != 0))) {
           more[u] = 2;
+          more_src.emplace(u, &m);
+          // Naming a submodule forces the unit again where the submodule
+          // is first cited (`open Effect.Deep`: Effect's 6 a second time
+          // right after Deep's 9); an application or a meet where it
+          // stands.
+          const At* at = nullptr;
+          for (auto& sm : subs) {
+            const std::string sk = m + "." + sm.first;
+            // an alias of the submodule forces nothing until it is used
+            const At* sa = subopens.count(sk) ? cite_at(sk) : force_at(sk);
+            at = earlier(at, sa ? sa : cite_at(sk));
+          }
+          if (a.self || xforce.count(m))
+            at = earlier(at, force_at(m, opens.count(m) ? &c.sig() : nullptr));
+          raise2(u, at);
+        }
         for (auto& e : a.units)
-          if (more[e.first] < e.second) more[e.first] = e.second;
+          if (more[e.first] < e.second) {
+            more[e.first] = e.second;
+            more_src.emplace(e.first, &m);
+            if (e.second >= 2)
+              raise2(e.first, force_at(m, opens.count(m) ? &c.sig() : nullptr));
+          }
       } catch (...) {
       }
     }
@@ -25035,15 +25241,31 @@ struct Cites {
       if (cited && e.second < 2) continue;
       std::string p = head_cmi(e.first);
       if (!std::filesystem::exists(p)) continue;
+      auto ms = more_src.find(e.first);
+      const std::string src = ms == more_src.end() ? "" : *ms->second;
       try {
         const cmi::CmiFile& cf = cmi::CmiFile::load(p);
         loaded.insert(cf.module_name());
         const cmi::Signature& sg = cf.sig();
-        if (!cited && !noload.count(e.first))
+        // A unit forced only through another's .cmi is forced where a
+        // manifest of that one is EXPANDED -- a meet, an application (a
+        // `lazy` met at a `Lazy.t` field loads CamlinternalLazy there, not
+        // at the field) -- else where the other was first cited.
+        if (!cited && !noload.count(e.first)) {
+          auto m1 = more1_at.find(e.first);
           add(load_cost(sg, extra,
                         !xoff && e.first == cf.module_name() ? 2 : 1),
-              "more", e.first);
-        if (e.second >= 2) add(load_cost(sg, extra, 2), "more2", e.first);
+              "more", e.first,
+              m1 != more1_at.end() && m1->second
+                  ? m1->second->node
+                  : force_anchor(src, "", opens.count(src) ? &sg : nullptr));
+        }
+        if (e.second >= 2) {
+          auto m2 = more2_at.find(e.first);
+          const At* at = m2 == more2_at.end() ? nullptr : m2->second;
+          add(load_cost(sg, extra, 2), "more2", e.first,
+              at ? at->node : cite_anchor(src));
+        }
       } catch (...) {
       }
     }
@@ -25064,7 +25286,8 @@ struct Cites {
     if (fmt && done.insert("CamlinternalFormatBasics").second) {
       std::string p = head_cmi("CamlinternalFormatBasics");
       if (std::filesystem::exists(p)) try {
-          add(load_cost(cmi::CmiFile::load(p).sig(), extra), "fmt", "");
+          add(load_cost(cmi::CmiFile::load(p).sig(), extra), "fmt", "",
+              node(fmt_at));
           loaded.insert("CamlinternalFormatBasics");
         } catch (...) {
         }
@@ -25699,6 +25922,41 @@ struct Charge {
 
 struct Count {
   Charge n;
+  // ---- THE COUNTER'S VALUE AT A LABEL'S / CONSTRUCTOR'S IDENT (S557) ------
+  // Subst renames a saved signature's bound idents but leaves a
+  // constructor's `cd_id` and a label's `ld_id` the ones Typedecl created, so
+  // their stamps are 274 + the count at their creation: the walk records
+  // that count under the writer's uid key (`uidkey`), and pays a citation's
+  // unit loads (Cites::acost_) at the node they were first cited under.
+  std::map<std::string, long long>* stamps_ = nullptr;
+  std::map<const void*, long long>* acost_ = nullptr;
+  std::vector<std::string> spath_;  // the enclosing named modules
+  void anchored(const void* a) {
+    if (!acost_) return;
+    auto it = acost_->find(a);
+    if (it == acost_->end()) return;
+    static const bool trace = dbg_env("CITETRACE") != nullptr;
+    if (trace) fprintf(stderr, "ANCHOR pay %lld @%p at n=%lld\n", it->second, a, (long long)n);
+    n += it->second;
+    acost_->erase(it);
+  }
+  void stamp_at(char kind, const std::string& name) {
+    if (!stamps_) return;
+    std::string path;
+    for (auto& m : spath_) path += (path.empty() ? "" : ".") + m;
+    (*stamps_)[uidkey(kind, path, name)] = n;
+  }
+  // The renames a nesting depth costs (`(l.a - 1) * ..`, a module type
+  // body's `per`) are paid after the whole unit is typed (measured: `module
+  // M = struct module type T = sig type t = A end type u = { x : int } end
+  // module N = struct type s = { y : int } end` gives y 281, the three
+  // extras after it), so they are deferred to the end of the walk.
+  long long pend_end_ = 0;
+  bool defer_ = false;
+  void extra(long long d) {
+    if (defer_) pend_end_ += d;
+    else n += d;
+  }
   // Value names in scope, so the ghost bindings below can ask what
   // `Env.bound_value` would.  `mark`/`release` bracket a scope.
   std::unordered_map<std::string, int> vals;
@@ -33068,32 +33326,75 @@ struct Count {
   void type_decls(const std::vector<TypeDeclaration>& ds, int per) {
     const bool td = tdecl_;
     tdecl_ = true;
+    if (ldstamp_off()) {
+      for (auto& d : ds) {
+        n += per;
+        if (fixed_row(d)) n += per;
+        if (d.manifest) ty_app(**d.manifest, 0, false, 2);
+        if (!pkwrit_off())
+          for (auto& c : d.constraints) { ty_app(*c.t1); ty_app(*c.t2); }
+        if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
+          for (auto& c : v->ctors) { ++n; ctor_args(c.args); }
+        } else if (auto* r = std::get_if<Ptype_record>(&d.kind)) {
+          n += (long long)r->fields.size();
+          for (auto& f : r->fields) ty_app(*f.type, 0, false, 1);
+        }
+      }
+      tdecl_ = td;
+      return;
+    }
+    // transl_type_decl's order (S557): the `#row` idents (those declarations
+    // are put FIRST), then every declaration's ident, then per declaration
+    // its constraints, its kind -- a constructor's ident before its
+    // arguments, a label's type before its ident -- and its manifest.
+    for (auto& d : ds) if (fixed_row(d)) n += per;
+    n += (long long)ds.size();
+    extra((per - 1) * (long long)ds.size());
     for (auto& d : ds) {
-      n += per;
-      if (fixed_row(d)) n += per;
-      if (d.manifest) ty_app(**d.manifest, 0, false, 2);
       if (!pkwrit_off())
         for (auto& c : d.constraints) { ty_app(*c.t1); ty_app(*c.t2); }
       if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
-        for (auto& c : v->ctors) { ++n; ctor_args(c.args); }
+        for (auto& c : v->ctors) {
+          stamp_at('c', d.name.txt + "#" + c.name.txt);
+          ++n;
+          anchored(&c);
+          ctor_args(c.args, d.name.txt + "#" + c.name.txt);
+        }
       } else if (auto* r = std::get_if<Ptype_record>(&d.kind)) {
-        n += (long long)r->fields.size();
-        for (auto& f : r->fields) ty_app(*f.type, 0, false, 1);
+        for (auto& f : r->fields) {
+          anchored(&f);
+          ty_app(*f.type, 0, false, 1);
+          stamp_at('l', d.name.txt + "." + f.name.txt);
+          ++n;
+        }
       }
+      anchored(&d);
+      if (d.manifest) ty_app(**d.manifest, 0, false, 2);
     }
     tdecl_ = td;
   }
-  void ctor_args(const ConstructorArguments& a) {
+  void ctor_args(const ConstructorArguments& a, const std::string& ck = "") {
     if (auto* t = std::get_if<Pcstr_tuple>(&a))
       for (auto& e : t->elems) ty_app(*e);
     if (auto* r = std::get_if<Pcstr_record>(&a)) {
-      n += (long long)r->fields.size();
-      for (auto& f : r->fields) ty_app(*f.type);
+      if (ldstamp_off()) {
+        n += (long long)r->fields.size();
+        for (auto& f : r->fields) ty_app(*f.type);
+        return;
+      }
+      for (auto& f : r->fields) {
+        anchored(&f);
+        ty_app(*f.type);
+        stamp_at('L', ck + "." + f.name.txt);
+        ++n;
+      }
     }
   }
   void ext_ctor(const ExtensionConstructor& c) {
     ++n;
-    if (auto* d = std::get_if<Pext_decl>(&c.kind)) ctor_args(d->args);
+    anchored(&c);
+    if (auto* d = std::get_if<Pext_decl>(&c.kind))
+      ctor_args(d->args, c.name.txt + "#" + c.name.txt);
   }
 
   static bool dupval_off() {
@@ -42302,7 +42603,8 @@ struct Count {
       else if (auto* p = std::get_if<Psig_primitive>(&it.desc))
         vn = &p->pd.name.txt;
       bool vdup = !vdup_off() && vn && vseen_ && !vseen_->insert(*vn).second;
-      n += vdup ? 1 : per;
+      ++n;
+      if (!vdup) extra(per - 1);
       if (auto* v = std::get_if<Psig_value>(&it.desc)) ty_app(*v->vd.type);
       else if (auto* p = std::get_if<Psig_primitive>(&it.desc))
         if (p->pd.type) ty_app(*p->pd.type);
@@ -42336,14 +42638,14 @@ struct Count {
     // `sig type t = .. type t += B | C end` is 2 + 2 + 2.  Only the TYPING
     // ident was charged here, which is the whole of it at weight 1.
     } else if (auto* x = std::get_if<Psig_typext>(&it.desc)) {
-      if (!sigext_off()) n += (per - 1) * (long long)x->ext.ctors.size();
+      if (!sigext_off()) extra((per - 1) * (long long)x->ext.ctors.size());
       for (auto& c : x->ext.ctors) ext_ctor(c);
       if (saved_ && !packty_off())
         for (auto& c : x->ext.ctors) n += pack_ext(c);
       else if (!packty_off() && !mtyres_off())
         for (auto& c : x->ext.ctors) n += pk_epatches(c);
     } else if (auto* e = std::get_if<Psig_exception>(&it.desc)) {
-      if (!sigext_off()) n += per - 1;
+      if (!sigext_off()) extra(per - 1);
       ext_ctor(e->exn.ctor);
       if (saved_ && !packty_off()) n += pack_ext(e->exn.ctor);
       else if (!packty_off() && !mtyres_off()) n += pk_epatches(e->exn.ctor);
@@ -42352,9 +42654,12 @@ struct Count {
     // (`fexp_charge`) off its written type, as an ascription at a functor
     // type is charged; the structure behind the ascription is not saved.
     } else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
-      n += per;
+      // Its ident is created after its type is translated
+      // (`Env.enter_module_declaration`, typemod.ml).
+      if (!defer_) n += per;
       const bool fxp = m->md.name.txt.has_value();
       if (fxp) fxpath_.push_back(*m->md.name.txt);
+      if (fxp) spath_.push_back(*m->md.name.txt);
       if (fxp && !privfx_off() && !fexp_off() && fexp_ &&
           mtctx_ == MtCtx::Ascr && saved_ && !inexpr_ &&
           std::holds_alternative<Pmty_functor>(m->md.type->desc) &&
@@ -42365,20 +42670,26 @@ struct Count {
         n += pfun_checks(l) * pfun_mty_params(*m->md.type);
       mty(*m->md.type, sub(l));
       if (fxp) fxpath_.pop_back();
+      if (fxp) spath_.pop_back();
+      if (defer_) { ++n; extra(per - 1); }
       // `module Q = Priority.N` looks the path up: Priority's components.
       if (auto* al = std::get_if<Pmty_alias>(&m->md.type->desc))
         n += read_lid(al->id.txt, false);
       sbind(m->md);
     } else if (auto* m = std::get_if<Psig_recmodule>(&it.desc)) {
       for (auto& d : m->decls) sbind(d);
-      for (auto& d : m->decls) { n += per; mty(*d.type, sub(l)); }
+      for (auto& d : m->decls) { ++n; extra(per - 1); mty(*d.type, sub(l)); }
       n += recmodule_sig_extra(*m);
     } else if (auto* m = std::get_if<Psig_modtype>(&it.desc)) {
-      n += per;
+      if (!defer_) n += per;
+      spath_.push_back(m->name.txt);
       if (m->type) mty(*m->type, mtd(l));
+      spath_.pop_back();
+      if (defer_) { ++n; extra(per - 1); }
       tbind(m->name.txt, m->type ? &*m->type : nullptr);
     } else if (auto* m = std::get_if<Psig_modtypesubst>(&it.desc)) {
-      n += per;
+      ++n;
+      extra(per - 1);
       mty(m->type, mtd(l));
     // An `include` binds the whole signature it names a second time, the
     // NESTED items of it included (`Subst` recurses), on top of what the
@@ -42444,7 +42755,11 @@ struct Count {
   }
 
   void item(const StructureItem& it, Lvl l = Lvl{1, 1, 0, true}) {
-    if (!depth_off() && l.a > 1) n += (l.a - 1) * str_items(it);
+    if (!depth_off() && l.a > 1) {
+      if (defer_) pend_end_ += (l.a - 1) * str_items(it);
+      else n += (l.a - 1) * str_items(it);
+    }
+    anchored(&it);
     if (auto* e = std::get_if<Pstr_eval>(&it.desc)) {
       expr(*e->e);
     } else if (auto* v = std::get_if<Pstr_value>(&it.desc)) {
@@ -42459,6 +42774,7 @@ struct Count {
     } else if (auto* t = std::get_if<Pstr_type>(&it.desc)) {
       reg_ctors(t->decls);
       type_decls(t->decls, 1);
+      anchored((const char*)&it + 1);  // Cites::item_end
       if (saved_ && !packty_off())
         for (auto& d : t->decls) n += pack_decl(d);
       else if (!packty_off() && !mtyres_off())
@@ -42576,6 +42892,7 @@ struct Count {
       // cross-unit one is `cross_charge`'s, measured with them.
       const bool fxp = m->binding.name.txt.has_value();
       if (fxp) fxpath_.push_back(*m->binding.name.txt);
+      if (fxp) spath_.push_back(*m->binding.name.txt);
       if (fxp && saved_ && !inexpr_) n += fexp_charge(m->binding.expr);
       // `module M = X` of an enclosing functor's PARAMETER is `module M =
       // struct include X end` less the include's own enter: X is not
@@ -42603,6 +42920,7 @@ struct Count {
         n += lrd_charge(m->binding.expr, pres);
       }
       if (fxp) fxpath_.pop_back();
+      if (fxp) spath_.pop_back();
       ascr_sig_ = asv;
       mdiscard_ = dsv;
       mnarrow_ = nsv;
@@ -42644,7 +42962,9 @@ struct Count {
         mtctx_ = MtCtx::Decl;
         const bool dsc = !deadasc_off() && ascr_sig_ &&
                          !sig_binds_mty(*ascr_sig_, m->name.txt, true);
+        spath_.push_back(m->name.txt);
         mty(*m->type, dsc || is_dead(l) ? dead() : mtd(l));
+        spath_.pop_back();
         mtctx_ = sv;
         if (!anonarg_off() && saved_ && !inexpr_)
           n += anon_mty(*m->type, false);
@@ -43254,7 +43574,8 @@ std::set<std::string> fexp_paths(const std::vector<cmi::cmiw::SigItem>& items) {
 int typing_ident_count(const ast::Structure& s, std::size_t eta_sites,
                        long long pkg_sig,
                        const std::set<std::string>* fexp,
-                       std::size_t pv_reify, std::set<std::string>* loaded) {
+                       std::size_t pv_reify, std::set<std::string>* loaded,
+                       std::map<std::string, long long>* stamps) {
   // The citation walk runs FIRST: whether a `module M = A.N` alias is ever
   // READ is what says the path has to be resolved, and only a name this file
   // binds ONCE can be followed to the module it stands for.
@@ -43320,9 +43641,21 @@ int typing_ident_count(const ast::Structure& s, std::size_t eta_sites,
     xbf.insert(k);
     xba.insert(k + u.fargk[fi]);
   }
+  // The unit loads are summed FIRST so the walk can pay each one where
+  // its citation stands (S557); what no node of the walk claims is added
+  // at the end as before.
+  long long ucost = 0;
+  if (!dbg_env("NOUNITLOAD"))
+    ucost = u.cost(!dbg_env("NOEXTRALOAD"), !dbg_env("NOSUBLOAD"),
+                   !dbg_env("NOAPPRES"));
   stampcount::Count c;
   c.used_ = &used;
   c.xk_ = &xkeys;
+  if (!stampcount::ldstamp_off()) {
+    c.acost_ = &u.acost_;
+    c.stamps_ = stamps;
+    c.defer_ = true;
+  }
   c.xbf_ = &xbf;
   c.xba_ = &xba;
   c.ereads_ = &u.ereads_;
@@ -43343,11 +43676,17 @@ int typing_ident_count(const ast::Structure& s, std::size_t eta_sites,
   c.pk_push();
   for (auto& it : s) c.item(it);
   c.pk_pop();
+  c.n += c.pend_end_;
   long long k = c.n + c.nd_open(s) + c.oapp_open(s) + c.xsig_open_str(s) +
                 stampcount::modforce_cost(s, u);
-  if (!dbg_env("NOUNITLOAD"))
-    k += u.cost(!dbg_env("NOEXTRALOAD"), !dbg_env("NOSUBLOAD"),
-                !dbg_env("NOAPPRES"));
+  if (!dbg_env("NOUNITLOAD")) {
+    long long paid = 0;
+    if (c.acost_) {
+      for (auto& e : u.acost_) paid += e.second;  // the anchors the walk missed
+      paid = ucost - paid;
+    }
+    k += ucost - paid;
+  }
   if (loaded) *loaded = u.loaded;
   // An INFERRED argument whose type begins with optional arrows, used where
   // a plain arrow is expected, is let-and-eta-expanded (typecore.ml's

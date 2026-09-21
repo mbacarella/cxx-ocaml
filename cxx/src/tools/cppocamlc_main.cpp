@@ -244,12 +244,18 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
         // to the signature's citations).
         std::set<std::string> loaded;
         const bool imports = !cppcaml::dbg_env("NOCMIIMPORTS");
+        // The count at each constructor's / label's ident: their saved
+        // stamps, Subst keeping those idents (S557; NOLDSTAMP reverts).
+        std::map<std::string, long long> at;
         int base = cppcaml::dbg_env("NOSTAMPBASE")
                        ? 300
                        : 274 + cppcaml::typing_ident_count(
                                    structure, eta_sites,
                                    cppcaml::package_sig_idents(sig), &fexp,
-                                   pv_reify, &loaded);
+                                   pv_reify, &loaded, &at);
+        std::map<std::string, int> stamps;
+        if (!cppcaml::dbg_env("NOSTAMPBASE") && !cppcaml::dbg_env("NOLDSTAMP"))
+          for (auto& e : at) stamps[e.first] = 274 + (int)e.second;
         // The uid typing gave each declaration -- the local binders on the
         // way included (NOUIDWALK reverts to numbering the signature).
         cppcaml::UidMap um;
@@ -262,7 +268,8 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
             /*intf=*/false,
             cppcaml::dbg_env("NOMLLOC") ? std::vector<std::string>{}
                                         : std::vector<std::string>{in_path},
-            base, /*cite=*/!imports, um.complete ? &um.ids : nullptr);
+            base, /*cite=*/!imports, um.complete ? &um.ids : nullptr,
+            stamps.empty() ? nullptr : &stamps);
       }
     } catch (const std::exception& e) {
       if (prof) std::cerr << "  (.cmi emission skipped: " << e.what() << ")\n";
