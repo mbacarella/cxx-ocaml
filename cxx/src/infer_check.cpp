@@ -533,7 +533,7 @@ struct Checker {
       if (!no_field_scope_ && rb0->kind == I::Type::Kind::Var &&
           no_local_field_in_scope(lbl, e->loc.start.lnum))
         if (TypePtr fa = unique_opened_ext_field(lbl)) {
-          TypePtr fs = I::Engine::repr(eng.instantiate(fa));
+          TypePtr fs = I::Engine::repr(eng.instantiate_scheme(fa));
           if (fs->kind == I::Type::Kind::Arrow) {
             try_unify(bt, fs->dom);
             rb0 = I::Engine::repr(bt);
@@ -552,7 +552,7 @@ struct Checker {
         if (auto rit = rec_expr_.find(e); rit != rec_expr_.end())
           if (I::Engine::repr(rit->second)->kind == I::Type::Kind::Var)
             if (TypePtr fa = ext_field_arrow_at(rb0->path, lbl)) {
-              TypePtr s = I::Engine::repr(eng.instantiate(fa));
+              TypePtr s = I::Engine::repr(eng.instantiate_scheme(fa));
               if (s->kind == I::Type::Kind::Arrow) {
                 try_unify(bt, s->dom);
                 try_unify(rit->second, s->cod);
@@ -876,7 +876,7 @@ struct Checker {
         "int32", "int64", "nativeint"};
     std::string agreed;
     for (auto& cand : ci->second) {
-      TypePtr a = I::Engine::repr(eng.instantiate(cand));
+      TypePtr a = I::Engine::repr(eng.instantiate_scheme(cand));
       if (a->kind != I::Type::Kind::Arrow) return "";
       TypePtr cod = I::Engine::repr(a->cod);
       if (cod->kind != I::Type::Kind::Constr || !cod->args.empty() ||
@@ -1151,6 +1151,11 @@ struct Checker {
   // name).  NOT set in value-kinds (which needs the expanded arrow to apply a
   // `Seq.t` as a function, the float kind, etc.) or strict.
   bool fold_abbrevs_ = false;
+  // A folded pass over a STRUCTURE (the display pass, the .ml cmi writer):
+  // instantiate makes ocamlc's per-use copies (Engine::node_copy_, set per
+  // structure item from this -- fold_abbrevs_ itself flips transiently
+  // inside the kind pass too).
+  bool node_copy_pass_ = false;
   // The .cmi VERBATIM path (signature_to_cmi): keep a same-signature
   // abbreviation as its written name (`val make : float -> t` stores the
   // local `t`, like ocamlc) instead of expanding its manifest.
@@ -1170,15 +1175,30 @@ struct Checker {
 
   // A source-written type constructor cites a FRESH path object: Env.lookup_type
   // builds `Pident id` / `Pdot (root, name)` per lookup (cmi.hpp prov_new).
+  // Under a ROW of the annotation (a variant's tag arguments, an object's
+  // methods) the node is not marked: our engine never copies an annotation's
+  // row per use (the one row IS every instance -- see Engine::instantiate),
+  // so what a pattern takes from it must stay shared and linkable, as the
+  // instance's own copies are in ocamlc.
+  static inline int annot_row_depth_ = 0;
   static TypePtr annot(TypePtr t) {
     t->prov = cmi::prov_new();
-    t->scheme = true;  // generalize_structure'd: every use copies it
+    t->scheme = annot_row_depth_ == 0 || cmi::node_id_off();  // generalize_structure'd: every use copies it
     return t;
+  }
+  // What an expression or a pattern MEETS of an annotation is an instance of
+  // it (typecore's `instance ty` at every expected-type site): a fresh copy
+  // of the structure over the annotation's own variables, non-generic, so
+  // the nodes a parameter or a sub-pattern takes from it are shared by every
+  // later use (and can adopt an abbreviation), while the annotation node
+  // itself is never linked.  Identity when per-use copies are off.
+  TypePtr annot_instance(const TypePtr& a) {
+    return eng.node_copy_ ? eng.instantiate(a, /*share_vars=*/true) : a;
   }
   // ...reached through `open <pfx>`: `Pdot (that open's root, name)`.
   static TypePtr annot_open(TypePtr t, const std::string& pfx) {
     t->prov = cmi::prov_new_open(pfx);
-    t->scheme = true;
+    t->scheme = annot_row_depth_ == 0 || cmi::node_id_off();
     return t;
   }
   // The module prefix of a qualified name ("Bigarray.Array1.t" -> "Bigarray.Array1").
@@ -1203,13 +1223,18 @@ struct Checker {
         memo[const_cast<cmi::TypeExpr*>(n)] = v;
         return v;
       }
-      case cmi::TypeExpr::Tarrow:
-        return eng.arrow(from_cmi(n->dom, memo), from_cmi(n->cod, memo),
-                         n->label_kind, n->label);
+      case cmi::TypeExpr::Tarrow: {
+        TypePtr r = eng.arrow(from_cmi(n->dom, memo), from_cmi(n->cod, memo),
+                              n->label_kind, n->label);
+        r->scheme = true;  // a .cmi's node: every use copies it
+        return r;
+      }
       case cmi::TypeExpr::Ttuple: {
         std::vector<TypePtr> es;
         for (auto& e : n->elems) es.push_back(from_cmi(e.second, memo));
-        return eng.tuple(std::move(es));
+        TypePtr r = eng.tuple(std::move(es));
+        r->scheme = true;
+        return r;
       }
       case cmi::TypeExpr::Tconstr:
       case cmi::TypeExpr::Texpand: {
@@ -1469,12 +1494,15 @@ struct Checker {
                : std::holds_alternative<Optional>(a->label) ? 2 : 0;
       std::string nm = lk == 1 ? std::get<Labelled>(a->label).name
                        : lk == 2 ? std::get<Optional>(a->label).name : "";
-      return eng.arrow(from_coretype(*a->dom, vars), from_coretype(*a->cod, vars), lk, nm);
+      TypePtr r = eng.arrow(from_coretype(*a->dom, vars), from_coretype(*a->cod, vars), lk, nm);
+      r->scheme = true;  // generalize_structure'd: every use copies it
+      return r;
     }
     if (auto* tu = std::get_if<Ptyp_tuple>(&t.desc)) {
       std::vector<TypePtr> es;
       for (auto& e : tu->elems) es.push_back(from_coretype(*e, vars));
       TypePtr r = eng.tuple(std::move(es));
+      r->scheme = true;
       // A LABELED tuple (`arg_label list * is_ret_tvar:bool`, ctype.mli):
       // keep the component labels ("" = unlabeled) -- `labels` is otherwise
       // unused on a Tuple node.  Dropping them made the cmi a plain tuple,
@@ -1600,7 +1628,9 @@ struct Checker {
             // has=2: CONJUNCTIVE constant (`` `A of & t ``, constant flag AND
             // an arg type -- Reither{no_arg=true; arg_type=[t]}); truthy for
             // every has-an-arg consumer, distinguished by the writer bridge.
-            else { ats.push_back(from_coretype(*rt->types[0], vars));
+            else { ++annot_row_depth_;
+                   ats.push_back(from_coretype(*rt->types[0], vars));
+                   --annot_row_depth_;
                    has.push_back(rt->constant ? 2 : 1); }
           } else {
             auto* ri = std::get_if<Rinherit>(&r);
@@ -2146,11 +2176,15 @@ struct Checker {
             auto sub = vars;
             std::vector<TypePtr> bs;
             for (auto& n : pp->vars) { auto fv = generic_var(); sub[n] = fv; bs.push_back(fv); }
+            ++annot_row_depth_;
             ts.push_back(from_coretype(*pp->type, sub));
+            --annot_row_depth_;
             mpv.push_back(std::move(bs)); mpn.push_back(pp->vars);
             any_poly = true;
           } else {
+            ++annot_row_depth_;
             ts.push_back(from_coretype(*ot->type, vars));
+            --annot_row_depth_;
             mpv.emplace_back(); mpn.emplace_back();
           }
         } else if (auto* oi = std::get_if<Oinherit>(&f)) {
@@ -2250,7 +2284,7 @@ struct Checker {
       }
       auto& s = stdlib_schemes();
       auto f = s.find(l->name);
-      if (f != s.end()) return eng.instantiate(f->second);
+      if (f != s.end()) return eng.instantiate_scheme(f->second);
       if (strict) note_error("Unbound value " + l->name);  // genuine error
       return eng.fresh_var();
     }
@@ -2270,7 +2304,7 @@ struct Checker {
             for (size_t i = 1; i < pc.size(); ++i) qc.push_back(pc[i]);
             auto& ex2 = module_values_cached_comps(qc);
             if (auto f = ex2.find(d->name); f != ex2.end())
-              return eng.instantiate(f->second);
+              return eng.instantiate_scheme(f->second);
           }
         if (strict && module_head_unbound(*d->prefix))  // genuinely unbound -> error
           note_error("Unbound module " + mod_components(*d->prefix).front());
@@ -2289,7 +2323,7 @@ struct Checker {
         return eng.fresh_var();
       }
       if (auto f = ex.find(d->name); f != ex.end())
-        return eng.instantiate(f->second);  // present: use its real type
+        return eng.instantiate_scheme(f->second);  // present: use its real type
       if (strict) note_error("Unbound value " + lid_full(lid));  // genuinely absent
       if (std::getenv("ANY_A_DBG"))
         fprintf(stderr, "ANY_A site2 %s\n", lid_full(lid).c_str());
@@ -5215,7 +5249,7 @@ struct Checker {
     TypePtr* sch = find_ctor(cn);
     if (!sch) return "";
     TypePtr res;
-    ctor_params(eng.instantiate(*sch), res);
+    ctor_params(eng.instantiate_scheme(*sch), res);
     TypePtr rr = I::Engine::repr(res);
     if (!ctor_type_differs(rr->kind == I::Type::Kind::Constr ? rr->path : "",
                            d->path))
@@ -5507,7 +5541,7 @@ struct Checker {
       for (auto& [cn, s] : cs)
         if (cn == d->name) { found = s; ++hits; break; }
     }
-    return hits == 1 ? eng.instantiate(found) : nullptr;
+    return hits == 1 ? eng.instantiate_scheme(found) : nullptr;
   }
 
   // `I.C` where `module I = F(X)` applies a functor THIS FILE declares: F's
@@ -5549,7 +5583,7 @@ struct Checker {
     int hits = 0;
     for (auto& [n, s] : *body)
       if (n == cn) { found = s; ++hits; }
-    return hits == 1 ? eng.instantiate(found) : nullptr;
+    return hits == 1 ? eng.instantiate_scheme(found) : nullptr;
   }
 
   // The same test, for the pattern recorder that must mark such a cite so its
@@ -6425,7 +6459,7 @@ struct Checker {
       auto range = args.equal_range(cname);
       if (range.first == range.second) continue;  // ctor not matched here
       TypePtr result;
-      auto ps = ctor_params(eng.instantiate(sch), result);
+      auto ps = ctor_params(eng.instantiate_scheme(sch), result);
       if (ps.empty()) continue;  // constant ctor
       try_unify(result, pt);     // fresh instantiation vars only -> safe
       for (size_t i = 0; i < ps.size(); ++i) {
@@ -6461,7 +6495,7 @@ struct Checker {
       auto range = args.equal_range(cname);
       if (range.first == range.second) continue;  // ctor not matched here
       TypePtr result;
-      auto ps = ctor_params(eng.instantiate(sch), result);
+      auto ps = ctor_params(eng.instantiate_scheme(sch), result);
       if (ps.empty()) continue;  // constant ctor
       try_unify(result, s);      // fresh instantiation vars only -> safe
       for (size_t i = 0; i < ps.size(); ++i) {
@@ -6575,7 +6609,7 @@ struct Checker {
       for (auto& [n, sch] : *schemes) if (n == cname) { schp = &sch; break; }
       if (!schp) return false;  // unknown scheme -> can't prove non-refutable
       TypePtr result;
-      ctor_params(eng.instantiate(*schp), result);
+      ctor_params(eng.instantiate_scheme(*schp), result);
       TypePtr r = I::Engine::repr(result);
       if (r->kind != I::Type::Kind::Constr) return false;
       bool refutable = false;  // some index position provably distinct
@@ -6660,7 +6694,7 @@ struct Checker {
       auto it = ctors.find(cn);
       if (it == ctors.end()) continue;
       TypePtr result;
-      ctor_params(eng.instantiate(it->second), result);
+      ctor_params(eng.instantiate_scheme(it->second), result);
       TypePtr r = I::Engine::repr(result);
       if (r->kind == I::Type::Kind::Constr) { path = r->path; break; }
     }
@@ -6674,7 +6708,7 @@ struct Checker {
       for (auto& [n, sch] : sc->second)
         if (n == cn) {
           TypePtr result;
-          ctor_params(eng.instantiate(sch), result);
+          ctor_params(eng.instantiate_scheme(sch), result);
           try_unify(result, scrut);  // instantiation vars + the scrutinee var
           break;
         }
@@ -6733,7 +6767,7 @@ struct Checker {
     std::optional<bool> verdict;
     for (auto& acc : accs) {
       size_t wm = eng.mark();
-      TypePtr a = I::Engine::repr(eng.instantiate(acc));
+      TypePtr a = I::Engine::repr(eng.instantiate_scheme(acc));
       bool ok = false;
       if (a->kind == I::Type::Kind::Arrow) {
         // Not try_unify: a clash here is "wrong candidate", never a user error.
@@ -7420,7 +7454,7 @@ struct Checker {
         if (!ir) throw MxBail{__LINE__};
         std::unordered_map<const I::Type*, TypePtr> memo;
         TypePtr result;
-        auto ps = ctor_params(mx_qualify(eng.instantiate(ir->second), "", memo),
+        auto ps = ctor_params(mx_qualify(eng.instantiate_scheme(ir->second), "", memo),
                               result);
         TypePtr rr = I::Engine::repr(result);
         if (rr->kind != K::Constr || rr->args.size() != t->args.size() ||
@@ -7463,7 +7497,7 @@ struct Checker {
         TypePtr result;
         std::unordered_map<const I::Type*, TypePtr> memo;
         auto params =
-            ctor_params(mx_qualify(eng.instantiate(scheme), prefix, memo), result);
+            ctor_params(mx_qualify(eng.instantiate_scheme(scheme), prefix, memo), result);
         TypePtr r = I::Engine::repr(result);
         if (r->kind != K::Constr || r->args.size() != t->args.size()) throw MxBail{__LINE__};
         bool inhabited = true;  // index equations flow into su2 here
@@ -7979,7 +8013,7 @@ struct Checker {
       differs = true;
     } else {
       TypePtr found_res;
-      ctor_params(eng.instantiate(*sch), found_res);
+      ctor_params(eng.instantiate_scheme(*sch), found_res);
       TypePtr fr = I::Engine::repr(found_res);
       differs =
           ctor_type_differs(fr->kind == I::Type::Kind::Constr ? fr->path : "", tp);
@@ -8354,7 +8388,7 @@ struct Checker {
     static const bool cdbg = std::getenv("CTDBG") != nullptr;
     if (auto ts = type_ctor_schemes_.find(typath); ts != type_ctor_schemes_.end()) {
       for (auto& [n, s] : ts->second)
-        if (n == cn) return tied(ctor_params(eng.instantiate(s), res));
+        if (n == cn) return tied(ctor_params(eng.instantiate_scheme(s), res));
       if (cdbg) fprintf(stderr, "[CTDBG-A] %s.%s: local-table miss\n", typath.c_str(), cn.c_str());
       return {};
     }
@@ -8366,7 +8400,7 @@ struct Checker {
     // their historical empty answer, so NODISAMBTIE reverts the whole path.
     if (auto pi = predef_ctor_schemes_.find(cn);
         tie && pi != predef_ctor_schemes_.end()) {
-      auto ps = ctor_params(eng.instantiate(pi->second), res);
+      auto ps = ctor_params(eng.instantiate_scheme(pi->second), res);
       TypePtr rr = I::Engine::repr(res);
       // The predef scheme spells its type BARE ("result"); a cmi-imported
       // occurrence spells it through the wrapper ("Stdlib.result").
@@ -8468,7 +8502,7 @@ struct Checker {
     std::vector<int> out;
     for (auto& [n, s] : ts->second) {
       TypePtr res;
-      out.push_back((int)ctor_params(eng.instantiate(s), res).size());
+      out.push_back((int)ctor_params(eng.instantiate_scheme(s), res).size());
     }
     return out;
   }
@@ -8531,7 +8565,7 @@ struct Checker {
     auto it = predef_ctor_schemes_.find(cn);
     if (it == predef_ctor_schemes_.end()) return "";
     TypePtr res;
-    ctor_params(eng.instantiate(it->second), res);
+    ctor_params(eng.instantiate_scheme(it->second), res);
     TypePtr r = I::Engine::repr(res);
     return r->kind == I::Type::Kind::Constr ? r->path : "";
   }
@@ -8587,7 +8621,7 @@ struct Checker {
     // Already right: the first label resolves, by scope, to the expected
     // record.
     if (TypePtr fsch = field_scheme(lid_last(rc.fields[0].first.txt))) {
-      TypePtr s = I::Engine::repr(eng.instantiate(fsch));
+      TypePtr s = I::Engine::repr(eng.instantiate_scheme(fsch));
       TypePtr sd = I::Engine::repr(s->dom);
       if (sd->kind == I::Type::Kind::Constr && sd->path == er->path) return;
     }
@@ -8723,7 +8757,7 @@ struct Checker {
       // so key on the type mismatch directly; a genuinely-correct resolution
       // has found == expected (same last component) and is left untouched.
       TypePtr res;
-      ctor_params(eng.instantiate(*sch), res);
+      ctor_params(eng.instantiate_scheme(*sch), res);
       TypePtr rr = I::Engine::repr(res);
       // Same LAST component does not mean same type across modules
       // (Parsetree and Typedtree both declare `functor_parameter`;
@@ -8785,7 +8819,7 @@ struct Checker {
       if (pit != predef_ctor_schemes_.end()) {
         TypePtr pres;
         std::vector<TypePtr> pp =
-            ctor_params(eng.instantiate(pit->second), pres);
+            ctor_params(eng.instantiate_scheme(pit->second), pres);
         soft_unify(pres, er);
         ps = std::move(pp);
       }
@@ -8988,7 +9022,7 @@ struct Checker {
       TypePtr* sch = find_ctor(lid_last(k->id.txt));
       if (!sch) return fallback();
       TypePtr result;
-      auto ps = ctor_params(eng.instantiate(*sch), result);
+      auto ps = ctor_params(eng.instantiate_scheme(*sch), result);
       if (k->arg) {
         auto* tup = std::get_if<Ppat_tuple>(&(*k->arg)->desc);
         if (ps.size() > 1 && tup && tup->elems.size() == ps.size()) {
@@ -9646,7 +9680,7 @@ struct Checker {
         return eng.fresh_var();  // P4-C: unknown ctor pattern -> fresh var (was Any)
       }
       TypePtr result;
-      auto ps = ctor_params(eng.instantiate(*sch), result);
+      auto ps = ctor_params(eng.instantiate_scheme(*sch), result);
       if (k->arg) {
         auto* tup = std::get_if<Ppat_tuple>(&(*k->arg)->desc);
         // A multi-argument constructor `B of t1*t2` (arity>1) destructures a
@@ -9727,8 +9761,13 @@ struct Checker {
       TypePtr pt = infer_pat(*ct->p);
       std::unordered_map<std::string, TypePtr> local;
       TypePtr at = from_coretype(*ct->t, annot_vars_ ? *annot_vars_ : local);
+      // solve_Ppat_constraint: the sub-pattern is typed at the annotation
+      // itself (its variables' uses then copy it, generalize_structure'd),
+      // while the pattern's OWN type -- what the parameter's arrow meets --
+      // is one instance of it, shared by every later contact (a recursive
+      // sibling's `f x` sees f's parameter node, not a copy).
       try_unify(pt, at);
-      return at;
+      return annot_instance(at);
     }
     if (auto* al = std::get_if<Ppat_alias>(&p.desc)) {
       // `pat as x`: x is bound not to the scrutinee's type but to one REBUILT
@@ -9776,7 +9815,7 @@ struct Checker {
           TypePtr dom = nullptr;
           size_t ai = 0;
           for (auto& [lid, sub] : r->fields) {
-            TypePtr s = I::Engine::repr(eng.instantiate(arrows[ai++]));
+            TypePtr s = I::Engine::repr(eng.instantiate_scheme(arrows[ai++]));
             if (s->kind != I::Type::Kind::Arrow) {
               bind_pat_any(*sub); continue;
             }
@@ -9803,7 +9842,7 @@ struct Checker {
         if (all) {
           size_t ai = 0;
           for (auto& [lid, sub] : r->fields) {
-            TypePtr s = I::Engine::repr(eng.instantiate(arrows[ai++]));
+            TypePtr s = I::Engine::repr(eng.instantiate_scheme(arrows[ai++]));
             if (s->kind != I::Type::Kind::Arrow) { bind_pat_any(*sub); continue; }
             try_unify(s->dom, exp);
             try_unify(infer_pat(*sub), s->cod);
@@ -9848,7 +9887,7 @@ struct Checker {
         if (record_kinds_ && !qual_label_preload_off())
           if (auto* d = std::get_if<Ldot>(&lid.txt.v))
             if (TypePtr qa = qualified_ext_field_arrow(*d->prefix, d->name)) {
-              TypePtr s = I::Engine::repr(eng.instantiate(qa));
+              TypePtr s = I::Engine::repr(eng.instantiate_scheme(qa));
               if (s->kind == I::Type::Kind::Arrow) {
                 try_unify(infer_pat(*sub), s->cod);
                 if (recTy) try_unify(recTy, s->dom); else recTy = s->dom;
@@ -9863,7 +9902,7 @@ struct Checker {
         if (it != fields_.end())
           if (TypePtr sh = shadowing_opened_field(lid_last(lid.txt),
                                                   p.loc.start.lnum)) {
-            TypePtr s = I::Engine::repr(eng.instantiate(sh));
+            TypePtr s = I::Engine::repr(eng.instantiate_scheme(sh));
             if (s->kind == I::Type::Kind::Arrow) {
               try_unify(infer_pat(*sub), s->cod);
               if (recTy) try_unify(recTy, s->dom); else recTy = s->dom;
@@ -9898,7 +9937,7 @@ struct Checker {
               std::unordered_map<std::string, TypePtr> fv;
               TypePtr fldTy = from_coretype(*pit->second.ftype, fv);
               if (!bind_poly_field(*sub, fldTy)) bind_pat_any(*sub);
-              TypePtr rt = eng.instantiate(pit->second.recTy);
+              TypePtr rt = eng.instantiate_scheme(pit->second.recTy);
               if (recTy) try_unify(recTy, rt); else recTy = rt;
               continue;
             }
@@ -9913,7 +9952,7 @@ struct Checker {
           if (!strict && !any_local) {
             auto eit = ext_fields_.find(lid_last(lid.txt));
             if (eit != ext_fields_.end() && eit->second.size() == 1) {
-              TypePtr s = I::Engine::repr(eng.instantiate(eit->second[0]));
+              TypePtr s = I::Engine::repr(eng.instantiate_scheme(eit->second[0]));
               if (s->kind == I::Type::Kind::Arrow) {
                 try_unify(infer_pat(*sub), s->cod);
                 if (recTy) try_unify(recTy, s->dom); else recTy = s->dom;
@@ -9947,7 +9986,7 @@ struct Checker {
           if (!strict && self_typing_pat(*sub)) { infer_pat(*sub); continue; }
           bind_pat_any(*sub); continue;
         }
-        TypePtr s = I::Engine::repr(eng.instantiate(it->second));
+        TypePtr s = I::Engine::repr(eng.instantiate_scheme(it->second));
         try_unify(infer_pat(*sub), s->cod);
         if (recTy) try_unify(recTy, s->dom); else recTy = s->dom;
       }
@@ -10544,7 +10583,7 @@ struct Checker {
         return eng.fresh_var();  // P4-C: unknown ctor -> fresh var (corpus-validated)
       }
       TypePtr result;
-      auto ps = ctor_params(eng.instantiate(*sch), result);
+      auto ps = ctor_params(eng.instantiate_scheme(*sch), result);
       if (pushed) soft_unify(result, pushed);
       if (k->arg) {
         auto* tup = std::get_if<Pexp_tuple>(&(*k->arg)->desc);
@@ -10718,19 +10757,28 @@ struct Checker {
     }
     if (auto* ct = std::get_if<Pexp_constraint>(&e.desc)) {
       TypePtr et, at;
+      // What the inner expression MEETS is an instance of the annotation
+      // (typecore's `type_argument env sarg ty (instance ty)`): a variable
+      // the expression carries links to that copy, never to the annotation
+      // node itself, and the expression's own type is one more instance.
+      TypePtr at_use;
+      auto use_of = [&](const TypePtr& a) { return annot_instance(a); };
       std::unordered_map<std::string, TypePtr> vars;
       if (coretype_is_format(*ct->t)) {
         // `("%s" : _ format)`: push the format type into the expression so its
         // string literals type (and lower) as formats, not plain strings.
         at = from_coretype(*ct->t, vars);
-        et = infer_expr_expected(*ct->e, at);
+        at_use = use_of(at);
+        et = infer_expr_expected(*ct->e, at_use);
       } else if (eta_sites_on()) {
         // The annotation is the expression's expected type (type_argument).
         at = from_coretype(*ct->t, vars);
-        et = expect_arg(*ct->e, at);
+        at_use = use_of(at);
+        et = expect_arg(*ct->e, at_use);
       } else {
         et = infer_expr(*ct->e);
         at = from_coretype(*ct->t, vars);
+        at_use = use_of(at);
       }
       if (strict && expected_clash(et, at))  // (e : T) with e of a clashing type
         note_error("expression does not match the type constraint");
@@ -10740,7 +10788,7 @@ struct Checker {
       // in the inferred signature, not just the value kinds.  Not in the strict
       // reject pass, where an incomplete unify can propagate a spurious clash and
       // cost a false-rejection.  Soft (try_unify) so a stray clash can't abort.
-      if (!strict) try_unify(et, at);
+      if (!strict) try_unify(et, at_use);
       // The annotation is an EXPECTED type for the inner expression, which the
       // plain infer_expr above never sees -- so run the constructor
       // disambiguation hook on it explicitly, as an argument position would.
@@ -10752,7 +10800,10 @@ struct Checker {
       // the hook itself.
       if (record_kinds_ && !coretype_is_format(*ct->t))
         disambig_expr_now(*ct->e, at, /*allow_defer=*/true);
-      return at;
+      // `(e : t)` is typed `instance ty`: a fresh copy of the annotation's
+      // structure over its own variables, so two constraints written alike
+      // are two nodes and a later contact links a copy, never the annotation.
+      return use_of(at);
     }
     if (auto* co = std::get_if<Pexp_coerce>(&e.desc)) {
       // A coercion `(e :> T)` or `(e : T1 :> T2)` has the TARGET type T/T2.
@@ -10775,7 +10826,7 @@ struct Checker {
           if (auto* l = std::get_if<Lident>(&pc->id.txt.v))
             if (auto ct = class_types_.find(l->name); ct != class_types_.end())
               if (I::Engine::repr(src)->kind == I::Type::Kind::Var) {
-                TypePtr inst = I::Engine::repr(eng.instantiate(ct->second));
+                TypePtr inst = I::Engine::repr(eng.instantiate_scheme(ct->second));
                 if (inst->kind == I::Type::Kind::Object) {
                   TypePtr open_ = eng.object_type(inst->labels, inst->args);
                   open_->variant_kind = 1;  // open row (`< .. ; .. >`)
@@ -10833,7 +10884,7 @@ struct Checker {
             for (auto& [nm, sch] : schemes)
               if (auto f = ex->second.find(nm); f != ex->second.end())
                 if (I::Engine::repr(f->second)->kind == I::Type::Kind::Var)
-                  soft_unify(f->second, eng.instantiate(sch));
+                  soft_unify(f->second, eng.instantiate_scheme(sch));
           }
         }
         return package_type(*pk->pkg);
@@ -10848,10 +10899,10 @@ struct Checker {
       // with constructor params is the constructor arrow (mixin2's
       // `lazy_fix (new lambda_ops)`).
       if (auto it = class_types_.find(lid_last(nw->id.txt)); it != class_types_.end())
-        return eng.instantiate(it->second);
+        return eng.instantiate_scheme(it->second);
       if (auto it = class_ctor_types_.find(lid_last(nw->id.txt));
           it != class_ctor_types_.end())
-        return eng.instantiate(it->second);
+        return eng.instantiate_scheme(it->second);
       return eng.fresh_var();  // P4-D: unknown class, per-occurrence var
     }
     if (auto* lz = std::get_if<Pexp_lazy>(&e.desc)) {
@@ -10889,7 +10940,7 @@ struct Checker {
       // (`(stat file).Unix.st_size` gives stat : 'a -> Unix.stats).
       if (std::holds_alternative<Ldot>(fld->field.txt.v))
         if (TypePtr qfs = qualified_field_scheme(fld->field.txt)) {
-          TypePtr s = I::Engine::repr(eng.instantiate(qfs));
+          TypePtr s = I::Engine::repr(eng.instantiate_scheme(qfs));
           TypePtr bt = infer_expr(*fld->e);
           try_unify(bt, s->dom);
           if (record_kinds_) pending_field_.push_back({&e, bt, lid_last(fld->field.txt)});
@@ -10906,14 +10957,14 @@ struct Checker {
       if (auto pit = poly_field_rec_.find(lid_last(fld->field.txt));
           pit != poly_field_rec_.end() && !fields_.count(lid_last(fld->field.txt))) {
         TypePtr bt = infer_expr(*fld->e);
-        try_unify(bt, eng.instantiate(pit->second.recTy));
+        try_unify(bt, eng.instantiate_scheme(pit->second.recTy));
         if (record_kinds_) pending_field_.push_back({&e, bt, lid_last(fld->field.txt)});
         std::unordered_map<std::string, TypePtr> fv;
         return from_coretype(*pit->second.ftype, fv);
       }
       if (TypePtr fsch =
               field_scheme(lid_last(fld->field.txt), e.loc.start.lnum)) {
-        TypePtr s = I::Engine::repr(eng.instantiate(fsch));  // recTy -> fldTy
+        TypePtr s = I::Engine::repr(eng.instantiate_scheme(fsch));  // recTy -> fldTy
         TypePtr bt = infer_expr(*fld->e);
         try_unify(bt, s->dom);
         // A label the inferencer sees as UNIQUE (it models only local records) can
@@ -11048,14 +11099,14 @@ struct Checker {
           TypePtr ex = nullptr;
           if (eta_sites_on())
             if (TypePtr fs = field_scheme(lid_last(lbl.txt)))
-              ex = I::Engine::repr(eng.instantiate(fs))->cod;
+              ex = I::Engine::repr(eng.instantiate_scheme(fs))->cod;
           overr.emplace_back(lid_last(lbl.txt), ex ? expect_arg(*val, ex) : infer_expr(*val));
         }
         // Pin the base's record identity through the first resolvable label so
         // the decl lookup below sees a Constr even when the base is a bare var.
         for (auto& [lbl, vt] : overr)
           if (TypePtr fsch = field_scheme(lbl)) {
-            TypePtr s = I::Engine::repr(eng.instantiate(fsch));
+            TypePtr s = I::Engine::repr(eng.instantiate_scheme(fsch));
             try_unify(bt, s->dom);
             break;
           }
@@ -11088,16 +11139,16 @@ struct Checker {
           std::set<std::string> overrset;
           for (auto& [lbl, vt] : overr) {
             overrset.insert(lbl);
-            TypePtr s = I::Engine::repr(eng.instantiate(field_scheme(lbl)));
+            TypePtr s = I::Engine::repr(eng.instantiate_scheme(field_scheme(lbl)));
             if (resTy) try_unify(resTy, s->dom); else resTy = s->dom;
             try_unify(vt, s->cod);
           }
           for (auto& f : rec->fields) {  // unify_kept
             if (overrset.count(f.name.txt)) continue;
             TypePtr fsch = field_scheme(f.name.txt);
-            TypePtr s1 = I::Engine::repr(eng.instantiate(fsch));
+            TypePtr s1 = I::Engine::repr(eng.instantiate_scheme(fsch));
             try_unify(s1->dom, bt);
-            TypePtr s2 = I::Engine::repr(eng.instantiate(fsch));
+            TypePtr s2 = I::Engine::repr(eng.instantiate_scheme(fsch));
             try_unify(s2->dom, resTy);
             try_unify(s1->cod, s2->cod);
           }
@@ -11108,7 +11159,7 @@ struct Checker {
           // type (`M.allocation -> 'a option`) instead of leaking a free var.
           for (auto& [lbl, vt] : overr)
             if (TypePtr fsch = field_scheme(lbl)) {
-              TypePtr s = I::Engine::repr(eng.instantiate(fsch));
+              TypePtr s = I::Engine::repr(eng.instantiate_scheme(fsch));
               try_unify(bt, s->dom);
               try_unify(vt, s->cod);
             }
@@ -11164,7 +11215,7 @@ struct Checker {
         if (!fsch)
           fsch = shadowing_opened_field(lid_last(lbl.txt), e.loc.start.lnum);
         if (!fsch) fsch = field_scheme(lid_last(lbl.txt));
-        TypePtr s = fsch ? I::Engine::repr(eng.instantiate(fsch)) : nullptr;
+        TypePtr s = fsch ? I::Engine::repr(eng.instantiate_scheme(fsch)) : nullptr;
         // Infer the field value for its type, but suppress errors from inside its
         // body: traversing field values exposes unrelated inference incompleteness
         // (effect handlers, polymorphic recursion).  The record-shape check below
@@ -11280,7 +11331,7 @@ struct Checker {
       TypePtr sbt;
       if (TypePtr fsch =
               field_scheme(lid_last(sf->field.txt), e.loc.start.lnum)) {
-        TypePtr s = I::Engine::repr(eng.instantiate(fsch));
+        TypePtr s = I::Engine::repr(eng.instantiate_scheme(fsch));
         sbt = infer_expr(*sf->obj);
         try_unify(sbt, s->dom);
         try_unify(expect_arg(*sf->value, s->cod), s->cod);  // type_label_exp
@@ -11367,7 +11418,7 @@ struct Checker {
       // class's object row (woodyatt: `y#x` where x : format -> 'a).
       if (ot->kind == I::Type::Kind::Constr)
         if (auto it = class_types_.find(ot->path); it != class_types_.end())
-          ot = I::Engine::repr(eng.instantiate(it->second));
+          ot = I::Engine::repr(eng.instantiate_scheme(it->second));
       if (ot->kind == I::Type::Kind::Object)
         for (size_t i = 0; i < ot->labels.size(); ++i)
           if (ot->labels[i] == sd->meth.txt) return ot->args[i];
@@ -11644,7 +11695,7 @@ struct Checker {
           auto& ex = module_values_cached(*d->prefix);
           auto f = ex.find(d->name);
           if (f != ex.end()) {
-            TypePtr rt = I::Engine::repr(eng.instantiate(f->second));
+            TypePtr rt = I::Engine::repr(eng.instantiate_scheme(f->second));
             for (auto& [lbl, arg] : a.args) {
               if (rt->kind != I::Type::Kind::Arrow) break;
               if (std::holds_alternative<Nolabel>(lbl) && rt->arrow_label == 0 &&
@@ -11950,7 +12001,7 @@ struct Checker {
           if (auto* pc = std::get_if<Pcl_constr>(&ap->ce->desc))
             if (auto it = class_ctor_types_.find(lid_last(pc->id.txt));
                 it != class_ctor_types_.end())
-              ctor = eng.instantiate(it->second);
+              ctor = eng.instantiate_scheme(it->second);
           for (auto& [l, e] : ap->args) {
             TypePtr at = infer_expr(*e);
             if (!ctor) continue;
@@ -12077,8 +12128,14 @@ struct Checker {
           f.constraint_ ? std::get_if<Pconstraint>(&*f.constraint_) : nullptr;
       if (rpc && eta_sites_on() && !strict) {
         std::unordered_map<std::string, TypePtr> rlocal;
-        body = expect_arg(*fb->e, from_coretype(*rpc->type,
-                                                annot_vars_ ? *annot_vars_ : rlocal));
+        // type_constraint_expect: the body meets an INSTANCE of the
+        // annotation (a parameter's variable then links to that copy, never
+        // to the annotation node).  The function's result stays what
+        // expect_arg returns: with a GADT-refined body the annotation's own
+        // variables can stay unbound here (the refinement is not an
+        // equation), and the second conversion below ties the path objects.
+        body = expect_arg(*fb->e, annot_instance(from_coretype(
+                              *rpc->type, annot_vars_ ? *annot_vars_ : rlocal)));
       } else {
         body = infer_expr(*fb->e);
       }
@@ -12535,7 +12592,7 @@ struct Checker {
         };
         if (!no_gadtrow_pba && !strict && plain_annot[i] && bound[i] &&
             !is_format_constr(bound[i]) && rhs_gadt_cases(*bs[i].expr))
-          pending_binding_annot_ = bound[i];
+          pending_binding_annot_ = annot_instance(bound[i]);
         // Otherwise the recursion var's arrow IS the function's expected type
         // (type_let's type_approx, then type_expect): its parameters are the
         // approx's domain vars from the start, so a recursive call's argument
@@ -12552,7 +12609,7 @@ struct Checker {
                  I::Engine::repr(tv[i])->kind == I::Type::Kind::Arrow)
           pending_binding_annot_ = tv[i];
         TypePtr te = (bound[i] && is_format_constr(bound[i]))
-                         ? infer_expr_expected(*bs[i].expr, bound[i])
+                         ? infer_expr_expected(*bs[i].expr, annot_instance(bound[i]))
                          : infer_expr(*bs[i].expr);
         pending_binding_annot_ = nullptr;
         if (upc && !upc->univars.empty()) --la_scope_;
@@ -12639,7 +12696,7 @@ struct Checker {
       // the strict pass compares it against the inferred type to find clashes.
       if (!strict && !fmt_annot && upc && upc->univars.empty() &&
           std::holds_alternative<Pexp_function>(b.expr->desc))
-        pending_binding_annot_ = from_coretype(*upc->typ, avars);
+        pending_binding_annot_ = annot_instance(from_coretype(*upc->typ, avars));
       // Any other RHS is typed AT the declared type (`let x : t = e` is
       // `let x = (e : t)` to type_let, and a `let x : t :> t' = e` at t): the
       // erasure of an optional-arrow value's optionals happens here, see
@@ -12652,8 +12709,8 @@ struct Checker {
         else if (auto* co = std::get_if<Pvc_coercion>(&*b.constraint_); co && co->ground)
           arg_annot = from_coretype(**co->ground, avars);
       }
-      TypePtr te = fmt_annot  ? infer_expr_expected(*b.expr, fmt_annot)
-                   : arg_annot ? expect_arg(*b.expr, arg_annot)
+      TypePtr te = fmt_annot  ? infer_expr_expected(*b.expr, annot_instance(fmt_annot))
+                   : arg_annot ? expect_arg(*b.expr, annot_instance(arg_annot))
                                : infer_expr(*b.expr);
       pending_binding_annot_ = nullptr;
       if (upc && !upc->univars.empty()) --la_scope_;
@@ -13396,7 +13453,14 @@ struct Checker {
     // line; save and restore so a nested module's opens do not escape it.
     int saved_end = cur_struct_end_;
     cur_struct_end_ = items.empty() ? -1 : items.back().loc.end.lnum;
-    for (auto& it : items) process_item(it);
+    // Per-use instantiate copies (Engine::node_copy_) in the folded passes
+    // (display + the cmi writer; the kind pass keeps its shared graph).
+    bool saved_nc = eng.node_copy_;
+    for (auto& it : items) {
+      eng.node_copy_ = node_copy_pass_ && !strict && !cmi::node_id_off();
+      process_item(it);
+    }
+    eng.node_copy_ = saved_nc;
     cur_struct_end_ = saved_end;
   }
 
@@ -13553,7 +13617,7 @@ struct Checker {
                 else if (auto f2 = class_ctor_types_.find(tgt); f2 != class_ctor_types_.end())
                   t = f2->second;
                 if (t) {
-                  TypePtr obj = I::Engine::repr(eng.instantiate(t));
+                  TypePtr obj = I::Engine::repr(eng.instantiate_scheme(t));
                   while (napp-- > 0 && obj->kind == I::Type::Kind::Arrow)
                     obj = I::Engine::repr(obj->cod);
                   if (obj->kind == I::Type::Kind::Object) {
@@ -15283,6 +15347,7 @@ std::vector<std::pair<std::string, std::string>> infer_structure_types(
   Checker ck;
   ck.eng.lenient = true;  // signature pass: best-effort unify (see Engine::lenient)
   ck.fold_abbrevs_ = true;  // keep abbreviations folded for display (see fold_abbrevs_)
+  ck.node_copy_pass_ = true;
   run_checker(ck, s);
   // Apply `module MP = Long.Path` aliases to a rendered signature: rewrite each
   // `Long.Path.` prefix back to `MP.`.  Longest target first so a nested alias
@@ -15405,10 +15470,19 @@ struct BridgeCtx {
   // open/upper rows are as-written, never weak '_weak rows, so they are
   // emittable even at non-generic level (`val bar : [< `A | `B ] t -> unit`).
   bool written = false;
+  // ONE writer node per engine node, across every value of a signature: the
+  // typer's graph shares a type_expr wherever unification made two positions
+  // one node (`let g y = ignore (y + 1); y` has one `int` as domain and
+  // codomain; a `let rec` group's values cite each other's nodes), and
+  // Subst copies a node reached twice once.  Keyed on prov_rep: a node
+  // ocamlc's unify LINKED to another (same nullary constructor) is that
+  // other node in the saved graph.  Null = a fresh node per occurrence.
+  std::unordered_map<const I::Type*, cmi::cmiw::TyPtr>* memo = nullptr;
 };
 static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
                                       std::unordered_map<const I::Type*, int>& vars, int& nextvar,
                                       BridgeCtx& ctx);
+static void adopt_provs(const TypePtr& from0, const TypePtr& to0, int depth = 0);
 static cmi::cmiw::TyPtr bridge_ty(const TypePtr& t0,
                                   std::unordered_map<const I::Type*, int>& vars, int& nextvar) {
   BridgeCtx ctx;
@@ -15477,6 +15551,16 @@ static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
       return it->second;
   if (t->kind == I::Type::Kind::Var || t->kind == I::Type::Kind::Link)
     return bridge_ty_body(t, vars, nextvar, ctx);
+  // The signature-wide node memo (BridgeCtx::memo): a Constr bridges AS the
+  // node its shadow links lead to (ocamlc's unify linked it there), and a
+  // node already bridged for this signature is that one writer node.
+  const I::Type* key = nullptr;
+  if (ctx.memo && (t->kind == I::Type::Kind::Arrow || t->kind == I::Type::Kind::Tuple ||
+                   t->kind == I::Type::Kind::Constr)) {
+    if (t->kind == I::Type::Kind::Constr) t = I::Engine::prov_rep(t);
+    key = t.get();
+    if (auto it = ctx.memo->find(key); it != ctx.memo->end()) return it->second;
+  }
   // Pre-register an in-progress node: a cycle through this node returns it
   // instead of unrolling/degrading, and the finished shape is grafted in
   // below.  A body result that nothing cycled onto is returned as-is.
@@ -15486,11 +15570,15 @@ static cmi::cmiw::TyPtr bridge_ty_rec(const TypePtr& t0,
   ctx.in_progress[t.get()] = node;
   auto res = bridge_ty_body(t, vars, nextvar, ctx);
   ctx.in_progress.erase(t.get());
-  if (node.use_count() == 1) return res;  // no cycle closed onto the node
+  if (node.use_count() == 1) {  // no cycle closed onto the node
+    if (key) (*ctx.memo)[key] = res;
+    return res;
+  }
   *node = *res;  // graft (copy: res may be a previously-registered shared node)
   // A registration the body just made must keep pointing at the SURVIVING node.
   if (auto it = ctx.nodes.find(t.get()); it != ctx.nodes.end() && it->second == res)
     it->second = node;
+  if (key) (*ctx.memo)[key] = node;
   return node;
 }
 static cmi::cmiw::TyPtr bridge_ty_body(const TypePtr& t,
@@ -16487,9 +16575,32 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
       std::vector<cmi::cmiw::Ctor> ctors;
       for (auto& c : var->ctors) {
         cmi::cmiw::Ctor cc; cc.name = c.name.txt; cc.loc = conv_loc(c.loc);
-        if (c.res) cc.res = bridge_ty_named(fc(**c.res), bvars, nextvar, tvars, &dctx);
-        if (auto* tup = std::get_if<Pcstr_tuple>(&c.args))
-          for (auto& a : tup->elems) cc.args.push_back(bridge_ty_named(fc(*a), bvars, nextvar, tvars, &dctx));
+        // The checker's registered scheme for this constructor: its argument
+        // (and GADT result) nodes carry the path objects a value built or
+        // matched with the constructor cites (`f (A n) = n` cites A's
+        // declared `int` block), so the declaration's own conversion adopts
+        // them -- one block per written constructor, as Typedecl stores.
+        std::vector<TypePtr> sargs;
+        TypePtr sres;
+        if (!cmi::prov_off() && !cmi::node_id_off())
+          if (auto sit = ck.ctor_scheme_.find(&c); sit != ck.ctor_scheme_.end() && sit->second) {
+            TypePtr r;
+            sargs = Checker::ctor_params(sit->second, r);
+            if (c.res) sres = r;
+          }
+        if (c.res) {
+          const TypePtr& er = fc(**c.res);
+          if (sres) adopt_provs(sres, er);
+          cc.res = bridge_ty_named(er, bvars, nextvar, tvars, &dctx);
+        }
+        if (auto* tup = std::get_if<Pcstr_tuple>(&c.args)) {
+          if (sargs.size() != tup->elems.size()) sargs.clear();
+          for (std::size_t ai = 0; ai < tup->elems.size(); ++ai) {
+            const TypePtr& ea = fc(*tup->elems[ai]);
+            if (ai < sargs.size()) adopt_provs(sargs[ai], ea);
+            cc.args.push_back(bridge_ty_named(ea, bvars, nextvar, tvars, &dctx));
+          }
+        }
         else if (auto* r = std::get_if<Pcstr_record>(&c.args))
           // Inline record (Typedtree's `Texp_record of {fields; representation;
           // extended_expression}`): emit the labels so a consumer matching
@@ -17223,6 +17334,31 @@ static std::vector<std::string> typext_param_names(const ast::TypeExtension& ext
 // resolves the labels -- otherwise ext_match bails on that arm and the whole
 // match collapses to its first arm (the cause of the bootstrapped
 // includemod_errorprinter's `Includemod.Apply_error {..}` collapse + crash).
+// Give a fresh conversion of a written type the path objects the checker's
+// own conversion of the same text carries: the two walk in step (both are
+// from_coretype of one coretype; unification never changes a node's kind),
+// each Constr taking the registered node's prov.  Rows are not entered.
+static void adopt_provs(const TypePtr& from0, const TypePtr& to0, int depth) {
+  TypePtr f = I::Engine::repr(from0), t = I::Engine::repr(to0);
+  if (depth > 64 || f == t || f->kind != t->kind) return;
+  switch (f->kind) {
+    case I::Type::Kind::Constr:
+      if (f->path != t->path || f->args.size() != t->args.size()) return;
+      t->prov = f->prov;
+      for (std::size_t i = 0; i < f->args.size(); ++i) adopt_provs(f->args[i], t->args[i], depth + 1);
+      break;
+    case I::Type::Kind::Arrow:
+      adopt_provs(f->dom, t->dom, depth + 1);
+      adopt_provs(f->cod, t->cod, depth + 1);
+      break;
+    case I::Type::Kind::Tuple:
+      if (f->args.size() != t->args.size()) return;
+      for (std::size_t i = 0; i < f->args.size(); ++i) adopt_provs(f->args[i], t->args[i], depth + 1);
+      break;
+    default:
+      break;
+  }
+}
 // `ec`: the structure's constructor, whose registered scheme (the checker's
 // own conversion of these argument types) the item then bridges -- a value
 // built or matched with the constructor cites the SAME path objects as the
@@ -20028,6 +20164,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
   // must be best-effort like the display pass (see infer_structure_types).
   ck.eng.lenient = true;
   ck.fold_abbrevs_ = true;
+  ck.node_copy_pass_ = true;
   // Enclosing-scope opens (this file is a re-inferred submodule): replay them so
   // its value inference matches the main pass, which typed it with those opens
   // in scope.  `active` accumulates them plus this level's own opens, for
@@ -20135,6 +20272,15 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
   // written, the spliced top-level type names).
   std::vector<std::tuple<std::size_t, std::string, std::set<std::string>>>
       unit_includes;
+  // The values of one signature bridge into ONE graph (BridgeCtx::memo, one
+  // variable numbering): a node two values reach is one writer node, as it
+  // is one type_expr in ocamlc's signature.  NONODEID keeps a node per
+  // occurrence and a numbering per value.
+  std::unordered_map<const I::Type*, cmi::cmiw::TyPtr> value_memo;
+  BridgeCtx vctx;
+  std::unordered_map<const I::Type*, int> vvars; int vnextvar = 0;
+  const bool sigwide = !cmi::node_id_off();
+  if (sigwide) vctx.memo = &value_memo;
   for (auto& it : s) {
     std::size_t before_item = out.size();  // md_loc / mtd_loc stamping, below
     if (auto* op = std::get_if<Pstr_open>(&it.desc)) {
@@ -20152,9 +20298,15 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
           const std::string& nm = names[ni];
           auto f = ck.venv.back().find(nm);
           if (f == ck.venv.back().end()) continue;
-          std::unordered_map<const I::Type*, int> vars; int nextvar = 0;
+          std::unordered_map<const I::Type*, int> lvars; int lnextvar = 0;
           if (getenv("BRIDGEDBG")) fprintf(stderr, "[bridge-val] %s\n", nm.c_str());
-          auto ty = bridge_ty(f->second, vars, nextvar);
+          // Rows registered for sharing stay per value (a generic row is
+          // copied per use by ocamlc, and our instantiate keeps one node);
+          // only the node memo spans the signature.
+          vctx.nodes.clear();
+          vctx.in_progress.clear();
+          auto ty = sigwide ? bridge_ty_rec(f->second, vvars, vnextvar, vctx)
+                            : bridge_ty(f->second, lvars, lnextvar);
           if (!local_mod_defs.empty())
             rewrite_ty_names(ty, [&](std::string& n) {
               std::string head = n.substr(0, n.find('.'));
@@ -20167,6 +20319,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
                 n = q->second;
             });
           out.push_back(cmi::cmiw::sig_value(nm, std::move(ty)));
+          out.back().sigwide = sigwide;
           if (ni < nlocs.size()) out.back().loc = ml_loc(nlocs[ni]);
         }
       }

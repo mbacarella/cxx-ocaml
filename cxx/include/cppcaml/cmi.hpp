@@ -92,6 +92,10 @@ int prov_new_open(const std::string& open_pfx);
 const ProvInfo& prov_info(int prov);
 int cmi_id_of(const std::string& filepath);
 bool prov_off();  // NOPROV=1: the writer ignores provenance (S554 behaviour)
+// NONODEID=1: the saved graph keeps one writer node per OCCURRENCE (S555
+// behaviour) -- no per-use instantiate copies, no node memo across a
+// signature's values, no shared Predef.path_option for optional arrows.
+bool node_id_off();
 
 struct TypeExpr;
 using TypePtr = GraphPtr<TypeExpr>;
@@ -528,6 +532,10 @@ struct SigItem {
   // 2 Text_exception).
   std::string ext_path;
   int ext_prov = 0;  // ext_path's path object (prov_new; 0 = fresh blocks)
+  // Value: its Ty graph and variable numbering are shared with the other
+  // sigwide values of the signature (the writer's one BridgeCtx), so the
+  // emitter keeps ONE type_expr memo across them.
+  bool sigwide = false;
   std::vector<std::string> ext_params;
   TyPtr ext_ret;
   int text_kind = 2;

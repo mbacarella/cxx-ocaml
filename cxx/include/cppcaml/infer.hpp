@@ -65,6 +65,12 @@ struct Type {
   Kind kind = Kind::Var;
   int level = 0;             // Var: binding level (GENERIC_LEVEL if generalized)
   int id = 0;                // unique id (occurs-check / debug printing)
+  int nlevel = 0;            // Constr/Arrow/Tuple: the level ocamlc's node
+                             // would have -- stamped at creation, lowered by
+                             // every unification the node takes part in
+                             // (Ctype.update_level), so generalize can tell a
+                             // node the binding OWNS (generic: uses copy it)
+                             // from one an outer variable captured (shared).
 
   TypePtr dom, cod;          // Arrow
   int arrow_label = 0;       // Arrow: 0 Nolabel, 1 Labelled, 2 Optional
@@ -98,10 +104,12 @@ struct Type {
   TypePtr plink;             // Constr: a shadow link for the path object ONLY
                              // (Engine::prov_link): the writer cites
                              // prov_rep(t)->prov.  Unify never links Constrs.
-  bool scheme = false;       // Constr: shared across uses (a let-bound scheme's,
-                             // an annotation's, a .cmi's, a predef ctor's node
-                             // -- ocamlc copies those per use and links the
-                             // copy), so prov_link never links it
+  bool scheme = false;       // Constr/Arrow/Tuple: shared across uses (a
+                             // let-bound scheme's, an annotation's, a .cmi's, a
+                             // predef ctor's node -- ocamlc's generic node,
+                             // copied per use; the copy is what links), so
+                             // prov_link never links it and instantiate
+                             // fresh-copies it (Engine::node_copy_)
   int stamp = 0;             // Constr: identity of a local type decl (0 = none).
                              // Two constrs with distinct non-zero stamps are
                              // distinct types even if their paths match.
@@ -172,7 +180,7 @@ public:
   // so the saved type cites t2's path object; record that on t1 (a per-use
   // node only -- see Type::scheme) without linking the nodes.
   void prov_link(const TypePtr& a, const TypePtr& b);
-  // Mark every Constr reachable from t as shared across uses (Type::scheme).
+  // Mark every Constr/Arrow/Tuple reachable from t as shared across uses (Type::scheme).
   static void mark_scheme(const TypePtr& t);
 
   // Make a and b equal, or throw TypeError on a clash.  Updates levels and runs
@@ -188,8 +196,23 @@ public:
   }
 
   // Copy a generalized type, replacing GENERIC_LEVEL vars with fresh vars at the
-  // current level (shared structure for non-generic parts).
-  TypePtr instantiate(const TypePtr& scheme);
+  // current level (shared structure for non-generic parts).  With node_copy_
+  // set, a node ocamlc would COPY (Type::scheme) gets a fresh node per use
+  // like Ctype.instance makes, so two uses of one scheme are two nodes and
+  // the saved graph shares a node exactly where the typer's graph does.
+  // `share_vars` shares every variable, generic or not (Ctype.instance of a
+  // generalize_structure'd annotation: its variables are never generic).
+  TypePtr instantiate(const TypePtr& scheme, bool share_vars = false);
+  // instantiate of a SCHEME by nature (a constructor's, a label's, a .cmi
+  // value's, a class's type): every node of it is generic to ocamlc's
+  // instance, whether or not a generalize ever ran over it (a `let
+  // exception` inside an item, a record loaded from a .cmi mid-item).
+  TypePtr instantiate_scheme(const TypePtr& scheme) {
+    if (node_copy_) mark_scheme(scheme);
+    return instantiate(scheme);
+  }
+  // ocamlc-generic copying (above); set by the checker per structure item.
+  bool node_copy_ = false;
 
   // Generalize: any variable with level > the current level becomes generic.
   void generalize(const TypePtr& t);

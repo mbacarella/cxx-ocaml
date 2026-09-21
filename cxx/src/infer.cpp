@@ -48,6 +48,7 @@ TypePtr Engine::fresh_var() {
 TypePtr Engine::arrow(TypePtr dom, TypePtr cod, int label, std::string lbl) {
   TypePtr t{g_type_arena.alloc()};
   t->kind = Type::Kind::Arrow;
+  t->nlevel = level;
   t->dom = std::move(dom);
   t->cod = std::move(cod);
   t->arrow_label = label;
@@ -58,6 +59,7 @@ TypePtr Engine::arrow(TypePtr dom, TypePtr cod, int label, std::string lbl) {
 TypePtr Engine::tuple(std::vector<TypePtr> elems) {
   TypePtr t{g_type_arena.alloc()};
   t->kind = Type::Kind::Tuple;
+  t->nlevel = level;
   t->args = std::move(elems);
   t->id = next_id_++;
   return t;
@@ -65,6 +67,7 @@ TypePtr Engine::tuple(std::vector<TypePtr> elems) {
 TypePtr Engine::constr(std::string path, std::vector<TypePtr> args, int stamp) {
   TypePtr t{g_type_arena.alloc()};
   t->kind = Type::Kind::Constr;
+  t->nlevel = level;
   t->path = std::move(path);
   t->args = std::move(args);
   t->stamp = stamp;
@@ -221,6 +224,7 @@ void Engine::occurs_and_lower(const TypePtr& var, const TypePtr& t0) {
         if (t->level > var->level) { note(t); t->level = var->level; }
         break;
       case Type::Kind::Arrow:
+        if (t->nlevel > var->level) t->nlevel = var->level;
         if (!seen.insert(t.get()).second) break;
         go(t->dom, under_row);
         go(t->cod, under_row);
@@ -259,6 +263,10 @@ void Engine::occurs_and_lower(const TypePtr& var, const TypePtr& t0) {
         }
         [[fallthrough]];
       case Type::Kind::Tuple:
+        if (cppcaml::dbg_env("NLDBG") && t->kind == Type::Kind::Constr)
+          fprintf(stderr, "[nl] lower %s#%d nlevel=%d by var#%d level %d\n",
+                  t->path.c_str(), t->id, t->nlevel, var->id, var->level);
+        if (t->nlevel > var->level) t->nlevel = var->level;
         if (!seen.insert(t.get()).second) break;
         for (auto& a : t->args) go(a, under_row);
         break;
@@ -291,7 +299,18 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
     b->link = a;
     return;
   }
+  // Two nodes ocamlc's unify would LINK (update_level t1's level onto t2):
+  // both take the lower node level.  Not trailed: a window's rollback leaves
+  // the lowering (a node then shares where it might have copied), and a
+  // trail entry here would read as a BINDING to the abbreviation retry's
+  // binding-free test (matching's `( = )` key lost its int).
+  auto min_nlevel = [&](const TypePtr& x, const TypePtr& y) {
+    int m = std::min(x->nlevel, y->nlevel);
+    x->nlevel = m;
+    y->nlevel = m;
+  };
   if (a->kind == Type::Kind::Arrow && b->kind == Type::Kind::Arrow) {
+    min_nlevel(a, b);
     unify(a->dom, b->dom);
     unify(a->cod, b->cod);
     return;
@@ -301,6 +320,7 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
       if (lenient) return;
       throw TypeError("tuple arity mismatch");
     }
+    min_nlevel(a, b);
     for (size_t i = 0; i < a->args.size(); ++i) unify(a->args[i], b->args[i]);
     return;
   }
@@ -383,6 +403,7 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
         const TypePtr& exp = flip ? a : b;
         const TypePtr& lo = tie ? act : (fa < fb ? a : b);
         const TypePtr& hi = tie ? exp : (fa < fb ? b : a);
+        min_nlevel(lo, hi);
         for (size_t i = 0; i < lo->args.size(); ++i)
           unify(lo->args[i], hi->args[i]);
         // Inside a ROW-FIELD unification the nodes keep their own names --
@@ -474,6 +495,7 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
       if (lenient) return;
       throw TypeError("type constructor mismatch: " + a->path + " vs " + b->path);
     }
+    min_nlevel(a, b);
     for (size_t i = 0; i < a->args.size(); ++i) unify(a->args[i], b->args[i]);
     if (prov_flip_) prov_link(b, a); else prov_link(a, b);
     return;
@@ -701,6 +723,10 @@ TypePtr Engine::prov_rep(TypePtr t) {
 void Engine::prov_link(const TypePtr& a, const TypePtr& b) {
   if (a->path != b->path) return;
   TypePtr ra = prov_rep(a), rb = prov_rep(b);
+  if (cppcaml::dbg_env("NLDBG"))
+    fprintf(stderr, "[nl] prov_link %s#%d(prov %d, rep #%d scheme=%d) -> #%d(prov %d, rep #%d)%s\n",
+            a->path.c_str(), a->id, a->prov, ra->id, (int)ra->scheme, b->id, b->prov, rb->id,
+            (ra == rb || ra->scheme) ? " SKIP" : "");
   if (ra == rb || ra->scheme) return;
   note(ra);
   ra->plink = b;
@@ -711,14 +737,15 @@ void Engine::mark_scheme(const TypePtr& t0) {
     TypePtr t = repr(x0);
     switch (t->kind) {
       case Type::Kind::Arrow:
+        t->scheme = true;
         if (!seen.insert(t.get()).second) break;
         go(t->dom);
         go(t->cod);
         break;
       case Type::Kind::Constr:
+      case Type::Kind::Tuple:
         t->scheme = true;
         [[fallthrough]];
-      case Type::Kind::Tuple:
       case Type::Kind::Variant:
       case Type::Kind::Object:
         if (!seen.insert(t.get()).second) break;
@@ -732,7 +759,7 @@ void Engine::mark_scheme(const TypePtr& t0) {
   go(t0);
 }
 
-TypePtr Engine::instantiate(const TypePtr& scheme) {
+TypePtr Engine::instantiate(const TypePtr& scheme, bool share_vars) {
   std::unordered_map<Type*, TypePtr> mapping;  // generic var -> fresh var
   // Copy replacing generic vars with fresh ones, but SHARING any subtree that
   // contains none (return the original node when no child changed).  This keeps a
@@ -801,6 +828,19 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
     go(root, stk);
     return ok && back_edge && seen.size() <= 512;
   };
+  // A node ocamlc's instance COPIES: a generic one there = Type::scheme here
+  // (a let-bound scheme's node the binding owns, an annotation's, a .cmi's,
+  // a predef constructor's, a scheme marked at instantiate_scheme).  A node
+  // an outer variable captured is never marked (Engine::generalize), so a
+  // later item shares it as ocamlc does.  Rows keep their own rules below
+  // (a shared row accumulates tags across uses).  Under a ROW (a variant's
+  // tag arguments, an object's methods) nothing is fresh-copied for
+  // genericity: the row stays one shared node (the display names it `as 'a`
+  // by that identity, ocamlc by the shared row variable).
+  int row_depth = 0;
+  auto ocaml_generic = [&](const TypePtr& t) {
+    return node_copy_ && row_depth == 0 && t->scheme;
+  };
   // Cycle-preserving copy: pre-register each composite's fresh shell in `memo`
   // BEFORE recursing, so a back-edge resolves to the in-progress copy (the
   // instance gets its own cycle, isolated from the scheme's).
@@ -810,7 +850,7 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
     if (mit != memo.end()) return mit->second;
     switch (t->kind) {
       case Type::Kind::Var: {
-        if (t->level == GENERIC_LEVEL) {
+        if (t->level == GENERIC_LEVEL && !share_vars) {
           auto it = mapping.find(t.get());
           // NB: the fresh copy does NOT inherit var_hint -- ocamlc's copy
           // drops Tvar names on instantiation (keep_names=false), so a use of
@@ -835,7 +875,7 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
       case Type::Kind::Variant: {
         TypePtr r;
         if (t->kind == Type::Kind::Tuple) r = tuple(t->args);
-        else if (t->kind == Type::Kind::Constr) { r = constr(t->path, t->args, t->stamp); r->functor_abbrev = t->functor_abbrev; r->abbrev = t->abbrev; r->labels = t->labels; r->rigid = t->rigid; r->rigid_name = t->rigid_name; r->prov = t->prov; }
+        else if (t->kind == Type::Kind::Constr) { r = constr(t->path, t->args, t->stamp); r->functor_abbrev = t->functor_abbrev; r->abbrev = t->abbrev; r->labels = t->labels; r->rigid = t->rigid; r->rigid_name = t->rigid_name; r->prov = node_copy_ ? prov_rep(t)->prov : t->prov; }
         else if (t->kind == Type::Kind::Object) {
           r = object_type(t->labels, t->args);
           r->variant_kind = t->variant_kind;
@@ -868,7 +908,7 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
     if (mit != memo.end()) return mit->second;
     switch (t->kind) {
       case Type::Kind::Var:
-        if (t->level == GENERIC_LEVEL) {
+        if (t->level == GENERIC_LEVEL && !share_vars) {
           auto it = mapping.find(t.get());
           // NB: the fresh copy does NOT inherit var_hint -- ocamlc's copy
           // drops Tvar names on instantiation (keep_names=false), so a use of
@@ -887,7 +927,7 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
         // already resolved to a concrete type) resolves to the same node when
         // truly unchanged -- comparing to the wrapper pointer spuriously marked
         // it "changed" and re-copied shareable structure per use.
-        TypePtr r = (d == repr(t->dom) && c == repr(t->cod))
+        TypePtr r = (d == repr(t->dom) && c == repr(t->cod) && !ocaml_generic(t))
                       ? t  // no generic inside: share
                       : arrow(std::move(d), std::move(c), t->arrow_label, t->arrow_lbl);
         memo[t.get()] = r;
@@ -901,10 +941,13 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
         std::vector<TypePtr> as;
         bool changed = false;
         as.reserve(t->args.size());
+        bool row = t->kind == Type::Kind::Variant || t->kind == Type::Kind::Object;
+        if (row) ++row_depth;
         for (auto& a : t->args) {  // repr-compare: see the Arrow case
           as.push_back(copy(a));
           if (as.back() != repr(a)) changed = true;
         }
+        if (row) --row_depth;
         on_stack.erase(t.get());
         // A generic variant row gets a FRESH weak node per use (see `fits`), so a
         // value-restricted use (`bar = wrap ()`) can weaken its own copy without
@@ -921,13 +964,25 @@ TypePtr Engine::instantiate(const TypePtr& scheme) {
         bool sch_head = t->kind == Type::Kind::Constr && t->scheme_head &&
                         t->level == GENERIC_LEVEL;
         TypePtr r;
-        if (!changed && !weak_copy && !sch_head) r = t;  // monomorphic composite: share the node
+        // A generic Constr/Tuple is a fresh node per use (ocaml_generic);
+        // a row is shared unchanged unless weak_copy says otherwise.  A
+        // RIGID locally-abstract type stays ONE node: generalize turns that
+        // node into the type variable every reference must then see.
+        bool gen_copy = (t->kind == Type::Kind::Tuple ||
+                         (t->kind == Type::Kind::Constr && !t->rigid)) &&
+                        ocaml_generic(t);
+        if ((gen_copy || changed || weak_copy || sch_head) && cppcaml::dbg_env("NLDBG"))
+          fprintf(stderr, "[nl] copy %s#%d scheme=%d gen=%d changed=%d weak=%d sch=%d\n",
+                  t->path.c_str(), t->id, (int)t->scheme, (int)gen_copy,
+                  (int)changed, (int)weak_copy, (int)sch_head);
+        if (!changed && !weak_copy && !sch_head && !gen_copy) r = t;  // monomorphic composite: share the node
         else if (t->kind == Type::Kind::Tuple) r = tuple(std::move(as));
         else if (t->kind == Type::Kind::Constr) {
           r = constr(t->path, std::move(as), t->stamp);
           r->functor_abbrev = t->functor_abbrev; r->abbrev = t->abbrev;
           r->labels = t->labels; r->rigid = t->rigid; r->rigid_name = t->rigid_name;
-          r->prov = t->prov;  // a copy cites the same path object (ocamlc's copy shares p)
+          // the copy is of the REPR: it cites the path object the shadow links lead to
+          r->prov = node_copy_ ? prov_rep(t)->prov : t->prov;
           // Stamp a scheme-head copy with its creation level, so an inner
           // let's generalization can tell an OWNED head (created at its level;
           // becomes a per-use scheme head) from a CAPTURED one (created
@@ -993,7 +1048,10 @@ void Engine::finalize_family_heads(const TypePtr& t0, bool scheme) {
         go(t->cod);
         break;
       case Type::Kind::Constr:
-        if (family_prio(t.get()) >= 0) {
+        // (with node_copy_: a head an outer variable captured -- nlevel at
+        // or below the current level -- stays live and shared; ocamlc's
+        // later uses meet that one node and may relink it)
+        if (family_prio(t.get()) >= 0 && !(node_copy_ && t->nlevel <= level)) {
           t->level = GENERIC_LEVEL;
           if (scheme) t->scheme_head = true;
         }
@@ -1034,8 +1092,10 @@ void Engine::finalize_owned_family_heads(const TypePtr& t0) {
         go(t->cod);
         break;
       case Type::Kind::Constr:
+        // (with node_copy_: a head an outer variable captured -- nlevel
+        // lowered to the outer level -- is not owned; ocamlc shares it)
         if (t->level != GENERIC_LEVEL && t->level > level &&
-            family_prio(t.get()) >= 0) {
+            family_prio(t.get()) >= 0 && !(node_copy_ && t->nlevel <= level)) {
           t->level = GENERIC_LEVEL;
           t->scheme_head = true;
         }
@@ -1066,6 +1126,11 @@ void Engine::generalize(const TypePtr& t0) {
         if (t->level > level) t->level = GENERIC_LEVEL;
         break;
       case Type::Kind::Arrow:
+        // A let-bound scheme's node: uses copy it -- unless an outer variable
+        // captured it (nlevel lowered to the outer level: ocamlc leaves such
+        // a node non-generic and shared).  Without per-use copies
+        // (node_copy_ off) every node is marked, as before.
+        if (t->nlevel > level || !node_copy_) t->scheme = true;
         if (!seen.insert(t.get()).second) break;
         go(t->dom);
         go(t->cod);
@@ -1085,6 +1150,7 @@ void Engine::generalize(const TypePtr& t0) {
         for (auto& a : t->inherited) go(a);
         break;
       case Type::Kind::Tuple:
+        if (t->nlevel > level || !node_copy_) t->scheme = true;
         if (!seen.insert(t.get()).second) break;
         for (auto& a : t->args) go(a);
         break;
@@ -1108,7 +1174,12 @@ void Engine::generalize(const TypePtr& t0) {
         // stays `lazy_t` after later uses; only a same-rec-group flow -- where
         // the node is still unstamped and shared -- adopts `Lazy.t`, hamming).
         // (family-head finalization moved to finalize_family_heads -- top-level only)
-        t->scheme = true;  // a let-bound scheme's node: uses copy it (prov_link)
+        // A let-bound scheme's node: uses copy it (prov_link never links it)
+        // -- see the Arrow arm for the captured-node exception.
+        if (cppcaml::dbg_env("NLDBG"))
+          fprintf(stderr, "[nl] generalize %s#%d nlevel=%d at level %d prov=%d\n",
+                  t->path.c_str(), t->id, t->nlevel, level, t->prov);
+        if (t->nlevel > level || !node_copy_) t->scheme = true;
         if (!seen.insert(t.get()).second) break;
         for (auto& a : t->args) go(a);
         break;
@@ -1136,6 +1207,9 @@ void Engine::demote(const TypePtr& t0) {
         if (t->level != GENERIC_LEVEL && t->level > level) { note(t); t->level = level; }
         break;
       case Type::Kind::Arrow:
+        // A weak binding's structure is generic too (lower_contravariant
+        // lowers variables only), captured nodes excepted -- see generalize.
+        if (t->nlevel > level || !node_copy_) t->scheme = true;
         if (!seen.insert(t.get()).second) break;
         go(t->dom);
         go(t->cod);
@@ -1158,6 +1232,7 @@ void Engine::demote(const TypePtr& t0) {
         for (auto& a : t->inherited) go(a);
         break;
       case Type::Kind::Tuple:
+        if (t->nlevel > level || !node_copy_) t->scheme = true;
         if (!seen.insert(t.get()).second) break;
         for (auto& a : t->args) go(a);
         break;
@@ -1165,7 +1240,10 @@ void Engine::demote(const TypePtr& t0) {
         // Weak bindings are FINALIZED too: stamp the lazy head (see generalize)
         // so a later use can't relink the binding's displayed node.
         // (family-head finalization moved to finalize_family_heads -- top-level only)
-        t->scheme = true;  // a let-bound scheme's node: uses copy it (prov_link)
+        if (cppcaml::dbg_env("NLDBG"))
+          fprintf(stderr, "[nl] demote %s#%d nlevel=%d at level %d prov=%d\n",
+                  t->path.c_str(), t->id, t->nlevel, level, t->prov);
+        if (t->nlevel > level || !node_copy_) t->scheme = true;  // a let-bound scheme's node: uses copy it (prov_link)
         if (!seen.insert(t.get()).second) break;
         for (auto& a : t->args) go(a);
         break;

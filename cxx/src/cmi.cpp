@@ -720,6 +720,10 @@ bool prov_off() {
   static const bool off = cppcaml::dbg_env("NOPROV") != nullptr;
   return off;
 }
+bool node_id_off() {
+  static const bool off = cppcaml::dbg_env("NONODEID") != nullptr;
+  return off;
+}
 
 namespace {
 // Read a .cmi file, locate its Marshal header, and decode the byte stream into
@@ -2169,7 +2173,11 @@ struct TyEmit {
             !(t->args[0]->k == Ty::Constr && t->args[0]->name == "option")) {
           // An OPTIONAL argument's stored domain is `d option` (the printer
           // strips it back to `?x:d`; a bare domain prints `?x:<hidden>`).
-          auto opath = o::vblock(0, {o::vblock(3, {o::vstr("option"), o::vint(12)})});
+          // Typecore.type_option cites Predef.path_option: ONE block per
+          // compile (max_arity's 133 optional parameters share it).
+          auto opath = node_id_off()
+                           ? o::vblock(0, {o::vblock(3, {o::vstr("option"), o::vint(12)})})
+                           : pident_predef("option", 12);
           inner = texpr(o::vblock(3, {opath, o::vlist({inner}),
                                       o::vblock(0, {o::vint(0)})}));  // Tconstr option
         }
@@ -2646,6 +2654,11 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
   // ext_type_params are the extension's own (transl_type_extension builds
   // them once), so a Text_next item cites its Text_first's blocks.
   std::vector<o::ValPtr> ext_group_params;
+  // One type_expr per shared Ty node (and per variable id) across the
+  // signature's sigwide values: their bridge shares nodes and numbers
+  // variables together (SigItem::sigwide), so the memo carries over.
+  std::unordered_map<int, o::ValPtr> sw_vars;
+  std::unordered_map<const Ty*, o::ValPtr> sw_nodes;
   for (std::size_t i = 0; i < items.size(); ++i) {
     const SigItem& it = items[i];
     TyEmit te; te.referenced = &referenced; te.local_types = &visible;
@@ -2653,6 +2666,12 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
     te.local_modtypes = &visible_mt; te.local_mods = &visible_mod;
     te.engine_types = &visible_eng;
     te.mods_by_name = &modscope.by_name; te.mod_members = &modscope.members;
+    if (it.sigwide) { std::swap(te.vars, sw_vars); std::swap(te.shared_nodes, sw_nodes); }
+    struct SwRestore {
+      TyEmit& te; bool on;
+      std::unordered_map<int, o::ValPtr>& v; std::unordered_map<const Ty*, o::ValPtr>& n;
+      ~SwRestore() { if (on) { std::swap(te.vars, v); std::swap(te.shared_nodes, n); } }
+    } sw_restore{te, it.sigwide, sw_vars, sw_nodes};
     auto ident = ident_val(0, it.name, item_stamp[i]);  // Ident.Local
     if (it.k == SigItem::Value) {
       o::ValPtr valkind;
