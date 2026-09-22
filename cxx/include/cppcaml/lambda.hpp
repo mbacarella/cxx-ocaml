@@ -9,6 +9,7 @@
 #pragma once
 
 #include <map>
+#include <set>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -573,7 +574,8 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
                                 std::vector<std::string>* required_globals = nullptr,
                                 const std::vector<std::string>* directive_files = nullptr,
                                 std::size_t* eta_sites = nullptr,
-                                std::size_t* pv_reify = nullptr);
+                                std::size_t* pv_reify = nullptr,
+                                std::set<const ast::Expression*>* eta_nodes = nullptr);
 
 // Print in -dlambda format (stamps normalized by first appearance).
 void print_dlambda(const LamPtr& code, std::ostream& out);

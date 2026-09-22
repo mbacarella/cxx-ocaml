@@ -217,9 +217,10 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
       cppcaml::ast::print_dparsetree(structure, in_path, std::cout, dirfiles);
     std::vector<std::string> required_globals;
     std::size_t eta_sites = 0, pv_reify = 0;
+    std::set<const cppcaml::ast::Expression*> eta_nodes;
     auto code = cppcaml::lambda::translate_implementation(structure, mod, stdlib_dir, in_path,
                                                           &required_globals, &dirfiles,
-                                                          &eta_sites, &pv_reify);
+                                                          &eta_sites, &pv_reify, &eta_nodes);
     lap("translate (infer+lambda)", tp);
     if (g_dump.lambda) cppcaml::lambda::print_dlambda(code, std::cout);
     auto instrs = cppcaml::bytecode::compile_implementation(code, mod);
@@ -247,19 +248,23 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
         // The count at each constructor's / label's ident: their saved
         // stamps, Subst keeping those idents (S557; NOLDSTAMP reverts).
         std::map<std::string, long long> at;
+        // The local types pattern typing named, per pattern node: uids
+        // too (S562; NOUIDLTYPE reverts).
+        std::map<const void*, long long> ltypes;
         int base = cppcaml::dbg_env("NOSTAMPBASE")
                        ? 300
                        : 274 + cppcaml::typing_ident_count(
                                    structure, eta_sites,
                                    cppcaml::package_sig_idents(sig), &fexp,
-                                   pv_reify, &loaded, &at);
+                                   pv_reify, &loaded, &at, &ltypes);
         std::map<std::string, int> stamps;
         if (!cppcaml::dbg_env("NOSTAMPBASE") && !cppcaml::dbg_env("NOLDSTAMP"))
           for (auto& e : at) stamps[e.first] = 274 + (int)e.second;
         // The uid typing gave each declaration -- the local binders on the
         // way included (NOUIDWALK reverts to numbering the signature).
         cppcaml::UidMap um;
-        if (!cppcaml::dbg_env("NOUIDWALK")) um = cppcaml::typing_uid_map(structure);
+        if (!cppcaml::dbg_env("NOUIDWALK"))
+          um = cppcaml::typing_uid_map(structure, &ltypes, &eta_nodes);
         cppcaml::cmi::cmiw::write_cmi(
             cmi_path.string(), mod, sig,
             imports ? cppcaml::cmi::cmiw::cmi_imports(loaded, mod,

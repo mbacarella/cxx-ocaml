@@ -29300,8 +29300,11 @@ struct Count {
       explicit Depth(int& x) : d(x) { ++d; }
       ~Depth() { --d; }
     } depth{patd_};
-    if (patd_ == 1 && !exist_off() && !exhmat_off() && !cexty_off())
-      n += cx_row(p);
+    if (patd_ == 1 && !exist_off() && !exhmat_off() && !cexty_off()) {
+      long long e0 = eqk_, r = cx_row(p);
+      n += r;
+      lt(&p, r + eqk_ - e0);
+    }
     if (auto* v = std::get_if<Ppat_var>(&p.desc)) {
       ++n;
       if (out) out->push_back(v->name.txt);
@@ -29348,13 +29351,15 @@ struct Count {
       return;
     }
     if (auto* c = std::get_if<Ppat_construct>(&p.desc)) {
-      n += (long long)c->vars.size();       // `Constr (type a) p`
+      long long ex = (long long)c->vars.size();  // `Constr (type a) p`
       // `type_pat`'s `Ppat_construct` arm runs `Ctype.instance_constructor
       // Make_existentials_abstract`, which `Env.enter_type`s one abstract
       // type per existential the constructor opens.
-      n += ctor_exist(c->id.txt);
+      ex += ctor_exist(c->id.txt);
       if (exhmat_off() || cexty_off())  // else `cx_row` reads the row (S507)
-        n += ctor_reify(c->id.txt);
+        ex += ctor_reify(c->id.txt);
+      n += ex;
+      lt(&p, ex);
       if (c->arg) pat(**c->arg, out);
       // A variable the pattern binds at a constructor's PACKAGE-typed
       // argument is package-typed by the declaration: an unpack or a
@@ -29423,7 +29428,10 @@ struct Count {
     auto m = mark();
     std::vector<std::string> nm;
     cx_scrut_ = scrut;
-    pat(c.lhs, &nm);
+    {
+      EffRow er(*this, std::holds_alternative<Ppat_effect>(c.lhs.desc));
+      pat(c.lhs, &nm);
+    }
     cx_scrut_ = nullptr;
     cxenv_.push_back(cxlast_);
     for (auto& s : nm) bind(s);
@@ -31589,6 +31597,8 @@ struct Count {
   static const Pattern* peel(const Pattern* p) {
     if (!p) return nullptr;
     const Pattern* q = &strip(*p);
+    if (!effeq_off())
+      if (auto* f = std::get_if<Ppat_effect>(&q->desc)) q = &strip(*f->eff);
     while (auto* a = std::get_if<Ppat_alias>(&q->desc)) q = &strip(*a->p);
     return q;
   }
@@ -31945,6 +31955,39 @@ struct Count {
     }
   };
   long long cxk_ = 0;   // idents the counterexamples' typing named
+  // ---- THE LOCAL TYPES PATTERN TYPING NAMES ARE UIDS TOO (S562) ----------
+  // Every `Ctype.new_local_type` is a `Uid.mk`: a reified `$`, an
+  // existential a constructor pattern opens, a `Constr (type a)` name --
+  // each an ident this walk counts -- and a GADT EQUATION (`add_gadt_equation`,
+  // ctype.ml:3136), which names no ident and is counted here alone (`eqk_`).
+  // `ltypes_`, when given, receives what each row's typing and check cost,
+  // under the pattern node they are typed at: the uid walk adds them there.
+  std::map<const void*, long long>* ltypes_ = nullptr;
+  long long eqk_ = 0;
+  // An `effect P, k` row is typed at `%eff eff` (`type_effect_cases`,
+  // typecore.ml:7386: ONE local abstract type for the match, a newtype to
+  // the rows' typing), so `Print : string -> unit eff` there adds the
+  // equation `%eff = unit` -- and the rows' unused check types its
+  // witnesses at the same type.  `effrow_` puts that scrutinee type under
+  // the rows; `NOEFFEQ=1` reverts.
+  bool effrow_ = false;
+  static bool effeq_off() {
+    static const bool off =
+        dbg_env("NOEFFEQ") != nullptr || dbg_env("NOUID562") != nullptr;
+    return off;
+  }
+  struct EffRow {
+    Count& c; bool on;
+    EffRow(Count& cc, bool b) : c(cc), on(b && !effeq_off()) {
+      if (on) { c.effrow_ = true; ++c.la_; c.las_.push_back("%eff"); }
+    }
+    ~EffRow() {
+      if (on) { c.effrow_ = false; --c.la_; c.las_.pop_back(); }
+    }
+  };
+  void lt(const void* key, long long k) {
+    if (ltypes_ && k) (*ltypes_)[key] += k;
+  }
   bool cxbt_ = false;   // `Backtrack_or` (the unused check) or `Refine_or`
   bool cxreal_ = false; // a ROW's own typing: both alternatives, no backtrack
   bool cxlax_ = false;  // no newtype in scope: nothing is refused (as before)
@@ -31989,6 +32032,9 @@ struct Count {
     if (ky == Sty::Var) { st.a[y].link = x; return true; }
     if (kx == Sty::Nt || ky == Sty::Nt) {
       if (!gadt) return false;
+      // an equation on a real local type, not on the `?` S504 fabricates
+      // for an unread scrutinee (a plain variable takes no equation)
+      if (st.a[x].name != "?" && st.a[y].name != "?") ++eqk_;
       if (kx == Sty::Nt && ky == Sty::Nt) { st.a[x].link = y; return true; }
       int n = kx == Sty::Nt ? x : y, t = kx == Sty::Nt ? y : x;
       std::set<int> seen;
@@ -33028,6 +33074,7 @@ struct Count {
   // scrutinee's type otherwise.
   int pat_ty(Tst& st, const Pattern* ann, const Expression* scrut,
              std::map<std::string, int>& vars) {
+    if (effrow_) return st.mk(Sty::Con, "eff", {st.nt("%eff")});
     for (const Pattern* q = ann; q;) {
       if (auto* c = std::get_if<Ppat_constraint>(&q->desc))
         return inst(st, *c->t, vars, true);
@@ -33159,9 +33206,12 @@ struct Count {
           // Under no newtype nothing is refused and the first satisfying
           // vector is the clause's own shape: S504's reading, at no cost
           // (patmatch.ml's hundred-constructor matches took 16s typed).
-          long long u = cx && la_ > 0
-                            ? cx_unused(pref, c.lhs, g == 0 ? scrut : nullptr)
-                            : -1;
+          long long u = -1;
+          {
+            EffRow er(*this, g == 2);
+            if (cx && la_ > 0)
+              u = cx_unused(pref, c.lhs, g == 0 ? scrut : nullptr);
+          }
           k += u >= 0 ? u : any ? wit_cost(pref, false) : pat_exist(c.lhs);
         }
         if (!c.guard) {
@@ -33212,7 +33262,11 @@ struct Count {
       pat(b.pat, &nm);
       cx_scrut_ = nullptr;
     }
-    for (auto& b : bs) n += pat_check(b.pat, b.expr.get());
+    for (auto& b : bs) {
+      long long e0 = eqk_, r = pat_check(b.pat, b.expr.get());
+      n += r;
+      lt(&b.pat, r + eqk_ - e0);
+    }
     // The ghosts are entered into `exp_env`, the environment the BODIES are
     // typed in, so they are held there like any binding: an inner
     // `let f i = ..` under `let f x = ..` finds `f` bound already and adds
@@ -33310,7 +33364,11 @@ struct Count {
         las_.push_back(std::get<Pparam_newtype>(pm.desc).name.txt);
         continue;
       }
-      n += pat_check(pv->pat);
+      {
+        long long e0 = eqk_, r = pat_check(pv->pat);
+        n += r;
+        lt(&pv->pat, r + eqk_ - e0);
+      }
       if (pv->default_) {
         // A defaulted optional parameter binds `*opt*` INSTEAD of running
         // name_pattern (typecore.ml:6083).
@@ -33370,7 +33428,11 @@ struct Count {
     bool named = false;
     for (auto& c : cs) if (is_named(c.lhs)) { named = true; break; }
     if (!named) ++n;  // name_cases "param" cases
-    n += unused_extra(cs);
+    {
+      long long e0 = eqk_, r = unused_extra(cs);
+      n += r;
+      if (!cs.empty()) lt(&cs[0].lhs, r + eqk_ - e0);
+    }
     for (auto& c : cs) cse(c);
     release(m);
     la_ -= nla;
@@ -33455,7 +33517,11 @@ struct Count {
       }
       pat(f->pat, &nm);
       n += (long long)nm.size();
-      n += pat_check(f->pat);
+      {
+        long long e0 = eqk_, r = pat_check(f->pat);
+        n += r;
+        lt(&f->pat, r + eqk_ - e0);
+      }
       for (auto& s : nm) bind(s);
       cexpr(*f->body);
       release(m);
@@ -33511,13 +33577,21 @@ struct Count {
       n += appexp_pos(*m->e);
       expr(*m->e);
       n += eff_row(m->cases);
-      n += unused_extra(m->cases, true, m->e.get());
+      {
+        long long e0 = eqk_, r = unused_extra(m->cases, true, m->e.get());
+        n += r;
+        if (!m->cases.empty()) lt(&m->cases[0].lhs, r + eqk_ - e0);
+      }
       for (auto& c : m->cases) cse(c, m->e.get());
     } else if (auto* t = std::get_if<Pexp_try>(&e.desc)) {
       if (!pkmeet_off() && !pkexp_.count(&e)) n += pk_arms(t->e.get(), t->cases);
       expr(*t->e);
       n += eff_row(t->cases);
-      n += unused_extra(t->cases, false);
+      {
+        long long e0 = eqk_, r = unused_extra(t->cases, false);
+        n += r;
+        if (!t->cases.empty()) lt(&t->cases[0].lhs, r + eqk_ - e0);
+      }
       for (auto& c : t->cases) cse(c);
     } else if (auto* s = std::get_if<Pexp_sequence>(&e.desc)) {
       n += appexp_pos(*s->e1);
@@ -33659,7 +33733,11 @@ struct Count {
       pat(l->let_.pat, &nm); expr(*l->let_.exp);
       Row lrow{&l->let_.pat};
       for (auto& a : l->ands) { pat(a.pat, &nm); expr(*a.exp); lrow.push_back(&a.pat); }
-      n += pat_check(lrow);
+      {
+        long long e0 = eqk_, r = pat_check(lrow);
+        n += r;
+        lt(&l->let_.pat, r + eqk_ - e0);
+      }
       // Texp_letop carries a `param` named the same way (typecore.ml:5503);
       // with `and`s the case pattern is a tuple, so never a bare variable.
       if (!l->ands.empty() || !is_named(l->let_.pat)) ++n;
@@ -44160,7 +44238,8 @@ int typing_ident_count(const ast::Structure& s, std::size_t eta_sites,
                        long long pkg_sig,
                        const std::set<std::string>* fexp,
                        std::size_t pv_reify, std::set<std::string>* loaded,
-                       std::map<std::string, long long>* stamps) {
+                       std::map<std::string, long long>* stamps,
+                       std::map<const void*, long long>* ltypes) {
   // The citation walk runs FIRST: whether a `module M = A.N` alias is ever
   // READ is what says the path has to be resolved, and only a name this file
   // binds ONCE can be followed to the module it stands for.
@@ -44243,6 +44322,7 @@ int typing_ident_count(const ast::Structure& s, std::size_t eta_sites,
   }
   c.xbf_ = &xbf;
   c.xba_ = &xba;
+  c.ltypes_ = ltypes;
   c.ereads_ = &u.ereads_;
   c.yreads_ = &u.yreads_;
   c.treads_ = &u.treads_;
@@ -44356,6 +44436,49 @@ struct Walk {
   bool obj_off = false;          // NOUIDOBJ: keep bailing on `object .. end`
   bool class_off = false;        // NOUIDCLASS: keep bailing on a class
   bool rec_off = false;          // NORECSTAMP: keep bailing on `module rec`
+  // S562: the local types pattern typing names -- reifications,
+  // existentials, GADT equations, the witnesses the partial and unused
+  // checks type -- per pattern node, from the counting walk
+  // (stampcount::Count::ltypes_): every `Ctype.new_local_type` is a
+  // `Uid.mk`.  NOUIDLTYPE=1 drops them, the `type a.` newtypes and the
+  // effect rows' `%eff`; NOUIDTYPEXT=1 keeps bailing on a type extension.
+  const std::map<const void*, long long>* ltypes = nullptr;
+  bool ltype_off = false;
+  bool typext_off = false;
+  bool ext_off = false;
+  bool orpat_off = false;
+  bool inlparam_off = false;
+  bool coerce_off = false;
+  bool anonparam_off = false;
+  bool sigalias_off = false;
+  // An argument whose inferred type begins with optional arrows, used where
+  // a plain arrow is expected, is let-and-eta-expanded (typecore.ml's
+  // type_argument: `var_pair "eta"`, `var_pair "arg"`): two uids at the
+  // site (S562; NOUIDETA=1 reverts).
+  const std::set<const ast::Expression*>* eta = nullptr;
+  void local_types(const ast::Pattern& p) {
+    if (!ltypes) return;
+    auto it = ltypes->find(&p);
+    if (it != ltypes->end()) c += (int)it->second;
+  }
+  // `let f : type a. t = e` wraps `e` in one `Pexp_newtype` per univar
+  // (typecore.ml's vb_exp_constraint); the pattern's own poly constraint
+  // names nothing.
+  void univars(const std::vector<ast::ValueBinding>& bs) {
+    if (ltype_off) return;
+    for (auto& b : bs)
+      if (b.constraint_)
+        if (auto* pc = std::get_if<ast::Pvc_constraint>(&*b.constraint_))
+          c += (int)pc->univars.size();
+  }
+  // A `match`/`try`/`function` with an `effect` row is typed by
+  // `type_effect_cases` (typecore.ml:7386), which names ONE local type for
+  // the effect whatever the rows number.
+  void eff_row(const std::vector<ast::Case>& cs) {
+    if (ltype_off) return;
+    for (auto& k : cs)
+      if (std::get_if<ast::Ppat_effect>(&k.lhs.desc)) { mk(); return; }
+  }
   // The instance variables of every class (and class type) declared so far,
   // by dotted path: what an `inherit` of it costs in the second pass.
   std::map<std::string, std::set<std::string>> cvars;
@@ -44369,6 +44492,7 @@ struct Walk {
   // variables those bind are the ones the signature saves.
   void pat(const ast::Pattern& p, bool save) {
     using namespace ast;
+    local_types(p);
     if (auto* v = std::get_if<Ppat_var>(&p.desc)) {
       if (save) give('v', v->name.txt); else mk();
     } else if (auto* a = std::get_if<Ppat_alias>(&p.desc)) {
@@ -44379,7 +44503,10 @@ struct Walk {
     } else if (auto* ct = std::get_if<Ppat_construct>(&p.desc)) {
       if (ct->arg) pat(**ct->arg, save);
     } else if (auto* o = std::get_if<Ppat_or>(&p.desc)) {
-      pat(*o->l, save); pat(*o->r, save);       // once per branch
+      // once per branch -- and a saved variable keeps the LEFT branch's
+      // (`enter_orpat_variables` unifies the two and keeps p1's idents;
+      // S562, NOUIDORPAT=1 lets the right's overwrite as before)
+      pat(*o->l, save); pat(*o->r, save && orpat_off);
     } else if (auto* cs = std::get_if<Ppat_constraint>(&p.desc)) {
       pat(*cs->p, save);
     } else if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
@@ -44406,6 +44533,7 @@ struct Walk {
   // A function parameter's unpack costs ONE, not two.
   void param_pat(const ast::Pattern& p) {
     if (auto* u = std::get_if<ast::Ppat_unpack>(&p.desc)) {
+      local_types(p);
       if (u->name.txt) mk();
       return;
     }
@@ -44417,8 +44545,10 @@ struct Walk {
   // matters here; the order within one expression never moves a saved uid.
   void expr(const ast::Expression& e) {
     using namespace ast;
+    if (eta && eta->count(&e)) c += 2;
     if (auto* l = std::get_if<Pexp_let>(&e.desc)) {
       for (auto& b : l->bindings) pat(b.pat, false);
+      univars(l->bindings);
       for (auto& b : l->bindings) if (b.expr) expr(*b.expr);
       if (l->body) expr(*l->body);
     } else if (auto* f = std::get_if<Pexp_function>(&e.desc)) {
@@ -44433,9 +44563,11 @@ struct Walk {
       if (f->body) fbody(*f->body);
     } else if (auto* m = std::get_if<Pexp_match>(&e.desc)) {
       if (m->e) expr(*m->e);
+      eff_row(m->cases);
       cases(m->cases);
     } else if (auto* t = std::get_if<Pexp_try>(&e.desc)) {
       if (t->e) expr(*t->e);
+      eff_row(t->cases);
       cases(t->cases);
     } else if (auto* fo = std::get_if<Pexp_for>(&e.desc)) {
       pat(fo->var, false);
@@ -44507,8 +44639,21 @@ struct Walk {
       if (obj_off || !ob->cs) bail(); else structure_(*ob->cs, nullptr);
     } else if (std::get_if<Pexp_new>(&e.desc)) {
       if (class_off) bail();  // `new c` looks c up and mints nothing
-    } else if (std::get_if<Pexp_extension>(&e.desc)) {
-      bail();
+    } else if (auto* x = std::get_if<Pexp_extension>(&e.desc)) {
+      // The typer's own extensions (typecore.ml:5522): `[%extension_
+      // constructor C]` looks C up, `[%atomic.loc r.x]` types the field
+      // access -- nothing more (S562; NOUIDEXT=1 bails as before).
+      if (ext_off) { bail(); return; }
+      if (x->name == "extension_constructor" ||
+          x->name == "ocaml.extension_constructor") {
+        // nothing
+      } else if (x->name == "atomic.loc" || x->name == "ocaml.atomic.loc") {
+        if (x->payload.str.size() == 1)
+          if (auto* ev = std::get_if<Pstr_eval>(&x->payload.str[0].desc))
+            if (ev->e) expr(*ev->e);
+      } else {
+        bail();
+      }
     }
     // Pexp_ident / constant / unreachable: nothing.
   }
@@ -44516,6 +44661,7 @@ struct Walk {
     if (auto* e = std::get_if<ast::Pfunction_body>(&b.v)) {
       if (e->e) expr(*e->e);
     } else {
+      eff_row(std::get<ast::Pfunction_cases>(b.v).cases);
       cases(std::get<ast::Pfunction_cases>(b.v).cases);
     }
   }
@@ -44639,6 +44785,7 @@ struct Walk {
       for (auto& a : ap->args) if (a.second) expr(*a.second);
     } else if (auto* l = std::get_if<Pcl_let>(&ce.desc)) {
       for (auto& b : l->bindings) pat(b.pat, false);
+      univars(l->bindings);
       for (auto& b : l->bindings) if (b.expr) expr(*b.expr);
       if (l->body) class_expr(*l->body, vars);
     } else if (auto* cs = std::get_if<Pcl_constraint>(&ce.desc)) {
@@ -44707,7 +44854,16 @@ struct Walk {
   // declaration datarepr builds behind it (typing/datarepr.ml ~94).
   void type_group(const std::vector<ast::TypeDeclaration>& decls, bool save) {
     for (auto& d : decls) { if (save) give('t', d.name.txt); else mk(); }
+    // Each inline-record constructor's hidden record type is rebuilt by
+    // datarepr five times over the group's translation -- and once more
+    // when any declaration of the GROUP has parameters (`type 'x a = A of
+    // {..}` costs 6, so does `type h = H of {..} and 'a i = ..`; S562,
+    // NOUIDINLPARAM=1 keeps the flat five).
     int inline_ctors = 0;
+    int per_ctor = 5;
+    if (!inlparam_off)
+      for (auto& d : decls)
+        if (!d.params.empty()) per_ctor = 6;
     for (auto& d : decls) {
       if (auto* v = std::get_if<ast::Ptype_variant>(&d.kind)) {
         for (auto& ct : v->ctors) {
@@ -44729,7 +44885,7 @@ struct Walk {
         }
       }
     }
-    c += 5 * inline_ctors;
+    c += per_ctor * inline_ctors;
   }
 
   // ---- module types -------------------------------------------------------
@@ -44740,8 +44896,12 @@ struct Walk {
     } else if (std::get_if<Pmty_ident>(&m.desc)) {
       // `: S` -- the saved items are S's OWN declarations and carry ITS uids.
       if (save) bail();
+    } else if (std::get_if<Pmty_alias>(&m.desc)) {
+      // `module B = A` in a signature: an alias declares nothing of its own
+      // (its md_uid is the item's; S562, NOUIDSIGALIAS=1 bails as before)
+      if (sigalias_off) bail();
     } else {
-      bail();  // functor / with / typeof / alias / extension
+      bail();  // functor / with / typeof / extension
     }
   }
   void sig_items(const ast::Signature& items, bool save) {
@@ -44755,6 +44915,9 @@ struct Walk {
         type_group(t->decls, save);
       } else if (auto* e = std::get_if<Psig_exception>(&it.desc)) {
         exception_decl(e->exn, save);
+      } else if (auto* x = std::get_if<Psig_typext>(&it.desc)) {
+        if (typext_off) { bail(); return; }
+        typext(x->ext, save);
       } else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
         if (!m->md.name.txt) {  // `module _ : S`: its type's items, then its own
           if (rec_off) { bail(); continue; }
@@ -44835,6 +44998,27 @@ struct Walk {
     if (save) give('e', n); else mk();
     if (inl) ++c;
   }
+  // `type t += A | B of { .. } | C = D` (S562): `transl_type_extension`
+  // translates every constructor in order -- an inline record's labels
+  // before the constructor's own uid, a rebinding one like a declaration --
+  // and only then does datarepr build each inline record's hidden type,
+  // one uid apiece, after the whole extension.
+  void typext(const ast::TypeExtension& x, bool save) {
+    int inl = 0;
+    for (auto& ec : x.ctors) {
+      const std::string& n = ec.name.txt;
+      if (auto* d = std::get_if<ast::Pext_decl>(&ec.kind))
+        if (auto* r = std::get_if<ast::Pcstr_record>(&d->args)) {
+          ++inl;
+          for (auto& f : r->fields) {
+            if (save) ids[uidkey('L', path, n + "#" + n + "." + f.name.txt)] = mk();
+            else mk();
+          }
+        }
+      if (save) give('e', n); else mk();
+    }
+    c += inl;
+  }
 
   // ---- module expressions -------------------------------------------------
   void mod_expr(const ast::ModuleExpr& m, bool save) {
@@ -44847,10 +45031,16 @@ struct Walk {
       // the later uids and overwrite what the structure recorded.
       if (cn->me) mod_expr(*cn->me, save);
       if (cn->mt) mty(*cn->mt, save);
+      if (cn->me && cn->mt && !coerce_off) {
+        int k = coerce_cost(*cn->me, *cn->mt);
+        if (k < 0) bail(); else c += k;
+      }
     } else if (auto* fn = std::get_if<Pmod_functor>(&m.desc)) {
       if (auto* nm = std::get_if<Functor_named>(&fn->param)) {
         if (nm->type) mty(*nm->type, /*save=*/false);
-        mk();  // the parameter itself
+        // the parameter itself -- an anonymous `(_ : S)` mints none
+        // (typemod.ml:2521; S562, NOUIDANONPARAM=1 charges it as before)
+        if (nm->name.txt || anonparam_off) mk();
       }
       if (fn->body) mod_expr(*fn->body, save);
     } else if (std::get_if<Pmod_ident>(&m.desc)) {
@@ -44860,11 +45050,107 @@ struct Walk {
     }
   }
 
+  // THE CHECK ADDS THE ACTUAL SIGNATURE TO THE ENV (S562).  `Includemod`
+  // compares an ascribed structure against its signature with the actual
+  // signature's items added to the environment, and adding a type (an
+  // exception, an extension constructor) with an inline record has
+  // datarepr build the hidden record type again: one uid per inline-record
+  // constructor of the actual's TOP-LEVEL items, after both sides are
+  // typed, and the same for each submodule the expected signature pairs
+  // (`module D : sig type p = P of {..} end = struct type p = .. type q =
+  // Q of {..} end` costs 2 there; a submodule the signature does not
+  // mention costs nothing; `NOUIDCOERCE=1` reverts).  -1 where the
+  // actual's items cannot be read (an include, a module path, an
+  // application, a named module type).
+  static int inl_ctor_args(const ast::ConstructorArguments& a) {
+    return std::holds_alternative<ast::Pcstr_record>(a) ? 1 : 0;
+  }
+  static int inl_ext(const ast::ExtensionConstructor& ec) {
+    if (auto* d = std::get_if<ast::Pext_decl>(&ec.kind)) return inl_ctor_args(d->args);
+    return 0;
+  }
+  static int inl_decls(const std::vector<ast::TypeDeclaration>& ds) {
+    int k = 0;
+    for (auto& d : ds)
+      if (auto* v = std::get_if<ast::Ptype_variant>(&d.kind))
+        for (auto& ct : v->ctors) k += inl_ctor_args(ct.args);
+    return k;
+  }
+  // The actual signature of a module expression, paired with the expected
+  // module type: the structure's items, or an inner ascription's signature.
+  static int coerce_cost(const ast::ModuleExpr& me, const ast::ModuleType& mt) {
+    using namespace ast;
+    auto* sg = std::get_if<Pmty_signature>(&mt.desc);
+    if (!sg) return -1;
+    if (auto* cn = std::get_if<Pmod_constraint>(&me.desc)) {
+      if (!cn->mt) return -1;
+      return sig_cost(*cn->mt, *sg);
+    }
+    auto* st = std::get_if<Pmod_structure>(&me.desc);
+    if (!st) return -1;
+    int k = 0;
+    for (auto& it : st->items) {
+      if (auto* t = std::get_if<Pstr_type>(&it.desc)) k += inl_decls(t->decls);
+      else if (auto* x = std::get_if<Pstr_exception>(&it.desc)) k += inl_ext(x->exn.ctor);
+      else if (auto* x = std::get_if<Pstr_typext>(&it.desc)) {
+        for (auto& ec : x->ext.ctors) k += inl_ext(ec);
+      } else if (auto* m = std::get_if<Pstr_module>(&it.desc)) {
+        if (!m->binding.name.txt) continue;
+        const ModuleType* want = sig_module(*sg, *m->binding.name.txt);
+        if (!want) continue;
+        int sub = coerce_cost(m->binding.expr, *want);
+        if (sub < 0) return -1;
+        k += sub;
+      } else if (std::get_if<Pstr_include>(&it.desc) ||
+                 std::get_if<Pstr_recmodule>(&it.desc) ||
+                 std::get_if<Pstr_open>(&it.desc)) {
+        return -1;
+      }
+    }
+    return k;
+  }
+  // An ascribed module's actual signature IS its ascription's.
+  static int sig_cost(const ast::ModuleType& have, const ast::Pmty_signature& want) {
+    using namespace ast;
+    auto* hs = std::get_if<Pmty_signature>(&have.desc);
+    if (!hs) return -1;
+    int k = 0;
+    for (auto& it : hs->items) {
+      if (auto* t = std::get_if<Psig_type>(&it.desc)) k += inl_decls(t->decls);
+      else if (auto* x = std::get_if<Psig_exception>(&it.desc)) k += inl_ext(x->exn.ctor);
+      else if (auto* x = std::get_if<Psig_typext>(&it.desc)) {
+        for (auto& ec : x->ext.ctors) k += inl_ext(ec);
+      } else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+        if (!m->md.name.txt || !m->md.type) continue;
+        const ModuleType* w = sig_module(want, *m->md.name.txt);
+        if (!w) continue;
+        auto* ws = std::get_if<Pmty_signature>(&w->desc);
+        if (!ws) return -1;
+        int sub = sig_cost(*m->md.type, *ws);
+        if (sub < 0) return -1;
+        k += sub;
+      } else if (std::get_if<Psig_include>(&it.desc) ||
+                 std::get_if<Psig_recmodule>(&it.desc) ||
+                 std::get_if<Psig_open>(&it.desc)) {
+        return -1;
+      }
+    }
+    return k;
+  }
+  static const ast::ModuleType* sig_module(const ast::Pmty_signature& sg,
+                                           const std::string& name) {
+    for (auto& it : sg.items)
+      if (auto* m = std::get_if<ast::Psig_module>(&it.desc))
+        if (m->md.name.txt && *m->md.name.txt == name) return m->md.type.get();
+    return nullptr;
+  }
+
   // ---- structure items ----------------------------------------------------
   void item(const ast::StructureItem& it, bool save) {
     using namespace ast;
     if (auto* v = std::get_if<Pstr_value>(&it.desc)) {
       for (auto& b : v->bindings) pat(b.pat, save);
+      univars(v->bindings);
       for (auto& b : v->bindings) if (b.expr) expr(*b.expr);
     } else if (auto* e = std::get_if<Pstr_eval>(&it.desc)) {
       if (e->e) expr(*e->e);
@@ -44874,6 +45160,9 @@ struct Walk {
       if (save) give('v', p->prim.name.txt); else mk();
     } else if (auto* x = std::get_if<Pstr_exception>(&it.desc)) {
       exception_decl(x->exn, save);
+    } else if (auto* x = std::get_if<Pstr_typext>(&it.desc)) {
+      if (typext_off) { bail(); return; }
+      typext(x->ext, save);
     } else if (auto* m = std::get_if<Pstr_module>(&it.desc)) {
       if (!m->binding.name.txt) {  // `module _ = ..`: its body, then its own uid
         if (rec_off) { bail(); return; }
@@ -44921,11 +45210,27 @@ struct Walk {
 
 }  // namespace uidwalk
 
-UidMap typing_uid_map(const ast::Structure& s) {
+UidMap typing_uid_map(const ast::Structure& s,
+                      const std::map<const void*, long long>* ltypes,
+                      const std::set<const ast::Expression*>* eta_nodes) {
   uidwalk::Walk w;
   w.obj_off = dbg_env("NOUIDOBJ");
   w.class_off = dbg_env("NOUIDCLASS");
   w.rec_off = dbg_env("NORECSTAMP");
+  // S562's facets, each with its own revert and one for them all
+  // (NOUID562=1, which also turns Count's NOEFFEQ on).
+  const bool all = dbg_env("NOUID562") != nullptr;
+  auto off = [&](const char* v) { return all || dbg_env(v) != nullptr; };
+  w.ltype_off = off("NOUIDLTYPE");
+  w.ltypes = w.ltype_off ? nullptr : ltypes;
+  w.eta = off("NOUIDETA") ? nullptr : eta_nodes;
+  w.typext_off = off("NOUIDTYPEXT");
+  w.ext_off = off("NOUIDEXT");
+  w.orpat_off = off("NOUIDORPAT");
+  w.inlparam_off = off("NOUIDINLPARAM");
+  w.coerce_off = off("NOUIDCOERCE");
+  w.anonparam_off = off("NOUIDANONPARAM");
+  w.sigalias_off = off("NOUIDSIGALIAS");
   for (auto& it : s) w.item(it, /*save=*/true);
   UidMap m;
   m.complete = w.complete;

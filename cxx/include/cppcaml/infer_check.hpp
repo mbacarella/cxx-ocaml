@@ -244,12 +244,17 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
 // `stamps`, when given, receives the count at each constructor's and label's
 // ident creation, under the writer's uid key (S557): Subst keeps those
 // idents, so their saved stamps are 274 + that count.
+// `ltypes`, when given, receives the local types pattern typing names at
+// each pattern node -- reifications, existentials, GADT equations, the
+// witnesses the checks type (S562): each is a `Uid.mk` too, and
+// typing_uid_map adds them where the pattern stands.
 int typing_ident_count(const ast::Structure& s, std::size_t eta_sites = 0,
                        long long pkg_sig = 0,
                        const std::set<std::string>* fexp = nullptr,
                        std::size_t pv_reify = 0,
                        std::set<std::string>* loaded = nullptr,
-                       std::map<std::string, long long>* stamps = nullptr);
+                       std::map<std::string, long long>* stamps = nullptr,
+                       std::map<const void*, long long>* ltypes = nullptr);
 // The idents the inferred-signature check allocates for the package types the
 // saved signature's values carry -- `pkg_sig` above, computed off the items
 // the .cmi writer is handed.
@@ -278,7 +283,12 @@ struct UidMap {
   bool complete = true;
   std::map<std::string, int> ids;
 };
-UidMap typing_uid_map(const ast::Structure& s);
+// `eta_nodes`: the argument expressions the value-kinds pass eta-expanded
+// for an erased optional (translate_implementation's `eta_nodes`): two uids
+// each (typecore's `var_pair`), paid where the argument stands (S562).
+UidMap typing_uid_map(const ast::Structure& s,
+                      const std::map<const void*, long long>* ltypes = nullptr,
+                      const std::set<const ast::Expression*>* eta_nodes = nullptr);
 
 // The key scheme lives in cmi.hpp (cppcaml::cmi::cmiw::uidkey), beside the
 // writer pass that reads the map.

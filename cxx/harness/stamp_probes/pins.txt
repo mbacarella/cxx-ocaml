@@ -5647,6 +5647,17 @@ xub_a1 0
 xub_a2 0
 xub_a3 0
 xub_a4 0
+xuid_a1 0
+xuid_a2 0
+xuid_a3 0
+xuid_a4 0
+xuid_a5 0
+xuid_a6 0
+xuid_a7 0
+xuid_a8 0
+xuid_a9 0
+xuid_b1 0
+xuid_b2 0
 xvr_a1 0
 xvr_a2 0
 xvr_a3 0
