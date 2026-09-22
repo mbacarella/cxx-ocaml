@@ -1,0 +1,20 @@
+type a = A of int
+type b = B of int * int
+type c = C of int | D
+type d = { x : int }
+type e = { mutable y : int }
+type f = { u : int; v : int }
+type g = G of { w : int }
+type h = H of { mutable z : int }
+type i = I of int [@@unboxed]
+type j = J of int [@@boxed]
+type k = K : int -> k
+type l = L : l
+type m = int
+type n = a = A of int
+type o = |
+type p = ..
+type q = private Q of int
+type 'a r = R of 'a
+type s = S of int [@@ocaml.unboxed]
+type t = T of int [@@ocaml.boxed]

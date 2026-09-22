@@ -379,6 +379,9 @@ public:
     // constant, so it marshals as an int).
     if (d.fields.size() > 11 && arena_[d.fields[11]].kind == m::Value::Kind::Int)
       td.immediate = static_cast<int>(arena_[d.fields[11]].i);
+    // type_unboxed_default : bool (field 12).
+    if (d.fields.size() > 12 && arena_[d.fields[12]].kind == m::Value::Kind::Int)
+      td.unboxed_default = arena_[d.fields[12]].i == 1;
     return td;
   }
 
@@ -405,6 +408,7 @@ public:
         if (k.fields.size() > 1) {
           const m::Value& rep = arena_[k.fields[1]];
           td.unboxed = rep.kind == m::Value::Kind::Block && rep.tag == 0;
+          td.record_float = rep.kind == m::Value::Kind::Int && rep.i == 1;
         }
         break;
       case 2:  // Type_variant of constructor_declaration list * variant_repr
@@ -1543,6 +1547,13 @@ CmiShare g_share;
 // NOCLSITEM=1 reverts to the S553 emitter.
 bool clsitem_off_() {
   static const bool off = cppcaml::dbg_env("NOCLSITEM") != nullptr;
+  return off;
+}
+// S561: a type declaration's type_unboxed_default and a record's
+// Record_float representation.  NOUNBOXDEF=1 writes false / Record_regular
+// for every declaration (the S560 emitter).
+bool unboxdef_off() {
+  static const bool off = cppcaml::dbg_env("NOUNBOXDEF") != nullptr;
   return off;
 }
 bool no_share() {
@@ -3374,10 +3385,12 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                                       o::vint(l.atomic ? 1 : 0) /*ld_atomic*/, te.emit(l.ty),
                                       emit_loc(l.loc), o::vint(0) /*attrs*/, emit_uid(l.uid)}));
         }
-        // record_representation: Record_regular (const 0) or, for a single-field
+        // record_representation: Record_regular (const 0), Record_float
+        // (const 1: every field a float, S561) or, for a single-field
         // `[@@unboxed]` record, Record_unboxed of bool (block tag 0; false = not
         // an inlined record).
-        auto rep = it.type_unboxed ? o::vblock(0, {o::vint(0)}) : o::vint(0);
+        auto rep = it.type_unboxed ? o::vblock(0, {o::vint(0)})
+                 : o::vint(it.type_record_float && !unboxdef_off() ? 1 : 0);
         kind = o::vblock(1, {o::vlist(lds), rep});  // Type_record
       } else if (it.type_open) {
         kind = o::vint(0);  // Type_open (`type t = ..`), the lone constant ctor
@@ -3424,7 +3437,10 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                 loc_none()});                             // attr_loc
             return o::vlist({attr});
           }(),
-          o::vint(it.type_immediate), o::vint(0),      // type_immediate, unboxed false
+          o::vint(it.type_immediate),                  // type_immediate
+          // type_unboxed_default: true for an unboxable declaration written
+          // without `[@@unboxed]`/`[@@boxed]` (typedecl's `unboxed_default`).
+          o::vint(it.type_unboxed_default && !unboxdef_off() ? 1 : 0),
           emit_uid(it.uid)});                          // type_uid
       sig.push_back(o::vblock(1, {ident, tdecl,
                                   // Trec_first, or Trec_next for the `and`

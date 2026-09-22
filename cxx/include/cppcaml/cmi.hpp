@@ -200,6 +200,14 @@ struct TypeDecl {
   // `[@@unboxed]`: a single single-field ctor (Variant_unboxed) or single-field
   // record (Record_unboxed) whose value IS its argument -- no box, no field read.
   bool unboxed = false;
+  // type_unboxed_default: the declaration was unboxABLE (one constructor of
+  // one argument or one immutable field, or a one-immutable-field record)
+  // and carried neither `[@@unboxed]` nor `[@@boxed]` -- typedecl's
+  // `unboxed_default`; a copy (`include`, Subst) keeps it.
+  bool unboxed_default = false;
+  // Record_float: every field is a `float` (typedecl's `is_float`, the
+  // abbreviations and unboxed wrappers expanded) and none is atomic.
+  bool record_float = false;
   bool priv = false;                    // type_private = Private
   // type_immediate : Type_immediacy.t -- 0 Unknown / 1 Always / 2
   // Always_on_64bits.  Only Always is an immediate in bytecode
@@ -579,6 +587,15 @@ struct SigItem {
   // REPRESENTATION (Printtyp derives the printed attr from the representation,
   // not an attribute node).
   bool type_unboxed = false;
+  // Type: type_unboxed_default -- the decl is unboxable (typedecl: one ctor
+  // of one tuple argument or of one immutable inline field, or a record of
+  // one immutable field) and no `[@@unboxed]`/`[@@boxed]` was written.
+  bool type_unboxed_default = false;
+  // Type: a record whose fields are ALL `float` (typedecl's `is_float` on each
+  // label: the label type with its abbreviations and unboxed wrappers
+  // expanded is the predef float; an atomic field disqualifies) --
+  // Record_float, the flat float block.
+  bool type_record_float = false;
   // Type: an EMPTY variant (`type empty = |`) -- Type_variant([]), not abstract.
   bool type_empty_variant = false;
   // Type: params+manifest came from a `with type` constraint whose RHS was

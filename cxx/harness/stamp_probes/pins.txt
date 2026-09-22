@@ -5643,6 +5643,10 @@ xtf_n16 0
 xtf_n17 0
 xtf_n18 0
 xtf_n19 0
+xub_a1 0
+xub_a2 0
+xub_a3 0
+xub_a4 0
 xvr_a1 0
 xvr_a2 0
 xvr_a3 0

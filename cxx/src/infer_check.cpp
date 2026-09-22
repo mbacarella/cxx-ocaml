@@ -16554,6 +16554,100 @@ static int manifest_immediacy(Checker& ck, const ast::CoreType& m,
   return ck.cmi_type_is_immediate(dotted) ? 1 : 0;
 }
 
+// typedecl's `unboxed_default`: the declaration is unboxABLE -- one
+// constructor of one tuple argument or of one immutable inline field, or a
+// record of one immutable field -- and neither `[@@unboxed]` nor `[@@boxed]`
+// was written on it (the attributes decide `unbox`; their absence is the
+// default the flag records).
+static bool unboxed_default_of(const TypeDeclaration& d) {
+  for (auto& a : d.attrs)
+    if (a.name == "unboxed" || a.name == "ocaml.unboxed" ||
+        a.name == "boxed" || a.name == "ocaml.boxed")
+      return false;
+  if (auto* var = std::get_if<Ptype_variant>(&d.kind)) {
+    if (var->ctors.size() != 1) return false;
+    auto& c = var->ctors[0];
+    if (auto* tup = std::get_if<Pcstr_tuple>(&c.args)) return tup->elems.size() == 1;
+    auto& rec = std::get<Pcstr_record>(c.args);
+    return rec.fields.size() == 1 && rec.fields[0].mut != MutableFlag::Mutable;
+  }
+  if (auto* rec = std::get_if<Ptype_record>(&d.kind))
+    return rec->fields.size() == 1 && rec->fields[0].mut != MutableFlag::Mutable;
+  return false;
+}
+
+// The Type item a (possibly dotted) name denotes among the items emitted so
+// far -- a local module's items are walked like manifest_immediacy does; null
+// when the head is not a module of this unit or the type is not there.  On a
+// hit `*level` is the item vector the declaration sits in (its own bare names
+// resolve at that level).
+static const cmi::cmiw::SigItem* local_type_item(
+    const std::vector<cmi::cmiw::SigItem>& out, size_t limit,
+    const std::string& dotted, const std::vector<cmi::cmiw::SigItem>** level) {
+  std::vector<std::string> comps = split_dotted(dotted);
+  const std::vector<cmi::cmiw::SigItem>* cur = &out;
+  size_t lim = limit;
+  for (size_t i = 0; i + 1 < comps.size(); ++i) {
+    const std::vector<cmi::cmiw::SigItem>* next = nullptr;
+    for (size_t j = lim; j-- > 0;) {
+      auto& it = (*cur)[j];
+      if (it.k == cmi::cmiw::SigItem::Module && it.name == comps[i] &&
+          !it.is_functor && it.alias.empty()) { next = &it.sub; break; }
+    }
+    if (!next) return nullptr;
+    cur = next; lim = cur->size();
+  }
+  for (size_t j = lim; j-- > 0;) {
+    auto& it = (*cur)[j];
+    if (it.k == cmi::cmiw::SigItem::Type && it.name == comps.back()) {
+      *level = cur;
+      return &it;
+    }
+  }
+  return nullptr;
+}
+
+// typedecl's `is_float`: the label's type, its abbreviations expanded
+// (Ctype.expand_head_opt -- a private one too) and an `[@@unboxed]` wrapper
+// looked through (Typedecl_unboxed.get_unboxed_type_representation), is the
+// predefined `float`.  A declaration of the SAME `type .. and ..` group is
+// still a stub in the environment typing reads (its manifest a fresh
+// variable), so the items scanned stop at `limit`, the group's first.
+static bool label_ty_is_float(Checker& ck, const cmi::cmiw::TyPtr& t,
+                              const std::vector<cmi::cmiw::SigItem>& out,
+                              size_t limit, int fuel) {
+  using cmi::cmiw::SigItem;
+  if (!t || t->k != cmi::cmiw::Ty::Constr || fuel <= 0) return false;
+  const std::vector<SigItem>* level = nullptr;
+  const SigItem* it = local_type_item(out, limit, t->name, &level);
+  if (!it) {
+    if (t->name.find('.') == std::string::npos) return t->name == "float" && t->args.empty();
+    return t->args.empty() && ck.cmi_type_resolves_to(t->name, "float");
+  }
+  auto sub = [&](const cmi::cmiw::TyPtr& u) {
+    // the declaration's own bare names resolve at its level, after it
+    return label_ty_is_float(ck, u, *level, level->size(), fuel - 1);
+  };
+  if (it->ctors.empty() && it->labels.empty()) {  // an abbreviation
+    if (!it->manifest) return false;
+    if (it->manifest->k == cmi::cmiw::Ty::Var) {  // `type 'a p = 'a`: the argument
+      for (size_t i = 0; i < it->params.size() && i < t->args.size(); ++i)
+        if (it->params[i] && it->params[i]->var == it->manifest->var)
+          return label_ty_is_float(ck, t->args[i], out, limit, fuel - 1);
+      return false;
+    }
+    return sub(it->manifest);
+  }
+  if (!it->type_unboxed) return false;
+  if (it->labels.size() == 1) return sub(it->labels[0].ty);
+  if (it->ctors.size() == 1) {
+    auto& c = it->ctors[0];
+    if (c.inline_record.size() == 1) return sub(c.inline_record[0].ty);
+    if (c.args.size() == 1) return sub(c.args[0]);
+  }
+  return false;
+}
+
 // Convert a run of `type ... and ...` declarations (shared by structure and
 // signature emission -- both hold a std::vector<TypeDeclaration>) into SigItems.
 static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& decls,
@@ -16710,6 +16804,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
       si.type_private = (d.priv == PrivateFlag::Private);
       si.type_immediate = immed; si.type_immediate_attr = immed_attr;
       si.type_unboxed = unboxed;
+      si.type_unboxed_default = unboxed_default_of(d);
       // A re-exported datatype (`type s = t = A | B`) carries BOTH a manifest
       // (the `= t` equation) and the variant kind: ocamlc stores type_manifest =
       // Some (Tconstr t) alongside Type_variant.  Bridge the manifest (sharing
@@ -16735,6 +16830,16 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
       si.type_private = (d.priv == PrivateFlag::Private);
       si.type_immediate = immed; si.type_immediate_attr = immed_attr;
       si.type_unboxed = unboxed;
+      si.type_unboxed_default = unboxed_default_of(d);
+      // Record_float: every label a float and none atomic (typedecl).
+      if (!unboxed && !si.labels.empty()) {
+        bool all_float = true;
+        for (auto& l : si.labels)
+          if (l.atomic || !label_ty_is_float(ck, l.ty, out, first_new, 100)) {
+            all_float = false; break;
+          }
+        si.type_record_float = all_float;
+      }
       // A CONSTRAINED param is stored as its bound (not a var), so Printtyp
       // prints its variance chip even on concrete decls -- carry the WRITTEN
       // annotation (`type +'a range = { .. } constraint ..` -- range_intf).
@@ -17008,6 +17113,12 @@ static bool withpos_off() {
   static const bool off = dbg_env("NOWITHPOS") != nullptr;
   return off;
 }
+// S561: a copied declaration keeps the .cmi's `[@@unboxed]` representation
+// (with the writer's type_unboxed_default / Record_float, under the same hook).
+static bool unboxdef_off() {
+  static const bool off = dbg_env("NOUNBOXDEF") != nullptr;
+  return off;
+}
 // A Sig_typext decoded from a cmi -> the writer's item.  An inline-record
 // payload (`exception Inconsistency of { unit_name : ..; .. }`) must survive
 // the round trip: a spliced signature that drops it re-exports the exception as
@@ -17200,6 +17311,10 @@ static cmi::cmiw::SigItem cmi_type_to_item(const cmi::TypeDecl& td) {
     si.manifest = conv_cmi_ty(td.manifest, vars, nv, &nodes);
   si.type_private = td.priv;
   si.type_immediate = td.immediate;
+  si.type_unboxed_default = td.unboxed_default;
+  si.type_record_float = td.record_float;
+  // Subst keeps the representation: a copied `[@@unboxed]` stays unboxed.
+  if (!unboxdef_off()) si.type_unboxed = td.unboxed;
   si.type_variances = td.variances;
   si.loc = rloc_to_loc(td.loc);
   return si;
