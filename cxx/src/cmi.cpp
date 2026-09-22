@@ -2757,8 +2757,13 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         // the inlined signature is the fallback.
         if (!it.modtype_ref.empty())
           if (o::ValPtr mp = modtype_path(it.modtype_ref)) mty = o::vblock(0, {mp});  // Mty_ident
+        // A `module rec` binding's own name IS in scope inside its
+        // declaration (`B.t` in B's signature is the local B), so no self
+        // stamp is masked there (S560).
+        const int self = it.rec_status && !cppcaml::dbg_env("NORECSTAMP")
+                             ? 0 : item_stamp[i];
         if (!mty)
-          mty = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod, &visible_eng, &modscope, &scopes, it.name, item_stamp[i]))});  // Mty_signature
+          mty = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod, &visible_eng, &modscope, &scopes, it.name, self))});  // Mty_signature
       }
       auto md = o::vblock(0, {mty, o::vint(0) /*[] attrs*/, emit_loc(it.loc),
                               emit_uid(it.uid)});  // module_declaration

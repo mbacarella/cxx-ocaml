@@ -3305,9 +3305,7 @@ class Parser {
     }
     if (t.kind == Kind::MODULE && peek(1).kind == Kind::REC) {
       advance(); advance();  // module rec
-      std::vector<ModuleBinding> binds;
-      binds.push_back(parse_module_binding_def());
-      while (cur().kind == Kind::AND) { advance(); binds.push_back(parse_module_binding_def()); }
+      std::vector<ModuleBinding> binds = parse_rec_module_bindings(t.start);
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
       return StructureItem{Pstr_recmodule{std::move(binds)}, l};
     }
@@ -3319,11 +3317,9 @@ class Parser {
       while (cur().kind == Kind::LBRACKETAT) { advance(); itemattrs.push_back(parse_attribute_body()); }
       if (cur().kind == Kind::REC) {  // `module%ext[@attr] rec M … and …`
         advance();
-        std::vector<ModuleBinding> binds;
-        binds.push_back(parse_module_binding_def());
+        std::vector<ModuleBinding> binds = parse_rec_module_bindings(t.start);
         binds[0].attrs.insert(binds[0].attrs.begin(), std::make_move_iterator(itemattrs.begin()),
                               std::make_move_iterator(itemattrs.end()));
-        while (cur().kind == Kind::AND) { advance(); binds.push_back(parse_module_binding_def()); }
         Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
         StructureItem item{Pstr_recmodule{std::move(binds)}, l};
         if (mod_ext) {
@@ -3871,6 +3867,7 @@ class Parser {
         advance();
         std::vector<ModuleDeclaration> decls;
         bool first = true;
+        size_t kw = t.start;  // each declaration's span starts at its keyword
         for (;;) {
           Attributes dattrs = first ? std::move(prefixattrs) : take_attrs();
           first = false;
@@ -3878,8 +3875,9 @@ class Parser {
           expect(Kind::COLON, ":");
           ModuleType mt = parse_module_type();
           while (cur().kind == Kind::LBRACKETATAT) { advance(); dattrs.push_back(parse_attribute_body()); }
-          decls.push_back(ModuleDeclaration{std::move(nm), box(std::move(mt)), std::move(dattrs)});
-          if (cur().kind == Kind::AND) { advance(); continue; }
+          decls.push_back(ModuleDeclaration{std::move(nm), box(std::move(mt)), std::move(dattrs),
+                                            span(position(kw), position(tokens_[idx_ - 1].end))});
+          if (cur().kind == Kind::AND) { kw = cur().start; advance(); continue; }
           break;
         }
         return wrap_sig_ext(SignatureItem{Psig_recmodule{std::move(decls)}, here()}, std::move(mod_ext));
@@ -3970,6 +3968,21 @@ class Parser {
   }
 
   // name [params] [: S] = me   (a binding in `module M …` / `module rec …`)
+  // The bindings of a `module rec` group, `rec` already consumed: each one's
+  // `loc` runs from its keyword (`module` at `first`, then each `and`) to
+  // its last token, as parser.mly's rec_module_binding / and_module_binding.
+  std::vector<ModuleBinding> parse_rec_module_bindings(size_t first) {
+    std::vector<ModuleBinding> binds;
+    binds.push_back(parse_module_binding_def());
+    binds.back().loc = span(position(first), position(tokens_[idx_ - 1].end));
+    while (cur().kind == Kind::AND) {
+      size_t kw = cur().start;
+      advance();
+      binds.push_back(parse_module_binding_def());
+      binds.back().loc = span(position(kw), position(tokens_[idx_ - 1].end));
+    }
+    return binds;
+  }
   ModuleBinding parse_module_binding_def() {
     Attributes prefixattrs;  // `and[@attr] M …` -> pmb_attributes (prefix)
     while (cur().kind == Kind::LBRACKETAT) { advance(); prefixattrs.push_back(parse_attribute_body()); }

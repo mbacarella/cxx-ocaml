@@ -16431,8 +16431,59 @@ static void rewrite_eff_back(const cmi::cmiw::TyPtr& t);  // defined below
 // reads the owning cmi (Always only), and anything unresolved -- an OPENED
 // module's abbreviation, a same-rec-group forward reference -- stays Unknown,
 // which can only under-specialize, never miscompile.
+static std::vector<std::string> split_dotted(const std::string& s);
+// The `module rec` group whose declarations are being converted: each
+// binding's name and declared module type (S560).
+struct RecGroup { std::vector<std::pair<std::string, const ast::ModuleType*>> decls; };
+static const RecGroup* g_rec_group = nullptr;
+static bool recimm_off() {
+  static const bool off = dbg_env("NORECSTAMP") != nullptr;
+  return off;
+}
 static int manifest_immediacy(Checker& ck, const ast::CoreType& m,
-                              const std::vector<cmi::cmiw::SigItem>& out) {
+                              const std::vector<cmi::cmiw::SigItem>& out,
+                              const ast::Signature* rec_sig = nullptr);
+// `Ctype.immediacy` reads the manifest HEAD's declaration: `type u = M.t`
+// is Always when M.t's declaration is -- M a module of this unit included
+// (its emitted items answer).  In a `module rec` group the head is looked
+// up in the FIRST translation's declarations (typemod.ml
+// `transl_recmodule_modtypes`: dcl2 is typed in env1), where a sibling's
+// own manifest into a sibling still met the approximation (Unknown): so a
+// sibling's `type t` answers by its own kind, or by a manifest whose head
+// is not a sibling (S560).  `rec_sig` is that sibling's signature, whose
+// earlier declarations a bare name reaches.
+static int sig_ast_immediacy(Checker& ck, const ast::Signature& items,
+                             const std::string& name,
+                             const std::vector<cmi::cmiw::SigItem>& out) {
+  const TypeDeclaration* found = nullptr;
+  for (auto& it : items)
+    if (auto* t = std::get_if<Psig_type>(&it.desc))
+      for (auto& d : t->decls)
+        if (d.name.txt == name) found = &d;
+  if (!found) return 0;
+  int immed = 0;
+  bool unboxed = false;
+  for (auto& a : found->attrs) {
+    if (a.name == "immediate64") immed = 2;
+    else if (a.name == "immediate" && immed == 0) immed = 1;
+    else if (a.name == "unboxed" || a.name == "ocaml.unboxed") unboxed = true;
+  }
+  if (immed) return immed;
+  if (auto* var = std::get_if<Ptype_variant>(&found->kind); var && !unboxed) {
+    bool all_const = true;
+    for (auto& c : var->ctors) {
+      auto* tup = std::get_if<Pcstr_tuple>(&c.args);
+      if (!tup || !tup->elems.empty()) { all_const = false; break; }
+    }
+    if (all_const) return 1;
+  }
+  if (found->manifest && std::holds_alternative<Ptype_abstract>(found->kind))
+    return manifest_immediacy(ck, **found->manifest, out, &items);
+  return 0;
+}
+static int manifest_immediacy(Checker& ck, const ast::CoreType& m,
+                              const std::vector<cmi::cmiw::SigItem>& out,
+                              const ast::Signature* rec_sig) {
   if (auto* pv = std::get_if<Ptyp_variant>(&m.desc)) {
     if (pv->closed != ClosedFlag::Closed) return 0;
     for (auto& r : pv->rows) {
@@ -16444,13 +16495,22 @@ static int manifest_immediacy(Checker& ck, const ast::CoreType& m,
       // cited type must itself be a polyvariant, and a polyvariant is Always
       // exactly when closed and all-constant -- so its flag answers for its
       // rows, and recursing treats the citation like a manifest head.
-      if (manifest_immediacy(ck, *std::get<Rinherit>(r).ct, out) != 1) return 0;
+      if (manifest_immediacy(ck, *std::get<Rinherit>(r).ct, out, rec_sig) != 1)
+        return 0;
     }
     return 1;
   }
   auto* c = std::get_if<Ptyp_constr>(&m.desc);
   if (!c) return 0;  // args are irrelevant: the HEAD decl's flag decides
   if (auto* l = std::get_if<Lident>(&c->id.txt.v)) {
+    if (rec_sig) {
+      bool own = false;
+      for (auto& it : *rec_sig)
+        if (auto* t = std::get_if<Psig_type>(&it.desc))
+          for (auto& d : t->decls)
+            if (d.name.txt == l->name) own = true;
+      if (own) return sig_ast_immediacy(ck, *rec_sig, l->name, out);
+    }
     for (auto it = out.rbegin(); it != out.rend(); ++it)
       if (it->k == cmi::cmiw::SigItem::Type && it->name == l->name)
         return it->type_immediate == 1 ? 1 : 0;
@@ -16461,7 +16521,35 @@ static int manifest_immediacy(Checker& ck, const ast::CoreType& m,
   }
   if (!std::holds_alternative<Ldot>(c->id.txt.v)) return 0;
   std::string dotted = lid_full(c->id.txt);
-  if (ck.bound_module_names_.count(dotted.substr(0, dotted.find('.'))))
+  auto comps = split_dotted(dotted);
+  if (!recimm_off()) {
+    // A sibling of the `module rec` group being converted (see above).
+    if (g_rec_group && comps.size() == 2)
+      for (auto& [nm, mt] : g_rec_group->decls)
+        if (nm == comps[0]) {
+          if (rec_sig) return 0;  // the approximation: Unknown
+          if (auto* sg = mt ? std::get_if<Pmty_signature>(&mt->desc) : nullptr)
+            return sig_ast_immediacy(ck, sg->items, comps[1], out);
+          return 0;
+        }
+    // A module of this unit already converted: its emitted declaration.
+    const std::vector<cmi::cmiw::SigItem>* cur = &out;
+    for (std::size_t i = 0; cur && i + 1 < comps.size(); ++i) {
+      const std::vector<cmi::cmiw::SigItem>* next = nullptr;
+      for (auto it = cur->rbegin(); it != cur->rend(); ++it)
+        if (it->k == cmi::cmiw::SigItem::Module && it->name == comps[i] &&
+            !it->is_functor && it->alias.empty()) {
+          next = &it->sub;
+          break;
+        }
+      cur = next;
+      if (cur && i + 2 == comps.size())
+        for (auto it = cur->rbegin(); it != cur->rend(); ++it)
+          if (it->k == cmi::cmiw::SigItem::Type && it->name == comps.back())
+            return it->type_immediate == 1 ? 1 : 0;
+    }
+  }
+  if (ck.bound_module_names_.count(comps[0]))
     return 0;
   return ck.cmi_type_is_immediate(dotted) ? 1 : 0;
 }
@@ -16911,6 +16999,15 @@ static bool cmistamp_off() {
   return off;
 }
 static int cmi_stamp(int stamp) { return cmistamp_off() ? 0 : stamp; }
+// S560: `NORECSTAMP=1` reverts a recursive module's declaration keys.
+static bool recstamp_off() {
+  static const bool off = dbg_env("NORECSTAMP") != nullptr;
+  return off;
+}
+static bool withpos_off() {
+  static const bool off = dbg_env("NOWITHPOS") != nullptr;
+  return off;
+}
 // A Sig_typext decoded from a cmi -> the writer's item.  An inline-record
 // payload (`exception Inconsistency of { unit_name : ..; .. }`) must survive
 // the round trip: a spliced signature that drops it re-exports the exception as
@@ -18346,6 +18443,11 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
       // expanded), marked Trec_first/Trec_next so Printtyp prints the group
       // back as one `module rec .. and ..`.
       int rs = 1;
+      RecGroup rg;
+      for (auto& md : prm->decls)
+        if (md.name.txt) rg.decls.emplace_back(*md.name.txt, md.type.get());
+      const RecGroup* rgv = g_rec_group;
+      g_rec_group = &rg;
       for (auto& md : prm->decls) {
         if (!md.name.txt || !md.type) continue;
         std::vector<cmi::cmiw::SigItem> items;
@@ -18359,8 +18461,10 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
         if (auto* pid = std::get_if<Pmty_ident>(&md.type->desc))
           mi.modtype_ref = lid_full(pid->id.txt);
         mi.rec_status = rs; rs = 2;
+        if (!recimm_off()) mi.loc = conv_loc(md.loc);  // its own span (S560)
         out.push_back(std::move(mi));
       }
+      g_rec_group = rgv;
     } else if (auto* pm = std::get_if<Psig_module>(&it.desc)) {
       std::size_t mbefore = out.size();
       if (pm->md.name.txt && pm->md.type) {
@@ -20908,14 +21012,29 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
       // `module rec A .. and B ..`: each binding like Pstr_module, marked
       // Trec_first/Trec_next so ocamlc prints the group as one `module rec`.
       int rs = 1;
+      RecGroup rg;
+      for (auto& b : mr->bindings)
+        if (b.name.txt) {
+          auto* cn = std::get_if<Pmod_constraint>(&b.expr.desc);
+          rg.decls.emplace_back(*b.name.txt, cn ? cn->mt.get() : nullptr);
+        }
+      const RecGroup* rgv = g_rec_group;
+      g_rec_group = &rg;
       for (auto& b : mr->bindings) {
         if (!b.name.txt) continue;
+        std::size_t before = out.size();
         if (auto item = module_binding_sigitem(*b.name.txt, b.expr, &out, &ck)) {
           item->rec_status = rs;
           out.push_back(std::move(*item));
         }
+        // Each declaration's md_loc is its OWN binding's span (typemod's
+        // `type_recmodule` keeps `pmb_loc`), not the whole group's (S560).
+        if (!recimm_off())
+          for (std::size_t j = before; j < out.size(); ++j)
+            if (out[j].loc.ghost) out[j].loc = ml_loc(b.loc);
         rs = 2;
       }
+      g_rec_group = rgv;
     } else if (auto* in = std::get_if<Pstr_include>(&it.desc)) {
       // `include M` / `include (struct .. end)`: build_module FLATTENS the
       // included module's members into THIS module's record (each takes its own
@@ -36056,7 +36175,10 @@ struct Count {
   // binding's DECLARED signature is walked three times over (`approx_modtype`,
   // which reaches only the declarations, the second `transl_modtype` pass, and
   // the base case's `Subst.modtype`) and its ACTUAL one once per round.
-  long long recmodule_extra(const Pstr_recmodule& rm) const {
+  // `part` 1 is what precedes the bodies (the unbound modules, the
+  // approximation, the second translation of each declaration), 2 what
+  // follows them (the fresh Y_i, the unrolling rounds, the checks), 0 both.
+  long long recmodule_extra(const Pstr_recmodule& rm, int part = 0) const {
     if (dbg_env("NORECMOD")) return 0;
     long long nb = (long long)rm.bindings.size(), named = 0;
     Sibs sib;
@@ -36070,7 +36192,8 @@ struct Count {
     // the unbound modules the approximation enters have an ident for it, and
     // its own actual signature is substituted only by the base case, since the
     // rounds walk the named bindings alone.
-    long long k = 2 * nb * named;
+    const bool pre = part != 2, post = part != 1;
+    long long k = (pre ? nb * named : 0) + (post ? nb * named : 0);
     for (auto& b : rm.bindings) {
       auto* c = std::get_if<Pmod_constraint>(&b.expr.desc);
       if (!c) continue;
@@ -36080,11 +36203,14 @@ struct Count {
         pass += wpass_mty(*c->mt);
         sub = wsub_mty(*c->mt) + xwsub_root(*c->mt);
       }
-      k += pass + sub + ctl_mty(*c->mt) + dec_mty(*c->mt) +
-           (recfun_off() ? 0 : rfun_mty(*c->mt)) +
-           (recfun_off() ? 0 : (rounds + 1) * sibapp(*c->me, sib)) +
-           rounds * (ren_mexpr(*c->me, sib) + recapp(*c->me, c->mt.get())) +
-           (mtyres_off() ? 0 : rec_mtinfos(*c->mt) + pk_mpatches(*c->mt));
+      if (pre)
+        k += pass + ctl_mty(*c->mt) + dec_mty(*c->mt) +
+             (mtyres_off() ? 0 : pk_mpatches(*c->mt));
+      if (post)
+        k += sub + (recfun_off() ? 0 : rfun_mty(*c->mt)) +
+             (recfun_off() ? 0 : (rounds + 1) * sibapp(*c->me, sib)) +
+             rounds * (ren_mexpr(*c->me, sib) + recapp(*c->me, c->mt.get())) +
+             (mtyres_off() ? 0 : rec_mtinfos(*c->mt));
     }
     return k;
   }
@@ -42027,6 +42153,85 @@ struct Count {
   // `saved` is false where the signature this expression has is DISCARDED --
   // behind an ascription, as an argument, as the module an `open` names --
   // and so is never renamed by anything below.
+  // An ascription's module type, walked under the ENCLOSING ascription.
+  void asc_type(const Pmod_constraint& c, const Lvl& l) {
+    MtCtx sv = mtctx_;
+    mtctx_ = MtCtx::Ascr;
+    mty(*c.mt, depth_off() ? Lvl{1, 1, 0, true} : l, true);
+    mtctx_ = sv;
+  }
+  // What pairing an ascription's body with its module type costs.
+  void asc_pairing(const Pmod_constraint& c) {
+    n += asc_alias(*c.me, mty_sig(c.mt.get()));
+    // A path bound at the ascription's own module type name is checked
+    // `Mty_ident` against `Mty_ident`, the same path: nothing is paired.
+    if (std::holds_alternative<Pmod_ident>(c.me->desc) &&
+        !same_named(*c.me, *c.mt))
+      n += anon_path(*c.me) + arrows_in(*c.mt, 8, c.me.get());
+    if (!parfun_off() && !std::holds_alternative<Pmod_ident>(c.me->desc))
+      n += pfun_mty_params(*c.mt);
+    // An ascription at a functor type NAME expands the name and pairs
+    // the parameters the same way, once: what it saves is the name
+    // (S533).
+    if (!hoapp_off() && !parfun_off() &&
+        !std::holds_alternative<Pmod_ident>(c.me->desc))
+      if (auto* id = std::get_if<Pmty_ident>(&c.mt->desc))
+        if (const ModuleType* d = named_mty(id->id.txt, 8))
+          if (std::holds_alternative<Pmty_functor>(d->desc))
+            n += pfun_mty_params(*d);
+  }
+  // ---- A RECURSIVE MODULE'S DECLARATION IS TRANSLATED BEFORE ITS BODY ----
+  // (S560) `transl_recmodule_modtypes` (typemod.ml) names the bound
+  // modules, approximates each declaration (the unbound modules and its
+  // declarations), translates each declaration once, then ONCE MORE -- the
+  // second translation's constructor and label idents are the saved ones --
+  // and only then is each body typed and checked for consistency, and the
+  // unrolling rounds run.  The walk pays the lumps in that order and
+  // records the declared types' keys under the binding's name; a body's
+  // declarations are never saved, so its keys are not recorded at all.
+  // `NORECSTAMP=1` reverts to the body-first walk.
+  void rec_decl(const Pmod_constraint& c, const std::string& name,
+                const Lvl& l, long long& pend) {
+    if (!pkmeet_off() && !packty_off() &&
+        !std::holds_alternative<Pmty_signature>(c.mt->desc))
+      if (const Signature* sg = mty_sig(c.mt.get())) n += pk_sig_cost(*sg);
+    if (!pkclass_off() && !inexpr_ &&
+        !std::holds_alternative<Pmty_signature>(c.mt->desc))
+      if (const Signature* sg = mty_sig(c.mt.get())) n += casc_sig(*sg, 8);
+    const long long apv = asc_pend_;
+    asc_pend_ = 0;
+    ++in_asc_;
+    spath_.push_back(name);
+    asc_type(c, l);
+    spath_.pop_back();
+    --in_asc_;
+    pend = asc_pend_;
+    asc_pend_ = apv;
+  }
+  void rec_body(const Pmod_constraint& c, long long pend) {
+    const Signature* asv = ascr_sig_;
+    const ModuleType* amv = asc_mty_;
+    ascr_sig_ = mty_sig(c.mt.get());
+    asc_mty_ = std::holds_alternative<Pmod_apply>(c.me->desc) ? c.mt.get()
+                                                              : nullptr;
+    const long long apv = asc_pend_;
+    asc_pend_ = pend;
+    ++in_asc_;
+    chk_ = true;
+    chk_sig_ = mty_sig(c.mt.get());
+    auto* stv = stamps_;
+    stamps_ = nullptr;
+    mexpr(*c.me, Lvl{1, 1, 0, true}, false);
+    stamps_ = stv;
+    chk_ = false;
+    chk_sig_ = nullptr;
+    --in_asc_;
+    n += asc_pend_;
+    asc_pend_ = apv;
+    asc_mty_ = amv;
+    ascr_sig_ = asv;
+    asc_pairing(c);
+  }
   void mexpr(const ModuleExpr& m, Lvl l = Lvl{1, 1, 0, true},
              bool saved = true) {
     if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
@@ -42119,35 +42324,14 @@ struct Count {
       mexpr(*c->me, Lvl{1, 1, 0, true}, false);
       chk_ = false;
       chk_sig_ = nullptr;
-      auto pairing = [&]() {
-        n += asc_alias(*c->me, mty_sig(c->mt.get()));
-        // A path bound at the ascription's own module type name is checked
-        // `Mty_ident` against `Mty_ident`, the same path: nothing is paired.
-        if (std::holds_alternative<Pmod_ident>(c->me->desc) &&
-            !same_named(*c->me, *c->mt))
-          n += anon_path(*c->me) + arrows_in(*c->mt, 8, c->me.get());
-        if (!parfun_off() && !std::holds_alternative<Pmod_ident>(c->me->desc))
-          n += pfun_mty_params(*c->mt);
-        // An ascription at a functor type NAME expands the name and pairs
-        // the parameters the same way, once: what it saves is the name
-        // (S533).
-        if (!hoapp_off() && !parfun_off() &&
-            !std::holds_alternative<Pmod_ident>(c->me->desc))
-          if (auto* id = std::get_if<Pmty_ident>(&c->mt->desc))
-            if (const ModuleType* d = named_mty(id->id.txt, 8))
-              if (std::holds_alternative<Pmty_functor>(d->desc))
-                n += pfun_mty_params(*d);
-      };
+      auto pairing = [&]() { asc_pairing(*c); };
       if (chkpos_off()) pairing();
       asc_mty_ = amv;
       ascr_sig_ = asv;
-      MtCtx sv = mtctx_;
-      mtctx_ = MtCtx::Ascr;
-      mty(*c->mt, depth_off() ? Lvl{1, 1, 0, true} : l, true);
+      asc_type(*c, l);
       --in_asc_;
       n += asc_pend_;
       asc_pend_ = apv;
-      mtctx_ = sv;
       if (!chkpos_off()) pairing();
     // An APPLICATION's argument is a module of its own: what the
     // application leaves in the structure is the functor's RESULT, so the
@@ -42482,7 +42666,19 @@ struct Count {
                           std::holds_alternative<Pmty_with>(w->mt->desc)
                       ? flat()
                       : l);
-      if (!with_off()) n += with_node(*w, l);
+      // The merged signature's cascade renames -- what it costs above the
+      // one pass that lands it -- are the check's (S560): a functor
+      // parameter's `with` pays them where the parameter is paired, after
+      // the body's declarations.  `NOWITHPOS=1` reverts.
+      if (!with_off()) {
+        const long long full = with_node(*w, l);
+        if (withpos_off()) n += full;
+        else {
+          const long long fl = with_node(*w, flat());
+          n += fl;
+          chk(full - fl);
+        }
+      }
       if (!xwith_off()) n += xwith_node(*w, l);
       n += twith_node(*w, l);
       // A constraint's manifest is a type written where it is expanded: an
@@ -42891,8 +43087,20 @@ struct Count {
       sbind(m->md);
     } else if (auto* m = std::get_if<Psig_recmodule>(&it.desc)) {
       for (auto& d : m->decls) sbind(d);
-      for (auto& d : m->decls) { ++n; extra(per - 1); mty(*d.type, sub(l)); }
-      n += recmodule_sig_extra(*m);
+      if (recstamp_off()) {
+        for (auto& d : m->decls) { ++n; extra(per - 1); mty(*d.type, sub(l)); }
+        n += recmodule_sig_extra(*m);
+      } else {
+        // The declarations are named, approximated and translated once
+        // before the translation that is saved (S560, `rec_decl`).
+        for (std::size_t i = 0; i < m->decls.size(); ++i) { ++n; extra(per - 1); }
+        n += recmodule_sig_extra(*m);
+        for (auto& d : m->decls) {
+          if (d.name.txt) spath_.push_back(*d.name.txt);
+          mty(*d.type, sub(l));
+          if (d.name.txt) spath_.pop_back();
+        }
+      }
     } else if (auto* m = std::get_if<Psig_modtype>(&it.desc)) {
       if (!defer_) n += per;
       spath_.push_back(m->name.txt);
@@ -43176,13 +43384,33 @@ struct Count {
       const Lvl sl = depth_off() ? Lvl{1, 1, 0, true} : sub(l);
       const int rbv = recb_;
       recb_ = narrowapp_off() ? 0 : (int)m->bindings.size();
-      for (auto& b : m->bindings) {
-        mexpr(b.expr, sl);
-        if (b.name.txt) ++n;
-        mbind(b);
+      if (recstamp_off()) {
+        for (auto& b : m->bindings) {
+          mexpr(b.expr, sl);
+          if (b.name.txt) ++n;
+          mbind(b);
+        }
+        n += recmodule_extra(*m);
+      } else {
+        for (auto& b : m->bindings)
+          if (b.name.txt) ++n;
+        n += recmodule_extra(*m, 1);
+        std::vector<long long> pend(m->bindings.size(), 0);
+        for (std::size_t i = 0; i < m->bindings.size(); ++i) {
+          auto& b = m->bindings[i];
+          auto* c = std::get_if<Pmod_constraint>(&b.expr.desc);
+          if (c && b.name.txt) rec_decl(*c, *b.name.txt, sl, pend[i]);
+        }
+        for (std::size_t i = 0; i < m->bindings.size(); ++i) {
+          auto& b = m->bindings[i];
+          auto* c = std::get_if<Pmod_constraint>(&b.expr.desc);
+          if (c && b.name.txt) rec_body(*c, pend[i]);
+          else mexpr(b.expr, sl);
+          mbind(b);
+        }
+        n += recmodule_extra(*m, 2);
       }
       recb_ = rbv;
-      n += recmodule_extra(*m);
       // A `module rec` an ascription HIDES is never paired by the compunit
       // check, so its declarations' submodules are not expanded as aliases
       // there: one less per item below the top of each declaration (S545).
@@ -43995,10 +44223,14 @@ int typing_ident_count(const ast::Signature& s) {
 //
 // What is NOT modelled leaves `complete` false and the writer keeps its own
 // numbering for the whole file: an `include` (whose items keep their SOURCE
-// unit's uids), a `module rec`, a functor APPLICATION, a module type
-// reached by NAME, an `open struct .. end`, an `inherit` of a class the walk
-// did not see declared, an extension node.  A file is thus either fully
-// modelled or exactly as before.
+// unit's uids), a functor APPLICATION, a module type reached by NAME, an
+// `open struct .. end`, an `inherit` of a class the walk did not see
+// declared, an extension node.  A file is thus either fully modelled or
+// exactly as before.
+//   * a `module rec` group mints one uid per binding first, then translates
+//     every declared type twice -- the second translation's items are saved
+//     -- and only then types the bodies (S560, `rec_group`); an anonymous
+//     `module _` costs its body's (or its type's) uids and one of its own.
 namespace uidwalk {
 
 struct Walk {
@@ -44008,6 +44240,7 @@ struct Walk {
   std::string path;              // dotted path of the enclosing module
   bool obj_off = false;          // NOUIDOBJ: keep bailing on `object .. end`
   bool class_off = false;        // NOUIDCLASS: keep bailing on a class
+  bool rec_off = false;          // NORECSTAMP: keep bailing on `module rec`
   // The instance variables of every class (and class type) declared so far,
   // by dotted path: what an `inherit` of it costs in the second pass.
   std::map<std::string, std::set<std::string>> cvars;
@@ -44408,7 +44641,12 @@ struct Walk {
       } else if (auto* e = std::get_if<Psig_exception>(&it.desc)) {
         exception_decl(e->exn, save);
       } else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
-        if (!m->md.name.txt) { bail(); continue; }
+        if (!m->md.name.txt) {  // `module _ : S`: its type's items, then its own
+          if (rec_off) { bail(); continue; }
+          if (m->md.type) mty(*m->md.type, /*save=*/false);
+          mk();
+          continue;
+        }
         std::string n = *m->md.name.txt;
         std::string save_path = path;
         if (save) path = path.empty() ? n : path + "." + n;
@@ -44422,6 +44660,12 @@ struct Walk {
         class_type_group(c->decls, save);
       } else if (auto* ct = std::get_if<Psig_class_type>(&it.desc)) {
         class_type_group(ct->decls, save);
+      } else if (auto* r = std::get_if<Psig_recmodule>(&it.desc)) {
+        if (rec_off) { bail(); return; }
+        std::vector<const ModuleType*> mts;
+        std::vector<std::optional<std::string>> names;
+        for (auto& d : r->decls) { mts.push_back(d.type.get()); names.push_back(d.name.txt); }
+        rec_group(names, mts, {}, save);
       } else if (std::get_if<Psig_open>(&it.desc) ||
                  std::get_if<Psig_attribute>(&it.desc)) {
         // nothing
@@ -44429,6 +44673,34 @@ struct Walk {
         bail();
       }
     }
+  }
+  // ---- recursive modules --------------------------------------------------
+  // `transl_recmodule_modtypes` (typemod.ml) mints each binding's own uid
+  // first (`init`, named or not), translates every declared module type
+  // once (dcl1) and once more (dcl2) -- the second translation's items are
+  // the saved ones -- and only then are the bodies typed (S560).  The
+  // approximation mints nothing (`Uid.internal_not_actually_unique`); the
+  // unrolling rounds and the checks mint nothing either.
+  void rec_group(const std::vector<std::optional<std::string>>& names,
+                 const std::vector<const ast::ModuleType*>& mts,
+                 const std::vector<const ast::ModuleExpr*>& bodies, bool save) {
+    std::vector<int> own;
+    for (std::size_t i = 0; i < mts.size(); ++i) own.push_back(mk());
+    for (int pass = 0; pass < 2; ++pass)
+      for (std::size_t i = 0; i < mts.size(); ++i) {
+        if (!mts[i]) { bail(); return; }
+        const bool sv = save && pass == 1;
+        std::string save_path = path;
+        if (sv && names[i])
+          path = path.empty() ? *names[i] : path + "." + *names[i];
+        mty(*mts[i], sv);
+        path = save_path;
+      }
+    for (const ast::ModuleExpr* b : bodies)
+      if (b) mod_expr(*b, /*save=*/false);
+    if (save)
+      for (std::size_t i = 0; i < names.size(); ++i)
+        if (names[i]) ids[uidkey('m', path, *names[i])] = own[i];
   }
 
   void exception_decl(const ast::TypeException& x, bool save) {
@@ -44488,7 +44760,12 @@ struct Walk {
     } else if (auto* x = std::get_if<Pstr_exception>(&it.desc)) {
       exception_decl(x->exn, save);
     } else if (auto* m = std::get_if<Pstr_module>(&it.desc)) {
-      if (!m->binding.name.txt) { bail(); return; }
+      if (!m->binding.name.txt) {  // `module _ = ..`: its body, then its own uid
+        if (rec_off) { bail(); return; }
+        mod_expr(m->binding.expr, /*save=*/false);
+        mk();
+        return;
+      }
       std::string n = *m->binding.name.txt;
       std::string save_path = path;
       if (save) path = path.empty() ? n : path + "." + n;
@@ -44506,10 +44783,23 @@ struct Walk {
       class_group(c->decls, save);
     } else if (auto* ct = std::get_if<Pstr_class_type>(&it.desc)) {
       class_type_group(ct->decls, save);
+    } else if (auto* r = std::get_if<Pstr_recmodule>(&it.desc)) {
+      if (rec_off) { bail(); return; }
+      std::vector<const ModuleType*> mts;
+      std::vector<const ModuleExpr*> bodies;
+      std::vector<std::optional<std::string>> names;
+      for (auto& b : r->bindings) {
+        auto* cn = std::get_if<Pmod_constraint>(&b.expr.desc);
+        if (!cn) { bail(); return; }  // rejected: no explicit type
+        mts.push_back(cn->mt.get());
+        bodies.push_back(cn->me.get());
+        names.push_back(b.name.txt);
+      }
+      rec_group(names, mts, bodies, save);
     } else if (std::get_if<Pstr_attribute>(&it.desc)) {
       // nothing
     } else {
-      bail();  // include / recmodule / typext / ext / val
+      bail();  // include / typext / ext / val
     }
   }
 };
@@ -44520,6 +44810,7 @@ UidMap typing_uid_map(const ast::Structure& s) {
   uidwalk::Walk w;
   w.obj_off = dbg_env("NOUIDOBJ");
   w.class_off = dbg_env("NOUIDCLASS");
+  w.rec_off = dbg_env("NORECSTAMP");
   for (auto& it : s) w.item(it, /*save=*/true);
   UidMap m;
   m.complete = w.complete;

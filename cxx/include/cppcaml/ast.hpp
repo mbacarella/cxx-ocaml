@@ -384,7 +384,9 @@ struct Psig_type { RecFlag rf; std::vector<TypeDeclaration> decls; };
 struct Psig_typesubst { std::vector<TypeDeclaration> decls; };  // type t := …
 struct Psig_typext { TypeExtension ext; };
 struct Psig_exception { TypeException exn; };
-struct ModuleDeclaration { StrOptLoc name; ModuleTypeBox type; Attributes attrs; };
+// `loc` is set for the declarations of a `module rec` group only (see
+// ModuleBinding::loc): each one's own span from its `module`/`and` keyword.
+struct ModuleDeclaration { StrOptLoc name; ModuleTypeBox type; Attributes attrs; Location loc; };
 struct Psig_module { ModuleDeclaration md; };
 struct Psig_recmodule { std::vector<ModuleDeclaration> decls; };  // module rec M : … and N : …
 struct Psig_modtype { StringLoc name; std::optional<ModuleType> type; Attributes attrs; };  // module type S [= mty]
@@ -422,7 +424,10 @@ struct ModuleExpr {
   Location loc;
   Attributes attrs;  // pmod_attributes
 };
-struct ModuleBinding { StrOptLoc name; ModuleExpr expr; Attributes attrs; };
+// `loc` is set for the bindings of a `module rec` group only: each one's own
+// span (`pmb_loc`, from its `module`/`and` keyword), which is the `md_loc` the
+// group's declarations save; a plain `module` binding's span is its item's.
+struct ModuleBinding { StrOptLoc name; ModuleExpr expr; Attributes attrs; Location loc; };
 
 // --- class language ---
 enum class VirtualFlag { Virtual, Concrete };
