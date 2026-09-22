@@ -21893,6 +21893,16 @@ bool ldstamp_off() {
   static const bool off = dbg_env("NOLDSTAMP") != nullptr;
   return off;
 }
+// S558: what a CHECK costs is paid where the check runs -- an ascription's
+// (`Includemod.modtypes` at a `Pmod_constraint`, a pack, an application's
+// argument) once its body and its module type are typed, and the inferred
+// signature's (`Includemod.compunit`, and the cascade of renames it sets
+// off) after the whole unit -- not where the walk meets the construct
+// (`NOCHKPOS=1` reverts: every such charge where S557 made it).
+bool chkpos_off() {
+  static const bool off = dbg_env("NOCHKPOS") != nullptr;
+  return off;
+}
 
 // ---- WHAT A DISCARDED MODULE DOES NOT PAY --------------------------------
 // `module M : sig end = struct module S = Set.Make (X) end` binds S behind an
@@ -25953,9 +25963,39 @@ struct Count {
   // extras after it), so they are deferred to the end of the walk.
   long long pend_end_ = 0;
   bool defer_ = false;
+  // What an ascription's check costs, paid once its module type is walked.
+  long long asc_pend_ = 0;
   void extra(long long d) {
     if (defer_) pend_end_ += d;
     else n += d;
+  }
+  // The S558 positions: a charge of the inferred signature's check, and
+  // one of the enclosing ascription's.
+  void chk(long long d) {
+    if (chkpos_off()) n += d;
+    else extra(d);
+  }
+  void asc(long long d) {
+    if (chkpos_off()) n += d;
+    else asc_pend_ += d;
+  }
+  // A charge made ONCE PER CHECK of the signature item (`csig_w` counts
+  // them): the ascription's at the ascription, the saved result's and a
+  // module type declaration's -- both ways -- where it is checked, at the
+  // ascription around it or after the whole unit.
+  int in_asc_ = 0;  // inside a checked body or an ascription's module type
+  void checks(long long d) {
+    if (chkpos_off()) { n += csig_w() * d; return; }
+    if (mtctx_ == MtCtx::Ascr) {
+      asc(d);
+      if (saved_ && !inexpr_) chk(d);
+    } else if (inexpr_) {
+    } else if (mtctx_ == MtCtx::Decl) {
+      if (in_asc_ > 0) asc(2 * d);
+      else chk(2 * d);
+    } else if (saved_) {
+      chk(d);
+    }
   }
   // Value names in scope, so the ghost bindings below can ask what
   // `Env.bound_value` would.  `mark`/`release` bracket a scope.
@@ -33262,11 +33302,17 @@ struct Count {
     } else if (auto* s = std::get_if<Pexp_send>(&e.desc)) {
       expr(*s->obj);
     } else if (auto* p = std::get_if<Pexp_pack>(&e.desc)) {
+      const long long apv = asc_pend_;
+      asc_pend_ = 0;
+      ++in_asc_;
       chk_ = true;
       chk_sig_ = p->pkg ? mty_sig(named_mty(p->pkg->path.txt, 8)) : nullptr;
       mexpr(*p->me);
       chk_ = false;
       chk_sig_ = nullptr;
+      --in_asc_;
+      n += asc_pend_;  // the pack is checked once it is typed
+      asc_pend_ = apv;
       if (p->pkg && !packty_off()) n += pack_pkg(*p->pkg);
       if (p->pkg) n += pk_with(*p->pkg, 2);
       // A module ascribed in place at the package's own module type is
@@ -33350,32 +33396,73 @@ struct Count {
     for (auto& d : ds) if (fixed_row(d)) n += per;
     n += (long long)ds.size();
     extra((per - 1) * (long long)ds.size());
+    // A package type's `with type` constraints are merged where the type
+    // is translated (S558, `pk_merge`); the check's share of the package
+    // is the declaration's site's, after the whole unit.
+    pkmerge_ = saved_ && !packty_off() && !chkpos_off();
     for (auto& d : ds) {
       if (!pkwrit_off())
-        for (auto& c : d.constraints) { ty_app(*c.t1); ty_app(*c.t2); }
+        for (auto& c : d.constraints) {
+          ty_app(*c.t1); ty_app(*c.t2);
+          pk_merge(*c.t1); pk_merge(*c.t2);
+        }
       if (auto* v = std::get_if<Ptype_variant>(&d.kind)) {
         for (auto& c : v->ctors) {
           stamp_at('c', d.name.txt + "#" + c.name.txt);
           ++n;
           anchored(&c);
           ctor_args(c.args, d.name.txt + "#" + c.name.txt);
+          if (c.res) pk_merge(**c.res);
         }
       } else if (auto* r = std::get_if<Ptype_record>(&d.kind)) {
         for (auto& f : r->fields) {
           anchored(&f);
           ty_app(*f.type, 0, false, 1);
+          pk_merge(*f.type);
           stamp_at('l', d.name.txt + "." + f.name.txt);
           ++n;
         }
       }
       anchored(&d);
-      if (d.manifest) ty_app(**d.manifest, 0, false, 2);
+      if (d.manifest) { ty_app(**d.manifest, 0, false, 2); pk_merge(**d.manifest); }
     }
+    pkmerge_ = false;
     tdecl_ = td;
+  }
+  bool pkmerge_ = false;
+  static long long pack_merge(const CoreType& t) {
+    return pack_ty(t) - 2 * pack_nodes(t);
+  }
+  void pk_merge(const CoreType& t) {
+    if (pkmerge_) n += pack_merge(t);
+  }
+  // `pack_decl` over the merges alone: what `type_decls` charged at the
+  // types.
+  static long long pack_decl_merge(const TypeDeclaration& d) {
+    long long k = d.manifest ? pack_merge(**d.manifest) : 0;
+    if (!pkwrit_off())
+      for (auto& c : d.constraints) k += pack_merge(*c.t1) + pack_merge(*c.t2);
+    if (auto* v = std::get_if<Ptype_variant>(&d.kind))
+      for (auto& c : v->ctors) {
+        if (c.res) k += pack_merge(**c.res);
+        if (auto* t = std::get_if<Pcstr_tuple>(&c.args))
+          for (auto& e : t->elems) k += pack_merge(*e);
+        else if (auto* r = std::get_if<Pcstr_record>(&c.args))
+          for (auto& f : r->fields) k += pack_merge(*f.type);
+      }
+    else if (auto* r = std::get_if<Ptype_record>(&d.kind))
+      for (auto& f : r->fields) k += pack_merge(*f.type);
+    return k;
+  }
+  // What a saved declaration's package types cost at its site: the whole
+  // where S557 charged it, else the check's share, after the unit.
+  void pk_decl_site(const TypeDeclaration& d) {
+    if (chkpos_off()) n += pack_decl(d);
+    else chk(pack_decl(d) - pack_decl_merge(d));
   }
   void ctor_args(const ConstructorArguments& a, const std::string& ck = "") {
     if (auto* t = std::get_if<Pcstr_tuple>(&a))
-      for (auto& e : t->elems) ty_app(*e);
+      for (auto& e : t->elems) { ty_app(*e); pk_merge(*e); }
     if (auto* r = std::get_if<Pcstr_record>(&a)) {
       if (ldstamp_off()) {
         n += (long long)r->fields.size();
@@ -33385,6 +33472,7 @@ struct Count {
       for (auto& f : r->fields) {
         anchored(&f);
         ty_app(*f.type);
+        pk_merge(*f.type);
         stamp_at('L', ck + "." + f.name.txt);
         ++n;
       }
@@ -41926,33 +42014,48 @@ struct Count {
       if (!pkclass_off() && !inexpr_ &&
           !std::holds_alternative<Pmty_signature>(c->mt->desc))
         if (const Signature* sg = mty_sig(c->mt.get())) n += casc_sig(*sg, 8);
+      // The check is run once the module type is translated (typemod's
+      // `Pmod_constraint`: the body, the type, then the pairing), so what
+      // it costs comes after the type's own idents (S558): here, and what
+      // the body's and the type's walks set aside in `asc_pend_`.
+      const long long apv = asc_pend_;
+      asc_pend_ = 0;
+      ++in_asc_;
       chk_ = true;
       chk_sig_ = mty_sig(c->mt.get());
       mexpr(*c->me, Lvl{1, 1, 0, true}, false);
       chk_ = false;
       chk_sig_ = nullptr;
-      n += asc_alias(*c->me, mty_sig(c->mt.get()));
-      // A path bound at the ascription's own module type name is checked
-      // `Mty_ident` against `Mty_ident`, the same path: nothing is paired.
-      if (std::holds_alternative<Pmod_ident>(c->me->desc) &&
-          !same_named(*c->me, *c->mt))
-        n += anon_path(*c->me) + arrows_in(*c->mt, 8, c->me.get());
-      if (!parfun_off() && !std::holds_alternative<Pmod_ident>(c->me->desc))
-        n += pfun_mty_params(*c->mt);
-      // An ascription at a functor type NAME expands the name and pairs the
-      // parameters the same way, once: what it saves is the name (S533).
-      if (!hoapp_off() && !parfun_off() &&
-          !std::holds_alternative<Pmod_ident>(c->me->desc))
-        if (auto* id = std::get_if<Pmty_ident>(&c->mt->desc))
-          if (const ModuleType* d = named_mty(id->id.txt, 8))
-            if (std::holds_alternative<Pmty_functor>(d->desc))
-              n += pfun_mty_params(*d);
+      auto pairing = [&]() {
+        n += asc_alias(*c->me, mty_sig(c->mt.get()));
+        // A path bound at the ascription's own module type name is checked
+        // `Mty_ident` against `Mty_ident`, the same path: nothing is paired.
+        if (std::holds_alternative<Pmod_ident>(c->me->desc) &&
+            !same_named(*c->me, *c->mt))
+          n += anon_path(*c->me) + arrows_in(*c->mt, 8, c->me.get());
+        if (!parfun_off() && !std::holds_alternative<Pmod_ident>(c->me->desc))
+          n += pfun_mty_params(*c->mt);
+        // An ascription at a functor type NAME expands the name and pairs
+        // the parameters the same way, once: what it saves is the name
+        // (S533).
+        if (!hoapp_off() && !parfun_off() &&
+            !std::holds_alternative<Pmod_ident>(c->me->desc))
+          if (auto* id = std::get_if<Pmty_ident>(&c->mt->desc))
+            if (const ModuleType* d = named_mty(id->id.txt, 8))
+              if (std::holds_alternative<Pmty_functor>(d->desc))
+                n += pfun_mty_params(*d);
+      };
+      if (chkpos_off()) pairing();
       asc_mty_ = amv;
       ascr_sig_ = asv;
       MtCtx sv = mtctx_;
       mtctx_ = MtCtx::Ascr;
       mty(*c->mt, depth_off() ? Lvl{1, 1, 0, true} : l, true);
+      --in_asc_;
+      n += asc_pend_;
+      asc_pend_ = apv;
       mtctx_ = sv;
+      if (!chkpos_off()) pairing();
     // An APPLICATION's argument is a module of its own: what the
     // application leaves in the structure is the functor's RESULT, so the
     // argument is typed where it stands and none of the renames below the
@@ -41966,11 +42069,17 @@ struct Count {
       bool allpath = true;
       for (;;) {
         if (auto* a = std::get_if<Pmod_apply>(&h->desc)) {
+          const long long apv = asc_pend_;
+          asc_pend_ = 0;
+          ++in_asc_;
           chk_ = true;
           chk_sig_ = chkarrow_off() ? nullptr : arg_param_sig(m, h);
           mexpr(*a->arg, Lvl{1, 1, 0, true}, false);
           chk_ = false;
           chk_sig_ = nullptr;
+          --in_asc_;
+          n += asc_pend_;  // the argument is checked once it is typed
+          asc_pend_ = apv;
           if (std::holds_alternative<Pmod_ident>(a->arg->desc))
             n += anon_path(*a->arg);
           if (!has_path(*a->arg)) allpath = false;
@@ -42254,10 +42363,18 @@ struct Count {
     } else if (auto* s = std::get_if<Pmty_signature>(&mt.desc)) {
       sig_items(s->items, l);
     } else if (auto* f = std::get_if<Pmty_functor>(&mt.desc)) {
-      n += mtfun_wt(*f, l);
+      // An ascription's arrow is named at its check, and the cascade
+      // around it renames it the rest after the whole unit (S558).
+      if (mtctx_ == MtCtx::Ascr) {
+        const long long w = mtfun_wt(*f, l);
+        asc(w > 0 ? 1 : 0);
+        chk(w > 0 ? w - 1 : 0);
+      } else {
+        chk(mtfun_wt(*f, l));
+      }
       if (mtctx_ != MtCtx::Other)
         if (auto* nm = std::get_if<Functor_named>(&f->param))
-          if (nm->type) n += (l.a - 1) * pfun_named(*nm->type);
+          if (nm->type) chk((l.a - 1) * pfun_named(*nm->type));
       fparam(f->param, l);
       // The parameter is in scope over the result: a `with module` there
       // names it (S544).
@@ -42618,17 +42735,20 @@ struct Count {
     } else if (auto* t = std::get_if<Psig_type>(&it.desc)) {
       type_decls(t->decls, per);
       if (saved_ && !packty_off())
-        for (auto& d : t->decls) n += pack_decl(d);
+        for (auto& d : t->decls) pk_decl_site(d);
       else if (!packty_off() && !mtyres_off())
         for (auto& d : t->decls) n += pk_dpatches(d);
       if (!pkmeet_off() && !packty_off() && !pkinfer_off())
         for (auto& d : t->decls) n += pk_mtx() * pack_decl_nodes(d);
       if (!pkclass_off())
-        for (auto& d : t->decls) n += (2 + 2 * csig_w()) * adecl_nodes(d);
+        for (auto& d : t->decls) {
+          n += 2 * adecl_nodes(d);
+          checks(2 * adecl_nodes(d));
+        }
     } else if (auto* t = std::get_if<Psig_typesubst>(&it.desc)) {
       type_decls(t->decls, per);
       if (saved_ && !packty_off())
-        for (auto& d : t->decls) n += pack_decl(d);
+        for (auto& d : t->decls) pk_decl_site(d);
       else if (!packty_off() && !mtyres_off())
         for (auto& d : t->decls) n += pk_dpatches(d);
     // An EXTENSION CONSTRUCTOR is a signature item of its own -- `Sig_typext`
@@ -42664,7 +42784,7 @@ struct Count {
           mtctx_ == MtCtx::Ascr && saved_ && !inexpr_ &&
           std::holds_alternative<Pmty_functor>(m->md.type->desc) &&
           fexp_->count(fxkey()))
-        n += fexp_self_mty(m->md.type.get());
+        chk(fexp_self_mty(m->md.type.get()));
       if (!parfun_off() &&
           std::holds_alternative<Pmty_functor>(m->md.type->desc))
         n += pfun_checks(l) * pfun_mty_params(*m->md.type);
@@ -42738,17 +42858,21 @@ struct Count {
     // environment renames the items it saves -- three of them, where a class
     // type saves two.
     } else if (auto* c = std::get_if<Psig_class>(&it.desc)) {
-      if (!cls_off())
-        n += (3 + 3 * (per - 1)) * (long long)c->decls.size();
+      if (!cls_off()) {
+        n += 3 * (long long)c->decls.size();
+        chk(3 * (per - 1) * (long long)c->decls.size());
+      }
       for (auto& d : c->decls) cty_app(d.expr);
       if (!pkclass_off())
-        for (auto& d : c->decls) n += csig_w() * cty_pk(d.expr, 10, 8, 8, 8);
+        for (auto& d : c->decls) checks(cty_pk(d.expr, 10, 8, 8, 8));
     } else if (auto* c = std::get_if<Psig_class_type>(&it.desc)) {
-      if (!cls_off())
-        n += (3 + 2 * (per - 1)) * (long long)c->decls.size();
+      if (!cls_off()) {
+        n += 3 * (long long)c->decls.size();
+        chk(2 * (per - 1) * (long long)c->decls.size());
+      }
       for (auto& d : c->decls) cty_app(d.expr);
       if (!pkclass_off())
-        for (auto& d : c->decls) n += csig_w() * cty_pk(d.expr, 6, 4, 4, 8);
+        for (auto& d : c->decls) checks(cty_pk(d.expr, 6, 4, 4, 8));
     } else if (auto* o = std::get_if<Psig_open>(&it.desc)) {
       n += sopen(o->id.txt);
     }
@@ -42776,11 +42900,16 @@ struct Count {
       type_decls(t->decls, 1);
       anchored((const char*)&it + 1);  // Cites::item_end
       if (saved_ && !packty_off())
-        for (auto& d : t->decls) n += pack_decl(d);
+        for (auto& d : t->decls) pk_decl_site(d);
       else if (!packty_off() && !mtyres_off())
         for (auto& d : t->decls) n += pk_dpatches(d);
+      // `check_constraints` meets the group's abbreviations once it is
+      // translated; each check of the signature meets them again (S530).
       if (!pkclass_off())
-        for (auto& d : t->decls) n += (2 + 2 * csig_w()) * adecl_nodes(d);
+        for (auto& d : t->decls) {
+          n += 2 * adecl_nodes(d);
+          checks(2 * adecl_nodes(d));
+        }
     } else if (auto* x = std::get_if<Pstr_typext>(&it.desc)) {
       for (auto& c : x->ext.ctors) { reg_ext(c); ext_ctor(c); }
       if (saved_ && !packty_off())
@@ -42809,7 +42938,7 @@ struct Count {
                                          : sub(l);
       if (!fcas_off() && ml.a > 1 &&
           std::holds_alternative<Pmod_functor>(m->binding.expr.desc))
-        n += (ml.a - 1) * fcas(m->binding.expr);
+        chk((ml.a - 1) * fcas(m->binding.expr));
       // A functor bound inside a saved structure is checked as a copy
       // (S543): the type paths applied to what the copy renames are built
       // again, once per file; a functor inside the walk is in it already.
@@ -42824,21 +42953,32 @@ struct Count {
         const bool fn = std::holds_alternative<Pmod_functor>(fe->desc) ||
                         (nd && std::holds_alternative<Pmty_functor>(nd->desc));
         if (fn) {
-          n += nf_functor(m->binding.expr, nd);
+          chk(nf_functor(m->binding.expr, nd));
           nfw = true;
           ++nfwalk_;
         }
       }
-      if (!ascp_off() && !inexpr_) n += ascp_charge(m->binding.expr);
+      // What the binding's ascription CHECKS costs is paid once its body
+      // and its module type are typed (S558): `own` is added after `mexpr`.
+      long long own = 0;
+      auto later = [&](long long d) {
+        if (chkpos_off()) n += d;
+        else own += d;
+      };
+      if (!ascp_off() && !inexpr_) later(ascp_charge(m->binding.expr));
       const bool paired = chkd_ && !chkarrow_off() && chkd_sig_ &&
                           m->binding.name.txt &&
                           sig_binds_mod(*chkd_sig_, *m->binding.name.txt);
-      if (!anonfun_off() && ((saved_ && !inexpr_) || paired))
-        n += anon_mexpr(m->binding.expr);
+      // .. and a binding the ascription ABOVE pairs is checked there.
+      if (!anonfun_off() && ((saved_ && !inexpr_) || paired)) {
+        const long long d = anon_mexpr(m->binding.expr);
+        if (paired) asc(d);
+        else later(d);
+      }
       // A binding an ascription pairs is charged with the signature's
       // item: one substitution of the declared type per check.
       if (!parfun_off() && saved_ && !inexpr_)
-        n += pfun_params(m->binding.expr);
+        later(pfun_params(m->binding.expr));
       const Signature* asv = ascr_sig_;
       const bool dsv = mdiscard_;
       const bool nsv = mnarrow_;
@@ -42856,10 +42996,10 @@ struct Count {
           // per declaration (measured: `Set.S` 47, `Set.OrderedType` 2,
           // `module rec` or not).
           if (std::holds_alternative<Pmty_ident>(d->desc)) {
-            n += xforce(*d);
+            later(xforce(*d));
             std::string key;
             const cmi::Signature* sg = xmty_sig(d, key);
-            if (sg && fxin_ > 0) n += flat_csig(*sg);
+            if (sg && fxin_ > 0) later(flat_csig(*sg));
           }
         }
       const bool dtv = mdisctop_;
@@ -42893,7 +43033,7 @@ struct Count {
       const bool fxp = m->binding.name.txt.has_value();
       if (fxp) fxpath_.push_back(*m->binding.name.txt);
       if (fxp) spath_.push_back(*m->binding.name.txt);
-      if (fxp && saved_ && !inexpr_) n += fexp_charge(m->binding.expr);
+      if (fxp && saved_ && !inexpr_) chk(fexp_charge(m->binding.expr));
       // `module M = X` of an enclosing functor's PARAMETER is `module M =
       // struct include X end` less the include's own enter: X is not
       // aliasable, so M carries X's signature written out, and the cascade
@@ -42901,11 +43041,12 @@ struct Count {
       if (!ltapp_off())
         if (const ModuleType* pt = par_of(m->binding.expr)) {
           bool dt = false;
-          n += (ml.a - 1) * inc_top(m->binding.expr, dt) +
-               par_nested(*pt, ml, true);
+          chk((ml.a - 1) * inc_top(m->binding.expr, dt));
+          n += par_nested(*pt, ml, true);
         }
       mexpr(m->binding.expr, ml,
             appexp_off() || saved_ || !local_app(m->binding.expr));
+      n += own;
       if (nfw) --nfwalk_;
       // A saved local application's first expanding read builds it (S545):
       // the values are read as `C.x` from inside this structure and as
@@ -43065,7 +43206,7 @@ struct Count {
       }
       for (auto& d : c->decls) { n += 3; cexpr(d.expr); }
       if (!pkclass_off())
-        for (auto& d : c->decls) n += csig_w() * cexp_pk(d.expr, 10, 8, 8, 8);
+        for (auto& d : c->decls) checks(cexp_pk(d.expr, 10, 8, 8, 8));
     } else if (auto* c = std::get_if<Pstr_class_type>(&it.desc)) {
       if (cls_off()) return;
       for (auto& d : c->decls) {
@@ -43075,7 +43216,7 @@ struct Count {
       n += 3 * (long long)c->decls.size();
       for (auto& d : c->decls) cty_app(d.expr);
       if (!pkclass_off())
-        for (auto& d : c->decls) n += csig_w() * cty_pk(d.expr, 6, 4, 4, 8);
+        for (auto& d : c->decls) checks(cty_pk(d.expr, 6, 4, 4, 8));
     }
   }
 };
