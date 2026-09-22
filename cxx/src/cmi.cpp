@@ -3560,6 +3560,13 @@ static void assign_uids(std::vector<SigItem>& items, const std::string& unit,
 // items `assign_uids` numbers, and returns false -- leaving the signature
 // untouched -- as soon as one of them has no recorded uid, so a file either
 // takes the model whole or keeps the old numbering whole.
+// S563's facet revert (and the whole-slice one).
+static bool mtbody_off() {
+  static const bool off = cppcaml::dbg_env("NOUIDMTBODY") != nullptr ||
+                          cppcaml::dbg_env("NOUID563") != nullptr;
+  return off;
+}
+
 static bool assign_uids_mapped(std::vector<SigItem>& items,
                                const std::string& unit, bool intf,
                                const std::map<std::string, int>& uids,
@@ -3590,9 +3597,23 @@ static bool assign_uids_mapped(std::vector<SigItem>& items,
           if (!at('L', it.name + "#" + ct.name + "." + l.name, &l.uid)) return false;
     } else if (it.k == SigItem::Module) {
       const std::string sub = path.empty() ? it.name : path + "." + it.name;
+      // A functor's PARAMETER signature is a module type body too (S563).
+      if (it.is_functor && !mtbody_off() &&
+          !assign_uids_mapped(it.param_sig, unit, intf, uids,
+                              sub + ".!" + it.functor_param, commit))
+        return false;
       if (!assign_uids_mapped(it.sub, unit, intf, uids, sub, commit)) return false;
       if (!at('m', it.name, &it.uid)) return false;
     } else if (it.k == SigItem::Modtype) {
+      // `module type S = sig .. end`: the typer numbers the body's items
+      // like any other signature's (S563; NOUIDMTBODY=1 leaves them
+      // Internal, as before).
+      if (!mtbody_off() &&
+          !assign_uids_mapped(it.sub, unit, intf, uids,
+                              (path.empty() ? std::string() : path + ".") +
+                                  "%" + it.name,
+                              commit))
+        return false;
       if (!at('M', it.name, &it.uid)) return false;
     } else if (it.k == SigItem::Class) {
       // `class c`, `class type c` and `type c` all carry the ONE uid

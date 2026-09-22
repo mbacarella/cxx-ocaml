@@ -44451,6 +44451,61 @@ struct Walk {
   bool coerce_off = false;
   bool anonparam_off = false;
   bool sigalias_off = false;
+  // S563: a SAVED module type's body -- a `module type S = sig .. end`'s
+  // items and a functor parameter's -- is numbered by the typer like any
+  // other signature, and our writer left those items Internal.  They are
+  // recorded under a path segment that no identifier can spell (`%S` for a
+  // module type's body, `!X` for a functor parameter's), and the writer
+  // descends into them the same way.  NOUIDMTBODY=1 reverts.
+  bool mtbody_off = false;
+  // S563, THE UID HALF OF THE COPY LAW: an `include M`, a `module B = A`
+  // and a functor application `F (A)` re-export declarations that were
+  // already made -- Subst renames their idents but KEEPS their uids -- so
+  // the copies' keys are the originals', re-filed under the new path.
+  // `msrc` is the path a bound module's item keys live under (its own, or
+  // the module type's body for `M : S`, or the functor body's for `F (A)`),
+  // `mtsrc` the same for a module type name.  NOUIDCOPY=1 reverts (both
+  // bail, as before).
+  bool copy_off = false;
+  std::map<std::string, std::string> msrc, mtsrc;
+  // Re-file every key recorded under `from` (a path) under `to`.
+  void copy_prefix(const std::string& from, const std::string& to) {
+    std::vector<std::pair<std::string, int>> add;
+    for (auto& kv : ids) {
+      const std::string& k = kv.first;
+      if (k.size() < from.size() + 3) continue;
+      if (k.compare(1, from.size(), from) != 0) continue;
+      if (k[1 + from.size()] != '.') continue;
+      add.emplace_back(std::string(1, k[0]) +
+                           join(to, k.substr(from.size() + 2)),
+                       kv.second);
+    }
+    for (auto& a : add) ids[a.first] = a.second;
+  }
+  // Resolve a module (or module type) name as written at the current path:
+  // innermost scope first.
+  const std::string* look(const std::map<std::string, std::string>& m,
+                          const std::string& name) const {
+    std::string p = path;
+    for (;;) {
+      auto it = m.find(join(p, name));
+      if (it != m.end()) return &it->second;
+      if (p.empty()) return nullptr;
+      std::size_t d = p.rfind('.');
+      if (d == std::string::npos) p.clear(); else p.resize(d);
+    }
+  }
+  static bool mtbody_off_s() {
+    static const bool off = dbg_env("NOUIDMTBODY") != nullptr ||
+                            dbg_env("NOUID563") != nullptr;
+    return off;
+  }
+  // "?" -- the path is NOT known (an external functor, an unmodelled module
+  // type); the empty string is the compilation unit's own top level.
+  static bool unk(const std::string& p) { return p == "?"; }
+  static std::string join(const std::string& p, const std::string& n) {
+    return p.empty() ? n : p + "." + n;
+  }
   // An argument whose inferred type begins with optional arrows, used where
   // a plain arrow is expected, is let-and-eta-expanded (typecore.ml's
   // type_argument: `var_pair "eta"`, `var_pair "arg"`): two uids at the
@@ -44889,20 +44944,82 @@ struct Walk {
   }
 
   // ---- module types -------------------------------------------------------
-  void mty(const ast::ModuleType& m, bool save) {
+  // Like `mod_expr`, returns the path this module type's saved items' keys
+  // live under (empty = not known).
+  std::string mty(const ast::ModuleType& m, bool save) {
     using namespace ast;
     if (auto* sg = std::get_if<Pmty_signature>(&m.desc)) {
       sig_items(sg->items, save);
-    } else if (std::get_if<Pmty_ident>(&m.desc)) {
-      // `: S` -- the saved items are S's OWN declarations and carry ITS uids.
-      if (save) bail();
+      return path;
+    } else if (auto* id = std::get_if<Pmty_ident>(&m.desc)) {
+      // `: S` -- the saved module type IS `Mty_ident S`: no item of its own
+      // is declared here, and nothing is minted (S563; NOUIDMTBODY=1 bails
+      // as before).
+      if (save && mtbody_off) { bail(); return "?"; }
+      if (const std::string* q = look(mtsrc, lid_full(id->id.txt))) return *q;
+      return "?";
     } else if (std::get_if<Pmty_alias>(&m.desc)) {
       // `module B = A` in a signature: an alias declares nothing of its own
       // (its md_uid is the item's; S562, NOUIDSIGALIAS=1 bails as before)
       if (sigalias_off) bail();
+      return "?";
+    } else if (auto* fn = std::get_if<Pmty_functor>(&m.desc)) {
+      // `functor (X : A) -> S`: the parameter's signature, then the
+      // parameter's own uid (`transl_modtype_aux` typemod.ml:1594 -- an
+      // anonymous `(_ : A)` mints none, like a functor expression's), then
+      // the result (S563).
+      if (copy_off) { bail(); return "?"; }
+      if (auto* nm = std::get_if<Functor_named>(&fn->param)) {
+        if (nm->type) {
+          const bool sv = save && !mtbody_off;
+          std::string save_path = path;
+          if (sv) path = join(path, "!" + (nm->name.txt ? *nm->name.txt : "_"));
+          mty(*nm->type, sv);
+          path = save_path;
+        }
+        if (nm->name.txt || anonparam_off) mk();
+      }
+      if (fn->body) return mty(*fn->body, save);
+      return "?";
+    } else if (auto* wi = std::get_if<Pmty_with>(&m.desc)) {
+      // `S with type t = ..`: the items are S's, keeping S's uids, and
+      // every `with type` constraint -- destructive or not -- mints ONE
+      // (`Typedecl.transl_with_constraint`); a `with module` mints none
+      // (S563).
+      if (copy_off) { bail(); return "?"; }
+      if (!wi->mt) { bail(); return "?"; }
+      std::string src = mty(*wi->mt, save);
+      if (save) {
+        if (unk(src)) { bail(); return "?"; }
+        if (src != path) copy_prefix(src, path);
+      }
+      for (auto& wc : wi->constraints) {
+        if (auto* wt = std::get_if<Pwith_type>(&wc)) {
+          int u = mk();
+          if (save) ids[uidkey('t', path, lid_full(wt->lid.txt))] = u;
+        } else if (std::get_if<Pwith_typesubst>(&wc)) {
+          mk();  // the item goes away; the uid is still minted
+        } else if (std::get_if<Pwith_module>(&wc) ||
+                   std::get_if<Pwith_modsubst>(&wc)) {
+          // no uid -- but the re-exported module's items are the ARGUMENT's
+          if (save) { bail(); return "?"; }
+        } else {
+          bail(); return "?";
+        }
+      }
+      return path;
+    } else if (auto* tf = std::get_if<Pmty_typeof>(&m.desc)) {
+      // `module type of M`: M's items, uids and all (S563).
+      if (copy_off || !tf->me) { bail(); return "?"; }
+      auto* id2 = std::get_if<Pmod_ident>(&tf->me->desc);
+      const std::string* q = id2 ? look(msrc, lid_full(id2->id.txt)) : nullptr;
+      if (!q || unk(*q)) { bail(); return "?"; }
+      if (save && *q != path) copy_prefix(*q, path);
+      return path;
     } else {
-      bail();  // functor / with / typeof / extension
+      bail();  // extension
     }
+    return "?";
   }
   void sig_items(const ast::Signature& items, bool save) {
     using namespace ast;
@@ -44927,12 +45044,26 @@ struct Walk {
         }
         std::string n = *m->md.name.txt;
         std::string save_path = path;
-        if (save) path = path.empty() ? n : path + "." + n;
-        if (m->md.type) mty(*m->md.type, save);
+        if (save) path = join(path, n);
+        std::string src = m->md.type ? mty(*m->md.type, save) : std::string("?");
+        std::string q = path;
         path = save_path;
-        if (save) give('m', n); else mk();
+        if (save) {
+          if (!unk(src) && src != q) copy_prefix(src, q);
+          msrc[q] = unk(src) ? std::string("?") : q;
+          give('m', n);
+        } else mk();
       } else if (auto* mt = std::get_if<Psig_modtype>(&it.desc)) {
-        if (mt->type) mty(*mt->type, /*save=*/false);
+        const bool sv = save && !mtbody_off;
+        std::string save_path = path;
+        if (sv) path = join(path, "%" + mt->name.txt);
+        std::string src = mt->type ? mty(*mt->type, sv) : std::string("?");
+        std::string body = path;
+        path = save_path;
+        if (sv) {
+          if (!unk(src) && src != body) copy_prefix(src, body);
+          mtsrc[join(path, mt->name.txt)] = unk(src) ? std::string("?") : body;
+        }
         if (save) give('M', mt->name.txt); else mk();
       } else if (auto* c = std::get_if<Psig_class>(&it.desc)) {
         class_type_group(c->decls, save);
@@ -45021,33 +45152,74 @@ struct Walk {
   }
 
   // ---- module expressions -------------------------------------------------
-  void mod_expr(const ast::ModuleExpr& m, bool save) {
+  // Returns the path this module expression's saved items' keys live under
+  // (empty = not known): `path` for a structure, the module type's body for
+  // an ascription by name, the functor body's for an application.
+  std::string mod_expr(const ast::ModuleExpr& m, bool save) {
     using namespace ast;
     if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
       for (auto& it : st->items) item(it, save);
+      return path;
     } else if (auto* cn = std::get_if<Pmod_constraint>(&m.desc)) {
       // typemod types the module expression FIRST and the module type after,
-      // so the ascribed signature's items -- the ones that are saved -- carry
-      // the later uids and overwrite what the structure recorded.
-      if (cn->me) mod_expr(*cn->me, save);
+      // and the SIGNATURE's items are the ones that are saved -- they carry
+      // the later uids.  What the structure binds is recorded nowhere: a
+      // name the signature drops (`(struct let c let d end : sig val d end)`)
+      // must not overwrite the key an earlier item holds (S563).
+      if (cn->me) mod_expr(*cn->me, /*save=*/copy_off && save);
       if (cn->mt) mty(*cn->mt, save);
       if (cn->me && cn->mt && !coerce_off) {
         int k = coerce_cost(*cn->me, *cn->mt);
         if (k < 0) bail(); else c += k;
       }
+      if (!cn->mt) return "?";
+      if (std::get_if<Pmty_signature>(&cn->mt->desc)) return path;
+      if (auto* id = std::get_if<Pmty_ident>(&cn->mt->desc))
+        if (const std::string* q = look(mtsrc, lid_full(id->id.txt))) return *q;
+      return "?";
     } else if (auto* fn = std::get_if<Pmod_functor>(&m.desc)) {
       if (auto* nm = std::get_if<Functor_named>(&fn->param)) {
-        if (nm->type) mty(*nm->type, /*save=*/false);
+        if (nm->type) {
+          const bool sv = save && !mtbody_off;
+          std::string save_path = path;
+          if (sv) path = join(path, "!" + (nm->name.txt ? *nm->name.txt : "_"));
+          mty(*nm->type, sv);
+          path = save_path;
+        }
         // the parameter itself -- an anonymous `(_ : S)` mints none
         // (typemod.ml:2521; S562, NOUIDANONPARAM=1 charges it as before)
         if (nm->name.txt || anonparam_off) mk();
       }
-      if (fn->body) mod_expr(*fn->body, save);
-    } else if (std::get_if<Pmod_ident>(&m.desc)) {
-      // `module M = A.B`: an alias declares nothing of its own.
+      if (fn->body) return mod_expr(*fn->body, save);
+      return "?";
+    } else if (auto* id = std::get_if<Pmod_ident>(&m.desc)) {
+      // `module M = A.B`: an alias declares nothing of its own -- and what
+      // it re-exports keeps A.B's uids.
+      if (copy_off) return "?";
+      if (const std::string* q = look(msrc, lid_full(id->id.txt))) return *q;
+      return "?";
+    } else if (auto* ap = std::get_if<Pmod_apply>(&m.desc)) {
+      // `module B = F (A)`: the ARGUMENT is typed first (a structure
+      // argument's own bindings take uids), and the result signature IS the
+      // functor body's, Subst-renamed, so its items keep the BODY's uids
+      // and the application itself mints nothing (S563).
+      if (copy_off) { bail(); return "?"; }
+      if (ap->arg) mod_expr(*ap->arg, /*save=*/false);
+      auto* fid = std::get_if<Pmod_ident>(&ap->f->desc);
+      const std::string* q = fid ? look(msrc, lid_full(fid->id.txt)) : nullptr;
+      if (!q || unk(*q)) { bail(); return "?"; }
+      return *q;
+    } else if (auto* au = std::get_if<Pmod_apply_unit>(&m.desc)) {
+      // `F ()`: a generative application, the same law.
+      if (copy_off) { bail(); return "?"; }
+      auto* fid = std::get_if<Pmod_ident>(&au->f->desc);
+      const std::string* q = fid ? look(msrc, lid_full(fid->id.txt)) : nullptr;
+      if (!q || unk(*q)) { bail(); return "?"; }
+      return *q;
     } else {
-      bail();  // apply / apply_unit / unpack / extension
+      bail();  // unpack / extension
     }
+    return "?";
   }
 
   // THE CHECK ADDS THE ACTUAL SIGNATURE TO THE ENV (S562).  `Includemod`
@@ -45078,13 +45250,17 @@ struct Walk {
   }
   // The actual signature of a module expression, paired with the expected
   // module type: the structure's items, or an inner ascription's signature.
+  // `want` is null for an expected type written as a NAME (`: S`): the
+  // check still charges the actual's own top-level inline records, but
+  // there is no expected signature to pair a submodule against, so a
+  // submodule makes the cost unknown (S563).
   static int coerce_cost(const ast::ModuleExpr& me, const ast::ModuleType& mt) {
     using namespace ast;
     auto* sg = std::get_if<Pmty_signature>(&mt.desc);
-    if (!sg) return -1;
+    if (!sg && !(std::get_if<Pmty_ident>(&mt.desc) && !mtbody_off_s())) return -1;
     if (auto* cn = std::get_if<Pmod_constraint>(&me.desc)) {
       if (!cn->mt) return -1;
-      return sig_cost(*cn->mt, *sg);
+      return sig_cost(*cn->mt, sg);
     }
     auto* st = std::get_if<Pmod_structure>(&me.desc);
     if (!st) return -1;
@@ -45095,6 +45271,7 @@ struct Walk {
       else if (auto* x = std::get_if<Pstr_typext>(&it.desc)) {
         for (auto& ec : x->ext.ctors) k += inl_ext(ec);
       } else if (auto* m = std::get_if<Pstr_module>(&it.desc)) {
+        if (!sg) return -1;
         if (!m->binding.name.txt) continue;
         const ModuleType* want = sig_module(*sg, *m->binding.name.txt);
         if (!want) continue;
@@ -45110,7 +45287,7 @@ struct Walk {
     return k;
   }
   // An ascribed module's actual signature IS its ascription's.
-  static int sig_cost(const ast::ModuleType& have, const ast::Pmty_signature& want) {
+  static int sig_cost(const ast::ModuleType& have, const ast::Pmty_signature* want) {
     using namespace ast;
     auto* hs = std::get_if<Pmty_signature>(&have.desc);
     if (!hs) return -1;
@@ -45121,12 +45298,13 @@ struct Walk {
       else if (auto* x = std::get_if<Psig_typext>(&it.desc)) {
         for (auto& ec : x->ext.ctors) k += inl_ext(ec);
       } else if (auto* m = std::get_if<Psig_module>(&it.desc)) {
+        if (!want) return -1;
         if (!m->md.name.txt || !m->md.type) continue;
-        const ModuleType* w = sig_module(want, *m->md.name.txt);
+        const ModuleType* w = sig_module(*want, *m->md.name.txt);
         if (!w) continue;
         auto* ws = std::get_if<Pmty_signature>(&w->desc);
         if (!ws) return -1;
-        int sub = sig_cost(*m->md.type, *ws);
+        int sub = sig_cost(*m->md.type, ws);
         if (sub < 0) return -1;
         k += sub;
       } else if (std::get_if<Psig_include>(&it.desc) ||
@@ -45172,17 +45350,36 @@ struct Walk {
       }
       std::string n = *m->binding.name.txt;
       std::string save_path = path;
-      if (save) path = path.empty() ? n : path + "." + n;
-      mod_expr(m->binding.expr, save);
+      if (save) path = join(path, n);
+      std::string src = mod_expr(m->binding.expr, save), q = path;
       path = save_path;
-      if (save) give('m', n); else mk();
+      if (save) {
+        if (!unk(src) && src != q) copy_prefix(src, q);
+        msrc[q] = unk(src) ? std::string("?") : q;
+        give('m', n);
+      } else mk();
     } else if (auto* mt = std::get_if<Pstr_modtype>(&it.desc)) {
-      if (mt->type) mty(*mt->type, /*save=*/false);
+      const bool sv = save && !mtbody_off;
+      std::string save_path = path;
+      if (sv) path = join(path, "%" + mt->name.txt);
+      std::string src = mt->type ? mty(*mt->type, sv) : std::string("?");
+      std::string body = path;
+      path = save_path;
+      if (sv) {
+        if (!unk(src) && src != body) copy_prefix(src, body);
+        mtsrc[join(path, mt->name.txt)] = unk(src) ? std::string("?") : body;
+      }
       if (save) give('M', mt->name.txt); else mk();
     } else if (auto* o = std::get_if<Pstr_open>(&it.desc)) {
-      // `open M` declares nothing; `open struct .. end` does, and its items
-      // land in the enclosing signature -- not modelled.
-      if (!std::get_if<Pmod_ident>(&o->expr.desc)) bail();
+      // `open M` declares nothing.  `open struct .. end` types its items
+      // right here -- they take uids -- but the signature does not save
+      // them (S563).
+      if (auto* st = std::get_if<Pmod_structure>(&o->expr.desc)) {
+        if (copy_off) { bail(); return; }
+        for (auto& si : st->items) item(si, /*save=*/false);
+      } else if (!std::get_if<Pmod_ident>(&o->expr.desc)) {
+        bail();
+      }
     } else if (auto* c = std::get_if<Pstr_class>(&it.desc)) {
       class_group(c->decls, save);
     } else if (auto* ct = std::get_if<Pstr_class_type>(&it.desc)) {
@@ -45200,10 +45397,21 @@ struct Walk {
         names.push_back(b.name.txt);
       }
       rec_group(names, mts, bodies, save);
+    } else if (auto* inc = std::get_if<Pstr_include>(&it.desc)) {
+      // `include M` re-exports M's declarations UNCHANGED: Subst renames
+      // their idents and keeps their uids, and the include itself mints
+      // nothing (S563).  `include struct .. end` types its items right
+      // here, so they are already the enclosing signature's.
+      if (copy_off) { bail(); return; }
+      std::string src = mod_expr(inc->expr, save);
+      if (save) {
+        if (unk(src)) { bail(); return; }
+        if (src != path) copy_prefix(src, path);
+      }
     } else if (std::get_if<Pstr_attribute>(&it.desc)) {
       // nothing
     } else {
-      bail();  // include / typext / ext / val
+      bail();  // typext / ext / val
     }
   }
 };
@@ -45221,6 +45429,9 @@ UidMap typing_uid_map(const ast::Structure& s,
   // (NOUID562=1, which also turns Count's NOEFFEQ on).
   const bool all = dbg_env("NOUID562") != nullptr;
   auto off = [&](const char* v) { return all || dbg_env(v) != nullptr; };
+  // S563's facets, each with its own revert and one for them all.
+  const bool all563 = dbg_env("NOUID563") != nullptr;
+  auto off563 = [&](const char* v) { return all563 || dbg_env(v) != nullptr; };
   w.ltype_off = off("NOUIDLTYPE");
   w.ltypes = w.ltype_off ? nullptr : ltypes;
   w.eta = off("NOUIDETA") ? nullptr : eta_nodes;
@@ -45231,6 +45442,8 @@ UidMap typing_uid_map(const ast::Structure& s,
   w.coerce_off = off("NOUIDCOERCE");
   w.anonparam_off = off("NOUIDANONPARAM");
   w.sigalias_off = off("NOUIDSIGALIAS");
+  w.mtbody_off = off563("NOUIDMTBODY");
+  w.copy_off = off563("NOUIDCOPY");
   for (auto& it : s) w.item(it, /*save=*/true);
   UidMap m;
   m.complete = w.complete;
