@@ -17104,6 +17104,31 @@ static bool cmistamp_off() {
   return off;
 }
 static int cmi_stamp(int stamp) { return cmistamp_off() ? 0 : stamp; }
+// S564: THE CROSS-UNIT HALF OF THE COPY LAW.  A declaration this unit
+// re-exports from another one (`module M = Set.Make (Int)`, `include
+// <external>`, `module type of <external>`) keeps the uid that unit gave it,
+// exactly as it keeps its ctor/label idents (S559) and its source location:
+// `Subst` renames the copy's bound idents and leaves `type_uid`/`val_uid`/
+// `md_uid`/`cd_uid`/`ld_uid` alone.  The uid the .cmi reader decoded travels
+// with the item, and the writer's numbering passes leave it be.
+// `NOXUID=1` reverts (the writer numbers the copies itself, as before).
+static bool xuid_off() {
+  static const bool off = dbg_env("NOXUID") != nullptr ||
+                          dbg_env("NOUID564") != nullptr;
+  return off;
+}
+static cmi::cmiw::Uid cmi_uid(const cmi::RUid& r) {
+  cmi::cmiw::Uid u;
+  if (xuid_off()) return u;
+  switch (r.kind) {
+    case 0: u.k = cmi::cmiw::Uid::CompUnit; u.unit = r.unit; break;
+    case 1: u.k = cmi::cmiw::Uid::Item; u.unit = r.unit; u.id = r.id;
+            u.intf = r.intf; break;
+    case 3: u.k = cmi::cmiw::Uid::Predef; u.unit = r.unit; break;
+    default: break;  // nothing decoded / Internal / Local_opaque_item
+  }
+  return u;
+}
 // S560: `NORECSTAMP=1` reverts a recursive module's declaration keys.
 static bool recstamp_off() {
   static const bool off = dbg_env("NORECSTAMP") != nullptr;
@@ -17135,13 +17160,18 @@ static cmi::cmiw::SigItem cmi_typext_to_item(const cmi::ExtConstructor& x) {
                           conv_cmi_ty(l.type, vars, nv, &nodes)};
       lw.loc = rloc_to_loc(l.loc);
       lw.stamp = cmi_stamp(l.stamp);
+      lw.uid = cmi_uid(l.uid);
       ls.push_back(std::move(lw));
     }
-    return cmi::cmiw::sig_exception_record(x.name, std::move(ls));
+    auto se = cmi::cmiw::sig_exception_record(x.name, std::move(ls));
+    se.uid = cmi_uid(x.uid);
+    return se;
   }
   std::vector<cmi::cmiw::TyPtr> args;
   for (auto& a : x.args) args.push_back(conv_cmi_ty(a, vars, nv));
-  return cmi::cmiw::sig_exception(x.name, std::move(args));
+  auto se = cmi::cmiw::sig_exception(x.name, std::move(args));
+  se.uid = cmi_uid(x.uid);
+  return se;
 }
 static cmi::cmiw::SigItem cmi_module_to_item(const std::string& name,
                                              const cmi::ModuleDecl& md,
@@ -17182,6 +17212,7 @@ static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& si
           if (mt.type && mt.type->kind == cmi::ModuleType::Sig && mt.type->sig) {
             out.push_back(cmi::cmiw::sig_modtype(mt.name, cmi_sig_to_items(*mt.type->sig, origin, &stack)));
             out.back().loc = rloc_to_loc(mt.loc);
+            out.back().uid = cmi_uid(mt.uid);
           }
           break;
         }
@@ -17200,12 +17231,14 @@ static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& si
           } else
             out.push_back(cmi::cmiw::sig_value(v.name, conv_cmi_ty(v.type, vars, nv, &nodes)));
           out.back().loc = rloc_to_loc(v.loc);
+          out.back().uid = cmi_uid(v.uid);
           break;
         }
         case cmi::Signature::OrderEnt::Module: {
           auto mit = cmi_module_to_item(sig.modules.at(oe.idx).name,
                                         sig.modules.at(oe.idx), origin, &stack);
           mit.loc = rloc_to_loc(sig.modules.at(oe.idx).loc);
+          mit.uid = cmi_uid(sig.modules.at(oe.idx).uid);
           out.push_back(std::move(mit));
           break;
         }
@@ -17222,6 +17255,7 @@ static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& si
     if (mt.type && mt.type->kind == cmi::ModuleType::Sig && mt.type->sig) {
       out.push_back(cmi::cmiw::sig_modtype(mt.name, cmi_sig_to_items(*mt.type->sig, origin, &stack)));
       out.back().loc = rloc_to_loc(mt.loc);
+      out.back().uid = cmi_uid(mt.uid);
     }
   // Primitive values take no field either; emit before the field-takers.
   for (auto& v : sig.values) {
@@ -17234,6 +17268,7 @@ static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& si
     se.prim_reprs = v.prim_reprs;
     se.prim_repr_res = v.prim_repr_res;
     se.loc = rloc_to_loc(v.loc);
+    se.uid = cmi_uid(v.uid);
     out.push_back(std::move(se));
   }
   // Field-taking items in the recorded runtime field order, so the spliced
@@ -17250,9 +17285,11 @@ static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& si
       std::unordered_map<const cmi::TypeExpr*, cmi::cmiw::TyPtr> nodes;
       out.push_back(cmi::cmiw::sig_value(fn, conv_cmi_ty(it->second->type, vars, nv, &nodes)));
       out.back().loc = rloc_to_loc(it->second->loc);
+      out.back().uid = cmi_uid(it->second->uid);
     } else if (auto it = mmap.find(fn); it != mmap.end()) {
       auto mit = cmi_module_to_item(fn, *it->second, origin, &stack);
       mit.loc = rloc_to_loc(it->second->loc);
+      mit.uid = cmi_uid(it->second->uid);
       out.push_back(std::move(mit));
     } else if (auto it = xmap.find(fn); it != xmap.end()) {
       out.push_back(cmi_typext_to_item(*it->second));
@@ -17275,6 +17312,7 @@ static cmi::cmiw::SigItem cmi_type_to_item(const cmi::TypeDecl& td) {
       cmi::cmiw::Label lw{l.name, l.mutable_, false, conv_cmi_ty(l.type, vars, nv, &nodes)};
       lw.loc = rloc_to_loc(l.loc);
       lw.stamp = cmi_stamp(l.stamp);
+      lw.uid = cmi_uid(l.uid);
       ls.push_back(std::move(lw));
     }
     si = cmi::cmiw::sig_record(td.name, std::move(params), std::move(ls));
@@ -17285,11 +17323,13 @@ static cmi::cmiw::SigItem cmi_type_to_item(const cmi::TypeDecl& td) {
       cw.name = c.name;
       cw.loc = rloc_to_loc(c.loc);
       cw.stamp = cmi_stamp(c.stamp);
+      cw.uid = cmi_uid(c.uid);
       for (auto& a : c.args) cw.args.push_back(conv_cmi_ty(a, vars, nv, &nodes));
       for (auto& l : c.inline_record) {
         cmi::cmiw::Label lw{l.name, l.mutable_, false, conv_cmi_ty(l.type, vars, nv, &nodes)};
         lw.loc = rloc_to_loc(l.loc);
         lw.stamp = cmi_stamp(l.stamp);
+        lw.uid = cmi_uid(l.uid);
         cw.inline_record.push_back(std::move(lw));
       }
       // GADT return (`Element : 'a lr1state * .. -> element`): dropping cd_res
@@ -17317,6 +17357,7 @@ static cmi::cmiw::SigItem cmi_type_to_item(const cmi::TypeDecl& td) {
   if (!unboxdef_off()) si.type_unboxed = td.unboxed;
   si.type_variances = td.variances;
   si.loc = rloc_to_loc(td.loc);
+  si.uid = cmi_uid(td.uid);
   return si;
 }
 static cmi::cmiw::SigItem cmi_module_to_item(const std::string& name,
@@ -44467,6 +44508,15 @@ struct Walk {
   // `mtsrc` the same for a module type name.  NOUIDCOPY=1 reverts (both
   // bail, as before).
   bool copy_off = false;
+  // S564, THE CROSS-UNIT HALF: a module (or module type) name that is not
+  // bound in this unit belongs to ANOTHER one, and what it re-exports keeps
+  // that unit's uids -- which this walk cannot know and does not need to:
+  // the items carry them, decoded from the dependency's .cmi, and the
+  // writer's `at` leaves a foreign uid alone.  So an external functor
+  // application, alias, `include` or `module type of` no longer bails; it
+  // reports the EXTERNAL path `"*"`, under which no key is recorded.
+  // NOXEXT=1 reverts (they bail, as at S563).
+  bool xext_off = false;
   std::map<std::string, std::string> msrc, mtsrc;
   // Re-file every key recorded under `from` (a path) under `to`.
   void copy_prefix(const std::string& from, const std::string& to) {
@@ -44503,6 +44553,19 @@ struct Walk {
   // "?" -- the path is NOT known (an external functor, an unmodelled module
   // type); the empty string is the compilation unit's own top level.
   static bool unk(const std::string& p) { return p == "?"; }
+  // "*" -- the items live in ANOTHER unit and keep its uids (S564).
+  static bool ext(const std::string& p) { return p == "*"; }
+  // What an unresolved module / module-type name reports: external, unless
+  // the facet is off -- then "unknown", exactly as at S563.  `outside_b`
+  // is the form for the sites that used to BAIL there (an application, a
+  // `module type of`); `outside` the form for the two that only reported
+  // the path as unknown (a module / module-type ident).
+  std::string outside() const { return xext_off ? "?" : "*"; }
+  std::string outside_b() { if (xext_off) { bail(); return "?"; } return "*"; }
+  // S564: an ascription's answer is the ascribed MODULE TYPE's own,
+  // whatever form it takes -- S563 re-derived it and could only read a
+  // literal signature or a name.  NOXASC=1 restores that.
+  bool asc_off = false;
   static std::string join(const std::string& p, const std::string& n) {
     return p.empty() ? n : p + "." + n;
   }
@@ -44957,7 +45020,7 @@ struct Walk {
       // as before).
       if (save && mtbody_off) { bail(); return "?"; }
       if (const std::string* q = look(mtsrc, lid_full(id->id.txt))) return *q;
-      return "?";
+      return outside();
     } else if (std::get_if<Pmty_alias>(&m.desc)) {
       // `module B = A` in a signature: an alias declares nothing of its own
       // (its md_uid is the item's; S562, NOUIDSIGALIAS=1 bails as before)
@@ -44991,7 +45054,9 @@ struct Walk {
       std::string src = mty(*wi->mt, save);
       if (save) {
         if (unk(src)) { bail(); return "?"; }
-        if (src != path) copy_prefix(src, path);
+        // An EXTERNAL base keeps its own uids; only the constraints below
+        // are this unit's, and they are recorded at `path` (S564).
+        if (!ext(src) && src != path) copy_prefix(src, path);
       }
       for (auto& wc : wi->constraints) {
         if (auto* wt = std::get_if<Pwith_type>(&wc)) {
@@ -45012,8 +45077,11 @@ struct Walk {
       // `module type of M`: M's items, uids and all (S563).
       if (copy_off || !tf->me) { bail(); return "?"; }
       auto* id2 = std::get_if<Pmod_ident>(&tf->me->desc);
-      const std::string* q = id2 ? look(msrc, lid_full(id2->id.txt)) : nullptr;
-      if (!q || unk(*q)) { bail(); return "?"; }
+      if (!id2) { bail(); return "?"; }
+      const std::string* q = look(msrc, lid_full(id2->id.txt));
+      if (!q) return outside_b();        // `module type of List` (S564)
+      if (unk(*q)) { bail(); return "?"; }
+      if (ext(*q)) return "*";
       if (save && *q != path) copy_prefix(*q, path);
       return path;
     } else {
@@ -45049,8 +45117,9 @@ struct Walk {
         std::string q = path;
         path = save_path;
         if (save) {
-          if (!unk(src) && src != q) copy_prefix(src, q);
-          msrc[q] = unk(src) ? std::string("?") : q;
+          if (!unk(src) && !ext(src) && src != q) copy_prefix(src, q);
+          msrc[q] = unk(src) ? std::string("?")
+                           : (ext(src) ? std::string("*") : q);
           give('m', n);
         } else mk();
       } else if (auto* mt = std::get_if<Psig_modtype>(&it.desc)) {
@@ -45061,8 +45130,9 @@ struct Walk {
         std::string body = path;
         path = save_path;
         if (sv) {
-          if (!unk(src) && src != body) copy_prefix(src, body);
-          mtsrc[join(path, mt->name.txt)] = unk(src) ? std::string("?") : body;
+          if (!unk(src) && !ext(src) && src != body) copy_prefix(src, body);
+          mtsrc[join(path, mt->name.txt)] =
+            unk(src) ? std::string("?") : (ext(src) ? std::string("*") : body);
         }
         if (save) give('M', mt->name.txt); else mk();
       } else if (auto* c = std::get_if<Psig_class>(&it.desc)) {
@@ -45167,16 +45237,17 @@ struct Walk {
       // name the signature drops (`(struct let c let d end : sig val d end)`)
       // must not overwrite the key an earlier item holds (S563).
       if (cn->me) mod_expr(*cn->me, /*save=*/copy_off && save);
-      if (cn->mt) mty(*cn->mt, save);
+      // The ascribed module type's own answer IS the ascription's: the
+      // signature's items are the saved ones (S563), wherever they live.
+      std::string mtp = cn->mt ? mty(*cn->mt, save) : std::string("?");
       if (cn->me && cn->mt && !coerce_off) {
         int k = coerce_cost(*cn->me, *cn->mt);
         if (k < 0) bail(); else c += k;
       }
-      if (!cn->mt) return "?";
-      if (std::get_if<Pmty_signature>(&cn->mt->desc)) return path;
-      if (auto* id = std::get_if<Pmty_ident>(&cn->mt->desc))
-        if (const std::string* q = look(mtsrc, lid_full(id->id.txt))) return *q;
-      return "?";
+      if (asc_off && cn->mt && !std::get_if<Pmty_signature>(&cn->mt->desc) &&
+          !std::get_if<Pmty_ident>(&cn->mt->desc))
+        return "?";  // S563 read only a literal signature or a name
+      return mtp;
     } else if (auto* fn = std::get_if<Pmod_functor>(&m.desc)) {
       if (auto* nm = std::get_if<Functor_named>(&fn->param)) {
         if (nm->type) {
@@ -45197,7 +45268,7 @@ struct Walk {
       // it re-exports keeps A.B's uids.
       if (copy_off) return "?";
       if (const std::string* q = look(msrc, lid_full(id->id.txt))) return *q;
-      return "?";
+      return outside();
     } else if (auto* ap = std::get_if<Pmod_apply>(&m.desc)) {
       // `module B = F (A)`: the ARGUMENT is typed first (a structure
       // argument's own bindings take uids), and the result signature IS the
@@ -45206,15 +45277,19 @@ struct Walk {
       if (copy_off) { bail(); return "?"; }
       if (ap->arg) mod_expr(*ap->arg, /*save=*/false);
       auto* fid = std::get_if<Pmod_ident>(&ap->f->desc);
-      const std::string* q = fid ? look(msrc, lid_full(fid->id.txt)) : nullptr;
-      if (!q || unk(*q)) { bail(); return "?"; }
+      if (!fid) { bail(); return "?"; }
+      const std::string* q = look(msrc, lid_full(fid->id.txt));
+      if (!q) return outside_b();        // `Set.Make (Int)` (S564)
+      if (unk(*q)) { bail(); return "?"; }
       return *q;
     } else if (auto* au = std::get_if<Pmod_apply_unit>(&m.desc)) {
       // `F ()`: a generative application, the same law.
       if (copy_off) { bail(); return "?"; }
       auto* fid = std::get_if<Pmod_ident>(&au->f->desc);
-      const std::string* q = fid ? look(msrc, lid_full(fid->id.txt)) : nullptr;
-      if (!q || unk(*q)) { bail(); return "?"; }
+      if (!fid) { bail(); return "?"; }
+      const std::string* q = look(msrc, lid_full(fid->id.txt));
+      if (!q) return outside_b();
+      if (unk(*q)) { bail(); return "?"; }
       return *q;
     } else {
       bail();  // unpack / extension
@@ -45354,8 +45429,9 @@ struct Walk {
       std::string src = mod_expr(m->binding.expr, save), q = path;
       path = save_path;
       if (save) {
-        if (!unk(src) && src != q) copy_prefix(src, q);
-        msrc[q] = unk(src) ? std::string("?") : q;
+        if (!unk(src) && !ext(src) && src != q) copy_prefix(src, q);
+        msrc[q] = unk(src) ? std::string("?")
+                           : (ext(src) ? std::string("*") : q);
         give('m', n);
       } else mk();
     } else if (auto* mt = std::get_if<Pstr_modtype>(&it.desc)) {
@@ -45366,8 +45442,9 @@ struct Walk {
       std::string body = path;
       path = save_path;
       if (sv) {
-        if (!unk(src) && src != body) copy_prefix(src, body);
-        mtsrc[join(path, mt->name.txt)] = unk(src) ? std::string("?") : body;
+        if (!unk(src) && !ext(src) && src != body) copy_prefix(src, body);
+        mtsrc[join(path, mt->name.txt)] =
+            unk(src) ? std::string("?") : (ext(src) ? std::string("*") : body);
       }
       if (save) give('M', mt->name.txt); else mk();
     } else if (auto* o = std::get_if<Pstr_open>(&it.desc)) {
@@ -45406,7 +45483,9 @@ struct Walk {
       std::string src = mod_expr(inc->expr, save);
       if (save) {
         if (unk(src)) { bail(); return; }
-        if (src != path) copy_prefix(src, path);
+        // `include <an external module>`: the spliced items keep the other
+        // unit's uids, so there is nothing to re-file here (S564).
+        if (!ext(src) && src != path) copy_prefix(src, path);
       }
     } else if (std::get_if<Pstr_attribute>(&it.desc)) {
       // nothing
@@ -45444,6 +45523,9 @@ UidMap typing_uid_map(const ast::Structure& s,
   w.sigalias_off = off("NOUIDSIGALIAS");
   w.mtbody_off = off563("NOUIDMTBODY");
   w.copy_off = off563("NOUIDCOPY");
+  // S564: the cross-unit half of the copy law.
+  w.xext_off = dbg_env("NOUID564") != nullptr || dbg_env("NOXEXT") != nullptr;
+  w.asc_off = dbg_env("NOUID564") != nullptr || dbg_env("NOXASC") != nullptr;
   for (auto& it : s) w.item(it, /*save=*/true);
   UidMap m;
   m.complete = w.complete;

@@ -146,10 +146,25 @@ struct RLoc {
   bool ghost = true;
 };
 
+// Shape.Uid.t as READ from a dependency's .cmi (S564).  A declaration a unit
+// COPIES -- `include M`, `module M = F (X)`, `module type of M` -- keeps the
+// uid the unit that declared it gave it: `Subst` renames a copied signature's
+// bound idents and leaves `type_uid`/`val_uid`/`md_uid`/`cd_uid` alone.  So a
+// spliced item is not the writer's to number; it re-emits this.  `kind`
+// mirrors the marshal repr: -1 nothing decoded, 0 Compilation_unit, 1 Item,
+// 2 Local_opaque_item, 3 Predef, 4 Internal (the immediate 0).
+struct RUid {
+  int kind = -1;
+  std::string unit;  // Item: comp_unit;  Compilation_unit/Predef: the name
+  int id = 0;        // Item
+  bool intf = false; // Item: `from` = Intf
+};
+
 struct SigValue {
   std::string name;
   TypePtr type;
   RLoc loc;
+  RUid uid;
   // For a Val_prim value (`external x = "%op"` / C primitive), its prim_name
   // (e.g. "%compare", "caml_format_int"); empty for an ordinary Val_reg value.
   std::string prim;
@@ -172,6 +187,7 @@ struct SigValue {
 struct LabelDecl {
   std::string name;
   int stamp = 0;  // ld_id's stamp (0: none decoded)
+  RUid uid;       // ld_uid, kept on a copy (S564)
   bool mutable_ = false;
   TypePtr type;
   RLoc loc;
@@ -180,6 +196,7 @@ struct LabelDecl {
 struct ConstructorDecl {
   std::string name;
   int stamp = 0;  // cd_id's stamp (0: none decoded)
+  RUid uid;       // cd_uid, kept on a copy (S564)
   std::vector<TypePtr> args;       // Cstr_tuple
   std::vector<LabelDecl> inline_record;  // Cstr_record (inline record args)
   bool is_inline_record = false;
@@ -191,6 +208,7 @@ struct ConstructorDecl {
 struct TypeDecl {
   std::string name;
   long long stamp = 0;  // the decl's own Ident stamp (Sig_type's ident)
+  RUid uid;             // type_uid, kept on a copy (S564)
   std::vector<TypePtr> params;
   int arity = 0;
   enum Kind { Abstract, Record, Variant, Open, External } kind = Abstract;
@@ -236,17 +254,20 @@ struct ModuleDecl {
   std::string name;
   ModuleTypePtr type;
   RLoc loc;  // md_loc
+  RUid uid;  // md_uid, kept on a copy (S564)
 };
 
 struct ModtypeDecl {
   std::string name;
   ModuleTypePtr type;  // null => abstract module type
   RLoc loc;  // mtd_loc
+  RUid uid;  // mtd_uid, kept on a copy (S564)
 };
 
 // extension_constructor (the typext payload), simplified.
 struct ExtConstructor {
   std::string name;
+  RUid uid;  // ext_uid, kept on a copy (S564)
   PathPtr type_path;
   std::vector<TypePtr> args;            // Cstr_tuple
   std::vector<LabelDecl> inline_record; // Cstr_record

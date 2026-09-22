@@ -147,6 +147,7 @@ public:
               const m::Value& vd = arena_[item.fields[1]];
               sv.type = type(vd.fields.at(0));
               if (vd.fields.size() > 2) sv.loc = decode_loc(vd.fields[2]);
+              if (vd.fields.size() > 4) sv.uid = decode_uid(vd.fields[4]);
               // val_kind: Val_reg is the immediate constant 0; Val_prim (an
               // inlined %/C primitive) is a block and takes no runtime field.
               bool runtime = vd.fields.size() > 1 &&
@@ -227,6 +228,8 @@ public:
               md.type = module_type(arena_[item.fields[2]].fields.at(0));
               if (arena_[item.fields[2]].fields.size() > 2)
                 md.loc = decode_loc(arena_[item.fields[2]].fields[2]);
+              if (arena_[item.fields[2]].fields.size() > 3)
+                md.uid = decode_uid(arena_[item.fields[2]].fields[3]);
               // Only a present submodule (Mp_present = int 0) takes a runtime
               // field; an Mp_absent module alias is transparent (no field).
               const m::Value& pres = arena_[item.fields[1]];
@@ -248,6 +251,8 @@ public:
                 mtd.type = module_type(opt.fields.at(0));
               if (arena_[item.fields[1]].fields.size() > 2)
                 mtd.loc = decode_loc(arena_[item.fields[1]].fields[2]);
+              if (arena_[item.fields[1]].fields.size() > 3)
+                mtd.uid = decode_uid(arena_[item.fields[1]].fields[3]);
               out.order.push_back({Signature::OrderEnt::Modtype,
                                    (int)out.modtypes.size(), false});
               out.modtypes.push_back(std::move(mtd));
@@ -346,6 +351,7 @@ public:
     const m::Value& res = arena_[v.fields.at(3)];
     if (res.kind == m::Value::Kind::Block && res.tag == 0)
       ec.res = type(res.fields.at(0));
+    if (v.fields.size() > 7) ec.uid = decode_uid(v.fields[7]);
     return ec;
   }
 
@@ -382,6 +388,7 @@ public:
     // type_unboxed_default : bool (field 12).
     if (d.fields.size() > 12 && arena_[d.fields[12]].kind == m::Value::Kind::Int)
       td.unboxed_default = arena_[d.fields[12]].i == 1;
+    if (d.fields.size() > 13) td.uid = decode_uid(d.fields[13]);
     return td;
   }
 
@@ -445,6 +452,7 @@ public:
                   arena_[v.fields[1]].i != 0;  // mutable_flag: Mutable = 1
     ld.type = type(v.fields.at(3));
     if (v.fields.size() > 4) ld.loc = decode_loc(v.fields[4]);  // ld_loc
+    if (v.fields.size() > 6) ld.uid = decode_uid(v.fields[6]);  // ld_uid
     return ld;
   }
 
@@ -469,7 +477,30 @@ public:
     if (res.kind == m::Value::Kind::Block && res.tag == 0)
       cd.res = type(res.fields.at(0));
     if (v.fields.size() > 3) cd.loc = decode_loc(v.fields[3]);  // cd_loc
+    if (v.fields.size() > 5) cd.uid = decode_uid(v.fields[5]);  // cd_uid
     return cd;
+  }
+
+  // Shape.Uid.t (typing/shape.ml).  The immediate 0 is Internal; the blocks
+  // are Compilation_unit(0) of string, Item(1) of {comp_unit; id; from},
+  // Local_opaque_item(2) and Predef(3) of string, with `from` =
+  // Unit_info.intf_or_impl = Intf(0) | Impl(1).  A declaration this unit
+  // copies keeps the uid decoded here (S564).
+  RUid decode_uid(std::size_t id) {
+    RUid u;
+    const m::Value& v = arena_[id];
+    if (v.kind == m::Value::Kind::Int) { u.kind = 4; return u; }  // Internal
+    u.kind = static_cast<int>(v.tag);
+    if (v.tag == 1 && v.fields.size() >= 3) {
+      u.unit = arena_[v.fields[0]].str();
+      if (arena_[v.fields[1]].kind == m::Value::Kind::Int)
+        u.id = static_cast<int>(arena_[v.fields[1]].i);
+      u.intf = arena_[v.fields[2]].kind == m::Value::Kind::Int &&
+               arena_[v.fields[2]].i == 0;
+    } else if ((v.tag == 0 || v.tag == 3) && !v.fields.empty()) {
+      u.unit = arena_[v.fields[0]].str();
+    }
+    return u;
   }
 
   // Location.t = { loc_start; loc_end; loc_ghost }; each position is
@@ -3507,25 +3538,37 @@ std::string module_cmi_crc(const std::string& mod) {
 // NOTE: does not yet PRESERVE uids for include/functor/alias members (they carry
 // their source unit's uid) -- correct for self-contained modules; see the
 // byte-identity plan.
+// A declaration this unit COPIED from a dependency's .cmi already carries the
+// uid its own unit gave it (S564): it is not the writer's to number and it
+// costs the counter nothing, since `Subst` mints nothing when it renames the
+// idents of a signature an `include` / a functor application re-exports.
+static bool foreign_uid(const cmiw::Uid& u, const std::string& unit) {
+  return u.k == cmiw::Uid::Item && !u.unit.empty() && u.unit != unit;
+}
 static void assign_uids(std::vector<SigItem>& items, const std::string& unit,
                         bool intf, int& c) {
   auto mk = [&]() { cmiw::Uid u; u.k = cmiw::Uid::Item; u.unit = unit;
                     u.id = c++; u.intf = intf; return u; };
+  auto own = [&](cmiw::Uid& u) { if (!foreign_uid(u, unit)) u = mk(); };
   for (std::size_t i = 0; i < items.size();) {
     SigItem& it = items[i];
     if (it.k == SigItem::Type) {
       std::size_t j = i + 1;  // gather the recursion group [i, j)
       while (j < items.size() && items[j].k == SigItem::Type &&
              items[j].rec_status == 2) ++j;
-      for (std::size_t k = i; k < j; ++k) items[k].uid = mk();  // pass 1: type_uids
+      bool copied = false;
+      for (std::size_t k = i; k < j; ++k) {                     // pass 1: type_uids
+        copied = copied || foreign_uid(items[k].uid, unit);
+        own(items[k].uid);
+      }
       int inline_ctors = 0;
       for (std::size_t k = i; k < j; ++k) {                     // pass 2: ctors/labels
         for (auto& ct : items[k].ctors) {
-          for (auto& l : ct.inline_record) l.uid = mk();  // inline labels before cd
-          ct.uid = mk();
-          if (!ct.inline_record.empty()) ++inline_ctors;
+          for (auto& l : ct.inline_record) own(l.uid);  // inline labels before cd
+          own(ct.uid);
+          if (!ct.inline_record.empty() && !copied) ++inline_ctors;
         }
-        for (auto& l : items[k].labels) l.uid = mk();
+        for (auto& l : items[k].labels) own(l.uid);
       }
       // Pass 3: each inline-record constructor made datarepr build a HIDDEN
       // record type_declaration (typing/datarepr.ml ~94), burning 5 uids that
@@ -3535,16 +3578,16 @@ static void assign_uids(std::vector<SigItem>& items, const std::string& unit,
       c += 5 * inline_ctors;
       i = j;
     } else if (it.k == SigItem::Value) {
-      it.uid = mk(); ++i;
+      own(it.uid); ++i;
     } else if (it.k == SigItem::Exception) {
-      it.uid = mk();
-      for (auto& ct : it.ctors) for (auto& l : ct.inline_record) l.uid = mk();
+      own(it.uid);
+      for (auto& ct : it.ctors) for (auto& l : ct.inline_record) own(l.uid);
       ++i;
     } else if (it.k == SigItem::Module) {
       assign_uids(it.sub, unit, intf, c);  // contents first (post-order)
-      it.uid = mk(); ++i;
+      own(it.uid); ++i;
     } else if (it.k == SigItem::Modtype) {
-      it.uid = mk(); ++i;
+      own(it.uid); ++i;
     } else {
       ++i;  // Class: uids not yet modelled
     }
@@ -3573,7 +3616,11 @@ static bool assign_uids_mapped(std::vector<SigItem>& items,
                                const std::string& path, bool commit) {
   auto at = [&](char kind, const std::string& name, cmiw::Uid* out) {
     auto it = uids.find(uidkey(kind, path, name));
-    if (it == uids.end()) return false;
+    // THE CROSS-UNIT HALF OF THE COPY LAW (S564).  A declaration re-exported
+    // from ANOTHER unit (`module M = Set.Make (Int)`, `include <external>`)
+    // keeps that unit's uid, which the walk cannot know and does not record:
+    // the item carries it already, decoded from the dependency's .cmi.
+    if (it == uids.end()) return foreign_uid(*out, unit);
     if (commit) { out->k = cmiw::Uid::Item; out->unit = unit;
                   out->id = it->second; out->intf = intf; }
     return true;

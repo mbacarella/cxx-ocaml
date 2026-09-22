@@ -565,6 +565,15 @@ xct_m9 -5
 xct_m10 -40
 xct_m11 0
 xct_m12 0
+xcu_a1 0
+xcu_a2 0
+xcu_a3 0
+xcu_a4 0
+xcu_a5 0
+xcu_a6 0
+xcu_a7 0
+xcu_a8 0
+xcu_a9 0
 xcx_ha 0
 xcx_hb 0
 xcx_hc 0
