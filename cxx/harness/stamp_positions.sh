@@ -38,12 +38,16 @@ if [ "${1:-}" = "--worker" ]; then
   ( cd "$w/c" && timeout 20 ${HOOKENV:-env} "$BIN" -nostdlib -I "$ROOT/stdlib" \
       -c "$x.ml" ) >/dev/null 2>&1
   [ -f "$w/o/$x.cmi" ] && [ -f "$w/c/$x.cmi" ] || { echo "FAIL $x"; exit 0; }
-  # every Local ident (tag 0 block of a name and a stamp) in dump order
-  ids() { perl "$ROOT/cxx/harness/mdump.pl" "$1" 2>/dev/null | awk '
+  # every Local ident (a tag-0 block of exactly a name and a stamp) in dump
+  # order, physical sharing expanded so that a name string or an ident block
+  # ocamlc shares (S559: `Subst` keeps a copied constructor's ident) reads
+  # the same as one written twice
+  ids() { perl "$ROOT/cxx/harness/mdump.pl" --expand "$1" 2>/dev/null | awk '
     /^ *\(t0$/ {st=1; next}
     st==1 && /^ *"[^"]*"$/ {nm=$1; st=2; next}
     st==2 && /^ *[0-9]+$/ {
-      if ($1+0 < 100000 && $1+0 > 1) printf "%s=%s ", nm, $1; st=0; next}
+      if ($1+0 < 100000 && $1+0 > 1) { pend=nm "=" $1; st=3 } else st=0; next}
+    st==3 && /^ *\)$/ {printf "%s ", pend; st=0; next}
     {st=0}'; }
   o=$(ids "$w/c/$x.cmi"); r=$(ids "$w/o/$x.cmi")
   if [ "$o" = "$r" ]; then echo "SAME $x"; exit 0; fi

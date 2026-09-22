@@ -165,8 +165,13 @@ struct SigValue {
 };
 
 // label_declaration / constructor_declaration (typing/types.mli).
+// A label's `ld_id` and a constructor's `cd_id` travel with the declaration:
+// `Subst.signature` renames a signature's BOUND idents but copies these, so a
+// declaration a unit copies from a .cmi (`include List`, `module type of
+// List`, a functor application's result) keeps the .cmi's stamps (S559).
 struct LabelDecl {
   std::string name;
+  int stamp = 0;  // ld_id's stamp (0: none decoded)
   bool mutable_ = false;
   TypePtr type;
   RLoc loc;
@@ -174,6 +179,7 @@ struct LabelDecl {
 
 struct ConstructorDecl {
   std::string name;
+  int stamp = 0;  // cd_id's stamp (0: none decoded)
   std::vector<TypePtr> args;       // Cstr_tuple
   std::vector<LabelDecl> inline_record;  // Cstr_record (inline record args)
   bool is_inline_record = false;

@@ -436,6 +436,7 @@ public:
     const m::Value& v = arena_[id];  // { ld_id; ld_mutable; ld_atomic; ld_type; ...}
     LabelDecl ld;
     ld.name = ident(v.fields.at(0)).name;
+    ld.stamp = ident(v.fields.at(0)).stamp;
     ld.mutable_ = arena_[v.fields.at(1)].kind == m::Value::Kind::Int &&
                   arena_[v.fields[1]].i != 0;  // mutable_flag: Mutable = 1
     ld.type = type(v.fields.at(3));
@@ -447,6 +448,7 @@ public:
     const m::Value& v = arena_[id];  // { cd_id; cd_args; cd_res; ... }
     ConstructorDecl cd;
     cd.name = ident(v.fields.at(0)).name;
+    cd.stamp = ident(v.fields.at(0)).stamp;
     const m::Value& args = arena_[v.fields.at(1)];  // constructor_arguments
     if (args.tag == 0) {  // Cstr_tuple of type_expr list
       cd.args = type_list(args.fields.at(0));
@@ -3805,11 +3807,15 @@ struct TyIdWalk {
 // gave them, in the middle of whatever typing allocated around them.  The
 // counting walk (cppcaml::typing_ident_count) records the counter at each
 // one; this pass hands them to the items, and an item the walk did not
-// record keeps the writer's placeholder.
+// record keeps the writer's placeholder.  A declaration COPIED from a .cmi
+// arrives with the .cmi's own stamps (S559): those are the ones Subst kept,
+// and the walk's record -- a same-named declaration of this unit's -- must
+// not replace them.
 static void assign_stamps_mapped(std::vector<SigItem>& items,
                                  const std::map<std::string, int>& stamps,
                                  const std::string& path) {
   auto at = [&](char kind, const std::string& name, int* out) {
+    if (*out) return;
     auto it = stamps.find(uidkey(kind, path, name));
     if (it != stamps.end()) *out = it->second;
   };

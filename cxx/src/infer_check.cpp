@@ -16900,6 +16900,17 @@ static cmi::cmiw::Loc rloc_to_loc(const cmi::RLoc& r) {
   return l;
 }
 static cmi::cmiw::SigItem cmi_type_to_item(const cmi::TypeDecl& td);
+// S559: a declaration copied from a .cmi keeps the .cmi's constructor and
+// label idents -- `Subst.signature` renames the bound idents of a signature
+// it copies (`include List`, `module type of List`, a functor application's
+// result) but `cd_id`/`ld_id` as they are, so the saved stamps are the
+// .cmi's, not this unit's counter (`NOCMISTAMP=1` reverts: the writer's
+// placeholders).
+static bool cmistamp_off() {
+  static const bool off = dbg_env("NOCMISTAMP") != nullptr;
+  return off;
+}
+static int cmi_stamp(int stamp) { return cmistamp_off() ? 0 : stamp; }
 // A Sig_typext decoded from a cmi -> the writer's item.  An inline-record
 // payload (`exception Inconsistency of { unit_name : ..; .. }`) must survive
 // the round trip: a spliced signature that drops it re-exports the exception as
@@ -16915,6 +16926,7 @@ static cmi::cmiw::SigItem cmi_typext_to_item(const cmi::ExtConstructor& x) {
       cmi::cmiw::Label lw{l.name, l.mutable_, false,
                           conv_cmi_ty(l.type, vars, nv, &nodes)};
       lw.loc = rloc_to_loc(l.loc);
+      lw.stamp = cmi_stamp(l.stamp);
       ls.push_back(std::move(lw));
     }
     return cmi::cmiw::sig_exception_record(x.name, std::move(ls));
@@ -17054,6 +17066,7 @@ static cmi::cmiw::SigItem cmi_type_to_item(const cmi::TypeDecl& td) {
     for (auto& l : td.labels) {
       cmi::cmiw::Label lw{l.name, l.mutable_, false, conv_cmi_ty(l.type, vars, nv, &nodes)};
       lw.loc = rloc_to_loc(l.loc);
+      lw.stamp = cmi_stamp(l.stamp);
       ls.push_back(std::move(lw));
     }
     si = cmi::cmiw::sig_record(td.name, std::move(params), std::move(ls));
@@ -17063,10 +17076,12 @@ static cmi::cmiw::SigItem cmi_type_to_item(const cmi::TypeDecl& td) {
       cmi::cmiw::Ctor cw;
       cw.name = c.name;
       cw.loc = rloc_to_loc(c.loc);
+      cw.stamp = cmi_stamp(c.stamp);
       for (auto& a : c.args) cw.args.push_back(conv_cmi_ty(a, vars, nv, &nodes));
       for (auto& l : c.inline_record) {
         cmi::cmiw::Label lw{l.name, l.mutable_, false, conv_cmi_ty(l.type, vars, nv, &nodes)};
         lw.loc = rloc_to_loc(l.loc);
+        lw.stamp = cmi_stamp(l.stamp);
         cw.inline_record.push_back(std::move(lw));
       }
       // GADT return (`Element : 'a lr1state * .. -> element`): dropping cd_res
@@ -25955,6 +25970,77 @@ struct Count {
     std::string path;
     for (auto& m : spath_) path += (path.empty() ? "" : ".") + m;
     (*stamps_)[uidkey(kind, path, name)] = n;
+  }
+  // S559: `include M` of a module bound in this unit copies M's declarations,
+  // and `Subst` keeps a copied constructor's / label's ident -- so the copies
+  // save the stamps the walk recorded for the declarations M's signature
+  // carries: a module bound (or a functor parameter declared) at a NAMED
+  // module type carries that module type's, any other its own.  An alias
+  // chain is followed first; the source is looked up from the innermost
+  // enclosing path outwards (`module Y = struct include X end` includes the
+  // enclosing structure's X); a later include's copy shadows an earlier's.
+  // `module M = F (X)` of a functor bound in this unit copies the functor's
+  // body the same way (its result is saved under M: `copy_stamp_keys` with
+  // M's path), and so does `include F (X)`.
+  void inc_stamp_keys(const ModuleExpr& me) {
+    std::string path;
+    for (auto& m : spath_) path += (path.empty() ? "" : ".") + m;
+    copy_stamp_keys(me, path);
+  }
+  void copy_stamp_keys(const ModuleExpr& me, const std::string& path) {
+    if (!stamps_ || cmistamp_off()) return;
+    const Longident* id = nullptr;
+    const ModuleExpr* head = &me;
+    for (int i = 0; i < 8; ++i) {
+      if (auto* a = std::get_if<Pmod_apply>(&head->desc)) head = a->f.get();
+      else if (auto* a = std::get_if<Pmod_apply_unit>(&head->desc))
+        head = a->f.get();
+      else break;
+    }
+    if (auto* i = std::get_if<Pmod_ident>(&head->desc)) id = &lal_hops(i->id.txt);
+    if (auto* cn = std::get_if<Pmod_constraint>(&me.desc))
+      if (const Longident* t = mty_name_of(cn->mt.get())) id = t;
+    if (!id) return;
+    std::vector<std::string> c;
+    if (!lid_path(*id, c) || c.empty()) return;
+    if (c.size() == 1 && !std::holds_alternative<Pmod_constraint>(me.desc)) {
+      const ModuleType* at = nullptr;
+      if (auto f = fmods.find(c[0]); f != fmods.end() && !f->second.empty())
+        at = f->second.back();
+      else if (auto m = mods.find(c[0]); m != mods.end() && !m->second.empty())
+        if (auto* cn = std::get_if<Pmod_constraint>(&m->second.back()->desc))
+          at = cn->mt.get();
+      if (const Longident* t = mty_name_of(at)) {
+        std::vector<std::string> tc;
+        if (lid_path(*t, tc) && !tc.empty()) c = tc;
+      }
+    }
+    for (std::size_t up = spath_.size() + 1; up-- > 0;) {
+      std::string src;
+      for (std::size_t i = 0; i < up; ++i)
+        src += (src.empty() ? "" : ".") + spath_[i];
+      for (auto& m : c) src += (src.empty() ? "" : ".") + m;
+      std::vector<std::pair<std::string, long long>> add;
+      for (auto& [k, v] : *stamps_) {
+        if (k.size() < 2 || (k[0] != 'c' && k[0] != 'l' && k[0] != 'L'))
+          continue;
+        if (k.compare(1, src.size() + 1, src + ".") != 0) continue;
+        add.emplace_back(uidkey(k[0], path, k.substr(src.size() + 2)), v);
+      }
+      if (add.empty()) continue;
+      for (auto& [k, v] : add) (*stamps_)[k] = v;
+      return;
+    }
+  }
+  // The module type NAME an ascription is at: `S`, or the base of `S with ..`.
+  static const Longident* mty_name_of(const ModuleType* mt) {
+    for (int i = 0; mt && i < 8; ++i) {
+      if (auto* id = std::get_if<Pmty_ident>(&mt->desc)) return &id->id.txt;
+      auto* w = std::get_if<Pmty_with>(&mt->desc);
+      if (!w) return nullptr;
+      mt = w->mt.get();
+    }
+    return nullptr;
   }
   // The renames a nesting depth costs (`(l.a - 1) * ..`, a module type
   // body's `per`) are paid after the whole unit is typed (measured: `module
@@ -41999,6 +42085,13 @@ struct Count {
       mexpr(*f->body, Lvl{1, 1, 0, true});
       fbody_ = false;
       --fxin_;
+      // A body that IS a parameter (`module F (X : S) = X`) or an
+      // application saves that module's declarations under the functor's
+      // own path (S559).
+      if (std::holds_alternative<Pmod_ident>(f->body->desc) ||
+          std::holds_alternative<Pmod_apply>(f->body->desc) ||
+          std::holds_alternative<Pmod_apply_unit>(f->body->desc))
+        inc_stamp_keys(*f->body);
       frelease(fk);
     } else if (auto* c = std::get_if<Pmod_constraint>(&m.desc)) {
       // What an ascribed module SAVES is the ascription, so that is what the
@@ -43047,6 +43140,13 @@ struct Count {
       mexpr(m->binding.expr, ml,
             appexp_off() || saved_ || !local_app(m->binding.expr));
       n += own;
+      if (fxp && (std::holds_alternative<Pmod_apply>(m->binding.expr.desc) ||
+                  std::holds_alternative<Pmod_apply_unit>(m->binding.expr.desc) ||
+                  std::holds_alternative<Pmod_ident>(m->binding.expr.desc))) {
+        std::string mp;
+        for (auto& sp : spath_) mp += (mp.empty() ? "" : ".") + sp;
+        copy_stamp_keys(m->binding.expr, mp);
+      }
       if (nfw) --nfwalk_;
       // A saved local application's first expanding read builds it (S545):
       // the values are read as `C.x` from inside this structure and as
@@ -43117,6 +43217,7 @@ struct Count {
       tbind(m->name.txt, m->type ? &*m->type : nullptr);
     } else if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
       mexpr(i->expr, l);
+      inc_stamp_keys(i->expr);
       if (saved_ && !pkmeet_off() && !packty_off() && !pkinfer_off() &&
           !std::holds_alternative<Pmod_structure>(i->expr.desc))
         n += pk_inc_nodes(i->expr, 8);
