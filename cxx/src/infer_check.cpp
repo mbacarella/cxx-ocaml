@@ -16945,6 +16945,14 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
 // re-emitted bare would let a sibling `module Set` CAPTURE the head
 // (ident.mli's spliced Identifiable.S Set.t = Stdlib.Set.Make(T).t cited
 // ident's own Set -> the oracle looped expanding the recursive manifest).
+// S565: NOSPLPROV=1 drops a spliced citation's path provenance again (the
+// S564 writer, which gave every copied predef citation this unit's one
+// canonical `Pident` and rebuilt each dotted head fresh).
+static bool splprov_off() {
+  static const bool off = cppcaml::dbg_env("NOSPLPROV") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE565") != nullptr;
+  return off;
+}
 static std::string bare_cmi_path(const cmi::Path& p) {
   std::string s = cmi_path_str(p);
   bool has_app = s.find('(') != std::string::npos;
@@ -17025,6 +17033,15 @@ static cmi::cmiw::TyPtr conv_cmi_ty(const cmi::TypePtr& t0,
         fprintf(stderr, "[CONVDBG] conv_cmi_ty app name: %s\n", nm.c_str());
       r = nm.empty() ? cmi::cmiw::ty_var(nextvar++)
                      : cmi::cmiw::ty_constr(nm, std::move(as));
+      // S565: A SPLICED DECLARATION CITES THE PATH OBJECTS OF THE UNIT IT CAME
+      // FROM.  `Subst` leaves a `Pident` alone and rebuilds a `Pdot` over the
+      // SAME head and component strings (subst.ml:90-132), so a signature this
+      // unit copies out of a dependency's .cmi -- `include List`,
+      // `module M = Set.Make (Int)` -- keeps that file's own path blocks: its
+      // `Pident (Predef "int")`, one per lookup the DECLARING unit made, not
+      // this unit's single canonical one.  The path's provenance is exactly
+      // that block (cmi.hpp prov_new, memoised per arena index by the reader).
+      if (r && t->path && !splprov_off()) r->prov = t->path->prov;
       break;
     }
     case cmi::TypeExpr::Tvariant: {

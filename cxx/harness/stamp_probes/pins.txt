@@ -4133,6 +4133,14 @@ xpk_c15 0
 xpk_c16 0
 xpk_c17 0
 xpk_c18 0
+xpsh_a1 0
+xpsh_a2 0
+xpsh_a3 0
+xpsh_a4 0
+xpsh_a5 0
+xpsh_a6 0
+xpsh_a7 0
+xpsh_a8 0
 xpu_a0 0
 xpu_a1 0
 xpu_a2 0

@@ -1566,10 +1566,11 @@ struct CmiShare {
   std::map<std::string, o::ValPtr> pstrs;           // "prov:i:s" -> string
   o::ValPtr none;                                   // Location.none
   o::ValPtr tvar_none, tunivar_none;                // the two shared descs
+  o::ValPtr prim_noname;                            // the `""` native name
   void clear() {
     strs.clear(); poss.clear(); ids.clear(); pidents.clear(); none = nullptr;
     ppaths.clear(); heads.clear(); pstrs.clear();
-    tvar_none = tunivar_none = nullptr;
+    tvar_none = tunivar_none = nullptr; prim_noname = nullptr;
   }
 };
 CmiShare g_share;
@@ -1597,6 +1598,21 @@ o::ValPtr shared_str(const std::string& s) {
   auto& v = g_share.strs[s];
   if (!v) v = o::vstr(s);
   return v;
+}
+// S565: an external that names no C stub gets `Primitive.description`'s
+// `prim_native_name = ""` -- primitive.ml's own literal (`init_native_name`
+// :150), one string for the whole process -- so a unit's externals all cite
+// THAT object.  A native name that was written is the parsetree's own string,
+// one per declaration.  NOPRIMNONAME=1 writes a fresh empty string again.
+bool primnoname_off() {
+  static const bool off = cppcaml::dbg_env("NOPRIMNONAME") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE565") != nullptr;
+  return off;
+}
+o::ValPtr prim_native_str(const std::string& s) {
+  if (!s.empty() || no_share() || primnoname_off()) return o::vstr(s);
+  if (!g_share.prim_noname) g_share.prim_noname = o::vstr(s);
+  return g_share.prim_noname;
 }
 // Ident.t: Local{name;stamp} is tag 0, Predef{name;stamp} tag 3.  `origin`
 // (predef only) is the .cmi whose unmarshalled Ident block this is -- another
@@ -2743,7 +2759,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           reprs.push_back(repr_val(i < (int)it.prim_reprs.size() ? it.prim_reprs[i] : 0));
         auto desc = o::vblock(0, {o::vstr(it.prim), o::vint(arity),
                                   o::vint(it.prim_alloc ? 1 : 0),
-                                  o::vstr(it.prim_native),
+                                  prim_native_str(it.prim_native),
                                   reprs.empty() ? o::vint(0) : o::vlist(reprs),
                                   repr_val(it.prim_repr_res)});
         valkind = o::vblock(0, {desc});  // Val_prim
