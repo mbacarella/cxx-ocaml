@@ -3062,6 +3062,16 @@ xnf_w7 0
 xnf_w8 0
 xnf_w9 0
 xnf_w10 0
+xnmt_a1 0
+xnmt_a2 0
+xnmt_a3 0
+xnmt_a4 0
+xnmt_a5 0
+xnmt_a6 0
+xnmt_a7 0
+xnmt_a8 0
+xnmt_a9 0
+xnmt_a10 0
 xoa_a1 0
 xoa_a2 0
 xoa_a3 0

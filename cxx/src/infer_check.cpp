@@ -3004,6 +3004,33 @@ struct Checker {
         }
     return nullptr;
   }
+  // S572: THE SIGNATURE AN ASCRIPTION NAMES IS THE SIGNATURE IT WRITES.
+  // `module A : S = struct .. end` ascribes exactly what the same signature
+  // written inline does -- ocamlc's `Typemod.type_module` transl_modtype's the
+  // constraint first and then runs ONE `Includemod.modtypes` either way, so
+  // A's values are S's DECLARED types (and S's written core types are the path
+  // objects they cite, S571) whichever spelling the source used.  A local
+  // `module type` is in `modtype_sig_asts_`; a DOTTED one whose head is a
+  // local structure resolves through `local_dotted_modtype_sig`.  A cmi one
+  // stays null: its items are not an AST, and `modtype_values` answers those.
+  // NOASCRNAMED=1 (alias NOSHARE572=1) restores the inline-only behaviour.
+  static bool ascrnamed_off() {
+    static const bool off = cppcaml::dbg_env("NOASCRNAMED") != nullptr ||
+                            cppcaml::dbg_env("NOSHARE572") != nullptr;
+    return off;
+  }
+  const ast::Signature* ascription_sig_items(const ModuleType& mt) {
+    if (auto* sg = std::get_if<Pmty_signature>(&mt.desc)) return &sg->items;
+    if (ascrnamed_off()) return nullptr;
+    if (auto* mi = std::get_if<Pmty_ident>(&mt.desc)) {
+      if (auto* l = std::get_if<Lident>(&mi->id.txt.v)) {
+        auto it = modtype_sig_asts_.find(l->name);
+        return it == modtype_sig_asts_.end() ? nullptr : it->second;
+      }
+      return local_dotted_modtype_sig(mi->id.txt);
+    }
+    return nullptr;
+  }
   std::unordered_map<std::string, TypePtr> param_sig_value_schemes(
       const ModuleType& ps, const std::unordered_map<std::string, TypePtr>& argtypes,
       const std::string& qual = "") {
@@ -13388,9 +13415,9 @@ struct Checker {
         // translation containing Any (an untranslated corner) keeps the
         // struct-inferred type.  Non-strict only.
         if (!strict)
-          if (auto* sg = std::get_if<Pmty_signature>(&mc->mt->desc)) {
+          if (const ast::Signature* sgi = ascription_sig_items(*mc->mt)) {
             std::set<std::string> own;
-            for (auto& sit : sg->items)
+            for (auto& sit : *sgi)
               if (auto* pt = std::get_if<Psig_type>(&sit.desc))
                 for (auto& d : pt->decls) own.insert(d.name.txt);
             // qualify own-type constrs
@@ -13410,7 +13437,7 @@ struct Checker {
               for (auto& a : t->inherited) ok &= qual(a, seen);
               return ok;
             };
-            for (auto& sit : sg->items)
+            for (auto& sit : *sgi)
               if (auto* pv = std::get_if<Psig_value>(&sit.desc)) {
                 std::unordered_map<std::string, TypePtr> vars;
                 TypePtr t = from_coretype(*pv->vd.type, vars);
