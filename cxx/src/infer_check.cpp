@@ -13221,6 +13221,64 @@ struct Checker {
     }
     // complex pattern: unify and bind its vars monomorphically
     try_unify(infer_pat(p), te);
+    mark_pat_var_schemes(p);
+  }
+
+  // S570: GENERALIZATION IS BY LEVEL, NOT BY REACHABILITY.
+  // `Ctype.with_local_level_generalize` (ctype.ml:277) ends the definition
+  // level and walks THAT LEVEL'S POOL (:230-271), stamping `generic_level` on
+  // every node the binding created -- not the graph one type reaches.  A
+  // variable a destructuring pattern binds owns such a node: `let { a } = { a
+  // = 42 }` gives `a` an INSTANCE of the label's declared `int`, and the
+  // pattern's own type (the nullary `t`) does not reach it, so a generalize
+  // that walks from the binding's type walks past it.  ocamlc's does not, so
+  // every later use of `a` copies that node and `print_int a` links the COPY
+  // -- the saved `val a` keeps the object the label declaration was written
+  // with.  We left it linkable, and the use moved `val a`'s path onto
+  // stdlib.cmi's own `int` block (its Pident, its Ident AND its name string).
+  // Only the per-use-copy pass has anything to mark: with node_copy_ off the
+  // pattern binds the declaration's node itself, which is already a scheme.
+  // NOPATVARGEN=1 leaves a pattern variable's type unmarked (S569's emitter).
+  static bool patvargen_off() {
+    static const bool off = cppcaml::dbg_env("NOPATVARGEN") != nullptr ||
+                            cppcaml::dbg_env("NOSHARE570") != nullptr;
+    return off;
+  }
+  void mark_pat_var_schemes(const Pattern& p) {
+    if (!eng.node_copy_ || patvargen_off()) return;
+    mark_pat_vars_(p);
+  }
+  void mark_pat_vars_(const Pattern& p) {
+    if (auto* v = std::get_if<Ppat_var>(&p.desc)) {
+      auto it = venv.back().find(v->name.txt);
+      if (it != venv.back().end() && it->second)
+        I::Engine::mark_scheme(it->second);
+      return;
+    }
+    if (auto* t = std::get_if<Ppat_tuple>(&p.desc)) {
+      for (auto& e : t->elems) mark_pat_vars_(*e);
+    } else if (auto* c = std::get_if<Ppat_construct>(&p.desc)) {
+      if (c->arg) mark_pat_vars_(**c->arg);
+    } else if (auto* a = std::get_if<Ppat_alias>(&p.desc)) {
+      mark_pat_vars_(*a->p);
+      auto it = venv.back().find(a->name.txt);
+      if (it != venv.back().end() && it->second)
+        I::Engine::mark_scheme(it->second);
+    } else if (auto* ct = std::get_if<Ppat_constraint>(&p.desc)) {
+      mark_pat_vars_(*ct->p);
+    } else if (auto* r = std::get_if<Ppat_record>(&p.desc)) {
+      for (auto& f : r->fields) mark_pat_vars_(*f.second);
+    } else if (auto* lz = std::get_if<Ppat_lazy>(&p.desc)) {
+      mark_pat_vars_(*lz->p);
+    } else if (auto* vr = std::get_if<Ppat_variant>(&p.desc)) {
+      if (vr->arg) mark_pat_vars_(**vr->arg);
+    } else if (auto* ar = std::get_if<Ppat_array>(&p.desc)) {
+      for (auto& e : ar->elems) mark_pat_vars_(*e);
+    } else if (auto* op = std::get_if<Ppat_open>(&p.desc)) {
+      mark_pat_vars_(*op->p);
+    } else if (auto* o = std::get_if<Ppat_or>(&p.desc)) {
+      mark_pat_vars_(*o->l);  // both sides bind the same set
+    }
   }
 
   // Bring a module's exported value schemes into the current scope (open M):

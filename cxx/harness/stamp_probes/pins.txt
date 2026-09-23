@@ -4165,6 +4165,14 @@ xpk_c15 0
 xpk_c16 0
 xpk_c17 0
 xpk_c18 0
+xplv_a1 0
+xplv_a2 0
+xplv_a3 0
+xplv_a4 0
+xplv_a5 0
+xplv_a6 0
+xplv_a7 0
+xplv_a8 0
 xpsh_a1 0
 xpsh_a2 0
 xpsh_a3 0
