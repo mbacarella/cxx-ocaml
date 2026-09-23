@@ -44752,6 +44752,31 @@ struct Walk {
   // whatever form it takes -- S563 re-derived it and could only read a
   // literal signature or a name.  NOXASC=1 restores that.
   bool asc_off = false;
+  // S573: A CURRIED FUNCTOR APPLICATION IS AN APPLICATION OF AN APPLICATION.
+  // `F (A) (B)` and `F (A) ()` parse as `Pmod_apply (Pmod_apply (F, A), B)`,
+  // so the head is not an ident and S563's arms BAILED -- the whole file then
+  // lost the typing uid map and fell back to the writer's own numbering,
+  // which leaves a `module type`'s body items `Uid.Internal`.  The head's own
+  // answer IS the functor body's path (each application returns it), so the
+  // curried form needs no new law, only the recursion.  NOUIDCURRIED=1
+  // (alias NOSHARE573=1) bails as before.
+  bool curried_off = false;
+  // S573: AN INLINE-RECORD CONSTRUCTOR IS THE ONLY THING A COERCION MINTS.
+  // `Includemod.modtypes` adds the ACTUAL signature to the environment, and
+  // the one `Uid.mk` that runs there is datarepr.ml:94's, for a `Cstr_record`
+  // constructor's hidden record declaration -- nothing else in a signature
+  // mints.  S562 therefore charged the actual's inline records and BAILED
+  // (`coerce_cost` = -1) wherever the actual could not be read from the
+  // parsetree: an `include`, a module path, an application, a named module
+  // type.  But an actual with no inline-record constructor costs NOTHING,
+  // and a unit whose parsetree declares none anywhere has none to put in an
+  // actual signature, so the unreadable ones are free -- charge 0 and keep
+  // the map.  A unit that DOES declare one keeps S562's bail, since which
+  // signature the unreadable actual is then decides the count.
+  // NOUIDCOERCEUNK=1 (alias NOSHARE573=1) bails as before.
+  bool coerceunk_off = false;
+  bool saw_inl = false;      // this unit declares an inline record somewhere
+  int coerce_unknown = 0;    // coercions charged 0 on that promise
   static std::string join(const std::string& p, const std::string& n) {
     return p.empty() ? n : p + "." + n;
   }
@@ -45178,6 +45203,7 @@ struct Walk {
               else mk();
             }
             ++inline_ctors;
+            saw_inl = true;  // S573
           }
           if (save) ids[uidkey('c', path, d.name.txt + "#" + ct.name.txt)] = mk();
           else mk();
@@ -45376,7 +45402,7 @@ struct Walk {
     bool inl = false;
     if (auto* d = std::get_if<ast::Pext_decl>(&x.ctor.kind))
       if (auto* r = std::get_if<ast::Pcstr_record>(&d->args)) {
-        inl = true;
+        inl = true; saw_inl = true;  // S573
         for (auto& f : r->fields) {
           if (save) ids[uidkey('L', path, n + "#" + n + "." + f.name.txt)] = mk();
           else mk();
@@ -45396,7 +45422,7 @@ struct Walk {
       const std::string& n = ec.name.txt;
       if (auto* d = std::get_if<ast::Pext_decl>(&ec.kind))
         if (auto* r = std::get_if<ast::Pcstr_record>(&d->args)) {
-          ++inl;
+          ++inl; saw_inl = true;  // S573
           for (auto& f : r->fields) {
             if (save) ids[uidkey('L', path, n + "#" + n + "." + f.name.txt)] = mk();
             else mk();
@@ -45411,6 +45437,16 @@ struct Walk {
   // Returns the path this module expression's saved items' keys live under
   // (empty = not known): `path` for a structure, the module type's body for
   // an ascription by name, the functor body's for an application.
+  // The head of a CURRIED application (S573): an application of an
+  // application, whose own answer is already the functor body's path.
+  std::string applied_head(const ast::ModuleExpr& f) {
+    using namespace ast;
+    if (curried_off || !(std::get_if<Pmod_apply>(&f.desc) ||
+                         std::get_if<Pmod_apply_unit>(&f.desc))) {
+      bail(); return "?";
+    }
+    return mod_expr(f, /*save=*/false);
+  }
   std::string mod_expr(const ast::ModuleExpr& m, bool save) {
     using namespace ast;
     if (auto* st = std::get_if<Pmod_structure>(&m.desc)) {
@@ -45428,6 +45464,7 @@ struct Walk {
       std::string mtp = cn->mt ? mty(*cn->mt, save) : std::string("?");
       if (cn->me && cn->mt && !coerce_off) {
         int k = coerce_cost(*cn->me, *cn->mt);
+        if (k < 0 && !coerceunk_off) { ++coerce_unknown; k = 0; }  // S573
         if (k < 0) bail(); else c += k;
       }
       if (asc_off && cn->mt && !std::get_if<Pmty_signature>(&cn->mt->desc) &&
@@ -45463,7 +45500,7 @@ struct Walk {
       if (copy_off) { bail(); return "?"; }
       if (ap->arg) mod_expr(*ap->arg, /*save=*/false);
       auto* fid = std::get_if<Pmod_ident>(&ap->f->desc);
-      if (!fid) { bail(); return "?"; }
+      if (!fid) return applied_head(*ap->f);   // `F (A) (B)` (S573)
       const std::string* q = look(msrc, lid_full(fid->id.txt));
       if (!q) return outside_b();        // `Set.Make (Int)` (S564)
       if (unk(*q)) { bail(); return "?"; }
@@ -45472,7 +45509,7 @@ struct Walk {
       // `F ()`: a generative application, the same law.
       if (copy_off) { bail(); return "?"; }
       auto* fid = std::get_if<Pmod_ident>(&au->f->desc);
-      if (!fid) { bail(); return "?"; }
+      if (!fid) return applied_head(*au->f);   // `F (A) ()` (S573)
       const std::string* q = look(msrc, lid_full(fid->id.txt));
       if (!q) return outside_b();
       if (unk(*q)) { bail(); return "?"; }
@@ -45712,7 +45749,16 @@ UidMap typing_uid_map(const ast::Structure& s,
   // S564: the cross-unit half of the copy law.
   w.xext_off = dbg_env("NOUID564") != nullptr || dbg_env("NOXEXT") != nullptr;
   w.asc_off = dbg_env("NOUID564") != nullptr || dbg_env("NOXASC") != nullptr;
+  // S573
+  w.curried_off = dbg_env("NOUIDCURRIED") != nullptr ||
+                  dbg_env("NOSHARE573") != nullptr;
+  w.coerceunk_off = dbg_env("NOUIDCOERCEUNK") != nullptr ||
+                    dbg_env("NOSHARE573") != nullptr;
   for (auto& it : s) w.item(it, /*save=*/true);
+  // The promise above is kept only by a unit that declares no inline record
+  // anywhere (S573): with one in the file, an unreadable actual might be the
+  // signature that carries it, and the count decides every later id.
+  if (w.coerce_unknown && w.saw_inl) w.complete = false;
   UidMap m;
   m.complete = w.complete;
   m.ids = std::move(w.ids);

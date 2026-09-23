@@ -253,6 +253,17 @@ xau_c2 0
 xau_c3 0
 xau_c4 0
 xau_c5 0
+xcfa_a1 0
+xcfa_a2 -1
+xcfa_a3 0
+xcfa_a7 0
+xcfa_c1 0
+xcfa_c2 0
+xcfa_e1 0
+xcfa_e2 0
+xcfa_f1 0
+xcfa_f2 0
+xcfa_f3 0
 xchk_a01 0
 xchk_a02 0
 xchk_a03 0

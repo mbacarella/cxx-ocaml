@@ -3708,6 +3708,11 @@ std::string module_cmi_crc(const std::string& mod) {
 static bool foreign_uid(const cmiw::Uid& u, const std::string& unit) {
   return u.k == cmiw::Uid::Item && !u.unit.empty() && u.unit != unit;
 }
+static bool mtfall_off() {
+  static const bool off = cppcaml::dbg_env("NOUIDMTFALL") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE573") != nullptr;
+  return off;
+}
 static void assign_uids(std::vector<SigItem>& items, const std::string& unit,
                         bool intf, int& c) {
   auto mk = [&]() { cmiw::Uid u; u.k = cmiw::Uid::Item; u.unit = unit;
@@ -3750,6 +3755,14 @@ static void assign_uids(std::vector<SigItem>& items, const std::string& unit,
       assign_uids(it.sub, unit, intf, c);  // contents first (post-order)
       own(it.uid); ++i;
     } else if (it.k == SigItem::Modtype) {
+      // `module type S = sig .. end`: the body's items are numbered like any
+      // other signature's, before the module type's own uid -- the same law
+      // `assign_uids_mapped` below already follows (S563).  Leaving them out
+      // here left them `Uid.Internal` AND shifted every later id by the
+      // body's length, so a file that lost the typing map lost far more than
+      // the declarations the map was missing (S573; NOUIDMTFALL=1, alias
+      // NOSHARE573=1, leaves the body alone as before).
+      if (!mtfall_off()) assign_uids(it.sub, unit, intf, c);
       own(it.uid); ++i;
     } else {
       ++i;  // Class: uids not yet modelled
