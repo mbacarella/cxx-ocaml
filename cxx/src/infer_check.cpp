@@ -1181,8 +1181,8 @@ struct Checker {
   // so what a pattern takes from it must stay shared and linkable, as the
   // instance's own copies are in ocamlc.
   static inline int annot_row_depth_ = 0;
-  static TypePtr annot(TypePtr t) {
-    t->prov = cmi::prov_new();
+  static TypePtr annot(TypePtr t, int src_dots = 0) {
+    t->prov = cmi::prov_new_dots(src_dots);
     t->scheme = annot_row_depth_ == 0 || cmi::node_id_off();  // generalize_structure'd: every use copies it
     return t;
   }
@@ -1475,8 +1475,14 @@ struct Checker {
           if (!predefs.count(l->name)) {
             std::vector<TypePtr> as;
             for (auto& a : c->args) as.push_back(from_coretype(*a, vars));
-            return annot(eng.constr(lid_full(op->mod_.txt) + "." + l->name,
-                                    std::move(as)));
+            // S566: `N.(t)` is `open N in t` -- the lookup reaches the name
+            // THROUGH the open and builds `Pdot (root, name)` over its own
+            // string, not the declaration's ident name, so every component
+            // here counts as written (cmi.hpp ProvInfo::src_dots).
+            std::string q = lid_full(op->mod_.txt) + "." + l->name;
+            int qd = 0;
+            for (char ch : q) qd += ch == '.';
+            return annot(eng.constr(std::move(q), std::move(as)), qd);
           }
         }
       return from_coretype(*op->type, vars);
@@ -2142,7 +2148,13 @@ struct Checker {
           }
       }
       TypePtr rc = eng.constr(std::move(path), std::move(as), stamp);
-      rc = open_pfx.empty() ? annot(rc) : annot_open(rc, open_pfx);
+      // S566: a path the SOURCE wrote dotted keeps the parsetree's own
+      // component strings; a bare name this unit qualifies itself takes the
+      // declarations' ident names (cmi.hpp ProvInfo::src_dots).
+      int src_dots = 0;
+      if (std::holds_alternative<Ldot>(c->id.txt.v))
+        for (char ch : lid_full(c->id.txt)) src_dots += ch == '.';
+      rc = open_pfx.empty() ? annot(rc, src_dots) : annot_open(rc, open_pfx);
       // A SOURCE-WRITTEN path never relinks to a family abbreviation: the user
       // wrote it and ocamlc displays it as written (`(a : int32)` stays int32
       // even after `Int32.unsigned_compare a b`).  Finalize its family heads.

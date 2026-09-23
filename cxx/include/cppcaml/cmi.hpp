@@ -86,9 +86,16 @@ struct Path {
 // `open_pfx` (annotations): the name reached the type through `open <pfx>`
 // -- the lookup's `Pdot (root, name)` shares that open's root (its module
 // path block and strings) with every other name resolved through it.
-struct ProvInfo { int cmi = 0; int head_blk = -1; bool pdot = false; std::string open_pfx; };
+// `src_dots` (S566): how many TRAILING components of the path the SOURCE
+// wrote as a dotted name (`T1.t` = 1, a bare `t` this unit then qualifies to
+// `M.t` = 0).  A written dot is `Pdot (p, s.txt)` over the parsetree's own
+// string (env.ml lookup_dot_type :3108); a component the ENVIRONMENT added
+// when it prefixed a module's own declarations is `Pdot (root, Ident.name
+// id)` -- that declaration's own name string (prefix_idents :1728).
+struct ProvInfo { int cmi = 0; int head_blk = -1; bool pdot = false; std::string open_pfx; int src_dots = 0; };
 int prov_new(int cmi = 0, int head_blk = -1, bool pdot = false);
 int prov_new_open(const std::string& open_pfx);
+int prov_new_dots(int src_dots);  // a source annotation, `src_dots` written
 const ProvInfo& prov_info(int prov);
 int cmi_id_of(const std::string& filepath);
 bool prov_off();  // NOPROV=1: the writer ignores provenance (S554 behaviour)

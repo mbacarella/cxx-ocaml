@@ -735,12 +735,17 @@ std::vector<ProvInfo>& prov_table() {
 }  // namespace
 int prov_new(int cmi, int head_blk, bool pdot) {
   auto& t = prov_table();
-  t.push_back(ProvInfo{cmi, head_blk, pdot, {}});
+  t.push_back(ProvInfo{cmi, head_blk, pdot, {}, 0});
   return static_cast<int>(t.size()) - 1;
 }
 int prov_new_open(const std::string& open_pfx) {
   auto& t = prov_table();
-  t.push_back(ProvInfo{0, -1, false, open_pfx});
+  t.push_back(ProvInfo{0, -1, false, open_pfx, 0});
+  return static_cast<int>(t.size()) - 1;
+}
+int prov_new_dots(int src_dots) {
+  auto& t = prov_table();
+  t.push_back(ProvInfo{0, -1, false, {}, src_dots});
   return static_cast<int>(t.size()) - 1;
 }
 const ProvInfo& prov_info(int prov) {
@@ -1564,12 +1569,15 @@ struct CmiShare {
   std::map<int, o::ValPtr> ppaths;                  // prov -> Pident(Predef)
   std::map<std::string, o::ValPtr> heads;           // head key -> Pident(Global)
   std::map<std::string, o::ValPtr> pstrs;           // "prov:i:s" -> string
+  // S566: "<module stamp>:<member>" -> that member's own ident stamp, so a
+  // `N.t` component can cite the string inside `type t`'s Ident block.
+  std::map<std::string, int> mstamps;
   o::ValPtr none;                                   // Location.none
   o::ValPtr tvar_none, tunivar_none;                // the two shared descs
   o::ValPtr prim_noname;                            // the `""` native name
   void clear() {
     strs.clear(); poss.clear(); ids.clear(); pidents.clear(); none = nullptr;
-    ppaths.clear(); heads.clear(); pstrs.clear();
+    ppaths.clear(); heads.clear(); pstrs.clear(); mstamps.clear();
     tvar_none = tunivar_none = nullptr; prim_noname = nullptr;
   }
 };
@@ -1694,6 +1702,29 @@ o::ValPtr comp_str(const std::string& s, int prov, int i) {
   auto& v = g_share.pstrs[key];
   if (!v) v = o::vstr(s);
   return v;
+}
+// S566: A PATH'S COMPONENT STRING IS THE NAME OBJECT OF THE DECLARATION IT
+// NAMES.  `prefix_idents` (env.ml:1728-1767) builds every path into a
+// module's components as `Pdot(root, Ident.name id)` -- the signature item's
+// OWN name string, the one that module's Ident block carries -- and
+// `Mtype.strengthen` (mtype.ml:78) builds its manifests the same way.  So
+// every citation of `N.t` in this unit hands on the string inside `type t`'s
+// ident: Subst rebuilds the Pdot BLOCK per citation but passes `n` through
+// untouched (subst.ml:90-132, S565).  NOMEMBSTR=1 writes a fresh string.
+bool membstr_off() {
+  static const bool off = cppcaml::dbg_env("NOMEMBSTR") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE566") != nullptr;
+  return off;
+}
+// The ident stamp of `name` declared by the local module `owner`, 0 when this
+// unit has not emitted that module's signature (nothing to cite yet).
+int member_stamp(int owner, const std::string& name) {
+  if (!owner || no_share() || membstr_off()) return 0;
+  auto f = g_share.mstamps.find(std::to_string(owner) + ":" + name);
+  return f == g_share.mstamps.end() ? 0 : f->second;
+}
+o::ValPtr member_str(int mstamp, const std::string& name) {
+  return ident_val(0, name, mstamp)->fields[0];
 }
 // The Stdlib alias member on a `Stdlib.List.t`-style chain: a .cmi Pident's
 // (List's own `t`, reached through Stdlib's components) is the alias ident's
@@ -2052,8 +2083,20 @@ struct TyEmit {
                 if (*s != self_stamp) { mstamp = *s; break; }
           if (mstamp != self_stamp) {
             o::ValPtr path = pident_local(comps[0], mstamp);
-            for (std::size_t i = 1; i < comps.size(); ++i)
-              path = o::vblock(1, {path, comp_str(comps[i], prov, i)});  // Pdot
+            int owner = mstamp;
+            // S566: the components the ENVIRONMENT added -- everything but
+            // the last `src_dots`, which the source wrote itself -- name
+            // declarations OF the module they hang off, so each is that
+            // declaration's own ident name string (prefix_idents).
+            const std::size_t written =
+                comps.size() - 1 - std::min<std::size_t>(
+                    comps.size() - 1, prov_info(prov).src_dots);
+            for (std::size_t i = 1; i < comps.size(); ++i) {
+              int ms = i <= written ? member_stamp(owner, comps[i]) : 0;
+              path = o::vblock(1, {path, ms ? member_str(ms, comps[i])
+                                            : comp_str(comps[i], prov, i)});  // Pdot
+              owner = ms;
+            }
             return path;
           }
           // else: the only visible candidate is the module itself -- fall
@@ -2460,7 +2503,8 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                                              const ModScope* outer_modscope = nullptr,
                                              const std::vector<const std::unordered_map<std::string, int>*>* outer_scopes = nullptr,
                                              const std::string& self_name = "",
-                                             int self_stamp = 0);
+                                             int self_stamp = 0,
+                                             int owner_stamp = 0);
 static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                                              std::map<std::string, bool>& referenced,
                                              int& stamp,
@@ -2471,7 +2515,8 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                                              const ModScope* outer_modscope,
                                              const std::vector<const std::unordered_map<std::string, int>*>* outer_scopes,
                                              const std::string& self_name,
-                                             int self_stamp) {
+                                             int self_stamp,
+                                             int owner_stamp) {
   // Pre-pass: give every item its stamp up front and record the local type
   // names, so a value emitted before/after a type can still cite it by stamp.
   std::vector<int> item_stamp(items.size());
@@ -2488,6 +2533,13 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
     if (items[i].k == SigItem::Class) local_classes[items[i].name] = item_stamp[i];
     if (items[i].k == SigItem::Modtype) local_modtypes[items[i].name] = item_stamp[i];
     if (items[i].k == SigItem::Module) local_mods[items[i].name] = item_stamp[i];
+    // S566: a dotted citation of this member off the enclosing module cites
+    // THIS ident's name string (a class takes three idents built over one
+    // shared name of their own, so it is left out).
+    if (owner_stamp && (items[i].k == SigItem::Type ||
+                        items[i].k == SigItem::Module))
+      g_share.mstamps[std::to_string(owner_stamp) + ":" + items[i].name] =
+          item_stamp[i];
   }
   // Types visible here = enclosing-scope types overlaid with this level's own
   // (locals shadow).  A nested `module M = struct type t += A end` extending the
@@ -2821,7 +2873,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         const int self = it.rec_status && !cppcaml::dbg_env("NORECSTAMP")
                              ? 0 : item_stamp[i];
         if (!mty)
-          mty = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod, &visible_eng, &modscope, &scopes, it.name, self))});  // Mty_signature
+          mty = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod, &visible_eng, &modscope, &scopes, it.name, self, item_stamp[i]))});  // Mty_signature
       }
       auto md = o::vblock(0, {mty, o::vint(0) /*[] attrs*/, emit_loc(it.loc),
                               emit_uid(it.uid)});  // module_declaration

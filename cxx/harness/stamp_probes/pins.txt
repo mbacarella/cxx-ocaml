@@ -3610,6 +3610,14 @@ xpc_t23 0
 xpc_t24 0
 xpc_t25 0
 xpc_t26 0
+xpds_a1 0
+xpds_a2 0
+xpds_a3 0
+xpds_a4 0
+xpds_a5 0
+xpds_a6 0
+xpds_a7 0
+xpds_a8 0
 xpf_a01 0
 xpf_a02 0
 xpf_a03 0
