@@ -1678,27 +1678,84 @@ o::ValPtr predef_exn_path() {
     return o::vblock(0, {o::vblock(3, {o::vstr("exn"), o::vint(7)})});
   return pident_predef("exn", 7, 0);
 }
-// The head `Pident (Global unit)` of a Pdot chain, by provenance: prov 0 is a
-// fresh block per citation (as before); an annotation's head is the initial
-// open's root when the name routed through it (`List.t`, `ref`), else fresh
-// per lookup (`Stdlib.List.t`, `Foo.t` -- find_name_module allocates); a .cmi
+// S569: A NAME THE ENVIRONMENT RESOLVED IN A LOADED UNIT IS THAT UNIT'S ONE
+// ROOT AND THAT DECLARATION'S ONE NAME.  `Env.sign_of_cmi` (env.ml:937) builds
+// ONE `path = Pident id` per .cmi it loads, and every component reached
+// through that unit is `Pdot (root, Ident.name id)` -- `prefix_idents` over
+// the loaded signature's own idents (S566) -- so `Arg.spec` and `Arg.key`,
+// however many citations and whichever value dragged them in, hang off that
+// one root and hand on the one name string each declaration's Ident carries.
+// Subst rebuilds the Pdot BLOCKS per citation (S565) but nothing below them.
+// The counter-cases keep their own objects: a head the SOURCE wrote
+// (`find_name_module`, env.ml:872, allocates a `Pident` per lookup), a
+// trailing component the source wrote (`lookup_dot_type`'s `s.txt`, S566),
+// and a Pdot chain decoded verbatim out of another .cmi (that file's blocks).
+// NOENVPATH=1 mints a fresh block and fresh strings for a citation with no
+// provenance, and keys an environment-added component by provenance again.
+bool envpath_off() {
+  static const bool off = cppcaml::dbg_env("NOENVPATH") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE569") != nullptr;
+  return off;
+}
+// Did the ENVIRONMENT build this citation's path out of a loaded unit's own
+// declarations?  A citation with no provenance did (the writer qualified a
+// bare name itself), and so did one decoded from a .cmi as a `Pident` this
+// unit then qualifies.  A name LOOKUP does not, even a bare one resolved
+// through an `open`: `IdTbl.find_name` (env.ml:389-401) returns `Pdot (root,
+// name)` over the string the LOOKUP passed, one per lookup site.
+bool env_built(int prov) {
+  if (envpath_off()) return false;
+  if (prov == 0) return true;
+  const ProvInfo& pi = prov_info(prov);
+  return pi.cmi != 0 && !pi.pdot;
+}
+// The `Ident.t` inside the `Pident (Global unit)` a WRITTEN head resolves to:
+// the one persistent ident that unit's entry in `env.modules` carries.  The
+// lookup builds a fresh `Pident` BLOCK over it (env.ml:389-401, :872 --
+// `Pident id` allocates, `id` does not), so `Stdlib.List.t` written twice is
+// two blocks over one ident.  Every other head keeps its own.
+o::ValPtr written_head_ident(const std::string& unit) {
+  if (no_share() || envpath_off()) return o::vblock(2, {o::vstr(unit)});
+  auto& v = g_share.heads["gid:" + unit];
+  if (!v) v = o::vblock(2, {o::vstr(unit)});
+  return v;
+}
+// The name string of `s`, the `i`th component of a path into `owner`'s own
+// declarations: that declaration's ident name, one per unit member.
+o::ValPtr unit_member_str(const std::string& owner, int i,
+                          const std::string& s) {
+  if (no_share()) return o::vstr(s);
+  auto& v = g_share.pstrs["gmem:" + owner + ":" + std::to_string(i) + ":" + s];
+  if (!v) v = o::vstr(s);
+  return v;
+}
+// The head `Pident (Global unit)` of a Pdot chain, by provenance: prov 0 is
+// that unit's own root (S569) unless the source WROTE the head; an
+// annotation's head is the initial open's root when the name routed through
+// it (`List.t`, `ref`), else fresh per lookup (`Stdlib.List.t`, `Foo.t` --
+// find_name_module allocates); a .cmi
 // Pident's head is that unit's prefix root (sign_of_cmi's one `Pident id`);
 // a Pdot stored in a .cmi keeps that file's block.
 o::ValPtr global_head(const std::string& unit, int prov, bool explicit_head) {
   if (prov_off_()) prov = 0;
-  if (prov == 0 || no_share())
-    return o::vblock(0, {o::vblock(2, {o::vstr(unit)})});
+  if (no_share() || (prov == 0 && (explicit_head || envpath_off())))
+    return o::vblock(0, {written_head_ident(unit)});
   const ProvInfo& pi = prov_info(prov);
   std::string key;
   if (!pi.open_pfx.empty()) explicit_head = false;  // the open's root
-  if (pi.cmi == 0)
+  if (prov == 0)
+    key = "unit:" + unit;  // S569: the root sign_of_cmi made for that unit
+  else if (pi.cmi == 0)
     key = explicit_head ? "prov:" + std::to_string(prov) : "open:" + unit;
   else if (pi.pdot)
     key = "cmi:" + std::to_string(pi.cmi) + ":" + std::to_string(pi.head_blk);
   else
     key = "unit:" + unit;
   auto& v = g_share.heads[key];
-  if (!v) v = o::vblock(0, {o::vblock(2, {o::vstr(unit)})});
+  if (!v)
+    v = o::vblock(0, {key.compare(0, 5, "prov:") == 0
+                          ? written_head_ident(unit)
+                          : o::vblock(2, {o::vstr(unit)})});
   return v;
 }
 // A Pdot component's string: one per path object (a copy of an annotation, or
@@ -1751,8 +1808,8 @@ o::ValPtr member_str(int mstamp, const std::string& name) {
 o::ValPtr alias_str(const std::string& member, int prov) {
   if (prov_off_()) prov = 0;
   const ProvInfo& pi = prov_info(prov);
-  if (prov == 0 || no_share() || pi.cmi == 0 || pi.pdot)
-    return comp_str(member, prov, 0);
+  const bool envq = prov == 0 ? !envpath_off() : (pi.cmi != 0 && !pi.pdot);
+  if (no_share() || !envq) return comp_str(member, prov, 0);
   auto& v = g_share.pstrs["alias:" + member];
   if (!v) v = o::vstr(member);
   return v;
@@ -2135,8 +2192,16 @@ struct TyEmit {
       } else {
         path = global_head(g, prov, true);  // Pident(Global head), written
       }
+      // S569: everything but the `src_dots` components the SOURCE wrote is a
+      // declaration the environment prefixed -- its own ident name (S566).
+      const ProvInfo& gpi = prov_info(prov);
+      const std::size_t gwritten =
+          comps.size() - 1 - std::min<std::size_t>(comps.size() - 1,
+                                                   gpi.src_dots);
       for (std::size_t i = 1; i < comps.size(); ++i)
-        path = o::vblock(1, {path, comp_str(comps[i], prov, i)});   // Pdot(path, comp)
+        path = o::vblock(1, {path, env_built(prov) && i <= gwritten
+                                       ? unit_member_str(g, (int)i, comps[i])
+                                       : comp_str(comps[i], prov, i)});  // Pdot
       return path;
     }
     // A same-sig decl SHADOWS a predefined name: typedtree.mli declares its
@@ -2153,7 +2218,9 @@ struct TyEmit {
     if (stdlib_toplevel_type(name)) {
       if (referenced) (*referenced)["Stdlib"] = true;
       return o::vblock(1, {global_head("Stdlib", prov, false),
-                           comp_str(name, prov, 1)});  // Pdot(Pident(Global Stdlib), name)
+                           env_built(prov)
+                               ? unit_member_str("Stdlib", 1, name)
+                               : comp_str(name, prov, 1)});  // Pdot
     }
     return nullptr;
   }

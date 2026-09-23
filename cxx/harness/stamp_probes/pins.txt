@@ -923,6 +923,14 @@ xeh_v09 0
 xeh_v10 0
 xeh_v11 0
 xeh_v12 0
+xenv_a1 0
+xenv_a2 0
+xenv_a3 0
+xenv_a4 0
+xenv_a5 0
+xenv_a6 0
+xenv_a7 0
+xenv_a8 0
 xeta_a1 0
 xeta_a2 0
 xeta_a3 0
