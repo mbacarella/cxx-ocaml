@@ -1181,8 +1181,29 @@ struct Checker {
   // so what a pattern takes from it must stay shared and linkable, as the
   // instance's own copies are in ocamlc.
   static inline int annot_row_depth_ = 0;
-  static TypePtr annot(TypePtr t, int src_dots = 0) {
-    t->prov = cmi::prov_new_dots(src_dots);
+  // S567: a written annotation is ONE `Env.lookup_type`, so the path object it
+  // built is the SAME block however many times this unit's passes convert that
+  // source node -- the declaration's own emission, the field / constructor
+  // scheme registered beside it, the value environment.  ocamlc copies a type
+  // by rebuilding the type_expr spine and passing the Path through (Ctype.copy
+  // behind instance / instance_label / instance_constructor, Subst), so every
+  // instance of the annotation cites that one block.  Keyed by the parsetree
+  // node, per Checker -- one is built per pass, per unit.
+  std::unordered_map<const void*, int> annot_prov_;
+  std::unordered_map<const void*, int> annot_openprov_;
+  static bool annotprov_off() {
+    static const bool off = cppcaml::dbg_env("NOANNOTPROV") != nullptr ||
+                            cppcaml::dbg_env("NOSHARE567") != nullptr;
+    return off;
+  }
+  TypePtr annot(TypePtr t, int src_dots = 0, const void* key = nullptr) {
+    if (!key || annotprov_off()) {
+      t->prov = cmi::prov_new_dots(src_dots);
+    } else {
+      int& v = annot_prov_[key];
+      if (!v) v = cmi::prov_new_dots(src_dots);
+      t->prov = v;
+    }
     t->scheme = annot_row_depth_ == 0 || cmi::node_id_off();  // generalize_structure'd: every use copies it
     return t;
   }
@@ -1196,8 +1217,15 @@ struct Checker {
     return eng.node_copy_ ? eng.instantiate(a, /*share_vars=*/true) : a;
   }
   // ...reached through `open <pfx>`: `Pdot (that open's root, name)`.
-  static TypePtr annot_open(TypePtr t, const std::string& pfx) {
-    t->prov = cmi::prov_new_open(pfx);
+  TypePtr annot_open(TypePtr t, const std::string& pfx,
+                     const void* key = nullptr) {
+    if (!key || annotprov_off()) {
+      t->prov = cmi::prov_new_open(pfx);
+    } else {
+      int& v = annot_openprov_[key];
+      if (!v) v = cmi::prov_new_open(pfx);
+      t->prov = v;
+    }
     t->scheme = annot_row_depth_ == 0 || cmi::node_id_off();
     return t;
   }
@@ -1482,7 +1510,7 @@ struct Checker {
             std::string q = lid_full(op->mod_.txt) + "." + l->name;
             int qd = 0;
             for (char ch : q) qd += ch == '.';
-            return annot(eng.constr(std::move(q), std::move(as)), qd);
+            return annot(eng.constr(std::move(q), std::move(as)), qd, &t);
           }
         }
       return from_coretype(*op->type, vars);
@@ -1760,7 +1788,7 @@ struct Checker {
       if (is_format_base(lid_full(c->id.txt))) {
         std::vector<TypePtr> fa;
         for (auto& a : c->args) fa.push_back(from_coretype(*a, vars));
-        return annot(eng.constr("format6", std::move(fa)));
+        return annot(eng.constr("format6", std::move(fa)), 0, &t);
       }
       // `_ M.t` where M.t is a cmi type of arity N>1: record N so the dump can
       // fill every parameter slot with Ttyp_any (the local type_arity_ registry
@@ -2096,7 +2124,7 @@ struct Checker {
         if (auto* l = std::get_if<Lident>(&c->id.txt.v))
           if (auto s = functor_param_type_quals_.find(l->name);
               s != functor_param_type_quals_.end())
-            return annot(eng.constr(s->second, std::move(as)));
+            return annot(eng.constr(s->second, std::move(as)), 0, &t);
       // A bare reference to a local opaque type carries its identity stamp.
       int stamp = 0;
       if (auto* l = std::get_if<Lident>(&c->id.txt.v)) stamp = tenv_lookup(l->name);
@@ -2106,7 +2134,7 @@ struct Checker {
       // unify and print alike.
       if (!stamp)
         if (auto* l = std::get_if<Lident>(&c->id.txt.v); l && l->name == "eff")
-          return annot(eng.constr("Effect.t", std::move(as)));
+          return annot(eng.constr("Effect.t", std::move(as)), 0, &t);
       // A bare type name brought into scope by `open M` (M not Stdlib, not a
       // local type) renders with M's qualification, matching ocamlc (`c_layout`
       // after `open Bigarray` -> `Bigarray.c_layout`).
@@ -2114,7 +2142,7 @@ struct Checker {
         if (auto* l = std::get_if<Lident>(&c->id.txt.v))
           if (auto q = opened_type_quals_.find(l->name); q != opened_type_quals_.end())
             return annot_open(eng.constr(q->second, std::move(as)),
-                              qual_prefix(q->second));
+                              qual_prefix(q->second), &t);
       // `Array1.t` after `open Bigarray` -> `Bigarray.Array1.t` (opened submodule).
       std::string path = lid_full(c->id.txt);
       // A bare reference to a module-nested type displays with the module's
@@ -2154,7 +2182,7 @@ struct Checker {
       int src_dots = 0;
       if (std::holds_alternative<Ldot>(c->id.txt.v))
         for (char ch : lid_full(c->id.txt)) src_dots += ch == '.';
-      rc = open_pfx.empty() ? annot(rc, src_dots) : annot_open(rc, open_pfx);
+      rc = open_pfx.empty() ? annot(rc, src_dots, &t) : annot_open(rc, open_pfx, &t);
       // A SOURCE-WRITTEN path never relinks to a family abbreviation: the user
       // wrote it and ocamlc displays it as written (`(a : int32)` stays int32
       // even after `Int32.unsigned_compare a b`).  Finalize its family heads.

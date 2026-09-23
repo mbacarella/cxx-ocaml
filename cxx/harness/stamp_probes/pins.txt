@@ -125,6 +125,14 @@ xae_f03 -10
 xae_f04 -2
 xae_f05 -2
 xae_f06 -10
+xanp_a1 0
+xanp_a2 0
+xanp_a3 0
+xanp_a4 0
+xanp_a5 0
+xanp_a6 0
+xanp_a7 0
+xanp_a8 0
 xar_a1 0
 xar_a2 0
 xar_a3 0
