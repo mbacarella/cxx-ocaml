@@ -47,6 +47,10 @@ struct TypePtr {
   friend constexpr bool operator<(TypePtr a, TypePtr b) noexcept { return a.p_ < b.p_; }
 };
 
+// NOCOMMU=1 / NOSHARE575=1: ignore the arrow commutation entirely (every
+// saved arrow reads `Cok`, the S574 behaviour).  Defined in infer.cpp.
+bool commu_off();
+
 // Generic (generalized) variables carry this level; ordinary vars carry the
 // binding depth at which they were created.
 constexpr int GENERIC_LEVEL = 1'000'000'000;
@@ -75,6 +79,15 @@ struct Type {
   TypePtr dom, cod;          // Arrow
   int arrow_label = 0;       // Arrow: 0 Nolabel, 1 Labelled, 2 Optional
   std::string arrow_lbl;     // Arrow: label name (when Labelled/Optional)
+  // Arrow: ocamlc's `commutable` field (types.ml `Cok | Cunknown | Cvar`).
+  // 0 = Cok (the constant -- no cell of our own), 1 = `Cvar {Cunknown}`,
+  // 2 = a `Cvar` whose cell has since been set to `Cok`.  `clink` is
+  // Types.link_commu's chain: the node whose cell ours now points at.  A
+  // source-written arrow is Cok; only the arrow an application INVENTS for a
+  // variable-typed callee starts unknown (typecore.ml
+  // collect_unknown_apply_args), and it stays so unless it meets a known one.
+  int commu = 0;
+  TypePtr clink;
   std::vector<TypePtr> args; // Tuple / Constr / Object / Variant
   std::vector<std::string> labels;  // Object: method names; Variant: tag names
   // Object: per-method `'a.` poly binders from a WRITTEN `< m : 'a. 'a >`
@@ -176,6 +189,13 @@ public:
   static TypePtr repr(TypePtr t);
   // The node whose path OBJECT a Constr cites after its shadow links.
   static TypePtr prov_rep(TypePtr t);
+  // The Arrow node holding the commutable cell this one's `Cvar` resolves to
+  // (Types.commu_repr), and whether that cell reads `Cok`.
+  static TypePtr commu_rep(TypePtr t);
+  static bool commu_is_ok(const TypePtr& t);
+  // Types.set_commu_ok / link_commu, trailed like any other binding.
+  void set_commu_ok(const TypePtr& t);
+  void link_commu(const TypePtr& a, const TypePtr& b);
   // ocamlc's unify links t1 -> t2 when both are one nullary/same constructor,
   // so the saved type cites t2's path object; record that on t1 (a per-use
   // node only -- see Type::scheme) without linking the nodes.
@@ -246,7 +266,8 @@ private:
   int row_field_depth_ = 0;
   void occurs_and_lower(const TypePtr& var, const TypePtr& t);
 
-  struct Trail { TypePtr node; Type::Kind kind; TypePtr link; int level; TypePtr plink; };
+  struct Trail { TypePtr node; Type::Kind kind; TypePtr link; int level; TypePtr plink;
+                 int commu; TypePtr clink; };
   std::vector<Trail> trail_;
   int window_depth_ = 0;
   void note(const TypePtr& n);

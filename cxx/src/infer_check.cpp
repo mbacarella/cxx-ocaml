@@ -1290,6 +1290,7 @@ struct Checker {
       case cmi::TypeExpr::Tarrow: {
         TypePtr r = eng.arrow(from_cmi(n->dom, memo), from_cmi(n->cod, memo),
                               n->label_kind, n->label);
+        r->commu = n->commu_var ? 1 : 0;  // the dependency's own commutable
         r->scheme = true;  // a .cmi's node: every use copies it
         return r;
       }
@@ -11952,7 +11953,12 @@ struct Checker {
       // soft_unify of two arrows only recurses dom/cod (labels aren't checked),
       // so tagging a label here can never false-reject against a known callee.
       TypePtr dom = eng.fresh_var(), r = eng.fresh_var();
-      soft_unify(ft, eng.arrow(dom, r, lk, nm));
+      TypePtr inv = eng.arrow(dom, r, lk, nm);
+      // S575: the ONE `commu_var ()` site of the typer -- a callee whose type
+      // is still a variable (typecore.ml:3292).  A callee that already has an
+      // arrow keeps its own cell; the unification below merges the two.
+      if (I::Engine::repr(ft)->kind == I::Type::Kind::Var) inv->commu = 1;
+      soft_unify(ft, inv);
       TypePtr at = infer_expr_expected(*arg, dom);
       soft_unify_rev(dom, at);
       ft = I::Engine::repr(r);
@@ -15901,8 +15907,10 @@ static cmi::cmiw::TyPtr bridge_ty_body(const TypePtr& t,
       // evaluation order is unspecified (see conv_cmi_ty's Tarrow).
       auto dom = bridge_ty(t->dom, vars, nextvar);
       auto cod = bridge_ty(t->cod, vars, nextvar);
-      return cmi::cmiw::ty_arrow_lbl(std::move(dom), std::move(cod),
-                                     t->arrow_label, t->arrow_lbl);
+      auto r = cmi::cmiw::ty_arrow_lbl(std::move(dom), std::move(cod),
+                                       t->arrow_label, t->arrow_lbl);
+      r->commu_var = !I::Engine::commu_is_ok(t);
+      return r;
     }
     case K::Tuple: {
       std::vector<cmi::cmiw::TyPtr> as;
@@ -17185,6 +17193,7 @@ static cmi::cmiw::TyPtr conv_cmi_ty(const cmi::TypePtr& t0,
       auto dom = conv_cmi_ty(t->dom, vars, nextvar, nodes);
       auto cod = conv_cmi_ty(t->cod, vars, nextvar, nodes);
       r = cmi::cmiw::ty_arrow_lbl(std::move(dom), std::move(cod), t->label_kind, t->label);
+      r->commu_var = t->commu_var;
       break;
     }
     case cmi::TypeExpr::Ttuple: {

@@ -123,6 +123,9 @@ struct TypeExpr {
   int label_kind = 0;
   std::string label;
   TypePtr dom, cod;
+  // Tarrow: the commutable field read `Cvar {Cunknown}` (an arrow an
+  // application invented for a variable-typed callee), not `Cok`.
+  bool commu_var = false;
 
   std::vector<std::pair<std::optional<std::string>, TypePtr>> elems;  // Ttuple
 
@@ -441,6 +444,8 @@ struct Ty {
                                // params keep their written names ('outputValue)
   int label_kind = 0;          // Arrow: 0 Nolabel, 1 Labelled, 2 Optional
   std::string label;           // Arrow: label name (Labelled/Optional)
+  bool commu_var = false;      // Arrow: the commutable is `Cvar {Cunknown}`,
+                               // not `Cok` (see infer.hpp's Type::commu)
   std::vector<std::string> pv_tags;  // Variant: polymorphic-variant tag names;
                                      // Object: method names
   int row_kind = 2;            // Variant: 0 open `[>`, 1 upper `[<`, 2 exact `[ ]`

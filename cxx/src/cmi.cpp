@@ -616,6 +616,9 @@ private:
         decode_arg_label(d.fields.at(0), t);
         t.dom = type(d.fields.at(1));
         t.cod = type(d.fields.at(2));
+        // commutable: `Cok` is the int 0, `Cvar {..}` a one-field block.
+        t.commu_var = d.fields.size() > 3 &&
+                      arena_[d.fields[3]].kind == m::Value::Kind::Block;
         break;
       case 2:  // Ttuple of (string option * type_expr) list
         t.kind = TypeExpr::Ttuple;
@@ -1756,6 +1759,14 @@ o::ValPtr predef_exn_path() {
 // and a Pdot chain decoded verbatim out of another .cmi (that file's blocks).
 // NOENVPATH=1 mints a fresh block and fresh strings for a citation with no
 // provenance, and keys an environment-added component by provenance again.
+// S575: A FUNCTION TYPE AN APPLICATION INVENTED KEEPS ITS COMMUTATION UNKNOWN.
+// The writer's half of the law (the engine's is infer.cpp's commu_off): emit
+// `Cok` for every arrow again.
+bool commu_off() {
+  static const bool off = cppcaml::dbg_env("NOCOMMU") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE575") != nullptr;
+  return off;
+}
 bool envpath_off() {
   static const bool off = cppcaml::dbg_env("NOENVPATH") != nullptr ||
                           cppcaml::dbg_env("NOSHARE569") != nullptr;
@@ -2439,7 +2450,13 @@ struct TyEmit {
                             ? inner
                             : texpr(o::vblock(8, {inner, o::vint(0) /*[]*/}));  // Tpoly
         o::ValPtr c = emit(t->args[1]);
-        return texpr(o::vblock(1, {lbl, dom, c, o::vint(0) /*Cok*/}));  // Tarrow
+        // The commutable (see infer.hpp's Type::commu): `Cok`, or the
+        // `Cvar {Cunknown}` cell Btype.copy_commu mints for every copy of an
+        // unresolved one.
+        o::ValPtr commu = t->commu_var && !commu_off()
+                              ? o::vblock(0, {o::vint(1) /*Cunknown*/})
+                              : o::vint(0) /*Cok*/;
+        return texpr(o::vblock(1, {lbl, dom, c, commu}));  // Tarrow
       }
       case Ty::Tuple: {
         std::vector<o::ValPtr> elems;

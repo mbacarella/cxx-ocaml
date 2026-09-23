@@ -115,7 +115,8 @@ TypePtr Engine::variant_type(std::vector<std::string> tags, std::vector<TypePtr>
 Engine* Engine::trail_owner_ = nullptr;
 
 void Engine::note(const TypePtr& n) {
-  if (window_depth_) trail_.push_back({n, n->kind, n->link, n->level, n->plink});
+  if (window_depth_)
+    trail_.push_back({n, n->kind, n->link, n->level, n->plink, n->commu, n->clink});
 }
 size_t Engine::mark() {
   ++window_depth_;
@@ -129,6 +130,8 @@ void Engine::undo_to(size_t m) {
     e.node->link = e.link;
     e.node->level = e.level;
     e.node->plink = e.plink;
+    e.node->commu = e.commu;
+    e.node->clink = e.clink;
     trail_.pop_back();
   }
   if (--window_depth_ == 0) {
@@ -313,6 +316,14 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
     min_nlevel(a, b);
     unify(a->dom, b->dom);
     unify(a->cod, b->cod);
+    // ctype.ml unify3's Tarrow arm, verbatim: a known commutation wins over an
+    // unknown one, and two unknowns become ONE cell.
+    if (!commu_off()) {
+      bool oa = commu_is_ok(a), ob = commu_is_ok(b);
+      if (!oa && ob) set_commu_ok(a);
+      else if (oa && !ob) set_commu_ok(b);
+      else if (!oa && !ob) link_commu(a, b);
+    }
     return;
   }
   if (a->kind == Type::Kind::Tuple && b->kind == Type::Kind::Tuple) {
@@ -708,6 +719,42 @@ void Engine::unify(const TypePtr& a0, const TypePtr& b0) {
   throw TypeError("cannot unify incompatible types");
 }
 
+// S575: A FUNCTION TYPE AN APPLICATION INVENTED KEEPS ITS COMMUTATION
+// UNKNOWN.  `Tarrow`'s fourth field is a `commutable`: every arrow the source
+// writes, and every one ctype.ml builds, is `Cok`, but when the callee's type
+// is still a variable `Typecore.collect_unknown_apply_args` (typecore.ml:3292)
+// unifies it with `Tarrow (lbl, ty_param, ty_res, commu_var ())` -- the one
+// `commu_var` site in the typer -- so `let f g x = g x` saves g's arrow as
+// `Cvar {Cunknown}` where `let f (g : int -> int) x = g x` saves `Cok`.
+// Unification merges the two (ctype.ml:3419) and `Btype.copy_commu` flattens
+// every copy, so the value a .cmi carries is exactly `Cok` or `Cvar
+// {Cunknown}`.  NOCOMMU=1 writes `Cok` everywhere (the S574 behaviour).
+bool commu_off() {
+  static const bool off = cppcaml::dbg_env("NOCOMMU") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE575") != nullptr;
+  return off;
+}
+TypePtr Engine::commu_rep(TypePtr t) {
+  for (int guard = 0; t && t->clink && guard < 64; ++guard) t = t->clink;
+  return t;
+}
+bool Engine::commu_is_ok(const TypePtr& t) {
+  if (commu_off()) return true;
+  return commu_rep(t)->commu != 1;
+}
+void Engine::set_commu_ok(const TypePtr& t) {
+  TypePtr r = commu_rep(t);
+  if (r->commu != 1) return;
+  note(r);
+  r->commu = 2;
+}
+void Engine::link_commu(const TypePtr& a, const TypePtr& b) {
+  TypePtr ra = commu_rep(a), rb = commu_rep(b);
+  if (ra == rb || ra->commu != 1) return;
+  note(ra);
+  ra->clink = rb;
+}
+
 TypePtr Engine::prov_rep(TypePtr t) {
   for (int guard = 0; t && t->plink && guard < 64; ++guard) t = t->plink;
   return t;
@@ -864,6 +911,9 @@ TypePtr Engine::instantiate(const TypePtr& scheme, bool share_vars) {
       }
       case Type::Kind::Arrow: {
         TypePtr r = arrow(t->dom, t->cod, t->arrow_label, t->arrow_lbl);
+        // Btype.copy_commu: a copy of an unknown commutation is a FRESH
+        // `Cvar {Cunknown}`, and a copy of `Cok` is `Cok`.
+        r->commu = commu_is_ok(t) ? 0 : 1;
         memo[t.get()] = r;
         r->dom = ccopy(t->dom);
         r->cod = ccopy(t->cod);
@@ -930,6 +980,9 @@ TypePtr Engine::instantiate(const TypePtr& scheme, bool share_vars) {
         TypePtr r = (d == repr(t->dom) && c == repr(t->cod) && !ocaml_generic(t))
                       ? t  // no generic inside: share
                       : arrow(std::move(d), std::move(c), t->arrow_label, t->arrow_lbl);
+        // Btype.copy_commu again (see ccopy): a copy of an unknown commutation
+        // is a fresh `Cvar {Cunknown}`; a SHARED node keeps its own cell.
+        if (r != t) r->commu = commu_is_ok(t) ? 0 : 1;
         memo[t.get()] = r;
         return r;
       }
