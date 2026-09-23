@@ -199,6 +199,7 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
   std::ostringstream ss; ss << in.rdbuf();
   std::string mod = module_name(in_path);
   cppcaml::clear_head_cmi_cache();  // a prior unit's fresh .cmi must be visible
+  cppcaml::clear_unit_annot_provs();  // S571: annotation provs are per UNIT
   using clk = std::chrono::steady_clock;
   auto t0 = clk::now();
   auto lap = [&](const char* what, clk::time_point& prev) {
@@ -303,6 +304,7 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
   if (!in) { std::cerr << "c++ocamlc: cannot open " << in_path << '\n'; return 2; }
   std::ostringstream ss; ss << in.rdbuf();
   cppcaml::clear_head_cmi_cache();  // a prior unit's fresh .cmi must be visible
+  cppcaml::clear_unit_annot_provs();  // S571: annotation provs are per UNIT
   try {
     auto sig = cppcaml::parse_signature(ss.str());
     cppcaml::cmi::cmiw::write_cmi(cmi_out, module_name(in_path), cppcaml::signature_to_cmi(sig),

@@ -1566,7 +1566,15 @@ struct CmiShare {
   // object, a global unit's head `Pident (Global u)` per origin (the initial
   // open's root, a unit's own prefix root, a .cmi's unmarshalled block), and
   // a Pdot component string per path object.  NOPROV=1 reverts.
-  std::map<int, o::ValPtr> ppaths;                  // prov -> Pident(Predef)
+  // S571: keyed "<prov>:<stamp>:<name>", not by prov alone.  A prov is one
+  // written source node, and `T with type t := float` SUBSTITUTES the path
+  // that node's lookup built (Subst.type_path hands on the substituting
+  // object), so one node can reach the writer under several names -- six, in
+  // translprim/module_coercion.  Sharing on prov alone gave all six
+  // instantiations the FIRST name's block (`t array` became `int array`
+  // everywhere).  Two citations are the same path object only if they also
+  // name the same type.
+  std::map<std::string, o::ValPtr> ppaths;          // prov:stamp:name -> Pident
   std::map<std::string, o::ValPtr> heads;           // head key -> Pident(Global)
   std::map<std::string, o::ValPtr> pstrs;           // "prov:i:s" -> string
   // S566: "<module stamp>:<member>" -> that member's own ident stamp, so a
@@ -1655,7 +1663,8 @@ o::ValPtr pident_predef(const std::string& name, int stamp, int prov = 0) {
   const ProvInfo& pi = prov_info(prov);
   o::ValPtr id = ident_val(3, name, stamp, pi.cmi);
   if (prov == 0 || no_share()) return pident(id);
-  auto& v = g_share.ppaths[prov];
+  auto& v = g_share.ppaths[std::to_string(prov) + ":" +
+                           std::to_string(stamp) + ":" + name];
   if (!v) v = o::vblock(0, {id});
   return v;
 }

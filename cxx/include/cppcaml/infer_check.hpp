@@ -218,6 +218,10 @@ const std::vector<std::string>& infer_module_dirs();
 // a unit compiled earlier in the same invocation writes a .cmi that a later
 // unit's lookups must see.
 void clear_head_cmi_cache();
+// S571: drop the unit-wide memo that makes ONE written core type ONE path
+// object for a file (see infer_check.cpp).  Called beside the line above, once
+// per compiled unit: a freed parsetree's node addresses are reusable.
+void clear_unit_annot_provs();
 
 // A compilation unit's top-level signature (in source order) as cmiw items --
 // the input to cmi::cmiw::write_cmi.  Single-var `let` bindings -> Sig_value

@@ -137,6 +137,30 @@ std::string cmi_path_str(const cmi::Path& p) {
   return "?";
 }
 
+// S571: ONE WRITTEN CORE TYPE IS ONE PATH OBJECT FOR THE WHOLE FILE.
+// S567 memoised an annotation's prov by parsetree node PER CHECKER, because one
+// pass converts a declaration's core types twice.  But a unit runs several
+// passes over the SAME source nodes, and a module's signature is converted by a
+// Checker of its own (`signature_to_cmi_i` builds one for the verbatim path),
+// so `module rec M : sig val f : int list -> int list end = struct .. end`
+// converted `int list` once for the environment `M.f` is looked up in and again
+// for the EMITTED signature -- two provs, two saved path objects.  ocamlc has
+// one `Env.lookup_type` per written core type for the whole file: `let v = M.f
+// []` instantiates the env's scheme, and Ctype.copy rebuilds the type_expr
+// spine while passing the `Path` through (S567), so `val v : int list` cites the
+// very block the saved `sig` does -- the CODOMAIN's, since that is the part of
+// the arrow the application returns.  So the memo is per UNIT, not per pass.
+// Cleared between units (`clear_unit_annot_provs`, called where the driver
+// clears the head-cmi cache): a freed parsetree's addresses are reusable.
+std::unordered_map<const void*, int>& unit_annot_prov() {
+  static std::unordered_map<const void*, int> m;
+  return m;
+}
+std::unordered_map<const void*, int>& unit_annot_openprov() {
+  static std::unordered_map<const void*, int> m;
+  return m;
+}
+
 // The whole checker, holding the engine and environments.  Every inference step
 // is best-effort: a TypeError (clash, unbound, unsupported) is caught and the
 // node gets a fresh variable, so inference never aborts a file.
@@ -1196,11 +1220,23 @@ struct Checker {
                             cppcaml::dbg_env("NOSHARE567") != nullptr;
     return off;
   }
+  // S571: NOANNOTFILE=1 keeps the memo per Checker (S567's behaviour).
+  static bool annotfile_off() {
+    static const bool off = cppcaml::dbg_env("NOANNOTFILE") != nullptr ||
+                            cppcaml::dbg_env("NOSHARE571") != nullptr;
+    return off;
+  }
+  std::unordered_map<const void*, int>& annot_prov_map() {
+    return annotfile_off() ? annot_prov_ : unit_annot_prov();
+  }
+  std::unordered_map<const void*, int>& annot_openprov_map() {
+    return annotfile_off() ? annot_openprov_ : unit_annot_openprov();
+  }
   TypePtr annot(TypePtr t, int src_dots = 0, const void* key = nullptr) {
     if (!key || annotprov_off()) {
       t->prov = cmi::prov_new_dots(src_dots);
     } else {
-      int& v = annot_prov_[key];
+      int& v = annot_prov_map()[key];
       if (!v) v = cmi::prov_new_dots(src_dots);
       t->prov = v;
     }
@@ -1222,7 +1258,7 @@ struct Checker {
     if (!key || annotprov_off()) {
       t->prov = cmi::prov_new_open(pfx);
     } else {
-      int& v = annot_openprov_[key];
+      int& v = annot_openprov_map()[key];
       if (!v) v = cmi::prov_new_open(pfx);
       t->prov = v;
     }
@@ -14166,6 +14202,14 @@ struct Checker {
 };
 
 }  // namespace
+
+// S571: a unit's written core types own their path objects only for that unit --
+// the next file's parsetree may reuse the freed addresses.  The driver calls
+// this where it clears the head-cmi cache, once per compiled unit.
+void clear_unit_annot_provs() {
+  unit_annot_prov().clear();
+  unit_annot_openprov().clear();
+}
 
 // Register variant constructors from type decls, recursing into local module
 // structures (a flat ctor namespace — best-effort, so `open M; A` resolves).
