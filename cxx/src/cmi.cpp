@@ -1580,12 +1580,30 @@ struct CmiShare {
   // S566: "<module stamp>:<member>" -> that member's own ident stamp, so a
   // `N.t` component can cite the string inside `type t`'s Ident block.
   std::map<std::string, int> mstamps;
+  // S574: A RE-EXPORTED DECLARATION IS ONE DECLARATION.  `include A`, a
+  // functor application's result and a strengthened alias all build their
+  // signature through `Subst`, which rebuilds the type but carries the
+  // declaration's name string (`rename_bound_idents` is `Ident.create_local
+  // (Ident.name id)` -- a fresh stamp over the SAME string), its location
+  // (`Subst.loc` is the identity while locations are kept) and its uid
+  // (copied verbatim), so ocamlc's heap holds ONE name string, ONE Location.t
+  // and ONE Uid block per declaration however many signatures re-export it.
+  // Keyed on the three TOGETHER: same uid, same name, same span = the same
+  // declaration.  A key that agreed on the uid alone would also fuse two
+  // declarations our own numbering happened to give one id (w60's two
+  // functor parameters both declare `module Id : Comparable`), which is a
+  // separate bug and not this law's to paper over.
+  // A CONSTRUCTOR / LABEL goes further: `rename_bound_idents` renames only a
+  // signature's own items, so `Subst.constructor_declaration` carries `cd_id`
+  // (and `ld_id`) THEMSELVES -- the whole Ident block, stamp and all.
+  std::map<std::string, o::ValPtr> decl_strs, decl_locs, decl_uids, decl_ids;
   o::ValPtr none;                                   // Location.none
   o::ValPtr tvar_none, tunivar_none;                // the two shared descs
   o::ValPtr prim_noname;                            // the `""` native name
   void clear() {
     strs.clear(); poss.clear(); ids.clear(); pidents.clear(); none = nullptr;
     ppaths.clear(); heads.clear(); pstrs.clear(); mstamps.clear();
+    decl_strs.clear(); decl_locs.clear(); decl_uids.clear(); decl_ids.clear();
     tvar_none = tunivar_none = nullptr; prim_noname = nullptr;
   }
 };
@@ -1615,6 +1633,42 @@ o::ValPtr shared_str(const std::string& s) {
   if (!v) v = o::vstr(s);
   return v;
 }
+// S574: the sharing key of a declaration (see CmiShare::decl_strs).  Only an
+// `Item` uid names a declaration; Internal is "no uid at all" and
+// Predef/CompUnit name no item.  NOUIDSHARE=1 (alias NOSHARE574=1) writes a
+// fresh name / location / uid block per occurrence again.
+bool uidshare_off() {
+  static const bool off = cppcaml::dbg_env("NOUIDSHARE") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE574") != nullptr;
+  return off;
+}
+std::string pos_key(const cmiw::WPos& p) {
+  return p.fname + "/" + std::to_string(p.file_id) + ":" +
+         std::to_string(p.lnum) + ":" + std::to_string(p.bol) + ":" +
+         std::to_string(p.cnum);
+}
+std::string decl_key(const std::string& name, const cmiw::Loc& l,
+                     const cmiw::Uid& u) {
+  if (u.k != cmiw::Uid::Item || no_share() || uidshare_off()) return "";
+  return u.unit + "/" + std::to_string(u.id) + (u.intf ? "/i/" : "/m/") +
+         name + "@" + (l.ghost ? "g" : pos_key(l.start) + "-" + pos_key(l.end));
+}
+// A declaration's name string, shared with every signature that re-exports
+// that same declaration (S574).
+o::ValPtr decl_name_str(const std::string& n, const std::string& key) {
+  if (key.empty()) return o::vstr(n);
+  auto& v = g_share.decl_strs[key];
+  if (!v) v = o::vstr(n);
+  return v;
+}
+// A constructor's / label's whole Ident block, shared with every signature
+// that re-exports its declaration (S574): `Subst` never renames one.
+o::ValPtr decl_ident(const std::string& n, int stamp, const std::string& key) {
+  if (key.empty()) return o::vblock(0, {o::vstr(n), o::vint(stamp)});
+  auto& v = g_share.decl_ids[key];
+  if (!v) v = o::vblock(0, {o::vstr(n), o::vint(stamp)});
+  return v;
+}
 // S565: an external that names no C stub gets `Primitive.description`'s
 // `prim_native_name = ""` -- primitive.ml's own literal (`init_native_name`
 // :150), one string for the whole process -- so a unit's externals all cite
@@ -1639,10 +1693,11 @@ std::string ident_key(int tag, const std::string& name, int stamp,
          std::to_string(origin);
 }
 o::ValPtr ident_val(int tag, const std::string& name, int stamp,
-                    int origin = 0) {
-  if (no_share()) return o::vblock(tag, {o::vstr(name), o::vint(stamp)});
+                    int origin = 0, o::ValPtr name_val = nullptr) {
+  if (!name_val) name_val = o::vstr(name);
+  if (no_share()) return o::vblock(tag, {name_val, o::vint(stamp)});
   auto& v = g_share.ids[ident_key(tag, name, stamp, origin)];
-  if (!v) v = o::vblock(tag, {o::vstr(name), o::vint(stamp)});
+  if (!v) v = o::vblock(tag, {name_val, o::vint(stamp)});
   return v;
 }
 o::ValPtr pident(const o::ValPtr& id) {  // Path.Pident
@@ -2550,10 +2605,17 @@ o::ValPtr emit_loc(const cmiw::Loc& l) {  // Location.t
   if (l.ghost) return loc_none();
   return o::vblock(0, {emit_pos(l.start), emit_pos(l.end), o::vint(0) /*loc_ghost=false*/});
 }
+// The same declaration's location, wherever it is re-exported (S574).
+o::ValPtr emit_loc(const cmiw::Loc& l, const std::string& key) {
+  if (key.empty()) return emit_loc(l);
+  auto& v = g_share.decl_locs[key];
+  if (!v) v = emit_loc(l);
+  return v;
+}
 // Shape.Uid.t marshal repr.  Constant ctor Internal -> immediate 0.  Non-constant
 // ctors in declaration order: Compilation_unit(0), Item(1), Local_opaque_item(2),
 // Predef(3).  Item's `from` is Unit_info.intf_or_impl = Intf(0) | Impl(1).
-o::ValPtr emit_uid(const cmiw::Uid& u) {
+o::ValPtr emit_uid_raw(const cmiw::Uid& u) {
   switch (u.k) {
     case cmiw::Uid::Item:
       return o::vblock(1, {shared_str(u.unit), o::vint(u.id),
@@ -2563,6 +2625,14 @@ o::ValPtr emit_uid(const cmiw::Uid& u) {
     case cmiw::Uid::Internal: break;
   }
   return o::vint(0);  // Internal
+}
+// One Uid block per declaration (S574): `Subst` copies the uid physically, so
+// every signature that re-exports a declaration cites the same block.
+o::ValPtr emit_uid(const cmiw::Uid& u, const std::string& key = "") {
+  if (key.empty()) return emit_uid_raw(u);
+  auto& v = g_share.decl_uids[key];
+  if (!v) v = emit_uid_raw(u);
+  return v;
 }
 }  // namespace
 
@@ -2879,7 +2949,9 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       std::unordered_map<int, o::ValPtr>& v; std::unordered_map<const Ty*, o::ValPtr>& n;
       ~SwRestore() { if (on) { std::swap(te.vars, v); std::swap(te.shared_nodes, n); } }
     } sw_restore{te, it.sigwide, sw_vars, sw_nodes};
-    auto ident = ident_val(0, it.name, item_stamp[i]);  // Ident.Local
+    const std::string dkey = decl_key(it.name, it.loc, it.uid);  // S574
+    auto ident = ident_val(0, it.name, item_stamp[i], 0,
+                           decl_name_str(it.name, dkey));  // Ident.Local
     if (it.k == SigItem::Value) {
       o::ValPtr valkind;
       if (it.prim.empty() && it.prim_native.empty() && !it.prim_external) {
@@ -2911,8 +2983,8 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                                   repr_val(it.prim_repr_res)});
         valkind = o::vblock(0, {desc});  // Val_prim
       }
-      auto vdesc = o::vblock(0, {te.emit(it.ty), valkind, emit_loc(it.loc),
-                                 o::vint(0) /*[] attrs*/, emit_uid(it.uid)});
+      auto vdesc = o::vblock(0, {te.emit(it.ty), valkind, emit_loc(it.loc, dkey),
+                                 o::vint(0) /*[] attrs*/, emit_uid(it.uid, dkey)});
       sig.push_back(o::vblock(0, {ident, vdesc, o::vint(0) /*Exported*/}));  // Sig_value
     } else if (it.k == SigItem::Module) {
       // Sig_module(id, Mp_present, module_declaration, rec_status, visibility).
@@ -2970,8 +3042,8 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         if (!mty)
           mty = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod, &visible_eng, &modscope, &scopes, it.name, self, item_stamp[i]))});  // Mty_signature
       }
-      auto md = o::vblock(0, {mty, o::vint(0) /*[] attrs*/, emit_loc(it.loc),
-                              emit_uid(it.uid)});  // module_declaration
+      auto md = o::vblock(0, {mty, o::vint(0) /*[] attrs*/, emit_loc(it.loc, dkey),
+                              emit_uid(it.uid, dkey)});  // module_declaration
       sig.push_back(o::vblock(3, {ident, o::vint(presence), md,
                                   o::vint(it.rec_status) /*Trec_*/,
                                   o::vint(0) /*Exported*/}));  // Sig_module
@@ -2994,7 +3066,8 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       if (!mto)
         mto = o::vblock(0, {o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod, &visible_eng, &modscope, &scopes))})});  // Some(Mty_signature)
       auto mtd = o::vblock(0, {mto, o::vint(0) /*attrs*/,
-                               emit_loc(it.loc), emit_uid(it.uid)});  // modtype_declaration
+                               emit_loc(it.loc, dkey),
+                               emit_uid(it.uid, dkey)});  // modtype_declaration
       sig.push_back(o::vblock(4, {ident, mtd, o::vint(0) /*Exported*/}));  // Sig_modtype
     } else if (it.k == SigItem::Exception) {
       // Sig_typext(id, extension_constructor, ext_status, vis).  A plain
@@ -3025,10 +3098,12 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         int lstamp = 290;
         std::vector<o::ValPtr> lds;
         for (auto& l : it.ctors[0].inline_record) {
-          auto lid = o::vblock(0, {o::vstr(l.name), o::vint(l.stamp ? l.stamp : lstamp++)});  // ld_id
+          const std::string lkey = decl_key(l.name, l.loc, l.uid);  // S574
+          auto lid = decl_ident(l.name, l.stamp ? l.stamp : lstamp++, lkey);  // ld_id
           lds.push_back(o::vblock(0, {lid, o::vint(l.mut ? 1 : 0) /*ld_mutable*/,
                                       o::vint(l.atomic ? 1 : 0) /*ld_atomic*/, te.emit(l.ty),
-                                      loc_none(), o::vint(0) /*attrs*/, emit_uid(l.uid)}));
+                                      loc_none(), o::vint(0) /*attrs*/,
+                                      emit_uid(l.uid, lkey)}));
         }
         cargs = o::vblock(1, {o::vlist(lds)});  // Cstr_record
       } else {
@@ -3049,7 +3124,8 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                                   tparams.empty() ? o::vint(0) : o::vlist(tparams),  // ext_type_params
                                   cargs, ret,
                                   o::vint(it.type_private ? 0 : 1) /*ext_private*/,
-                                  loc_none(), o::vint(0) /*ext_attributes*/, emit_uid(it.uid)});
+                                  loc_none(), o::vint(0) /*ext_attributes*/,
+                                  emit_uid(it.uid, dkey)});
       sig.push_back(o::vblock(2, {ident, extcon, o::vint(status),
                                   o::vint(0) /*Exported*/}));  // Sig_typext
     } else if (it.k == SigItem::Class) {
@@ -3546,16 +3622,19 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         int cstamp = 270;
         std::vector<o::ValPtr> cds;
         for (auto& c : it.ctors) {
-          auto cid = o::vblock(0, {o::vstr(c.name), o::vint(c.stamp ? c.stamp : cstamp++)});  // cd_id = Ident.Local
+          const std::string ckey = decl_key(c.name, c.loc, c.uid);  // S574
+          auto cid = decl_ident(c.name, c.stamp ? c.stamp : cstamp++, ckey);  // cd_id
           o::ValPtr cargs;
           if (!c.inline_record.empty()) {  // Cstr_record of label_declaration list
             int lstamp = 290;
             std::vector<o::ValPtr> lds;
             for (auto& l : c.inline_record) {
-              auto lid = o::vblock(0, {o::vstr(l.name), o::vint(l.stamp ? l.stamp : lstamp++)});  // ld_id
+              const std::string lkey = decl_key(l.name, l.loc, l.uid);  // S574
+              auto lid = decl_ident(l.name, l.stamp ? l.stamp : lstamp++, lkey);  // ld_id
               lds.push_back(o::vblock(0, {lid, o::vint(l.mut ? 1 : 0) /*ld_mutable*/,
                                           o::vint(l.atomic ? 1 : 0) /*ld_atomic*/, te.emit(l.ty),
-                                          emit_loc(l.loc), o::vint(0) /*attrs*/, emit_uid(l.uid)}));
+                                          emit_loc(l.loc, lkey), o::vint(0) /*attrs*/,
+                                          emit_uid(l.uid, lkey)}));
             }
             cargs = o::vblock(1, {o::vlist(lds)});  // Cstr_record
           } else {
@@ -3564,8 +3643,8 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
             cargs = o::vblock(0, {args.empty() ? o::vint(0) : o::vlist(args)});  // Cstr_tuple
           }
           auto cres = c.res ? o::vblock(0, {te.emit(c.res)}) : o::vint(0);  // cd_res Some/None
-          cds.push_back(o::vblock(0, {cid, cargs, cres, emit_loc(c.loc),
-                                      o::vint(0) /*attrs*/, emit_uid(c.uid)}));
+          cds.push_back(o::vblock(0, {cid, cargs, cres, emit_loc(c.loc, ckey),
+                                      o::vint(0) /*attrs*/, emit_uid(c.uid, ckey)}));
         }
         // variant_representation: Variant_regular (0) or Variant_unboxed (1),
         // the latter for a single single-field ctor marked `[@@unboxed]`.
@@ -3574,10 +3653,12 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         int lstamp = 280;
         std::vector<o::ValPtr> lds;
         for (auto& l : it.labels) {
-          auto lid = o::vblock(0, {o::vstr(l.name), o::vint(l.stamp ? l.stamp : lstamp++)});  // ld_id
+          const std::string lkey = decl_key(l.name, l.loc, l.uid);  // S574
+          auto lid = decl_ident(l.name, l.stamp ? l.stamp : lstamp++, lkey);  // ld_id
           lds.push_back(o::vblock(0, {lid, o::vint(l.mut ? 1 : 0) /*ld_mutable*/,
                                       o::vint(l.atomic ? 1 : 0) /*ld_atomic*/, te.emit(l.ty),
-                                      emit_loc(l.loc), o::vint(0) /*attrs*/, emit_uid(l.uid)}));
+                                      emit_loc(l.loc, lkey), o::vint(0) /*attrs*/,
+                                      emit_uid(l.uid, lkey)}));
         }
         // record_representation: Record_regular (const 0), Record_float
         // (const 1: every field a float, S561) or, for a single-field
@@ -3617,7 +3698,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           }(),
           [&] { std::vector<o::ValPtr> v(it.params.size(), o::vint(0)); return v.empty() ? o::vint(0) : o::vlist(v); }(),
           o::vint(0), o::vint(0),                      // is_newtype false, expansion_scope 0
-          emit_loc(it.loc),                            // type_loc
+          emit_loc(it.loc, dkey),                      // type_loc
           // type_attributes: Printtyp derives the printed `[@@immediate]` /
           // `[@@immediate64]` from Type_immediacy.of_attributes of THIS field (not
           // from type_immediate), so emit the real attribute when WRITTEN in
@@ -3635,7 +3716,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           // type_unboxed_default: true for an unboxable declaration written
           // without `[@@unboxed]`/`[@@boxed]` (typedecl's `unboxed_default`).
           o::vint(it.type_unboxed_default && !unboxdef_off() ? 1 : 0),
-          emit_uid(it.uid)});                          // type_uid
+          emit_uid(it.uid, dkey)});                    // type_uid
       sig.push_back(o::vblock(1, {ident, tdecl,
                                   // Trec_first, or Trec_next for the `and`
                                   // members of a mutually-recursive group;

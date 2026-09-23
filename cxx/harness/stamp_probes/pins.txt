@@ -745,6 +745,17 @@ xcx_x12 0
 xcx_x13 0
 xcx_x14 0
 xcx_x15 0
+xdcl_a1 0
+xdcl_a2 0
+xdcl_a3 0
+xdcl_b1 0
+xdcl_b2 0
+xdcl_b3 0
+xdcl_c1 0
+xdcl_c2 -1
+xdcl_c3 0
+xdcl_d1 0
+xdcl_d2 0
 xdl_a1 0
 xdl_a2 0
 xdl_a3 0
