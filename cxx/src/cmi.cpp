@@ -1659,6 +1659,25 @@ o::ValPtr pident_predef(const std::string& name, int stamp, int prov = 0) {
   if (!v) v = o::vblock(0, {id});
   return v;
 }
+// S568: AN EXCEPTION'S EXTENDED TYPE IS THE ONE `Predef.path_exn`.  A plain
+// exception is `Text_exception` over `Predef.path_exn` (typedecl.ml's
+// `transl_exception` -> `Predef.path_exn`, and env.ml's initial environment
+// holds the same object), which is a MODULE-LEVEL binding in predef.ml, built
+// once per process and never rebuilt -- unlike a written `exn` annotation,
+// which is an `Env.lookup_type` and so gets its own `Pident` block over the
+// shared Predef ident (S567).  So every exception a unit declares cites ONE
+// path object, block + Ident + name string alike, and a .cmi with two
+// exceptions back-references the second.  NOEXNPATH=1 writes a fresh block.
+bool exnpath_off() {
+  static const bool off = cppcaml::dbg_env("NOEXNPATH") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE568") != nullptr;
+  return off;
+}
+o::ValPtr predef_exn_path() {
+  if (exnpath_off())
+    return o::vblock(0, {o::vblock(3, {o::vstr("exn"), o::vint(7)})});
+  return pident_predef("exn", 7, 0);
+}
 // The head `Pident (Global unit)` of a Pdot chain, by provenance: prov 0 is a
 // fresh block per citation (as before); an annotation's head is the initial
 // open's root when the name routed through it (`List.t`, `ref`), else fresh
@@ -2921,7 +2940,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       }
       if (!group_next) ext_group_params.clear();
       if (!path)
-        path = o::vblock(0, {o::vblock(3, {o::vstr("exn"), o::vint(7)})});  // Pident(Predef exn)
+        path = predef_exn_path();  // Pident(Predef exn)
       o::ValPtr cargs;
       if (!it.ctors.empty() && !it.ctors[0].inline_record.empty()) {
         // Cstr_record inline-record payload (`exception E of {l;..}`): emit the

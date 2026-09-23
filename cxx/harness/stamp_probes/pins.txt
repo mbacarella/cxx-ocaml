@@ -972,6 +972,14 @@ xets_c6 0
 xets_c7 0
 xets_m1 -2
 xets_m2 -2
+xexn_a1 0
+xexn_a2 0
+xexn_a3 0
+xexn_a4 0
+xexn_a5 0
+xexn_a6 0
+xexn_a7 0
+xexn_a8 0
 xfa_a0 0
 xfa_a1 0
 xfa_a2 0
