@@ -5785,6 +5785,15 @@ xtf_n16 0
 xtf_n17 0
 xtf_n18 0
 xtf_n19 0
+xubi_a1 0
+xubi_a2 0
+xubi_a3 0
+xubi_a4 0
+xubi_a5 0
+xubi_a6 0
+xubi_a7 0
+xubi_a8 0
+xubi_a9 0
 xub_a1 0
 xub_a2 0
 xub_a3 0

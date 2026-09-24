@@ -16675,6 +16675,28 @@ static int manifest_immediacy(Checker& ck, const ast::CoreType& m,
 // sibling's `type t` answers by its own kind, or by a manifest whose head
 // is not a sibling (S560).  `rec_sig` is that sibling's signature, whose
 // earlier declarations a bare name reaches.
+// S579: the one argument of an `[@@unboxed]` declaration (a single
+// constructor of one tuple argument or one inline field, or a record of one
+// field), whose representation Typedecl_immediacy.compute_decl reads.
+static const ast::CoreType* unboxed_arg(const TypeDeclaration& d) {
+  if (auto* var = std::get_if<Ptype_variant>(&d.kind)) {
+    if (var->ctors.size() != 1) return nullptr;
+    auto& c = var->ctors[0];
+    if (auto* tup = std::get_if<Pcstr_tuple>(&c.args))
+      return tup->elems.size() == 1 ? &*tup->elems[0] : nullptr;
+    auto& rec = std::get<Pcstr_record>(c.args);
+    return rec.fields.size() == 1 ? &*rec.fields[0].type : nullptr;
+  }
+  if (auto* rec = std::get_if<Ptype_record>(&d.kind))
+    return rec->fields.size() == 1 ? &*rec->fields[0].type : nullptr;
+  return nullptr;
+}
+// NOUNBIMM=1 leaves an `[@@unboxed]` declaration Unknown again.
+static bool unbimm_off() {
+  static const bool off = dbg_env("NOUNBIMM") != nullptr ||
+                          dbg_env("NOSHARE579") != nullptr;
+  return off;
+}
 static int sig_ast_immediacy(Checker& ck, const ast::Signature& items,
                              const std::string& name,
                              const std::vector<cmi::cmiw::SigItem>& out) {
@@ -16702,6 +16724,9 @@ static int sig_ast_immediacy(Checker& ck, const ast::Signature& items,
   }
   if (found->manifest && std::holds_alternative<Ptype_abstract>(found->kind))
     return manifest_immediacy(ck, **found->manifest, out, &items);
+  if (unboxed && !unbimm_off())
+    if (auto* arg = unboxed_arg(*found))
+      return manifest_immediacy(ck, *arg, out, &items);
   return 0;
 }
 static int manifest_immediacy(Checker& ck, const ast::CoreType& m,
@@ -17058,9 +17083,9 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
     int immed_attr = immed;
     // Typedecl_immediacy.compute_decl: a non-unboxed variant whose ctors ALL
     // have empty Cstr_tuple args is Always -- no-arg GADT ctors and the empty
-    // variant included, an inline-record ctor excluded.  (The unboxed
-    // derivation is not modelled; it stays at the attribute value, i.e.
-    // possibly Unknown where ocamlc computes Always.)
+    // variant included, an inline-record ctor excluded.  An `[@@unboxed]`
+    // declaration answers by its argument's representation (S579): the head
+    // declaration's flag, like a manifest's.
     if (auto* var = std::get_if<Ptype_variant>(&d.kind); var && !unboxed) {
       bool all_const = true;
       for (auto& c : var->ctors) {
@@ -17073,6 +17098,8 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
     if (immed == 0 && d.manifest &&
         std::holds_alternative<Ptype_abstract>(d.kind))
       immed = manifest_immediacy(ck, **d.manifest, out);
+    if (immed == 0 && unboxed && !unbimm_off())
+      if (auto* arg = unboxed_arg(d)) immed = manifest_immediacy(ck, *arg, out);
     std::unordered_map<std::string, TypePtr> tvars;        // param name -> engine var
     std::unordered_map<const I::Type*, int> bvars; int nextvar = 0;  // shared across params+manifest
     BridgeCtx dctx;  // ONE bridge context per decl: a non-var node cited from
