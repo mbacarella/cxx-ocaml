@@ -16694,6 +16694,12 @@ static const ast::CoreType* unboxed_arg(const TypeDeclaration& d) {
 namespace stampcount {
 std::string alias_unit(const cmi::Path* p);
 }
+// NOSHADOWTY=1 writes an included type a later declaration shadows again.
+static bool shadowty_off() {
+  static const bool off = dbg_env("NOSHADOWTY") != nullptr ||
+                          dbg_env("NOSHARE582") != nullptr;
+  return off;
+}
 // NODOTINC=1 drops an `include` of a dotted path's items again.
 static bool dotinc_off() {
   static const bool off = dbg_env("NODOTINC") != nullptr ||
@@ -21975,6 +21981,33 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
     });
   }
   out = cmi::cmiw::dedup_shadowed_fields(std::move(out));
+  // Signature_names.simplify (typemod.ml) drops every item a later one of the
+  // same name shadows, not only the field-taking ones: `include X  type t =
+  // float` saves only the second `t`.  A structure cannot declare a type,
+  // module type or class twice by itself, so a repeat here is an include's.
+  if (!shadowty_off()) {
+    auto key = [](const cmi::cmiw::SigItem& it) -> std::string {
+      using K = cmi::cmiw::SigItem;
+      if (it.k == K::Type) return "t:" + it.name;
+      if (it.k == K::Modtype) return "M:" + it.name;
+      if (it.k == K::Class) return "c:" + it.name;
+      return "";
+    };
+    std::unordered_map<std::string, std::size_t> last;
+    bool dup = false;
+    for (std::size_t i = 0; i < out.size(); ++i)
+      if (std::string k = key(out[i]); !k.empty()) {
+        if (last.count(k)) dup = true;
+        last[k] = i;
+      }
+    if (dup) {
+      std::vector<cmi::cmiw::SigItem> ded; ded.reserve(out.size());
+      for (std::size_t i = 0; i < out.size(); ++i)
+        if (std::string k = key(out[i]); k.empty() || last[k] == i)
+          ded.push_back(std::move(out[i]));
+      out = std::move(ded);
+    }
+  }
   g_outer_modtype_asts = saved_mt_asts;
   g_outer_modtype_quals = saved_mt_quals;
   g_enclosing_struct_items = saved_enclosing;
@@ -35499,17 +35532,105 @@ struct Count {
     }
     return false;
   }
+  // ---- WHAT A SHADOWED INCLUDE LEAVES BEHIND (S582) -----------------------
+  // A later declaration may REDECLARE a type, a module, a module type or a
+  // class an `include` brought in, and `Signature_names.simplify` then hides
+  // the included one -- a kind a type can name, so the survivors are all
+  // rebuilt by the same nondep pass a hiding open sets off, and the hidden
+  // ones are not.  The names an include of a structure (or of a local module
+  // bound to one) brings, by namespace; `false` when it cannot be read.
+  bool nd_inc_names(const ModuleExpr& m, std::set<std::string>& ns,
+                    int fuel = 8) const {
+    const ModuleExpr* e = fuel > 0 ? mderef(&m) : nullptr;
+    auto* st = e ? std::get_if<Pmod_structure>(&e->desc) : nullptr;
+    if (!st) return false;
+    for (auto& it : st->items) nd_item_names(it, ns, fuel - 1);
+    return true;
+  }
+  void nd_item_names(const StructureItem& it, std::set<std::string>& ns,
+                     int fuel) const {
+    if (auto* t = std::get_if<Pstr_type>(&it.desc))
+      for (auto& d : t->decls) ns.insert("t:" + d.name.txt);
+    else if (auto* m = std::get_if<Pstr_module>(&it.desc)) {
+      if (m->binding.name.txt) ns.insert("m:" + *m->binding.name.txt);
+    } else if (auto* r = std::get_if<Pstr_recmodule>(&it.desc)) {
+      for (auto& b : r->bindings)
+        if (b.name.txt) ns.insert("m:" + *b.name.txt);
+    } else if (auto* mt = std::get_if<Pstr_modtype>(&it.desc))
+      ns.insert("M:" + mt->name.txt);
+    else if (auto* c = std::get_if<Pstr_class>(&it.desc))
+      for (auto& d : c->decls) ns.insert("c:" + d.name.txt);
+    else if (auto* c = std::get_if<Pstr_class_type>(&it.desc))
+      for (auto& d : c->decls) ns.insert("c:" + d.name.txt);
+    else if (auto* i = std::get_if<Pstr_include>(&it.desc))
+      nd_inc_names(i->expr, ns, fuel);
+  }
+  static bool shadowinc_off() {
+    static const bool off = dbg_env("NOSHADOWTY") != nullptr ||
+                            dbg_env("NOSHARE582") != nullptr;
+    return off;
+  }
+  // The names some later item shadows in an included structure, or empty.
+  std::set<std::string> nd_shadowed(const std::vector<StructureItem>& items) const {
+    std::set<std::string> seen, sh;
+    for (auto& it : items) {
+      std::set<std::string> ns;
+      nd_item_names(it, ns, 8);
+      for (auto& n : ns)
+        if (seen.count(n)) sh.insert(n);
+      if (std::holds_alternative<Pstr_include>(it.desc))
+        seen.insert(ns.begin(), ns.end());
+    }
+    return sh;
+  }
+  // What the nondep pass rebuilds of an included structure's survivors.
+  long long nd_inc_rest(const ModuleExpr& m, const std::set<std::string>& sh,
+                        int fuel = 8) const {
+    const ModuleExpr* e = fuel > 0 ? mderef(&m) : nullptr;
+    auto* st = e ? std::get_if<Pmod_structure>(&e->desc) : nullptr;
+    if (!st) return 0;
+    long long k = 0;
+    for (auto& it : st->items) {
+      if (auto* i = std::get_if<Pstr_include>(&it.desc)) {
+        k += nd_inc_rest(i->expr, sh, fuel - 1);
+        continue;
+      }
+      std::set<std::string> ns;
+      nd_item_names(it, ns, 0);
+      bool hidden = false;
+      for (auto& n : ns) hidden |= sh.count(n) > 0;
+      if (!hidden) k += nd_str_item(it);
+    }
+    return k;
+  }
   // The whole charge for one structure: nothing at all unless it holds a
-  // generalized open that hides a kind a type can name.
+  // generalized open that hides a kind a type can name, or an include one of
+  // whose items a later one shadows.
   long long nd_open(const std::vector<StructureItem>& items) const {
     if (ndopen_off()) return 0;
     bool hides = false;
     for (auto& it : items)
       if (auto* o = std::get_if<Pstr_open>(&it.desc))
         if (nd_hides(o->expr)) { hides = true; break; }
-    if (!hides) return 0;
+    std::set<std::string> sh;
+    if (!shadowinc_off()) sh = nd_shadowed(items);
+    if (!hides && sh.empty()) return 0;
     long long k = 0;
-    for (auto& it : items) k += nd_str_item(it);
+    for (std::size_t i = 0; i < items.size(); ++i) {
+      auto* inc = std::get_if<Pstr_include>(&items[i].desc);
+      if (sh.empty() || !inc) {
+        k += nd_str_item(items[i]);
+        continue;
+      }
+      // Only what no LATER item redeclares survives to be rebuilt.
+      std::set<std::string> later;
+      for (std::size_t j = i + 1; j < items.size(); ++j)
+        nd_item_names(items[j], later, 8);
+      std::set<std::string> gone;
+      for (auto& n : later)
+        if (sh.count(n)) gone.insert(n);
+      k += nd_inc_rest(inc->expr, gone);
+    }
     return k;
   }
 
