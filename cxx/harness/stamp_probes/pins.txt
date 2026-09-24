@@ -4995,6 +4995,14 @@ xrw_d2 -102
 xrw_d3 0
 xrw_d4 0
 xrw_d5 0
+xsal_a1 0
+xsal_a2 0
+xsal_a3 0
+xsal_a4 0
+xsal_a5 0
+xsal_a6 0
+xsal_a7 75
+xsal_a8 0
 xsa_a01 0
 xsa_a02 0
 xsa_a03 0

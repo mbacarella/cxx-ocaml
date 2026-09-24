@@ -1802,6 +1802,13 @@ bool reprshare_off() {
                           cppcaml::dbg_env("NOSHARE578") != nullptr;
   return off;
 }
+// S580: an alias of a stdlib member cites it through the initial open.
+// NOSTDALIAS=1 writes the bare unit global again.
+bool stdalias_off() {
+  static const bool off = cppcaml::dbg_env("NOSTDALIAS") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE580") != nullptr;
+  return off;
+}
 bool envpath_off() {
   static const bool off = cppcaml::dbg_env("NOENVPATH") != nullptr ||
                           cppcaml::dbg_env("NOSHARE569") != nullptr;
@@ -3077,6 +3084,20 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           // A LOCAL sibling head (`include M` strengthened `module Set =
           // M.Set`): Pident(Local{M, stamp}), not a unit global.
           path = pident_local(head, lm->second);
+        } else if (stdlib_alias_module(head) && !stdalias_off()) {
+          // A stdlib member (`module M = Gc.Memprof`) resolves through the
+          // initial `open Stdlib`: `IdTbl.find_name` gives `Pdot (root,
+          // name)` over the open's root and the looked-up string (S580).
+          referenced.emplace(head, false);
+          o::ValPtr root;
+          if (no_share()) {
+            root = o::vblock(0, {o::vblock(2, {o::vstr("Stdlib")})});
+          } else {
+            auto& v = g_share.heads["open:Stdlib"];
+            if (!v) v = o::vblock(0, {o::vblock(2, {o::vstr("Stdlib")})});
+            root = v;
+          }
+          path = o::vblock(1, {root, o::vstr(head)});  // Pdot(Stdlib, head)
         } else {
           referenced.emplace(head, false);
           path = o::vblock(0, {o::vblock(2, {o::vstr(head)})});  // Pident(Global head)
