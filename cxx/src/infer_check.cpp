@@ -16536,14 +16536,65 @@ static std::vector<int> compute_decl_variance(
 
 static cmi::cmiw::Loc conv_loc(const ast::Location& l);  // defined below
 // val_attributes / type_attributes as written (S577) -- only when every
-// attribute's payload is `PStr []`: a real payload would need the parsetree
-// marshalled, so the writer keeps its old default for it.
+// attribute's payload is `PStr []` or one expression payload_expr handles
+// (S589); for any other payload the writer keeps its old default.
+// A payload expression the writer can marshal (S589): an unqualified
+// identifier, a string or integer constant, or an unlabelled application of
+// those -- none carrying attributes of its own.  A nested application is
+// parenthesized, and the pexp_loc_stack that leaves is not modelled.
+static bool payload_expr(const ast::Expression& e, cmi::cmiw::PExpr& out,
+                         bool nested = false) {
+  if (!e.attrs.empty()) return false;
+  out.loc = conv_loc(e.loc);
+  if (auto* id = std::get_if<ast::Pexp_ident>(&e.desc)) {
+    auto* l = std::get_if<ast::Lident>(&id->id.txt.v);
+    if (!l) return false;
+    out.k = 'I'; out.s = l->name; out.cloc = conv_loc(id->id.loc);
+    return true;
+  }
+  if (auto* c = std::get_if<ast::Pexp_constant>(&e.desc)) {
+    out.cloc = conv_loc(c->c.loc);
+    if (auto* st = std::get_if<ast::Pconst_string>(&c->c.desc)) {
+      out.k = 'S'; out.s = st->s; out.delim = st->delim;
+      out.sloc = conv_loc(st->strloc);
+      return true;
+    }
+    if (auto* n = std::get_if<ast::Pconst_integer>(&c->c.desc)) {
+      out.k = 'N'; out.s = n->value; out.suffix = n->suffix;
+      return true;
+    }
+    return false;
+  }
+  if (auto* ap = std::get_if<ast::Pexp_apply>(&e.desc); ap && !nested) {
+    out.k = 'A';
+    out.kids.resize(ap->args.size() + 1);
+    if (!payload_expr(*ap->fn, out.kids[0], true)) return false;
+    for (std::size_t i = 0; i < ap->args.size(); ++i)
+      if (!std::holds_alternative<ast::Nolabel>(ap->args[i].first) ||
+          !payload_expr(*ap->args[i].second, out.kids[i + 1], true))
+        return false;
+    return true;
+  }
+  return false;
+}
 static std::optional<std::vector<cmi::cmiw::Attr>> empty_payload_attrs(
     const ast::Attributes& as) {
   std::vector<cmi::cmiw::Attr> v;
   for (auto& a : as) {
-    if (!a.payload.empty() || a.typ || a.pat) return std::nullopt;
-    v.push_back({a.name, conv_loc(a.name_loc), conv_loc(a.loc)});
+    if (a.typ || a.pat) return std::nullopt;
+    cmi::cmiw::Attr w{a.name, conv_loc(a.name_loc), conv_loc(a.loc), nullptr};
+    if (!a.payload.empty()) {
+      // A docstring's attachment and locations are not ocamlc's yet.
+      if (cmi::payload_off() || a.payload.size() != 1 ||
+          a.name == "ocaml.doc" || a.name == "ocaml.text")
+        return std::nullopt;
+      auto* ev = std::get_if<ast::Pstr_eval>(&a.payload[0].desc);
+      if (!ev || !ev->attrs.empty()) return std::nullopt;
+      auto pe = std::make_shared<cmi::cmiw::PExpr>();
+      if (!payload_expr(*ev->e, *pe)) return std::nullopt;
+      w.pl = pe;
+    }
+    v.push_back(std::move(w));
   }
   return v;
 }

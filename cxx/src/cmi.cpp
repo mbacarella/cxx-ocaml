@@ -1525,6 +1525,14 @@ bool attrpos_off() {
   return off;
 }
 
+// S589: an attribute whose payload is one simple expression is written with
+// it.  NOPAYLOAD=1 drops the whole attribute list again, as before.
+bool payload_off() {
+  static const bool off = cppcaml::dbg_env("NOPAYLOAD") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE589") != nullptr;
+  return off;
+}
+
 namespace cmiw {
 
 namespace o = omarshal;
@@ -2705,14 +2713,44 @@ o::ValPtr emit_loc(const cmiw::Loc& l, const std::string& key) {
   if (!v) v = emit_loc(l);
   return v;
 }
+// A payload expression (S589): `{pexp_desc; pexp_loc; pexp_loc_stack = [];
+// pexp_attributes = []}`.  Pexp_ident is tag 0 (`{txt = Lident s; loc}`),
+// Pexp_constant tag 1 (`{pconst_desc; pconst_loc}`), Pexp_apply tag 4.
+o::ValPtr emit_pexpr(const cmiw::PExpr& e) {
+  o::ValPtr d;
+  if (e.k == 'I') {
+    d = o::vblock(0, {o::vblock(0, {o::vblock(0, {o::vstr(e.s)}), emit_loc(e.cloc)})});
+  } else if (e.k == 'S' || e.k == 'N') {
+    auto opt = [](o::ValPtr x) { return o::vblock(0, {x}); };
+    o::ValPtr cd =
+        e.k == 'S'
+            ? o::vblock(2, {o::vstr(e.s), emit_loc(e.sloc),
+                            e.delim ? opt(o::vstr(*e.delim)) : o::vint(0)})
+            : o::vblock(0, {o::vstr(e.s),
+                            e.suffix ? opt(o::vint((unsigned char)*e.suffix)) : o::vint(0)});
+    d = o::vblock(1, {o::vblock(0, {cd, emit_loc(e.cloc)})});
+  } else {
+    std::vector<o::ValPtr> args;
+    for (std::size_t i = 1; i < e.kids.size(); ++i)
+      args.push_back(o::vblock(0, {o::vint(0) /*Nolabel*/, emit_pexpr(e.kids[i])}));
+    d = o::vblock(4, {emit_pexpr(e.kids[0]), o::vlist(args)});
+  }
+  return o::vblock(0, {d, emit_loc(e.loc), o::vint(0), o::vint(0)});
+}
 // A declaration's attribute list (S577): each `{attr_name = {txt; loc};
-// attr_payload = PStr []; attr_loc}`, in source order.
+// attr_payload = PStr []; attr_loc}`, in source order.  A payload's one item
+// is `{pstr_desc = Pstr_eval (e, []); pstr_loc = e.pexp_loc}` (S589).
 o::ValPtr emit_attrs(const std::vector<cmiw::Attr>& as) {
   std::vector<o::ValPtr> v;
-  for (auto& a : as)
-    v.push_back(o::vblock(0, {o::vblock(0, {o::vstr(a.name), emit_loc(a.name_loc)}),
-                              o::vblock(0, {o::vint(0)}),  // PStr []
-                              emit_loc(a.loc)}));
+  for (auto& a : as) {
+    auto name = o::vblock(0, {o::vstr(a.name), emit_loc(a.name_loc)});
+    o::ValPtr str = o::vint(0);
+    if (a.pl) {
+      auto e = emit_pexpr(*a.pl);
+      str = o::vlist({o::vblock(0, {o::vblock(0, {e, o::vint(0)}), e->fields[1]})});
+    }
+    v.push_back(o::vblock(0, {name, o::vblock(0, {str}), emit_loc(a.loc)}));
+  }
   return v.empty() ? o::vint(0) : o::vlist(v);
 }
 // A label's / constructor's / module's / module type's / extension

@@ -101,6 +101,7 @@ int cmi_id_of(const std::string& filepath);
 bool sep_off();   // NOSEP=1: every parameter written `Ind` (S576)
 bool attr_off();  // NOATTR=1: attribute lists written as before (S577)
 bool attrpos_off();  // NOATTRPOS=1: no label/ctor/module attributes (S588)
+bool payload_off();  // NOPAYLOAD=1: an attribute with a payload is not written (S589)
 bool prov_off();  // NOPROV=1: the writer ignores provenance (S554 behaviour)
 // NONODEID=1: the saved graph keeps one writer node per OCCURRENCE (S555
 // behaviour) -- no per-use instantiate copies, no node memo across a
@@ -503,9 +504,25 @@ struct Import { std::string name; std::string crc; };
 // One signature item, in source order.  A Type item emits Sig_type (it takes no
 // runtime field, so it doesn't shift the value field layout the .cmo expects);
 // a Value item emits Sig_value.
-// A declaration's attribute with an EMPTY `PStr []` payload (`[@@noalloc]`,
-// `[@@immediate]`, ..): its name, attr_name.loc and attr_loc (S577).
-struct Attr { std::string name; Loc name_loc, loc; };
+// The one expression of an attribute's `PStr [Pstr_eval (e, [])]` payload
+// (S589): an identifier `never` (I), a string "x" (S), an integer 3 (N) or an
+// application `foo "x"` (A: kids[0] applied to the rest, unlabelled).  `loc`
+// is pexp_loc; `cloc` the ident's / constant's own location, `sloc` a
+// string's contents.
+struct PExpr {
+  char k = 'I';
+  std::string s;  // I: the name, S: the contents, N: the digits
+  std::optional<std::string> delim;  // S: `{id|..|id}`
+  std::optional<char> suffix;        // N: `3l`
+  Loc loc, cloc, sloc;
+  std::vector<PExpr> kids;
+};
+// A declaration's attribute: its name, attr_name.loc and attr_loc (S577), and
+// its payload's expression when it has one (S589; `PStr []` otherwise).
+struct Attr {
+  std::string name; Loc name_loc, loc;
+  std::shared_ptr<PExpr> pl;
+};
 struct Label {  // record field
   std::string name; bool mut = false; bool atomic = false; TyPtr ty; Uid uid; Loc loc;
   int stamp = 0;  // ld_id's stamp, the one typing created (0: the writer's placeholder)
