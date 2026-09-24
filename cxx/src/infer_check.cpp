@@ -16694,6 +16694,12 @@ static const ast::CoreType* unboxed_arg(const TypeDeclaration& d) {
 namespace stampcount {
 std::string alias_unit(const cmi::Path* p);
 }
+// NOTYPEOFMT=1 leaves a `module type S = module type of <unit or path>` out.
+static bool typeofmt_off() {
+  static const bool off = dbg_env("NOTYPEOFMT") != nullptr ||
+                          dbg_env("NOSHARE583") != nullptr;
+  return off;
+}
 // NOSHADOWTY=1 writes an included type a later declaration shadows again.
 static bool shadowty_off() {
   static const bool off = dbg_env("NOSHADOWTY") != nullptr ||
@@ -21181,12 +21187,24 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         if (auto* pt = std::get_if<Pmty_typeof>(&mt.desc)) {
           if (auto* ms = std::get_if<Pmod_structure>(&pt->me->desc))
             return infer_signature(ms->items);
-          if (auto* mi = std::get_if<Pmod_ident>(&pt->me->desc))
+          if (auto* mi = std::get_if<Pmod_ident>(&pt->me->desc)) {
             if (auto* l = std::get_if<Lident>(&mi->id.txt.v))
               for (auto& si : out)
                 if (si.k == cmi::cmiw::SigItem::Module && si.name == l->name &&
                     !si.is_functor && si.alias.empty())
                   return si.sub;
+            // A unit (`module type of Option`), a dotted path or an alias:
+            // resolved the way an ascription's `module type of` is --
+            // without it the whole module type was left out.
+            if (!typeofmt_off() &&
+                !std::holds_alternative<Lapply>(mi->id.txt.v)) {
+              auto t = resolve_typeof_path(&out, lid_full(mi->id.txt));
+              if (t.ok) {
+                if (t.through_alias) strengthen_abstract(t.items, t.norm, false);
+                return std::move(t.items);
+              }
+            }
+          }
           return std::nullopt;
         }
         if (auto* pw = std::get_if<Pmty_with>(&mt.desc)) {

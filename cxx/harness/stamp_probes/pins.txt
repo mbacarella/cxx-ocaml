@@ -5814,6 +5814,15 @@ xtf_n16 0
 xtf_n17 0
 xtf_n18 0
 xtf_n19 0
+xtmt_a1 0
+xtmt_a2 0
+xtmt_a3 0
+xtmt_a4 -10
+xtmt_a5 -2
+xtmt_a6 0
+xtmt_a7 0
+xtmt_a8 -10
+xtmt_a9 -4
 xubi_a1 0
 xubi_a2 0
 xubi_a3 0
