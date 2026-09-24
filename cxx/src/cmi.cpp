@@ -1533,6 +1533,14 @@ bool payload_off() {
   return off;
 }
 
+// S590: a docstring is dropped from a saved attribute list, as Subst.attrs
+// does without -keep-docs.  NODOCFILT=1 drops the whole list again.
+bool docfilt_off() {
+  static const bool off = cppcaml::dbg_env("NODOCFILT") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE590") != nullptr;
+  return off;
+}
+
 namespace cmiw {
 
 namespace o = omarshal;

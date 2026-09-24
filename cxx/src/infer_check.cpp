@@ -16582,6 +16582,10 @@ static std::optional<std::vector<cmi::cmiw::Attr>> empty_payload_attrs(
   std::vector<cmi::cmiw::Attr> v;
   for (auto& a : as) {
     if (a.typ || a.pat) return std::nullopt;
+    // Subst.attrs drops a docstring when saving (no -keep-docs).
+    if ((a.name == "ocaml.doc" || a.name == "ocaml.text" || a.name == "doc" ||
+         a.name == "text") && !cmi::docfilt_off())
+      continue;
     cmi::cmiw::Attr w{a.name, conv_loc(a.name_loc), conv_loc(a.loc), nullptr};
     if (!a.payload.empty()) {
       // A docstring's attachment and locations are not ocamlc's yet.

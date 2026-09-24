@@ -827,6 +827,17 @@ xdl_b5 0
 xdl_b6 0
 xdl_b7 0
 xdl_b8 0
+xdoc_a1 0
+xdoc_a2 0
+xdoc_a3 0
+xdoc_a4 0
+xdoc_a5 0
+xdoc_a6 0
+xdoc_b1 0
+xdoc_b2 0
+xdoc_c1 0
+xdoc_c2 0
+xdoc_c3 0
 xdr_a1 0
 xdr_a2 0
 xdr_a3 0
