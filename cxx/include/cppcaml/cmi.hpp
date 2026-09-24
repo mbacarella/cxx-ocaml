@@ -100,6 +100,7 @@ const ProvInfo& prov_info(int prov);
 int cmi_id_of(const std::string& filepath);
 bool sep_off();   // NOSEP=1: every parameter written `Ind` (S576)
 bool attr_off();  // NOATTR=1: attribute lists written as before (S577)
+bool attrpos_off();  // NOATTRPOS=1: no label/ctor/module attributes (S588)
 bool prov_off();  // NOPROV=1: the writer ignores provenance (S554 behaviour)
 // NONODEID=1: the saved graph keeps one writer node per OCCURRENCE (S555
 // behaviour) -- no per-use instantiate copies, no node memo across a
@@ -502,9 +503,13 @@ struct Import { std::string name; std::string crc; };
 // One signature item, in source order.  A Type item emits Sig_type (it takes no
 // runtime field, so it doesn't shift the value field layout the .cmo expects);
 // a Value item emits Sig_value.
+// A declaration's attribute with an EMPTY `PStr []` payload (`[@@noalloc]`,
+// `[@@immediate]`, ..): its name, attr_name.loc and attr_loc (S577).
+struct Attr { std::string name; Loc name_loc, loc; };
 struct Label {  // record field
   std::string name; bool mut = false; bool atomic = false; TyPtr ty; Uid uid; Loc loc;
   int stamp = 0;  // ld_id's stamp, the one typing created (0: the writer's placeholder)
+  std::optional<std::vector<Attr>> attrs;  // ld_attributes, as SigItem::attrs (S588)
 };
 // One member of a class body: a val (mut/virt) or a method (priv/virt).
 // What Typecore.type_approx materialized of a method's type in the class's
@@ -534,10 +539,8 @@ struct Ctor {
   Uid uid;
   Loc loc;
   int stamp = 0;  // cd_id's stamp, the one typing created (0: the writer's placeholder)
+  std::optional<std::vector<Attr>> attrs;  // cd_attributes, as SigItem::attrs (S588)
 };
-// A declaration's attribute with an EMPTY `PStr []` payload (`[@@noalloc]`,
-// `[@@immediate]`, ..): its name, attr_name.loc and attr_loc (S577).
-struct Attr { std::string name; Loc name_loc, loc; };
 struct SigItem;
 struct SigItem {
   enum K { Value, Type, Module, Modtype, Exception, Class } k = Value;
@@ -654,7 +657,9 @@ struct SigItem {
   // Typedecl_separability computed or a read .cmi carried.  Empty = Ind for
   // every param (the writer's default).
   std::vector<int> type_separability;
-  // Value / Type: val_attributes / type_attributes as written, set only when
+  // Value / Type / Module / Modtype / Exception: val_attributes /
+  // type_attributes / md_attributes / mtd_attributes / ext_attributes as
+  // written, set only when
   // EVERY attribute has an empty payload (nullopt = not modelled; the writer
   // then keeps its old default).
   std::optional<std::vector<Attr>> attrs;

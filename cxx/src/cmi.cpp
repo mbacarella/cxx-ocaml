@@ -1516,6 +1516,15 @@ std::string print_type_decl(const TypeDecl& d) {
 }
 
 // ---- .cmi WRITER ---------------------------------------------------------
+// S588: a label's, a constructor's, a module's, a module type's and an
+// extension constructor's attributes are written too.  NOATTRPOS=1 writes
+// their empty lists again.
+bool attrpos_off() {
+  static const bool off = cppcaml::dbg_env("NOATTRPOS") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE588") != nullptr;
+  return off;
+}
+
 namespace cmiw {
 
 namespace o = omarshal;
@@ -2706,6 +2715,11 @@ o::ValPtr emit_attrs(const std::vector<cmiw::Attr>& as) {
                               emit_loc(a.loc)}));
   return v.empty() ? o::vint(0) : o::vlist(v);
 }
+// A label's / constructor's / module's / module type's / extension
+// constructor's attribute list (S588): `[]` when not modelled.
+o::ValPtr emit_attrs(const std::optional<std::vector<cmiw::Attr>>& as) {
+  return as && !attrpos_off() ? emit_attrs(*as) : o::vint(0);
+}
 // Shape.Uid.t marshal repr.  Constant ctor Internal -> immediate 0.  Non-constant
 // ctors in declaration order: Compilation_unit(0), Item(1), Local_opaque_item(2),
 // Predef(3).  Item's `from` is Unit_info.intf_or_impl = Intf(0) | Impl(1).
@@ -3166,7 +3180,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         if (!mty)
           mty = o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod, &visible_eng, &modscope, &scopes, it.name, self, item_stamp[i]))});  // Mty_signature
       }
-      auto md = o::vblock(0, {mty, o::vint(0) /*[] attrs*/, emit_loc(it.loc, dkey),
+      auto md = o::vblock(0, {mty, emit_attrs(it.attrs), emit_loc(it.loc, dkey),
                               emit_uid(it.uid, dkey)});  // module_declaration
       sig.push_back(o::vblock(3, {ident, o::vint(presence), md,
                                   o::vint(it.rec_status) /*Trec_*/,
@@ -3189,7 +3203,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       }
       if (!mto)
         mto = o::vblock(0, {o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod, &visible_eng, &modscope, &scopes))})});  // Some(Mty_signature)
-      auto mtd = o::vblock(0, {mto, o::vint(0) /*attrs*/,
+      auto mtd = o::vblock(0, {mto, emit_attrs(it.attrs),
                                emit_loc(it.loc, dkey),
                                emit_uid(it.uid, dkey)});  // modtype_declaration
       sig.push_back(o::vblock(4, {ident, mtd, o::vint(0) /*Exported*/}));  // Sig_modtype
@@ -3226,7 +3240,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           auto lid = decl_ident(l.name, l.stamp ? l.stamp : lstamp++, lkey);  // ld_id
           lds.push_back(o::vblock(0, {lid, o::vint(l.mut ? 1 : 0) /*ld_mutable*/,
                                       o::vint(l.atomic ? 1 : 0) /*ld_atomic*/, te.emit(l.ty),
-                                      loc_none(), o::vint(0) /*attrs*/,
+                                      loc_none(), emit_attrs(l.attrs),
                                       emit_uid(l.uid, lkey)}));
         }
         cargs = o::vblock(1, {o::vlist(lds)});  // Cstr_record
@@ -3248,7 +3262,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                                   tparams.empty() ? o::vint(0) : o::vlist(tparams),  // ext_type_params
                                   cargs, ret,
                                   o::vint(it.type_private ? 0 : 1) /*ext_private*/,
-                                  loc_none(), o::vint(0) /*ext_attributes*/,
+                                  loc_none(), emit_attrs(it.attrs),
                                   emit_uid(it.uid, dkey)});
       sig.push_back(o::vblock(2, {ident, extcon, o::vint(status),
                                   o::vint(0) /*Exported*/}));  // Sig_typext
@@ -3757,7 +3771,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
               auto lid = decl_ident(l.name, l.stamp ? l.stamp : lstamp++, lkey);  // ld_id
               lds.push_back(o::vblock(0, {lid, o::vint(l.mut ? 1 : 0) /*ld_mutable*/,
                                           o::vint(l.atomic ? 1 : 0) /*ld_atomic*/, te.emit(l.ty),
-                                          emit_loc(l.loc, lkey), o::vint(0) /*attrs*/,
+                                          emit_loc(l.loc, lkey), emit_attrs(l.attrs),
                                           emit_uid(l.uid, lkey)}));
             }
             cargs = o::vblock(1, {o::vlist(lds)});  // Cstr_record
@@ -3768,7 +3782,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           }
           auto cres = c.res ? o::vblock(0, {te.emit(c.res)}) : o::vint(0);  // cd_res Some/None
           cds.push_back(o::vblock(0, {cid, cargs, cres, emit_loc(c.loc, ckey),
-                                      o::vint(0) /*attrs*/, emit_uid(c.uid, ckey)}));
+                                      emit_attrs(c.attrs), emit_uid(c.uid, ckey)}));
         }
         // variant_representation: Variant_regular (0) or Variant_unboxed (1),
         // the latter for a single single-field ctor marked `[@@unboxed]`.
@@ -3781,7 +3795,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           auto lid = decl_ident(l.name, l.stamp ? l.stamp : lstamp++, lkey);  // ld_id
           lds.push_back(o::vblock(0, {lid, o::vint(l.mut ? 1 : 0) /*ld_mutable*/,
                                       o::vint(l.atomic ? 1 : 0) /*ld_atomic*/, te.emit(l.ty),
-                                      emit_loc(l.loc, lkey), o::vint(0) /*attrs*/,
+                                      emit_loc(l.loc, lkey), emit_attrs(l.attrs),
                                       emit_uid(l.uid, lkey)}));
         }
         // record_representation: Record_regular (const 0), Record_float

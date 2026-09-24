@@ -1,0 +1,1 @@
+module N = List [@@foo]

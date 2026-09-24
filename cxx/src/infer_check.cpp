@@ -16547,6 +16547,13 @@ static std::optional<std::vector<cmi::cmiw::Attr>> empty_payload_attrs(
   }
   return v;
 }
+// ld_attributes / cd_attributes / ext_attributes / md_attributes /
+// mtd_attributes as written (S588), under the same empty-payload rule.
+static std::optional<std::vector<cmi::cmiw::Attr>> item_attrs(
+    const ast::Attributes& as) {
+  if (cmi::attrpos_off()) return std::nullopt;
+  return empty_payload_attrs(as);
+}
 
 // --- what Typecore.type_approx materializes of a method's type ---------------
 // The class's first pass runs type_approx over each concrete method's body
@@ -17348,6 +17355,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
       std::vector<cmi::cmiw::Ctor> ctors;
       for (auto& c : var->ctors) {
         cmi::cmiw::Ctor cc; cc.name = c.name.txt; cc.loc = conv_loc(c.loc);
+        cc.attrs = item_attrs(c.attrs);
         // The checker's registered scheme for this constructor: its argument
         // (and GADT result) nodes carry the path objects a value built or
         // matched with the constructor cites (`f (A n) = n` cites A's
@@ -17383,6 +17391,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
             lab.name = f.name.txt; lab.loc = conv_loc(f.loc);
             lab.mut = (f.mut == MutableFlag::Mutable);
         for (auto& la : f.attrs) if (la.name == "atomic" || la.name == "ocaml.atomic") lab.atomic = true;
+        lab.attrs = item_attrs(f.attrs);
             lab.ty = bridge_label_ty(ck, *f.type, tvars, bvars, nextvar, &dctx);
             cc.inline_record.push_back(std::move(lab));
           }
@@ -17413,6 +17422,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
         lab.name = f.name.txt; lab.loc = conv_loc(f.loc);
         lab.mut = (f.mut == MutableFlag::Mutable);
         for (auto& la : f.attrs) if (la.name == "atomic" || la.name == "ocaml.atomic") lab.atomic = true;
+        lab.attrs = item_attrs(f.attrs);
         lab.ty = bridge_label_ty(ck, *f.type, tvars, bvars, nextvar, &dctx);
         labels.push_back(std::move(lab));
       }
@@ -18299,6 +18309,7 @@ static cmi::cmiw::SigItem exn_sigitem(Checker& ck, const std::string& name,
       lab.name = f.name.txt;
       lab.mut = (f.mut == MutableFlag::Mutable);
         for (auto& la : f.attrs) if (la.name == "atomic" || la.name == "ocaml.atomic") lab.atomic = true;
+        lab.attrs = item_attrs(f.attrs);
       lab.ty = bridge_label_ty(ck, *f.type, tvars, bvars, nextvar);
       labels.push_back(std::move(lab));
     }
@@ -19256,6 +19267,7 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
         if (auto* pid = std::get_if<Pmty_ident>(&md.type->desc))
           mi.modtype_ref = lid_full(pid->id.txt);
         mi.rec_status = rs; rs = 2;
+        mi.attrs = item_attrs(md.attrs);
         if (!recimm_off()) mi.loc = conv_loc(md.loc);  // its own span (S560)
         out.push_back(std::move(mi));
       }
@@ -19354,6 +19366,7 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
       }
       if (out.size() > mbefore) {
         out.back().loc = conv_loc(it.loc);
+        out.back().attrs = item_attrs(pm->md.attrs);
         // `module M : S with type t := ..`: the destructive subst relocates
         // every member of M to the ascription's location.
         if (pm->md.type && with_has_destructive_subst(*pm->md.type))
@@ -19390,6 +19403,7 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
       }
       if (out.size() > mtbefore) {
         out.back().loc = conv_loc(it.loc);
+        out.back().attrs = item_attrs(pmt->attrs);
         if (pmt->type && with_has_destructive_subst(*pmt->type))
           relocate_sig_locs(out.back().sub, conv_loc(pmt->type->loc));
       }
@@ -19480,8 +19494,10 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
       // shifted peek_val -> the C parse engine read the wrong table fields).
       const ExtensionConstructor& ec = pe->exn.ctor;
       if (!ec.name.txt.empty())
-        if (auto* pd = std::get_if<Pext_decl>(&ec.kind))
+        if (auto* pd = std::get_if<Pext_decl>(&ec.kind)) {
           out.push_back(exn_sigitem(ck, ec.name.txt, *pd));
+          out.back().attrs = item_attrs(ec.attrs);
+        }
     } else if (auto* px = std::get_if<Psig_typext>(&it.desc)) {
       // `type exn += Error of t`: each extension constructor TAKES A FIELD (like
       // an exception).  persistent_env.mli's `type exn += private Error` was
@@ -19492,11 +19508,13 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
         if (ec.name.txt.empty()) continue;
         if (auto* pd = std::get_if<Pext_decl>(&ec.kind)) {
           out.push_back(exn_sigitem(ck, ec.name.txt, *pd, &px->ext, first));
+          out.back().attrs = item_attrs(ec.attrs);
         } else {
           auto item = cmi::cmiw::sig_exception(ec.name.txt, {});  // rebind `+= C = D`
           item.ext_path = typext_path(ck, px->ext.path.txt, &item.ext_prov);
           item.ext_params = typext_param_names(px->ext);
           item.text_kind = first ? 0 : 1;
+          item.attrs = item_attrs(ec.attrs);
           out.push_back(std::move(item));
         }
         first = false;
@@ -21277,15 +21295,18 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
       // qualified `M.E` use must resolve it -- otherwise the match collapses).
       const ExtensionConstructor& ec = pe->exn.ctor;
       if (!ec.name.txt.empty()) {
-        if (auto* pd = std::get_if<Pext_decl>(&ec.kind))
+        if (auto* pd = std::get_if<Pext_decl>(&ec.kind)) {
           out.push_back(exn_sigitem(ck, ec.name.txt, *pd, nullptr, false, &ec));
-        else if (std::holds_alternative<Pext_rebind>(ec.kind))
+          out.back().attrs = item_attrs(ec.attrs);
+        } else if (std::holds_alternative<Pext_rebind>(ec.kind)) {
           // `exception F = E`: a rebind over the predefined exn.  ocamlc records a
           // Sig_typext (Text_exception, Text_rebind) that Printtyp prints as bare
           // `exception F`; without it a submodule `struct exception F = E end`
           // came out `sig end`.  (The signature path already handles this at the
           // Psig_typext rebind branch.)
           out.push_back(cmi::cmiw::sig_exception(ec.name.txt, {}));
+          out.back().attrs = item_attrs(ec.attrs);
+        }
       }
     } else if (auto* px = std::get_if<Pstr_typext>(&it.desc)) {
       bool first = true;
@@ -21293,6 +21314,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         if (ec.name.txt.empty()) continue;
         if (auto* pd = std::get_if<Pext_decl>(&ec.kind)) {
           out.push_back(exn_sigitem(ck, ec.name.txt, *pd, &px->ext, first, &ec));
+          out.back().attrs = item_attrs(ec.attrs);
           first = false;
         } else if (auto* rb = std::get_if<Pext_rebind>(&ec.kind)) {
           // `type 'a Msg.tag += String = StrM.C`: clone the target ctor's
@@ -21318,6 +21340,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
               one[0].ext_path = lid_full(px->ext.path.txt);
               one[0].ext_params = typext_param_names(px->ext);
               one[0].text_kind = first ? 0 : 1;
+              one[0].attrs = item_attrs(ec.attrs);
               out.push_back(std::move(one[0]));
               first = false;
               break;
@@ -21383,6 +21406,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         }
         return std::nullopt;
       };
+      const std::size_t mtb = out.size();
       if (!pmt->type)  // ABSTRACT `module type S` in a struct (pr7112)
         out.push_back(cmi::cmiw::sig_modtype_abstract(pmt->name.txt));
       else if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc))
@@ -21410,6 +21434,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         if (auto r = mt_items(*pmt->type))
           out.push_back(cmi::cmiw::sig_modtype(pmt->name.txt, std::move(*r)));
       }
+      if (out.size() > mtb) out.back().attrs = item_attrs(pmt->attrs);
     } else if (auto* pc = std::get_if<Pstr_class>(&it.desc)) {
       // `class c [params] = object .. end`: emit Sig_class (the writer adds
       // the two ghost companions).  Member TYPES come from the checker
@@ -21728,8 +21753,10 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         }
         if (anon_tgt) {
           if (auto item = module_binding_sigitem(*mb->binding.name.txt,
-                                                 *anon_tgt, &out, &ck))
+                                                 *anon_tgt, &out, &ck)) {
+            item->attrs = item_attrs(mb->binding.attrs);
             out.push_back(std::move(*item));
+          }
           continue;
         }
       }
@@ -21791,13 +21818,16 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
             strengthen_abstract(sub, path);
             out.push_back(
                 cmi::cmiw::sig_module(*mb->binding.name.txt, std::move(sub)));
+            out.back().attrs = item_attrs(mb->binding.attrs);
             continue;
           }
         }
       }
       if (auto item = module_binding_sigitem(*mb->binding.name.txt,
-                                             mb->binding.expr, &out, &ck))
+                                             mb->binding.expr, &out, &ck)) {
+        item->attrs = item_attrs(mb->binding.attrs);
         out.push_back(std::move(*item));
+      }
     } else if (auto* po2 = std::get_if<Pstr_open>(&it.desc)) {
       // `open M` where M is a LOCAL module already emitted above (`module
       // FArg = X.F(Arg); open FArg; type u = t`): register its type members
@@ -21833,6 +21863,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         std::size_t before = out.size();
         if (auto item = module_binding_sigitem(*b.name.txt, b.expr, &out, &ck)) {
           item->rec_status = rs;
+          item->attrs = item_attrs(b.attrs);
           out.push_back(std::move(*item));
         }
         // Each declaration's md_loc is its OWN binding's span (typemod's
