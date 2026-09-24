@@ -251,6 +251,8 @@ struct TypeDecl {
   // 2 Deepsep); empty when the decl predates the decode.
   std::vector<int> separability;
   RLoc loc;                             // type_loc
+  // Sig_type's rec_status as read: 0 Trec_not / 1 Trec_first / 2 Trec_next.
+  int rec_status = 1;
 };
 
 struct Signature;

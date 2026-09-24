@@ -205,6 +205,8 @@ public:
               TypeDecl td = type_declaration(item.fields[1]);
               td.name = ident(item.fields[0]).name;
               td.stamp = ident(item.fields[0]).stamp;
+              if (arena_[item.fields[2]].kind == m::Value::Kind::Int)
+                td.rec_status = (int)arena_[item.fields[2]].i;
               out.order.push_back({Signature::OrderEnt::Type,
                                    (int)out.types.size(), false});
               out.types.push_back(std::move(td));
@@ -1670,6 +1672,12 @@ std::string decl_key(const std::string& name, const cmiw::Loc& l,
   return u.unit + "/" + std::to_string(u.id) + (u.intf ? "/i/" : "/m/") +
          name + "@" + (l.ghost ? "g" : pos_key(l.start) + "-" + pos_key(l.end));
 }
+// NOFWDIDSTR=1 gives a type cited ahead of its own item a fresh name string.
+bool fwdidstr_off() {
+  static const bool off = cppcaml::dbg_env("NOFWDIDSTR") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE584") != nullptr;
+  return off;
+}
 // A declaration's name string, shared with every signature that re-exports
 // that same declaration (S574).
 o::ValPtr decl_name_str(const std::string& n, const std::string& key) {
@@ -3005,6 +3013,15 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
   // variables together (SigItem::sigwide), so the memo carries over.
   std::unordered_map<int, o::ValPtr> sw_vars;
   std::unordered_map<const Ty*, o::ValPtr> sw_nodes;
+  // A re-exported `and` member cited before its own item (`t = unit -> u`
+  // ahead of `u`) is still `Ident.rename` of the original: its name string
+  // is the original's too, so its ident block is made up front.
+  if (!fwdidstr_off())
+    for (std::size_t i = 0; i < items.size(); ++i)
+      if (items[i].k == SigItem::Type)
+        ident_val(0, items[i].name, item_stamp[i], 0,
+                  decl_name_str(items[i].name,
+                                decl_key(items[i].name, items[i].loc, items[i].uid)));
   for (std::size_t i = 0; i < items.size(); ++i) {
     const SigItem& it = items[i];
     TyEmit te; te.referenced = &referenced; te.local_types = &visible;

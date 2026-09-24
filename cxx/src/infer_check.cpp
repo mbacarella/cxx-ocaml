@@ -17756,6 +17756,12 @@ static std::vector<cmi::cmiw::SigItem> cmi_sig_to_items(const cmi::Signature& si
   }
   return out;
 }
+// NORECREAD=1 writes a type read from a .cmi as Trec_first, whatever it was.
+static bool recread_off() {
+  static const bool off = dbg_env("NORECREAD") != nullptr ||
+                          dbg_env("NOSHARE584") != nullptr;
+  return off;
+}
 static cmi::cmiw::SigItem cmi_type_to_item(const cmi::TypeDecl& td) {
   std::unordered_map<const cmi::TypeExpr*, int> vars; int nv = 0;
   // ONE sharing map across the decl: a constrained param (stored as its
@@ -17808,6 +17814,8 @@ static cmi::cmiw::SigItem cmi_type_to_item(const cmi::TypeDecl& td) {
   if (!si.manifest && td.manifest &&
       (td.kind == cmi::TypeDecl::Record || td.kind == cmi::TypeDecl::Variant))
     si.manifest = conv_cmi_ty(td.manifest, vars, nv, &nodes);
+  // The `and` members of a group keep Trec_next, a `type nonrec` Trec_not.
+  if (!recread_off()) si.rec_status = td.rec_status == 0 ? -1 : td.rec_status;
   si.type_private = td.priv;
   si.type_immediate = td.immediate;
   si.type_unboxed_default = td.unboxed_default;
