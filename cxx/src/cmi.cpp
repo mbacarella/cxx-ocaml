@@ -1817,6 +1817,23 @@ bool stdalias_off() {
                           cppcaml::dbg_env("NOSHARE580") != nullptr;
   return off;
 }
+// S587: an applied path's pervasive head (`Set.Make (X).t`) is the initial
+// open's root too.  NOAPPOPEN=1 writes a fresh `Pident Stdlib` again.
+bool appopen_off() {
+  static const bool off = cppcaml::dbg_env("NOAPPOPEN") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE587") != nullptr;
+  return off;
+}
+// The root a pervasive module head is looked up through: `IdTbl.find_name`
+// resolves `Set` to `Pdot (root, "Set")` over the initial open's ONE root,
+// whether the path is a type's, an application's or a module type's (S587).
+o::ValPtr open_stdlib_root() {
+  if (no_share() || appopen_off())
+    return o::vblock(0, {o::vblock(2, {o::vstr("Stdlib")})});
+  auto& v = g_share.heads["open:Stdlib"];
+  if (!v) v = o::vblock(0, {o::vblock(2, {o::vstr("Stdlib")})});
+  return v;
+}
 bool envpath_off() {
   static const bool off = cppcaml::dbg_env("NOENVPATH") != nullptr ||
                           cppcaml::dbg_env("NOSHARE569") != nullptr;
@@ -2109,7 +2126,7 @@ struct TyEmit {
         // a pervasive head goes THROUGH the Stdlib alias (Set.OrderedType =
         // Pdot(Pdot(Pident(Global Stdlib), "Set"), ..)), like type_path
         if (referenced) (*referenced)["Stdlib"] = true;
-        path = o::vblock(0, {o::vblock(2, {o::vstr("Stdlib")})});
+        path = open_stdlib_root();
         path = o::vblock(1, {path, o::vstr(head.substr(8))});
       } else {
         path = o::vblock(0, {o::vblock(2, {o::vstr(head)})});  // Pident(Global)
@@ -2199,7 +2216,7 @@ struct TyEmit {
           // back as written (`Set.Make(X).t` in a declared signature).
           if (g.rfind("Stdlib__", 0) == 0 && id.rfind("Stdlib__", 0) != 0) {
             if (referenced) (*referenced)["Stdlib"] = true;
-            path = o::vblock(0, {o::vblock(2, {o::vstr("Stdlib")})});
+            path = open_stdlib_root();
             path = o::vblock(1, {path, o::vstr(g.substr(8))});
           } else {
             path = o::vblock(0, {o::vblock(2, {o::vstr(g)})});  // Pident(Global), raw unit
@@ -2908,7 +2925,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         // pervasive head through the Stdlib alias: `(Elem : Map.OrderedType)`
         // is Pdot(Pdot(Pident(Global Stdlib), "Map"), "OrderedType")
         referenced.emplace("Stdlib", true);
-        path = o::vblock(0, {o::vblock(2, {o::vstr("Stdlib")})});
+        path = open_stdlib_root();
         path = o::vblock(1, {path, o::vstr(head.substr(8))});
       } else {
         path = o::vblock(0, {o::vblock(2, {o::vstr(head)})});  // Pident(Global)

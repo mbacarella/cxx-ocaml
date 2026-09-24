@@ -4102,6 +4102,139 @@ struct Checker {
   // The variance signature of an EXTERNAL type constructor: predef table,
   // locally computed decls, or the head unit's cmi (reader-parsed
   // td.variances).  Empty = unknown (caller walks args with unknown).
+  // ---- A PATH THROUGH A LOCAL MODULE READS THAT MODULE'S ITEMS (S587) ----
+  // `module M = Map.Make (X)  type 'a u = 'a M.t` composes through M.t's
+  // variance exactly as through a unit's: ocamlc finds the declaration in
+  // the environment, whatever bound M.  The writer's own emitted items are
+  // that environment here -- the level's `out`, the signature being built,
+  // the enclosing structure -- set around `emit_type_decls`' variance pass
+  // (`var_scopes_`, innermost first).  A head no scope binds is a unit's.
+  // `NOLOCVAR=1` reverts: every such path walked its arguments unknown.
+  static bool locvar_off() {
+    static const bool off = cppcaml::dbg_env("NOLOCVAR") != nullptr ||
+                            cppcaml::dbg_env("NOSHARE587") != nullptr;
+    return off;
+  }
+  std::vector<const std::vector<cmi::cmiw::SigItem>*> var_scopes_;
+  const std::vector<cmi::cmiw::SigItem>* var_outer_ = nullptr;
+  // `A.F(B.C).t` -> {"A", "F(B.C)"} + "t": split at the dots outside parens.
+  static std::vector<std::string> path_comps(const std::string& s) {
+    std::vector<std::string> r(1);
+    int depth = 0;
+    for (char ch : s) {
+      if (ch == '(') ++depth;
+      if (ch == ')') --depth;
+      if (ch == '.' && depth == 0) r.emplace_back();
+      else r.back() += ch;
+    }
+    return r;
+  }
+  // The variance a unit path's type declares: `comps` names the modules
+  // from the head unit down, an applied component (`Make(X)`) steps into the
+  // functor's result signature.  Empty = not found.
+  std::vector<int> cmi_type_variance(const std::vector<std::string>& comps,
+                                     const std::string& tyname,
+                                     std::size_t arity) {
+    try {
+      std::deque<const cmi::CmiFile*> loaded;
+      loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back()->sig();
+      for (std::size_t i = 1; i < comps.size() && sig; ++i) {
+        std::string nm = comps[i];
+        bool app = false;
+        if (auto lp = nm.find('('); lp != std::string::npos && !locvar_off()) {
+          nm = nm.substr(0, lp);
+          app = true;
+        }
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules)
+          if (mm.name == nm) { md = &mm; break; }
+        if (md && app) {
+          const cmi::ModuleTypePtr* mt = &md->type;
+          if (*mt && (*mt)->kind == cmi::ModuleType::Functor)
+            mt = &(*mt)->functor_body;
+          else
+            mt = nullptr;
+          sig = mt ? module_sig(*mt, loaded) : nullptr;
+        } else {
+          sig = md ? module_sig(md->type, loaded) : nullptr;
+        }
+      }
+      if (sig)
+        for (auto& td : sig->types)
+          if (td.name == tyname && td.variances.size() == arity)
+            return std::vector<int>(td.variances.begin(), td.variances.end());
+    } catch (...) {}
+    return {};
+  }
+  // The last module of that name a scope binds, innermost scope first.
+  static const cmi::cmiw::SigItem* scope_module(
+      const std::vector<const std::vector<cmi::cmiw::SigItem>*>& scopes,
+      const std::string& nm, std::size_t& at) {
+    for (std::size_t k = 0; k < scopes.size(); ++k) {
+      if (!scopes[k]) continue;
+      const cmi::cmiw::SigItem* hit = nullptr;
+      for (auto& si : *scopes[k])
+        if (si.k == cmi::cmiw::SigItem::Module && si.name == nm) hit = &si;
+      if (hit) { at = k; return hit; }
+    }
+    return nullptr;
+  }
+  // nullopt = no scope binds the head (a unit path); a vector (maybe empty =
+  // unknown) = the local module's answer.
+  std::optional<std::vector<int>> local_type_variance(
+      const std::vector<std::string>& comps, const std::string& tyname,
+      std::size_t arity) {
+    auto scopes = var_scopes_;
+    std::size_t at = 0;
+    auto bare = [](const std::string& c) {
+      auto lp = c.find('(');
+      return lp == std::string::npos ? c : c.substr(0, lp);
+    };
+    const cmi::cmiw::SigItem* m = scope_module(scopes, bare(comps[0]), at);
+    if (!m) return std::nullopt;
+    std::size_t i = 0;
+    for (int guard = 0; guard < 64; ++guard) {
+      // An alias goes on to what it names: a module of the same scope, or a
+      // unit, whose path then continues through the cmi.
+      if (!m->alias.empty()) {
+        auto ac = path_comps(m->alias);
+        std::vector<const std::vector<cmi::cmiw::SigItem>*> rest(
+            scopes.begin() + at, scopes.end());
+        std::size_t at2 = 0;
+        const cmi::cmiw::SigItem* t =
+            ac.size() == 1 ? scope_module(rest, ac[0], at2) : nullptr;
+        if (t && t != m) {
+          scopes = rest; at = at2; m = t;
+          continue;
+        }
+        if (ac[0].rfind("Stdlib__", 0) == 0) ac[0] = ac[0].substr(8);
+        for (std::size_t j = i + 1; j < comps.size(); ++j)
+          ac.push_back(comps[j]);
+        return cmi_type_variance(ac, tyname, arity);
+      }
+      bool app = comps[i].find('(') != std::string::npos;
+      if (m->is_functor != app) return std::vector<int>{};
+      if (++i == comps.size()) break;
+      const cmi::cmiw::SigItem* n = nullptr;
+      for (auto& si : m->sub)
+        if (si.k == cmi::cmiw::SigItem::Module && si.name == bare(comps[i]))
+          n = &si;
+      if (!n) return std::vector<int>{};
+      scopes.assign(1, &m->sub);
+      at = 0;
+      m = n;
+    }
+    for (auto& si : m->sub)
+      if (si.k == cmi::cmiw::SigItem::Type && si.name == tyname &&
+          si.params.size() == arity) {
+        std::vector<int> v(arity, 7);
+        for (std::size_t j = 0; j < arity && j < si.type_variances.size(); ++j)
+          v[j] = (int)si.type_variances[j];
+        return v;
+      }
+    return std::vector<int>{};
+  }
   std::vector<int> external_type_variance_sig(const Ptyp_constr& c,
                                               std::size_t arity) {
     static const int COV = 25, FULL = 63;
@@ -4130,6 +4263,14 @@ struct Checker {
         return {};
     } else if (std::holds_alternative<Ldot>(c.id.txt.v)) {
       dotted = lid_full(c.id.txt);
+      if (!locvar_off()) {
+        auto comps = path_comps(dotted);
+        std::string tyname = comps.back();
+        comps.pop_back();
+        if (auto lv = local_type_variance(comps, tyname, arity)) return *lv;
+        if (auto b = builtin(dotted); !b.empty()) return b;
+        return cmi_type_variance(comps, tyname, arity);
+      }
     } else {
       return {};
     }
@@ -17092,6 +17233,12 @@ static void compute_group_separability(Checker& ck,
 
 // Convert a run of `type ... and ...` declarations (shared by structure and
 // signature emission -- both hold a std::vector<TypeDeclaration>) into SigItems.
+// The ENCLOSING structure's already-emitted items (set by infer_signature
+// around its emission loop; restored on return).  Lets a SIGNATURE body
+// resolve `module type of Foo` where Foo is a local struct module (t02's
+// `module type Gee = sig module M : module type of Foo .. end`).
+static const std::vector<cmi::cmiw::SigItem>* g_enclosing_struct_items = nullptr;
+
 static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& decls,
                             std::vector<cmi::cmiw::SigItem>& out,
                             bool nonrec_ = false) {
@@ -17353,6 +17500,14 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
   // Abstract-without-manifest and constrained decls keep the written/default
   // behavior above (compute_decl_variance returns empty for them).
   {
+    // What a path through a local module reads (S587): this level's items,
+    // the structure a signature is written in, the enclosing structure.
+    auto saved_scopes = ck.var_scopes_;
+    ck.var_scopes_ = {&out};
+    if (g_enclosing_struct_items && g_enclosing_struct_items != &out)
+      ck.var_scopes_.push_back(g_enclosing_struct_items);
+    if (ck.var_outer_ && ck.var_outer_ != g_enclosing_struct_items)
+      ck.var_scopes_.push_back(ck.var_outer_);
     std::map<std::string, std::vector<int>> cur;
     for (auto& d : decls)
       if (!d.params.empty())
@@ -17377,6 +17532,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
           break;
         }
     }
+    ck.var_scopes_ = saved_scopes;
   }
   // A `type a .. and b ..` group: Trec_first on the head, Trec_next after
   // (ocamlc prints the group back with `and`).  A `type nonrec` head is
@@ -18185,11 +18341,6 @@ static cmi::cmiw::SigItem exn_sigitem(Checker& ck, const std::string& name,
 // records the CONSTRAINED decl: `S with type in_t = T0.t` stores in_t's
 // manifest).  `with type t := ..` (destructive) erases the decl instead --
 // types take no runtime field, so erasure can't shift the value layout.
-// The ENCLOSING structure's already-emitted items (set by infer_signature
-// around its emission loop; restored on return).  Lets a SIGNATURE body
-// resolve `module type of Foo` where Foo is a local struct module (t02's
-// `module type Gee = sig module M : module type of Foo .. end`).
-static const std::vector<cmi::cmiw::SigItem>* g_enclosing_struct_items = nullptr;
 
 // Enclosing-scope `open M` module paths active where a submodule is emitted, so
 // its re-inference (a fresh Checker) sees the outer file's opens.  Set around
@@ -20969,6 +21120,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
   auto* saved_mt_asts = g_outer_modtype_asts;
   auto* saved_mt_quals = g_outer_modtype_quals;
   auto* saved_enclosing = g_enclosing_struct_items;
+  ck.var_outer_ = saved_enclosing;
   auto* saved_modenv = g_outer_modenv;
   auto* saved_venv = g_outer_venv;
   auto* saved_cenv = g_outer_cenv;
