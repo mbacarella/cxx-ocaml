@@ -62,6 +62,8 @@ struct Attribute {
   Box<CoreType> typ;            // PTyp: `[@name : t]`
   Box<Pattern> pat;            // PPat: `[@name ? p]`
   Box<Expression> guard;       // PPat guard: `[@name ? p when g]`
+  Location name_loc;           // attr_name.loc: the (dotted) name
+  Location loc;                // attr_loc: `[@@` through `]`
 };
 using Attributes = std::vector<Attribute>;
 

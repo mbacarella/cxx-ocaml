@@ -1783,6 +1783,13 @@ bool sep_off() {
                           cppcaml::dbg_env("NOSHARE576") != nullptr;
   return off;
 }
+// S577: A DECLARATION'S EMPTY-PAYLOAD ATTRIBUTES ARE WRITTEN.  NOATTR=1
+// writes the empty lists (and the placeholder `[@@immediate]`) again.
+bool attr_off() {
+  static const bool off = cppcaml::dbg_env("NOATTR") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE577") != nullptr;
+  return off;
+}
 bool envpath_off() {
   static const bool off = cppcaml::dbg_env("NOENVPATH") != nullptr ||
                           cppcaml::dbg_env("NOSHARE569") != nullptr;
@@ -2645,6 +2652,16 @@ o::ValPtr emit_loc(const cmiw::Loc& l, const std::string& key) {
   if (!v) v = emit_loc(l);
   return v;
 }
+// A declaration's attribute list (S577): each `{attr_name = {txt; loc};
+// attr_payload = PStr []; attr_loc}`, in source order.
+o::ValPtr emit_attrs(const std::vector<cmiw::Attr>& as) {
+  std::vector<o::ValPtr> v;
+  for (auto& a : as)
+    v.push_back(o::vblock(0, {o::vblock(0, {o::vstr(a.name), emit_loc(a.name_loc)}),
+                              o::vblock(0, {o::vint(0)}),  // PStr []
+                              emit_loc(a.loc)}));
+  return v.empty() ? o::vint(0) : o::vlist(v);
+}
 // Shape.Uid.t marshal repr.  Constant ctor Internal -> immediate 0.  Non-constant
 // ctors in declaration order: Compilation_unit(0), Item(1), Local_opaque_item(2),
 // Predef(3).  Item's `from` is Unit_info.intf_or_impl = Intf(0) | Impl(1).
@@ -3017,7 +3034,9 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         valkind = o::vblock(0, {desc});  // Val_prim
       }
       auto vdesc = o::vblock(0, {te.emit(it.ty), valkind, emit_loc(it.loc, dkey),
-                                 o::vint(0) /*[] attrs*/, emit_uid(it.uid, dkey)});
+                                 it.attrs && !attr_off() ? emit_attrs(*it.attrs)
+                                                         : o::vint(0) /*[] attrs*/,
+                                 emit_uid(it.uid, dkey)});
       sig.push_back(o::vblock(0, {ident, vdesc, o::vint(0) /*Exported*/}));  // Sig_value
     } else if (it.k == SigItem::Module) {
       // Sig_module(id, Mp_present, module_declaration, rec_status, visibility).
@@ -3744,6 +3763,7 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           // from type_immediate), so emit the real attribute when WRITTEN in
           // source -- not for a derived all-const-variant Always.
           [&]() -> o::ValPtr {
+            if (it.attrs && !attr_off()) return emit_attrs(*it.attrs);  // S577
             if (!it.type_immediate_attr) return o::vint(0);  // []
             const char* nm = it.type_immediate_attr == 2 ? "immediate64" : "immediate";
             auto attr = o::vblock(0, {

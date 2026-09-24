@@ -3446,24 +3446,30 @@ class Parser {
   // parse the body of an attribute (the `[@`/`[@@` has already been consumed):
   //   name payload ]   with a structure payload (PStr).
   Attribute parse_attribute_body() {
+    // attr_loc runs from the `[@`/`[@@`/`[@@@` the caller just consumed to
+    // the closing `]`; attr_name.loc covers the (dotted) name.
+    const Token& open = tokens_[idx_ > 0 ? idx_ - 1 : 0];
+    const bool opened = open.kind == Kind::LBRACKETAT || open.kind == Kind::LBRACKETATAT ||
+                        open.kind == Kind::LBRACKETATATAT;
+    size_t name_start = cur().start;
     std::string name = parse_attr_name();
+    Location name_loc = span(position(name_start), position(tokens_[idx_ - 1].end));
+    Attribute a;
     if (cur().kind == Kind::COLON) {  // `[@name : core_type]`  -> PTyp
       advance();
-      CoreTypeBox ty = parse_core_type();
-      expect(Kind::RBRACKET, "]");
-      return Attribute{std::move(name), {}, std::move(ty), nullptr, nullptr};
-    }
-    if (cur().kind == Kind::QUESTION) {  // `[@name ? pat [when guard]]`  -> PPat
+      a.typ = parse_core_type();
+    } else if (cur().kind == Kind::QUESTION) {  // `[@name ? pat [when guard]]`  -> PPat
       advance();
-      PatBox p = box(parse_pattern());
-      ExprBox g;
-      if (cur().kind == Kind::WHEN) { advance(); g = parse_expr(); }
-      expect(Kind::RBRACKET, "]");
-      return Attribute{std::move(name), {}, nullptr, std::move(p), std::move(g)};
+      a.pat = box(parse_pattern());
+      if (cur().kind == Kind::WHEN) { advance(); a.guard = parse_expr(); }
+    } else {
+      a.payload = parse_structure_until(Kind::RBRACKET);
     }
-    Structure payload = parse_structure_until(Kind::RBRACKET);
     expect(Kind::RBRACKET, "]");
-    return Attribute{std::move(name), std::move(payload), nullptr, nullptr, nullptr};
+    a.name = std::move(name);
+    a.name_loc = name_loc;
+    a.loc = span(position(opened ? open.start : name_start), position(tokens_[idx_ - 1].end));
+    return a;
   }
 
   StrOptLoc parse_module_name() {

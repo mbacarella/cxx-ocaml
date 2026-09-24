@@ -16394,6 +16394,18 @@ static std::vector<int> compute_decl_variance(
 }
 
 static cmi::cmiw::Loc conv_loc(const ast::Location& l);  // defined below
+// val_attributes / type_attributes as written (S577) -- only when every
+// attribute's payload is `PStr []`: a real payload would need the parsetree
+// marshalled, so the writer keeps its old default for it.
+static std::optional<std::vector<cmi::cmiw::Attr>> empty_payload_attrs(
+    const ast::Attributes& as) {
+  std::vector<cmi::cmiw::Attr> v;
+  for (auto& a : as) {
+    if (!a.payload.empty() || a.typ || a.pat) return std::nullopt;
+    v.push_back({a.name, conv_loc(a.name_loc), conv_loc(a.loc)});
+  }
+  return v;
+}
 
 // --- what Typecore.type_approx materializes of a method's type ---------------
 // The class's first pass runs type_approx over each concrete method's body
@@ -17180,6 +17192,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
       si.type_empty_variant = var->ctors.empty();  // `type empty = |`
       si.type_private = (d.priv == PrivateFlag::Private);
       si.type_immediate = immed; si.type_immediate_attr = immed_attr;
+      si.attrs = empty_payload_attrs(d.attrs);
       si.type_unboxed = unboxed;
       si.type_unboxed_default = unboxed_default_of(d);
       // A re-exported datatype (`type s = t = A | B`) carries BOTH a manifest
@@ -17206,6 +17219,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
         si.engine_stamp = ts->second;
       si.type_private = (d.priv == PrivateFlag::Private);
       si.type_immediate = immed; si.type_immediate_attr = immed_attr;
+      si.attrs = empty_payload_attrs(d.attrs);
       si.type_unboxed = unboxed;
       si.type_unboxed_default = unboxed_default_of(d);
       // Record_float: every label a float and none atomic (typedecl).
@@ -17265,6 +17279,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
     si.type_open = std::holds_alternative<Ptype_open>(d.kind);
     si.type_private = (d.priv == PrivateFlag::Private);
     si.type_immediate = immed; si.type_immediate_attr = immed_attr;
+      si.attrs = empty_payload_attrs(d.attrs);
     // Written variance/injectivity (`type +!'a t`) survives on ABSTRACT
     // manifest-free decls -- the only place Printtyp prints it back
     // (concrete/manifest decls carry COMPUTED variance, printed as nothing).
@@ -17928,6 +17943,7 @@ static void apply_prim_attrs(const ast::PrimitiveDescription& pd,
                              const std::vector<cmi::cmiw::SigItem>& out,
                              cmi::cmiw::SigItem& item) {
   item.prim_alloc = !attrs_have(pd.attrs, "noalloc");
+  item.attrs = empty_payload_attrs(pd.attrs);
   int gkind = attrs_have(pd.attrs, "unboxed") ? 1
             : attrs_have(pd.attrs, "untagged") ? 2 : 0;
   std::set<std::string> immediates = local_immediates(out);
@@ -17976,6 +17992,7 @@ static std::optional<cmi::cmiw::SigItem> emit_prim_alias(
   item.prim_alloc = tgt->prim_alloc;
   item.prim_reprs = tgt->prim_reprs;
   item.prim_repr_res = tgt->prim_repr_res;
+  item.attrs = empty_payload_attrs(pd.attrs);  // the alias's OWN attributes
   return item;
 }
 
@@ -18390,6 +18407,8 @@ static void apply_with_constraints(Checker& ck, const ast::ModuleType& mt,
       // transl_with_constraint re-derives the refined declaration's
       // separability (Typedecl_separability.compute_decl), S576.
       tgt->type_separability.clear();
+      // ... and takes the CLAUSE's own attributes (S577).
+      tgt->attrs = empty_payload_attrs(td->attrs);
       try {
         tgt->type_separability = sepc::check_def(*tgt, [&](const cmi::cmiw::Ty& t) {
           return sep_resolve_global(ck, t);
@@ -18954,6 +18973,7 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
       out.push_back(cmi::cmiw::sig_value(pv->vd.name.txt,
                       bridge_ty_named(ck.from_coretype(*pv->vd.type, tvars), bvars, nextvar, tvars)));
       out.back().loc = conv_loc(pv->vd.loc);
+      out.back().attrs = empty_payload_attrs(pv->vd.attrs);
     } else if (auto* pr = std::get_if<Psig_primitive>(&it.desc)) {
       if (pr->pd.type && !pr->pd.prims.empty()) {
         std::unordered_map<std::string, TypePtr> tvars;

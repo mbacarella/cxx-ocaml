@@ -99,6 +99,7 @@ int prov_new_dots(int src_dots);  // a source annotation, `src_dots` written
 const ProvInfo& prov_info(int prov);
 int cmi_id_of(const std::string& filepath);
 bool sep_off();   // NOSEP=1: every parameter written `Ind` (S576)
+bool attr_off();  // NOATTR=1: attribute lists written as before (S577)
 bool prov_off();  // NOPROV=1: the writer ignores provenance (S554 behaviour)
 // NONODEID=1: the saved graph keeps one writer node per OCCURRENCE (S555
 // behaviour) -- no per-use instantiate copies, no node memo across a
@@ -532,6 +533,9 @@ struct Ctor {
   Loc loc;
   int stamp = 0;  // cd_id's stamp, the one typing created (0: the writer's placeholder)
 };
+// A declaration's attribute with an EMPTY `PStr []` payload (`[@@noalloc]`,
+// `[@@immediate]`, ..): its name, attr_name.loc and attr_loc (S577).
+struct Attr { std::string name; Loc name_loc, loc; };
 struct SigItem;
 struct SigItem {
   enum K { Value, Type, Module, Modtype, Exception, Class } k = Value;
@@ -648,6 +652,10 @@ struct SigItem {
   // Typedecl_separability computed or a read .cmi carried.  Empty = Ind for
   // every param (the writer's default).
   std::vector<int> type_separability;
+  // Value / Type: val_attributes / type_attributes as written, set only when
+  // EVERY attribute has an empty payload (nullopt = not modelled; the writer
+  // then keeps its old default).
+  std::optional<std::vector<Attr>> attrs;
   // Module: rec_status (0 Trec_not / 1 Trec_first / 2 Trec_next) -- a
   // `module rec A .. and B ..` group prints as such only when marked.
   int rec_status = 0;
