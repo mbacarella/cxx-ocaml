@@ -24317,7 +24317,33 @@ struct Cites {
     cite(p.path, false);
     for (auto& c : p.constraints) { cite(c.first, false); ty(*c.second); }
   }
+  // ---- A WRITTEN TYPE IS LOOKED UP A SECOND TIME (S586) -----------------
+  // What a declaration's `tf_tdecl` pays, every other written type pays too:
+  // a `val`, an `external`, a pattern's or an expression's annotation, a
+  // method's type -- `(x : int Seq.t)` forces Seq 65 + 65 where `Buffer.t`,
+  // which takes no argument, forces Buffer once, and `int Lazy.t` pays the
+  // CamlinternalLazy its manifest names.  Declarations (types, extension
+  // constructors) keep their own walk.  `NOWTYF=1` reverts.
+  static bool wtyf_off() {
+    static const bool off = dbg_env("NOWTYF") != nullptr ||
+                            dbg_env("NOSHARE586") != nullptr;
+    return off;
+  }
+  int tydepth_ = 0;
+  int indecl_ = 0;
+  struct InDecl {
+    int& d;
+    explicit InDecl(int& x) : d(x) { ++d; }
+    ~InDecl() { --d; }
+  };
   void ty(const CoreType& t) {
+    ++tydepth_;
+    ty_walk(t);
+    --tydepth_;
+    if (tydepth_ == 0 && indecl_ == 0 && !tdecl_off() && !wtyf_off())
+      tf_ty(t, 0, 0);
+  }
+  void ty_walk(const CoreType& t) {
     if (auto* c = std::get_if<Ptyp_constr>(&t.desc)) {
       cite(c->id, false);
       // A written `(_, _, _) format` annotation types its string literal
@@ -24789,23 +24815,53 @@ struct Cites {
   std::string tf_decl(const cmi::TypeDecl* td, const cmi::Signature* sg,
                       const std::string& unit, int mode, int depth) {
     if (!td || depth > 6) return {};
-    if (td->manifest && !td->priv)
-      return tf_cmi(td->manifest.get(), sg, unit, mode, depth + 1);
+    if (td->manifest && !td->priv) {
+      // only an APPLIED abbreviation is expanded by the second look-up
+      const bool sv = expanding_;
+      if (!td->params.empty()) expanding_ = true;
+      std::string r = tf_cmi(td->manifest.get(), sg, unit, mode, depth + 1);
+      expanding_ = sv;
+      return r;
+    }
     if (mode >= 2 || !td->params.empty() ||
         (mode == 1 && td->kind == cmi::TypeDecl::Abstract))
       xmeet(unit);
     return {};
   }
+  std::map<std::string, At> xload_;  // units a manifest's expansion loads
+  bool expanding_ = false;
+  std::set<std::string> xsub_;  // "Unit.Sub" a second look-up rebuilds
   std::string tf_path(std::vector<std::string> c, int mode, int depth) {
     if (c.size() < 2 || local.count(c[0])) return {};
     const cmi::Signature* rt = unit_of_path(c);  // normalises c in place
     if (!rt || c.size() < 2) return {};
     std::string unit = c[0];
+    if (depth > 0 && expanding_ && !wtyf_off()) xload_.emplace(unit, anchor_);
     const cmi::Signature* sg = rt;
     for (std::size_t i = 1; sg && i + 1 < c.size(); ++i)
       sg = submodule(*sg, c[i]);
     if (!sg) return {};
-    return tf_decl(sig_tdecl(*sg, c.back()), sg, unit, mode, depth);
+    const cmi::TypeDecl* td = sig_tdecl(*sg, c.back());
+    // An applied type of a SUBMODULE looked up again builds the submodule's
+    // components again, by path: `(int, int) MoreLabels.Hashtbl.t` pays
+    // Hashtbl's 41 + 2 a second time and `(_, _) Effect.Shallow.continuation`
+    // Shallow's 7 (the "sub2" of a read type) -- but not an abbreviation of a
+    // type of the unit itself, `Effect.Deep.continuation`, whose second
+    // look-up lands on Effect's own `continuation`.
+    auto own_abbrev = [](const cmi::TypeDecl* d) {
+      if (!d->manifest || d->priv) return false;
+      const cmi::TypeExpr* e = d->manifest.get();
+      for (int i = 0; e && e->kind == cmi::TypeExpr::Tlink && i < 8; ++i)
+        e = e->link.get();
+      return e && e->kind == cmi::TypeExpr::Tconstr && e->path &&
+             e->path->kind == cmi::Path::Pident;
+    };
+    if (c.size() > 2 && td && !td->params.empty() && !own_abbrev(td) &&
+        !wtyf_off()) {
+      xsub_.insert(unit + "." + c[1]);
+      if (!ldstamp_off()) xf_anchor_.emplace(unit + "." + c[1], anchor_);
+    }
+    return tf_decl(td, sg, unit, mode, depth);
   }
   // The body of an abbreviation, as the .cmi carries it: a bare `Pident` there
   // names a type of the very signature it was read from.
@@ -25334,6 +25390,7 @@ struct Cites {
   // `tf_later`: the caller runs `tf_tdecl` itself, under the item's end
   // anchor (a structure's `item` below).
   void tdecl(const TypeDeclaration& d, bool tf_later = false) {
+    InDecl in(indecl_);
     tbound_.insert(d.name.txt);
     for (auto& p : d.params) ty(*p);
     // transl_declaration's order (S557): the constraints, the kind (a
@@ -25384,6 +25441,7 @@ struct Cites {
     return (const char*)&it + 1;
   }
   void ext(const ExtensionConstructor& c) {
+    InDecl in(indecl_);
     Anchor an(*this, ldstamp_off() ? anchor_.node : (const void*)&c);
     if (auto* d = std::get_if<Pext_decl>(&c.kind)) {
       cargs(d->args);
@@ -25394,6 +25452,7 @@ struct Cites {
     }
   }
   void typext(const TypeExtension& x) {
+    InDecl in(indecl_);
     cite(x.path, false);
     for (auto& p : x.params) ty(*p);
     for (auto& c : x.ctors) ext(c);
@@ -26135,6 +26194,7 @@ struct Cites {
           Applied b;
           scan_applied(m + "." + s.first, true, *s.second, b, app);
           if (aliased && (b.self || a.subs.count(s.first) ||
+                          xsub_.count(u + "." + s.first) ||
                           (!subapp_off() &&
                            sub_applied(m, s.first, *s.second))))
             add(load_cost(*s.second, extra, 2), "sub2", m + "." + s.first,
@@ -26195,6 +26255,15 @@ struct Cites {
     if (sub && !xoff) functor_loads(more, noload);
     if (sub && dbg_env("NOXWITHC") == nullptr) with_loads(more);
     if (sub && !incpath_off()) add(inc_loads(more, extra), "inc", "");
+    // A second look-up that EXPANDS an abbreviation loads the unit its
+    // manifest names, cited or not: `(x : int Lazy.t)` loads the
+    // CamlinternalLazy behind it where the look-up stands (S586).
+    if (!wtyf_off())
+      for (auto& u : xload_)
+        if (!more.count(u.first)) {
+          more[u.first] = 1;
+          more1_at.emplace(u.first, &u.second);
+        }
     for (auto& e : more) {
       bool cited = !done.insert(e.first).second;
       if (cited && e.second < 2) continue;
