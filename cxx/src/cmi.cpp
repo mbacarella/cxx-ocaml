@@ -380,6 +380,15 @@ public:
           td.variances.push_back(arena_[cons.fields[0]].i);
         cur = cons.fields[1];
       }
+    // type_separability : Separability.t list (field 6) -- constant ctors.
+    if (d.fields.size() > 6)
+      for (std::size_t cur = d.fields[6];
+           arena_[cur].kind == m::Value::Kind::Block && !arena_[cur].fields.empty();) {
+        const m::Value& cons = arena_[cur];
+        if (arena_[cons.fields.at(0)].kind == m::Value::Kind::Int)
+          td.separability.push_back(static_cast<int>(arena_[cons.fields[0]].i));
+        cur = cons.fields[1];
+      }
     if (d.fields.size() > 9) td.loc = decode_loc(d.fields[9]);  // type_loc
     // type_immediate : Type_immediacy.t (field 11; all-constant ctors are
     // constant, so it marshals as an int).
@@ -1765,6 +1774,13 @@ o::ValPtr predef_exn_path() {
 bool commu_off() {
   static const bool off = cppcaml::dbg_env("NOCOMMU") != nullptr ||
                           cppcaml::dbg_env("NOSHARE575") != nullptr;
+  return off;
+}
+// S576: A DECLARATION'S PARAMETERS CARRY THEIR SEPARABILITY
+// (Typedecl_separability).  NOSEP=1 writes `Ind` for every parameter again.
+bool sep_off() {
+  static const bool off = cppcaml::dbg_env("NOSEP") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE576") != nullptr;
   return off;
 }
 bool envpath_off() {
@@ -3713,7 +3729,14 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                                       ? it.type_variances[i] : 7));
             return v.empty() ? o::vint(0) : o::vlist(v);
           }(),
-          [&] { std::vector<o::ValPtr> v(it.params.size(), o::vint(0)); return v.empty() ? o::vint(0) : o::vlist(v); }(),
+          // type_separability: Ind unless computed/carried (S576).
+          [&] {
+            std::vector<o::ValPtr> v;
+            for (std::size_t i = 0; i < it.params.size(); ++i)
+              v.push_back(o::vint(!sep_off() && i < it.type_separability.size()
+                                      ? it.type_separability[i] : 0));
+            return v.empty() ? o::vint(0) : o::vlist(v);
+          }(),
           o::vint(0), o::vint(0),                      // is_newtype false, expansion_scope 0
           emit_loc(it.loc, dkey),                      // type_loc
           // type_attributes: Printtyp derives the printed `[@@immediate]` /

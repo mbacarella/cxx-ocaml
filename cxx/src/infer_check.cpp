@@ -4609,6 +4609,40 @@ struct Checker {
     cmi_immediate_memo_[path] = r;
     return r;
   }
+  // The cross-module type at `path`'s Separability.t per parameter, as its
+  // owning unit's cmi records it (Env.find_type's type_separability, what
+  // Typedecl_separability.check_type reads at a Tconstr).  nullopt when the
+  // path does not resolve.  Same walk as cmi_type_is_immediate.
+  std::optional<std::vector<int>> cmi_type_separability(const std::string& path) {
+    std::vector<std::string> comps = mod_components_str(path);
+    if (comps.size() >= 2) try {
+      std::deque<const cmi::CmiFile*> loaded;
+      loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back()->sig();
+      for (size_t i = 1; i + 1 < comps.size() && sig; ++i) {
+        std::string name = comps[i];
+        int applications = 0;
+        if (auto par = name.find('('); par != std::string::npos) {
+          for (char c : name) applications += c == '(';
+          name = name.substr(0, par);
+        }
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules) if (mm.name == name) { md = &mm; break; }
+        if (!md) { sig = nullptr; break; }
+        cmi::ModuleTypePtr mt = md->type;
+        for (int a = 0; a < applications && mt; ++a)
+          mt = mt->kind == cmi::ModuleType::Functor ? mt->functor_body : nullptr;
+        sig = module_sig(mt, loaded);
+      }
+      if (sig)
+        for (auto& td : sig->types)
+          if (td.name == comps.back()) {
+            if (td.separability.size() != td.params.size()) return std::nullopt;
+            return td.separability;
+          }
+    } catch (...) {}
+    return std::nullopt;
+  }
   // Does the cross-module type ABBREVIATION `path` resolve (through its cmi
   // manifest chain) to the predefined `string`?  `Asttypes.label = string` in
   // Btype.hash_variant's signature is why a plain `l <> l'` on variant tags must
@@ -16825,6 +16859,172 @@ static bool label_ty_is_float(Checker& ck, const cmi::cmiw::TyPtr& t,
   return false;
 }
 
+// Typedecl_separability over the declarations just converted (S576): each
+// parameter's mode -- 0 Ind, 1 Sep, 2 Deepsep -- is the one `check_def`
+// requires.  An abstract type is `msig_of_external_type` (Deepsep unless
+// immediate), a variant/record/open type `best_msig` (Ind), an abbreviation
+// and an `[@@unboxed]` type check their body at Sep and read the context
+// back through `msig_of_context`.  A Tconstr composes with its OWN
+// declaration's signature (no expansion), so a name that does not resolve
+// gives up and the declaration keeps the writer's Ind default.
+namespace sepc {
+using cmi::cmiw::Ty;
+using cmi::cmiw::TyPtr;
+using cmi::cmiw::SigItem;
+enum { Ind = 0, Sep = 1, Deepsep = 2 };
+struct Fail {};
+using Resolve = std::function<std::vector<int>(const Ty&)>;  // throws Fail
+static int compose(int m1, int m2) {
+  return m1 == Deepsep ? Deepsep : m1 == Sep ? m2 : Ind;
+}
+static void check(const TyPtr& t, int m, std::map<int, int>& ctx,
+                  std::set<std::pair<const Ty*, int>>& seen, const Resolve& res) {
+  if (!t || m == Ind) return;
+  if (!seen.insert({t.get(), m}).second) return;  // a cycle: Hyps.safe
+  switch (t->k) {
+    case Ty::Var:
+      if (!t->univar) ctx[t->var] = std::max(ctx[t->var], m);
+      return;
+    case Ty::Poly:
+      if (!t->args.empty()) check(t->args[0], m, ctx, seen, res);
+      return;
+    case Ty::Constr: {
+      std::vector<int> msig = res(*t);
+      if (msig.size() != t->args.size()) throw Fail{};
+      for (size_t i = 0; i < msig.size(); ++i)
+        check(t->args[i], compose(m, msig[i]), ctx, seen, res);
+      return;
+    }
+    default:  // arrow, tuple, variant, object, package
+      if (m == Deepsep)
+        for (auto& a : t->args) check(a, Deepsep, ctx, seen, res);
+      return;
+  }
+}
+static void free_vars(const TyPtr& t, std::set<const Ty*>& seen,
+                      std::vector<int>& out) {
+  if (!t || !seen.insert(t.get()).second) return;
+  if (t->k == Ty::Var) { if (!t->univar) out.push_back(t->var); return; }
+  for (auto& a : t->args) free_vars(a, seen, out);
+}
+static std::vector<int> msig_of_context(const std::vector<TyPtr>& params,
+                                        std::map<int, int> ctx) {
+  std::vector<int> r;
+  for (auto& p : params) {
+    if (p && p->k == Ty::Var && !p->univar) {
+      auto it = ctx.find(p->var);
+      r.push_back(it == ctx.end() ? Ind : it->second);
+      ctx[p->var] = Ind;
+      continue;
+    }
+    std::set<const Ty*> seen; std::vector<int> fv;
+    free_vars(p, seen, fv);
+    bool all_ind = true;
+    for (int v : fv) if (auto it = ctx.find(v); it != ctx.end() && it->second != Ind) all_ind = false;
+    r.push_back(all_ind ? Ind : Deepsep);
+    if (!all_ind) for (int v : fv) ctx[v] = Ind;
+  }
+  return r;
+}
+static std::vector<int> check_def(const SigItem& it, const Resolve& res) {
+  const size_t n = it.params.size();
+  if (it.type_open) return std::vector<int>(n, Ind);
+  auto on_body = [&](const TyPtr& body, const std::vector<TyPtr>& params) {
+    std::map<int, int> ctx; std::set<std::pair<const Ty*, int>> seen;
+    check(body, Sep, ctx, seen, res);
+    return msig_of_context(params, std::move(ctx));
+  };
+  if (it.ctors.empty() && it.labels.empty() && !it.type_empty_variant) {
+    if (!it.manifest)  // msig_of_external_type
+      return std::vector<int>(n, it.type_immediate ? Ind : Deepsep);
+    return on_body(it.manifest, it.params);
+  }
+  if (it.type_unboxed) {
+    if (it.labels.size() == 1 && it.ctors.empty())
+      return on_body(it.labels[0].ty, it.params);
+    if (it.ctors.size() == 1) {
+      auto& c = it.ctors[0];
+      const std::vector<TyPtr>& ps =
+          c.res && c.res->k == Ty::Constr ? c.res->args : it.params;
+      if (c.args.size() == 1) return on_body(c.args[0], ps);
+      if (c.inline_record.size() == 1) return on_body(c.inline_record[0].ty, ps);
+    }
+  }
+  return std::vector<int>(n, Ind);
+}
+}  // namespace sepc
+
+static bool is_predef_type_name(const std::string& n) {
+  static const std::set<std::string> names = {
+      "int", "char", "string", "bytes", "float", "bool", "unit", "exn",
+      "array", "iarray", "list", "option", "nativeint", "int32", "int64",
+      "lazy_t", "extension_constructor", "floatarray", "eff", "continuation",
+      "atomic_loc"};
+  return names.count(n) != 0;
+}
+
+// A citation no declaration of this unit answers: a predefined type or a
+// dotted path into another unit's cmi.
+static std::vector<int> sep_resolve_global(Checker& ck, const cmi::cmiw::Ty& t) {
+  const std::string& nm = t.name;
+  if (nm.find('.') == std::string::npos) {
+    if (is_predef_type_name(nm)) return std::vector<int>(t.args.size(), sepc::Ind);
+    throw sepc::Fail{};
+  }
+  auto comps = split_dotted(nm);
+  if (ck.bound_module_names_.count(comps[0])) throw sepc::Fail{};
+  if (auto r = ck.cmi_type_separability(nm)) return *r;
+  throw sepc::Fail{};
+}
+
+// The fixed point over one `type .. and ..` group (Typedecl_properties.
+// compute_property_noreq: start every member at best_msig, recompute until
+// nothing moves).  `out[first_new..]` are the group's converted items.
+static void compute_group_separability(Checker& ck,
+                                       std::vector<cmi::cmiw::SigItem>& out,
+                                       size_t first_new, bool nonrec_) {
+  using cmi::cmiw::SigItem;
+  const size_t end = out.size();
+  std::vector<char> failed(end - first_new, 0);
+  for (size_t i = first_new; i < end; ++i)
+    if (out[i].k == SigItem::Type)
+      out[i].type_separability.assign(out[i].params.size(), sepc::Ind);
+  sepc::Resolve res = [&](const cmi::cmiw::Ty& t) -> std::vector<int> {
+    const std::string& nm = t.name;
+    auto sep_of = [&](const SigItem& it) {
+      if (it.type_separability.size() != it.params.size()) throw sepc::Fail{};
+      return it.type_separability;
+    };
+    if (nm.find('.') == std::string::npos) {
+      if (!nonrec_)
+        for (size_t i = first_new; i < end; ++i)
+          if (out[i].k == SigItem::Type && out[i].name == nm) return sep_of(out[i]);
+      const std::vector<SigItem>* lvl = nullptr;
+      if (auto* it = local_type_item(out, first_new, nm, &lvl)) return sep_of(*it);
+      return sep_resolve_global(ck, t);
+    }
+    const std::vector<SigItem>* lvl = nullptr;
+    if (auto* it = local_type_item(out, first_new, nm, &lvl)) return sep_of(*it);
+    return sep_resolve_global(ck, t);
+  };
+  for (int iter = 0; iter < 16; ++iter) {
+    bool changed = false;
+    for (size_t i = first_new; i < end; ++i) {
+      if (out[i].k != SigItem::Type || failed[i - first_new]) continue;
+      std::vector<int> v;
+      try { v = sepc::check_def(out[i], res); }
+      catch (sepc::Fail&) {
+        failed[i - first_new] = 1;
+        out[i].type_separability.clear();
+        changed = true;
+        continue;
+      }
+      if (v != out[i].type_separability) { out[i].type_separability = v; changed = true; }
+    }
+    if (!changed) break;
+  }
+}
+
 // Convert a run of `type ... and ...` declarations (shared by structure and
 // signature emission -- both hold a std::vector<TypeDeclaration>) into SigItems.
 static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& decls,
@@ -17112,6 +17312,7 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
   // (ocamlc prints the group back with `and`).  A `type nonrec` head is
   // Trec_not -- carried as -1 (0 doubles as "unset -> Trec_first" in the
   // writer); Printtyp prints the keyword back from it.
+  compute_group_separability(ck, out, first_new, nonrec_);
   for (size_t i = first_new; i < out.size(); ++i)
     out[i].rec_status = (i == first_new) ? (nonrec_ ? -1 : 1) : 2;
 }
@@ -17551,6 +17752,7 @@ static cmi::cmiw::SigItem cmi_type_to_item(const cmi::TypeDecl& td) {
   // Subst keeps the representation: a copied `[@@unboxed]` stays unboxed.
   if (!unboxdef_off()) si.type_unboxed = td.unboxed;
   si.type_variances = td.variances;
+  si.type_separability = td.separability;  // Subst keeps it (S576)
   si.loc = rloc_to_loc(td.loc);
   si.uid = cmi_uid(td.uid);
   return si;
@@ -18185,6 +18387,14 @@ static void apply_with_constraints(Checker& ck, const ast::ModuleType& mt,
       // with type key = t` cites the enclosing t, not Map.S's t).  The item
       // sits comps.size()-1 levels below `items` plus the caller's bias.
       tgt->with_scope_skip = (int)comps.size() - 1 + depth_bias;
+      // transl_with_constraint re-derives the refined declaration's
+      // separability (Typedecl_separability.compute_decl), S576.
+      tgt->type_separability.clear();
+      try {
+        tgt->type_separability = sepc::check_def(*tgt, [&](const cmi::cmiw::Ty& t) {
+          return sep_resolve_global(ck, t);
+        });
+      } catch (sepc::Fail&) {}
     }
     m = pw->mt.get();
   }
