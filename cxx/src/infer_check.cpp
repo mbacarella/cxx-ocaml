@@ -16691,6 +16691,15 @@ static const ast::CoreType* unboxed_arg(const TypeDeclaration& d) {
     return rec->fields.size() == 1 ? &*rec->fields[0].type : nullptr;
   return nullptr;
 }
+namespace stampcount {
+std::string alias_unit(const cmi::Path* p);
+}
+// NODOTINC=1 drops an `include` of a dotted path's items again.
+static bool dotinc_off() {
+  static const bool off = dbg_env("NODOTINC") != nullptr ||
+                          dbg_env("NOSHARE581") != nullptr;
+  return off;
+}
 // NOUNBIMM=1 leaves an `[@@unboxed]` declaration Unknown again.
 static bool unbimm_off() {
   static const bool off = dbg_env("NOUNBIMM") != nullptr ||
@@ -21779,6 +21788,108 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
             for (auto& si : items) out.push_back(std::move(si));
             unit_includes.push_back({out.size(), unm, std::move(tnames)});
             inc_path = unm;  // mark handled
+          } catch (...) {}
+        }
+        // `include X.Y` / `include Gc.Memprof`: a DOTTED path.  Walk it to
+        // the submodule's signature -- through this module's emitted items
+        // when the head is local, else through the head unit's cmi (a stdlib
+        // member `Stdlib.Gc` is its own unit, and an alias member goes on to
+        // its unit) -- and splice it strengthened at the path, as for a bare
+        // name.  Without this every included item was dropped, and each
+        // field after the include sat that many slots too low.
+        if (!inc && inc_path.empty() && !dotinc_off() &&
+            std::holds_alternative<Ldot>(mi->id.txt.v)) {
+          std::vector<std::string> comps;
+          std::string full = lid_full(mi->id.txt);
+          for (std::size_t a = 0;;) {
+            std::size_t d = full.find('.', a);
+            comps.push_back(full.substr(a, d == std::string::npos ? d : d - a));
+            if (d == std::string::npos) break;
+            a = d + 1;
+          }
+          bool bound_local = false;
+          for (auto& it2 : s)
+            if (auto* mb2 = std::get_if<Pstr_module>(&it2.desc))
+              if (mb2->binding.name.txt && *mb2->binding.name.txt == comps[0])
+                bound_local = true;
+          if (fparams)
+            for (auto& fp : *fparams)
+              if (fp.first == comps[0]) bound_local = true;
+          // A head bound by the ENCLOSING structure (`module M = struct
+          // include X.Y end`, X outer) walks that level's emitted items.
+          const std::vector<cmi::cmiw::SigItem>* from = &out;
+          if (!bound_local && saved_enclosing)
+            for (auto& si : *saved_enclosing)
+              if (si.k == cmi::cmiw::SigItem::Module && si.name == comps[0]) {
+                bound_local = true;
+                from = saved_enclosing;
+              }
+          if (bound_local) {
+            const std::vector<cmi::cmiw::SigItem>* cur = from;
+            const cmi::cmiw::SigItem* found = nullptr;
+            for (auto& c : comps) {
+              found = nullptr;
+              for (auto& si : *cur)
+                if (si.k == cmi::cmiw::SigItem::Module && si.name == c &&
+                    !si.is_functor && si.alias.empty())
+                  found = &si;
+              if (!found) break;
+              cur = &found->sub;
+            }
+            if (found) {
+              auto items = found->sub;
+              strengthen_abstract(items, full, /*aliasable=*/true);
+              for (auto& si : items) {
+                if (si.k == cmi::cmiw::SigItem::Modtype) {
+                  si.modtype_ref = full + "." + si.name;
+                  si.modtype_abstract = false;
+                }
+                out.push_back(std::move(si));
+              }
+              inc_path = full;  // mark handled
+            }
+          } else try {
+            std::size_t i = comps[0] == "Stdlib" && comps.size() > 2 ? 1 : 0;
+            std::string ucmi = head_cmi(comps[i]);
+            if (std::filesystem::exists(ucmi)) {
+              const auto* cmif = &cmi::CmiFile::load(ucmi);
+              const cmi::Signature* sg = &cmif->sig();
+              std::string spath = cmif->module_name().empty()
+                                      ? comps[i] : cmif->module_name();
+              for (std::size_t j = i + 1; sg && j < comps.size(); ++j) {
+                const cmi::ModuleDecl* md = nullptr;
+                for (auto& m : sg->modules)
+                  if (m.name == comps[j]) md = &m;
+                if (!md || !md->type) { sg = nullptr; break; }
+                if (md->type->kind == cmi::ModuleType::Sig && md->type->sig) {
+                  sg = md->type->sig.get();
+                  spath += "." + comps[j];
+                } else if (md->type->kind == cmi::ModuleType::Alias &&
+                           !stampcount::alias_unit(md->type->path.get()).empty()) {
+                  std::string u = stampcount::alias_unit(md->type->path.get());
+                  std::string c2 = head_cmi(u);
+                  if (!std::filesystem::exists(c2)) { sg = nullptr; break; }
+                  cmif = &cmi::CmiFile::load(c2);
+                  sg = &cmif->sig();
+                  spath = cmif->module_name().empty() ? u : cmif->module_name();
+                } else {
+                  sg = nullptr;
+                }
+              }
+              if (sg) {
+                std::string rel;
+                for (std::size_t j = i; j < comps.size(); ++j)
+                  rel += (rel.empty() ? "" : ".") + comps[j];
+                auto items = cmi_sig_to_items(*sg, rel);
+                strengthen_abstract(items, spath, /*aliasable=*/true);
+                std::set<std::string> tnames;
+                for (auto& si : items)
+                  if (si.k == cmi::cmiw::SigItem::Type) tnames.insert(si.name);
+                for (auto& si : items) out.push_back(std::move(si));
+                unit_includes.push_back({out.size(), rel, std::move(tnames)});
+                inc_path = full;  // mark handled
+              }
+            }
           } catch (...) {}
         }
       } else if (auto* pc = std::get_if<Pmod_constraint>(&in->expr.desc)) {

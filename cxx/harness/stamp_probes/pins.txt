@@ -783,6 +783,15 @@ xdcl_c2 -1
 xdcl_c3 0
 xdcl_d1 0
 xdcl_d2 0
+xdin_a1 0
+xdin_a2 0
+xdin_a3 0
+xdin_a4 0
+xdin_a5 0
+xdin_a6 0
+xdin_a7 0
+xdin_a8 0
+xdin_a9 0
 xdl_a1 0
 xdl_a2 0
 xdl_a3 0
