@@ -16706,6 +16706,13 @@ static bool shadowty_off() {
                           dbg_env("NOSHARE582") != nullptr;
   return off;
 }
+// NOALIASINC=1 drops the items of an `include` of a unit alias
+// (`module S = Seq  include S`) or of a `module type of` ascription again.
+static bool aliasinc_off() {
+  static const bool off = dbg_env("NOALIASINC") != nullptr ||
+                          dbg_env("NOSHARE585") != nullptr;
+  return off;
+}
 // NODOTINC=1 drops an `include` of a dotted path's items again.
 static bool dotinc_off() {
   static const bool off = dbg_env("NODOTINC") != nullptr ||
@@ -21696,6 +21703,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         inc = &ms->items;                              // include (struct .. end)
       else if (auto* mi = std::get_if<Pmod_ident>(&in->expr.desc)) {
         std::string nm = lid_last(mi->id.txt);         // include LocalModule
+        std::string alias_unit;  // `module S = Seq  include S`: the unit
         // Chase local ALIAS bindings (`module A_alias = A; include A_alias`):
         // ocamlc strengthens through the RESOLVED path (A, not A_alias).
         for (int hops = 0; hops < 8 && !inc; ++hops) {
@@ -21706,7 +21714,11 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
                 tgt = &mb2->binding.expr;
                 break;
               }
-          if (!tgt) break;
+          if (!tgt) {
+            // The chain ended at a name nothing here binds: a unit.
+            if (hops > 0 && !aliasinc_off()) alias_unit = nm;
+            break;
+          }
           if (auto* ms2 = std::get_if<Pmod_structure>(&tgt->desc)) {
             inc = &ms2->items;
             inc_path = nm;
@@ -21795,7 +21807,8 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         // once emission finishes (unit_includes).
         if (!inc && inc_path.empty() &&
             std::holds_alternative<Lident>(mi->id.txt.v)) {
-          std::string unm = lid_last(mi->id.txt);
+          std::string unm =
+              alias_unit.empty() ? lid_last(mi->id.txt) : alias_unit;
           bool bound_local = false;
           for (auto& it2 : s)
             if (auto* mb2 = std::get_if<Pstr_module>(&it2.desc))
@@ -21931,6 +21944,30 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         std::string cref;
         std::vector<cmi::cmiw::SigItem> csub;
         if (pc->mt) annot_modtype_items(&ck, *pc->mt, cref, csub);
+        // `include (Seq : module type of Seq)`: the typeof signature,
+        // strengthened iff its path crossed an alias -- as an ascription's.
+        if (pc->mt && csub.empty() && !aliasinc_off())
+          if (auto* pto = std::get_if<Pmty_typeof>(&pc->mt->desc))
+            if (auto* pi2 = std::get_if<Pmod_ident>(&pto->me->desc);
+                pi2 && !std::holds_alternative<Lapply>(pi2->id.txt.v)) {
+              auto t = resolve_typeof_path(&out, lid_full(pi2->id.txt));
+              if (t.ok) {
+                if (t.through_alias) strengthen_abstract(t.items, t.norm, false);
+                csub = std::move(t.items);
+              }
+            }
+        // `include (Option : T)`, T a local module type with no signature
+        // AST (`module type T = module type of Option`): T's emitted items.
+        if (pc->mt && csub.empty() && !aliasinc_off())
+          if (auto* pid = std::get_if<Pmty_ident>(&pc->mt->desc))
+            if (auto* l = std::get_if<Lident>(&pid->id.txt.v))
+              for (auto j = out.size(); j-- > 0;)
+                if (out[j].k == cmi::cmiw::SigItem::Modtype &&
+                    out[j].name == l->name) {
+                  if (!out[j].modtype_abstract && out[j].modtype_ref.empty())
+                    csub = out[j].sub;
+                  break;
+                }
         for (auto& si : csub) out.push_back(std::move(si));
       } else if (std::holds_alternative<Pmod_apply>(in->expr.desc)) {
         // `include F(struct end)`: the application's result items, computed by

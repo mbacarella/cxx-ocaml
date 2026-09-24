@@ -135,6 +135,16 @@ xafp_a7 0
 xafp_a8 0
 xafp_a9 0
 xafp_a10 0
+xain_a1 0
+xain_a2 0
+xain_a3 -65
+xain_a4 -52
+xain_a5 0
+xain_a6 0
+xain_a7 -52
+xain_c1 0
+xain_c2 0
+xain_c3 0
 xanp_a1 0
 xanp_a2 0
 xanp_a3 0
