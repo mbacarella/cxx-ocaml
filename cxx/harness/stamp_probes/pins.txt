@@ -5809,6 +5809,13 @@ xuid_a8 0
 xuid_a9 0
 xuid_b1 0
 xuid_b2 0
+xurp_a1 0
+xurp_a2 0
+xurp_a3 0
+xurp_a4 0
+xurp_a5 0
+xurp_a6 0
+xurp_a7 0
 xvr_a1 0
 xvr_a2 0
 xvr_a3 0

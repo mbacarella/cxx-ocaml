@@ -1612,11 +1612,16 @@ struct CmiShare {
   o::ValPtr none;                                   // Location.none
   o::ValPtr tvar_none, tunivar_none;                // the two shared descs
   o::ValPtr prim_noname;                            // the `""` native name
+  // S578: `Unboxed_integer Pint32/Pint64/Pnativeint` is a STATIC constant in
+  // Typedecl.native_repr_of_type, so every external's argument or result
+  // cites the ONE block per kind (keyed by the writer's repr code 3/4/5).
+  std::map<int, o::ValPtr> reprs;
   void clear() {
     strs.clear(); poss.clear(); ids.clear(); pidents.clear(); none = nullptr;
     ppaths.clear(); heads.clear(); pstrs.clear(); mstamps.clear();
     decl_strs.clear(); decl_locs.clear(); decl_uids.clear(); decl_ids.clear();
     tvar_none = tunivar_none = nullptr; prim_noname = nullptr;
+    reprs.clear();
   }
 };
 CmiShare g_share;
@@ -1788,6 +1793,13 @@ bool sep_off() {
 bool attr_off() {
   static const bool off = cppcaml::dbg_env("NOATTR") != nullptr ||
                           cppcaml::dbg_env("NOSHARE577") != nullptr;
+  return off;
+}
+// S578: an unboxed integer's native_repr is one shared block per kind.
+// NOREPRSHARE=1 allocates one per use again.
+bool reprshare_off() {
+  static const bool off = cppcaml::dbg_env("NOREPRSHARE") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE578") != nullptr;
   return off;
 }
 bool envpath_off() {
@@ -3014,6 +3026,11 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         int arity = 0;
         for (TyPtr a = it.ty; a && a->k == Ty::Arrow; a = a->args[1]) ++arity;
         auto repr_val = [](int c) -> o::ValPtr {
+          if (c >= 3 && c <= 5 && !reprshare_off()) {
+            o::ValPtr &r = g_share.reprs[c];
+            if (!r) r = o::vblock(0, {o::vint(c == 3 ? 1 : c == 4 ? 2 : 0)});
+            return r;
+          }
           switch (c) {
             case 1: return o::vint(1);                  // Unboxed_float
             case 2: return o::vint(2);                  // Untagged_immediate
