@@ -162,6 +162,14 @@ xaor_a6 0
 xaor_a7 0
 xaor_a8 -198
 xaor_a9 0
+xapr_a1 0
+xapr_a2 0
+xapr_a3 0
+xapr_a4 0
+xapr_a5 0
+xapr_a6 0
+xapr_a7 0
+xapr_a8 0
 xar_a1 0
 xar_a2 0
 xar_a3 0

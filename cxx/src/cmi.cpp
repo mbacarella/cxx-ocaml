@@ -1553,6 +1553,13 @@ bool openinj_off() {
                           cppcaml::dbg_env("NOSHARE592") != nullptr;
   return off;
 }
+// S593: an array literal's elements meet the element type as the EXPECTED
+// side.  NOARRPROV=1 links them the other way round again.
+bool arrprov_off() {
+  static const bool off = cppcaml::dbg_env("NOARRPROV") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE593") != nullptr;
+  return off;
+}
 
 namespace cmiw {
 

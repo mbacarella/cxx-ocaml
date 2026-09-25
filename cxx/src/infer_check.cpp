@@ -11625,8 +11625,13 @@ struct Checker {
       return eng.constr("unit");
     }
     if (auto* a = std::get_if<Pexp_array>(&e.desc)) {
+      // ocamlc type_expects every element AT the element type, so each one
+      // meets it as the ACTUAL side and the first element's path objects are
+      // the ones the saved type cites (typecore.ml's Pexp_array).
       TypePtr el = eng.fresh_var();
-      for (auto& x : a->elems) try_unify(el, infer_expr(*x));
+      for (auto& x : a->elems)
+        if (cmi::arrprov_off()) try_unify(el, infer_expr(*x));
+        else try_unify_rev(el, infer_expr(*x));
       return eng.constr("array", {el});
     }
     if (auto* sti = std::get_if<Pexp_struct_item>(&e.desc)) {
