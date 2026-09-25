@@ -22924,17 +22924,23 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         // APPLICATION, `module N = F(..)`): splice N's already-EMITTED
         // items, alias-strengthened at N -- `module M = N.M`
         // (index_functor).
+        // By index, and N's name copied out first: the splice grows `out`,
+        // which may move N's own item (reading it after was a use-after-free
+        // -- a bad_alloc that dropped the whole .cmi, S615).
         if (!inc && inc_path.empty() &&
             std::holds_alternative<Lident>(mi->id.txt.v))
-          for (auto& si : out)
+          for (std::size_t k = 0; k < out.size(); ++k) {
+            const auto& si = out[k];
             if (si.k == cmi::cmiw::SigItem::Module && !si.is_functor &&
                 si.name == lid_last(mi->id.txt) && !si.sub.empty()) {
+              std::string nm = si.name;
               std::vector<cmi::cmiw::SigItem> sub = si.sub;
-              strengthen_abstract(sub, si.name, /*aliasable=*/true);
+              strengthen_abstract(sub, nm, /*aliasable=*/true);
               for (auto& s2 : sub) out.push_back(std::move(s2));
-              inc_path = si.name;  // mark handled
+              inc_path = nm;  // mark handled
               break;
             }
+          }
         // `include Queue` of a COMPILATION UNIT (stdlib or a -I dir), bound
         // by nothing local: splice its compiled cmi signature strengthened at
         // the unit path -- ocamlc records `type 'a t = 'a Stdlib__Queue.t`,

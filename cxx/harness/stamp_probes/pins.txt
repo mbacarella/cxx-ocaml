@@ -1672,6 +1672,9 @@ xho_r3h 0
 xho_r3i 0
 xho_r3j 0
 xho_r3 0
+xiaf_a1 0
+xiaf_a2 0
+xiaf_a3 0
 xin_a01 0
 xin_a02 0
 xin_a03 0
