@@ -19358,6 +19358,11 @@ static bool fapp_body_off() {
                           cppcaml::dbg_env("NOSHARE602") != nullptr;
   return off;
 }
+static bool with_local_mt_off() {
+  static const bool off = cppcaml::dbg_env("NOWITHLOCMT") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE621") != nullptr;
+  return off;
+}
 // depth_bias: how many scope levels the `items` vector itself sits BELOW the
 // scope where the constraint was written -- 1 when they become a module's sub
 // (`module Map : Map.S with type ..`), 0 when spliced flat by an include.
@@ -19483,6 +19488,25 @@ static void apply_with_constraints(Checker& ck, const ast::ModuleType& mt,
                 si.modtype_ref.find('.') != std::string::npos) {
               auto mats = cmi_modtype_items(split_dotted(si.modtype_ref));
               if (!mats.empty()) { si.sub = std::move(mats); si.modtype_ref.clear(); }
+            }
+            // A BARE named modtype (`module Elem : ORDERED` inside HEAP, then
+            // `HEAP with type Elem.t = int`) is forced inline too: its items
+            // are the fallback layout (else the latest earlier `module type
+            // ORDERED` of the enclosing structure).  Kept as a ref, the writer
+            // emitted `Elem : ORDERED` and dropped the constraint (S621;
+            // NOWITHLOCMT reverts).
+            if (!si.modtype_ref.empty() &&
+                si.modtype_ref.find('.') == std::string::npos &&
+                !with_local_mt_off()) {
+              if (si.sub.empty() && g_enclosing_struct_items)
+                for (auto e = g_enclosing_struct_items->rbegin();
+                     e != g_enclosing_struct_items->rend(); ++e)
+                  if (e->k == cmi::cmiw::SigItem::Modtype &&
+                      e->name == si.modtype_ref) {
+                    if (!e->modtype_abstract) si.sub = e->sub;
+                    break;
+                  }
+              if (!si.sub.empty()) si.modtype_ref.clear();
             }
             next = &si.sub; break;
           }
