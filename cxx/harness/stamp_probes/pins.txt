@@ -3595,6 +3595,10 @@ xofd_a9 0
 xofd_b1 0
 xofd_b2 0
 xofd_b3 0
+xogd_a1 0
+xogd_a2 0
+xogd_a3 -5
+xogd_b1 0
 xoi_a1 0
 xoi_a2 0
 xoi_a3 0

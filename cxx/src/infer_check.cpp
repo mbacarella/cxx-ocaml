@@ -1053,6 +1053,7 @@ struct Checker {
     std::string param;
     std::unordered_map<std::string, TypePtr> vals;
     std::vector<std::string> own_types, own_mods;
+    std::vector<const TypeDeclaration*> own_decls;  // parallel to own_types
   };
   std::unordered_map<std::string, FunctorReal> functor_real_env_;
   static bool locfapp_off() {
@@ -3991,9 +3992,20 @@ struct Checker {
     for (auto& [k, v] : fr->second.vals) {
       std::unordered_map<I::Type*, TypePtr> m0;
       TypePtr t = subst_path_head(v, fr->second.param + ".", apfx, m0);
-      for (auto& n : fr->second.own_types) {
+      for (std::size_t oi = 0; oi < fr->second.own_types.size(); ++oi) {
+        const auto& n = fr->second.own_types[oi];
         std::unordered_map<I::Type*, TypePtr> m1;
-        t = subst_path_head(t, n, tpfx + n, m1, /*exact=*/true);
+        // Under an open, cite the stamp the open registered the type at, so
+        // the opened ctors (S617) and these values meet as one type.
+        int ns = -1;
+        static const bool no_open_gadt =
+            cppcaml::dbg_env("NOOPENGADT") != nullptr ||
+            cppcaml::dbg_env("NOSHARE617") != nullptr;
+        if (via_open && !no_open_gadt && oi < fr->second.own_decls.size())
+          if (auto ts = type_stamp_.find(fr->second.own_decls[oi]);
+              ts != type_stamp_.end())
+            ns = ts->second;
+        t = subst_path_head(t, n, tpfx + n, m1, /*exact=*/true, ns);
       }
       for (auto& n : fr->second.own_mods) {
         std::unordered_map<I::Type*, TypePtr> m2;
@@ -12337,14 +12349,14 @@ struct Checker {
   TypePtr subst_path_head(const TypePtr& t0, const std::string& from,
                           const std::string& to,
                           std::unordered_map<I::Type*, TypePtr>& memo,
-                          bool exact = false) {
+                          bool exact = false, int new_stamp = -1) {
     TypePtr t = I::Engine::repr(t0);
     if (auto m = memo.find(t.get()); m != memo.end()) return m->second;
     memo[t.get()] = t;
     switch (t->kind) {
       case I::Type::Kind::Arrow: {
-        TypePtr d = subst_path_head(t->dom, from, to, memo, exact);
-        TypePtr c = subst_path_head(t->cod, from, to, memo, exact);
+        TypePtr d = subst_path_head(t->dom, from, to, memo, exact, new_stamp);
+        TypePtr c = subst_path_head(t->cod, from, to, memo, exact, new_stamp);
         if (d.get() == I::Engine::repr(t->dom).get() &&
             c.get() == I::Engine::repr(t->cod).get())
           return t;
@@ -12359,14 +12371,15 @@ struct Checker {
         std::vector<TypePtr> as;
         bool changed = hit;
         for (auto& a : t->args) {
-          as.push_back(subst_path_head(a, from, to, memo, exact));
+          as.push_back(subst_path_head(a, from, to, memo, exact, new_stamp));
           if (as.back().get() != I::Engine::repr(a).get()) changed = true;
         }
         if (!changed) return t;
         TypePtr r = t->kind == I::Type::Kind::Tuple
                         ? eng.tuple(std::move(as))
                         : eng.constr(hit ? to + t->path.substr(from.size()) : t->path,
-                                     std::move(as), t->stamp);
+                                     std::move(as),
+                                     hit && new_stamp >= 0 ? new_stamp : t->stamp);
         memo[t.get()] = r;
         return r;
       }
@@ -14739,6 +14752,22 @@ struct Checker {
                       mod_prefix_ = func_bind_name_ + ".";
                       for (auto& bit : bs->items)
                         if (auto* ty2 = std::get_if<Pstr_type>(&bit.desc)) {
+                          // The group's names are in scope while its ctors
+                          // convert, as register_types_rec does: a GADT
+                          // result `u` read bare, so `U 1` saved `'a` (S617;
+                          // NOOPENGADT reverts).
+                          static const bool no_open_gadt =
+                              cppcaml::dbg_env("NOOPENGADT") != nullptr ||
+                              cppcaml::dbg_env("NOSHARE617") != nullptr;
+                          if (!no_open_gadt && !subtenv_off())
+                            for (auto& d : ty2->decls)
+                              if (decl_is_opaque(d)) {
+                                int st = next_type_stamp_++;
+                                prestamped_[&d] = st;
+                                stamp_path_[st] = mod_prefix_ + d.name.txt;
+                                if (ty2->rf == RecFlag::Recursive)
+                                  tenv.back()[d.name.txt] = st;
+                              }
                           for (auto& d : ty2->decls) {
                             register_type_decl(d);
                             register_record_decl(d);
@@ -14947,7 +14976,10 @@ struct Checker {
                   fr.vals = ex;
                   for (auto& bi : bs->items)
                     if (auto* bt = std::get_if<Pstr_type>(&bi.desc)) {
-                      for (auto& d : bt->decls) fr.own_types.push_back(d.name.txt);
+                      for (auto& d : bt->decls) {
+                        fr.own_types.push_back(d.name.txt);
+                        fr.own_decls.push_back(&d);
+                      }
                     } else if (auto* bm = std::get_if<Pstr_module>(&bi.desc)) {
                       if (bm->binding.name.txt)
                         fr.own_mods.push_back(*bm->binding.name.txt);
