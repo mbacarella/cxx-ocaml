@@ -118,6 +118,7 @@ bool optdef_off();  // NOOPTDEF=1: optional defaults unify actual-first (S594)
 // NOPARAMSTR=1: a functor parameter's / named modtype's members cite
 // fresh strings, opens are not told apart (S595)
 bool paramstr_off();
+bool hoparam_off();
 bool prov_off();  // NOPROV=1: the writer ignores provenance (S554 behaviour)
 // NONODEID=1: the saved graph keeps one writer node per OCCURRENCE (S555
 // behaviour) -- no per-use instantiate copies, no node memo across a
@@ -715,6 +716,9 @@ struct SigItem {
   // emitter reuses functor-module emission and takes its md_type.  When
   // non-empty it overrides param_sig/functor_param_ref.
   std::vector<SigItem> param_functor;
+  // ... and the same for each LATER parameter, parallel to more_param_names
+  // (`(B : S) (F : (X : T) -> U)`).
+  std::vector<std::vector<SigItem>> more_param_functors;
   std::vector<std::string> more_param_refs;
   // Module: `module MD5 : S` -- the decl's modtype is the NAMED reference S
   // (Mty_ident), not S's expansion.  Empty = Mty_signature(sub).

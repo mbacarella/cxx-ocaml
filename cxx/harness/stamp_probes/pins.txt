@@ -1480,6 +1480,16 @@ xgh_c5 0
 xgh_c6 0
 xgh_c7 0
 xgh_c8 0
+xhop_a1 0
+xhop_a2 0
+xhop_a3 0
+xhop_a4 0
+xhop_a5 -3
+xhop_a6 0
+xhop_a7 0
+xhop_a8 0
+xhop_b1 0
+xhop_b2 0
 xho_a1 0
 xho_a2 0
 xho_a3 0

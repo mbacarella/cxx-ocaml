@@ -18973,11 +18973,22 @@ static void relocate_sig_locs(std::vector<cmi::cmiw::SigItem>& items,
   for (auto& si : items) relocate_sig_item(si, loc);
 }
 
+// A structure's `module type T = functor (X : S) -> ..`: infer_signature asks
+// signature_to_cmi_i (called on an empty signature) for the functor item
+// its build_functor_item makes of a signature's own such declaration.
+static const Pmty_functor* g_functor_modtype_req = nullptr;
+static bool functor_modtype_off() {
+  static const bool off = cppcaml::dbg_env("NOHOPARAM") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE599") != nullptr;
+  return off;
+}
 static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
     const ast::Signature& s,
     const std::unordered_map<std::string, const ast::Signature*>* outer,
     const std::unordered_map<std::string, const ast::Signature*>* outer_mods,
     const Checker* outer_ck) {
+  const Pmty_functor* functor_req = g_functor_modtype_req;
+  g_functor_modtype_req = nullptr;
   Checker ck;
   ck.record_kinds_ = true;
   ck.keep_local_abbrevs_ = true;  // verbatim path: `t` stays `t`, not its manifest
@@ -19398,6 +19409,11 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
           apply_with_constraints(ck, *fn2->type, p.sig);
           if (auto* pid2 = std::get_if<Pmty_ident>(&fn2->type->desc))
             p.ref = lid_full(pid2->id.txt);
+          if (auto* pf3 = std::get_if<Pmty_functor>(&fn2->type->desc)) {
+            auto sub = build_functor_item("", *pf3);
+            sub.k = cmi::cmiw::SigItem::Module;
+            p.pfunc.push_back(std::move(sub));
+          }
         }
       }
       more.push_back(std::move(p));
@@ -19463,9 +19479,15 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
       fitem.more_param_sigs.push_back(std::move(p.sig));
       fitem.more_param_units.push_back(p.unit ? 1 : 0);
       fitem.more_param_refs.push_back(std::move(p.ref));
+      fitem.more_param_functors.push_back(std::move(p.pfunc));
     }
     return fitem;
   };
+  if (functor_req) {
+    auto fi = build_functor_item("", *functor_req);
+    fi.k = cmi::cmiw::SigItem::Modtype;
+    return {std::move(fi)};
+  }
   std::vector<cmi::cmiw::SigItem> out;
   // `open F(X)` in this signature: the applied path, so a following nonrec
   // self-manifest can qualify through it.
@@ -20984,6 +21006,7 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
       item.more_param_sigs.push_back(std::move(ps[i].sig));
       item.more_param_units.push_back(ps[i].unit ? 1 : 0);
       item.more_param_refs.push_back(std::move(ps[i].ref));
+      item.more_param_functors.push_back(std::move(ps[i].fsig));
     }
     return item;
   }
@@ -21759,6 +21782,16 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         // (t02): resolved to the expanded signature (ocamlc stores it too).
         if (auto r = mt_items(*pmt->type))
           out.push_back(cmi::cmiw::sig_modtype(pmt->name.txt, std::move(*r)));
+      } else if (auto* pf = std::get_if<Pmty_functor>(&pmt->type->desc);
+                 pf && !functor_modtype_off()) {
+        // `module type T = functor (X : S) -> ..`: was left out of the .cmi,
+        // so a later `(F : T)` parameter degraded to `sig end`.
+        g_functor_modtype_req = pf;
+        auto r = signature_to_cmi_i({}, &ck.modtype_sig_asts_, nullptr, &ck);
+        if (r.size() == 1) {
+          r[0].name = pmt->name.txt;
+          out.push_back(std::move(r[0]));
+        }
       }
       if (out.size() > mtb) out.back().attrs = item_attrs(pmt->attrs);
     } else if (auto* pc = std::get_if<Pstr_class>(&it.desc)) {

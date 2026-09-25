@@ -1554,6 +1554,13 @@ bool docfilt_off() {
 // off too -- `M.t` in the body is `Pdot(M, Ident.name id)` over the param
 // sig's own `type t` ident (env.ml's prefix_idents runs on the param's
 // components like on any module's).  NOPARAMSTR=1 writes a fresh string.
+// A higher-order parameter after the first keeps its functor type (it was
+// written `sig end`).  NOHOPARAM (alias NOSHARE599) reverts.
+bool hoparam_off() {
+  static const bool off = cppcaml::dbg_env("NOHOPARAM") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE599") != nullptr;
+  return off;
+}
 bool paramstr_off() {
   static const bool off = cppcaml::dbg_env("NOPARAMSTR") != nullptr ||
                           cppcaml::dbg_env("NOSHARE595") != nullptr;
@@ -3146,7 +3153,9 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
                                 p < it.more_param_sigs.size() ? it.more_param_sigs[p]
                                                               : std::vector<SigItem>{},
                                 p < it.more_param_refs.size() ? it.more_param_refs[p]
-                                                              : std::string()));
+                                                              : std::string(),
+                                !hoparam_off() && p < it.more_param_functors.size()
+                                    ? &it.more_param_functors[p] : nullptr));
     // A NAMED result modtype (`module F () : Ret`) is stored Mty_ident;
     // the resolved items are the fallback.
     o::ValPtr body;
@@ -4192,11 +4201,16 @@ static bool assign_uids_mapped(std::vector<SigItem>& items,
       // `module type S = sig .. end`: the typer numbers the body's items
       // like any other signature's (S563; NOUIDMTBODY=1 leaves them
       // Internal, as before).
+      const std::string mtp =
+          (path.empty() ? std::string() : path + ".") + "%" + it.name;
+      // A FUNCTOR module type's parameter signature comes first, as a
+      // functor module's does (S599, under NOHOPARAM).
+      if (it.is_functor && !mtbody_off() && !hoparam_off() &&
+          !assign_uids_mapped(it.param_sig, unit, intf, uids,
+                              mtp + ".!" + it.functor_param, commit))
+        return false;
       if (!mtbody_off() &&
-          !assign_uids_mapped(it.sub, unit, intf, uids,
-                              (path.empty() ? std::string() : path + ".") +
-                                  "%" + it.name,
-                              commit))
+          !assign_uids_mapped(it.sub, unit, intf, uids, mtp, commit))
         return false;
       if (!at('M', it.name, &it.uid)) return false;
     } else if (it.k == SigItem::Class) {
