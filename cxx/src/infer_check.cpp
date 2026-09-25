@@ -21176,6 +21176,16 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
         // inferred structure stays the fallback layout.
         auto inner = module_binding_sigitem(name, *mc->me, prior, ckp);
         if (!inner) inner = cmi::cmiw::sig_module(name, {});
+        // `module B : S = A` / `module B = (A : S)` is NOT an alias of A:
+        // the ascription hides what S does not declare (an abstract `t`
+        // stays abstract), and ocamlc records Mty_ident S.  An alias here
+        // let a consumer see `B.t = A.t` (S612; NOASCALIAS reverts).
+        static const bool no_asc_alias =
+            cppcaml::dbg_env("NOASCALIAS") != nullptr ||
+            cppcaml::dbg_env("NOSHARE612") != nullptr;
+        if (!no_asc_alias && inner->k == cmi::cmiw::SigItem::Module &&
+            !inner->alias.empty())
+          inner = cmi::cmiw::sig_module(name, {});
         if (inner->k == cmi::cmiw::SigItem::Module && !inner->is_functor &&
             inner->alias.empty())
           inner->modtype_ref = lid_full(pid->id.txt);

@@ -234,6 +234,12 @@ xar_d16 0
 xar_d17 0
 xar_d18n -10
 xar_d18 -10
+xasa_a1 0
+xasa_a2 0
+xasa_a3 0
+xasa_a4 0
+xasa_b1 0
+xasa_b2 0
 xasc_a1 0
 xasc_a2 0
 xasc_a3 0
