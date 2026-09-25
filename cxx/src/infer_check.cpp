@@ -1137,6 +1137,21 @@ struct Checker {
   // P's vals into the subclass body (woodyatt: charlie inherits bravo's `y`).
   std::unordered_map<std::string, std::vector<std::pair<std::string, TypePtr>>>
       class_instvars_;
+  // Each class's PRIVATE methods (S605): not in the public object row, so the
+  // writer had no type for them and wrote a fresh variable.  name -> (type,
+  // binders, binder names); infer_object_body leaves its own in
+  // last_priv_meths_ for the class registration to file under the decl.
+  struct PrivMeth { TypePtr ty; std::vector<TypePtr> polys;
+                    std::vector<std::string> pnames; };
+  std::vector<std::pair<std::string, PrivMeth>> last_priv_meths_;
+  std::unordered_map<const ast::ClassDeclaration*,
+                     std::vector<std::pair<std::string, PrivMeth>>>
+      class_priv_meths_;
+  static bool privmeth_off() {
+    static const bool off = cppcaml::dbg_env("NOPRIVMETH") != nullptr ||
+                            cppcaml::dbg_env("NOSHARE605") != nullptr;
+    return off;
+  }
   // `class type ['a,'b] ops = object method m : T .. end`: params + the
   // signature AST, so a `(T1,T2) #ops` annotation can build the object row
   // with params substituted (mixin3's self coercions).
@@ -12349,6 +12364,7 @@ struct Checker {
     std::vector<std::vector<TypePtr>> mpolys;
     std::vector<std::vector<std::string>> mpnames;
     bool any_mpoly = false;
+    std::vector<std::pair<std::string, PrivMeth>> privs;
     venv.emplace_back();
     // Class parameters: bind each so a val initialiser referencing one shares its
     // type var with the instance variable (method-body unification then flows back).
@@ -12490,7 +12506,11 @@ struct Checker {
             try_unify(it->second, bt);
             bt = it->second;
           }
-          if (m->priv == PrivateFlag::Private) continue;  // not in the public type
+          if (m->priv == PrivateFlag::Private) {  // not in the public type
+            privs.push_back({m->name.txt, {bt, std::move(mb_poly),
+                                           std::move(mb_pnames)}});
+            continue;
+          }
           mnames.push_back(m->name.txt);
           mtypes.push_back(bt);
           any_mpoly = any_mpoly || !mb_poly.empty();
@@ -12524,6 +12544,7 @@ struct Checker {
     }
     venv.pop_back();
     self_ty_stack_.pop_back();
+    last_priv_meths_ = std::move(privs);
     // A self-coerced object's PUBLIC type is the annotation's row, CLOSED
     // (an object value has exactly its methods): `(T1,T2) ops`, not `#ops`
     // -- private methods (mixin3's `method private map`) are not public
@@ -14297,6 +14318,7 @@ struct Checker {
                                            &ptys, &instvars, &selfty);
             if (selfty) class_self_types_[&d] = selfty;
             class_instvars_[d.name.txt] = std::move(instvars);
+            class_priv_meths_[&d] = std::move(last_priv_meths_);
             // Unify the pre-registered placeholder with the real inferred
             // ctor/object type so forward `new` uses (which grabbed the
             // placeholder) flow back into this class' body.
@@ -22161,6 +22183,29 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
                     break;
                   }
               f.approx = approx_of_method(*std::get<Cfk_concrete>(pm->kind).e);
+            } else if (auto pv = f.priv && !Checker::privmeth_off()
+                                     ? ck.class_priv_meths_.find(&d)
+                                     : ck.class_priv_meths_.end();
+                       pv != ck.class_priv_meths_.end()) {
+              // A PRIVATE method's own type (S605), a Poly node when it is
+              // written `m : 'a. T` (bridged through a one-method object).
+              f.ty = cmi::cmiw::ty_var(cnext++);
+              for (auto& [pn, pmeth] : pv->second)
+                if (pn == f.name) {
+                  f.self_ref = object_cites_self(pmeth.ty);
+                  f.ty = cbridge(pmeth.ty);
+                  f.approx = approx_of_method(*std::get<Cfk_concrete>(pm->kind).e);
+                  if (!pmeth.polys.empty() && !Checker::polysend_off()) {
+                    TypePtr tw = ck.eng.object_type({pn}, {pmeth.ty});
+                    tw->method_polys = {pmeth.polys};
+                    tw->method_poly_names = {pmeth.pnames};
+                    auto ob = cbridge(tw);
+                    if (ob && ob->k == cmi::cmiw::Ty::Object && !ob->args.empty() &&
+                        ob->args[0]->k == cmi::cmiw::Ty::Poly)
+                      f.ty = ob->args[0];
+                  }
+                  break;
+                }
             } else {
               f.ty = cmi::cmiw::ty_var(cnext++);
             }
