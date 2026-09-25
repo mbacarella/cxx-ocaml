@@ -1011,6 +1011,21 @@ struct Checker {
   // A local functor's fully-unwrapped body expression (constraints and functor
   // params stripped), for resolving applications through the body's own head.
   std::unordered_map<std::string, const ModuleExpr*> functor_body_exprs_;
+  // A one-parameter local functor with a STRUCTURE body: its body's exports at
+  // their inferred types (functor_env keeps only generic vars), the
+  // parameter's name, and the body's own type and module names -- enough to
+  // apply it to a LOCAL module by renaming paths (see applied_local_functor).
+  struct FunctorReal {
+    std::string param;
+    std::unordered_map<std::string, TypePtr> vals;
+    std::vector<std::string> own_types, own_mods;
+  };
+  std::unordered_map<std::string, FunctorReal> functor_real_env_;
+  static bool locfapp_off() {
+    static const bool off = cppcaml::dbg_env("NOLOCFAPP") != nullptr ||
+                            cppcaml::dbg_env("NOSHARE608") != nullptr;
+    return off;
+  }
   // Ascription signature of a top-level `module M : sig .. end = ..`, so an
   // application of a functor DECLARED IN that signature (`Msg.Define(struct ..)`)
   // can be instantiated from its declared functor type.
@@ -3852,6 +3867,50 @@ struct Checker {
   // signature into the body, which we don't do; binding the names (types left
   // fully generic) clears the unbound-value false-rejections without ever
   // introducing a clash.  F is given by its (possibly qualified) module path.
+  // `module M = F (B)`, F a one-parameter LOCAL functor with a structure body
+  // and B a module this file declares: M's members are F's body exports with
+  // the parameter's paths renamed to B's (`X.t` -> `B.t`) and the body's own
+  // types and submodules to M's (`t` -> `M.t`).  They were generic vars, so
+  // `let f () = M.mk ()` saved `f : unit -> 'a` -- a consumer could use its
+  // result at any type (S608; NOLOCFAPP reverts).  Non-strict only: the
+  // renamed `M.t` is not registered, so it must not reach a unification that
+  // can reject.
+  std::unordered_map<std::string, TypePtr> applied_local_functor(
+      const Longident& fpath, const ModuleExpr& arg) {
+    if (strict || locfapp_off() || func_bind_name_.empty()) return {};
+    const std::string bind = func_bind_name_ + ".";
+    if (proc_mod_prefix_.size() < bind.size() ||
+        proc_mod_prefix_.compare(proc_mod_prefix_.size() - bind.size(),
+                                 bind.size(), bind) != 0)
+      return {};
+    auto comps = mod_components(fpath);
+    if (comps.size() != 1) return {};
+    auto fr = functor_real_env_.find(comps[0]);
+    if (fr == functor_real_env_.end()) return {};
+    auto* ai = std::get_if<Pmod_ident>(&arg.desc);
+    if (!ai || std::holds_alternative<Lapply>(ai->id.txt.v)) return {};
+    auto acomps = mod_components(ai->id.txt);
+    if (acomps.empty()) return {};
+    std::string apfx = resolve_written_module(acomps[0]);
+    for (std::size_t i = 1; i < acomps.size(); ++i) apfx += "." + acomps[i];
+    apfx += ".";
+    if (!local_module_prefixes_.count(apfx)) return {};
+    std::unordered_map<std::string, TypePtr> out;
+    for (auto& [k, v] : fr->second.vals) {
+      std::unordered_map<I::Type*, TypePtr> m0;
+      TypePtr t = subst_path_head(v, fr->second.param + ".", apfx, m0);
+      for (auto& n : fr->second.own_types) {
+        std::unordered_map<I::Type*, TypePtr> m1;
+        t = subst_path_head(t, n, proc_mod_prefix_ + n, m1, /*exact=*/true);
+      }
+      for (auto& n : fr->second.own_mods) {
+        std::unordered_map<I::Type*, TypePtr> m2;
+        t = subst_path_head(t, n + ".", proc_mod_prefix_ + n + ".", m2);
+      }
+      out[k] = t;
+    }
+    return out;
+  }
   std::unordered_map<std::string, TypePtr> functor_result_values(const Longident& fpath,
                                                                  int napp = 1,
                                                                  const ModuleExpr* arg1 = nullptr) {
@@ -12123,14 +12182,15 @@ struct Checker {
   // Cyclic back-edges resolve to the original node (pre-registered memo).
   TypePtr subst_path_head(const TypePtr& t0, const std::string& from,
                           const std::string& to,
-                          std::unordered_map<I::Type*, TypePtr>& memo) {
+                          std::unordered_map<I::Type*, TypePtr>& memo,
+                          bool exact = false) {
     TypePtr t = I::Engine::repr(t0);
     if (auto m = memo.find(t.get()); m != memo.end()) return m->second;
     memo[t.get()] = t;
     switch (t->kind) {
       case I::Type::Kind::Arrow: {
-        TypePtr d = subst_path_head(t->dom, from, to, memo);
-        TypePtr c = subst_path_head(t->cod, from, to, memo);
+        TypePtr d = subst_path_head(t->dom, from, to, memo, exact);
+        TypePtr c = subst_path_head(t->cod, from, to, memo, exact);
         if (d.get() == I::Engine::repr(t->dom).get() &&
             c.get() == I::Engine::repr(t->cod).get())
           return t;
@@ -12140,11 +12200,12 @@ struct Checker {
       }
       case I::Type::Kind::Tuple:
       case I::Type::Kind::Constr: {
-        bool hit = t->kind == I::Type::Kind::Constr && t->path.rfind(from, 0) == 0;
+        bool hit = t->kind == I::Type::Kind::Constr &&
+                   (exact ? t->path == from : t->path.rfind(from, 0) == 0);
         std::vector<TypePtr> as;
         bool changed = hit;
         for (auto& a : t->args) {
-          as.push_back(subst_path_head(a, from, to, memo));
+          as.push_back(subst_path_head(a, from, to, memo, exact));
           if (as.back().get() != I::Engine::repr(a).get()) changed = true;
         }
         if (!changed) return t;
@@ -14134,6 +14195,10 @@ struct Checker {
                   }
             }
         }
+        if (napp == 1 && arg1) {
+          auto r = applied_local_functor(fi->id.txt, *arg1);
+          if (!r.empty()) return r;
+        }
         return functor_result_values(fi->id.txt, napp, arg1);
       }
       return {};
@@ -14687,6 +14752,20 @@ struct Checker {
                 if (prev) modenv[pn] = std::move(*prev); else modenv.erase(pn);
                 invalidate_param_modvals(pn);
               }
+              if (!strict && fparams.size() == 1)
+                if (auto* bs = std::get_if<Pmod_structure>(&me->desc)) {
+                  FunctorReal fr;
+                  fr.param = fparams[0].first;
+                  fr.vals = ex;
+                  for (auto& bi : bs->items)
+                    if (auto* bt = std::get_if<Pstr_type>(&bi.desc)) {
+                      for (auto& d : bt->decls) fr.own_types.push_back(d.name.txt);
+                    } else if (auto* bm = std::get_if<Pstr_module>(&bi.desc)) {
+                      if (bm->binding.name.txt)
+                        fr.own_mods.push_back(*bm->binding.name.txt);
+                    }
+                  functor_real_env_[*mb->binding.name.txt] = std::move(fr);
+                }
               for (auto& [k, v] : ex) v = generic_var();
               functor_env[*mb->binding.name.txt] = std::move(ex);
             } else {
