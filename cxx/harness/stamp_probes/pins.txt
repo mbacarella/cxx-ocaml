@@ -852,6 +852,13 @@ xdoc_b2 0
 xdoc_c1 0
 xdoc_c2 0
 xdoc_c3 0
+xdpk_a1 0
+xdpk_a2 -13
+xdpk_a3 0
+xdpk_a4 0
+xdpk_a5 0
+xdpk_b1 0
+xdpk_b2 0
 xdr_a1 0
 xdr_a2 0
 xdr_a3 0

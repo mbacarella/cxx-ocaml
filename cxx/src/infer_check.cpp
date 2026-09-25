@@ -3184,6 +3184,19 @@ struct Checker {
   // then take the named `module type` item (a bare alias resolves through the
   // file-level map).  Null when any hop is not a recorded local structure --
   // the cmi lookup keeps those.  NODOTMTPARAM reverts.
+  // The signature AST a first-class module's package type names: a bare
+  // local `module type`, else a dotted one under a local structure (`N.T`).
+  // The unpack and pack sites consulted only the bare map, so `(module X :
+  // N.T)` bound X's members at fresh vars (S613; NODOTPKG reverts).
+  const ast::Signature* local_pkg_sig(const Longident& id) {
+    if (auto* pl = std::get_if<Lident>(&id.v)) {
+      auto sg = modtype_sig_asts_.find(pl->name);
+      return sg == modtype_sig_asts_.end() ? nullptr : sg->second;
+    }
+    static const bool off = cppcaml::dbg_env("NODOTPKG") != nullptr ||
+                            cppcaml::dbg_env("NOSHARE613") != nullptr;
+    return off ? nullptr : local_dotted_modtype_sig(id);
+  }
   const ast::Signature* local_dotted_modtype_sig(const Longident& id) {
     static const bool off = std::getenv("NODOTMTPARAM") != nullptr;
     if (off) return nullptr;
@@ -11520,11 +11533,8 @@ struct Checker {
                       argtypes[d.name.txt] = from_coretype(**d.manifest, vars);
                     }
             std::unordered_map<std::string, TypePtr> schemes;
-            if (auto* pl = std::get_if<Lident>(&pk->pkg->path.txt.v)) {
-              if (auto sg = modtype_sig_asts_.find(pl->name);
-                  sg != modtype_sig_asts_.end())
-                schemes = unpack_module_values(ml->name, *sg->second, &argtypes);
-            }
+            if (auto* sg = local_pkg_sig(pk->pkg->path.txt))
+              schemes = unpack_module_values(ml->name, *sg, &argtypes);
             if (schemes.empty())
               schemes = cmi_modtype_value_schemes(pk->pkg->path.txt, argtypes);
             // Tie only exports still UNRESOLVED (a var): flowing the sig type
@@ -12811,15 +12821,24 @@ struct Checker {
         if (!strict) {
           const Ppat_unpack* up = std::get_if<Ppat_unpack>(&pv->pat.desc);
           const Ptyp_package* upkg = up && up->pkg ? &*up->pkg : nullptr;
+          // `((module X) : (module S))`: the package is the constraint's
+          // (S613 -- X's members were fresh vars).
+          static const bool no_dot_pkg = cppcaml::dbg_env("NODOTPKG") != nullptr ||
+                                         cppcaml::dbg_env("NOSHARE613") != nullptr;
+          if (!up && !no_dot_pkg)
+            if (auto* pc = std::get_if<Ppat_constraint>(&pv->pat.desc))
+              if (auto* iu = std::get_if<Ppat_unpack>(&pc->p->desc); iu && !iu->pkg)
+                if (auto* tp = std::get_if<Ptyp_package>(&pc->t->desc)) {
+                  up = iu;
+                  upkg = tp;
+                }
           // `?opt:((module M) = (module M1 : S))`: the bare unpack's package
           // type comes from the default's pack annotation.
           if (up && !upkg && pv->default_)
             if (auto* dp = std::get_if<Pexp_pack>(&(*pv->default_)->desc))
               if (dp->pkg) upkg = &*dp->pkg;
           if (up && up->name.txt && upkg)
-            if (auto* pl = std::get_if<Lident>(&upkg->path.txt.v))
-              if (auto sg = modtype_sig_asts_.find(pl->name);
-                  sg != modtype_sig_asts_.end()) {
+            if (auto* sgp = local_pkg_sig(upkg->path.txt)) {
                 auto prior = modenv.find(*up->name.txt);
                 saved_mods.emplace_back(*up->name.txt,
                     prior != modenv.end() ? std::optional(prior->second)
@@ -12832,10 +12851,10 @@ struct Checker {
                   argtypes[lid_full(lid.txt)] = from_coretype(*ctb, vars);
                 }
                 modenv[*up->name.txt] =
-                    unpack_module_values(*up->name.txt, *sg->second, &argtypes);
+                    unpack_module_values(*up->name.txt, *sgp, &argtypes);
                 // The sig's typext ctors (`type t += E`) resolve as `M.E` in
                 // the body (binding1's `?(opt = M.E)`) -- function-scoped cenv.
-                bind_sig_typext_ctors(*sg->second);
+                bind_sig_typext_ctors(*sgp);
               }
         }
       }
