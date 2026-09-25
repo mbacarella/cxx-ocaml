@@ -2668,20 +2668,41 @@ struct Checker {
     static const bool off = cppcaml::dbg_env("NOOPENAPP") != nullptr ||
                             cppcaml::dbg_env("NOSHARE607") != nullptr;
     if (off) return;
-    std::vector<std::string> args;
+    std::size_t nargs = 0;
     const ast::ModuleExpr* h = &me;
     while (auto* a = std::get_if<Pmod_apply>(&h->desc)) {
       const ast::ModuleExpr* am = a->arg.get();
       auto* ai = am ? std::get_if<Pmod_ident>(&am->desc) : nullptr;
       if (!ai || std::holds_alternative<Lapply>(ai->id.txt.v)) return;
-      args.push_back(lid_full(ai->id.txt));
+      ++nargs;
       h = a->f.get();
     }
     auto* hi = std::get_if<Pmod_ident>(&h->desc);
-    if (args.empty() || !hi || std::holds_alternative<Lapply>(hi->id.txt.v))
+    if (nargs == 0 || !hi || std::holds_alternative<Lapply>(hi->id.txt.v))
       return;
-    std::reverse(args.begin(), args.end());
-    auto comps = mod_components(hi->id.txt);
+    load_app_result_type_quals(hi->id.txt, nargs, app);
+  }
+  // `open F(A)` in a SIGNATURE: the path is a longident `Lapply` chain, every
+  // argument a path (S620; NOSIGOPENAPP reverts).
+  void load_sig_open_app_type_quals(const ast::Longident& lid) {
+    static const bool off = cppcaml::dbg_env("NOSIGOPENAPP") != nullptr ||
+                            cppcaml::dbg_env("NOSHARE620") != nullptr;
+    if (off) return;
+    std::size_t nargs = 0;
+    const ast::Longident* h = &lid;
+    while (auto* a = std::get_if<Lapply>(&h->v)) {
+      if (std::holds_alternative<Lapply>(a->x->v)) return;
+      ++nargs;
+      h = &*a->f;
+    }
+    if (nargs == 0 || !std::holds_alternative<Ldot>(h->v)) return;
+    load_app_result_type_quals(*h, nargs, lid_full(lid));
+  }
+  // Each type of the result of compiled functor `head` applied to `nargs`
+  // arguments qualifies to `<app>.t`.
+  void load_app_result_type_quals(const ast::Longident& head, std::size_t nargs,
+                                  const std::string& app) {
+    auto comps = mod_components(head);
     if (comps.size() < 2) return;
     try {
       std::deque<const cmi::CmiFile*> loaded;
@@ -2696,7 +2717,7 @@ struct Checker {
         sig = i + 1 < comps.size() ? module_sig(md->type, loaded) : nullptr;
       }
       const cmi::ModuleTypePtr* body = nullptr;
-      for (std::size_t i = 0; i < args.size(); ++i) {
+      for (std::size_t i = 0; i < nargs; ++i) {
         if (!mt || mt->kind != cmi::ModuleType::Functor) return;
         body = &mt->functor_body;
         mt = mt->functor_body.get();
@@ -19855,7 +19876,9 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
               }
             };
         seed_types(*module_sigs.at(l->name), 0);
-      } else if (!std::holds_alternative<Lapply>(po->id.txt.v)) {
+      } else if (std::holds_alternative<Lapply>(po->id.txt.v)) {
+        ck.load_sig_open_app_type_quals(po->id.txt);
+      } else {
         // `open Terms` of a separately-compiled unit (or dotted submodule):
         // its bare type names must resolve qualified (`term` -> `Terms.term`)
         // or every declared use degrades to a fresh var (misc-kb .mli files).
