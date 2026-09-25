@@ -2593,6 +2593,55 @@ struct Checker {
       }
     } catch (...) {}
   }
+  // `open F (A)` (F a compiled .cmi's functor, every argument a path): each
+  // type of F's result names `<app>.t`, the applicative path the open's values
+  // carry (`Stdlib__Set.Make(Int)`).  Nothing was registered, so `open Set.Make
+  // (Int) let e : t = empty` typed e's `t` as a bare name the .cmi writer could
+  // not place, and wrote `'a` (S607; NOOPENAPP reverts).
+  void load_open_app_type_quals(const ast::ModuleExpr& me,
+                                const std::string& app) {
+    static const bool off = cppcaml::dbg_env("NOOPENAPP") != nullptr ||
+                            cppcaml::dbg_env("NOSHARE607") != nullptr;
+    if (off) return;
+    std::vector<std::string> args;
+    const ast::ModuleExpr* h = &me;
+    while (auto* a = std::get_if<Pmod_apply>(&h->desc)) {
+      const ast::ModuleExpr* am = a->arg.get();
+      auto* ai = am ? std::get_if<Pmod_ident>(&am->desc) : nullptr;
+      if (!ai || std::holds_alternative<Lapply>(ai->id.txt.v)) return;
+      args.push_back(lid_full(ai->id.txt));
+      h = a->f.get();
+    }
+    auto* hi = std::get_if<Pmod_ident>(&h->desc);
+    if (args.empty() || !hi || std::holds_alternative<Lapply>(hi->id.txt.v))
+      return;
+    std::reverse(args.begin(), args.end());
+    auto comps = mod_components(hi->id.txt);
+    if (comps.size() < 2) return;
+    try {
+      std::deque<const cmi::CmiFile*> loaded;
+      loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
+      const cmi::Signature* sig = &loaded.back()->sig();
+      const cmi::ModuleType* mt = nullptr;
+      for (size_t i = 1; i < comps.size() && sig; ++i) {
+        const cmi::ModuleDecl* md = nullptr;
+        for (auto& mm : sig->modules) if (mm.name == comps[i]) { md = &mm; break; }
+        if (!md || !md->type) return;
+        mt = md->type.get();
+        sig = i + 1 < comps.size() ? module_sig(md->type, loaded) : nullptr;
+      }
+      const cmi::ModuleTypePtr* body = nullptr;
+      for (std::size_t i = 0; i < args.size(); ++i) {
+        if (!mt || mt->kind != cmi::ModuleType::Functor) return;
+        body = &mt->functor_body;
+        mt = mt->functor_body.get();
+      }
+      const cmi::Signature* rs = body ? module_sig(*body, loaded) : nullptr;
+      if (!rs) return;
+      for (auto& td : rs->types)
+        opened_type_quals_[td.name] = app + "." + td.name;
+    } catch (...) {}
+  }
   // `open M` where M is a LOCAL module declared in this file (no cmi on disk):
   // register each type it declares as a bare -> `M.t` qual, so a following
   // annotation `(x : t)` resolves to `M.t`.  load_open_type_quals only reaches
@@ -14432,6 +14481,8 @@ struct Checker {
               }
             }
           }
+          if (!strict && !func_bind_name_.empty())
+            load_open_app_type_quals(op->expr, func_bind_name_);
           // `open F(X)` of a LOCAL functor with a struct body: register the
           // body's type decls and (GADT) ctors under the applicative path, so
           // an opened `'a event` annotation displays `MkReify(PC).event` and

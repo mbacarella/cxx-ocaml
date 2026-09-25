@@ -3237,6 +3237,13 @@ xnmt_a7 0
 xnmt_a8 0
 xnmt_a9 0
 xnmt_a10 0
+xoap_a1 0
+xoap_a2 0
+xoap_a3 0
+xoap_a4 0
+xoap_a5 0
+xoap_b1 0
+xoap_b2 0
 xoa_a1 0
 xoa_a2 0
 xoa_a3 0
