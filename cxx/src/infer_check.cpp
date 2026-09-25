@@ -20673,6 +20673,7 @@ struct FunctorArgSubst {
   // struct argument, PHANTOM decl (`type 'a t = 'a ..`: manifest == params[i]):
   // an application substitutes to its i-th argument (pr4775's `'a A.t` -> 'a)
   std::unordered_map<std::string, int> phantoms;
+  bool anon = false;  // an anonymous struct argument (erases what it can't map)
 };
 // Does `name` contain `comp` as a whole PATH COMPONENT?  Components are
 // delimited by '.', '(' and ')' -- so "Ord" is found in "Ord.t" and in
@@ -20706,16 +20707,21 @@ static std::string path_replace_component(const std::string& name,
 // Does the type still reference any parameter that had NO path to rewrite to
 // (an anonymous struct argument)?  Such a reference cannot appear in the
 // recorded signature -- ocamlc erases the manifest (nondep) instead.
-static bool ty_mentions_unsubst_param(const cmi::cmiw::TyPtr& t,
-                                      const std::vector<FunctorArgSubst>& subs) {
+static bool ty_mentions_unsubst_param(
+    const cmi::cmiw::TyPtr& t, const std::vector<FunctorArgSubst>& subs,
+    std::unordered_set<const cmi::cmiw::Ty*>* seen = nullptr) {
   if (!t) return false;
+  // Types can be CYCLIC (`[ `Bar of 'a | `Foo ] as 'a`): visit each node once.
+  std::unordered_set<const cmi::cmiw::Ty*> local;
+  if (!seen) seen = &local;
+  if (!seen->insert(t.get()).second) return false;
   if (t->k == cmi::cmiw::Ty::Constr || t->k == cmi::cmiw::Ty::Package)
     for (auto& s : subs)
       if (!s.param.empty() && s.arg_path.empty() &&
           path_has_component(t->name, s.param))
         return true;
   for (auto& a : t->args)
-    if (ty_mentions_unsubst_param(a, subs)) return true;
+    if (ty_mentions_unsubst_param(a, subs, seen)) return true;
   return false;
 }
 static cmi::cmiw::TyPtr subst_param_ty(
@@ -20765,12 +20771,33 @@ static void subst_param_items(std::vector<cmi::cmiw::SigItem>& items,
         ty_mentions_unsubst_param(si.manifest, subs))
       si.manifest = nullptr;
     for (auto& p : si.params) p = subst_param_ty(p, subs, memo);
+    bool kind_cites = false;
     for (auto& c : si.ctors) {
-      for (auto& a : c.args) a = subst_param_ty(a, subs, memo);
-      for (auto& l : c.inline_record) l.ty = subst_param_ty(l.ty, subs, memo);
+      for (auto& a : c.args) {
+        a = subst_param_ty(a, subs, memo);
+        kind_cites |= ty_mentions_unsubst_param(a, subs);
+      }
+      for (auto& l : c.inline_record) {
+        l.ty = subst_param_ty(l.ty, subs, memo);
+        kind_cites |= ty_mentions_unsubst_param(l.ty, subs);
+      }
       c.res = subst_param_ty(c.res, subs, memo);
+      kind_cites |= ty_mentions_unsubst_param(c.res, subs);
     }
-    for (auto& l : si.labels) l.ty = subst_param_ty(l.ty, subs, memo);
+    for (auto& l : si.labels) {
+      l.ty = subst_param_ty(l.ty, subs, memo);
+      kind_cites |= ty_mentions_unsubst_param(l.ty, subs);
+    }
+    // Likewise a variant/record whose fields cite such a parameter: ocamlc's
+    // nondep_type_decl (covariant) makes the kind abstract (S619).
+    static const bool no_anon_arg = cppcaml::dbg_env("NOANONARG") != nullptr ||
+                                    cppcaml::dbg_env("NOSHARE619") != nullptr;
+    if (kind_cites && !no_anon_arg && si.k == cmi::cmiw::SigItem::Type) {
+      si.ctors.clear();
+      si.labels.clear();
+      si.type_record_float = false;
+      si.type_unboxed = false;
+    }
     si.ext_ret = subst_param_ty(si.ext_ret, subs, memo);
     for (auto& f : si.class_fields) f.ty = subst_param_ty(f.ty, subs, memo);
     for (auto& d : si.class_arrow_doms) d = subst_param_ty(d, subs, memo);
@@ -21992,11 +22019,20 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
             }
           }
         } else if (auto* ast_ = std::get_if<Pmod_structure>(&am->desc)) {
+          // An anonymous struct argument's ABSTRACT types have no path to
+          // rewrite to: a result manifest citing one is erased (nondep), as
+          // ocamlc does -- `F(struct type t end)` saved `type u = X.t` with X
+          // dangling.  NOANONARG (alias NOSHARE619) reverts.
+          static const bool no_anon_arg =
+              cppcaml::dbg_env("NOANONARG") != nullptr ||
+              cppcaml::dbg_env("NOSHARE619") != nullptr;
+          s.anon = !no_anon_arg;
           // An anonymous struct argument: its manifests eliminate the
           // parameter (`Ord.t` -> `int`).  Arity-0 substitution, plus
           // PHANTOM decls (manifest == a param: `'a t = 'a`) which
           // substitute an application to its argument.
-          for (auto& ai : infer_signature(ast_->items))
+          auto aitems = infer_signature(ast_->items);
+          for (auto& ai : aitems)
             if (ai.k == cmi::cmiw::SigItem::Type && ai.manifest) {
               if (ai.params.empty()) {
                 s.manifests[ai.name] = ai.manifest;
@@ -22008,10 +22044,64 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
                   }
               }
             }
+          // A manifest citing the struct's OWN types (`type a type t = a
+          // list`) names nothing outside it: expand the arity-0 abbreviations
+          // among them, and drop what still cites a sibling -- the result
+          // manifest is then erased, as ocamlc's nondep does.
+          if (s.anon) {
+            std::set<std::string> own;
+            for (auto& ai : aitems)
+              if (ai.k == cmi::cmiw::SigItem::Type ||
+                  ai.k == cmi::cmiw::SigItem::Module)
+                own.insert(ai.name);
+            bool bad = false, cycled = false;
+            // A CYCLIC manifest (`as 'a`) is walked once per node; one that
+            // an expansion would have to COPY is dropped (a copy can't keep
+            // the back edge), so the result manifest citing it is erased.
+            std::unordered_set<const cmi::cmiw::Ty*> active;
+            std::function<cmi::cmiw::TyPtr(const cmi::cmiw::TyPtr&, int)> exp =
+                [&](const cmi::cmiw::TyPtr& t, int depth) -> cmi::cmiw::TyPtr {
+              if (!t || bad) return t;
+              if (!active.insert(t.get()).second) { cycled = true; return t; }
+              struct Pop {
+                std::unordered_set<const cmi::cmiw::Ty*>& a; const cmi::cmiw::Ty* p;
+                ~Pop() { a.erase(p); }
+              } pop{active, t.get()};
+              if (t->k == cmi::cmiw::Ty::Constr || t->k == cmi::cmiw::Ty::Package) {
+                std::string head = t->name.substr(0, t->name.find('.'));
+                if (own.count(head)) {
+                  auto m = s.manifests.find(t->name);
+                  if (t->k == cmi::cmiw::Ty::Constr && t->args.empty() &&
+                      m != s.manifests.end() && depth < 8)
+                    return exp(m->second, depth + 1);
+                  bad = true;
+                  return t;
+                }
+              }
+              bool changed = false;
+              std::vector<cmi::cmiw::TyPtr> as;
+              for (auto& a : t->args) {
+                as.push_back(exp(a, depth));
+                if (as.back() != a) changed = true;
+              }
+              if (!changed) return t;
+              auto r = std::make_shared<cmi::cmiw::Ty>(*t);
+              r->args = std::move(as);
+              return r;
+            };
+            std::unordered_map<std::string, cmi::cmiw::TyPtr> expanded;
+            for (auto& [n, m] : s.manifests) {
+              bad = cycled = false;
+              auto e = exp(m, 0);
+              if (!bad && !(cycled && e != m)) expanded[n] = e;
+            }
+            s.manifests = std::move(expanded);
+          }
         }
       }
       if (!s.param.empty() &&
-          (!s.arg_path.empty() || !s.manifests.empty() || !s.phantoms.empty()))
+          (!s.arg_path.empty() || !s.manifests.empty() || !s.phantoms.empty() ||
+           s.anon))
         subs.push_back(std::move(s));
     }
     // Build the bound item: a plain module, or (partial application) a
