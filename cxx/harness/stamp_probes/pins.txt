@@ -4317,6 +4317,13 @@ xpki_c12 0
 xpki_c13 0
 xpki_c14 0
 xpki_c18 0
+xpkl_a1 0
+xpkl_a2 0
+xpkl_a3 0
+xpkl_a4 0
+xpkl_a5 0
+xpkl_b1 0
+xpkl_b2 0
 xpk_a1 0
 xpk_a2 0
 xpk_a3 0

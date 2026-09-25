@@ -1561,6 +1561,11 @@ bool hoparam_off() {
                           cppcaml::dbg_env("NOSHARE599") != nullptr;
   return off;
 }
+bool pkglocal_off() {
+  static const bool off = cppcaml::dbg_env("NOPKGLOCAL") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE600") != nullptr;
+  return off;
+}
 bool paramstr_off() {
   static const bool off = cppcaml::dbg_env("NOPARAMSTR") != nullptr ||
                           cppcaml::dbg_env("NOSHARE595") != nullptr;
@@ -2216,6 +2221,22 @@ struct TyEmit {
   // global (importing it); bare via the visible modtype map's Local stamp.
   o::ValPtr mty_path(const std::string& ref) {
     if (auto dot = ref.find('.'); dot != std::string::npos) {
+      // A LOCAL module head (`module X = struct module type S .. end` then
+      // `(module X.S)`): a Pdot chain off X's Local ident.  It was written
+      // Global "X", a unit that does not exist, so ocamlc reading the .cmi
+      // matched the package type against nothing (S600; NOPKGLOCAL reverts).
+      if (local_mods && !pkglocal_off())
+        if (auto lm = local_mods->find(ref.substr(0, dot));
+            lm != local_mods->end() && lm->second != self_stamp) {
+          o::ValPtr path = pident_local(lm->first, lm->second);
+          for (std::size_t pos = dot; pos != std::string::npos;) {
+            std::size_t nd = ref.find('.', pos + 1);
+            path = o::vblock(1, {path, o::vstr(ref.substr(pos + 1,
+                nd == std::string::npos ? std::string::npos : nd - pos - 1))});
+            pos = nd;
+          }
+          return path;
+        }
       std::string head = global_of(ref.substr(0, dot));
       if (referenced) (*referenced)[head] = true;
       o::ValPtr path;
