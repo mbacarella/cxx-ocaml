@@ -1239,6 +1239,8 @@ struct Checker {
   // compares last components, and consumers (record-label resolution) need the
   // module.  Predefs aren't in the signature's type list and stay bare.
   std::string cmi_mod_prefix_;
+  // module_exports is harvesting an `include F(X)` (S616).
+  bool include_result_ = false;
   // Enclosing cmi module scopes (outermost..innermost) for qualifying a Pident
   // type that lives in a PARENT module: `Array1.create`'s `kind` is
   // `Bigarray.kind`, not `Bigarray.Array1.kind`.  Each entry is (types, prefix).
@@ -4100,9 +4102,19 @@ struct Checker {
         // context and the binding name as the prefix.  The strict reject pass
         // keeps fully-generic schemes (which never clash); the value-kinds and
         // signature passes get the real, M-qualified types.
-        bool real = !strict && !func_bind_name_.empty();
-        if (real) { cmi_types_ctx_ = &cur->sig->types; cmi_mod_prefix_ = func_bind_name_;
-                    func_result_mode_ = true; }
+        // An `include F(X)` names them as the including module does: bare
+        // at top level, `M.t` inside M (S616 -- they were generic vars, so
+        // `include Set.Make(Int) let e = empty` saved `e : 'a`).
+        bool inc = !strict && func_bind_name_.empty() && include_result_;
+        bool real = !strict && (!func_bind_name_.empty() || inc);
+        if (real) {
+          cmi_types_ctx_ = &cur->sig->types;
+          cmi_mod_prefix_ = inc ? (proc_mod_prefix_.empty()
+                                       ? std::string()
+                                       : proc_mod_prefix_.substr(0, proc_mod_prefix_.size() - 1))
+                                : func_bind_name_;
+          func_result_mode_ = true;
+        }
         for (auto& v : cur->sig->values) {
           if (real && v.type) {
             std::unordered_map<cmi::TypeExpr*, TypePtr> memo;
@@ -15010,7 +15022,14 @@ struct Checker {
             if (b.name.txt) modenv[*b.name.txt] = std::move(ex);
           }
         } else if (auto* in = std::get_if<Pstr_include>(&it.desc)) {
+          static const bool no_inc_app =
+              cppcaml::dbg_env("NOINCAPP") != nullptr ||
+              cppcaml::dbg_env("NOSHARE616") != nullptr;
+          bool saved_ir = include_result_;
+          include_result_ = !no_inc_app && !strict &&
+                            std::holds_alternative<Pmod_apply>(in->expr.desc);
           for (auto& [k, v] : module_exports(in->expr)) venv.back()[k] = v;
+          include_result_ = saved_ir;
           if (auto* pi = std::get_if<Pmod_ident>(&in->expr.desc))  // include M -> M's submodules
             for (auto& s : module_submodule_names(pi->id.txt)) opened_submodules_.insert(s);
         } else if (auto* pr = std::get_if<Pstr_primitive>(&it.desc)) {
