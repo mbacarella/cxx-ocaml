@@ -15,7 +15,9 @@
 # itself counts as NOISE: `module type of` cannot restate its signature.
 #
 #   cmi_sound.sh [N]        JOBS=, CPP=, KEEP=dir (keep each failure's
-#                           checker message in dir/<class>/<path>.txt)
+#                           checker message in dir/<class>/<path>.txt),
+#                           DIR= (default testsuite/tests; the stamp probes
+#                           cxx/harness/stamp_probes are a far wider net)
 set -u
 SELF="$(readlink -f "$0")"
 cd "$(dirname "$SELF")/../.." || exit 1
@@ -72,7 +74,7 @@ if [ "${1:-}" = "--worker" ]; then
 fi
 
 LIMIT="${1:-0}"
-mapfile -t files < <(find testsuite/tests -name '*.ml' | sort)
+mapfile -t files < <(find "${DIR:-testsuite/tests}" -name '*.ml' | sort)
 [ "$LIMIT" -gt 0 ] 2>/dev/null && files=("${files[@]:0:$LIMIT}")
 res=$(printf '%s\n' "${files[@]}" \
       | xargs -P "$JOBS" -I{} bash "$SELF" --worker {})

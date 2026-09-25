@@ -5675,6 +5675,11 @@ xsty_a9 0
 xsty_a10 0
 xsty_a11 0
 xsty_a12 0
+xsx_a1 0
+xsx_a2 0
+xsx_a3 0
+xsx_b1 0
+xsx_b2 0
 xtal_a1 -7
 xtal_a2 -2
 xtal_a3 -7

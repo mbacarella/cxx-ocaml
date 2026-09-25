@@ -4125,6 +4125,17 @@ struct Checker {
           ctors[name] = ty;
           stdlib_ctor_types_[ty->path].push_back(name);
         }
+      // Stdlib's own CONSTANT exceptions (`exception Exit`): a bare `Exit`
+      // pattern typed as a fresh variable, so `let f Exit = 1` wrote
+      // `f : 'a -> int` (S606; NOSTDEXN reverts).  A local exception of the
+      // same name still binds over it in cenv.
+      static const bool stdexn_off = cppcaml::dbg_env("NOSTDEXN") != nullptr ||
+                                     cppcaml::dbg_env("NOSHARE606") != nullptr;
+      if (!stdexn_off)
+        for (auto& x : cmi.sig().typexts)
+          if (x.args.empty() && !x.is_inline_record && !x.res &&
+              !ctors.count(x.name) && !ambiguous.count(x.name))
+            ctors[x.name] = eng.constr("exn");
     } catch (...) {}
   }
   // Stdlib types whose constant ctors register_stdlib_ctors bound, by type name
