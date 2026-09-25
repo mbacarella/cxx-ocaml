@@ -20111,6 +20111,16 @@ static const std::vector<std::unordered_map<std::string, TypePtr>>*
 // types with the OUTER t instead of degrading the argument to a fresh var.
 static const std::vector<std::unordered_map<std::string, TypePtr>>*
     g_outer_cenv = nullptr;
+// The emitting file's checker, whose RECORD LABELS are seeded the same way:
+// `type r = {a:int} module M = struct let v x = x.a end` types v's argument
+// as r instead of a fresh var (a consumer of the .cmi could otherwise apply
+// v to anything).  NOOUTERFLD (alias NOSHARE598) reverts.
+static const Checker* g_outer_fields = nullptr;
+static bool outer_fields_off() {
+  static const bool off = cppcaml::dbg_env("NOOUTERFLD") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE598") != nullptr;
+  return off;
+}
 // The ENCLOSING module's already-emitted items, visible to functor-BODY
 // inference so `module Y = G(X)` inside a functor body resolves the sibling
 // functor G declared in the outer scope (set around the body's
@@ -21404,6 +21414,35 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
     for (auto& [n, v] : g_outer_venv->front()) ck.venv.front().emplace(n, v);
   if (g_outer_cenv && !g_outer_cenv->empty() && !ck.cenv.empty())
     for (auto& [n, v] : g_outer_cenv->front()) ck.cenv.front().emplace(n, v);
+  // The enclosing records' bare labels, save those declared inside this very
+  // structure (run_checker registers them again) -- the same source lines, so
+  // the scope rules (field_cand_line_/_end_) keep working unchanged.
+  if (g_outer_fields && !outer_fields_off() && !s.empty()) {
+    int lo = s.front().loc.start.lnum, hi = s.back().loc.end.lnum;
+    auto& o = *g_outer_fields;
+    for (auto& [lbl, cands] : o.field_candidates_) {
+      auto li = o.field_cand_line_.find(lbl);
+      auto ei = o.field_cand_end_.find(lbl);
+      if (li == o.field_cand_line_.end() || ei == o.field_cand_end_.end() ||
+          li->second.size() != cands.size() || ei->second.size() != cands.size())
+        continue;
+      for (size_t i = 0; i < cands.size(); ++i) {
+        int l = li->second[i];
+        if (l < 0 || (l >= lo && l <= hi)) continue;
+        ck.field_candidates_[lbl].push_back(cands[i]);
+        ck.field_cand_line_[lbl].push_back(l);
+        ck.field_cand_end_[lbl].push_back(ei->second[i]);
+      }
+    }
+    for (auto& [lbl, cands] : o.poly_field_rec_candidates_)
+      for (auto& pf : cands) {
+        int l = pf.ftype ? pf.ftype->loc.start.lnum : -1;
+        if (l < 0 || (l >= lo && l <= hi)) continue;
+        ck.poly_field_rec_candidates_[lbl].push_back(pf);
+        if (o.poly_format_labels_.count(lbl)) ck.poly_format_labels_.insert(lbl);
+      }
+    for (auto& [st, d] : o.stamp_record_decl_) ck.stamp_record_decl_.emplace(st, d);
+  }
   if (fparams) {
     if (g_outer_modtype_asts) ck.modtype_sig_asts_ = *g_outer_modtype_asts;
     if (g_outer_modtype_quals) ck.opened_modtype_quals_ = *g_outer_modtype_quals;
@@ -21427,6 +21466,8 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
   auto* saved_modenv = g_outer_modenv;
   auto* saved_venv = g_outer_venv;
   auto* saved_cenv = g_outer_cenv;
+  auto* saved_fields = g_outer_fields;
+  g_outer_fields = &ck;
   g_outer_modtype_asts = &ck.modtype_sig_asts_;
   g_outer_modtype_quals = &ck.opened_modtype_quals_;
   g_outer_modenv = &ck.modenv;
@@ -22546,6 +22587,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
   g_outer_modenv = saved_modenv;
   g_outer_venv = saved_venv;
   g_outer_cenv = saved_cenv;
+  g_outer_fields = saved_fields;
   return out;
 }
 
