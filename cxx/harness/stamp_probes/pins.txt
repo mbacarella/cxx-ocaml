@@ -5692,6 +5692,16 @@ xso_t8 -2
 xso_t9 0
 xso_t10 -49
 xso_z0 0
+xstv_a1 0
+xstv_a2 0
+xstv_a3 0
+xstv_a4 0
+xstv_a5 0
+xstv_a6 0
+xstv_a7 0
+xstv_b1 0
+xstv_b2 0
+xstv_b3 0
 xsty_a1 0
 xsty_a2 0
 xsty_a3 0

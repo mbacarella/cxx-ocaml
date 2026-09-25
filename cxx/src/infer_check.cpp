@@ -305,6 +305,20 @@ struct Checker {
   // keep outer and inner decls of the same name DISTINCT -- per-checker
   // counters made an outer `t` and an inner re-declared `t` collide on stamp.
   inline static int next_type_stamp_ = 1;
+  // Stamps handed out ahead of register_type_decl, so a submodule's type
+  // names are in scope while its own declarations are converted (S610).
+  std::unordered_map<const TypeDeclaration*, int> prestamped_;
+  static bool subtenv_off() {
+    static const bool off = cppcaml::dbg_env("NOSUBTENV") != nullptr ||
+                            cppcaml::dbg_env("NOSHARE610") != nullptr;
+    return off;
+  }
+  static bool decl_is_opaque(const TypeDeclaration& d) {
+    return std::holds_alternative<Ptype_variant>(d.kind) ||
+           std::holds_alternative<Ptype_record>(d.kind) ||
+           std::holds_alternative<Ptype_open>(d.kind) ||
+           (std::holds_alternative<Ptype_abstract>(d.kind) && !d.manifest);
+  }
   std::unordered_map<const TypeDeclaration*, int> type_stamp_;
   // Reverse maps for the tuple-GADT exhaustiveness analysis: a stamped opaque
   // decl's AST (constructor/field lists for the mcomp-lite compatibility check)
@@ -5251,15 +5265,16 @@ struct Checker {
     // without a stamp a nested `type t = ..` shadowing an enclosing `t` (its
     // `type t += ..` ctors, and any value matching on them) mis-resolved bare
     // `t` to the OUTER decl, so Printtyp disambiguated the cite as `t/2`.
-    bool opaque = std::holds_alternative<Ptype_variant>(d.kind) ||
-                  std::holds_alternative<Ptype_record>(d.kind) ||
-                  std::holds_alternative<Ptype_open>(d.kind) ||
-                  (std::holds_alternative<Ptype_abstract>(d.kind) && !d.manifest);
+    bool opaque = decl_is_opaque(d);
     // A module re-exported bare by a top-level `include A` displays its type
     // names unqualified (ocamlc shows the included name).
     bool inc = included_module_prefixes_.count(mod_prefix_) != 0;
     if (opaque) {
-      type_stamp_[&d] = next_type_stamp_++;
+      if (auto ps = prestamped_.find(&d); ps != prestamped_.end()) {
+        type_stamp_[&d] = ps->second;
+        prestamped_.erase(ps);
+      } else
+        type_stamp_[&d] = next_type_stamp_++;
       if (!mod_prefix_.empty() && !inc)
         stamp_path_[type_stamp_[&d]] = mod_prefix_ + d.name.txt;
       stamp_type_decl_[type_stamp_[&d]] = &d;  // decl AST by identity (mcomp-lite)
@@ -15018,10 +15033,30 @@ static void register_types_rec(Checker& ck, const ast::Structure& s) {
           ck.load_open_local_type_quals(pi->id.txt);
         }
     } else if (auto* ty = std::get_if<Pstr_type>(&it.desc)) {
+      // Inside a module, the group's own names (a recursive group) and the
+      // module's earlier types are in scope while the ctors and fields are
+      // converted: `module M = struct type e = A | B of e end` read B's
+      // argument as a bare `e` -- the saved .cmi cited nothing (a fresh
+      // var) or an OUTER `e` (S610; NOSUBTENV reverts).
+      const bool scope = !ck.mod_prefix_.empty() && !Checker::subtenv_off();
+      std::vector<std::pair<const TypeDeclaration*, int>> pre;
+      if (scope)
+        for (auto& d : ty->decls)
+          if (Checker::decl_is_opaque(d)) {
+            int st = Checker::next_type_stamp_++;
+            ck.prestamped_[&d] = st;
+            pre.emplace_back(&d, st);
+            // a LATER member of the group is cited before it registers
+            if (!ck.included_module_prefixes_.count(ck.mod_prefix_))
+              ck.stamp_path_[st] = ck.mod_prefix_ + d.name.txt;
+          }
+      if (scope && ty->rf == RecFlag::Recursive)
+        for (auto& [d, st] : pre) ck.tenv.back()[d->name.txt] = st;
       // two passes so a mutually-recursive group's aliases are all registered
       // before any record fields/ctors that reference them are built.
       for (auto& d : ty->decls) ck.register_type_decl(d);
       for (auto& d : ty->decls) ck.register_record_decl(d);
+      for (auto& [d, st] : pre) ck.tenv.back()[d->name.txt] = st;
     } else if (auto* ex = std::get_if<Pstr_exception>(&it.desc))
       ck.register_exception(ex->exn.ctor);
     else if (auto* tx = std::get_if<Pstr_typext>(&it.desc))
@@ -15039,7 +15074,10 @@ static void register_types_rec(Checker& ck, const ast::Structure& s) {
             if (auto* ty2 = std::get_if<Pstr_type>(&sit.desc))
               for (auto& d : ty2->decls) names.push_back(d.name.txt);
         }
+        const bool scope = !Checker::subtenv_off();
+        if (scope) ck.tenv.emplace_back();
         register_types_rec(ck, ms->items);
+        if (scope) ck.tenv.pop_back();
         ck.mod_prefix_ = saved;
       } else if (!ck.strict && std::holds_alternative<Pmod_functor>(me->desc)) {
         // A functor body's own type declarations (`module F(X:S) = struct type
@@ -15076,7 +15114,10 @@ static void register_types_rec(Checker& ck, const ast::Structure& s) {
             ck.mod_prefix_ += *b.name.txt + ".";
             ck.local_module_prefixes_.insert(ck.mod_prefix_);
           }
+          const bool scope = !Checker::subtenv_off();
+          if (scope) ck.tenv.emplace_back();
           register_types_rec(ck, ms2->items);
+          if (scope) ck.tenv.pop_back();
           ck.mod_prefix_ = saved;
         }
       }
