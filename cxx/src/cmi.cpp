@@ -1541,6 +1541,14 @@ bool docfilt_off() {
   return off;
 }
 
+// S591: an exception's inline-record labels keep their source locations.
+// NOEXNLOC=1 writes Location.none again.
+bool exnloc_off() {
+  static const bool off = cppcaml::dbg_env("NOEXNLOC") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE591") != nullptr;
+  return off;
+}
+
 namespace cmiw {
 
 namespace o = omarshal;
@@ -3286,7 +3294,8 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           auto lid = decl_ident(l.name, l.stamp ? l.stamp : lstamp++, lkey);  // ld_id
           lds.push_back(o::vblock(0, {lid, o::vint(l.mut ? 1 : 0) /*ld_mutable*/,
                                       o::vint(l.atomic ? 1 : 0) /*ld_atomic*/, te.emit(l.ty),
-                                      loc_none(), emit_attrs(l.attrs),
+                                      exnloc_off() ? loc_none() : emit_loc(l.loc, lkey),
+                                      emit_attrs(l.attrs),
                                       emit_uid(l.uid, lkey)}));
         }
         cargs = o::vblock(1, {o::vlist(lds)});  // Cstr_record

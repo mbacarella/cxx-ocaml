@@ -1078,6 +1078,14 @@ xets_c6 0
 xets_c7 0
 xets_m1 -2
 xets_m2 -2
+xexl_a1 0
+xexl_a2 0
+xexl_a3 0
+xexl_a4 0
+xexl_a5 0
+xexl_a6 0
+xexl_a7 0
+xexl_a9 0
 xexn_a1 0
 xexn_a2 0
 xexn_a3 0

@@ -18362,6 +18362,7 @@ static cmi::cmiw::SigItem exn_sigitem(Checker& ck, const std::string& name,
     for (auto& f : rec->fields) {
       cmi::cmiw::Label lab;
       lab.name = f.name.txt;
+      if (!cmi::exnloc_off()) lab.loc = conv_loc(f.loc);  // S591
       lab.mut = (f.mut == MutableFlag::Mutable);
         for (auto& la : f.attrs) if (la.name == "atomic" || la.name == "ocaml.atomic") lab.atomic = true;
         lab.attrs = item_attrs(f.attrs);
