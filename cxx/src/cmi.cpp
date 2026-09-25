@@ -757,6 +757,10 @@ int prov_new_open(const std::string& open_pfx) {
   t.push_back(ProvInfo{0, -1, false, open_pfx, 0});
   return static_cast<int>(t.size()) - 1;
 }
+void prov_mark_spliced(int prov) {
+  auto& t = prov_table();
+  if (prov > 0 && prov < static_cast<int>(t.size())) t[prov].spliced = true;
+}
 int prov_new_dots(int src_dots) {
   auto& t = prov_table();
   t.push_back(ProvInfo{0, -1, false, {}, src_dots});
@@ -1546,6 +1550,15 @@ bool docfilt_off() {
   return off;
 }
 
+// S595: a functor PARAMETER's signature is a module the body's paths hang
+// off too -- `M.t` in the body is `Pdot(M, Ident.name id)` over the param
+// sig's own `type t` ident (env.ml's prefix_idents runs on the param's
+// components like on any module's).  NOPARAMSTR=1 writes a fresh string.
+bool paramstr_off() {
+  static const bool off = cppcaml::dbg_env("NOPARAMSTR") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE595") != nullptr;
+  return off;
+}
 // S591: an exception's inline-record labels keep their source locations.
 // NOEXNLOC=1 writes Location.none again.
 bool exnloc_off() {
@@ -1992,6 +2005,25 @@ bool membstr_off() {
                           cppcaml::dbg_env("NOSHARE566") != nullptr;
   return off;
 }
+// A module whose type is `Mty_ident S` for a modtype S this unit declares
+// gets its components from S's own signature, so its members' names are
+// S's item idents' strings.  S's items register under the NEGATED modtype
+// stamp; this copies them to the module's (or parameter's) own key.
+void adopt_modtype_members(int dst, const std::string& ref,
+                           const std::unordered_map<std::string, int>& mts) {
+  if (paramstr_off() || membstr_off()) return;
+  auto f = mts.find(ref);
+  if (f == mts.end()) return;
+  const std::string from = std::to_string(-f->second) + ":";
+  std::vector<std::pair<std::string, int>> add;
+  for (auto m = g_share.mstamps.lower_bound(from);
+       m != g_share.mstamps.end() &&
+       m->first.compare(0, from.size(), from) == 0;
+       ++m)
+    add.emplace_back(std::to_string(dst) + ":" + m->first.substr(from.size()),
+                     m->second);
+  for (auto& [k, v] : add) g_share.mstamps[k] = v;
+}
 // The ident stamp of `name` declared by the local module `owner`, 0 when this
 // unit has not emitted that module's signature (nothing to cite yet).
 int member_stamp(int owner, const std::string& name) {
@@ -2364,9 +2396,16 @@ struct TyEmit {
             // the last `src_dots`, which the source wrote itself -- name
             // declarations OF the module they hang off, so each is that
             // declaration's own ident name string (prefix_idents).
+            // S595: a name an `open` resolved is IdTbl.find_name's
+            // `Pdot (root, name)` over the LOOKED-UP string (S580), so no
+            // component of it is a declaration's.
+            const bool via_open = !paramstr_off() &&
+                                  !prov_info(prov).open_pfx.empty() &&
+                                  !prov_info(prov).spliced;
             const std::size_t written =
-                comps.size() - 1 - std::min<std::size_t>(
-                    comps.size() - 1, prov_info(prov).src_dots);
+                via_open ? 0
+                         : comps.size() - 1 - std::min<std::size_t>(
+                               comps.size() - 1, prov_info(prov).src_dots);
             for (std::size_t i = 1; i < comps.size(); ++i) {
               int ms = i <= written ? member_stamp(owner, comps[i]) : 0;
               path = o::vblock(1, {path, ms ? member_str(ms, comps[i])
@@ -3086,9 +3125,16 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
           psig = emitted[0]->fields[2]->fields[0];
       }
       if (!psig && !ref.empty())
-        if (o::ValPtr mp = modtype_path(ref, &visible_mod_body)) psig = o::vblock(0, {mp});  // Mty_ident
+        if (o::ValPtr mp = modtype_path(ref, &visible_mod_body)) {
+          psig = o::vblock(0, {mp});  // Mty_ident
+          if (!pname.empty())
+            adopt_modtype_members(visible_mod_body[pname], ref, visible_mt);
+        }
+      // S595: a named parameter's items name its members (paramstr_off).
+      const int powner =
+          pname.empty() || paramstr_off() ? 0 : visible_mod_body[pname];
       if (!psig)
-        psig = o::vblock(1, {o::vlist(emit_sig_items(psig_items, referenced, stamp, &visible, &visible_mt, &visible_mod_body, &visible_eng, &modscope, &scopes))});  // Mty_signature
+        psig = o::vblock(1, {o::vlist(emit_sig_items(psig_items, referenced, stamp, &visible, &visible_mt, &visible_mod_body, &visible_eng, &modscope, &scopes, "", 0, powner))});  // Mty_signature
       return o::vblock(0, {name_opt, psig});  // Named(name_opt, <param sig>)
     };
     std::vector<o::ValPtr> params;
@@ -3250,7 +3296,10 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         // `module MD5 : S` (a NAMED modtype) emits Mty_ident(S) like ocamlc;
         // the inlined signature is the fallback.
         if (!it.modtype_ref.empty())
-          if (o::ValPtr mp = modtype_path(it.modtype_ref)) mty = o::vblock(0, {mp});  // Mty_ident
+          if (o::ValPtr mp = modtype_path(it.modtype_ref)) {
+            mty = o::vblock(0, {mp});  // Mty_ident
+            adopt_modtype_members(item_stamp[i], it.modtype_ref, visible_mt);
+          }
         // A `module rec` binding's own name IS in scope inside its
         // declaration (`B.t` in B's signature is the local B), so no self
         // stamp is masked there (S560).
@@ -3277,11 +3326,16 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
         // a signature -- mtd_type = Some(Mty_functor(..)) (shape_size_blowup).
         mto = o::vblock(0, {emit_functor_mty(it)});  // Some(Mty_functor)
       else if (!it.modtype_ref.empty()) {
-        if (o::ValPtr mp = modtype_path(it.modtype_ref))
+        if (o::ValPtr mp = modtype_path(it.modtype_ref)) {
           mto = o::vblock(0, {o::vblock(0, {mp})});  // Some(Mty_ident)
+          adopt_modtype_members(-item_stamp[i], it.modtype_ref, visible_mt);
+        }
       }
+      // S595: the items register under the NEGATED modtype stamp, for
+      // adopt_modtype_members.
+      const int mtowner = paramstr_off() ? 0 : -item_stamp[i];
       if (!mto)
-        mto = o::vblock(0, {o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod, &visible_eng, &modscope, &scopes))})});  // Some(Mty_signature)
+        mto = o::vblock(0, {o::vblock(1, {o::vlist(emit_sig_items(it.sub, referenced, stamp, &visible, &visible_mt, &visible_mod, &visible_eng, &modscope, &scopes, "", 0, mtowner))})});  // Some(Mty_signature)
       auto mtd = o::vblock(0, {mto, emit_attrs(it.attrs),
                                emit_loc(it.loc, dkey),
                                emit_uid(it.uid, dkey)});  // modtype_declaration

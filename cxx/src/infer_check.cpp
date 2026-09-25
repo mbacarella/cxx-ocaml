@@ -2203,9 +2203,14 @@ struct Checker {
       // after `open Bigarray` -> `Bigarray.c_layout`).
       if (!stamp)
         if (auto* l = std::get_if<Lident>(&c->id.txt.v))
-          if (auto q = opened_type_quals_.find(l->name); q != opened_type_quals_.end())
-            return annot_open(eng.constr(q->second, std::move(as)),
-                              qual_prefix(q->second), &t);
+          if (auto q = opened_type_quals_.find(l->name); q != opened_type_quals_.end()) {
+            TypePtr r = annot_open(eng.constr(q->second, std::move(as)),
+                                   qual_prefix(q->second), &t);
+            if (auto sq = splice_type_quals_.find(l->name);
+                sq != splice_type_quals_.end() && sq->second == q->second)
+              cmi::prov_mark_spliced(r->prov);
+            return r;
+          }
       // `Array1.t` after `open Bigarray` -> `Bigarray.Array1.t` (opened submodule).
       std::string path = lid_full(c->id.txt);
       // A bare reference to a module-nested type displays with the module's
@@ -2524,6 +2529,9 @@ struct Checker {
   // qualified; Stdlib is the default-open we instead SHORTEN, so skip it).
   std::unordered_map<std::string, std::string> opened_type_quals_;
   std::unordered_map<std::string, std::string> opened_submod_quals_;  // Array1 -> Bigarray.Array1
+  // S595: the opened_type_quals_ entries an include splice seeded for its
+  // head module's OWN types (no `open` looked them up).
+  std::unordered_map<std::string, std::string> splice_type_quals_;
   // `open X` where X is an enclosing FUNCTOR PARAMETER (no cmi on disk): its
   // sig's type names were harvested into param_sig_type_names_ at param
   // registration; register each `t` -> `X.t` so a bare use afterwards resolves
@@ -18692,6 +18700,7 @@ static void apply_with_constraints(Checker& ck, const ast::ModuleType& mt,
         if (td->manifest) {
           if (auto* pc = std::get_if<Ptyp_constr>(&(*td->manifest)->desc)) {
             std::string newname = lid_full(pc->id.txt);
+            int newprov = 0;  // S595: the constraint's own path object
             // A BARE RHS written in the constraint's outer scope resolves
             // there (diffing.mli's `Parameters with type update_result :=
             // state` under `open D` means D.state): prefer the checker's
@@ -18704,9 +18713,25 @@ static void apply_with_constraints(Checker& ck, const ast::ModuleType& mt,
               if (r->kind == I::Type::Kind::Constr &&
                   r->path.size() > newname.size() &&
                   r->path.compare(r->path.size() - newname.size() - 1,
-                                  newname.size() + 1, "." + newname) == 0)
+                                  newname.size() + 1, "." + newname) == 0) {
                 newname = r->path;
+                if (!cmi::paramstr_off()) newprov = r->prov;
+              }
+            } else if (!cmi::paramstr_off()) {
+              std::unordered_map<std::string, TypePtr> tv2;
+              TypePtr r =
+                  I::Engine::repr(ck.from_coretype(**td->manifest, tv2));
+              if (r->kind == I::Type::Kind::Constr && r->path == newname)
+                newprov = r->prov;
             }
+            // Subst hands every citation the RHS's own path (subst.ml
+            // type_path), so the renamed nodes cite the constraint's lookup.
+            if (newprov)
+              rewrite_item_ty_nodes(items, [&](cmi::cmiw::TyPtr& t) {
+                if (t && t->k == cmi::cmiw::Ty::Constr && t->name == full &&
+                    t->args.empty())
+                  t->prov = newprov;
+              });
             if (full.find('.') == std::string::npos)
               // Bare erased name: referent-aware (a SHADOWING inner decl's
               // own citations stay; a skip-spliced manifest reaching the
@@ -18862,6 +18887,7 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
   // decls in the nested sig still shadow: the pre-pass below erases entries.
   if (outer_ck) {
     ck.opened_type_quals_ = outer_ck->opened_type_quals_;
+    ck.splice_type_quals_ = outer_ck->splice_type_quals_;
     ck.opened_submod_quals_ = outer_ck->opened_submod_quals_;
     ck.opened_modtype_quals_ = outer_ck->opened_modtype_quals_;
     ck.type_substs_ = outer_ck->type_substs_;
@@ -19126,10 +19152,14 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
                               : std::nullopt);
                   ck.opened_type_quals_[n2] = q;
                 };
+                auto saved_sq = ck.splice_type_quals_;
                 for (auto& hit : *f->second) {
                   if (auto* hpt = std::get_if<Psig_type>(&hit.desc))
-                    for (auto& d2 : hpt->decls)
+                    for (auto& d2 : hpt->decls) {
                       seed(d2.name.txt, comps[0] + "." + d2.name.txt);
+                      ck.splice_type_quals_[d2.name.txt] =
+                          comps[0] + "." + d2.name.txt;
+                    }
                   // an `open General` at the head module's top level is in
                   // scope inside MT too (INCREMENTAL_ENGINE's `type stack =
                   // element stream` means General.stream)
@@ -19148,6 +19178,7 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
                   if (q2) ck.opened_type_quals_[nm2] = *q2;
                   else ck.opened_type_quals_.erase(nm2);
                 }
+                ck.splice_type_quals_ = std::move(saved_sq);
                 return r;
               }
     // Cross-module, possibly DEEP (`CamlinternalMenhirLib.IncrementalEngine.

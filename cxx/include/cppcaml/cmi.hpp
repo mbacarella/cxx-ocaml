@@ -92,10 +92,14 @@ struct Path {
 // string (env.ml lookup_dot_type :3108); a component the ENVIRONMENT added
 // when it prefixed a module's own declarations is `Pdot (root, Ident.name
 // id)` -- that declaration's own name string (prefix_idents :1728).
+// `spliced` (S595): the `open_pfx` qualification was this unit's own, made
+// while splicing a head module's types into an included modtype -- not an
+// `open`'s lookup, so its components stay the declarations' name strings.
 struct ProvInfo { int cmi = 0; int head_blk = -1; bool pdot = false; std::string open_pfx; int src_dots = 0;
-                  int str_of = 0; };  // str_of: see prov_share_strs
+                  int str_of = 0; bool spliced = false; };  // str_of: see prov_share_strs
 int prov_new(int cmi = 0, int head_blk = -1, bool pdot = false);
 int prov_new_open(const std::string& open_pfx);
+void prov_mark_spliced(int prov);
 int prov_new_dots(int src_dots);  // a source annotation, `src_dots` written
 // S594: `prov` is a second lookup of the parsetree node `twin` came from, so
 // the component strings the source wrote are the same objects.
@@ -111,6 +115,9 @@ bool exnloc_off();  // NOEXNLOC=1: exn record labels at Location.none (S591)
 bool openinj_off();  // NOOPENINJ=1: open-type params not injective (S592)
 bool arrprov_off();  // NOARRPROV=1: array elements unify actual-first (S593)
 bool optdef_off();  // NOOPTDEF=1: optional defaults unify actual-first (S594)
+// NOPARAMSTR=1: a functor parameter's / named modtype's members cite
+// fresh strings, opens are not told apart (S595)
+bool paramstr_off();
 bool prov_off();  // NOPROV=1: the writer ignores provenance (S554 behaviour)
 // NONODEID=1: the saved graph keeps one writer node per OCCURRENCE (S555
 // behaviour) -- no per-use instantiate copies, no node memo across a
