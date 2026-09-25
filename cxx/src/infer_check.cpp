@@ -19353,6 +19353,23 @@ static void strengthen_abstract(std::vector<cmi::cmiw::SigItem>& items,
 static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
     const std::string& name, const ast::ModuleExpr& me,
     const std::vector<cmi::cmiw::SigItem>* prior, Checker* ckp);
+// A class type's method `method m : 'a. t` is polymorphic: its binders
+// scope to the method (a copy of the class' var map) and it bridges to a
+// Ty::Poly, as a record field's does.  It was written as `t` over free vars
+// (S623; NOCTPOLY reverts).
+static cmi::cmiw::TyPtr ctf_method_ty(
+    Checker& ck, const ast::CoreType& ct,
+    std::unordered_map<std::string, TypePtr>& tv,
+    std::unordered_map<const I::Type*, int>& cvars, int& cnext) {
+  static const bool off = cppcaml::dbg_env("NOCTPOLY") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE623") != nullptr;
+  auto* pp = std::get_if<Ptyp_poly>(&ct.desc);
+  if (off || !pp || pp->vars.empty())
+    return bridge_ty_named(ck.from_coretype(ct, tv), cvars, cnext, tv);
+  auto tvp = tv;
+  for (auto& n : pp->vars) tvp.erase(n);  // a binder shadows a class param
+  return bridge_label_ty(ck, ct, tvp, cvars, cnext);
+}
 static bool fapp_body_off() {
   static const bool off = cppcaml::dbg_env("NOFAPPBODY") != nullptr ||
                           cppcaml::dbg_env("NOSHARE602") != nullptr;
@@ -20485,7 +20502,7 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
             f.is_method = true;
             f.priv = (pm->priv == PrivateFlag::Private);
             f.virt = (pm->virt == VirtualFlag::Virtual);
-            f.ty = bridge_ty_named(ck.from_coretype(*pm->type, tv), cvars, cnext, tv);
+            f.ty = ctf_method_ty(ck, *pm->type, tv, cvars, cnext);
             f.approx.k = 'S';  // a class description's entry IS the field's node
             own_meths.insert(f.name);
             ci.class_fields.push_back(std::move(f));
@@ -22979,7 +22996,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
             f.is_method = true;
             f.priv = (pm->priv == PrivateFlag::Private);
             f.virt = (pm->virt == VirtualFlag::Virtual);
-            f.ty = bridge_ty_named(ck.from_coretype(*pm->type, tv), cvars, cnext, tv);
+            f.ty = ctf_method_ty(ck, *pm->type, tv, cvars, cnext);
             f.approx.k = 'S';  // a class type's entry IS the field's node
             ci.class_fields.push_back(std::move(f));
           } else if (std::holds_alternative<Pctf_inherit>(cf.desc) ||
