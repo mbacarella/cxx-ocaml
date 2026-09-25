@@ -5310,6 +5310,11 @@ xsal_a5 0
 xsal_a6 0
 xsal_a7 75
 xsal_a8 0
+xsa_1 0
+xsa_2 0
+xsa_3 0
+xsa_4 0
+xsa_5 0
 xsa_a01 0
 xsa_a02 0
 xsa_a03 0

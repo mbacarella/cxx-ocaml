@@ -1064,6 +1064,8 @@ struct Checker {
   // Set while an `open F(B)` harvests its exports: the prefix the result's own
   // types are named under (`F(B).`), in place of the binding's (S609).
   std::string locfapp_open_target_;
+  // Set while an `open F(struct .. end)` (no path) harvests its exports.
+  bool locfapp_open_anon_ = false;
   static bool openlocf_off() {
     static const bool off = cppcaml::dbg_env("NOOPENLOCF") != nullptr ||
                             cppcaml::dbg_env("NOSHARE609") != nullptr;
@@ -3971,11 +3973,104 @@ struct Checker {
     apfx += ".";
     return local_module_prefixes_.count(apfx) ? apfx : "";
   }
+  // A STRUCTURE argument (`F(struct type t = int .. end)`): its types'
+  // nullary manifests by name, so the body's `X.t` reads as `int` -- ocamlc
+  // eliminates the anonymous parameter the same way.  False when an item
+  // could change how a manifest resolves, or a manifest cites one of the
+  // structure's own types (S618; NOSTRUCTARG reverts).
+  static bool structarg_off() {
+    static const bool off = cppcaml::dbg_env("NOSTRUCTARG") != nullptr ||
+                            cppcaml::dbg_env("NOSHARE618") != nullptr;
+    return off;
+  }
+  bool local_functor_struct_arg(const ModuleExpr& arg,
+                                std::unordered_map<std::string, TypePtr>& out) {
+    if (structarg_off()) return false;
+    auto* st = std::get_if<Pmod_structure>(&arg.desc);
+    if (!st) return false;
+    std::unordered_set<std::string> own;
+    for (auto& it : st->items) {
+      if (auto* ty = std::get_if<Pstr_type>(&it.desc)) {
+        for (auto& d : ty->decls) own.insert(d.name.txt);
+      } else if (!std::holds_alternative<Pstr_value>(it.desc) &&
+                 !std::holds_alternative<Pstr_primitive>(it.desc) &&
+                 !std::holds_alternative<Pstr_attribute>(it.desc)) {
+        return false;
+      }
+    }
+    for (auto& it : st->items)
+      if (auto* ty = std::get_if<Pstr_type>(&it.desc))
+        for (auto& d : ty->decls) {
+          if (!d.manifest || !d.params.empty() || !d.constraints.empty()) continue;
+          std::unordered_map<std::string, TypePtr> v;
+          TypePtr m = from_coretype(**d.manifest, v);
+          bool cites_own = false;
+          std::unordered_set<I::Type*> seen;
+          std::function<void(const TypePtr&)> walk = [&](const TypePtr& t0) {
+            TypePtr t = I::Engine::repr(t0);
+            if (!seen.insert(t.get()).second) return;
+            if (t->kind == I::Type::Kind::Constr && own.count(t->path)) cites_own = true;
+            if (t->kind == I::Type::Kind::Arrow) { walk(t->dom); walk(t->cod); }
+            for (auto& a : t->args) walk(a);
+          };
+          walk(m);
+          if (cites_own) return false;
+          out[d.name.txt] = m;
+        }
+    return true;
+  }
+  // Replace each `P.n` (P = `pfx`) by the manifest `man[n]`; `ok` drops to
+  // false on a `P.` path with none (an abstract or parameterised type).
+  TypePtr subst_param_manifests(const TypePtr& t0, const std::string& pfx,
+                                const std::unordered_map<std::string, TypePtr>& man,
+                                std::unordered_map<I::Type*, TypePtr>& memo, bool& ok) {
+    TypePtr t = I::Engine::repr(t0);
+    if (auto m = memo.find(t.get()); m != memo.end()) return m->second;
+    memo[t.get()] = t;
+    switch (t->kind) {
+      case I::Type::Kind::Arrow: {
+        TypePtr d = subst_param_manifests(t->dom, pfx, man, memo, ok);
+        TypePtr c = subst_param_manifests(t->cod, pfx, man, memo, ok);
+        if (d.get() == I::Engine::repr(t->dom).get() &&
+            c.get() == I::Engine::repr(t->cod).get())
+          return t;
+        TypePtr r = eng.arrow(d, c, t->arrow_label, t->arrow_lbl);
+        memo[t.get()] = r;
+        return r;
+      }
+      case I::Type::Kind::Tuple:
+      case I::Type::Kind::Constr: {
+        if (t->kind == I::Type::Kind::Constr && t->path.rfind(pfx, 0) == 0) {
+          auto f = man.find(t->path.substr(pfx.size()));
+          if (f == man.end() || !t->args.empty()) { ok = false; return t; }
+          memo[t.get()] = f->second;
+          return f->second;
+        }
+        std::vector<TypePtr> as;
+        bool changed = false;
+        for (auto& a : t->args) {
+          as.push_back(subst_param_manifests(a, pfx, man, memo, ok));
+          if (as.back().get() != I::Engine::repr(a).get()) changed = true;
+        }
+        if (!changed) return t;
+        TypePtr r = t->kind == I::Type::Kind::Tuple
+                        ? eng.tuple(std::move(as))
+                        : eng.constr(t->path, std::move(as), t->stamp);
+        memo[t.get()] = r;
+        return r;
+      }
+      default:
+        return t;
+    }
+  }
   std::unordered_map<std::string, TypePtr> applied_local_functor(
       const Longident& fpath, const ModuleExpr& arg) {
-    if (strict || locfapp_off() || func_bind_name_.empty()) return {};
+    // An `open F(struct .. end)` has no path to name the result by: its
+    // values are taken only when none cites the body's own types (S618).
+    const bool anon_open = locfapp_open_anon_ && func_bind_name_.empty();
+    if (strict || locfapp_off() || (func_bind_name_.empty() && !anon_open)) return {};
     const std::string bind = func_bind_name_ + ".";
-    const bool via_open = !locfapp_open_target_.empty();
+    const bool via_open = !locfapp_open_target_.empty() || anon_open;
     if (!via_open &&
         (proc_mod_prefix_.size() < bind.size() ||
          proc_mod_prefix_.compare(proc_mod_prefix_.size() - bind.size(),
@@ -3987,11 +4082,37 @@ struct Checker {
     auto fr = functor_real_env_.find(comps[0]);
     if (fr == functor_real_env_.end()) return {};
     std::string apfx = local_functor_arg_prefix(arg);
-    if (apfx.empty()) return {};
+    std::unordered_map<std::string, TypePtr> man;
+    if (apfx.empty() && !local_functor_struct_arg(arg, man)) return {};
     std::unordered_map<std::string, TypePtr> out;
     for (auto& [k, v] : fr->second.vals) {
+      if (anon_open) {
+        bool cites_own = false;
+        std::unordered_set<I::Type*> seen;
+        std::function<void(const TypePtr&)> walk = [&](const TypePtr& t0) {
+          TypePtr t = I::Engine::repr(t0);
+          if (!seen.insert(t.get()).second) return;
+          if (t->kind == I::Type::Kind::Constr) {
+            for (auto& n : fr->second.own_types)
+              if (t->path == n) cites_own = true;
+            for (auto& n : fr->second.own_mods)
+              if (t->path.rfind(n + ".", 0) == 0) cites_own = true;
+          }
+          if (t->kind == I::Type::Kind::Arrow) { walk(t->dom); walk(t->cod); }
+          for (auto& a : t->args) walk(a);
+        };
+        walk(v);
+        if (cites_own) return {};
+      }
       std::unordered_map<I::Type*, TypePtr> m0;
-      TypePtr t = subst_path_head(v, fr->second.param + ".", apfx, m0);
+      TypePtr t;
+      if (apfx.empty()) {
+        bool ok = true;
+        t = subst_param_manifests(v, fr->second.param + ".", man, m0, ok);
+        if (!ok) return {};
+      } else {
+        t = subst_path_head(v, fr->second.param + ".", apfx, m0);
+      }
       for (std::size_t oi = 0; oi < fr->second.own_types.size(); ++oi) {
         const auto& n = fr->second.own_types[oi];
         std::unordered_map<I::Type*, TypePtr> m1;
@@ -14796,8 +14917,12 @@ struct Checker {
           if (!strict && !openlocf_off() && !func_bind_name_.empty() &&
               std::holds_alternative<Pmod_apply>(op->expr.desc))
             locfapp_open_target_ = func_bind_name_ + ".";
+          if (!strict && !openlocf_off() && func_bind_name_.empty())
+            if (auto* ap = std::get_if<Pmod_apply>(&op->expr.desc))
+              locfapp_open_anon_ = std::holds_alternative<Pmod_structure>(ap->arg->desc);
           for (auto& [k, v] : module_exports(op->expr)) venv.back()[k] = v;
           locfapp_open_target_.clear();
+          locfapp_open_anon_ = false;
           func_bind_name_ = saved_fbn;
           if (auto* pi = std::get_if<Pmod_ident>(&op->expr.desc)) {  // open M -> M's submodules
             for (auto& s : module_submodule_names(pi->id.txt)) opened_submodules_.insert(s);
