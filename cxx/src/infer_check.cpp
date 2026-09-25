@@ -374,6 +374,26 @@ struct Checker {
   // module matches on it (patmatch's MPR7761 -- else `B` resolved to the file's
   // top-level `type t = B of int | ..` and cited the wrong `t`).
   std::unordered_map<const void*, TypePtr> ext_ctor_scheme_;
+  // A local module's exceptions and extension ctors, by module prefix ("M."),
+  // in declaration order: the qualified and opened lookups below scan only
+  // the variant tables, so `M.E x` of `exception E of int` fell back to the
+  // flat map's last `E` -- a LATER `type t = E` typed it `t` (S611).  A deque:
+  // local_module_ctor_scheme hands out pointers into it.
+  std::unordered_map<std::string, std::deque<std::pair<std::string, TypePtr>>>
+      module_exn_schemes_;
+  static bool modexn_off() {
+    static const bool off = cppcaml::dbg_env("NOMODEXN") != nullptr ||
+                            cppcaml::dbg_env("NOSHARE611") != nullptr;
+    return off;
+  }
+  TypePtr* module_exn_scheme(const std::string& pfx, const std::string& cn) {
+    if (modexn_off()) return nullptr;
+    auto f = module_exn_schemes_.find(pfx);
+    if (f == module_exn_schemes_.end()) return nullptr;
+    for (auto it = f->second.rbegin(); it != f->second.rend(); ++it)
+      if (it->first == cn) return &it->second;
+    return nullptr;
+  }
   // And for `exception E` declarations (keyed by the exn ctor AST node):
   // process_item overlays the scheme into the CURRENT module's cenv so a bare
   // exn name resolves by scope like any ctor.  The flat `ctors` map is
@@ -5660,6 +5680,8 @@ struct Checker {
     ctors[ec.name.txt] = scheme;
     exn_ctors_.insert(ec.name.txt);
     exn_decl_scheme_[&ec] = scheme;  // for process_item's scoped cenv overlay
+    if (!mod_prefix_.empty())
+      module_exn_schemes_[mod_prefix_].emplace_back(ec.name.txt, scheme);
   }
 
   // A type extension `type ('a..) path += C [of args] [: res]` (extensible
@@ -5715,6 +5737,11 @@ struct Checker {
         int est = tpath.find('.') == std::string::npos
                       ? mx_resolve_bare_stamp(tpath, mod_prefix_)
                       : 0;
+        // ... and a module's own extensible type reads by its qualified path
+        // (`type u += E` inside M is `M.u`, not a bare `u`, S611).
+        if (est && !modexn_off())
+          if (auto sp = stamp_path_.find(est); sp != stamp_path_.end())
+            tpath = sp->second;
         result = is_exn ? eng.constr("exn") : eng.constr(tpath, params, est);
       }
       TypePtr scheme = result;
@@ -5726,6 +5753,8 @@ struct Checker {
       if (ctors.count(ec.name.txt)) ambiguous_ctors_.insert(ec.name.txt);
       ctors[ec.name.txt] = scheme;
       if (!is_exn) ext_ctor_scheme_[&ec] = scheme;  // for in-scope cenv overlay
+      if (!mod_prefix_.empty())
+        module_exn_schemes_[mod_prefix_].emplace_back(ec.name.txt, scheme);
       if (is_exn) exn_ctors_.insert(ec.name.txt);
     }
   }
@@ -5791,7 +5820,7 @@ struct Checker {
       for (auto& [cn2, sc] : lst)
         if (cn2 == d->name) return &sc;
     }
-    return nullptr;
+    return module_exn_scheme(pref, d->name);
   }
 
   // The path to record as a ctor argument's owning type, or "" for "record
@@ -6117,6 +6146,8 @@ struct Checker {
       for (auto& [cn, s] : cs)
         if (cn == d->name) { found = s; ++hits; break; }
     }
+    if (hits == 0)
+      if (TypePtr* es = module_exn_scheme(pfx, d->name)) { found = *es; hits = 1; }
     return hits == 1 ? eng.instantiate_scheme(found) : nullptr;
   }
 
@@ -6358,6 +6389,15 @@ struct Checker {
       if (k.find('.', pfx.size()) != std::string::npos) continue;
       for (auto& [cn, s] : cs) { auto& e = own[cn]; ++e.first; e.second = s; }
     }
+    // The module's exceptions / extension ctors, where no variant of it
+    // declares the name (declaration order: the last one wins).
+    if (!modexn_off())
+      if (auto f = module_exn_schemes_.find(pfx); f != module_exn_schemes_.end()) {
+        std::unordered_map<std::string, TypePtr> exn_own;
+        for (auto& [cn, s] : f->second) exn_own[cn] = s;
+        for (auto& [cn, s] : exn_own)
+          if (!own.count(cn)) own[cn] = {1, s};
+      }
     if (own.empty()) return false;
     for (auto& [cn, e] : own)
       if (e.first == 1) cenv.back()[cn] = e.second;

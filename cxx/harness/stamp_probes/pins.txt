@@ -1946,6 +1946,13 @@ xld_q20 0
 xld_q21 0
 xld_q22 0
 xld_q23 0
+xlex_a1 0
+xlex_a2 0
+xlex_a3 0
+xlex_a4 0
+xlex_a5 0
+xlex_b1 0
+xlex_b2 0
 xlfy_a1 0
 xlfy_a2 1
 xlfy_a3 0
