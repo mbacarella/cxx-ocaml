@@ -22902,7 +22902,31 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
           auto* pc = std::get_if<Pcl_constr>(&pce->desc);
           if (!pc) continue;
           std::string pname = lid_last(pc->id.txt);
-          for (auto& pit : out) {
+          // `inherit M.a` of a class in a LOCAL module: its item sits in M's
+          // sub (S622; NOINHMOD reverts -- the qualified parent was not found
+          // and the whole inherited interface was dropped).  Not for a
+          // `['x] M.a` parent: its fields would land over free vars.
+          const std::vector<cmi::cmiw::SigItem>* pscope = &out;
+          if (!std::holds_alternative<Lident>(pc->id.txt.v)) {
+            static const bool inhmod_off =
+                cppcaml::dbg_env("NOINHMOD") != nullptr ||
+                cppcaml::dbg_env("NOSHARE622") != nullptr;
+            auto comps = split_dotted(lid_full(pc->id.txt));
+            if (!inhmod_off) {
+              if (!pc->args.empty()) continue;
+              for (std::size_t i = 0; i + 1 < comps.size() && pscope; ++i) {
+                const cmi::cmiw::SigItem* mi = nullptr;
+                for (auto r = pscope->rbegin(); r != pscope->rend(); ++r)
+                  if (r->k == cmi::cmiw::SigItem::Module && r->name == comps[i]) {
+                    mi = &*r; break;
+                  }
+                pscope = mi && !mi->is_functor && mi->alias.empty() &&
+                                 mi->modtype_ref.empty() ? &mi->sub : nullptr;
+              }
+            }
+            if (!pscope) continue;
+          }
+          for (auto& pit : *pscope) {
             if (pit.k != cmi::cmiw::SigItem::Class || pit.name != pname) continue;
             for (auto& pf : pit.class_fields) {
               auto& seen = pf.is_method ? own_meths : own_vals;
