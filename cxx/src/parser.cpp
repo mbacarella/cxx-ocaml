@@ -2575,11 +2575,17 @@ class Parser {
           if (cur().kind == Kind::DOT) advance();
           else { idx_ = save; gvars.clear(); }
         }
-        std::vector<CoreTypeBox> ts;
-        ts.push_back(parse_type_app());
-        while (cur().kind == Kind::STAR) { advance(); ts.push_back(parse_type_app()); }
-        if (cur().kind == Kind::MINUSGREATER) { advance(); res = parse_core_type(); args = Pcstr_tuple{std::move(ts)}; }
-        else res = std::move(ts[0]);
+        if (cur().kind == Kind::LBRACE) {  // C : { fields } -> tres
+          args = Pcstr_record{parse_label_decls()};
+          expect(Kind::MINUSGREATER, "->");
+          res = parse_core_type();
+        } else {
+          std::vector<CoreTypeBox> ts;
+          ts.push_back(parse_type_app());
+          while (cur().kind == Kind::STAR) { advance(); ts.push_back(parse_type_app()); }
+          if (cur().kind == Kind::MINUSGREATER) { advance(); res = parse_core_type(); args = Pcstr_tuple{std::move(ts)}; }
+          else res = std::move(ts[0]);
+        }
         endp = position(tokens_[idx_ - 1].end);
       } else if (cur().kind == Kind::OF) {
         advance();

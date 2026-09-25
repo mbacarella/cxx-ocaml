@@ -104,6 +104,7 @@ bool attrpos_off();  // NOATTRPOS=1: no label/ctor/module attributes (S588)
 bool payload_off();  // NOPAYLOAD=1: an attribute with a payload is not written (S589)
 bool docfilt_off();  // NODOCFILT=1: a docstring drops the attribute list (S590)
 bool exnloc_off();  // NOEXNLOC=1: exn record labels at Location.none (S591)
+bool openinj_off();  // NOOPENINJ=1: open-type params not injective (S592)
 bool prov_off();  // NOPROV=1: the writer ignores provenance (S554 behaviour)
 // NONODEID=1: the saved graph keeps one writer node per OCCURRENCE (S555
 // behaviour) -- no per-use instantiate copies, no node memo across a

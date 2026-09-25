@@ -1085,6 +1085,7 @@ xexl_a4 0
 xexl_a5 0
 xexl_a6 0
 xexl_a7 0
+xexl_a8 0
 xexl_a9 0
 xexn_a1 0
 xexn_a2 0
@@ -3493,6 +3494,13 @@ xob_r3 0
 xob_r4 0
 xob_r5 0
 xob_r6 0
+xoi_a1 0
+xoi_a2 0
+xoi_a3 0
+xoi_a4 0
+xoi_a5 0
+xoi_a6 0
+xoi_a7 0
 xop_a1 0
 xop_a2 0
 xop_a3 0

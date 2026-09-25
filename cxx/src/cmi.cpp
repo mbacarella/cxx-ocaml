@@ -1548,6 +1548,11 @@ bool exnloc_off() {
                           cppcaml::dbg_env("NOSHARE591") != nullptr;
   return off;
 }
+bool openinj_off() {
+  static const bool off = cppcaml::dbg_env("NOOPENINJ") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE592") != nullptr;
+  return off;
+}
 
 namespace cmiw {
 

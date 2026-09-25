@@ -16440,8 +16440,11 @@ static std::vector<int> compute_decl_variance(
                           f.mut == MutableFlag::Mutable ? vrn::INV : vrn::POS,
                           slot, vari, group);
       }
-    bool concr = !abstract_kind;
-    bool do_strengthen = !d.manifest || !abstract_kind;
+    // An open kind is concrete (`not (Btype.type_kind_is_abstract decl)`).
+    bool open_concr = std::holds_alternative<Ptype_open>(d.kind) &&
+                      !cmi::openinj_off();
+    bool concr = !abstract_kind || open_concr;
+    bool do_strengthen = !d.manifest || concr;
     // A row-aliased param (`[< .. ] as 'a` anywhere in the body): the param
     // is INSTANTIATED to the row at type level -- non-Tvar finalization.
     std::vector<bool> is_var(d.params.size(), true);
@@ -17558,6 +17561,22 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
         si.type_variances.assign(d.param_variances.begin(),
                                  d.param_variances.end());
     }
+    // A manifest-free OPEN decl's params are injective whatever is written
+    // (Typedecl_variance.compute_variance_decl: `not abstract || i`).
+    if (!manifest && si.type_open && !cmi::openinj_off() &&
+        d.param_variances.size() == si.params.size())
+      for (int v : d.param_variances)
+        si.type_variances.push_back(v | vrn::INJ);
+    // A later decl citing this one reads its variance: the written one, or
+    // `make true true false` (7) unwritten, plus INJ when open.
+    if (!manifest && !cmi::openinj_off() && !si.params.empty()) {
+      std::vector<int> wv(si.params.size(), 7);
+      for (std::size_t i = 0; i < wv.size(); ++i)
+        if (i < d.param_variances.size()) wv[i] = d.param_variances[i];
+      if (si.type_open)
+        for (int& v : wv) v |= vrn::INJ;
+      ck.computed_variances_[d.name.txt] = wv;
+    }
     out.push_back(std::move(si));
   }
   // COMPUTED variance for concrete decls (record/variant/manifest), fixed
@@ -17577,6 +17596,16 @@ static void emit_type_decls(Checker& ck, const std::vector<TypeDeclaration>& dec
     for (auto& d : decls)
       if (!d.params.empty())
         cur[d.name.txt] = std::vector<int>(d.params.size(), 0);
+    // A manifest-free abstract/open member never iterates: it is seeded
+    // with the variance recorded above, not the fixed point's zero.
+    if (!cmi::openinj_off())
+      for (auto& d : decls)
+        if (!d.params.empty() && !d.manifest &&
+            !std::holds_alternative<Ptype_record>(d.kind) &&
+            !std::holds_alternative<Ptype_variant>(d.kind))
+          if (auto f = ck.computed_variances_.find(d.name.txt);
+              f != ck.computed_variances_.end())
+            cur[d.name.txt] = f->second;
     for (int iter = 0; iter < 16; ++iter) {
       bool changed = false;
       for (auto& d : decls) {
