@@ -1561,6 +1561,11 @@ bool hoparam_off() {
                           cppcaml::dbg_env("NOSHARE599") != nullptr;
   return off;
 }
+bool polyclass_off() {
+  static const bool off = cppcaml::dbg_env("NOPOLYSEND") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE604") != nullptr;
+  return off;
+}
 bool polymeth_off() {
   static const bool off = cppcaml::dbg_env("NOPOLYMETH") != nullptr ||
                           cppcaml::dbg_env("NOSHARE603") != nullptr;
@@ -3721,9 +3726,14 @@ static std::vector<o::ValPtr> emit_sig_items(const std::vector<SigItem>& items,
       std::vector<TyPtr> mtys;             // the closed object placeholder
       for (auto& f : it.class_fields) {
         if (f.is_method) {
+          // A POLYMORPHIC method (`m : 'a. T = ..`) carries its own
+          // Tpoly(T, univars): that is P, and the map entry cites it too
+          // (S604; NOPOLYSEND reverts to Tpoly(Tpoly(..), [])).
+          const bool pm = !f.self_ref && f.ty && f.ty->k == Ty::Poly &&
+                          !polyclass_off();
           o::ValPtr fty = f.self_ref ? self : te.emit(f.ty);
-          o::ValPtr P = te.texpr(o::vblock(8, {fty, o::vint(0)}));  // Tpoly(ty,[])
-          o::ValPtr M = f.approx.k == 'S' && !clsitem_off
+          o::ValPtr P = pm ? fty : te.texpr(o::vblock(8, {fty, o::vint(0)}));  // Tpoly(ty,[])
+          o::ValPtr M = (pm || f.approx.k == 'S') && !clsitem_off
               ? P : te.texpr(o::vblock(8, {spine(fty, f.approx), o::vint(0)}));
           o::ValPtr priv = f.priv
               ? (clsitem_off ? o::vblock(0, {o::vint(2)})

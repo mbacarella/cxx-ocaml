@@ -1023,6 +1023,11 @@ struct Checker {
   // unpack `(val m : X.S)`; a separate map so no bare-name lookup changes.
   std::unordered_map<std::string, const ast::Signature*> dotted_modtype_asts_;
   // NOUNPACKTY (alias NOSHARE601) reverts the unpack legs of S601.
+  static bool polysend_off() {
+    static const bool off = cppcaml::dbg_env("NOPOLYSEND") != nullptr ||
+                            cppcaml::dbg_env("NOSHARE604") != nullptr;
+    return off;
+  }
   static bool unpackty_off() {
     static const bool off = cppcaml::dbg_env("NOUNPACKTY") != nullptr ||
                             cppcaml::dbg_env("NOSHARE601") != nullptr;
@@ -11864,7 +11869,26 @@ struct Checker {
           ot = I::Engine::repr(eng.instantiate_scheme(it->second));
       if (ot->kind == I::Type::Kind::Object)
         for (size_t i = 0; i < ot->labels.size(); ++i)
-          if (ot->labels[i] == sd->meth.txt) return ot->args[i];
+          if (ot->labels[i] == sd->meth.txt) {
+            // A POLYMORPHIC method (`id : 'a. 'a -> 'a`) is instantiated at
+            // each send, like ocamlc's instance_poly: `o#id 1` must not bind
+            // the object's own 'a to int (S604; NOPOLYSEND reverts).  The
+            // binders are made generic just for the copy.
+            if (!polysend_off() && i < ot->method_polys.size() &&
+                !ot->method_polys[i].empty()) {
+              std::vector<std::pair<TypePtr, int>> saved;
+              for (auto& b : ot->method_polys[i]) {
+                TypePtr br = I::Engine::repr(b);
+                if (br->kind != I::Type::Kind::Var) continue;
+                saved.emplace_back(br, br->level);
+                br->level = I::GENERIC_LEVEL;
+              }
+              TypePtr inst = eng.instantiate(ot->args[i]);
+              for (auto& [br, lv] : saved) br->level = lv;
+              return inst;
+            }
+            return ot->args[i];
+          }
       return eng.fresh_var();  // P4-D: unknown receiver/method, per-occurrence var
     }
     if (auto* si = std::get_if<Pexp_setinstvar>(&e.desc)) {  // n <- e: e has n's type
@@ -12319,6 +12343,12 @@ struct Checker {
                          TypePtr* out_self = nullptr) {
     std::vector<std::string> mnames;
     std::vector<TypePtr> mtypes;
+    // A method written `m : 'a. T = ..`: its binders and their names, parallel
+    // to mnames (empty for a monomorphic method), recorded on the object so
+    // the .cmi stores Tpoly(T, univars) and a send instantiates them (S604).
+    std::vector<std::vector<TypePtr>> mpolys;
+    std::vector<std::vector<std::string>> mpnames;
+    bool any_mpoly = false;
     venv.emplace_back();
     // Class parameters: bind each so a val initialiser referencing one shares its
     // type var with the instance variable (method-body unification then flows back).
@@ -12417,6 +12447,8 @@ struct Checker {
       if (auto* m = std::get_if<Pcf_method>(&f.desc)) {
         if (auto* cc = std::get_if<Cfk_concrete>(&m->kind)) {
           const Expression* body = cc->e.get();
+          std::vector<TypePtr> mb_poly;
+          std::vector<std::string> mb_pnames;
           const CoreType* pty = nullptr;  // `method m : T = ...` poly annotation
           if (auto* poly = std::get_if<Pexp_poly>(&body->desc)) {
             if (poly->t) pty = poly->t->get();
@@ -12433,8 +12465,24 @@ struct Checker {
             if (cvars) vars = *cvars;
             if (!self_tyvar.empty())
               vars.emplace(self_tyvar, self_ty_stack_.back());
+            const Ptyp_poly* pp = polysend_off()
+                                      ? nullptr : std::get_if<Ptyp_poly>(&pty->desc);
+            if (pp && !pp->vars.empty() && !strict) {
+              std::vector<TypePtr> bs;
+              for (auto& n : pp->vars) {
+                TypePtr fv = generic_var();
+                vars[n] = fv;
+                bs.push_back(fv);
+              }
+              TypePtr at = from_coretype(*pp->type, vars);
+              try { try_unify(bt, at); } catch (...) {}
+              bt = at;
+              mb_poly = std::move(bs);
+              mb_pnames = pp->vars;
+            } else {
             TypePtr at = from_coretype(*pty, vars);
             if (strict) soft_unify(bt, at); else { try { try_unify(bt, at); } catch (...) {} bt = at; }
+            }
           }
           // Tie the pre-declared method var to the inferred body type, so any
           // `self#m` use elsewhere sees the real type.
@@ -12445,6 +12493,9 @@ struct Checker {
           if (m->priv == PrivateFlag::Private) continue;  // not in the public type
           mnames.push_back(m->name.txt);
           mtypes.push_back(bt);
+          any_mpoly = any_mpoly || !mb_poly.empty();
+          mpolys.push_back(std::move(mb_poly));
+          mpnames.push_back(std::move(mb_pnames));
         }
       } else if (auto* ini = std::get_if<Pcf_initializer>(&f.desc)) {
         infer_expr(*ini->e);
@@ -12483,7 +12534,12 @@ struct Checker {
       closed->abbrev_args = self_annot->abbrev_args;
       return closed;
     }
-    return eng.object_type(std::move(mnames), std::move(mtypes));
+    TypePtr obj = eng.object_type(std::move(mnames), std::move(mtypes));
+    if (any_mpoly) {
+      obj->method_polys = std::move(mpolys);
+      obj->method_poly_names = std::move(mpnames);
+    }
+    return obj;
   }
 
   TypePtr infer_function(const Pexp_function& f) {
@@ -14267,6 +14323,27 @@ struct Checker {
                 ctor = eng.arrow(ptys[i], ctor, lk, nm);
               }
               try_unify(pe.placeholder, ctor);
+            }
+            // ... and the polymorphic methods' binders (S604): the placeholder
+            // shell was built with plain vars, and unify does not carry them.
+            if (!polysend_off()) {
+              TypePtr src = I::Engine::repr(ot);
+              TypePtr ph = I::Engine::repr(pe.placeholder);
+              while (ph->kind == I::Type::Kind::Arrow) ph = I::Engine::repr(ph->cod);
+              if (src->kind == I::Type::Kind::Object && !src->method_polys.empty() &&
+                  ph->kind == I::Type::Kind::Object && ph.get() != src.get()) {
+                ph->method_polys.assign(ph->labels.size(), {});
+                ph->method_poly_names.assign(ph->labels.size(), {});
+                for (std::size_t i = 0; i < ph->labels.size(); ++i)
+                  for (std::size_t j = 0; j < src->labels.size(); ++j)
+                    if (src->labels[j] == ph->labels[i] &&
+                        j < src->method_polys.size()) {
+                      ph->method_polys[i] = src->method_polys[j];
+                      if (j < src->method_poly_names.size())
+                        ph->method_poly_names[i] = src->method_poly_names[j];
+                      break;
+                    }
+              }
             }
             // The writer reads the class type from the map (= the placeholder,
             // which object-object unify does NOT link to `ot`), so record the
@@ -22062,6 +22139,27 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
               // (Printtyp then prints `object ('a) .. method m : 'a end`).
               f.self_ref = object_cites_self(m->second);
               f.ty = cbridge(m->second);
+              // A polymorphic method (`m : 'a. T = ..`): the bridged object
+              // wraps it in Tpoly over its univars; take that node (S604).
+              if (!Checker::polysend_off() && obj &&
+                  obj->kind == I::Type::Kind::Object &&
+                  !obj->method_polys.empty())
+                for (std::size_t mj = 0; mj < obj->labels.size(); ++mj)
+                  if (obj->labels[mj] == f.name &&
+                      mj < obj->method_polys.size() &&
+                      !obj->method_polys[mj].empty()) {
+                    // an UNNAMED twin: the class's own object is named
+                    // after it and bridges as the class type
+                    TypePtr tw = ck.eng.object_type(obj->labels, obj->args);
+                    tw->method_polys = obj->method_polys;
+                    tw->method_poly_names = obj->method_poly_names;
+                    auto ob = cbridge(tw);
+                    if (ob && ob->k == cmi::cmiw::Ty::Object &&
+                        mj < ob->args.size() &&
+                        ob->args[mj]->k == cmi::cmiw::Ty::Poly)
+                      f.ty = ob->args[mj];
+                    break;
+                  }
               f.approx = approx_of_method(*std::get<Cfk_concrete>(pm->kind).e);
             } else {
               f.ty = cmi::cmiw::ty_var(cnext++);

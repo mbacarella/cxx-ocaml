@@ -4445,6 +4445,16 @@ xpms_b3 0
 xpms_b4 0
 xpms_b5 0
 xpms_b6 0
+xpsd_a1 0
+xpsd_a2 0
+xpsd_a3 0
+xpsd_a4 0
+xpsd_a5 0
+xpsd_a6 0
+xpsd_a7 0
+xpsd_a8 0
+xpsd_b1 0
+xpsd_b2 0
 xpsh_a1 0
 xpsh_a2 0
 xpsh_a3 0
