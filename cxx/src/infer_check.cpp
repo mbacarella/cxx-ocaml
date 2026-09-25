@@ -18713,6 +18713,11 @@ static void strengthen_abstract(std::vector<cmi::cmiw::SigItem>& items,
 static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
     const std::string& name, const ast::ModuleExpr& me,
     const std::vector<cmi::cmiw::SigItem>* prior, Checker* ckp);
+static bool fapp_body_off() {
+  static const bool off = cppcaml::dbg_env("NOFAPPBODY") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE602") != nullptr;
+  return off;
+}
 // depth_bias: how many scope levels the `items` vector itself sits BELOW the
 // scope where the constraint was written -- 1 when they become a module's sub
 // (`module Map : Map.S with type ..`), 0 when spliced flat by an include.
@@ -20960,6 +20965,39 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
       g_outer_prior = prior;
       result = infer_signature(bs->items, fps.empty() ? nullptr : &fps);
       g_outer_prior = saved_prior;
+    }
+    else if (!fapp_body_off() &&
+             (std::holds_alternative<Pmod_apply>(cur->desc) ||
+              std::holds_alternative<Pmod_apply_unit>(cur->desc))) {
+      // `module P (B : Set.OrderedType) = Set.Make (B)`: the result is the
+      // application's, as a `module M = Set.Make (B)` binding would have it
+      // (the parameters are in scope for the writer, so `B.t` resolves).
+      // It was left EMPTY, so a consumer's `P(X).add` was rejected.
+      // NOFAPPBODY (alias NOSHARE602) reverts.
+      // Only when every argument is a PATH: a struct or applied argument
+      // inside a functor body is not resolved, and would leave the applied
+      // functor's own parameter (`Ord.t`) dangling in the result.
+      bool paths = true;
+      for (const ast::ModuleExpr* h = cur; paths;) {
+        const ast::ModuleExpr* arg = nullptr;
+        if (auto* a = std::get_if<Pmod_apply>(&h->desc)) {
+          arg = a->arg.get(); h = a->f.get();
+        } else if (auto* au = std::get_if<Pmod_apply_unit>(&h->desc)) {
+          paths = false; (void)au;
+        } else break;
+        while (arg)
+          if (auto* ac = std::get_if<Pmod_constraint>(&arg->desc))
+            arg = ac->me.get();
+          else break;
+        auto* ai = arg ? std::get_if<Pmod_ident>(&arg->desc) : nullptr;
+        if (!ai || std::holds_alternative<Lapply>(ai->id.txt.v)) paths = false;
+      }
+      if (auto r = paths ? module_binding_sigitem(name, *cur, prior, ckp)
+                         : std::nullopt;
+          r && !r->is_functor && r->alias.empty()) {
+        result = std::move(r->sub);
+        result_ref = std::move(r->modtype_ref);
+      }
     }
     else if (auto* bi = std::get_if<Pmod_ident>(&cur->desc)) {
       // `module Id (S : S) = S` (an identity functor): ocamlc's result is the

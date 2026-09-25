@@ -1103,6 +1103,16 @@ xexn_a5 0
 xexn_a6 0
 xexn_a7 0
 xexn_a8 0
+xfap_a1 0
+xfap_a2 0
+xfap_a3 0
+xfap_a4 0
+xfap_a5 0
+xfap_a6 0
+xfap_a7 0
+xfap_a8 0
+xfap_b1 0
+xfap_b2 0
 xfa_a0 0
 xfa_a1 0
 xfa_a2 0
