@@ -1018,6 +1018,16 @@ struct Checker {
   // Signature AST of a local `module type S = sig .. end`, so a first-class-
   // module param `(module M : S)` can bind M's values at M-qualified types.
   std::unordered_map<std::string, const ast::Signature*> modtype_sig_asts_;
+  // The same signature module types under their DOTTED path from the unit
+  // (`module X = struct module type S = sig .. end end` -> "X.S"), for an
+  // unpack `(val m : X.S)`; a separate map so no bare-name lookup changes.
+  std::unordered_map<std::string, const ast::Signature*> dotted_modtype_asts_;
+  // NOUNPACKTY (alias NOSHARE601) reverts the unpack legs of S601.
+  static bool unpackty_off() {
+    static const bool off = cppcaml::dbg_env("NOUNPACKTY") != nullptr ||
+                            cppcaml::dbg_env("NOSHARE601") != nullptr;
+    return off;
+  }
   // Structure AST of a local `let module M = struct .. end`, so packing M
   // against a modtype can resolve the sig's abstract types from M's own
   // manifests (`type t1 = s1` -> the sig's t1 IS s1, not an opaque M.t1).
@@ -3359,8 +3369,13 @@ struct Checker {
   std::unordered_map<std::string, TypePtr> cmi_modtype_value_schemes(
       const Longident& path, const std::unordered_map<std::string, TypePtr>& argtypes,
       const std::string& qual = "") {
+    return cmi_modtype_value_schemes(mod_components(path), argtypes, qual);
+  }
+  std::unordered_map<std::string, TypePtr> cmi_modtype_value_schemes(
+      std::vector<std::string> comps,
+      const std::unordered_map<std::string, TypePtr>& argtypes,
+      const std::string& qual = "") {
     std::unordered_map<std::string, TypePtr> out;
-    auto comps = mod_components(path);
     if (comps.empty()) return out;
     // A BARE name declared by an opened module (`open Globroots` then
     // `(G : GLOBREF)`) resolves through the open's qualification.
@@ -13839,9 +13854,43 @@ struct Checker {
                 return unpack_module_values(
                     func_bind_name_.empty() ? pl->name : func_bind_name_,
                     *sg->second, &argtypes);
+            if (!unpackty_off())
+              if (auto sg = dotted_modtype_asts_.find(lid_full(pk->path.txt));
+                  sg != dotted_modtype_asts_.end())
+                return unpack_module_values(
+                    func_bind_name_.empty() ? lid_full(pk->path.txt)
+                                            : func_bind_name_,
+                    *sg->second, &argtypes);
           }
           return modtype_values_of(pk->path.txt);
         }
+      // A BARE `(val m)`: the package type is m's own, as inferred (an
+      // annotated parameter, a let-bound pack).  Every member was a fresh
+      // variable, so `let module M = (val m) in M.v` exported `'a`.
+      if (!strict && !unpackty_off()) {
+        TypePtr et = I::Engine::repr(infer_expr(*ie));
+        const std::string pre = "(module ";
+        if (et && et->kind == I::Type::Kind::Constr &&
+            et->path.size() > pre.size() + 1 &&
+            et->path.compare(0, pre.size(), pre) == 0 &&
+            et->path.back() == ')') {
+          std::string p = et->path.substr(pre.size(),
+                                          et->path.size() - pre.size() - 1);
+          std::unordered_map<std::string, TypePtr> argtypes;
+          for (std::size_t i = 0; i < et->labels.size() && i < et->args.size();
+               ++i)
+            argtypes[et->labels[i]] = et->args[i];
+          auto vals = cmi_modtype_value_schemes(mod_components_str(p), argtypes);
+          if (!vals.empty()) return vals;
+          auto sg = p.find('.') == std::string::npos
+                        ? modtype_sig_asts_.find(p) : modtype_sig_asts_.end();
+          if (sg == modtype_sig_asts_.end()) sg = dotted_modtype_asts_.find(p);
+          if (sg != modtype_sig_asts_.end() && sg != dotted_modtype_asts_.end())
+            return unpack_module_values(
+                func_bind_name_.empty() ? p : func_bind_name_, *sg->second,
+                &argtypes);
+        }
+      }
       return {};
     }
     if (std::get_if<Pmod_apply>(&me.desc) || std::get_if<Pmod_apply_unit>(&me.desc)) {
@@ -14568,6 +14617,9 @@ struct Checker {
             if (auto* sg = std::get_if<Pmty_signature>(&mt->type->desc)) {
               collect_sig_values(sg->items, modtype_env[mt->name.txt]);
               modtype_sig_asts_[mt->name.txt] = &sg->items;
+              if (!proc_mod_prefix_.empty())
+                dotted_modtype_asts_[proc_mod_prefix_ + mt->name.txt] =
+                    &sg->items;
             }
             // `module type S2 = S1`: the alias resolves to the target's items.
             else if (auto* pid = std::get_if<Pmty_ident>(&mt->type->desc))
