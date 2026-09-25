@@ -3502,6 +3502,15 @@ xob_r3 0
 xob_r4 0
 xob_r5 0
 xob_r6 0
+xodf_a1 0
+xodf_a2 0
+xodf_a3 0
+xodf_a4 0
+xodf_a5 0
+xodf_a6 0
+xodf_a7 0
+xodf_a8 0
+xodf_a9 0
 xoi_a1 0
 xoi_a2 0
 xoi_a3 0

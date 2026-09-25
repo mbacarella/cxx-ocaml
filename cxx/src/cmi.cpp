@@ -762,6 +762,11 @@ int prov_new_dots(int src_dots) {
   t.push_back(ProvInfo{0, -1, false, {}, src_dots});
   return static_cast<int>(t.size()) - 1;
 }
+void prov_share_strs(int prov, int twin) {
+  auto& t = prov_table();
+  if (prov > 0 && static_cast<std::size_t>(prov) < t.size())
+    t[prov].str_of = twin;
+}
 const ProvInfo& prov_info(int prov) {
   auto& t = prov_table();
   return prov > 0 && static_cast<std::size_t>(prov) < t.size() ? t[prov] : t[0];
@@ -1560,6 +1565,13 @@ bool arrprov_off() {
                           cppcaml::dbg_env("NOSHARE593") != nullptr;
   return off;
 }
+// S594: an optional parameter's default meets the parameter's type as the
+// EXPECTED side.  NOOPTDEF=1 links them the other way round again.
+bool optdef_off() {
+  static const bool off = cppcaml::dbg_env("NOOPTDEF") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE594") != nullptr;
+  return off;
+}
 
 namespace cmiw {
 
@@ -1961,7 +1973,8 @@ o::ValPtr comp_str(const std::string& s, int prov, int i) {
     if (i < k) key = "open:" + pi.open_pfx + ":" + std::to_string(i) + ":" + s;
   }
   if (key.empty())
-    key = std::to_string(prov) + ":" + std::to_string(i) + ":" + s;
+    key = std::to_string(pi.str_of ? pi.str_of : prov) + ":" +
+          std::to_string(i) + ":" + s;
   auto& v = g_share.pstrs[key];
   if (!v) v = o::vstr(s);
   return v;

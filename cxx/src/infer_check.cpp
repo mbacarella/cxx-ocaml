@@ -1232,12 +1232,29 @@ struct Checker {
   std::unordered_map<const void*, int>& annot_openprov_map() {
     return annotfile_off() ? annot_openprov_ : unit_annot_openprov();
   }
+  // S594: the default of an annotated optional parameter is typed through a
+  // SECOND copy of the pattern's annotation (typecore.ml's Pparam_val wraps it
+  // in a Pexp_constraint, Issue#12668) -- a second lookup, a second block.
+  // Keyed off the same parsetree node, one byte along (never a node address).
+  bool annot_second_ = false;
+  const void* annot_key(const void* key) const {
+    return key && annot_second_ ? static_cast<const char*>(key) + 1 : key;
+  }
   TypePtr annot(TypePtr t, int src_dots = 0, const void* key = nullptr) {
+    const void* key1 = key;
+    key = annot_key(key);
     if (!key || annotprov_off()) {
       t->prov = cmi::prov_new_dots(src_dots);
     } else {
       int& v = annot_prov_map()[key];
-      if (!v) v = cmi::prov_new_dots(src_dots);
+      if (!v) {
+        v = cmi::prov_new_dots(src_dots);
+        if (key != key1) {
+          int& v1 = annot_prov_map()[key1];
+          if (!v1) v1 = cmi::prov_new_dots(src_dots);
+          cmi::prov_share_strs(v, v1);
+        }
+      }
       t->prov = v;
     }
     t->scheme = annot_row_depth_ == 0 || cmi::node_id_off();  // generalize_structure'd: every use copies it
@@ -1255,11 +1272,20 @@ struct Checker {
   // ...reached through `open <pfx>`: `Pdot (that open's root, name)`.
   TypePtr annot_open(TypePtr t, const std::string& pfx,
                      const void* key = nullptr) {
+    const void* key1 = key;
+    key = annot_key(key);
     if (!key || annotprov_off()) {
       t->prov = cmi::prov_new_open(pfx);
     } else {
       int& v = annot_openprov_map()[key];
-      if (!v) v = cmi::prov_new_open(pfx);
+      if (!v) {
+        v = cmi::prov_new_open(pfx);
+        if (key != key1) {
+          int& v1 = annot_openprov_map()[key1];
+          if (!v1) v1 = cmi::prov_new_open(pfx);
+          cmi::prov_share_strs(v, v1);
+        }
+      }
       t->prov = v;
     }
     t->scheme = annot_row_depth_ == 0 || cmi::node_id_off();
@@ -10743,6 +10769,67 @@ struct Checker {
     return t;
   }
 
+  // `(inner : t)`: also the default of an annotated optional parameter,
+  // which ocamlc types as exactly this node (typecore.ml, Issue#12668).
+  TypePtr infer_constraint(const Expression& inner, const CoreType& t,
+                           bool second = false) {
+    TypePtr et, at;
+    // What the inner expression MEETS is an instance of the annotation
+    // (typecore's `type_argument env sarg ty (instance ty)`): a variable
+    // the expression carries links to that copy, never to the annotation
+    // node itself, and the expression's own type is one more instance.
+    TypePtr at_use;
+    auto use_of = [&](const TypePtr& a) { return annot_instance(a); };
+    std::unordered_map<std::string, TypePtr> vars;
+    auto translate = [&] {
+      bool saved = annot_second_;
+      annot_second_ = second;
+      TypePtr r = from_coretype(t, vars);
+      annot_second_ = saved;
+      return r;
+    };
+    if (coretype_is_format(t)) {
+      // `("%s" : _ format)`: push the format type into the expression so its
+      // string literals type (and lower) as formats, not plain strings.
+      at = translate();
+      at_use = use_of(at);
+      et = infer_expr_expected(inner, at_use);
+    } else if (eta_sites_on()) {
+      // The annotation is the expression's expected type (type_argument).
+      at = translate();
+      at_use = use_of(at);
+      et = expect_arg(inner, at_use);
+    } else {
+      et = infer_expr(inner);
+      at = translate();
+      at_use = use_of(at);
+    }
+    if (strict && expected_clash(et, at))  // (e : T) with e of a clashing type
+      note_error("expression does not match the type constraint");
+    mark_if_iarray(inner, at);  // `([|..|] : _ iarray)` -> Immutable dump
+    // Flow the annotation into the inner expression in the NON-strict passes
+    // (value-kinds AND signature): `ignore (f s : int)` then pins `f : _ -> int`
+    // in the inferred signature, not just the value kinds.  Not in the strict
+    // reject pass, where an incomplete unify can propagate a spurious clash and
+    // cost a false-rejection.  Soft (try_unify) so a stray clash can't abort.
+    if (!strict) try_unify(et, at_use);
+    // The annotation is an EXPECTED type for the inner expression, which the
+    // plain infer_expr above never sees -- so run the constructor
+    // disambiguation hook on it explicitly, as an argument position would.
+    // `let f x : t = e` carries its return annotation as exactly this node,
+    // so without it a constructor written there resolves by lexical scope
+    // alone: `let mk s n : Ia.outer = Olit (Onone, Lsize (s, n))` picked a
+    // file-local `Lsize of int` over the foreign arity-2 one it is at.  The
+    // format branch already routed through infer_expr_expected, which runs
+    // the hook itself.
+    if (record_kinds_ && !coretype_is_format(t))
+      disambig_expr_now(inner, at, /*allow_defer=*/true);
+    // `(e : t)` is typed `instance ty`: a fresh copy of the annotation's
+    // structure over its own variables, so two constraints written alike
+    // are two nodes and a later contact links a copy, never the annotation.
+    return use_of(at);
+  }
+
   TypePtr infer_expr_impl(const Expression& e) {
     if (e.loc.start.lnum) cur_line_ = e.loc.start.lnum;
     if (auto* c = std::get_if<Pexp_constant>(&e.desc)) return constant_type(c->c);
@@ -11034,56 +11121,8 @@ struct Checker {
         total_proven.insert(&e);
       return rt;
     }
-    if (auto* ct = std::get_if<Pexp_constraint>(&e.desc)) {
-      TypePtr et, at;
-      // What the inner expression MEETS is an instance of the annotation
-      // (typecore's `type_argument env sarg ty (instance ty)`): a variable
-      // the expression carries links to that copy, never to the annotation
-      // node itself, and the expression's own type is one more instance.
-      TypePtr at_use;
-      auto use_of = [&](const TypePtr& a) { return annot_instance(a); };
-      std::unordered_map<std::string, TypePtr> vars;
-      if (coretype_is_format(*ct->t)) {
-        // `("%s" : _ format)`: push the format type into the expression so its
-        // string literals type (and lower) as formats, not plain strings.
-        at = from_coretype(*ct->t, vars);
-        at_use = use_of(at);
-        et = infer_expr_expected(*ct->e, at_use);
-      } else if (eta_sites_on()) {
-        // The annotation is the expression's expected type (type_argument).
-        at = from_coretype(*ct->t, vars);
-        at_use = use_of(at);
-        et = expect_arg(*ct->e, at_use);
-      } else {
-        et = infer_expr(*ct->e);
-        at = from_coretype(*ct->t, vars);
-        at_use = use_of(at);
-      }
-      if (strict && expected_clash(et, at))  // (e : T) with e of a clashing type
-        note_error("expression does not match the type constraint");
-      mark_if_iarray(*ct->e, at);  // `([|..|] : _ iarray)` -> Immutable dump
-      // Flow the annotation into the inner expression in the NON-strict passes
-      // (value-kinds AND signature): `ignore (f s : int)` then pins `f : _ -> int`
-      // in the inferred signature, not just the value kinds.  Not in the strict
-      // reject pass, where an incomplete unify can propagate a spurious clash and
-      // cost a false-rejection.  Soft (try_unify) so a stray clash can't abort.
-      if (!strict) try_unify(et, at_use);
-      // The annotation is an EXPECTED type for the inner expression, which the
-      // plain infer_expr above never sees -- so run the constructor
-      // disambiguation hook on it explicitly, as an argument position would.
-      // `let f x : t = e` carries its return annotation as exactly this node,
-      // so without it a constructor written there resolves by lexical scope
-      // alone: `let mk s n : Ia.outer = Olit (Onone, Lsize (s, n))` picked a
-      // file-local `Lsize of int` over the foreign arity-2 one it is at.  The
-      // format branch already routed through infer_expr_expected, which runs
-      // the hook itself.
-      if (record_kinds_ && !coretype_is_format(*ct->t))
-        disambig_expr_now(*ct->e, at, /*allow_defer=*/true);
-      // `(e : t)` is typed `instance ty`: a fresh copy of the annotation's
-      // structure over its own variables, so two constraints written alike
-      // are two nodes and a later contact links a copy, never the annotation.
-      return use_of(at);
-    }
+    if (auto* ct = std::get_if<Pexp_constraint>(&e.desc))
+      return infer_constraint(*ct->e, *ct->t);
     if (auto* co = std::get_if<Pexp_coerce>(&e.desc)) {
       // A coercion `(e :> T)` or `(e : T1 :> T2)` has the TARGET type T/T2.
       // A ground type T1 is the source's expected type (type_argument).
@@ -12167,7 +12206,14 @@ struct Checker {
     if (cl_params)
       for (auto* pf : *cl_params) {
         TypePtr pt = infer_pat(pf->pat);
-        if (pf->default_) try_unify(pt, infer_expr(**pf->default_));
+        // typeclass.ml types `?(x : t = d)` as `let (x : t) = match .. with
+        // .. | None -> d`: d meets x's annotation as its EXPECTED type.
+        if (pf->default_) {
+          if (cmi::optdef_off() ||
+              !std::holds_alternative<Ppat_constraint>(pf->pat.desc))
+            try_unify(pt, infer_expr(**pf->default_));
+          else try_unify_rev(pt, infer_expr(**pf->default_));
+        }
         if (param_tys) param_tys->push_back(pt);
       }
     // `constraint 'a = [> 'a lambda]` fields pin the class's type params
@@ -12358,7 +12404,18 @@ struct Checker {
         auto [lk, nm] = arglabel(pv->label);
         TypePtr pt = infer_pat(pv->pat);
         // an optional parameter's type is its default's type: `?(c = 100)` => int
-        if (pv->default_) try_unify(pt, infer_expr(**pv->default_));
+        // ocamlc type_expects the default AT the parameter's type (wrapped in
+        // the pattern's annotation, Issue#12668), so an annotation's path
+        // objects win over the default's (typecore.ml's Pparam_val).
+        if (pv->default_) {
+          const auto* pc = std::get_if<Ppat_constraint>(&pv->pat.desc);
+          if (!pc || cmi::optdef_off()) try_unify(pt, infer_expr(**pv->default_));
+          else {
+            // ocamlc types `?(x : t = d)`'s default as `(d : t)`, and the
+            // parameter meets that copy of t as the actual side.
+            try_unify(pt, infer_constraint(**pv->default_, *pc->t, true));
+          }
+        }
         params.push_back({pt, lk, nm});
         ppat_types.emplace_back(&pv->pat, pt);  // for param-pattern partiality
         if (!strict) {
