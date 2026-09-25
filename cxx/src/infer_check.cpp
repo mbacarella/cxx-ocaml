@@ -2589,6 +2589,14 @@ struct Checker {
     if (comps.empty() || comps[0] == "Stdlib") return;
     std::string full = lid_full(m);
     if (full.rfind("Stdlib.", 0) == 0) return;
+    // `open X` of a functor PARAM: its submodules are the dotted modenv keys
+    // param_values_seeded left (`N` -> `X.N`).  NOPARAMSUB reverts.
+    if (!paramsub_off())
+      for (auto& [k, v] : modenv)
+        if (k.size() > full.size() + 1 && k[full.size()] == '.' &&
+            k.compare(0, full.size(), full) == 0 &&
+            k.find('.', full.size() + 1) == std::string::npos)
+          opened_submod_quals_[k.substr(full.size() + 1)] = k;
     try {
       std::deque<const cmi::CmiFile*> loaded;
       loaded.push_back(&cmi::CmiFile::load(head_cmi(comps[0])));
@@ -2888,6 +2896,23 @@ struct Checker {
     }
     return false;
   }
+  static bool paramsub_off() {
+    static const bool off = cppcaml::dbg_env("NOPARAMSUB") != nullptr ||
+                            cppcaml::dbg_env("NOSHARE596") != nullptr;
+    return off;
+  }
+  std::vector<std::string>* param_submod_keys_ = nullptr;
+  // Seed a functor param's value members (and, through param_submod_keys_,
+  // its submodules' under their dotted keys, which `keys` collects).
+  std::unordered_map<std::string, TypePtr> param_values_seeded(
+      const ModuleType& ps, const std::string& pn,
+      std::vector<std::string>& keys) {
+    auto* sk = param_submod_keys_;
+    if (!paramsub_off()) param_submod_keys_ = &keys;
+    auto r = param_sig_value_schemes(ps, {}, pn);
+    param_submod_keys_ = sk;
+    return r;
+  }
   std::unordered_map<std::string, TypePtr> sig_items_value_schemes(
       const ast::Signature& items,
       const std::unordered_map<std::string, TypePtr>& argtypes,
@@ -2964,6 +2989,20 @@ struct Checker {
             opened_submod_quals_[*md->md.name.txt] = qual + "." + *md->md.name.txt;
         }
       }
+    // A functor PARAMETER's SUBMODULE (`(X : sig module N : sig type t val v
+    // : t end end)`) binds its own members: `X.N.v` is the declared `X.N.t`,
+    // not a fresh var (which the .cmi then wrote as `'a`, and a consumer
+    // accepted at any type).  Seeded while the enclosing sig's quals are
+    // live, so an outer sibling type cited inside N stays `X.u`.  Only the
+    // param seeding sites set param_submod_keys_.  NOPARAMSUB reverts.
+    if (param_submod_keys_ && !qual.empty())
+      for (auto& it : items)
+        if (auto* md = std::get_if<Psig_module>(&it.desc);
+            md && md->md.name.txt) {
+          std::string key = qual + "." + *md->md.name.txt;
+          param_submod_keys_->push_back(key);
+          modenv[key] = param_sig_value_schemes(*md->md.type, {}, key);
+        }
     for (auto& it : items)
       if (auto* v = std::get_if<Psig_value>(&it.desc)) {
         std::unordered_map<std::string, TypePtr> vars;
@@ -3182,6 +3221,10 @@ struct Checker {
                               eng.arrow(result, from_coretype(*f.type, vars)));
           }
         }
+      } else if (auto* md = std::get_if<Psig_module>(&it.desc);
+                 md && md->md.name.txt && !paramsub_off()) {
+        // A submodule's datatypes: `X.N.A` is a `X.N.t` (NOPARAMSUB).
+        register_param_sig_members(pn + "." + *md->md.name.txt, *md->md.type);
       } else if (auto* tx = std::get_if<Psig_typext>(&it.desc)) {
         // `type e += E ..`: the EXTENDED type keeps its own path (the
         // enclosing scope's e, not X.e).
@@ -3352,6 +3395,13 @@ struct Checker {
   std::unordered_map<std::string, TypePtr> resolve_module_values_comps(
       std::vector<std::string> comps) {
     if (comps.empty()) return {};
+    // A functor param's submodule is keyed by its full dotted path.
+    if (comps.size() > 1 && !paramsub_off()) {
+      std::string key = comps[0];
+      for (size_t i = 1; i < comps.size(); ++i) key += "." + comps[i];
+      auto it = modenv.find(key);
+      if (it != modenv.end()) return it->second;
+    }
     // local modules are recorded flat by simple name; a qualified local nested
     // module (e.g. include T.Int) is found by its last component.
     {
@@ -3388,6 +3438,11 @@ struct Checker {
       std::vector<std::string> t = mod_components_str(q->second);
       t.insert(t.end(), comps.begin() + 1, comps.end());
       comps = std::move(t);
+      if (!paramsub_off()) {
+        std::string key = comps[0];
+        for (size_t i = 1; i < comps.size(); ++i) key += "." + comps[i];
+        if (auto it = modenv.find(key); it != modenv.end()) return it->second;
+      }
     }
     std::unordered_map<std::string, TypePtr> out;
     try {
@@ -14353,8 +14408,17 @@ struct Checker {
                 // aligns the main harvest.  NOPARAMSIGQUAL reverts.
                 static const bool noq =
                     std::getenv("NOPARAMSIGQUAL") != nullptr;
+                for (auto& [k, v] : modenv)
+                  if (k.size() > pn.size() && k[pn.size()] == '.' &&
+                      k.compare(0, pn.size(), pn) == 0)
+                    saved_penv.emplace_back(k, v);
+                std::vector<std::string> subkeys;
                 modenv[pn] =
-                    param_sig_value_schemes(*psig, {}, noq ? "" : pn);
+                    param_values_seeded(*psig, noq ? "" : pn, subkeys);
+                for (auto& k : subkeys)
+                  if (std::none_of(saved_penv.begin(), saved_penv.end(),
+                                   [&](auto& e) { return e.first == k; }))
+                    saved_penv.emplace_back(k, std::nullopt);
                 invalidate_param_modvals(pn);
               }
               // Keep only the result's value *names* (fresh polymorphic types):
@@ -21304,7 +21368,8 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
     for (auto& [pn, psig] : *fparams) {
       ck.bound_module_names_.insert(pn);
       if (psig) {
-        ck.modenv[pn] = ck.param_sig_value_schemes(*psig, {}, pn);
+        std::vector<std::string> subkeys;
+        ck.modenv[pn] = ck.param_values_seeded(*psig, pn, subkeys);
         ck.register_param_sig_members(pn, *psig);
       }
     }
