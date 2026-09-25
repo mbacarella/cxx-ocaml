@@ -1255,6 +1255,9 @@ struct Checker {
   std::unordered_map<std::string, TypePtr> stdlib_;
   // Strict mode: record definite type errors instead of swallowing them.
   bool strict = false;
+  // The reject pass's checker (structure_typecheck), even while a functor
+  // harvest turns `strict` off for a moment.
+  bool strict_run_ = false;
   // --infer signature DISPLAY pass: keep type abbreviations FOLDED (don't expand
   // `Float.t`/`String.t`/`int Seq.t` to their manifest), matching ocamlc's
   // printed signatures.  Safe only because this pass runs with lenient unify (a
@@ -2816,6 +2819,29 @@ struct Checker {
   // fresh var).  The param's own submodule paths ("T.M") go with it.  Called
   // at the harvest's bind AND restore, so the file-level meaning of the name
   // comes back after the body.  NOPARAMVALCACHE reverts.
+  // A module name bound for an expression's scope only (`let module X`, an
+  // unpacked `(module X : S)` parameter or let pattern): modenv is flat and
+  // modvals_cache_ is keyed by the name, so both must be restored after the
+  // scope -- `let module X = (val x : S) in ..` otherwise answered every
+  // LATER `X.w` of the file, a top-level `module X` included (S614).
+  bool modscope_off() const {
+    static const bool off = cppcaml::dbg_env("NOMODSCOPE") != nullptr ||
+                            cppcaml::dbg_env("NOSHARE614") != nullptr;
+    return off || strict_run_;
+  }
+  using SavedMod =
+      std::pair<std::string, std::optional<std::unordered_map<std::string, TypePtr>>>;
+  SavedMod save_scoped_mod(const std::string& n) {
+    auto f = modenv.find(n);
+    SavedMod r{n, f != modenv.end() ? std::optional(f->second) : std::nullopt};
+    if (!modscope_off()) invalidate_param_modvals(n);
+    return r;
+  }
+  void restore_scoped_mod(SavedMod& sm) {
+    if (sm.second) modenv[sm.first] = std::move(*sm.second);
+    else modenv.erase(sm.first);
+    if (!modscope_off()) invalidate_param_modvals(sm.first);
+  }
   void invalidate_param_modvals(const std::string& pn) {
     static const bool off = std::getenv("NOPARAMVALCACHE") != nullptr;
     if (off) return;
@@ -11192,7 +11218,35 @@ struct Checker {
     if (auto* le = std::get_if<Pexp_let>(&e.desc)) {
       venv.emplace_back();
       infer_bindings(le->rf, le->bindings);
+      // `let (module X : S) = e in body`: X's members for the body (they were
+      // never bound -- `X.w` read a fresh var, or a leaked earlier X).
+      std::vector<SavedMod> saved_lmods;
+      if (!strict && !modscope_off())
+        for (auto& b : le->bindings) {
+          const Ppat_unpack* up = std::get_if<Ppat_unpack>(&b.pat.desc);
+          const Ptyp_package* upkg = up && up->pkg ? &*up->pkg : nullptr;
+          if (!up)
+            if (auto* pc = std::get_if<Ppat_constraint>(&b.pat.desc))
+              if (auto* iu = std::get_if<Ppat_unpack>(&pc->p->desc); iu && !iu->pkg)
+                if (auto* tp = std::get_if<Ptyp_package>(&pc->t->desc)) {
+                  up = iu;
+                  upkg = tp;
+                }
+          if (!up || !up->name.txt || !upkg) continue;
+          auto* sgp = local_pkg_sig(upkg->path.txt);
+          if (!sgp) continue;
+          std::unordered_map<std::string, TypePtr> argtypes;
+          for (auto& [lid, ctb] : upkg->constraints) {
+            std::unordered_map<std::string, TypePtr> vars;
+            argtypes[lid_full(lid.txt)] = from_coretype(*ctb, vars);
+          }
+          saved_lmods.push_back(save_scoped_mod(*up->name.txt));
+          modenv[*up->name.txt] =
+              unpack_module_values(*up->name.txt, *sgp, &argtypes);
+        }
       TypePtr bt = infer_expr(*le->body);
+      for (auto it = saved_lmods.rbegin(); it != saved_lmods.rend(); ++it)
+        restore_scoped_mod(*it);
       venv.pop_back();
       return bt;
     }
@@ -12063,8 +12117,14 @@ struct Checker {
       // scoped open's span carries the ENCLOSING structure's end, so leaving it
       // behind lets `let open Types in ..` shadow every later line of the file.
       auto saved_field_spans = opened_field_mod_spans_;
+      std::optional<SavedMod> saved_mod;
+      if (auto* lm = std::get_if<Pstr_module>(&sti->item->desc);
+          lm && lm->binding.name.txt && !strict && !modscope_off())
+        saved_mod = save_scoped_mod(*lm->binding.name.txt);
       process_item(*sti->item);
+      if (saved_mod) invalidate_param_modvals(saved_mod->first);
       TypePtr bt = infer_expr(*sti->body);
+      if (saved_mod) restore_scoped_mod(*saved_mod);
       if (scoped_open) {
         opened_type_quals_ = std::move(saved_type_quals);
         opened_submod_quals_ = std::move(saved_submod_quals);
@@ -12852,6 +12912,8 @@ struct Checker {
                 }
                 modenv[*up->name.txt] =
                     unpack_module_values(*up->name.txt, *sgp, &argtypes);
+                if (!strict && !modscope_off())
+                  invalidate_param_modvals(*up->name.txt);
                 // The sig's typext ctors (`type t += E`) resolve as `M.E` in
                 // the body (binding1's `?(opt = M.E)`) -- function-scoped cenv.
                 bind_sig_typext_ctors(*sgp);
@@ -13097,6 +13159,7 @@ struct Checker {
     for (auto& [nm, prior] : saved_mods) {
       if (prior) modenv[nm] = std::move(*prior);
       else modenv.erase(nm);
+      if (!strict && !modscope_off()) invalidate_param_modvals(nm);
     }
     return t;
   }
@@ -16277,6 +16340,7 @@ struct UnboundWalk {
 std::vector<std::string> structure_typecheck(const ast::Structure& s) {
   Checker ck;
   ck.strict = true;
+  ck.strict_run_ = true;
   run_checker(ck, s);
   auto vr = valrec::value_rec_errors(s);
   for (auto& e : vr) ck.errors.push_back(std::move(e));

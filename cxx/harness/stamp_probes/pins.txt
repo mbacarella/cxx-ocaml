@@ -2392,6 +2392,12 @@ xlr_rc9 0
 xlr_rc10 0
 xlr_rc11 0
 xlr_rc12 -1
+xlsc_a1 0
+xlsc_a2 0
+xlsc_a3 0
+xlsc_a4 0
+xlsc_a5 0
+xlsc_b1 0
 xlt_a01 0
 xlt_a02 0
 xlt_a03 0
