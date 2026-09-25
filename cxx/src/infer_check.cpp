@@ -1026,6 +1026,14 @@ struct Checker {
                             cppcaml::dbg_env("NOSHARE608") != nullptr;
     return off;
   }
+  // Set while an `open F(B)` harvests its exports: the prefix the result's own
+  // types are named under (`F(B).`), in place of the binding's (S609).
+  std::string locfapp_open_target_;
+  static bool openlocf_off() {
+    static const bool off = cppcaml::dbg_env("NOOPENLOCF") != nullptr ||
+                            cppcaml::dbg_env("NOSHARE609") != nullptr;
+    return off;
+  }
   // Ascription signature of a top-level `module M : sig .. end = ..`, so an
   // application of a functor DECLARED IN that signature (`Msg.Define(struct ..)`)
   // can be instantiated from its declared functor type.
@@ -3875,37 +3883,46 @@ struct Checker {
   // result at any type (S608; NOLOCFAPP reverts).  Non-strict only: the
   // renamed `M.t` is not registered, so it must not reach a unification that
   // can reject.
+  // A functor argument that names a module this file declares: its prefix
+  // (`B.`), else "".
+  std::string local_functor_arg_prefix(const ModuleExpr& arg) {
+    auto* ai = std::get_if<Pmod_ident>(&arg.desc);
+    if (!ai || std::holds_alternative<Lapply>(ai->id.txt.v)) return "";
+    auto acomps = mod_components(ai->id.txt);
+    if (acomps.empty()) return "";
+    std::string apfx = resolve_written_module(acomps[0]);
+    for (std::size_t i = 1; i < acomps.size(); ++i) apfx += "." + acomps[i];
+    apfx += ".";
+    return local_module_prefixes_.count(apfx) ? apfx : "";
+  }
   std::unordered_map<std::string, TypePtr> applied_local_functor(
       const Longident& fpath, const ModuleExpr& arg) {
     if (strict || locfapp_off() || func_bind_name_.empty()) return {};
     const std::string bind = func_bind_name_ + ".";
-    if (proc_mod_prefix_.size() < bind.size() ||
-        proc_mod_prefix_.compare(proc_mod_prefix_.size() - bind.size(),
-                                 bind.size(), bind) != 0)
+    const bool via_open = !locfapp_open_target_.empty();
+    if (!via_open &&
+        (proc_mod_prefix_.size() < bind.size() ||
+         proc_mod_prefix_.compare(proc_mod_prefix_.size() - bind.size(),
+                                  bind.size(), bind) != 0))
       return {};
+    const std::string& tpfx = via_open ? locfapp_open_target_ : proc_mod_prefix_;
     auto comps = mod_components(fpath);
     if (comps.size() != 1) return {};
     auto fr = functor_real_env_.find(comps[0]);
     if (fr == functor_real_env_.end()) return {};
-    auto* ai = std::get_if<Pmod_ident>(&arg.desc);
-    if (!ai || std::holds_alternative<Lapply>(ai->id.txt.v)) return {};
-    auto acomps = mod_components(ai->id.txt);
-    if (acomps.empty()) return {};
-    std::string apfx = resolve_written_module(acomps[0]);
-    for (std::size_t i = 1; i < acomps.size(); ++i) apfx += "." + acomps[i];
-    apfx += ".";
-    if (!local_module_prefixes_.count(apfx)) return {};
+    std::string apfx = local_functor_arg_prefix(arg);
+    if (apfx.empty()) return {};
     std::unordered_map<std::string, TypePtr> out;
     for (auto& [k, v] : fr->second.vals) {
       std::unordered_map<I::Type*, TypePtr> m0;
       TypePtr t = subst_path_head(v, fr->second.param + ".", apfx, m0);
       for (auto& n : fr->second.own_types) {
         std::unordered_map<I::Type*, TypePtr> m1;
-        t = subst_path_head(t, n, proc_mod_prefix_ + n, m1, /*exact=*/true);
+        t = subst_path_head(t, n, tpfx + n, m1, /*exact=*/true);
       }
       for (auto& n : fr->second.own_mods) {
         std::unordered_map<I::Type*, TypePtr> m2;
-        t = subst_path_head(t, n + ".", proc_mod_prefix_ + n + ".", m2);
+        t = subst_path_head(t, n + ".", tpfx + n + ".", m2);
       }
       out[k] = t;
     }
@@ -14560,6 +14577,15 @@ struct Checker {
                   if (auto fb = functor_body_exprs_.find(comps[0]);
                       fb != functor_body_exprs_.end())
                     if (auto* bs = std::get_if<Pmod_structure>(&fb->second->desc)) {
+                      // The ctors' parameter paths read as the argument's
+                      // (`U of X.t` -> `P.t`): a match on U left `X.t` (S609).
+                      std::string cparam, capfx;
+                      if (!openlocf_off() && !locfapp_off())
+                        if (auto fr = functor_real_env_.find(comps[0]);
+                            fr != functor_real_env_.end()) {
+                          capfx = local_functor_arg_prefix(*ap->arg);
+                          if (!capfx.empty()) cparam = fr->second.param + ".";
+                        }
                       std::string savedp = mod_prefix_;
                       mod_prefix_ = func_bind_name_ + ".";
                       for (auto& bit : bs->items)
@@ -14573,14 +14599,27 @@ struct Checker {
                               tenv.back()[d.name.txt] = type_stamp_[&d];
                             if (auto* v2 = std::get_if<Ptype_variant>(&d.kind))
                               for (auto& c : v2->ctors)
-                                if (ctor_scheme_.count(&c))
-                                  cenv.back()[c.name.txt] = ctor_scheme_[&c];
+                                if (ctor_scheme_.count(&c)) {
+                                  TypePtr cs = ctor_scheme_[&c];
+                                  if (!cparam.empty()) {
+                                    std::unordered_map<I::Type*, TypePtr> m0;
+                                    cs = subst_path_head(cs, cparam, capfx, m0);
+                                  }
+                                  cenv.back()[c.name.txt] = cs;
+                                }
                           }
                         }
                       mod_prefix_ = savedp;
                     }
               }
+          // `open F(B)` of a local functor: the members keep their real
+          // types with the body's own types named `F(B).t` -- they were
+          // generic vars, so `let g = f` saved `g : 'a` (S609).
+          if (!strict && !openlocf_off() && !func_bind_name_.empty() &&
+              std::holds_alternative<Pmod_apply>(op->expr.desc))
+            locfapp_open_target_ = func_bind_name_ + ".";
           for (auto& [k, v] : module_exports(op->expr)) venv.back()[k] = v;
+          locfapp_open_target_.clear();
           func_bind_name_ = saved_fbn;
           if (auto* pi = std::get_if<Pmod_ident>(&op->expr.desc)) {  // open M -> M's submodules
             for (auto& s : module_submodule_names(pi->id.txt)) opened_submodules_.insert(s);
@@ -21795,6 +21834,15 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
         if (o.poly_format_labels_.count(lbl)) ck.poly_format_labels_.insert(lbl);
       }
     for (auto& [st, d] : o.stamp_record_decl_) ck.stamp_record_decl_.emplace(st, d);
+  }
+  // The enclosing scope's local functors and modules, so `open F(P)` or
+  // `module N = F(P)` inside this structure applies F as the main pass does
+  // (its members were generic vars in the saved submodule, S609).
+  if (g_outer_fields && !Checker::openlocf_off()) {
+    auto& o = *g_outer_fields;
+    for (auto& [n, fr] : o.functor_real_env_) ck.functor_real_env_.emplace(n, fr);
+    for (auto& [n, b] : o.functor_body_exprs_) ck.functor_body_exprs_.emplace(n, b);
+    for (auto& p : o.local_module_prefixes_) ck.local_module_prefixes_.insert(p);
   }
   if (fparams) {
     if (g_outer_modtype_asts) ck.modtype_sig_asts_ = *g_outer_modtype_asts;
