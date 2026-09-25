@@ -2901,6 +2901,14 @@ struct Checker {
                             cppcaml::dbg_env("NOSHARE596") != nullptr;
     return off;
   }
+  // NOPARAMLBL (alias NOSHARE597) reverts the param label/ctor-open legs.
+  static bool paramlbl_off() {
+    static const bool off = cppcaml::dbg_env("NOPARAMLBL") != nullptr ||
+                            cppcaml::dbg_env("NOSHARE597") != nullptr;
+    return off;
+  }
+  // A functor param's record labels, "X.a" -> recTy -> fldTy.
+  std::unordered_map<std::string, TypePtr> param_field_schemes_;
   std::vector<std::string>* param_submod_keys_ = nullptr;
   // Seed a functor param's value members (and, through param_submod_keys_,
   // its submodules' under their dotted keys, which `keys` collects).
@@ -3216,9 +3224,19 @@ struct Checker {
               reg_ctor(c.name.txt, res, c.args, vars);
             }
           } else if (auto* rec = std::get_if<Ptype_record>(&d.kind)) {
-            for (auto& f : rec->fields)
-              fields_.emplace(f.name.txt,
-                              eng.arrow(result, from_coretype(*f.type, vars)));
+            for (auto& f : rec->fields) {
+              TypePtr fs = eng.arrow(result, from_coretype(*f.type, vars));
+              fields_.emplace(f.name.txt, fs);
+              // fields_ answers only labels a LOCAL record declares (the
+              // scope rule), so `x.a` / `x.X.a` read the param's label as a
+              // fresh var and the .cmi wrote `'a` for its type.  Register it
+              // like an opened unit's label, owned by X.  NOPARAMLBL reverts.
+              if (!paramlbl_off()) {
+                ext_fields_[f.name.txt].push_back(fs);
+                ext_field_mod_[f.name.txt].push_back(pn);
+                param_field_schemes_[pn + "." + f.name.txt] = fs;
+              }
+            }
           }
         }
       } else if (auto* md = std::get_if<Psig_module>(&it.desc);
@@ -3586,6 +3604,10 @@ struct Checker {
   TypePtr qualified_field_scheme(const Longident& field) {
     auto* d = std::get_if<Ldot>(&field.v);
     if (!d) return nullptr;
+    // A functor PARAMETER's label (`x.X.a`) has no cmi to walk.
+    if (auto pf = param_field_schemes_.find(lid_full(field));
+        pf != param_field_schemes_.end())
+      return pf->second;
     auto comps = mod_components(*d->prefix);
     if (comps.empty()) return nullptr;
     for (auto& [tgt, al] : module_aliases_)
@@ -5995,6 +6017,13 @@ struct Checker {
       std::vector<std::string> qc = mod_components_str(q->second);
       qc.insert(qc.end(), comps.begin() + 1, comps.end());
       comps = std::move(qc);
+      if (!paramlbl_off()) {
+        std::string key;
+        for (auto& c : comps) key += c + ".";
+        if (auto pc = param_ctor_schemes_.find(key + d->name);
+            pc != param_ctor_schemes_.end())
+          return pc->second;
+      }
     } else
       for (auto& [tgt, al] : module_aliases_)
         if (al == comps[0]) {
@@ -6174,6 +6203,19 @@ struct Checker {
         path = f->second;
     // A module this file declares has no cmi; its open resolves locally.
     if (open_local_module_ctors(path)) return;
+    // Nor does a functor PARAMETER: `open X` brings its ctors (registered
+    // as "X.A" from its signature) into bare scope.  NOPARAMLBL reverts.
+    if (!paramlbl_off()) {
+      const std::string pfx = path + ".";
+      bool any = false;
+      for (auto& [k, sc] : param_ctor_schemes_)
+        if (k.size() > pfx.size() && k.compare(0, pfx.size(), pfx) == 0 &&
+            k.find('.', pfx.size()) == std::string::npos) {
+          cenv.back()[k.substr(pfx.size())] = sc;
+          any = true;
+        }
+      if (any) return;
+    }
     std::vector<std::string> comps;
     for (size_t p0 = 0;;) {
       size_t q = path.find('.', p0);
