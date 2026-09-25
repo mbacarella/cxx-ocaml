@@ -1561,6 +1561,11 @@ bool hoparam_off() {
                           cppcaml::dbg_env("NOSHARE599") != nullptr;
   return off;
 }
+bool polymeth_off() {
+  static const bool off = cppcaml::dbg_env("NOPOLYMETH") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE603") != nullptr;
+  return off;
+}
 bool pkglocal_off() {
   static const bool off = cppcaml::dbg_env("NOPKGLOCAL") != nullptr ||
                           cppcaml::dbg_env("NOSHARE600") != nullptr;
@@ -2743,7 +2748,13 @@ struct TyEmit {
                             : texpr(o::vint(0));                 // Tnil (a full type_expr node)
         for (std::size_t k = ord.size(); k-- > 0;) {
           std::size_t i = ord[k];
-          o::ValPtr mty = texpr(o::vblock(8, {emit(t->args[i]), o::vint(0)}));  // Tpoly(ty,[])
+          // A WRITTEN poly method (`m : 'a. 'a -> 'a`) arrives as a Poly
+          // node already: its own Tpoly(body, univars) is the method type.
+          // Wrapping it again stored Tpoly(Tpoly(..), []), a type ocamlc
+          // never unifies with the real one (S603; NOPOLYMETH reverts).
+          o::ValPtr mty = t->args[i]->k == Ty::Poly && !polymeth_off()
+              ? emit(t->args[i])
+              : texpr(o::vblock(8, {emit(t->args[i]), o::vint(0)}));  // Tpoly(ty,[])
           row = texpr(o::vblock(5, {o::vstr(t->pv_tags[i]), o::vint(1) /*FKpublic*/,
                                     mty, row}));  // Tfield
         }
