@@ -1058,7 +1058,14 @@ struct Checker {
     // whose own members are qualified by this placeholder (the functor's
     // name) and re-rooted at the application's path (S627).
     std::string own_qual;
+    // The ascription's submodule values, keyed by path relative to the
+    // result (`N`, `N.M`), qualified like vals (S628).
+    std::unordered_map<std::string,
+                       std::unordered_map<std::string, TypePtr>> submods;
   };
+  // Filled by applied_local_functor for the binding site (S628).
+  std::unordered_map<std::string,
+                     std::unordered_map<std::string, TypePtr>> locfapp_submods_;
   std::unordered_map<std::string, FunctorReal> functor_real_env_;
   static bool ascfapp_off() {
     static const bool off = cppcaml::dbg_env("NOASCFAPP") != nullptr ||
@@ -4115,7 +4122,9 @@ struct Checker {
     std::unordered_map<std::string, TypePtr> man;
     if (apfx.empty() && !local_functor_struct_arg(arg, man)) return {};
     std::unordered_map<std::string, TypePtr> out;
-    for (auto& [k, v] : fr->second.vals) {
+    // One value's type: the parameter substituted, the result's own
+    // members re-rooted at the application.  Null bails the whole result.
+    auto xf = [&](const TypePtr& v) -> TypePtr {
       if (anon_open) {
         bool cites_own = false;
         std::unordered_set<I::Type*> seen;
@@ -4135,14 +4144,14 @@ struct Checker {
           for (auto& a : t->args) walk(a);
         };
         walk(v);
-        if (cites_own) return {};
+        if (cites_own) return nullptr;
       }
       std::unordered_map<I::Type*, TypePtr> m0;
       TypePtr t;
       if (apfx.empty()) {
         bool ok = true;
         t = subst_param_manifests(v, fr->second.param + ".", man, m0, ok);
-        if (!ok) return {};
+        if (!ok) return nullptr;
       } else {
         t = subst_path_head(v, fr->second.param + ".", apfx, m0);
       }
@@ -4169,8 +4178,24 @@ struct Checker {
         std::unordered_map<I::Type*, TypePtr> m3;
         t = subst_path_head(t, fr->second.own_qual + ".", tpfx, m3);
       }
+      return t;
+    };
+    for (auto& [k, v] : fr->second.vals) {
+      TypePtr t = xf(v);
+      if (!t) return {};
       out[k] = t;
     }
+    // The ascription's submodules, for `C.N.z` (S628): handed to the
+    // binding site, which keys them under the binding's name.
+    if (!via_open)
+      for (auto& [sk, svals] : fr->second.submods) {
+        auto& dst = locfapp_submods_[sk];
+        for (auto& [k, v] : svals) {
+          TypePtr t = xf(v);
+          if (!t) { locfapp_submods_.clear(); return out; }
+          dst[k] = t;
+        }
+      }
     return out;
   }
   std::unordered_map<std::string, TypePtr> functor_result_values(const Longident& fpath,
@@ -15161,7 +15186,32 @@ struct Checker {
                   FunctorReal fr;
                   fr.param = fparams[0].first;
                   fr.own_qual = *mb->binding.name.txt;
-                  fr.vals = param_sig_value_schemes(*mc->mt, {}, fr.own_qual);
+                  static const bool no_ascsub =
+                      cppcaml::dbg_env("NOASCFSUB") != nullptr ||
+                      cppcaml::dbg_env("NOSHARE628") != nullptr;
+                  if (no_ascsub || paramsub_off()) {
+                    fr.vals = param_sig_value_schemes(*mc->mt, {}, fr.own_qual);
+                  } else {
+                    // Seeding the submodules writes modenv[`F.N`]: move
+                    // them into the FunctorReal and restore modenv.
+                    std::vector<std::pair<std::string, std::optional<
+                        std::unordered_map<std::string, TypePtr>>>> prev;
+                    for (auto& [k, v] : modenv)
+                      if (k.rfind(fr.own_qual + ".", 0) == 0)
+                        prev.emplace_back(k, v);
+                    std::vector<std::string> subkeys;
+                    fr.vals = param_values_seeded(*mc->mt, fr.own_qual, subkeys);
+                    for (auto& k : subkeys) {
+                      if (auto f = modenv.find(k); f != modenv.end()) {
+                        fr.submods[k.substr(fr.own_qual.size() + 1)] =
+                            std::move(f->second);
+                        modenv.erase(f);
+                      }
+                      invalidate_param_modvals(k);
+                    }
+                    for (auto& [k, v] : prev)
+                      if (v) modenv[k] = std::move(*v);
+                  }
                   functor_real_env_[*mb->binding.name.txt] = std::move(fr);
                 }
               for (auto& [k, v] : ex) v = generic_var();
@@ -15203,7 +15253,14 @@ struct Checker {
               }
               func_bind_name_ = *mb->binding.name.txt;
               proc_mod_prefix_ += *mb->binding.name.txt + ".";
+              locfapp_submods_.clear();
               modenv[*mb->binding.name.txt] = module_exports(mb->binding.expr);
+              for (auto& [sk, svals] : locfapp_submods_) {
+                std::string key = *mb->binding.name.txt + "." + sk;
+                modenv[key] = std::move(svals);
+                invalidate_param_modvals(key);
+              }
+              locfapp_submods_.clear();
               proc_mod_prefix_.resize(proc_mod_prefix_.size() -
                                       mb->binding.name.txt->size() - 1);
               func_bind_name_.clear();

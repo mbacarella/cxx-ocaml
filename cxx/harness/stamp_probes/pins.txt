@@ -140,6 +140,10 @@ xafr_2 0
 xafr_3 0
 xafr_4 0
 xafr_5 0
+xafs_1 0
+xafs_2 0
+xafs_3 0
+xafs_4 0
 xain_a1 0
 xain_a2 0
 xain_a3 -65
