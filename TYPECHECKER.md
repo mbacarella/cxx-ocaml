@@ -262,11 +262,18 @@ from the port.  The two must be identical on every .cmi in the tree
    the driver's `Compile_common.typecheck_intf` (the interface's
    self-inclusion check forces what ocamlc forces).  `cmi_port_parity.sh`:
    compiler interfaces **145/145 byte-identical** (cmx_format.mli is
-   rejected by both); standalone .ml probes (`--standalone`) 6204/6531
-   byte-identical, 314 identical graphs whose sharing differs, 13
-   different -- 11 of them only because `-w -a` is not interpreted yet
-   (Parmatch.check_unused, run under warning 11, creates uids), the 2 left
-   an attribute payload's sharing and a uid.  With the port's .cmi on
+   rejected by both); standalone .ml probes (`--standalone`, `-w -a`)
+   **6529/6531 byte-identical**.  The two left: an attribute payload whose
+   positions the payload encoder shares differently (xpay_b7), and a class
+   probe where the port creates 46 more type nodes than ocamlc while typing
+   (xrp_d34: a `Tlink` target keeps its creation id through saving).  More
+   identity the writer needed along the way: `Some s` options
+   (`OptStr.obj`; typetexp's `~name:"_"` is one static constant), methods'
+   `Mprivate k`, typedecl's `Unboxed_integer` constants, attributes by
+   pointer, and whole lists the Reader decoded (one Slice per marshaled
+   list); Subst's `List.filter` of attributes always builds a new list;
+   and the warning state (below) decides which checks run.  With the
+   port's .cmi on
    disk, the legacy translator (lambda.cpp) still reads its own writer's
    view of the unit's .mli (a private temporary .cmi,
    `lambda::set_legacy_own_cmi`): ocamlc's .cmi keeps a functor
@@ -274,8 +281,10 @@ from the port.  The two must be identical on every .cmi in the tree
    generator cannot resolve.  Type checking is on by default; DDC
    139/139 .cmo + 216 .cmi and effid 139/139 with it.
 9. **Messages:** `Printtyp` (+ `Out_type`, `Oprint`, `Errortrace_report`),
-   the `report_error` functions and `Location`'s reporting; then `Warnings`
-   and the checks that emit them.  Oracle: ocamlc's stderr, byte for byte
+   the `report_error` functions and `Location`'s reporting; then the
+   warnings themselves (their state is ported: `-w` / `-warn-error` /
+   `-alert` and `[@warning]` scopes drive `Warnings.is_active`) and the
+   checks that emit them.  Oracle: ocamlc's stderr, byte for byte
    (the testsuite's expect outputs are a second oracle).
 10. **The back end from the port:** `lambda/` (`Translcore`, `Translmod`,
    `Translprim`, `Translobj`/`Translclass`, `Matching`, `Switch`,

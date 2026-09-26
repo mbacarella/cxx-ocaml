@@ -15,6 +15,8 @@ Zone& permanent_zone() { return g_default_zone; }
 void set_zone(Zone* z) { g_zone = z ? z : &g_default_zone; }
 ZoneScope::ZoneScope(Zone& z) : saved(g_zone) { g_zone = &z; }
 ZoneScope::~ZoneScope() { g_zone = saved; }
+const void* fresh_identity() { return zone().alloc(1, 1); }
+
 std::string_view zborrow(std::string_view s) {
   if (s.data() && (g_default_zone.owns(s.data()) || g_zone->owns(s.data()))) return s;
   return zone().str(s);

@@ -51,11 +51,18 @@ struct ArgLabel {
 };
 
 // An optional string (`string option`), trivially copyable for Slices.
+// A fresh identity token (a zone byte): an OCaml allocation's identity where
+// the port keeps a value (the .cmi writer shares by it, as Marshal does).
+const void* fresh_identity();
+
 struct OptStr {
   bool some = false;
   std::string_view v;
+  // the `Some` block's identity: of() is an allocation (`~name` at a call
+  // site), copies keep it; nullptr = none recorded.  Not part of equality.
+  const void* obj = nullptr;
   static OptStr none() { return {}; }
-  static OptStr of(std::string_view s) { return {true, zborrow(s)}; }
+  static OptStr of(std::string_view s) { return {true, zborrow(s), fresh_identity()}; }
   bool operator==(const OptStr& o) const { return some == o.some && (!some || v == o.v); }
 };
 
@@ -101,6 +108,10 @@ struct NativeRepr {
   };
   Kind kind = Kind::Same_as_ocaml_repr;
   BoxedInteger bi = BoxedInteger::Pnativeint;
+  // Unboxed_integer's block identity: typedecl's `Unboxed_integer Pint64`
+  // (...) are static constants, a cmi's one per marshaled block.  Not part
+  // of equality.
+  const void* obj = nullptr;
 };
 struct PrimitiveDescription {
   std::string_view prim_name;

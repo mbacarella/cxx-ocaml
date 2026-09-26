@@ -70,14 +70,22 @@ class Reader {
   }
   bool boolean(std::size_t id) const { return ival(id) != 0; }
 
+  // one Slice per marshaled list (input_value's sharing of a whole list;
+  // a list sharing only its tail with another is not recorded)
   template <class T, class F>
   Slice<T> list(std::size_t id, F&& elt) {
+    if (is_int(id)) return {};
+    if (auto it = list_memo_.find(id); it != list_memo_.end())
+      return Slice<T>{static_cast<const T*>(it->second.first), it->second.second};
+    std::size_t start = id;
     std::vector<T> out;
     while (!is_int(id)) {
       out.push_back(elt(f(id, 0)));
       id = f(id, 1);
     }
-    return slice(out);
+    Slice<T> r = slice(out);
+    list_memo_[start] = {static_cast<const void*>(r.p), r.n};
+    return r;
   }
   template <class T, class F>
   std::vector<T> list_vec(std::size_t id, F&& elt) {
@@ -96,7 +104,9 @@ class Reader {
   }
   OptStr opt_str(std::size_t id) {
     if (is_int(id)) return OptStr::none();
-    return OptStr{true, str(f(id, 0))};
+    auto [it, fresh] = optstr_obj_.try_emplace(id, nullptr);
+    if (fresh) it->second = zone().alloc(1, 1);
+    return OptStr{true, str(f(id, 0)), it->second};
   }
 
   // ---- Ident / Path ----
@@ -637,6 +647,9 @@ class Reader {
       }
     } else {
       n.kind = NativeRepr::Kind::Unboxed_integer;
+      auto [ot, fresh] = repr_obj_.try_emplace(id, nullptr);
+      if (fresh) ot->second = zone().alloc(1, 1);
+      n.obj = ot->second;
       n.bi = static_cast<BoxedInteger>(ival(f(id, 0)));
     }
     return n;
@@ -800,6 +813,8 @@ class Reader {
   std::unordered_map<std::size_t, Path::t> path_;
   std::unordered_map<std::size_t, const void*> uid_obj_;
   std::unordered_map<std::size_t, const void*> repr_obj_;
+  std::unordered_map<std::size_t, const void*> optstr_obj_;
+  std::unordered_map<std::size_t, std::pair<const void*, std::size_t>> list_memo_;
 };
 
 
@@ -851,7 +866,14 @@ class Writer {
     lists_[key] = v;
     return v;
   }
-  V opt_str(const OptStr& x) { return x.some ? some(str(x.v)) : none(); }
+  V opt_str(const OptStr& x) {
+    if (!x.some) return none();
+    if (!x.obj) return some(str(x.v));
+    if (auto it = memo_.find(x.obj); it != memo_.end()) return it->second;
+    V v = some(str(x.v));
+    memo_[x.obj] = v;
+    return v;
+  }
   // a block registered under [key] before its fields are filled
   template <class K>
   V shared(std::unordered_map<const void*, V>& memo, const K* key, int tag,
@@ -995,8 +1017,9 @@ class Writer {
   }
   V attributes(const Attributes& as) {
     return list(as, [&](const Attribute* a) {
-      return o::vblock(0, {o::vblock(0, {str(a->attr_name), loc(a->attr_name_loc)}), ovalue(a->attr_payload),
-                           loc(a->attr_loc)});
+      return shared(memo_, a, 0, [&]() -> std::vector<V> {
+        return {o::vblock(0, {str(a->attr_name), loc(a->attr_name_loc)}), ovalue(a->attr_payload), loc(a->attr_loc)};
+      });
     });
   }
 
@@ -1253,7 +1276,18 @@ class Writer {
                 return o::vblock(0, {mutable_flag(e.mut), virtual_flag(e.virt), ty(e.ty)});
               }),
               strmap<MethEntry>(c->csig_meths.root(), [&](const MethEntry& e) {
-                V p = e.priv.is_private ? o::vblock(0, {field_kind(e.priv.kind)}) : i(0);
+                // Mprivate k is made once per method and copied by
+                // reference (Subst keeps a meths entry's privacy): one value
+                // per field kind
+                V p = i(0);
+                if (e.priv.is_private) {
+                  if (auto it = mprivate_.find(e.priv.kind); it != mprivate_.end()) {
+                    p = it->second;
+                  } else {
+                    p = o::vblock(0, {field_kind(e.priv.kind)});
+                    mprivate_[e.priv.kind] = p;
+                  }
+                }
                 return o::vblock(0, {p, virtual_flag(e.virt), ty(e.ty)});
               })};
     });
@@ -1277,7 +1311,13 @@ class Writer {
       case NativeRepr::Kind::Same_as_ocaml_repr: return i(0);
       case NativeRepr::Kind::Unboxed_float: return i(1);
       case NativeRepr::Kind::Untagged_immediate: return i(2);
-      case NativeRepr::Kind::Unboxed_integer: return o::vblock(0, {i(static_cast<long>(n.bi))});
+      case NativeRepr::Kind::Unboxed_integer: {
+        if (!n.obj) return o::vblock(0, {i(static_cast<long>(n.bi))});
+        if (auto it = memo_.find(n.obj); it != memo_.end()) return it->second;
+        V v = o::vblock(0, {i(static_cast<long>(n.bi))});
+        memo_[n.obj] = v;
+        return v;
+      }
     }
     return i(0);
   }
@@ -1374,6 +1414,7 @@ class Writer {
   V current_unit_name_;
   std::map<std::pair<const char*, std::size_t>, V> strs_;
   std::map<std::pair<const void*, std::size_t>, V> lists_;
+  std::unordered_map<const void*, V> mprivate_;
   std::map<std::tuple<int, const char*, std::size_t>, V> labels_;
   std::map<std::tuple<std::string, long, long, long>, V> poss_;
   std::map<std::tuple<const void*, const void*, bool>, V> locs_;

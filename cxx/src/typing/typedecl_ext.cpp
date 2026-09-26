@@ -246,10 +246,10 @@ std::optional<NativeRepr> native_repr_of_type(env::t env, NativeReprKind kind, T
   }
   const predef::Paths& p = predef::paths();
   if (path::same(tc->path, p.float_)) return NativeRepr{NativeRepr::Kind::Unboxed_float};
-  if (path::same(tc->path, p.int32)) return NativeRepr{NativeRepr::Kind::Unboxed_integer, BoxedInteger::Pint32};
-  if (path::same(tc->path, p.int64)) return NativeRepr{NativeRepr::Kind::Unboxed_integer, BoxedInteger::Pint64};
+  if (path::same(tc->path, p.int32)) { static const char k = 0; return NativeRepr{NativeRepr::Kind::Unboxed_integer, BoxedInteger::Pint32, &k}; }
+  if (path::same(tc->path, p.int64)) { static const char k = 0; return NativeRepr{NativeRepr::Kind::Unboxed_integer, BoxedInteger::Pint64, &k}; }
   if (path::same(tc->path, p.nativeint))
-    return NativeRepr{NativeRepr::Kind::Unboxed_integer, BoxedInteger::Pnativeint};
+    { static const char k = 0; return NativeRepr{NativeRepr::Kind::Unboxed_integer, BoxedInteger::Pnativeint, &k}; }
   return std::nullopt;
 }
 

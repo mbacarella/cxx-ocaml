@@ -350,7 +350,12 @@ static const tt::CoreType* transl_type_param_(env::t env, const pt::CoreType* st
   const Location& loc = styp->ptyp_loc;
   const pt::CoreTypeDesc* d = styp->ptyp_desc;
   if (d->kind == pt::CoreTypeDesc::Kind::Ptyp_any) {
-    TypeExpr* ty = new_global_var(OptStr::of("_"));
+    // `new_global_var ~name:"_"`: `Some "_"` is one static constant
+    static const OptStr underscore = [] {
+      ZoneScope perm(permanent_zone());
+      return OptStr::of("_");
+    }();
+    TypeExpr* ty = new_global_var(underscore);
     return make<tt::CoreType>(make<tt::Ttyp_any>(TK::Ttyp_any), ty, env, loc, styp->ptyp_attributes);
   }
   if (auto* v = as<pt::Ptyp_var>(d)) {

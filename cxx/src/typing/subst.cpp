@@ -68,7 +68,7 @@ static Attributes attrs(t s, Attributes x) {
     std::vector<const Attribute*> v;
     for (auto* a : x)
       if (is_not_doc(a)) v.push_back(a);
-    if (v.size() != x.size()) x = slice(v);
+    x = slice(v);  // List.filter always builds a new list
   }
   // remove_loc (Ast_mapper) applies only when for_saving && not keep_locs,
   // which the default flags never reach.
