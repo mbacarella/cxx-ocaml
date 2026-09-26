@@ -21,5 +21,9 @@ inline bool native_code = false;
 inline bool unboxed_types = false;
 inline bool typing_recovery = false;      // -typing-recovery
 inline bool opaque = false;               // -opaque
-inline bool dont_write_files = false;     // -i (print the interface, write nothing)
+inline bool dont_write_files = false;
+inline bool locations = true;             // -dno-locations
+inline bool unique_ids = true;            // -dno-unique-ids
+inline bool annotations = false;          // -annot
+inline bool afl_instrument = false;       // -afl-instrument (native)     // -i (print the interface, write nothing)
 }  // namespace cppcaml::typing::clflags

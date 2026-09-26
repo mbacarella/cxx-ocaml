@@ -7,6 +7,11 @@
 #include "cppcaml/typing/ctype.hpp"
 #include "cppcaml/typing/predef.hpp"
 
+#include <functional>
+#include <string_view>
+#include <utility>
+#include <vector>
+
 namespace cppcaml::typing::typeopt {
 
 using namespace types;
@@ -50,6 +55,27 @@ static bool is_immediate(TypeImmediacy i) {
       return clflags::native_code;  // && Sys.word_size = 64
   }
   return false;
+}
+
+// scrape env ty = Option.map get_desc (scrape_ty env ty)
+static const TypeDesc* scrape(env::t env, TypeExpr* ty) {
+  TypeExpr* t = scrape_ty(env, ty);
+  return t ? get_desc(t) : nullptr;
+}
+
+bool is_function_type(env::t env, TypeExpr* ty, TypeExpr** arg, TypeExpr** res) {
+  const TypeDesc* d = scrape(env, ty);
+  auto* a = d ? as<Tarrow>(d) : nullptr;
+  if (!a) return false;
+  if (arg) *arg = a->t1;
+  if (res) *res = a->t2;
+  return true;
+}
+
+bool is_base_type(env::t env, TypeExpr* ty, Path::t base_ty_path) {
+  const TypeDesc* d = scrape(env, ty);
+  auto* c = d ? as<Tconstr>(d) : nullptr;
+  return c && path::same(c->path, base_ty_path);
 }
 
 ImmediateOrPointer maybe_pointer_type(env::t env, TypeExpr* ty) {
@@ -205,6 +231,70 @@ LazySummary classify_lazy_argument(const tt::Expression* e) {
     case Classification::Float: return {LazySummary::Kind::Eager, flat_float_array ? FR::Forward : FR::Shortcut};
   }
   throw std::logic_error("Typeopt.classify_lazy_argument");
+}
+
+// ---- the rest of typeopt.ml (stage 10) ----------------------------------------
+using lambda::BigarrayKind;
+using lambda::BigarrayLayout;
+
+template <class T>
+static T bigarray_decode_type(env::t env, TypeExpr* ty, const std::vector<std::pair<std::string_view, T>>& tbl, T dfl) {
+  const TypeDesc* d = scrape(env, ty);
+  auto* c = d ? as<Tconstr>(d) : nullptr;
+  if (c && c->args.empty() && c->path->kind == Path::Kind::Pdot && c->path->p1->kind == Path::Kind::Pident &&
+      ident::name(c->path->p1->id) == "Stdlib__Bigarray") {
+    for (auto& [name, v] : tbl)
+      if (name == c->path->s) return v;
+    return dfl;
+  }
+  return dfl;
+}
+
+BigarrayKindLayout bigarray_type_kind_and_layout(env::t env, TypeExpr* typ) {
+  static const std::vector<std::pair<std::string_view, BigarrayKind>> kind_table = {
+      {"float16_elt", BigarrayKind::Pbigarray_float16},
+      {"float32_elt", BigarrayKind::Pbigarray_float32},
+      {"float64_elt", BigarrayKind::Pbigarray_float64},
+      {"int8_signed_elt", BigarrayKind::Pbigarray_sint8},
+      {"int8_unsigned_elt", BigarrayKind::Pbigarray_uint8},
+      {"int16_signed_elt", BigarrayKind::Pbigarray_sint16},
+      {"int16_unsigned_elt", BigarrayKind::Pbigarray_uint16},
+      {"int32_elt", BigarrayKind::Pbigarray_int32},
+      {"int64_elt", BigarrayKind::Pbigarray_int64},
+      {"int_elt", BigarrayKind::Pbigarray_caml_int},
+      {"nativeint_elt", BigarrayKind::Pbigarray_native_int},
+      {"complex32_elt", BigarrayKind::Pbigarray_complex32},
+      {"complex64_elt", BigarrayKind::Pbigarray_complex64}};
+  static const std::vector<std::pair<std::string_view, BigarrayLayout>> layout_table = {
+      {"c_layout", BigarrayLayout::Pbigarray_c_layout}, {"fortran_layout", BigarrayLayout::Pbigarray_fortran_layout}};
+  const TypeDesc* d = scrape(env, typ);
+  auto* c = d ? as<Tconstr>(d) : nullptr;
+  if (c && c->args.size() == 3) {
+    // (kind, layout): a tuple, evaluated right to left
+    BigarrayLayout l = bigarray_decode_type(env, c->args[2], layout_table, BigarrayLayout::Pbigarray_unknown_layout);
+    BigarrayKind k = bigarray_decode_type(env, c->args[1], kind_table, BigarrayKind::Pbigarray_unknown);
+    return {k, l};
+  }
+  return {BigarrayKind::Pbigarray_unknown, BigarrayLayout::Pbigarray_unknown_layout};
+}
+
+lambda::ValueKind value_kind(env::t env, TypeExpr* ty0) {
+  using VK = lambda::ValueKind;
+  TypeExpr* ty = scrape_ty(env, ty0);
+  if (!ty) return VK::gen();
+  if (is_immediate(ctype::immediacy(env, ty))) return VK::intval();
+  auto* c = as<Tconstr>(get_desc(ty));
+  if (!c) return VK::gen();
+  const predef::Paths& p = predef::paths();
+  if (path::same(c->path, p.float_)) return VK::floatval();
+  if (path::same(c->path, p.int32)) return VK::boxedint(BoxedInteger::Pint32);
+  if (path::same(c->path, p.int64)) return VK::boxedint(BoxedInteger::Pint64);
+  if (path::same(c->path, p.nativeint)) return VK::boxedint(BoxedInteger::Pnativeint);
+  return VK::gen();
+}
+
+lambda::ValueKind value_kind_union(const lambda::ValueKind& a, const lambda::ValueKind& b) {
+  return lambda::equal_value_kind(a, b) ? a : lambda::ValueKind::gen();
 }
 
 }  // namespace cppcaml::typing::typeopt

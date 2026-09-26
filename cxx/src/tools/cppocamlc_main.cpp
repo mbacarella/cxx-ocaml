@@ -48,6 +48,9 @@
 #include "cppcaml/typing/includemod.hpp"
 #include "cppcaml/typing/typecore.hpp"
 #include "cppcaml/typing/typemod.hpp"
+#include "cppcaml/typing/printlambda.hpp"
+#include "cppcaml/typing/simplif.hpp"
+#include "cppcaml/typing/translmod.hpp"
 #include "cppcaml/typing/warnings.hpp"
 
 namespace fs = std::filesystem;
@@ -202,7 +205,7 @@ static void report_unbound_module(const std::string& in_path, const std::string&
 // stdout during compilation and keep going.  Byte-comparable (after the usual
 // label/stamp normalization) with the matching `ocamlc -d*` and with the
 // standalone c++parse / c++lambda / c++instr tools.
-struct DumpFlags { bool parsetree = false, lambda = false, instr = false; };
+struct DumpFlags { bool parsetree = false, lambda = false, instr = false, rawlambda = false; };
 static DumpFlags g_dump;
 static bool g_nopervasives = false;  // -nopervasives: no implicit Stdlib import
 
@@ -235,7 +238,7 @@ static void set_typing_flag(const std::string& a) {
 }
 
 // -stop-after parsing / typing
-enum class StopAfter { None, Parsing, Typing };
+enum class StopAfter { None, Parsing, Typing, Lambda };
 static StopAfter g_stop_after = StopAfter::None;
 // Type checking runs on every unit, as in ocamlc; CPPCAML_NOTYPECHECK=1
 // skips it (a debugging hatch only: the .cmi then comes from the legacy
@@ -362,17 +365,33 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
       cppcaml::ast::print_dparsetree(structure, in_path, std::cout, dirfiles);
     if (g_stop_after == StopAfter::Parsing) return 0;
     PortResult port = PortResult::Fallback;
+    std::optional<cppcaml::typing::typedtree::Implementation> impl;
     if (typecheck_enabled()) {
       port = port_typecheck(in_path, mod, stdlib_dir, cmo_out, /*intf=*/false,
                             [&](cppcaml::typing::env::t env0, const cppcaml::typing::typemod::UnitInfo& target) {
                               namespace ty = cppcaml::typing;
                               ty::parsetree::Structure st = ty::parsetree::of_ast(structure, in_path, dirfiles);
                               // an .ml without .mli: its .cmi is written here (Typemod)
-                              ty::typemod::type_implementation(target, env0, st);
+                              impl = ty::typemod::type_implementation(target, env0, st);
                             });
       if (port == PortResult::Rejected) return 2;
       lap("typecheck", tp);
       if (g_stop_after == StopAfter::Typing) return 0;
+    }
+    // The lambda/ port (TYPECHECKER.md stage 10), driver/compile.ml's
+    // to_bytecode: Translmod.transl_implementation, -drawlambda,
+    // Simplif.simplify_lambda, -dlambda (the dumps on stderr, as ocamlc's
+    // ppf_dump).  Opt-in while it is brought up; the legacy translator
+    // still produces the .cmo.
+    if (cppcaml::dbg_env("CPPCAML_NEWLAMBDA") && port == PortResult::Typed && impl) {
+      namespace ty = cppcaml::typing;
+      ty::translmod::install_forward_refs();
+      ty::lambda::Program prog = ty::translmod::transl_implementation(mod, impl->structure, impl->coercion);
+      if (g_dump.rawlambda) std::cerr << ty::printlambda::dump(prog.code);
+      ty::lambda::lambda lam = ty::simplif::simplify_lambda(prog.code);
+      if (g_dump.lambda) std::cerr << ty::printlambda::dump(lam);
+      lap("lambda (port)", tp);
+      if (g_stop_after == StopAfter::Lambda) return 0;
     }
     // The .cmi of this unit's .mli comes from the type checker; the legacy
     // translator reads its own writer's view of the interface instead
@@ -579,6 +598,7 @@ static int run_main(int argc, char** argv) {
     else if (a == "-c") compile_only = true;
     else if (a == "-dparsetree") g_dump.parsetree = true;   // dump AST, keep going
     else if (a == "-dlambda") g_dump.lambda = true;         // dump Lambda IR
+    else if (a == "-drawlambda") g_dump.rawlambda = true;   // dump Lambda before Simplif (new path)
     else if (a == "-dinstr") g_dump.instr = true;           // dump bytecode instrs
     else if (a == "-a") make_lib = true;
     else if (a == "-pack") pack_name = "?";  // resolved from -o once known
@@ -613,6 +633,7 @@ static int run_main(int argc, char** argv) {
       std::string pass = need_arg("-stop-after");
       if (pass == "parsing") g_stop_after = StopAfter::Parsing;
       else if (pass == "typing") g_stop_after = StopAfter::Typing;
+      else if (pass == "lambda") g_stop_after = StopAfter::Lambda;
     }
     else if (kArgIgnore.count(a)) {
       if (strict_flags) reject_ignored(a);

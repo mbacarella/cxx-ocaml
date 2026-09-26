@@ -82,6 +82,18 @@ add_library(cppcaml_core
   src/typing/error_report.cpp
   src/typing/warnings.cpp
   src/typing/lambda.cpp
+  src/typing/format.cpp
+  src/typing/printlambda.cpp
+  src/typing/simplif.cpp
+  src/typing/tmc.cpp
+  src/typing/translobj.cpp
+  src/typing/translclass.cpp
+  src/typing/translmod.cpp
+  src/typing/translcore.cpp
+  src/typing/translprim.cpp
+  src/typing/translattribute.cpp
+  src/typing/value_rec_compiler.cpp
+  src/typing/matching_stub.cpp
   src/typing/typemod_sig.cpp
   src/typing/typemod_str.cpp
   src/typing/typemod_unit.cpp

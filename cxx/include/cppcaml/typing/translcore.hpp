@@ -20,6 +20,11 @@ lambda::lambda transl_apply(scopes sc, lambda::TailcallAttribute tailcall, lambd
 // transl_let ~scopes ?in_structure rec_flag pat_expr_list body
 lambda::lambda transl_let(scopes sc, bool in_structure, RecFlag rec_flag,
                           Slice<const typedtree::ValueBinding*> pat_expr_list, lambda::lambda body);
+// the staged form: OCaml's partial application `transl_let ~scopes
+// ~in_structure rec_flag pat_expr_list` (the bindings are translated now, the
+// body given later)
+std::function<lambda::lambda(lambda::lambda)> transl_let(scopes sc, bool in_structure, RecFlag rec_flag,
+                                                         Slice<const typedtree::ValueBinding*> pat_expr_list);
 lambda::lambda transl_extension_constructor(scopes sc, env::t env, Path::t path,  // nullptr = None
                                             const typedtree::TExtensionConstructor* ext);
 lambda::lambda transl_scoped_exp(scopes sc, const typedtree::Expression* e);
