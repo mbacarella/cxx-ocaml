@@ -81,6 +81,7 @@ add_library(cppcaml_core
   src/typing/typemod_util.cpp
   src/typing/error_report.cpp
   src/typing/warnings.cpp
+  src/typing/lambda.cpp
   src/typing/typemod_sig.cpp
   src/typing/typemod_str.cpp
   src/typing/typemod_unit.cpp
