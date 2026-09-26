@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Stage-1 oracle for the typing/ port (TYPECHECKER.md): decode every .cmi in
 # the tree with the port (c++typing-dump) and with compiler-libs
-# (typing_cmidump.ml, run on the bytecode runtime), and compare the two
+# (typing_dump.ml, run on the bytecode runtime), and compare the two
 # structural dumps byte for byte.
 #
 # Usage: typing_cmi_parity.sh [file.cmi ...]   (JOBS= overridable)
@@ -12,16 +12,16 @@ ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 cd "$ROOT" || exit 1
 JOBS="${JOBS:-8}"
 BIN=/tmp/typing_cmi_parity/bin
-DUMP_ML=$BIN/typing_cmidump
+DUMP_ML=$BIN/typing_dump
 CPP=${CPP:-$ROOT/cxx/build-release/c++typing-dump}
 
 build_oracle() {
-  src=$ROOT/cxx/harness/typing_cmidump.ml
+  src=$ROOT/cxx/harness/typing_dump.ml
   [ -f "$DUMP_ML" ] && [ "$DUMP_ML" -nt "$src" ] && return 0
-  mkdir -p "$BIN" && cp "$src" "$BIN/typing_cmidump.ml"
+  mkdir -p "$BIN" && cp "$src" "$BIN/typing_dump.ml"
   ./ocamlc.opt -nostdlib -I stdlib -I compilerlibs -I utils -I typing -I parsing \
-    -I file_formats compilerlibs/ocamlcommon.cma "$BIN/typing_cmidump.ml" \
-    -o "$DUMP_ML" || { echo "FATAL: typing_cmidump build failed" >&2; exit 1; }
+    -I file_formats compilerlibs/ocamlcommon.cma "$BIN/typing_dump.ml" \
+    -o "$DUMP_ML" || { echo "FATAL: typing_dump build failed" >&2; exit 1; }
 }
 
 if [ "${1:-}" == "--worker" ]; then

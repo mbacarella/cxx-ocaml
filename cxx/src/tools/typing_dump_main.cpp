@@ -10,6 +10,9 @@
 #include <unordered_map>
 
 #include "cppcaml/typing/cmi_format.hpp"
+#include "cppcaml/typing/env.hpp"
+#include <fstream>
+#include <functional>
 
 using namespace cppcaml::typing;
 
@@ -44,6 +47,21 @@ void q(std::string_view x) {
 }
 
 std::unordered_map<std::string, std::pair<std::unordered_map<const void*, long>, long>> tbls;
+bool canonical = false;
+std::unordered_map<long, long> ids_tbl, stamps_tbl;
+long canon(std::unordered_map<long, long>& t, long n) {
+  if (!canonical) return n;
+  auto it = t.find(n);
+  if (it != t.end()) return it->second;
+  long k = static_cast<long>(t.size());
+  t[n] = k;
+  return k;
+}
+void reset_numbering() {
+  tbls.clear();
+  ids_tbl.clear();
+  stamps_tbl.clear();
+}
 std::pair<long, bool> visit(const std::string& kind, const void* v) {
   auto& [t, c] = tbls[kind];
   if (auto it = t.find(v); it != t.end()) return {it->second, false};
@@ -112,7 +130,7 @@ void unscoped(ident::Unscoped* u) {
   if (!first) { s("@U"); i(n); return; }
   s("#U"); i(n); s("{");
   if (u->state == ident::Unscoped::State::Udesc) {
-    s("Udesc "); q(u->name); s(" "); i(u->stamp);
+    s("Udesc "); q(u->name); s(" "); i(canon(stamps_tbl, u->stamp));
   } else {
     // the oracle prints the linked cell generically; never occurs in a cmi
     s("Ulink ?");
@@ -123,9 +141,9 @@ void unscoped(ident::Unscoped* u) {
 void ident_(Ident::t id) {
   using K = Ident::Kind;
   switch (id->kind) {
-    case K::Local: s("Local("); q(id->name_); s(" "); i(id->stamp_); s(")"); break;
+    case K::Local: s("Local("); q(id->name_); s(" "); i(canon(stamps_tbl, id->stamp_)); s(")"); break;
     case K::Scoped:
-      s("Scoped("); q(id->name_); s(" "); i(id->stamp_); s(" "); i(id->scope_); s(")");
+      s("Scoped("); q(id->name_); s(" "); i(canon(stamps_tbl, id->stamp_)); s(" "); i(id->scope_); s(")");
       break;
     case K::Global: s("Global("); q(id->name_); s(")"); break;
     case K::Predef: s("Predef("); q(id->name_); s(" "); i(id->stamp_); s(")"); break;
@@ -289,7 +307,7 @@ void tylist(Slice<TypeExpr*> l) { list(l, [](TypeExpr* t) { ty(t); }); }
 void ty(TypeExpr* t) {
   auto [n, first] = visit("T", t);
   if (!first) { s("@T"); i(n); return; }
-  s("#T"); i(n); s("{"); i(t->level); s(" "); i(t->scope); s(" "); i(t->id); s(" ");
+  s("#T"); i(n); s("{"); i(t->level); s(" "); i(t->scope); s(" "); i(canon(ids_tbl, t->id)); s(" ");
   const TypeDesc* d = t->desc;
   switch (d->kind) {
     case DescKind::Tvar: s("Tvar "); optstr(as<Tvar>(d)->name); break;
@@ -600,11 +618,150 @@ std::string to_hex(const std::string& d) {
   return o;
 }
 
+
+// ---- stage 2: Env queries (the typing_dump.ml `env` mode) ----
+void cstr_tag(const ConstructorTag& t) {
+  switch (t.kind) {
+    case ConstructorTag::Kind::Cstr_constant: s("Cstr_constant "); i(t.n); break;
+    case ConstructorTag::Kind::Cstr_block: s("Cstr_block "); i(t.n); break;
+    case ConstructorTag::Kind::Cstr_unboxed: s("Cstr_unboxed"); break;
+    case ConstructorTag::Kind::Cstr_extension:
+      s("Cstr_extension("); path_(t.ext_path); s(" "); bool_(t.ext_constant); s(")");
+      break;
+  }
+}
+
+void cstr_descr(const ConstructorDescription* c) {
+  s("{"); q(c->cstr_name); s(" "); ty(c->cstr_res); s(" "); tylist(c->cstr_existentials);
+  s(" "); tylist(c->cstr_args); s(" "); i(c->cstr_arity); s(" "); cstr_tag(c->cstr_tag);
+  s(" "); i(c->cstr_consts); s(" "); i(c->cstr_nonconsts); s(" "); bool_(c->cstr_generalized);
+  s(" "); private_flag(c->cstr_private); s(" "); loc(c->cstr_loc); s(" ");
+  attributes(c->cstr_attributes); s(" "); opt(c->cstr_inlined, type_decl); s(" ");
+  uid(c->cstr_uid); s("}");
+}
+
+void lbl_descr(const LabelDescription* l) {
+  s("{"); q(l->lbl_name); s(" "); ty(l->lbl_res); s(" "); ty(l->lbl_arg); s(" ");
+  mutable_flag(l->lbl_mut); s(" ");
+  s(l->lbl_atomic == AtomicFlag::Nonatomic ? "Nonatomic" : "Atomic");
+  s(" "); i(l->lbl_pos); s(" "); i(static_cast<long>(l->lbl_all.size())); s(" ");
+  switch (l->lbl_repres.kind) {
+    case RecordRepresentation::Kind::Record_regular: s("Record_regular"); break;
+    case RecordRepresentation::Kind::Record_float: s("Record_float"); break;
+    case RecordRepresentation::Kind::Record_unboxed:
+      s("Record_unboxed "); bool_(l->lbl_repres.unboxed_inlined); break;
+    case RecordRepresentation::Kind::Record_inlined:
+      s("Record_inlined "); i(l->lbl_repres.inlined_tag); break;
+    case RecordRepresentation::Kind::Record_extension:
+      s("Record_extension "); path_(l->lbl_repres.extension); break;
+  }
+  s(" "); private_flag(l->lbl_private); s(" "); loc(l->lbl_loc); s(" ");
+  attributes(l->lbl_attributes); s(" "); uid(l->lbl_uid); s("}");
+}
+
+// "A.B.c", with functor applications "F(X).t" (as typing_dump.ml)
+Longident::t lid_of_string(const std::string& str) {
+  std::size_t pos = 0, n = str.size();
+  auto ident = [&]() {
+    std::size_t st = pos;
+    while (pos < n && str[pos] != '.' && str[pos] != '(' && str[pos] != ')') ++pos;
+    return str.substr(st, pos - st);
+  };
+  std::function<Longident::t()> path = [&]() -> Longident::t {
+    Longident::t l = Longident::lident(ident());
+    while (pos < n) {
+      if (str[pos] == '(') {
+        ++pos;
+        Longident::t a = path();
+        ++pos;  // ')'
+        l = Longident::lapply(l, location::none(), a, location::none());
+      } else if (str[pos] == '.') {
+        ++pos;
+        l = Longident::ldot(l, location::none(), ident(), location::none());
+      } else {
+        break;
+      }
+    }
+    return l;
+  };
+  return path();
+}
+
+int run_env(const std::string& stdlib_dir, const std::string& queries) {
+  canonical = true;
+  std::vector<std::string> dirs;
+  for (std::size_t st = 0;;) {
+    std::size_t c = stdlib_dir.find(':', st);
+    dirs.push_back(stdlib_dir.substr(st, c == std::string::npos ? std::string::npos : c - st));
+    if (c == std::string::npos) break;
+    st = c + 1;
+  }
+  load_path::init(dirs, {});
+  env::t e0 = env::initial();
+  env::OpenResult r = env::open_pers_signature("Stdlib", e0);
+  if (r.kind != env::OpenResult::Kind::Ok) {
+    std::cerr << "open Stdlib failed\n";
+    return 1;
+  }
+  env::t e = r.env;
+  std::ifstream in(queries);
+  std::string line;
+  while (std::getline(in, line)) {
+    std::size_t k = line.find(' ');
+    if (k == std::string::npos) continue;
+    std::string kind = line.substr(0, k), name = line.substr(k + 1);
+    Longident::t lid = lid_of_string(name);
+    reset_numbering();
+    s(line); s(" => ");
+    try {
+      if (kind == "value") {
+        auto [p, vd] = env::find_value_by_name(lid, e);
+        path_(p); s(" "); ty(vd->val_type); s(" "); value_kind(vd->val_kind);
+      } else if (kind == "type") {
+        auto [p, td] = env::find_type_by_name(lid, e);
+        path_(p); s(" "); type_decl(td);
+      } else if (kind == "constr") {
+        cstr_descr(env::find_constructor_by_name(lid, e));
+      } else if (kind == "label") {
+        lbl_descr(env::find_label_by_name(lid, e));
+      } else if (kind == "module") {
+        auto [p, md] = env::find_module_by_name(lid, e);
+        path_(p); s(" "); modtype(1, md->md_type);
+      } else if (kind == "modtype") {
+        auto [p, mtd] = env::find_modtype_by_name(lid, e);
+        path_(p); s(" "); opt(mtd->mtd_type, [](const ModuleType* m) { modtype(1, m); });
+      } else if (kind == "class") {
+        auto [p, cd] = env::find_class_by_name(lid, e);
+        path_(p); s(" "); class_type(cd->cty_type);
+      } else if (kind == "cltype") {
+        auto [p, ct] = env::find_cltype_by_name(lid, e);
+        path_(p); s(" "); class_type(ct->clty_type);
+      } else {
+        s("BADKIND");
+      }
+    } catch (const env::NotFound&) {
+      s("NOTFOUND");
+    }
+    s("\n");
+  }
+  std::cout << b;
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc == 4 && std::string(argv[1]) == "env") {
+    try {
+      return run_env(argv[2], argv[3]);
+    } catch (const std::exception& e) {
+      std::cerr << "c++typing-dump: " << e.what() << '\n';
+      std::cout << b;
+      return 1;
+    }
+  }
   if (argc != 2) {
-    std::cerr << "usage: c++typing-dump <file.cmi>\n";
+    std::cerr << "usage: c++typing-dump <file.cmi> | env <stdlib-dir> <queries>\n";
     return 2;
   }
   try {

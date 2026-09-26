@@ -45,6 +45,9 @@ add_library(cppcaml_core
   src/typing/predef.cpp
   src/typing/subst.cpp
   src/typing/persistent_env.cpp
+  src/typing/longident.cpp
+  src/typing/env.cpp
+  src/typing/mtype.cpp
   src/typing/cmi_format.cpp)
 target_include_directories(cppcaml_core PUBLIC include)
 # The typing/ port initializes aggregates partially on purpose (an OCaml

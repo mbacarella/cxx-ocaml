@@ -92,7 +92,7 @@ T* make(A&&... a) {
 // An immutable zone-owned array: an OCaml list inside an immutable value.
 template <class T>
 struct Slice {
-  static_assert(std::is_trivially_copyable_v<T>, "Slice holds plain values");
+  static_assert(std::is_trivially_destructible_v<T>, "Slice holds plain values");
   const T* p = nullptr;
   std::size_t n = 0;
   std::size_t size() const { return n; }
@@ -108,7 +108,7 @@ template <class T>
 Slice<T> slice(const std::vector<T>& v) {
   if (v.empty()) return {};
   T* p = static_cast<T*>(zone().alloc(sizeof(T) * v.size(), alignof(T)));
-  std::memcpy(static_cast<void*>(p), v.data(), sizeof(T) * v.size());
+  std::uninitialized_copy(v.begin(), v.end(), p);
   return {p, v.size()};
 }
 template <class T>

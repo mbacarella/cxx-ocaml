@@ -119,9 +119,18 @@ from the port.  The two must be identical on every .cmi in the tree
 (`cxx/harness/typing_cmi_parity.sh`).
 
 **Stages.**
-1. `Ident`, `Path`, `Types` (+ trail), `Cmi_format` read: dump parity on all cmis.
-2. `Btype`, `Subst`, `Predef`, `Persistent_env`, `Env` (lookups, lazy
-   components, strengthening via `Mtype`).
+1. **DONE:** `Ident`, `Path`, `Types` (+ trail), `Cmi_format` read.
+   `typing_cmi_parity.sh`: all 572 tree cmis and 973 testsuite-built cmis
+   are dump-identical.
+2. **DONE (except the deviations below):** `Btype`, `Subst` (+ lazy),
+   `Datarepr`, `Predef`, `Persistent_env`/`Load_path`, `Env`, `Mtype`
+   strengthening.  `typing_env_parity.sh`: 15314/15314 `Env.find_*_by_name`
+   queries over stdlib and the compiler's cmis, functor applications
+   included, are dump-identical.  Deviations still open: no shapes; no
+   warnings / alerts / usage tracking; `Env.check_functor_application`
+   (Includemod) is not installed yet, so `Map.Make(Map.Make(String)).t`
+   resolves where ocamlc reports it unbound; trunk's `Longident` inner
+   locations come from the enclosing location (parser gap).
 3. `Ctype`: levels, `newvar`, `instance`/`copy`, `generalize`, `expand_head`
    and abbreviation memos, `unify`, `moregen`, `eqtype`, `filter_arrow`, ...
 4. `Typetexp`, `Typecore` (core expressions and patterns, `Parmatch`), with

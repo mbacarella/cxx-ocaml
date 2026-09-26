@@ -1,7 +1,16 @@
-(* Structural dump of a .cmi's raw Types graph -- the stage-1 oracle for the
-   typing/ port (TYPECHECKER.md).  Built against compiler-libs; the C++ side
-   (c++typing-dump) prints the same format from typing::Types, and the two
-   must be byte-identical on every .cmi.
+(* Structural dumps of the typer's data -- the oracle for the typing/ port
+   (TYPECHECKER.md).  Built against compiler-libs; the C++ side
+   (c++typing-dump) prints the same formats from typing::, and the two must
+   be byte-identical.
+
+   Modes:
+     typing_dump FILE.cmi        a .cmi's raw Types graph (stage 1)
+     typing_dump gen CMI...      Env queries naming every item of the cmis
+     typing_dump env QUERIES     run the queries through Env.find_*_by_name
+                                 in Env.initial + open Stdlib (stage 2); type
+                                 ids and ident stamps are renumbered by first
+                                 visit, since their absolute values depend on
+                                 process initialization
 
    It dumps the REPRESENTATION, not a view of it: no [repr] (that would
    path-compress), raw level/scope/id, Tlink/Texpand as stored, every
@@ -15,6 +24,7 @@
 open Types
 
 let b = Buffer.create 65536
+let canonical = ref false
 let s x = Buffer.add_string b x
 let i n = s (string_of_int n)
 let q x = s (Printf.sprintf "%S" x)
@@ -44,6 +54,16 @@ let visit kind (v : Obj.t) =
       incr c;
       Phys.add t v n;
       (n, true)
+
+let ids : (int, int) Hashtbl.t = Hashtbl.create 64
+let stamps : (int, int) Hashtbl.t = Hashtbl.create 64
+let canon tbl n =
+  if not !canonical then n
+  else match Hashtbl.find_opt tbl n with
+    | Some k -> k
+    | None -> let k = Hashtbl.length tbl in Hashtbl.add tbl n k; k
+let reset_numbering () =
+  Hashtbl.reset tbls; Hashtbl.reset ids; Hashtbl.reset stamps
 
 let opt f = function None -> s "None" | Some x -> s "(Some "; f x; s ")"
 let list f l =
@@ -87,7 +107,7 @@ let unscoped (u : Ident.Unscoped.t) =
      | 0 ->
          let d = Obj.field st 0 in
          s "Udesc "; q (Obj.obj (Obj.field d 0)); s " ";
-         i (Obj.obj (Obj.field d 1))
+         i (canon stamps (Obj.obj (Obj.field d 1)))
      | _ -> s "Ulink "; generic (Obj.field st 0));
     s "}"
   end
@@ -97,8 +117,8 @@ let ident (id : Ident.t) =
   let str k = (Obj.obj (Obj.field v k) : string)
   and int k = (Obj.obj (Obj.field v k) : int) in
   match Obj.tag v with
-  | 0 -> s "Local("; q (str 0); s " "; i (int 1); s ")"
-  | 1 -> s "Scoped("; q (str 0); s " "; i (int 1); s " "; i (int 2); s ")"
+  | 0 -> s "Local("; q (str 0); s " "; i (canon stamps (int 1)); s ")"
+  | 1 -> s "Scoped("; q (str 0); s " "; i (canon stamps (int 1)); s " "; i (int 2); s ")"
   | 2 -> s "Global("; q (Obj.obj (Obj.field v 0)); s ")"
   | 3 -> s "Predef("; q (str 0); s " "; i (int 1); s ")"
   | _ -> s "Unscoped("; unscoped (Obj.obj (Obj.field v 0)); s ")"
@@ -224,7 +244,7 @@ and ty (t : type_expr) =
   if not first then (s "@T"; i n)
   else begin
     s "#T"; i n; s "{"; i r.level; s " "; i (Obj.obj (Obj.field (Obj.repr r) 2));
-    s " "; i r.id; s " ";
+    s " "; i (canon ids r.id); s " ";
     (match r.desc with
      | Tvar nm -> s "Tvar "; opt q nm
      | Tarrow (l, a, b, c) ->
@@ -429,8 +449,8 @@ and item depth = function
       s " "; loc ct.clty_loc; s " "; attributes ct.clty_attributes; s " ";
       uid ct.clty_uid; s "} "; rec_status r; s " "; visibility v
 
-let () =
-  let cmi = Cmi_format.read_cmi Sys.argv.(1) in
+let dump_cmi file =
+  let cmi = Cmi_format.read_cmi file in
   s "name "; q cmi.cmi_name; s "\nsig"; signature 1 cmi.cmi_sign;
   s "\ncrcs ";
   list (fun (n, d) -> q n; s " "; opt (fun d -> s (Digest.to_hex d)) d)
@@ -443,5 +463,163 @@ let () =
           s "Alerts ";
           list (fun (k, v) -> q k; s "="; q v) (Misc.Stdlib.String.Map.bindings m))
     cmi.cmi_flags;
-  s "\n";
-  print_string (Buffer.contents b)
+  s "\n"
+
+(* ---- stage 2: Env queries ---- *)
+
+let short_name m =
+  let p = "Stdlib__" in
+  let lp = String.length p in
+  if String.length m > lp && String.sub m 0 lp = p
+  then Some (String.sub m lp (String.length m - lp)) else None
+
+let gen files =
+  let emit kind name = print_string (kind ^ " " ^ name ^ "\n") in
+  let rec items prefixes depth sg =
+    List.iter (fun it ->
+        let each kind name = List.iter (fun p -> emit kind (p ^ "." ^ name)) prefixes in
+        match it with
+        | Sig_value (id, _, _) -> each "value" (Ident.name id)
+        | Sig_type (id, td, _, _) ->
+            each "type" (Ident.name id);
+            (match td.type_kind with
+             | Type_variant (cds, _) ->
+                 List.iter (fun cd -> each "constr" (Ident.name cd.cd_id)) cds
+             | Type_record (lds, _) ->
+                 List.iter (fun ld -> each "label" (Ident.name ld.ld_id)) lds
+             | _ -> ())
+        | Sig_typext (id, _, _, _) -> each "constr" (Ident.name id)
+        | Sig_module (id, _, md, _, _) ->
+            each "module" (Ident.name id);
+            (match md.md_type with
+             | Mty_signature sg when depth < 2 ->
+                 items (List.map (fun p -> p ^ "." ^ Ident.name id) prefixes)
+                   (depth + 1) sg
+             | _ -> ())
+        | Sig_modtype (id, _, _) -> each "modtype" (Ident.name id)
+        | Sig_class (id, _, _, _) -> each "class" (Ident.name id)
+        | Sig_class_type (id, _, _, _) -> each "cltype" (Ident.name id))
+      sg
+  in
+  List.iter (fun f ->
+      let cmi = Cmi_format.read_cmi f in
+      let m = cmi.cmi_name in
+      let prefixes = match short_name m with Some n -> [m; n] | None -> [m] in
+      items prefixes 0 cmi.cmi_sign)
+    files
+
+(* "A.B.c", with functor applications "F(X).t" (arguments are dotted paths,
+   possibly applications themselves) *)
+let lid_of_string str =
+  let n = String.length str in
+  let pos = ref 0 in
+  let ident () =
+    let st = !pos in
+    while !pos < n && not (List.mem str.[!pos] ['.'; '('; ')']) do incr pos done;
+    String.sub str st (!pos - st)
+  in
+  let rec path () =
+    let l = ref (Longident.Lident (ident ())) in
+    let continue = ref true in
+    while !continue && !pos < n do
+      match str.[!pos] with
+      | '(' ->
+          incr pos;
+          let a = path () in
+          incr pos;  (* ')' *)
+          l := Longident.Lapply (Location.mknoloc !l, Location.mknoloc a)
+      | '.' ->
+          incr pos;
+          l := Longident.Ldot (Location.mknoloc !l, Location.mknoloc (ident ()))
+      | _ -> continue := false
+    done;
+    !l
+  in
+  path ()
+
+let cstr_tag = function
+  | Data_types.Cstr_constant n -> s "Cstr_constant "; i n
+  | Cstr_block n -> s "Cstr_block "; i n
+  | Cstr_unboxed -> s "Cstr_unboxed"
+  | Cstr_extension (p, c) -> s "Cstr_extension("; path p; s " "; bool c; s ")"
+
+let cstr_descr (c : Data_types.constructor_description) =
+  s "{"; q c.cstr_name; s " "; ty c.cstr_res; s " "; list ty c.cstr_existentials;
+  s " "; list ty c.cstr_args; s " "; i c.cstr_arity; s " "; cstr_tag c.cstr_tag;
+  s " "; i c.cstr_consts; s " "; i c.cstr_nonconsts; s " "; bool c.cstr_generalized;
+  s " "; private_flag c.cstr_private; s " "; loc c.cstr_loc; s " ";
+  attributes c.cstr_attributes; s " "; opt type_decl c.cstr_inlined; s " ";
+  uid c.cstr_uid; s "}"
+
+let lbl_descr (l : Data_types.label_description) =
+  s "{"; q l.lbl_name; s " "; ty l.lbl_res; s " "; ty l.lbl_arg; s " ";
+  mutable_flag l.lbl_mut; s " ";
+  s (match l.lbl_atomic with Nonatomic -> "Nonatomic" | Atomic -> "Atomic");
+  s " "; i l.lbl_pos; s " "; i (Array.length l.lbl_all); s " ";
+  (match l.lbl_repres with
+   | Record_regular -> s "Record_regular"
+   | Record_float -> s "Record_float"
+   | Record_unboxed x -> s "Record_unboxed "; bool x
+   | Record_inlined n -> s "Record_inlined "; i n
+   | Record_extension p -> s "Record_extension "; path p);
+  s " "; private_flag l.lbl_private; s " "; loc l.lbl_loc; s " ";
+  attributes l.lbl_attributes; s " "; uid l.lbl_uid; s "}"
+
+let run_queries file env =
+  let ic = open_in file in
+  (try
+     while true do
+       let line = input_line ic in
+       match String.index_opt line ' ' with
+       | None -> ()
+       | Some k ->
+           let kind = String.sub line 0 k in
+           let name = String.sub line (k + 1) (String.length line - k - 1) in
+           let lid = lid_of_string name in
+           reset_numbering ();
+           s line; s " => ";
+           (try
+              match kind with
+              | "value" ->
+                  let p, vd = Env.find_value_by_name lid env in
+                  path p; s " "; ty vd.val_type; s " "; value_kind vd.val_kind
+              | "type" ->
+                  let p, td = Env.find_type_by_name lid env in
+                  path p; s " "; type_decl td
+              | "constr" -> cstr_descr (Env.find_constructor_by_name lid env)
+              | "label" -> lbl_descr (Env.find_label_by_name lid env)
+              | "module" ->
+                  let p, md = Env.find_module_by_name lid env in
+                  path p; s " "; modtype 1 md.md_type
+              | "modtype" ->
+                  let p, mtd = Env.find_modtype_by_name lid env in
+                  path p; s " "; opt (modtype 1) mtd.mtd_type
+              | "class" ->
+                  let p, cd = Env.find_class_by_name lid env in
+                  path p; s " "; class_type cd.cty_type
+              | "cltype" ->
+                  let p, ct = Env.find_cltype_by_name lid env in
+                  path p; s " "; class_type ct.clty_type
+              | _ -> s "BADKIND"
+            with Not_found -> s "NOTFOUND");
+           s "\n"
+     done
+   with End_of_file -> ());
+  close_in ic
+
+let () =
+  match Array.to_list Sys.argv with
+  | _ :: "gen" :: files -> gen files
+  | _ :: "env" :: stdlib_dir :: queries :: _ ->
+      canonical := true;
+      Load_path.init ~auto_include:Load_path.no_auto_include
+        ~visible:(String.split_on_char ':' stdlib_dir) ~hidden:[];
+      let env =
+        match Env.open_pers_signature "Stdlib" Env.initial with
+        | Ok env -> env
+        | Error _ -> failwith "open Stdlib"
+      in
+      run_queries queries env;
+      print_string (Buffer.contents b)
+  | _ :: file :: _ -> dump_cmi file; print_string (Buffer.contents b)
+  | _ -> prerr_endline "usage: typing_dump FILE.cmi | gen CMI... | env STDLIB QUERIES"
