@@ -2,7 +2,12 @@
 // defaults.  The c++ocamlc driver sets them from the command line.
 #pragma once
 
+#include <optional>
+#include <string>
+
 namespace cppcaml::typing::clflags {
+inline std::optional<std::string> for_package;  // -for-pack
+inline bool dump_lambda = false;             // -dlambda
 inline bool principal = false;             // -principal
 inline bool recursive_types = false;       // -rectypes
 inline bool strict_sequence = false;       // -strict-sequence

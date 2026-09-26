@@ -216,7 +216,7 @@ class Reader {
     switch (x.kind) {
       case m::Value::Kind::Int: return make<OValue>(OValue::Kind::Int, (long)x.i);
       case m::Value::Kind::String:
-        return make<OValue>(OValue::Kind::String, 0L, zstr(x.str()));
+        return make<OValue>(OValue::Kind::String, 0L, str(id));  // input_value's sharing
       case m::Value::Kind::Double:
         return make<OValue>(OValue::Kind::Double, 0L, std::string_view{}, x.d());
       case m::Value::Kind::Block: {
@@ -926,19 +926,23 @@ class Writer {
   // ---- support ----
   // Sharing that ocamlc's values have physically and Marshal keeps.  The
   // lexer makes one position per token boundary, all holding the one
-  // filename string, and parsed locations flow into the declarations by
-  // reference; so within a .cmi, equal positions are one value, filenames
-  // are one string, and equal locations one record (measured against
-  // ocamlc's .cmi files: cmi_port_parity.sh).
+  // filename string of its lexbuf, and parsed locations flow into the
+  // declarations by reference; a signature read from another .cmi carries
+  // that file's own strings (input_value's sharing, the Reader's).  So a
+  // filename is one value per string object (storage), equal positions of
+  // one filename are one value, and equal locations one record (measured
+  // against ocamlc's .cmi files: cmi_port_parity.sh, and -pack's, whose
+  // members' signatures come from several .cmi: pack_parity.sh).
   V fname(std::string_view f) {
+    if (f.data()) return str(f);
     auto [it, fresh] = fnames_.try_emplace(std::string(f), nullptr);
     if (fresh) it->second = str(f);
     return it->second;
   }
   V position(const Position& x) {
-    auto [it, fresh] = poss_.try_emplace(std::make_tuple(std::string(x.pos_fname), x.pos_lnum, x.pos_bol, x.pos_cnum),
-                                         nullptr);
-    if (fresh) it->second = o::vblock(0, {fname(x.pos_fname), i(x.pos_lnum), i(x.pos_bol), i(x.pos_cnum)});
+    V f = fname(x.pos_fname);
+    auto [it, fresh] = poss_.try_emplace(std::make_tuple(f.get(), x.pos_lnum, x.pos_bol, x.pos_cnum), nullptr);
+    if (fresh) it->second = o::vblock(0, {f, i(x.pos_lnum), i(x.pos_bol), i(x.pos_cnum)});
     return it->second;
   }
   V loc(const Location& l) {
@@ -953,9 +957,9 @@ class Writer {
   // one string.  A loaded unit's uids carry that unit's own name string
   // (shared by identity, str()), which Env's hashconsed persistent idents
   // share too.
-  void set_current_unit(std::string_view n) {
+  void set_current_unit(std::string_view n, V value = nullptr) {
     current_unit_ = std::string(n);
-    current_unit_name_ = o::vstr(current_unit_);
+    current_unit_name_ = value ? value : o::vstr(current_unit_);
   }
   V unit_name(std::string_view n) {
     if (current_unit_name_ && n == current_unit_) return current_unit_name_;
@@ -1442,7 +1446,7 @@ class Writer {
   std::map<std::pair<const void*, std::size_t>, V> lists_;
   std::unordered_map<const void*, V> mprivate_;
   std::map<std::tuple<int, const char*, std::size_t>, V> labels_;
-  std::map<std::tuple<std::string, long, long, long>, V> poss_;
+  std::map<std::tuple<const void*, long, long, long>, V> poss_;
   std::map<std::tuple<const void*, const void*, bool>, V> locs_;
 };
 
@@ -1596,6 +1600,16 @@ class EventWriter {
 };
 
 }  // namespace
+
+std::vector<o::ValPtr> debug_event_values(const std::vector<const instruct::DebugEvent*>& events,
+                                          o::ValPtr unit_name) {
+  Writer w;
+  if (!events.empty()) w.set_current_unit(events.front()->ev_module, unit_name);
+  EventWriter ew(w);
+  std::vector<o::ValPtr> evs;
+  for (const instruct::DebugEvent* ev : events) evs.push_back(ew.event(ev));
+  return evs;
+}
 
 std::vector<std::uint8_t> marshal_debug_events(const std::vector<const instruct::DebugEvent*>& events) {
   Writer w;

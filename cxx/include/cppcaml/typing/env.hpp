@@ -521,6 +521,11 @@ Signature read_signature(const std::string& modname, const std::string& filename
 // table; returns the cmi written.
 cmi_format::CmiInfos save_signature(StrMap<std::string_view> alerts, Signature sg, const std::string& modname,
                                     const std::string& filename);
+// save_signature_with_imports ~alerts sg cmi imports: the cmi's crcs are
+// [imports] (-pack's packed interface)
+cmi_format::CmiInfos save_signature_with_imports(
+    StrMap<std::string_view> alerts, Signature sg, const std::string& modname, const std::string& filename,
+    const std::vector<std::pair<std::string, std::optional<std::string>>>& imports);
 const ModuleData* find_pers_mod(bool allow_hidden, std::string_view name);
 std::vector<std::pair<std::string, std::optional<std::string>>> imports();
 // the string object Env.imports carries for an imported unit's name

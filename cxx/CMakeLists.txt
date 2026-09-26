@@ -92,9 +92,11 @@ add_library(cppcaml_core
   src/typing/bytegen.cpp
   src/typing/printinstr.cpp
   src/typing/emitcode.cpp
+  src/typing/bytepackager.cpp
   src/typing/typemod_sig.cpp
   src/typing/typemod_str.cpp
   src/typing/typemod_unit.cpp
+  src/typing/typemod_pack.cpp
   src/typing/typecore_class.cpp
   src/typing/typeclass.cpp
   src/typing/cmi_format.cpp)

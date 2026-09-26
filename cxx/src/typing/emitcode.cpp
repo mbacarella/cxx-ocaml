@@ -815,7 +815,39 @@ void output_value(std::string& out, const V& v) {
   out.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
 }
 
+V reloc_info_value(Values& w, const Reloc& r) {
+  switch (r.k) {
+    case RelocK::Reloc_literal: return o::vblock(0, {w.transl_const(r.lit)});
+    case RelocK::Reloc_getcompunit: return o::vblock(1, {w.str(r.name)});
+    case RelocK::Reloc_getpredef: return o::vblock(2, {w.str(r.name)});
+    case RelocK::Reloc_setcompunit: return o::vblock(3, {w.str(r.name)});
+    case RelocK::Reloc_primitive: return o::vblock(4, {w.str(r.name)});
+  }
+  fatal_error("Emitcode.reloc_info");
+}
+
 }  // namespace
+
+struct ValueContext::Impl {
+  Values v;
+};
+ValueContext::ValueContext() : impl(std::make_unique<Impl>()) {}
+ValueContext::~ValueContext() = default;
+omarshal::ValPtr ValueContext::str(std::string_view s) { return impl->v.str(s); }
+
+PackedFile to_packed_file(std::string& out, code c, ValueContext& w, ValueContext& hw) {
+  Emitter em;
+  em.emit(c);
+  out.append(reinterpret_cast<const char*>(em.out_buffer.data()), em.out_buffer.size());
+  PackedFile r;
+  r.size = em.out_position;
+  for (const Reloc& x : em.reloc_info) r.relocs.emplace_back(reloc_info_value(w.impl->v, x), x.pos);
+  r.events.assign(em.events.rbegin(), em.events.rend());
+  r.debug_dirs = em.debug_dirs;
+  for (auto it = em.hints.rbegin(); it != em.hints.rend(); ++it)
+    r.hints.emplace_back(it->first, hw.impl->v.optimization_hint(it->second));
+  return r;
+}
 
 void to_file(std::FILE* outchan, std::string_view filename, std::string_view modname,
              const lambda::IdentSet& required_globals, code c) {

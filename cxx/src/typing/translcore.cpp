@@ -58,8 +58,6 @@ std::function<lam_t(scopes, Ident::t, Slice<std::string_view>, const tt::ClassEx
 
 namespace {
 
-// Clflags.for_package (not in clflags.hpp: -for-pack; None)
-const std::optional<std::string> clflags_for_package;
 // Config.max_young_wosize
 constexpr long config_max_young_wosize = 256;
 // Obj.object_tag
@@ -1340,10 +1338,10 @@ lam_t transl_extension_constructor(scopes sc, env::t env, Path::t path, const tt
   std::string name;
   if (!path)
     name = std::string(ident::name(ext->ext_id));
-  else if (!clflags_for_package)
+  else if (!clflags::for_package)
     name = path::name(path);
   else
-    name = *clflags_for_package + "." + path::name(path);
+    name = *clflags::for_package + "." + path::name(path);
   ScopedLocation loc = of_location(sc, ext->ext_loc);
   if (ext->ext_kind.kind == tt::TExtensionConstructorKind::Kind::Text_decl) {
     lam_t oo = L::lprim(prim_fresh_oo_id(), slice({L::lconst(L::const_int(0))}), loc);

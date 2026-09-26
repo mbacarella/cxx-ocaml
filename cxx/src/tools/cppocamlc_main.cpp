@@ -47,6 +47,7 @@
 #include "cppcaml/typing/typemod.hpp"
 #include "cppcaml/typing/printlambda.hpp"
 #include "cppcaml/typing/bytegen.hpp"
+#include "cppcaml/typing/bytepackager.hpp"
 #include "cppcaml/typing/emitcode.hpp"
 #include "cppcaml/typing/printinstr.hpp"
 #include "cppcaml/typing/simplif.hpp"
@@ -167,8 +168,7 @@ static const std::set<std::string> kBoolIgnore = {
     // typing/dump switches with no effect on our .cmo/.cmi output
     "-typing-recovery", "-dno-unique-ids", "-dunique-ids", "-dno-locations", "-dlocations"};
 // Flags that would silently change the output if dropped -> reported unsupported.
-static const std::set<std::string> kUnsupportedArg = {"-ppx",
-                                                      "-for-pack"};
+static const std::set<std::string> kUnsupportedArg = {"-ppx"};
 static const std::set<std::string> kUnsupportedBool = {"-i", "-output-obj"};
 // -labels/-nolabels affect typing but not our (untyped-after-infer) output.
 static const std::set<std::string> kBoolIgnore2 = {"-labels", "-nolabels"};
@@ -273,6 +273,48 @@ static bool read_source(const std::string& path, std::string& text) {
 static std::string g_stdlib_dir;
 static bool g_nostdlib = false;
 
+// The typing port's forward references and module-init state (the idents
+// its modules create at startup, in link order), once per process
+static void install_typing() {
+  static bool installed = false;
+  if (!installed) {
+    cppcaml::typing::typemod::install_forward_refs();
+    installed = true;
+  }
+}
+
+// Compmisc.init_path: the cwd, the -I directories in command-line order,
+// then the stdlib
+static void init_path(const std::string& stdlib_dir) {
+  namespace ty = cppcaml::typing;
+  std::vector<std::string> visible{""};
+  for (auto& d : g_incdirs) visible.push_back(d);
+  // c++ocamlc finds its stdlib through -I when given one (ocamlc has
+  // Config.standard_library); that directory is not added twice, as the
+  // units of a later duplicate would shadow the opened Stdlib's
+  bool listed = false;
+  for (auto& d : g_incdirs) {
+    std::error_code ec;
+    if (fs::equivalent(d, stdlib_dir, ec)) listed = true;
+  }
+  if (!g_nostdlib && !listed) visible.push_back(stdlib_dir);
+  ty::load_path::init(visible, {});
+  ty::env::reset_cache();
+}
+
+// Compmisc.initial_env
+static cppcaml::typing::env::t initial_env() {
+  namespace ty = cppcaml::typing;
+  ty::ident::reinit();
+  ty::uid::reinit();
+  ty::types::reset();
+  ty::ctype::reset();
+  ty::Location cmdline = ty::location::none();
+  cmdline.loc_start.pos_fname = cmdline.loc_end.pos_fname = "command line";
+  return ty::typemod::initial_env(
+      cmdline, ty::clflags::nopervasives ? std::nullopt : std::optional<std::string>("Stdlib"), g_open_modules);
+}
+
 // The type checker (the typing/ port, TYPECHECKER.md): Compmisc.init_path +
 // initial_env, then Typemod.type_implementation / type_interface, before
 // code generation as in ocamlc.  A type error is reported as ocamlc's
@@ -287,38 +329,13 @@ enum class PortResult { Typed, Failed, Rejected };
 static PortResult port_typecheck(const std::string& in_path, const std::string& mod, const std::string& stdlib_dir,
                            const std::string& out, bool intf, const PortBody& body) {
   namespace ty = cppcaml::typing;
-  static bool installed = false;
-  if (!installed) {
-    ty::typemod::install_forward_refs();
-    installed = true;
-  }
+  install_typing();
   const bool debug = cppcaml::dbg_env("CPPCAML_TYPECHECK_DEBUG");
   try {
-    // Compmisc.init_path: the cwd, the -I directories in command-line
-    // order, then the stdlib
-    std::vector<std::string> visible{""};
-    for (auto& d : g_incdirs) visible.push_back(d);
-    // c++ocamlc finds its stdlib through -I when given one (ocamlc has
-    // Config.standard_library); that directory is not added twice, as the
-    // units of a later duplicate would shadow the opened Stdlib's
-    bool listed = false;
-    for (auto& d : g_incdirs) {
-      std::error_code ec;
-      if (fs::equivalent(d, stdlib_dir, ec)) listed = true;
-    }
-    if (!g_nostdlib && !listed) visible.push_back(stdlib_dir);
-    ty::load_path::init(visible, {});
-    ty::env::reset_cache();
+    init_path(stdlib_dir);
     // Compile_common: Env.set_current_unit; Compmisc.initial_env
     ty::env::set_current_unit(ty::UnitInfo{mod, intf ? ty::Uid::From::Intf : ty::Uid::From::Impl});
-    ty::ident::reinit();
-    ty::uid::reinit();
-    ty::types::reset();
-    ty::ctype::reset();
-    ty::Location cmdline = ty::location::none();
-    cmdline.loc_start.pos_fname = cmdline.loc_end.pos_fname = "command line";
-    ty::env::t env0 = ty::typemod::initial_env(
-        cmdline, ty::clflags::nopervasives ? std::nullopt : std::optional<std::string>("Stdlib"), g_open_modules);
+    ty::env::t env0 = initial_env();
     ty::typemod::UnitInfo target;
     target.source_file = in_path;
     target.modname = mod;
@@ -507,7 +524,7 @@ static int run_main(int argc, char** argv) {
       runtime = need_arg(a.c_str());
     else if (a == "-c") compile_only = true;
     else if (a == "-dparsetree") g_dump.parsetree = true;   // dump AST, keep going
-    else if (a == "-dlambda") g_dump.lambda = true;         // dump Lambda IR
+    else if (a == "-dlambda") g_dump.lambda = cppcaml::typing::clflags::dump_lambda = true;         // dump Lambda IR
     else if (a == "-drawlambda") g_dump.rawlambda = true;   // dump Lambda before Simplif (new path)
     else if (a == "-dinstr") g_dump.instr = true;           // dump bytecode instrs
     else if (a == "-a") make_lib = true;
@@ -547,6 +564,7 @@ static int run_main(int argc, char** argv) {
     }
     else if (a == "-open") g_open_modules.push_back(need_arg("-open"));
     else if (a == "-pp") g_preprocessor = need_arg("-pp");
+    else if (a == "-for-pack") cppcaml::typing::clflags::for_package = std::string(need_arg("-for-pack"));
     else if (kArgIgnore.count(a)) {
       if (strict_flags) reject_ignored(a);
       (void)need_arg(a.c_str());
@@ -615,6 +633,7 @@ static int run_main(int argc, char** argv) {
   // Compile every source input; collect the resulting (and pre-built) objects
   // for a possible link step.
   std::vector<std::string> link_objs;
+  std::vector<std::string> objfiles;  // Compenv's objfiles, as named (-pack)
   // A bare object name (`unix.cma`) on the link line is resolved against the
   // -I include path, like ocamlc -- otherwise only a cwd-relative path works.
   auto resolve_obj = [&](const std::string& f) -> std::string {
@@ -647,10 +666,12 @@ static int run_main(int argc, char** argv) {
       std::string cmo_out = output_prefix(f) + ".cmo";
       if (int rc = compile_ml(f, cmo_out, stdlib_dir, prof)) return rc;
       link_objs.push_back(cmo_out);
+      objfiles.push_back(cmo_out);
     } else if (ends_with(f, ".cmo") || ends_with(f, ".cma")) {
       link_objs.push_back(resolve_obj(f));  // a pre-compiled object/library to link
-    } else if (ends_with(f, ".cmi")) {
-      link_objs.push_back(resolve_obj(f));  // interface-only member (meaningful under -pack)
+      objfiles.push_back(f);
+    } else if (ends_with(f, ".cmi") && !pack_name.empty()) {
+      objfiles.push_back(f);  // an interface-only member of a pack
     } else {
       std::cerr << "c++ocamlc: don't know what to do with " << f << '\n';
       return 2;
@@ -669,13 +690,28 @@ static int run_main(int argc, char** argv) {
     }
     return 0;
   }
-  if (!pack_name.empty()) {  // -pack -o Pack.cmo : consolidate into one unit
+  if (!pack_name.empty()) {  // -pack -o Pack.cmo : Bytepackager.package_files
     if (out_path.empty()) { std::cerr << "c++ocamlc: -pack needs -o <Pack>.cmo\n"; return 2; }
+    namespace ty = cppcaml::typing;
     try {
-      cppcaml::link::pack(link_objs, module_name(out_path), out_path);
-    } catch (const std::exception& e) {
-      std::cerr << "c++ocamlc: -pack: " << e.what() << '\n';
-      return 1;
+      install_typing();
+      init_path(stdlib_dir);
+      ty::bytepackager::package_files(initial_env(), objfiles, out_path);
+    } catch (const ty::bytepackager::Error& e) {
+      std::cerr << "Error: " << ty::bytepackager::report_error(e) << '\n';
+      return 2;
+    } catch (...) {
+      std::optional<ty::error_report::Report> r = ty::error_report::classify(std::current_exception());
+      if (r) {
+        std::cerr << "Error: " << r->name << '\n';
+        return 2;
+      }
+      try {
+        throw;
+      } catch (const std::exception& e) {
+        std::cerr << "c++ocamlc: -pack: " << e.what() << '\n';
+      }
+      return 2;
     }
     return 0;
   }

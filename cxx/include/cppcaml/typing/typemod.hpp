@@ -102,6 +102,11 @@ struct UnitInfo {
 };
 tt::Implementation type_implementation(const UnitInfo& target, env::t initial_env, pt::Structure ast);
 const tt::Signature* type_interface(const UnitInfo& target, env::t env, pt::Signature ast);
+// package_units initial_env objfiles target_cmi (-pack): the packed unit's
+// signature, checked against its .mli's .cmi when there is one (the
+// coercion), else saved as [target_cmi]
+const tt::ModuleCoercion* package_units(env::t initial_env, const std::vector<std::string>& objfiles,
+                                        const std::string& target_modname, const std::string& target_cmi);
 env::t initial_env(const Location& loc, const std::optional<std::string>& initially_opened_module,
                    const std::vector<std::string>& open_implicit_modules);
 

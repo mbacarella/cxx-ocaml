@@ -453,16 +453,31 @@ static const ModuleData* read_sign_of_cmi(const persistent_env::PersistentSignat
   return sign_of_cmi(true, ps);
 }
 
-cmi_format::CmiInfos save_signature(StrMap<std::string_view> alerts, Signature sg, const std::string& modname,
-                                    const std::string& filename) {
+// save_signature_with_transform cmi_transform ~alerts sg cmi_info
+static cmi_format::CmiInfos save_signature_with_transform(
+    const std::function<void(cmi_format::CmiInfos&)>& cmi_transform, StrMap<std::string_view> alerts, Signature sg,
+    const std::string& modname, const std::string& filename) {
   btype::cleanup_abbrev_memo();
   subst::reset_for_saving();
   Signature ssg = subst::signature(subst::Scoping::make_local(), subst::for_saving(subst::identity()), sg);
   cmi_format::CmiInfos cmi = g_persistent_env.make_cmi(modname, ssg, alerts);
+  cmi_transform(cmi);
   persistent_env::PersistentSignature pers_sig{filename, cmi, load_path::Visibility::Visible};
   const ModuleData* pm = sign_of_cmi(false, pers_sig);  // save_sign_of_cmi
   g_persistent_env.save_cmi(pers_sig, pm);
   return cmi;
+}
+
+cmi_format::CmiInfos save_signature(StrMap<std::string_view> alerts, Signature sg, const std::string& modname,
+                                    const std::string& filename) {
+  return save_signature_with_transform([](cmi_format::CmiInfos&) {}, alerts, sg, modname, filename);
+}
+
+cmi_format::CmiInfos save_signature_with_imports(
+    StrMap<std::string_view> alerts, Signature sg, const std::string& modname, const std::string& filename,
+    const std::vector<std::pair<std::string, std::optional<std::string>>>& imports) {
+  return save_signature_with_transform([&](cmi_format::CmiInfos& cmi) { cmi.cmi_crcs = imports; }, alerts, sg,
+                                       modname, filename);
 }
 
 const ModuleData* find_pers_mod(bool allow_hidden, std::string_view name) {

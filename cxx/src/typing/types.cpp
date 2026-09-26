@@ -33,6 +33,17 @@ static long g_id = -1, g_id_param = -1;
 // a fresh record's identity
 static const void* fresh_obj() { return zone().alloc(1, 1); }
 void reinit() { g_id = -1; g_id_param = -1; }
+// shape.ml's "" for a uid made with no current unit: one static literal
+// (ocamlopt, which built the reference ocamlc.opt, merges the unit's equal
+// string constants, so mk's and mk_local_opaque's are the same object)
+static std::string_view no_unit_name() {
+  static std::string_view s = [] {
+    ZoneScope perm(permanent_zone());
+    return zone().str("");
+  }();
+  return s;
+}
+
 Uid mk(const UnitInfo* current_unit) {
   Uid u;
   u.kind = Uid::Kind::Item;
@@ -40,6 +51,7 @@ Uid mk(const UnitInfo* current_unit) {
     u.comp_unit = zstr(current_unit->modname);
     u.from = current_unit->kind;
   } else {
+    u.comp_unit = no_unit_name();
     u.from = Uid::From::Impl;
   }
   u.id = ++g_id;
@@ -49,7 +61,7 @@ Uid mk(const UnitInfo* current_unit) {
 Uid mk_local_opaque(const UnitInfo* current_unit) {
   Uid u;
   u.kind = Uid::Kind::Local_opaque_item;
-  if (current_unit) u.comp_unit = zstr(current_unit->modname);
+  u.comp_unit = current_unit ? zstr(current_unit->modname) : no_unit_name();
   u.id = ++g_id_param;
   u.obj = fresh_obj();
   return u;

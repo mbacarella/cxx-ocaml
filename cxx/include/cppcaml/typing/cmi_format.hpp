@@ -4,6 +4,8 @@
 // becomes exactly one C++ object, so sharing and cycles are preserved.
 #pragma once
 
+#include "cppcaml/omarshal.hpp"
+
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -54,5 +56,11 @@ std::string output_cmi(const std::string& filename, const CmiInfos& cmi);
 // `debug_event list`, whose typing values (types, Env summaries, Subst.t)
 // go through the .cmi Writer.  (Not in cmi_format.mli.)
 std::vector<std::uint8_t> marshal_debug_events(const std::vector<const instruct::DebugEvent*>& events);
+// The same events as values, to marshal within a larger list (-pack's,
+// whose other events are the members' read back).
+// [unit_name]: the value of the unit's name string, when the caller shares
+// it with values of its own (nullptr: a fresh one).
+std::vector<omarshal::ValPtr> debug_event_values(const std::vector<const instruct::DebugEvent*>& events,
+                                                 omarshal::ValPtr unit_name = nullptr);
 
 }  // namespace cppcaml::typing::cmi_format
