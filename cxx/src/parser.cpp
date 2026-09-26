@@ -3063,6 +3063,7 @@ class Parser {
   }
 
   std::pair<RecFlag, std::vector<ValueBinding>> parse_value_bindings() {
+    Position let_start = position(cur().start);
     expect(Kind::LET, "let");
     let_ext_ = std::nullopt;
     if (cur().kind == Kind::PERCENT) { advance(); let_ext_ = parse_ext_name(); }  // let%ext
@@ -3074,15 +3075,18 @@ class Parser {
     if (cur().kind == Kind::REC) { advance(); rf = RecFlag::Recursive; }
     std::vector<ValueBinding> binds;
     binds.push_back(parse_value_binding());
+    binds.back().loc = span(let_start, position(tokens_[idx_ - 1].end));
     if (!letattrs.empty()) {  // prepend the let-attrs before any trailing [@@attr]
       for (auto& a : binds[0].attrs) letattrs.push_back(std::move(a));
       binds[0].attrs = std::move(letattrs);
     }
     while (cur().kind == Kind::AND) {
+      Position and_start = position(cur().start);
       advance();
       Attributes andattrs;  // `and[@attr] …`  -> prepended to this binding
       while (cur().kind == Kind::LBRACKETAT) { advance(); andattrs.push_back(parse_attribute_body()); }
       ValueBinding vb = parse_value_binding();
+      vb.loc = span(and_start, position(tokens_[idx_ - 1].end));
       if (!andattrs.empty()) {
         for (auto& a : vb.attrs) andattrs.push_back(std::move(a));
         vb.attrs = std::move(andattrs);

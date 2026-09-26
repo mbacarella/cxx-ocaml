@@ -392,12 +392,12 @@ struct Conv {
                                  co.ground ? core_type(**co.ground) : nullptr,
                                  core_type(*co.coercion));
   }
-  // pvb_loc: the ast keeps no per-binding span (gap), except a lone binding
-  // of a structure item, whose span is the item's.
+  // pvb_loc: the binding's span where the parser records it, else (gap) a
+  // lone binding of a structure item's is the item's.
   Slice<const ValueBinding*> value_bindings(const std::vector<ast::ValueBinding>& l,
                                             const Location* lone_loc) const {
     return map_slice<const ValueBinding*>(l, [&](const ast::ValueBinding& vb) {
-      Location vl = (lone_loc && l.size() == 1) ? *lone_loc : gap_loc();
+      Location vl = vb.loc ? loc(*vb.loc) : (lone_loc && l.size() == 1) ? *lone_loc : gap_loc();
       return make<ValueBinding>(pattern(vb.pat), expression(*vb.expr),
                                 vb.constraint_ ? value_constraint(*vb.constraint_) : nullptr,
                                 attrs(vb.attrs), vl);

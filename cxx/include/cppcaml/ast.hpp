@@ -278,6 +278,10 @@ struct ValueBinding {
   ExprBox expr;
   std::optional<ValueConstraint> constraint_;  // pvb_constraint
   Attributes attrs;                            // pvb_attributes
+  // pvb_loc: parser.mly's `mklb ~loc:$sloc` -- from `let` (the first
+  // binding) or `and` to the end of the trailing [@@attrs]; unset where
+  // the parser builds a binding by other means
+  std::optional<Location> loc;
 };
 
 struct Pparam_val { Location loc; ArgLabel label; std::optional<ExprBox> default_; Pattern pat; };

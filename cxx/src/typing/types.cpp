@@ -38,6 +38,17 @@ std::string_view ocaml_literal(const char* unit, std::string_view s) {
   return interned[key] = zone().str(s);
 }
 
+static bool same_contents(const Position& a, const Position& b) {
+  return a.pos_fname.data() == b.pos_fname.data() && a.pos_fname.size() == b.pos_fname.size() &&
+         a.pos_lnum == b.pos_lnum && a.pos_bol == b.pos_bol && a.pos_cnum == b.pos_cnum;
+}
+bool same_record(const Position& x) { return x.obj && same_contents(x, *x.obj); }
+bool same_record(const Location& x) {
+  return x.obj && x.loc_ghost == x.obj->loc_ghost && same_contents(x.loc_start, x.obj->loc_start) &&
+         same_contents(x.loc_end, x.obj->loc_end) && x.loc_start.obj == x.obj->loc_start.obj &&
+         x.loc_end.obj == x.obj->loc_end.obj;
+}
+
 std::string_view zborrow(std::string_view s) {
   if (s.data() && (g_default_zone.owns(s.data()) || g_zone->owns(s.data()) || permanent_zone().owns(s.data())))
     return s;

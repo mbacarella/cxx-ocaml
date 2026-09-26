@@ -18,12 +18,21 @@ struct Position {
   long pos_lnum = 0;
   long pos_bol = 0;
   long pos_cnum = 0;
+  // The record's identity where it has one the writers must keep: the
+  // Reader's (one per marshaled record of a .cmi -- input_value's sharing).
+  // It points at the record's contents as read; a copy whose contents were
+  // changed since is a different record (same_record says whether it holds).
+  const Position* obj = nullptr;
 };
 struct Location {
   Position loc_start;
   Position loc_end;
   bool loc_ghost = false;
+  const Location* obj = nullptr;  // as Position::obj
 };
+// [x] is still the record [x.obj] identifies
+bool same_record(const Position& x);
+bool same_record(const Location& x);
 namespace location {
 // Location.none
 Location none();
@@ -134,6 +143,9 @@ struct OValue {
   double d = 0;             // Double
   unsigned tag = 0;         // Block
   Slice<const OValue*> fields;
+  // a Lexing.position block read from a .cmi: the Reader's record for the
+  // same marshaled block (one object, whichever way it is decoded)
+  const Position* pos = nullptr;
 };
 
 // ---- Parsetree.attribute ------------------------------------------------

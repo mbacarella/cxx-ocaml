@@ -171,11 +171,22 @@ class Reader {
   }
 
   // ---- support ----
+  // one record per marshaled block, with its identity (support.hpp)
   Position position(std::size_t id) {
-    return Position{str(f(id, 0)), ival(f(id, 1)), ival(f(id, 2)), ival(f(id, 3))};
+    if (auto it = pos_.find(id); it != pos_.end()) return *it->second;
+    auto* p = make<Position>(Position{str(f(id, 0)), ival(f(id, 1)), ival(f(id, 2)), ival(f(id, 3))});
+    p->obj = p;
+    pos_[id] = p;
+    return *p;
   }
   Location loc(std::size_t id) {
-    return Location{position(f(id, 0)), position(f(id, 1)), boolean(f(id, 2))};
+    if (auto it = loc_.find(id); it != loc_.end()) return *it->second;
+    Position a = position(f(id, 0));
+    Position e = position(f(id, 1));
+    auto* l = make<Location>(Location{a, e, boolean(f(id, 2))});
+    l->obj = l;
+    loc_[id] = l;
+    return *l;
   }
   Uid uid(std::size_t id) {
     Uid u;
@@ -226,6 +237,11 @@ class Reader {
         std::vector<const OValue*> fs;
         for (std::size_t k = 0; k < x.fields.size(); ++k) fs.push_back(ovalue(x.fields[k]));
         o->fields = slice(fs);
+        if (x.tag == 0 && fs.size() == 4 && fs[0]->kind == OValue::Kind::String && fs[1]->kind == OValue::Kind::Int &&
+            fs[2]->kind == OValue::Kind::Int && fs[3]->kind == OValue::Kind::Int) {
+          (void)position(id);
+          o->pos = pos_.at(id);
+        }
         return o;
       }
       default:
@@ -814,6 +830,8 @@ class Reader {
   std::unordered_map<std::size_t, Ident::t> ident_;
   std::unordered_map<std::size_t, Path::t> path_;
   std::unordered_map<std::size_t, const void*> uid_obj_;
+  std::unordered_map<std::size_t, const Position*> pos_;
+  std::unordered_map<std::size_t, const Location*> loc_;
   std::unordered_map<std::size_t, const void*> repr_obj_;
   std::unordered_map<std::size_t, const void*> optstr_obj_;
   std::unordered_map<std::size_t, std::pair<const void*, std::size_t>> list_memo_;
@@ -940,12 +958,26 @@ class Writer {
     return it->second;
   }
   V position(const Position& x) {
+    if (same_record(x)) {  // a record read from a .cmi: its own block
+      auto [it, fresh] = pos_objs_.try_emplace(x.obj, nullptr);
+      if (fresh) it->second = o::vblock(0, {str(x.pos_fname), i(x.pos_lnum), i(x.pos_bol), i(x.pos_cnum)});
+      return it->second;
+    }
     V f = fname(x.pos_fname);
     auto [it, fresh] = poss_.try_emplace(std::make_tuple(f.get(), x.pos_lnum, x.pos_bol, x.pos_cnum), nullptr);
     if (fresh) it->second = o::vblock(0, {f, i(x.pos_lnum), i(x.pos_bol), i(x.pos_cnum)});
     return it->second;
   }
   V loc(const Location& l) {
+    if (same_record(l)) {
+      auto [it, fresh] = loc_objs_.try_emplace(l.obj, nullptr);
+      if (fresh) {
+        V a = position(l.loc_start);
+        V e = position(l.loc_end);
+        it->second = o::vblock(0, {a, e, b(l.loc_ghost)});
+      }
+      return it->second;
+    }
     V a = position(l.loc_start);
     V e = position(l.loc_end);
     auto [it, fresh] = locs_.try_emplace(std::make_tuple(a.get(), e.get(), l.loc_ghost), nullptr);
@@ -1018,7 +1050,8 @@ class Writer {
         if (x->tag == 0 && x->fields.size() == 4 &&
             x->fields[0]->kind == OValue::Kind::String && x->fields[1]->kind == OValue::Kind::Int &&
             x->fields[2]->kind == OValue::Kind::Int && x->fields[3]->kind == OValue::Kind::Int)
-          return position(Position{x->fields[0]->s, x->fields[1]->i, x->fields[2]->i, x->fields[3]->i});
+          return x->pos ? position(*x->pos)
+                        : position(Position{x->fields[0]->s, x->fields[1]->i, x->fields[2]->i, x->fields[3]->i});
         return shared(memo_, x, static_cast<int>(x->tag), [&]() -> std::vector<V> {
           std::vector<V> fs;
           for (const OValue* f : x->fields) fs.push_back(ovalue(f));
@@ -1454,6 +1487,7 @@ class Writer {
   std::map<std::tuple<int, const char*, std::size_t>, V> labels_;
   std::map<std::tuple<const void*, long, long, long>, V> poss_;
   std::map<std::tuple<const void*, const void*, bool>, V> locs_;
+  std::unordered_map<const void*, V> pos_objs_, loc_objs_;
 };
 
 // ---- the debugging events of a .cmo (Emitcode.to_file with -g) ------------
