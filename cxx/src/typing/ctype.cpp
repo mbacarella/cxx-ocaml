@@ -120,13 +120,13 @@ long create_scope() {
 
 // with_local_level_gen handles both the scoping structure of levels and
 // automatic generalization through pools (cf. btype.ml)
-void with_local_level_gen_(bool class_def, bool structure, const std::function<void()>& f) {
+void with_local_level_gen_(bool class_def, bool structure, const std::function<void()>& f,
+                           const std::function<void()>& before_generalize) {
   if (class_def) begin_class_def();
   else begin_def();
   long level = current_level;
   std::vector<TypeExpr*> pool = with_new_pool(current_level, [&] {
-    // `let result = wrap_end_def f in Option.iter (fun g -> g result)
-    // before_generalize`: both are inside f here
+    // let result = wrap_end_def f in Option.iter (fun g -> g result) before_generalize
     struct E {
       bool done = false;
       ~E() {
@@ -136,6 +136,7 @@ void with_local_level_gen_(bool class_def, bool structure, const std::function<v
     f();
     e.done = true;
     end_def();
+    if (before_generalize) before_generalize();
   });
   simple_abbrevs()->contents = mnil();
   for (TypeExpr* ty : pool) {

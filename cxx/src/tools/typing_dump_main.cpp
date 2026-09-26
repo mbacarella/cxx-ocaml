@@ -13,6 +13,7 @@
 #include "cppcaml/typing/ctype.hpp"
 #include "cppcaml/typing/env.hpp"
 #include "cppcaml/typing/parsetree.hpp"
+#include "cppcaml/typing/typecore.hpp"
 #include "cppcaml/typing/typetexp.hpp"
 #include "cppcaml/parser.hpp"
 #include <sstream>
@@ -2119,12 +2120,200 @@ int run_typexp(const std::string& dirs, const std::string& modname, const std::s
   return 0;
 }
 
+
+// ---- stage 4c: Typecore (the typing_dump.ml `core` mode) ----
+const char* const tc_error_names[] = {
+    "Constructor_arity_mismatch",
+    "Label_mismatch",
+    "Pattern_type_clash",
+    "Or_pattern_type_clash",
+    "Multiply_bound_variable",
+    "Orpat_vars",
+    "Expr_type_clash",
+    "Function_arity_type_clash",
+    "Apply_non_function",
+    "Apply_wrong_label",
+    "Label_multiply_defined",
+    "Label_missing",
+    "Label_not_mutable",
+    "Wrong_name",
+    "Name_type_mismatch",
+    "Invalid_format",
+    "Not_an_object",
+    "Undefined_method",
+    "Undefined_self_method",
+    "Virtual_class",
+    "Private_type",
+    "Private_label",
+    "Private_constructor",
+    "Unbound_instance_variable",
+    "Instance_variable_not_mutable",
+    "Not_subtype",
+    "Outside_class",
+    "Value_multiply_overridden",
+    "Coercion_failure",
+    "Not_a_function",
+    "Too_many_arguments",
+    "Abstract_wrong_label",
+    "Not_a_polymorphic_variant_type",
+    "Incoherent_label_order",
+    "Less_general",
+    "Modules_not_allowed",
+    "Cannot_infer_signature",
+    "Not_a_packed_module",
+    "Unexpected_existential",
+    "Invalid_interval",
+    "Invalid_for_loop_index",
+    "No_value_clauses",
+    "Exception_pattern_disallowed",
+    "Mixed_value_and_exception_patterns_under_guard",
+    "Effect_pattern_below_toplevel",
+    "Invalid_continuation_pattern",
+    "Inlined_record_escape",
+    "Inlined_record_expected",
+    "Unrefuted_pattern",
+    "Invalid_extension_constructor_payload",
+    "Not_an_extension_constructor",
+    "Invalid_atomic_loc_payload",
+    "Label_not_atomic",
+    "Atomic_in_pattern",
+    "Literal_overflow",
+    "Unknown_literal",
+    "Illegal_letrec_pat",
+    "Illegal_letrec_expr",
+    "Illegal_class_expr",
+    "Letop_type_clash",
+    "Andop_type_clash",
+    "Bindings_type_clash",
+    "Unbound_existential",
+    "Bind_existential",
+    "Missing_type_constraint",
+    "Wrong_expected_kind",
+    "Expr_not_a_record_type",
+    "Constructor_labeled_arg",
+    "Partial_tuple_pattern_bad_type",
+    "Extra_tuple_label",
+    "Missing_tuple_label",
+    "Repeated_tuple_exp_label",
+    "Repeated_tuple_pat_label",
+    "Optional_poly_param",
+    "Cannot_unify_tfunctor_to_tarrow",
+    "Cannot_omit_tfunctor_argument"};
+
+int run_core(const std::string& dirs, const std::string& file) {
+  canonical = true;
+  load_path::init(split_dirs(dirs), {});
+  env::OpenResult r = env::open_pers_signature("Stdlib", env::initial());
+  if (r.kind != env::OpenResult::Kind::Ok) {
+    std::cerr << "open Stdlib failed\n";
+    return 1;
+  }
+  std::ifstream in(file, std::ios::binary);
+  std::stringstream ss;
+  ss << in.rdbuf();
+  std::string src = ss.str();
+  std::vector<std::string> dirfiles;
+  cppcaml::ast::Structure ast;
+  try {
+    ast = cppcaml::parse_structure(src, dirfiles);
+  } catch (const cppcaml::ParseError& ex) {
+    std::cerr << "c++typing-dump: parse error: " << ex.what() << '\n';
+    return 1;
+  }
+  pd::parse_file = zstr(file);
+  parsetree::Structure st = parsetree::of_ast(ast, file, dirfiles);
+  namespace tc = typecore;
+  // report: false when the exception is not a typing error
+  auto report = [&](std::exception_ptr ep) {
+    s("ERR ");
+    try {
+      std::rethrow_exception(ep);
+    } catch (const tc::Error& er) {
+      s("Typecore."); s(tc_error_names[static_cast<int>(er.kind)]); s(" "); pd::loc(er.loc);
+    } catch (const typetexp::Error& er) {
+      s("Typetexp."); s(txd::texp_error_name(er.kind)); s(" "); pd::loc(er.loc);
+    } catch (const env::Error& er) {
+      if (er.kind == env::Error::Kind::Lookup_error) {
+        s("Env."); s(txd::lookup_error_name(er.err.kind)); s(" "); pd::loc(er.loc);
+      } else {
+        s("Env.other");
+      }
+    } catch (const typetexp::ErrorForward&) {
+      s("Error_forward");
+    } catch (const tc::VariableInScope&) {
+      s("Syntaxerr");
+    }
+    s("\n");
+  };
+  tc::reset_delayed_checks();
+  env::t e = r.env;
+  for (const parsetree::StructureItem* it : st) {
+    using SK = parsetree::StructureItemDesc::Kind;
+    if (auto* v = parsetree::as<parsetree::Pstr_value>(it->pstr_desc)) {
+      tc::TypeBindingResult res;
+      try {
+        res = tc::type_binding(e, v->rec, v->vbs);
+      } catch (const std::bad_function_call&) {
+        s("UNSUPPORTED\n");
+        std::cout << b;
+        return 0;
+      } catch (...) {
+        report(std::current_exception());
+        std::cout << b;
+        return 0;
+      }
+      for (Ident::t id : typedtree::let_bound_idents(res.vbs)) {
+        reset_numbering();
+        s("val "); s(ident::name(id)); s(" : ");
+        ty(env::find_value(Path::pident(id), res.env)->val_type); s("\n");
+      }
+      e = res.env;
+    } else if (auto* ev = parsetree::as<parsetree::Pstr_eval>(it->pstr_desc)) {
+      const typedtree::Expression* exp;
+      try {
+        exp = tc::type_expression(e, ev->exp);
+      } catch (const std::bad_function_call&) {
+        s("UNSUPPORTED\n");
+        std::cout << b;
+        return 0;
+      } catch (...) {
+        report(std::current_exception());
+        std::cout << b;
+        return 0;
+      }
+      reset_numbering();
+      s("eval : "); ty(exp->exp_type); s("\n");
+    } else {
+      (void)SK::Pstr_eval;
+      s("STOP\n");
+      std::cout << b;
+      return 0;
+    }
+  }
+  try {
+    tc::force_delayed_checks();
+    s("END\n");
+  } catch (...) {
+    report(std::current_exception());
+  }
+  std::cout << b;
+  return 0;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
   if (argc == 5 && std::string(argv[1]) == "typexp") {
     try {
       return run_typexp(argv[2], argv[3], argv[4]);
+    } catch (const std::exception& e) {
+      std::cerr << "c++typing-dump: " << e.what() << '\n';
+      std::cout << b;
+      return 1;
+    }
+  }
+  if (argc == 4 && std::string(argv[1]) == "core") {
+    try {
+      return run_core(argv[2], argv[3]);
     } catch (const std::exception& e) {
       std::cerr << "c++typing-dump: " << e.what() << '\n';
       std::cout << b;

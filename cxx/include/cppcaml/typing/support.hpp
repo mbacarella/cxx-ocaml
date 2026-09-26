@@ -122,11 +122,17 @@ struct OValue {
 };
 
 // ---- Parsetree.attribute ------------------------------------------------
+// As Types records hold them: decoded from a cmi (`attr_payload`, a generic
+// value) or taken from the parsed source (`ast`, parsetree.hpp).
+namespace parsetree {
+struct Attribute;
+}
 struct Attribute {
   std::string_view attr_name;
   Location attr_name_loc;
   const OValue* attr_payload = nullptr;
   Location attr_loc;
+  const parsetree::Attribute* ast = nullptr;
 };
 using Attributes = Slice<const Attribute*>;
 

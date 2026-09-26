@@ -173,7 +173,27 @@ from the port.  The two must be identical on every .cmi in the tree
    ported (`Builtin_attributes.warning_scope` only runs its body).
    The parser now records Longident inner locations (parser.mly `ldot` /
    `lapply`), which Env reports lookup errors at.
-4. `Typetexp`, `Typecore` (core expressions and patterns, `Parmatch`), with
-   ocamlc's error messages.  `CPPCAML_TYPECHECK` switches from the
-   deprecated strict pass to the port here.
+4c. **DONE:** `Typecore` (all of typecore.ml: patterns, expressions,
+   functions, applications, cases, let, binding operators, the toplevel
+   entry points), `Parmatch` (with `Patterns`), `Value_rec_check` (with
+   the part of lambda/typeopt.ml it uses) and CamlinternalFormat's
+   `fmt_ebb_of_string` for format strings.  `typing_core_parity.sh` types
+   the `let` / eval items of an implementation (`type_binding` /
+   `type_expression`, then the delayed checks) and compares the whole type
+   graph of every bound value (levels, scopes, links, abbreviation memos)
+   or the error kind and location: over cxx/harness/core_probes (189
+   feature and one-error-per-file probes), stdlib and testsuite/tests,
+   1723 files identical (1614 items) + 274 identical errors, 0 different;
+   57 files reach a Typemod / Typeclass forward (local opens, objects,
+   first-class modules) and are UNSUPPORTED until stage 5.  Both stop at
+   the first other structure item, so coverage grows with Typemod.
+   Deviations: warnings are not emitted and warning-only computations are
+   left out; the checks that only run for an enabled warning
+   (Parmatch.check_unused) run under ocamlc's default warning set
+   (`typing/warnings.hpp`), since `-w` and `[@warning]` are not
+   interpreted yet.  Typing recovery (merlin) and the cmt partial trees are
+   not ported.
+4. `CPPCAML_TYPECHECK` switches from the deprecated strict pass to the port
+   once Typemod can drive it (stage 5); ocamlc's error messages come with
+   Printtyp.
 5. `Typedecl`, `Typemod`, `Includemod`, `Includecore`, `Mtype`, then `Typeclass`.

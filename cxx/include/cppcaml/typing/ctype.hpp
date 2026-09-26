@@ -101,7 +101,8 @@ long increase_global_level();
 void restore_global_level(long gl);
 
 // with_local_level_gen ~begin_def ~structure ?before_generalize f
-void with_local_level_gen_(bool class_def, bool structure, const std::function<void()>& f);
+void with_local_level_gen_(bool class_def, bool structure, const std::function<void()>& f,
+                           const std::function<void()>& before_generalize = {});
 
 template <class F>
 auto with_local_level_generalize(F&& f) -> decltype(f()) {
@@ -112,10 +113,7 @@ auto with_local_level_generalize(F&& f) -> decltype(f()) {
 template <class F, class G>
 auto with_local_level_generalize(F&& f, G&& before_generalize) -> decltype(f()) {
   std::optional<decltype(f())> r;
-  with_local_level_gen_(false, false, [&] {
-    r.emplace(f());
-    before_generalize(*r);
-  });
+  with_local_level_gen_(false, false, [&] { r.emplace(f()); }, [&] { before_generalize(*r); });
   return std::move(*r);
 }
 template <class F>
@@ -127,6 +125,11 @@ auto with_local_level_generalize_structure(F&& f) -> decltype(f()) {
 template <class F>
 auto with_local_level_generalize_if(bool cond, F&& f) -> decltype(f()) {
   if (cond) return with_local_level_generalize(f);
+  return f();
+}
+template <class F, class G>
+auto with_local_level_generalize_if(bool cond, F&& f, G&& before_generalize) -> decltype(f()) {
+  if (cond) return with_local_level_generalize(f, before_generalize);
   return f();
 }
 template <class F>

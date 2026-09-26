@@ -780,6 +780,9 @@ PT_CTOR(StructureItemDesc, Pstr_extension) const Extension* ext; Attributes attr
 #undef PT_CTOR
 #undef PT_END
 
+// Parsetree attributes as Types records hold them (support.hpp)
+typing::Attributes types_attributes(const Attributes& l);
+
 // ---- construction from the C++ parser (parsetree_of_ast.cpp) --------------------------------
 // Locations the parser does not record yet are gap_loc(): Location.none with
 // pos_cnum = -2 (TYPECHECKER.md lists them).

@@ -570,6 +570,11 @@ struct ModuleCoercion {
     Tcoerce_none, Tcoerce_structure, Tcoerce_functor, Tcoerce_primitive, Tcoerce_alias
   };
   Kind kind;
+  // Tcoerce_alias of Env.t * Path.t * module_coercion (the other payloads
+  // come with Typemod)
+  env::t alias_env = nullptr;
+  Path::t alias_path = nullptr;
+  const ModuleCoercion* alias_coercion = nullptr;
 };
 struct FunctorParameter {  // Unit | Named of Ident.t option * string option loc * module_type
   bool is_unit;
@@ -647,6 +652,43 @@ struct PathLid {
 using OpenDescription = OpenInfos<PathLid>;
 using OpenDeclaration = OpenInfos<const ModuleExpr*>;
 
+template <class A>
+struct IncludeInfos {
+  A incl_mod;
+  Signature incl_type;
+  Location incl_loc;
+  Attributes incl_attributes;
+};
+using IncludeDeclaration = IncludeInfos<const ModuleExpr*>;
+using IncludeDescription = IncludeInfos<const ModuleType*>;
+struct TModuleTypeDeclaration {
+  Ident::t mtd_id;
+  StrLoc mtd_name;
+  Uid mtd_uid;
+  const ModuleType* mtd_type;  // option
+  Attributes mtd_attributes;
+  Location mtd_loc;
+};
+
+// class fields (Texp_object / Typeclass)
+struct ClassFieldKind {  // Tcfk_virtual of core_type | Tcfk_concrete of override_flag * expression
+  bool is_virtual;
+  const CoreType* cty = nullptr;
+  OverrideFlag ovr = OverrideFlag::Fresh;
+  const Expression* exp = nullptr;
+};
+struct ClassFieldDesc {
+  enum class Kind : std::uint8_t {
+    Tcf_inherit, Tcf_val, Tcf_method, Tcf_constraint, Tcf_initializer, Tcf_attribute
+  };
+  Kind kind;
+};
+struct ClassField {
+  const ClassFieldDesc* cf_desc;
+  Location cf_loc;
+  Attributes cf_attributes;
+};
+
 TT_CTOR(StructureItemDesc, Tstr_eval) const Expression* exp; Attributes attrs; TT_END
 TT_CTOR(StructureItemDesc, Tstr_value) RecFlag rec; Slice<const ValueBinding*> vbs; TT_END
 TT_CTOR(StructureItemDesc, Tstr_primitive) const TPrimitiveDescription* pd; TT_END
@@ -657,6 +699,27 @@ TT_CTOR(StructureItemDesc, Tstr_module) const ModuleBinding* mb; TT_END
 TT_CTOR(StructureItemDesc, Tstr_recmodule) Slice<const ModuleBinding*> mbs; TT_END
 TT_CTOR(StructureItemDesc, Tstr_open) const OpenDeclaration* od; TT_END
 TT_CTOR(StructureItemDesc, Tstr_attribute) const Attribute* attr; TT_END
+TT_CTOR(StructureItemDesc, Tstr_modtype) const TModuleTypeDeclaration* mtd; TT_END
+TT_CTOR(StructureItemDesc, Tstr_include) const IncludeDeclaration* incl; TT_END
+
+TT_CTOR(ClassFieldDesc, Tcf_inherit)
+  OverrideFlag ovr;
+  const ClassExpr* ce;
+  OptStr as;
+  Slice<std::pair<std::string_view, Ident::t>> vals;
+  Slice<std::pair<std::string_view, Ident::t>> meths;
+TT_END
+TT_CTOR(ClassFieldDesc, Tcf_val)
+  StrLoc name;
+  MutableFlag mut;
+  Ident::t id;
+  ClassFieldKind kind_;
+  bool inherited;
+TT_END
+TT_CTOR(ClassFieldDesc, Tcf_method) StrLoc name; PrivateFlag priv; ClassFieldKind kind_; TT_END
+TT_CTOR(ClassFieldDesc, Tcf_constraint) const CoreType* t1; const CoreType* t2; TT_END
+TT_CTOR(ClassFieldDesc, Tcf_initializer) const Expression* exp; TT_END
+TT_CTOR(ClassFieldDesc, Tcf_attribute) const Attribute* attr; TT_END
 
 TT_CTOR(ModuleExprDesc, Tmod_ident) Path::t path; LidLoc lid; TT_END
 TT_CTOR(ModuleExprDesc, Tmod_structure) const Structure* str; TT_END
@@ -679,6 +742,56 @@ TT_CTOR(ModuleTypeDesc, Tmty_ident) Path::t path; LidLoc lid; TT_END
 TT_CTOR(ModuleTypeDesc, Tmty_functor) FunctorParameter param; const ModuleType* body; TT_END
 TT_CTOR(ModuleTypeDesc, Tmty_typeof) const ModuleExpr* me; TT_END
 TT_CTOR(ModuleTypeDesc, Tmty_alias) Path::t path; LidLoc lid; TT_END
+
+// class expressions (class_expr_desc) and class declarations (Tstr_class)
+struct IdentExpression {  // Ident.t * expression
+  Ident::t id;
+  const Expression* exp;
+};
+TT_CTOR(ClassExprDesc, Tcl_ident) Path::t path; LidLoc lid; Slice<const CoreType*> args; TT_END
+TT_CTOR(ClassExprDesc, Tcl_structure) const ClassStructure* cs; TT_END
+TT_CTOR(ClassExprDesc, Tcl_fun)
+  ArgLabel label;
+  const Pattern* pat;
+  Slice<IdentExpression> args;
+  const ClassExpr* ce;
+  Partial partial;
+TT_END
+TT_CTOR(ClassExprDesc, Tcl_apply) const ClassExpr* ce; Slice<LabeledArg> args; TT_END
+TT_CTOR(ClassExprDesc, Tcl_let)
+  RecFlag rec;
+  Slice<const ValueBinding*> vbs;
+  Slice<IdentExpression> vals;
+  const ClassExpr* ce;
+TT_END
+TT_CTOR(ClassExprDesc, Tcl_constraint)
+  const ClassExpr* ce;
+  const ClassType* cty;  // option
+  Slice<std::string_view> vals;           // visible instance variables
+  Slice<std::string_view> meths;          // methods
+  Slice<std::string_view> concrete_meths;  // Types.MethSet.t
+TT_END
+TT_CTOR(ClassExprDesc, Tcl_open) const OpenDescription* od; const ClassExpr* ce; TT_END
+template <class A>
+struct ClassInfos {  // 'a class_infos
+  VirtualFlag ci_virt;
+  Slice<TypeParam> ci_params;
+  StrLoc ci_id_name;
+  Ident::t ci_id_class;
+  Ident::t ci_id_class_type;
+  Ident::t ci_id_object;
+  A ci_expr;
+  const typing::ClassDeclaration* ci_decl;
+  const typing::ClassTypeDeclaration* ci_type_decl;
+  Location ci_loc;
+  Attributes ci_attributes;
+};
+using TClassDeclaration = ClassInfos<const ClassExpr*>;
+struct ClassDeclarationItem {  // class_declaration * string list
+  const TClassDeclaration* decl;
+  Slice<std::string_view> names;
+};
+TT_CTOR(StructureItemDesc, Tstr_class) Slice<ClassDeclarationItem> classes; TT_END
 
 #undef TT_CTOR
 #undef TT_END

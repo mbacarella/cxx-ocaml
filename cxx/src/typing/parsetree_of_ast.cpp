@@ -13,6 +13,14 @@
 
 namespace cppcaml::typing::parsetree {
 
+typing::Attributes types_attributes(const Attributes& l) {
+  std::vector<const typing::Attribute*> out;
+  for (const Attribute* a : l)
+    out.push_back(make<typing::Attribute>(
+        typing::Attribute{a->attr_name.txt, a->attr_name.loc, nullptr, a->attr_loc, a}));
+  return slice(out);
+}
+
 Location gap_loc() {
   Location l = location::none();
   l.loc_start.pos_cnum = -2;

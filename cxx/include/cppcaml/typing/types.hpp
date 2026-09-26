@@ -404,9 +404,15 @@ struct ValueKind {
   Kind kind = Kind::Val_reg;
   const PrimitiveDescription* prim = nullptr;  // Val_prim
   MutableFlag ivar_mut = MutableFlag::Immutable;  // Val_ivar
-  std::string_view ivar_name;                     // Val_ivar
-  // Val_self / Val_anc never occur in a cmi; their payload is ported with
-  // Typeclass.
+  std::string_view ivar_name;                     // Val_ivar: the class number
+  // Val_self (sign, meths, vars, cl_num) / Val_anc (sign, meths, cl_num); they
+  // never occur in a cmi.  `meths` is Self_concrete's map, Self_virtual's ref
+  // (self_virtual), or Val_anc's map.
+  ClassSignature* sign = nullptr;
+  bool self_virtual = false;
+  StrMap<Ident::t>* meths = nullptr;
+  StrMap<Ident::t> vars{};                        // Val_self
+  std::string_view cl_num;                        // Val_self / Val_anc
 };
 
 struct ValueDescription {

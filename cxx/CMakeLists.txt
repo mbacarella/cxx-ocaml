@@ -58,6 +58,16 @@ add_library(cppcaml_core
   src/typing/parsetree_of_ast.cpp
   src/typing/typedtree.cpp
   src/typing/typetexp.cpp
+  src/typing/typecore_util.cpp
+  src/typing/typecore_pat.cpp
+  src/typing/typecore_app.cpp
+  src/typing/typecore_exp.cpp
+  src/typing/typecore_fun.cpp
+  src/typing/typecore_let.cpp
+  src/typing/camlinternal_format.cpp
+  src/typing/parmatch.cpp
+  src/typing/typeopt.cpp
+  src/typing/value_rec_check.cpp
   src/typing/cmi_format.cpp)
 target_include_directories(cppcaml_core PUBLIC include)
 # The typing/ port initializes aggregates partially on purpose (an OCaml
