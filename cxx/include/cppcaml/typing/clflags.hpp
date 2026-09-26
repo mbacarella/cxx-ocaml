@@ -25,5 +25,7 @@ inline bool dont_write_files = false;
 inline bool locations = true;             // -dno-locations
 inline bool unique_ids = true;            // -dno-unique-ids
 inline bool annotations = false;          // -annot
-inline bool afl_instrument = false;       // -afl-instrument (native)     // -i (print the interface, write nothing)
+inline bool afl_instrument = false;       // -afl-instrument (native)
+inline long match_context_rows = 32;      // -match-context-rows
+inline bool safer_matching = false;       // -safer-matching
 }  // namespace cppcaml::typing::clflags

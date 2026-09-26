@@ -52,10 +52,9 @@ using L::LetKind;
 using tt::Partial;
 using typedtree::as;
 
-// Clflags settings clflags.hpp does not have yet (ocamlc's defaults)
-long match_context_rows = 32;  // -match-context-rows
-bool safer_matching = false;   // -safer-matching
-bool afl_instrument = false;   // -afl-instrument (Config.afl_instrument)
+using clflags::afl_instrument;
+using clflags::match_context_rows;
+using clflags::safer_matching;
 
 [[noreturn]] void fatal_error(const char* msg) { throw std::logic_error(msg); }
 

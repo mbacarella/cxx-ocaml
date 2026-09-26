@@ -6,7 +6,8 @@
 # in a scratch directory against the stdlib, by ocamlc.opt and by
 # c++ocamlc's new translation path (CPPCAML_NEWLAMBDA=1).
 #
-# Usage: lambda_port_parity.sh [file.ml ...]   (JOBS=, DUMP=drawlambda|dlambda)
+# Usage: lambda_port_parity.sh [file.ml ...]   (JOBS=, DUMP=drawlambda|dlambda,
+#   FLAGS= extra flags for both compilers, e.g. absolute -I dirs)
 #   no args: cxx/harness/stamp_probes
 #   SAME / DIFF / CFAIL (the port failed or produced nothing) / OFAIL
 set -u
@@ -15,16 +16,23 @@ ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 cd "$ROOT" || exit 1
 JOBS="${JOBS:-8}"
 DUMP="${DUMP:-drawlambda}"
-export DUMP
+FLAGS="${FLAGS:-}"
+export DUMP FLAGS
 CPP="${CPP:-$ROOT/cxx/build-release/c++ocamlc}"
 OUT=/tmp/lambda_port_parity
 
 if [ "${1:-}" == "--worker" ]; then
   f="$2"; b=$(basename "$f"); key=$(echo "$f" | tr '/' '_')
   w=$(mktemp -d); mkdir "$w/o" "$w/c"; cp "$f" "$w/o/"; cp "$f" "$w/c/"
-  ( cd "$w/o" && timeout 120 "$ROOT/ocamlc.opt" -nostdlib -I "$ROOT/stdlib" -w -a -"$DUMP" -c "$b" ) \
+  i="${f%.ml}.mli"
+  if [ -f "$i" ]; then  # a sibling interface: each compiler compiles it first
+    cp "$i" "$w/o/"; cp "$i" "$w/c/"
+    ( cd "$w/o" && timeout 120 "$ROOT/ocamlc.opt" -nostdlib -I "$ROOT/stdlib" -w -a $FLAGS -c "${b}i" ) >/dev/null 2>&1
+    ( cd "$w/c" && timeout 120 "$CPP" -I "$ROOT/stdlib" -w -a $FLAGS -c "${b}i" ) >/dev/null 2>&1
+  fi
+  ( cd "$w/o" && timeout 120 "$ROOT/ocamlc.opt" -nostdlib -I "$ROOT/stdlib" -w -a $FLAGS -"$DUMP" -c "$b" ) \
       >/dev/null 2>"$OUT/$key.o"; orc=$?
-  ( cd "$w/c" && CPPCAML_NEWLAMBDA=1 timeout 120 "$CPP" -I "$ROOT/stdlib" -w -a -"$DUMP" -stop-after lambda -c "$b" ) \
+  ( cd "$w/c" && CPPCAML_NEWLAMBDA=1 timeout 120 "$CPP" -I "$ROOT/stdlib" -w -a $FLAGS -"$DUMP" -stop-after lambda -c "$b" ) \
       >/dev/null 2>"$OUT/$key.c"; crc=$?
   rm -rf "${w:?}"
   if [ $orc -ne 0 ]; then printf 'OFAIL %s\n' "$f"
