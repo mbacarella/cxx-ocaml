@@ -19382,6 +19382,18 @@ static bool fident_body_off() {
                           cppcaml::dbg_env("NOSHARE624") != nullptr;
   return off;
 }
+// S625: the HIGHER-ORDER parameters of the functors whose body is being
+// emitted (`(P1 : S0 -> S0')`), as functor items -- an application `P1(M0)`
+// in the body resolves against them after the body's own earlier items and
+// before the enclosing scope's (the param shadows an outer functor).
+// Unresolved, `module X = P1(M0)` was DROPPED from the result, and every
+// later field of it sat one slot too low.
+static const std::vector<cmi::cmiw::SigItem>* g_fparam_functors = nullptr;
+static bool hoapp_off() {
+  static const bool off = cppcaml::dbg_env("NOHOAPP") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE625") != nullptr;
+  return off;
+}
 static bool with_local_mt_off() {
   static const bool off = cppcaml::dbg_env("NOWITHLOCMT") != nullptr ||
                           cppcaml::dbg_env("NOSHARE621") != nullptr;
@@ -20683,10 +20695,25 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
   return out;
 }
 
+// The emitting file's `module type` ASTs (see infer_signature).
+static const std::unordered_map<std::string, const ast::Signature*>*
+    g_outer_modtype_asts = nullptr;
+static bool sig_inc_outer_off() {
+  static const bool off = cppcaml::dbg_env("NOSIGINCOUTER") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE625") != nullptr;
+  return off;
+}
+
 std::vector<cmi::cmiw::SigItem> signature_to_cmi(
     const ast::Signature& s,
     const std::unordered_map<std::string, const ast::Signature*>* outer,
     const std::unordered_map<std::string, const ast::Signature*>* outer_mods) {
+  // Emitting a .ml, an inline signature (`module M : sig include S0 val z :
+  // int end = ..`, a param or ascribed modtype's body) sees the structure's
+  // own `module type` decls: `include S0` of one resolved to nothing, the
+  // included members were DROPPED, and `M.z` sat in k's slot -- a consumer
+  // read the wrong field (S625; NOSIGINCOUTER reverts).
+  if (!outer && !sig_inc_outer_off()) outer = g_outer_modtype_asts;
   return signature_to_cmi_i(s, outer, outer_mods, nullptr);
 }
 
@@ -20878,11 +20905,10 @@ static void subst_param_items(std::vector<cmi::cmiw::SigItem>& items,
   }
 }
 
-// The emitting file's `module type` ASTs and opened-modtype qualifications,
+// The emitting file's `module type` ASTs (g_outer_modtype_asts, declared
+// above signature_to_cmi) and opened-modtype qualifications,
 // visible to nested functor-body inference (set by infer_signature around its
 // emission loop; restored on return so recursion nests correctly).
-static const std::unordered_map<std::string, const ast::Signature*>*
-    g_outer_modtype_asts = nullptr;
 static const std::unordered_map<std::string, std::string>*
     g_outer_modtype_quals = nullptr;
 // The emitting file's module value exports (Checker::modenv, flat by simple
@@ -21690,6 +21716,25 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
     }
     std::vector<cmi::cmiw::SigItem> result;
     std::string result_ref;
+    // This functor's higher-order params (innermost-first, so a later param
+    // shadows an earlier one), then the enclosing functors'.  A plain param
+    // of the same name shadows an outer higher-order one: it is dropped.
+    std::vector<cmi::cmiw::SigItem> fparam_functors;
+    for (auto p = ps.rbegin(); p != ps.rend(); ++p)
+      if (!p->fsig.empty()) fparam_functors.push_back(p->fsig[0]);
+    if (g_fparam_functors)
+      for (auto& si : *g_fparam_functors) {
+        bool shadowed = false;
+        for (auto& p : ps) if (p.name == si.name) shadowed = true;
+        if (!shadowed) fparam_functors.push_back(si);
+      }
+    auto* saved_fparam_functors = g_fparam_functors;
+    if (!hoapp_off()) g_fparam_functors = &fparam_functors;
+    struct RestoreFparams {
+      const std::vector<cmi::cmiw::SigItem>*& g;
+      const std::vector<cmi::cmiw::SigItem>* v;
+      ~RestoreFparams() { g = v; }
+    } restore_fparams{g_fparam_functors, saved_fparam_functors};
     if (auto* bs = std::get_if<Pmod_structure>(&cur->desc)) {
       std::vector<std::pair<std::string, const ast::ModuleType*>> fps;
       for (auto& p : ps)
@@ -21920,6 +21965,7 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
     std::vector<cmi::cmiw::SigItem> result;
     std::string result_ref;  // a local functor's Mty_ident result (`: Priv`)
     bool resolved = false;
+    bool from_fparam = false;  // the head is a higher-order parameter (S625)
     // Chase local ALIAS bindings first (`module F' = F; module C = F'(A)`):
     // a bare alias item redirects the head to its target (index_aliases).
     for (int hop = 0; hop < 4 && comps.size() == 1; ++hop) {
@@ -21943,7 +21989,7 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
       // requiring items here dropped B entirely (a layout shift, B takes a
       // runtime field).  Inside a functor body, a sibling functor from the
       // ENCLOSING scope (g_outer_prior) resolves too.
-      for (auto* scope : {prior, g_outer_prior}) {
+      for (auto* scope : {prior, g_fparam_functors, g_outer_prior}) {
         if (!scope || resolved) continue;
         for (auto& si : *scope)
           if (si.k == cmi::cmiw::SigItem::Module && si.is_functor &&
@@ -21953,6 +21999,7 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
             for (auto& n : si.more_param_names) pnames.push_back(n);
             result = si.sub;  // fresh item; subst clones every node it touches
             result_ref = si.functor_result_ref;
+            from_fparam = scope == g_fparam_functors;
             resolved = true;
             break;
           }
@@ -22315,6 +22362,9 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
       for (auto& cp : comps) { if (!app.empty()) app += '.'; app += cp; }
       if (stdlib_unit_head) app = "Stdlib__" + app;
       for (auto& ap : argpaths) app += "(" + ap + ")";
+      // A parameter's named result modtype (`P1 : S0 -> S0'`) is expanded
+      // and strengthened at `P1(M0)`, as ocamlc's Mtype.strengthen scrapes.
+      if (from_fparam) item.modtype_ref.clear();
       if (item.is_functor) {
         app += "(" + item.functor_param + ")";
         for (auto& pn : item.more_param_names) app += "(" + pn + ")";
@@ -22446,6 +22496,15 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
   auto* saved_fields = g_outer_fields;
   g_outer_fields = &ck;
   g_outer_modtype_asts = &ck.modtype_sig_asts_;
+  // A nested structure's own checker knows only ITS modtypes: overlay them
+  // on the enclosing levels' so `module B : sig include S0 .. end` inside
+  // `module A = struct .. end` resolves an outer S0 (S625, NOSIGINCOUTER).
+  std::unordered_map<std::string, const ast::Signature*> merged_mt_asts;
+  if (saved_mt_asts && !sig_inc_outer_off()) {
+    merged_mt_asts = *saved_mt_asts;
+    for (auto& [n, sg] : ck.modtype_sig_asts_) merged_mt_asts[n] = sg;
+    g_outer_modtype_asts = &merged_mt_asts;
+  }
   g_outer_modtype_quals = &ck.opened_modtype_quals_;
   g_outer_modenv = &ck.modenv;
   g_outer_venv = &ck.venv;
@@ -23173,6 +23232,11 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
                     }
                     if (!m.empty()) { si.sub = std::move(m); si.modtype_ref.clear(); }
                   }
+                  // Already resolved (the param sig's own conversion sees
+                  // the file's modtypes, S625): expanded all the same.
+                  if (!si.sub.empty() && !si.modtype_ref.empty() &&
+                      !sig_inc_outer_off())
+                    si.modtype_ref.clear();
                   mat_refs(si.sub);
                 }
               };
