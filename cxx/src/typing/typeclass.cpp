@@ -273,7 +273,7 @@ const pt::Expression* make_method(const Location& loc, std::string_view cl_num, 
       mkd(pt::Ppat_var{{pt::PatternDesc::Kind::Ppat_var}, pt::StrLoc{"self-*", loc}}), loc);
   const pt::Pattern* pat = ah::pat_mk(
       mkd(pt::Ppat_alias{{pt::PatternDesc::Kind::Ppat_alias}, var,
-                         pt::StrLoc{zstr(std::string("self-") + std::string(cl_num)), loc}}),
+                         pt::StrLoc{zborrow(std::string("self-") + std::string(cl_num)), loc}}),
       loc);
   pt::FunctionParamDesc pd{pt::FunctionParamDesc::Kind::Pparam_val};
   pd.label = ArgLabel::nolabel();
@@ -1742,7 +1742,7 @@ std::pair<const tt::ClassExpr*, const ClassType*> class_declaration(env::t env, 
                                                                     const pt::ClassExpr* sexpr) {
   ++class_num;
   long self_scope = ctype::get_current_level();
-  const tt::ClassExpr* expr = class_expr(zstr(std::to_string(class_num)),
+  const tt::ClassExpr* expr = class_expr(zborrow(std::to_string(class_num)),
                                          Final::Definitely_not_final, env, env, virt, self_scope, sexpr);
   ClassSignature* sign = signature_of_class_type(expr->cl_type);
   update_class_signature(expr->cl_loc, env, virt, Kind::Class, sign);
@@ -1765,7 +1765,7 @@ std::pair<const tt::ClassType*, const ClassType*> class_description(env::t env, 
 std::pair<const tt::ClassStructure*, std::vector<std::string_view>> type_object(env::t env, const Location& loc,
                                                                                 const pt::ClassStructure* s) {
   ++class_num;
-  const tt::ClassStructure* desc = class_structure(zstr(std::to_string(class_num)), VirtualFlag::Concrete,
+  const tt::ClassStructure* desc = class_structure(zborrow(std::to_string(class_num)), VirtualFlag::Concrete,
                                                    lowest_level, Final::Definitely_final, env, env, loc, s);
   ctype::hide_private_methods(desc->cstr_type);
   std::vector<std::string_view> meths = public_methods(desc->cstr_type);
@@ -1826,6 +1826,10 @@ const pt::ClassDescription* approx_class(const pt::ClassDescription* sdecl) {
 }
 
 }  // namespace
+
+// the module-initialization values of typeclass.ml, created at startup (see
+// typemod::install_forward_refs)
+void module_init() { (void)unbound_class(); }
 
 std::pair<std::vector<ClassInfo<const tt::TClassDeclaration*>>, env::t> class_declarations(
     env::t env, Slice<const pt::ClassDeclaration*> cls) {

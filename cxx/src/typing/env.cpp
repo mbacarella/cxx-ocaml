@@ -416,9 +416,21 @@ static ModuleComponents* components_of_module(StrMap<std::string_view> alerts, c
 // ---- persistent structures ---------------------------------------------------
 static persistent_env::PersistentEnv<const ModuleData*> g_persistent_env;
 
+// hashcons_name: the first string of each unit name, for the whole process
+// (the persistent idents of one unit share one string across resets)
+static std::string_view hashcons_name(std::string_view name) {
+  static std::unordered_map<std::string, std::string_view> names;
+  auto [it, fresh] = names.try_emplace(std::string(name), std::string_view{});
+  if (fresh) {
+    ZoneScope perm(permanent_zone());
+    it->second = zborrow(name);
+  }
+  return it->second;
+}
+
 static const ModuleData* sign_of_cmi(bool freshen, const persistent_env::PersistentSignature& ps) {
   const auto& cmi = ps.cmi;
-  Ident::t id = Ident::create_persistent(cmi.cmi_name);  // hashcons_name: same string
+  Ident::t id = Ident::create_persistent(hashcons_name(cmi.cmi_name));
   Path::t path = Path::pident(id);
   StrMap<std::string_view> alerts;
   for (auto& f : cmi.cmi_flags)
@@ -439,6 +451,18 @@ static const ModuleData* sign_of_cmi(bool freshen, const persistent_env::Persist
 
 static const ModuleData* read_sign_of_cmi(const persistent_env::PersistentSignature& ps) {
   return sign_of_cmi(true, ps);
+}
+
+cmi_format::CmiInfos save_signature(StrMap<std::string_view> alerts, Signature sg, const std::string& modname,
+                                    const std::string& filename) {
+  btype::cleanup_abbrev_memo();
+  subst::reset_for_saving();
+  Signature ssg = subst::signature(subst::Scoping::make_local(), subst::for_saving(subst::identity()), sg);
+  cmi_format::CmiInfos cmi = g_persistent_env.make_cmi(modname, ssg, alerts);
+  persistent_env::PersistentSignature pers_sig{filename, cmi, load_path::Visibility::Visible};
+  const ModuleData* pm = sign_of_cmi(false, pers_sig);  // save_sign_of_cmi
+  g_persistent_env.save_cmi(pers_sig, pm);
+  return cmi;
 }
 
 const ModuleData* find_pers_mod(bool allow_hidden, const std::string& name) {
@@ -1598,7 +1622,7 @@ t enter_unbound_value(std::string_view name, ValueUnboundReason reason, t env) {
   e->values = idtbl_add(id, static_cast<const ValueEntry*>(make<ValueEntry>(false, nullptr, reason)),
                         env->values);
   Summary s{Summary::Kind::Env_value_unbound, env->summary};
-  s.name = zstr(name);
+  s.name = zborrow(name);
   s.value_reason = reason;
   e->summary = summ(s);
   return e;
@@ -1613,7 +1637,7 @@ t enter_unbound_module(std::string_view name, ModuleUnboundReason reason, t env)
           make<ModuleEntry>(ModuleEntry::Kind::Mod_unbound, nullptr, reason)),
       env->modules);
   Summary s{Summary::Kind::Env_module_unbound, env->summary};
-  s.name = zstr(name);
+  s.name = zborrow(name);
   s.module_reason = reason;
   e->summary = summ(s);
   return e;
@@ -2231,7 +2255,7 @@ InstanceVariable lookup_instance_variable(bool use, const Location& loc, std::st
     r = idtbl_find_name(wrap_value, use, name, env->values);
   } catch (const NotFound&) {
     LookupError e = lerr(LookupError::Kind::Unbound_instance_variable);
-    e.name = zstr(name);
+    e.name = zborrow(name);
     lookup_error(loc, env, e);
   }
   auto [path, entry] = r;
@@ -2240,7 +2264,7 @@ InstanceVariable lookup_instance_variable(bool use, const Location& loc, std::st
     if (desc->val_kind.kind == ValueKind::Kind::Val_ivar)
       return {path, desc->val_kind.ivar_mut, desc->val_kind.ivar_name, desc->val_type};
     LookupError e = lerr(LookupError::Kind::Not_an_instance_variable);
-    e.name = zstr(name);
+    e.name = zborrow(name);
     lookup_error(loc, env, e);
   }
   using RK = ValueUnboundReason::Kind;
@@ -2250,12 +2274,12 @@ InstanceVariable lookup_instance_variable(bool use, const Location& loc, std::st
     case RK::Val_unbound_self:
     case RK::Val_unbound_ancestor: {
       LookupError e = lerr(LookupError::Kind::Not_an_instance_variable);
-      e.name = zstr(name);
+      e.name = zborrow(name);
       lookup_error(loc, env, e);
     }
     case RK::Val_unbound_ghost_recursive: {
       LookupError e = lerr(LookupError::Kind::Unbound_instance_variable);
-      e.name = zstr(name);
+      e.name = zborrow(name);
       lookup_error(loc, env, e);
     }
   }

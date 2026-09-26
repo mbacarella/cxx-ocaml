@@ -702,7 +702,7 @@ TypeResult merge_type(bool destructive, env::t env, const Location& loc, Signatu
       decl_row->type_immediate = TypeImmediacy::Unknown;
       decl_row->type_unboxed_default = false;
       decl_row->type_uid = uid;
-      Ident::t id_row = Ident::create_local(zstr(std::string(s) + "#row"));
+      Ident::t id_row = Ident::create_local(zborrow(std::string(s) + "#row"));
       env::t initial_env = env::add_type(false, id_row, decl_row, env);
       env::t sig_env = env::add_signature(sg_for_env, sig_env0);
       const tt::TTypeDeclaration* tdecl =

@@ -5,10 +5,10 @@ namespace cppcaml::typing {
 
 using K = Longident::Kind;
 
-Longident::t Longident::lident(std::string_view s) { return make<Longident>(K::Lident, zstr(s)); }
+Longident::t Longident::lident(std::string_view s) { return make<Longident>(K::Lident, zborrow(s)); }
 Longident::t Longident::ldot(t prefix, const Location& prefix_loc, std::string_view s,
                              const Location& s_loc) {
-  return make<Longident>(K::Ldot, zstr(s), s_loc, prefix, prefix_loc);
+  return make<Longident>(K::Ldot, zborrow(s), s_loc, prefix, prefix_loc);
 }
 Longident::t Longident::lapply(t f, const Location& f_loc, t a, const Location& a_loc) {
   return make<Longident>(K::Lapply, std::string_view{}, Location{}, f, f_loc, a, a_loc);
@@ -110,8 +110,8 @@ t of_ast(const ast::Longident& lid, const Location& loc) {
 
 Location loc_of_ast(const ast::Location& l, std::string_view fname) {
   Location r;
-  r.loc_start = Position{zstr(fname), l.start.lnum, l.start.bol, l.start.cnum};
-  r.loc_end = Position{zstr(fname), l.end.lnum, l.end.bol, l.end.cnum};
+  r.loc_start = Position{zborrow(fname), l.start.lnum, l.start.bol, l.start.cnum};
+  r.loc_end = Position{zborrow(fname), l.end.lnum, l.end.bol, l.end.cnum};
   r.loc_ghost = l.ghost;
   return r;
 }

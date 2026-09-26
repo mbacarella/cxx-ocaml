@@ -2294,6 +2294,13 @@ int main(int argc, char** argv) {
       return 1;
     }
   }
+  // cmic FILE.cmi: the cmi dump with ident stamps and type ids renumbered by
+  // first visit (compares .cmi files written by different processes)
+  if (argc == 3 && std::string(argv[1]) == "cmic") {
+    canonical = true;
+    argv[1] = argv[2];
+    argc = 2;
+  }
   if (argc == 4 && std::string(argv[1]) == "env") {
     try {
       return run_env(argv[2], argv[3]);

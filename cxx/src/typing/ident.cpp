@@ -19,7 +19,7 @@ void (*unscoped_change_log)(const Unscoped::Change&) = nullptr;
 
 Unscoped* Unscoped::create(std::string_view s) {
   ++g_currentstamp;
-  return make<Unscoped>(State::Udesc, zstr(s), g_currentstamp, nullptr);
+  return make<Unscoped>(State::Udesc, zborrow(s), g_currentstamp, nullptr);
 }
 
 Unscoped::Desc Unscoped::get_desc(const Unscoped* us) {
@@ -65,12 +65,12 @@ using K = Ident::Kind;
 
 Ident::t Ident::create_scoped(int scope, std::string_view s) {
   ++ident::g_currentstamp;
-  return make<Ident>(K::Scoped, zstr(s), ident::g_currentstamp, scope, nullptr);
+  return make<Ident>(K::Scoped, zborrow(s), ident::g_currentstamp, scope, nullptr);
 }
 
 Ident::t Ident::create_local(std::string_view s) {
   ++ident::g_currentstamp;
-  return make<Ident>(K::Local, zstr(s), ident::g_currentstamp, 0, nullptr);
+  return make<Ident>(K::Local, zborrow(s), ident::g_currentstamp, 0, nullptr);
 }
 
 Ident::t Ident::of_unscoped(ident::Unscoped* u) {
@@ -79,16 +79,16 @@ Ident::t Ident::of_unscoped(ident::Unscoped* u) {
 
 Ident::t Ident::create_predef(std::string_view s) {
   ++ident::g_predefstamp;
-  return make<Ident>(K::Predef, zstr(s), ident::g_predefstamp, 0, nullptr);
+  return make<Ident>(K::Predef, zborrow(s), ident::g_predefstamp, 0, nullptr);
 }
 
 Ident::t Ident::create_persistent(std::string_view s) {
-  return make<Ident>(K::Global, zstr(s), 0, 0, nullptr);
+  return make<Ident>(K::Global, zborrow(s), 0, 0, nullptr);
 }
 
 Ident::t Ident::make_raw(Kind k, std::string_view name, int stamp, int scope,
                          ident::Unscoped* us) {
-  return make<Ident>(k, zstr(name), stamp, scope, us);
+  return make<Ident>(k, zborrow(name), stamp, scope, us);
 }
 
 namespace ident {

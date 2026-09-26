@@ -985,7 +985,7 @@ const tt::ModuleExpr* type_module(env::t env, const pt::ModuleExpr* smod) {
 }
 TypeStructureResult type_structure_(bool toplevel, bool funct_body, Path::t anchor, env::t env, pt::Structure sstr) {
   StructureTyped st = type_structure_s(toplevel, funct_body, anchor, env, sstr);
-  return {st.str, st.sg, st.names, st.env};
+  return {st.str, st.sg, st.names, st.env, st.shape};
 }
 TypeStructureResult type_structure(env::t env, pt::Structure sstr) {
   return type_structure_(false, false, nullptr, env, sstr);

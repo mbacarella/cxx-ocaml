@@ -205,7 +205,7 @@ const ConstructorDescription* extension_descr(const UnitInfo* current_unit, Path
   tag.ext_path = path_ext;
   tag.ext_constant = ca.args.empty();
   return make<ConstructorDescription>(
-      zstr(path::last(path_ext)), ty_res, slice(ca.existentials), slice(ca.args),
+      zborrow(path::last(path_ext)), ty_res, slice(ca.existentials), slice(ca.args),
       static_cast<long>(ca.args.size()), tag, -1L, -1L, ext->ext_ret_type != nullptr,
       ext->ext_private, ext->ext_loc, ext->ext_attributes, ca.inlined, ext->ext_uid);
 }

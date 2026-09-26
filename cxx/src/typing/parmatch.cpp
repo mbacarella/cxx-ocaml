@@ -304,6 +304,10 @@ bool all_coherent(const std::vector<const Head*>& column) {
 
 }  // namespace
 
+// the module-initialization values of parmatch.ml, created at startup (see
+// typemod::install_forward_refs)
+void module_init() { (void)extra_pat(); }
+
 // ---- compatibility check -----------------------------------------------------------------
 namespace {
 bool is_absent(std::string_view tag, const tt::RowDescRef* row) {
@@ -1006,7 +1010,7 @@ const tt::Pattern* build_other(Path::t ext, const std::vector<std::pair<const He
           tag = "AnyOtherTag";
           while (mem(tag)) tag += "'";
         }
-        return make_other_pat(zstr(tag), true);
+        return make_other_pat(zborrow(tag), true);
       }
       const tt::Pattern* p_res = others[0];
       for (std::size_t k = 1; k < others.size(); ++k)
@@ -1050,7 +1054,7 @@ const tt::Pattern* build_other(Path::t ext, const std::vector<std::pair<const He
           std::size_t i = 0;
           while (std::find(all.begin(), all.end(), i) != all.end()) ++i;
           tt::Constant c{CK::Const_string};
-          c.s = zstr(std::string(i, '*'));
+          c.s = zborrow(std::string(i, '*'));
           c.str_loc = location::none();
           return constant_pat(c);
         }
@@ -1065,7 +1069,7 @@ const tt::Pattern* build_other(Path::t ext, const std::vector<std::pair<const He
           };
           while (mem(f)) f += 1.0;
           tt::Constant c{CK::Const_float};
-          c.s = zstr(string_of_float(f));
+          c.s = zborrow(string_of_float(f));
           return constant_pat(c);
         }
       }

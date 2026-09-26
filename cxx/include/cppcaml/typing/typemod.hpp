@@ -81,6 +81,7 @@ struct TypeStructureResult {
   Signature sg;
   SignatureNames* names;
   env::t env;
+  shape::t shape = nullptr;
 };
 const tt::ModuleExpr* type_module(env::t env, const pt::ModuleExpr* smod);
 TypeStructureResult type_structure(env::t env, pt::Structure sstr);

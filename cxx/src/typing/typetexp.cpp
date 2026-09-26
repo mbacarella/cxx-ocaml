@@ -64,7 +64,7 @@ bool is_in_scope(std::string_view name) { return type_variables.mem(name); }
 static void add(std::string_view name, TypeExpr* v, bool* unused = nullptr) {
   if (!not_generic(v)) throw std::logic_error("Typetexp.TyVarEnv.add");
   if (!unused) unused = make<bool>(false);
-  type_variables = type_variables.add(zstr(name), {v, unused});
+  type_variables = type_variables.add(zborrow(name), {v, unused});
 }
 
 Context narrow() { return Context{ctype::increase_global_level(), type_variables}; }
@@ -106,7 +106,7 @@ static auto with_univars(const PolyUnivars& new_ones, F&& f) -> decltype(f()) {
 PolyUnivars make_poly_univars(const std::vector<std::string_view>& vars) {
   PolyUnivars out;
   for (auto name : vars)
-    out.push_back({zstr(name), make<PendingUnivar>(PendingUnivar{ctype::newvar(OptStr::of(name)), {}})});
+    out.push_back({zborrow(name), make<PendingUnivar>(PendingUnivar{ctype::newvar(OptStr::of(name)), {}})});
   return out;
 }
 
@@ -191,7 +191,7 @@ static TypeExpr* lookup_local(const std::vector<TyOptRef*>& row_context, std::st
 static void remember_used(std::string_view name, TypeExpr* v, const Location& loc) {
   if (!not_generic(v)) throw std::logic_error("Typetexp.remember_used");
   bool* unused = make<bool>(false);
-  used_variables = used_variables.add(zstr(name), UsedVar{v, loc, unused});
+  used_variables = used_variables.add(zborrow(name), UsedVar{v, loc, unused});
 }
 
 enum class Flavor { Unification, Universal };
@@ -358,7 +358,7 @@ static const tt::CoreType* transl_type_param_(env::t env, const pt::CoreType* st
     if (ty_var_env::is_in_scope(v->name)) throw AlreadyBound{};
     TypeExpr* ty = new_global_var(OptStr::of(v->name));
     ty_var_env::add(v->name, ty);
-    return make<tt::CoreType>(make<tt::Ttyp_var>(tt::Ttyp_var{{TK::Ttyp_var}, zstr(v->name)}), ty, env,
+    return make<tt::CoreType>(make<tt::Ttyp_var>(tt::Ttyp_var{{TK::Ttyp_var}, zborrow(v->name)}), ty, env,
                               loc, styp->ptyp_attributes);
   }
   throw std::logic_error("Typetexp.transl_type_param");
@@ -424,7 +424,7 @@ static const tt::CoreType* transl_type_aux(env::t env, const RowContext& row_con
         ty_var_env::remember_used(name, v, styp->ptyp_loc);
         ty = v;
       }
-      return ctyp(make<tt::Ttyp_var>(tt::Ttyp_var{{TK::Ttyp_var}, zstr(name)}), ty);
+      return ctyp(make<tt::Ttyp_var>(tt::Ttyp_var{{TK::Ttyp_var}, zborrow(name)}), ty);
     }
     case PK::Ptyp_arrow: {
       auto* a = as<pt::Ptyp_arrow>(sd);
@@ -590,7 +590,7 @@ static const tt::CoreType* transl_type_aux(env::t env, const RowContext& row_con
         long h = hash_variant(l);
         auto it = hfields.find(h);
         if (it == hfields.end()) {
-          hfields.emplace(h, std::make_pair(zstr(l), f));
+          hfields.emplace(h, std::make_pair(zborrow(l), f));
           return;
         }
         auto [l2, f2] = it->second;
@@ -806,7 +806,7 @@ static std::pair<TypeExpr*, Slice<const tt::ObjectField*>> transl_fields(
   auto add_typed_field = [&](const Location& loc, std::string_view l, TypeExpr* ty) {
     auto it = hfields.find(l);
     if (it == hfields.end()) {
-      hfields.emplace(zstr(l), ty);
+      hfields.emplace(zborrow(l), ty);
       return;
     }
     TypeExpr* ty2 = it->second;

@@ -33,7 +33,7 @@ static Slice<tt::ExpExtraItem> cons_extra(const tt::ExpExtra& e, const Location&
   return slice(v);
 }
 static Longident::t self_lid(std::string_view cl_num) {
-  return Longident::lident(zstr(std::string("self-") + std::string(cl_num)));
+  return Longident::lident(zborrow(std::string("self-") + std::string(cl_num)));
 }
 
 const tt::Expression* type_exp_r(Recarg recarg, env::t env, const pt::Expression* sexp) {

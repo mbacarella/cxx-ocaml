@@ -294,6 +294,10 @@ struct RecordRepresentation {
   bool unboxed_inlined = false;  // Record_unboxed
   long inlined_tag = 0;          // Record_inlined
   Path::t extension = nullptr;   // Record_extension
+  // A block representation's identity (copies keep it; the .cmi writer
+  // shares by it): typedecl's `Record_unboxed false` is one static constant,
+  // a cmi's are one per marshaled block.  Not part of equality.
+  const void* obj = nullptr;
 };
 
 enum class VariantRepresentation : std::uint8_t { Variant_regular, Variant_unboxed };

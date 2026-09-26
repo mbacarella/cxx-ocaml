@@ -15,6 +15,10 @@ Zone& permanent_zone() { return g_default_zone; }
 void set_zone(Zone* z) { g_zone = z ? z : &g_default_zone; }
 ZoneScope::ZoneScope(Zone& z) : saved(g_zone) { g_zone = &z; }
 ZoneScope::~ZoneScope() { g_zone = saved; }
+std::string_view zborrow(std::string_view s) {
+  if (s.data() && (g_default_zone.owns(s.data()) || g_zone->owns(s.data()))) return s;
+  return zone().str(s);
+}
 
 Location location::none() {
   Position p{"_none_", 0, 0, -1};  // Lexing.dummy_pos with pos_fname "_none_"
@@ -23,6 +27,8 @@ Location location::none() {
 
 namespace uid {
 static long g_id = -1, g_id_param = -1;
+// a fresh record's identity
+static const void* fresh_obj() { return zone().alloc(1, 1); }
 void reinit() { g_id = -1; g_id_param = -1; }
 Uid mk(const UnitInfo* current_unit) {
   Uid u;
@@ -34,6 +40,7 @@ Uid mk(const UnitInfo* current_unit) {
     u.from = Uid::From::Impl;
   }
   u.id = ++g_id;
+  u.obj = fresh_obj();
   return u;
 }
 Uid mk_local_opaque(const UnitInfo* current_unit) {
@@ -41,18 +48,21 @@ Uid mk_local_opaque(const UnitInfo* current_unit) {
   u.kind = Uid::Kind::Local_opaque_item;
   if (current_unit) u.comp_unit = zstr(current_unit->modname);
   u.id = ++g_id_param;
+  u.obj = fresh_obj();
   return u;
 }
 Uid of_compilation_unit_id(std::string_view name) {
   Uid u;
   u.kind = Uid::Kind::Compilation_unit;
   u.comp_unit = zstr(name);
+  u.obj = fresh_obj();
   return u;
 }
 Uid of_predef_id(std::string_view name) {
   Uid u;
   u.kind = Uid::Kind::Predef;
   u.comp_unit = zstr(name);
+  u.obj = fresh_obj();
   return u;
 }
 bool for_actual_declaration(const Uid& u) { return u.kind == Uid::Kind::Item; }

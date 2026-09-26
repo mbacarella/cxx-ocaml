@@ -163,7 +163,7 @@ t of_path(const std::function<t(SigComponentKind, Ident::t)>& find_shape, SigCom
 t for_persistent_unit(std::string_view s) {
   Uid u = uid::of_compilation_unit_id(ident::name(Ident::create_persistent(s)));
   Shape* r = mk(&u, Shape::Kind::Comp_unit);
-  r->str = zstr(s);
+  r->str = zborrow(s);
   return r;
 }
 t leaf_for_unpack() {

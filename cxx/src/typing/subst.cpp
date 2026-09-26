@@ -432,7 +432,12 @@ static const TypeDeclaration* type_declaration2(CopyScope& cs, t s, const TypeDe
       kind = k;
       break;
     }
-    default:
+    case TypeKind::Kind::Type_abstract:
+    case TypeKind::Kind::Type_external:
+      // `Type_abstract r -> Type_abstract r`: a new block (its origin shared)
+      kind = make<TypeKind>(*kind);
+      break;
+    case TypeKind::Kind::Type_open:  // an immediate
       break;
   }
   auto params = map_typexp(cs, s, d->type_params);

@@ -38,7 +38,7 @@ ClassArgPatternResult type_class_arg_pattern(std::string_view cl_num, env::t val
     val_env = env::add_value(v.pv_id, d1, val_env);
     ValueKind ivar{ValueKind::Kind::Val_ivar};
     ivar.ivar_mut = MutableFlag::Immutable;
-    ivar.ivar_name = zstr(cl_num);
+    ivar.ivar_name = zborrow(cl_num);
     auto* d2 = make<ValueDescription>(v.pv_type, ivar, v.pv_loc, pt::types_attributes(v.pv_attributes), val_uid);
     met_env = env::add_value(id2, d2, met_env);
     pv.insert(pv.begin(), ClassArgPatternVar{id2, v.pv_id, v.pv_type});

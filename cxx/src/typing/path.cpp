@@ -11,11 +11,11 @@ using K = Path::Kind;
 
 Path::t Path::pident(Ident::t id) { return make<Path>(K::Pident, id); }
 Path::t Path::pdot(t p, std::string_view s) {
-  return make<Path>(K::Pdot, nullptr, p, nullptr, zstr(s));
+  return make<Path>(K::Pdot, nullptr, p, nullptr, zborrow(s));
 }
 Path::t Path::papply(t f, t a) { return make<Path>(K::Papply, nullptr, f, a); }
 Path::t Path::pextra_ty(t p, Extra e, std::string_view s) {
-  return make<Path>(K::Pextra_ty, nullptr, p, nullptr, zstr(s), e);
+  return make<Path>(K::Pextra_ty, nullptr, p, nullptr, zborrow(s), e);
 }
 
 namespace path {

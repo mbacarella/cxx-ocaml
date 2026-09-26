@@ -396,6 +396,8 @@ static const tt::TTypeDeclaration* transl_declaration(env::t env, const pt::Type
       if (unbox) {
         rep.kind = RecordRepresentation::Kind::Record_unboxed;
         rep.unboxed_inlined = false;
+        static const char record_unboxed_false = 0;  // a static structured constant
+        rep.obj = &record_unboxed_false;
       } else {
         bool all_float = true;
         for (auto* l : lbls2) all_float = all_float && is_float(env, l->ld_type) && l->ld_atomic == AtomicFlag::Nonatomic;
@@ -451,7 +453,7 @@ static const tt::TTypeDeclaration* transl_declaration(env::t env, const pt::Type
   if (is_fixed_type(sdecl)) {
     Path::t p;
     try {
-      p = env::find_type_by_name(Longident::lident(zstr(std::string(ident::name(id)) + "#row")), env).first;
+      p = env::find_type_by_name(Longident::lident(zborrow(std::string(ident::name(id)) + "#row")), env).first;
     } catch (const env::NotFound&) {
       throw std::logic_error("transl_declaration: #row");
     }
@@ -913,7 +915,7 @@ TranslTypeDeclResult transl_type_decl(env::t env, RecFlag rec_flag, Slice<const 
     auto* d = make<pt::TypeDeclaration>(*sdecl);
     Location nloc = sdecl->ptype_name.loc;
     nloc.loc_ghost = true;
-    d->ptype_name = pt::StrLoc{zstr(std::string(sdecl->ptype_name.txt) + "#row"), nloc};
+    d->ptype_name = pt::StrLoc{zborrow(std::string(sdecl->ptype_name.txt) + "#row"), nloc};
     d->ptype_kind = pt::TypeKind{pt::TypeKind::Kind::Ptype_abstract};
     d->ptype_manifest = nullptr;
     d->ptype_loc.loc_ghost = true;

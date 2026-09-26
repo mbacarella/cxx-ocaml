@@ -53,13 +53,13 @@ struct Conv {
     else if (p.file_id > 0 && p.file_id <= static_cast<int>(dirfiles.size()))
       f = dirfiles[p.file_id - 1];
     else f = fname;
-    return Position{zstr(f), p.lnum, p.bol, p.cnum};
+    return Position{zborrow(f), p.lnum, p.bol, p.cnum};
   }
   Location loc(const ast::Location& l) const {
     return Location{pos(l.start), pos(l.end), l.ghost};
   }
-  StrLoc str(const ast::StringLoc& s) const { return {zstr(s.txt), loc(s.loc)}; }
-  StrLoc str_gap(std::string_view s) const { return {zstr(s), gap_loc()}; }
+  StrLoc str(const ast::StringLoc& s) const { return {zborrow(s.txt), loc(s.loc)}; }
+  StrLoc str_gap(std::string_view s) const { return {zborrow(s), gap_loc()}; }
   OptStrLoc optstr(const ast::StrOptLoc& s) const {
     return {s.txt ? OptStr::of(*s.txt) : OptStr::none(), loc(s.loc)};
   }
@@ -150,7 +150,7 @@ struct Conv {
     if (a.loc.start.cnum == 0 && a.loc.end.cnum == 0 && p.kind == Payload::Kind::PStr &&
         !p.str.empty())
       al = p.str[0]->pstr_loc;
-    return make<Attribute>(StrLoc{zstr(a.name), unset ? location::none() : loc(a.name_loc)}, p, al);
+    return make<Attribute>(StrLoc{zborrow(a.name), unset ? location::none() : loc(a.name_loc)}, p, al);
   }
   Attributes attrs(const ast::Attributes& l) const {
     return map_slice<const Attribute*>(l, [&](const ast::Attribute& a) { return attribute(a); });
@@ -159,10 +159,10 @@ struct Conv {
   // ast keeps only the name and the payload; the attribute spans the item.
   const Attribute* item_attribute(const std::string& name, const ast::Structure& payload,
                                   const Location& item_loc) const {
-    return make<Attribute>(StrLoc{zstr(name), gap_loc()}, payload_str(payload), item_loc);
+    return make<Attribute>(StrLoc{zborrow(name), gap_loc()}, payload_str(payload), item_loc);
   }
   const Extension* extension(const ast::ExtName& name, const ast::ExtPayload& p) const {
-    return make<Extension>(StrLoc{zstr(name), name.has_loc ? loc(name.loc) : gap_loc()}, ext_payload(p));
+    return make<Extension>(StrLoc{zborrow(name), name.has_loc ? loc(name.loc) : gap_loc()}, ext_payload(p));
   }
 
   // ---- constants ----
@@ -170,7 +170,7 @@ struct Conv {
     ConstantDesc d{};
     if (auto* i = std::get_if<ast::Pconst_integer>(&c.desc)) {
       d.kind = ConstantDesc::Kind::Pconst_integer;
-      d.s = zstr(i->value);
+      d.s = zborrow(i->value);
       d.has_suffix = i->suffix.has_value();
       d.suffix = i->suffix.value_or('\0');
     } else if (auto* ch = std::get_if<ast::Pconst_char>(&c.desc)) {
@@ -178,13 +178,13 @@ struct Conv {
       d.c = static_cast<char>(ch->code);
     } else if (auto* s = std::get_if<ast::Pconst_string>(&c.desc)) {
       d.kind = ConstantDesc::Kind::Pconst_string;
-      d.s = zstr(s->s);
+      d.s = zborrow(s->s);
       d.str_loc = loc(s->strloc);
       d.delim = optstr_of(s->delim);
     } else {
       auto& f = std::get<ast::Pconst_float>(c.desc);
       d.kind = ConstantDesc::Kind::Pconst_float;
-      d.s = zstr(f.value);
+      d.s = zborrow(f.value);
       d.has_suffix = f.suffix.has_value();
       d.suffix = f.suffix.value_or('\0');
     }
@@ -223,7 +223,7 @@ struct Conv {
           if constexpr (std::is_same_v<T, ast::Ptyp_any>) {
             d = make<Ptyp_any>(K::Ptyp_any);
           } else if constexpr (std::is_same_v<T, ast::Ptyp_var>) {
-            d = make<Ptyp_var>(Ptyp_var{{K::Ptyp_var}, zstr(v.name)});
+            d = make<Ptyp_var>(Ptyp_var{{K::Ptyp_var}, zborrow(v.name)});
           } else if constexpr (std::is_same_v<T, ast::Ptyp_arrow>) {
             d = make<Ptyp_arrow>(Ptyp_arrow{{K::Ptyp_arrow}, label(v.label), core_type(*v.dom),
                                             core_type(*v.cod)});
@@ -238,7 +238,7 @@ struct Conv {
           } else if constexpr (std::is_same_v<T, ast::Ptyp_class>) {
             d = make<Ptyp_class>(Ptyp_class{{K::Ptyp_class}, lidloc(v.id), core_types(v.args)});
           } else if constexpr (std::is_same_v<T, ast::Ptyp_alias>) {
-            d = make<Ptyp_alias>(Ptyp_alias{{K::Ptyp_alias}, core_type(*v.type), StrLoc{zstr(v.name), loc(v.name_loc)}});
+            d = make<Ptyp_alias>(Ptyp_alias{{K::Ptyp_alias}, core_type(*v.type), StrLoc{zborrow(v.name), loc(v.name_loc)}});
           } else if constexpr (std::is_same_v<T, ast::Ptyp_poly>) {
             auto vars = map_slice<StrLoc>(v.vars, [&](const std::string& s) { return str_gap(s); });
             d = make<Ptyp_poly>(Ptyp_poly{{K::Ptyp_poly}, vars, core_type(*v.type)});
@@ -266,7 +266,7 @@ struct Conv {
             }
             Slice<std::string_view> labels;
             if (v.labels)
-              labels = map_slice<std::string_view>(*v.labels, [](const std::string& s) { return zstr(s); });
+              labels = map_slice<std::string_view>(*v.labels, [](const std::string& s) { return zborrow(s); });
             d = make<Ptyp_variant>(Ptyp_variant{{K::Ptyp_variant}, slice(rows), closed(v.closed),
                                                 v.labels.has_value(), labels});
           } else if constexpr (std::is_same_v<T, ast::Ptyp_object>) {
@@ -323,7 +323,7 @@ struct Conv {
             }
             d = make<Ppat_construct>(Ppat_construct{{K::Ppat_construct}, lidloc(v.id), arg});
           } else if constexpr (std::is_same_v<T, ast::Ppat_variant>) {
-            d = make<Ppat_variant>(Ppat_variant{{K::Ppat_variant}, zstr(v.label),
+            d = make<Ppat_variant>(Ppat_variant{{K::Ppat_variant}, zborrow(v.label),
                                                 v.arg ? pattern(**v.arg) : nullptr});
           } else if constexpr (std::is_same_v<T, ast::Ppat_record>) {
             auto fs = map_slice<std::pair<LidLoc, const Pattern*>>(v.fields, [&](auto& f) {
@@ -460,7 +460,7 @@ struct Conv {
             d = make<Pexp_construct>(Pexp_construct{{K::Pexp_construct}, lidloc(v.id),
                                                     v.arg ? expression(**v.arg) : nullptr});
           } else if constexpr (std::is_same_v<T, ast::Pexp_variant>) {
-            d = make<Pexp_variant>(Pexp_variant{{K::Pexp_variant}, zstr(v.label),
+            d = make<Pexp_variant>(Pexp_variant{{K::Pexp_variant}, zborrow(v.label),
                                                 v.arg ? expression(**v.arg) : nullptr});
           } else if constexpr (std::is_same_v<T, ast::Pexp_record>) {
             auto fs = map_slice<std::pair<LidLoc, const Expression*>>(v.fields, [&](auto& f) {
@@ -589,7 +589,7 @@ struct Conv {
       k.kind = TypeKind::Kind::Ptype_open;
     } else if (auto* e = std::get_if<ast::Ptype_external>(&d.kind)) {
       k.kind = TypeKind::Kind::Ptype_external;
-      k.external = zstr(e->s);
+      k.external = zborrow(e->s);
     } else if (auto* v = std::get_if<ast::Ptype_variant>(&d.kind)) {
       k.kind = TypeKind::Kind::Ptype_variant;
       k.constructors = map_slice<const ConstructorDeclaration*>(v->ctors, [&](const ast::ConstructorDecl& c) {
@@ -656,7 +656,7 @@ struct Conv {
     } else {
       k.kind = PrimitiveKind::Kind::Pprim_decl;
       k.ty = core_type(*p.type);
-      k.prims = map_slice<std::string_view>(p.prims, [](const std::string& s) { return zstr(s); });
+      k.prims = map_slice<std::string_view>(p.prims, [](const std::string& s) { return zborrow(s); });
     }
     return make<PrimitiveDescription>(str(p.name), k, attrs(p.attrs), loc(p.loc));
   }
@@ -933,7 +933,7 @@ struct Conv {
           } else if constexpr (std::is_same_v<T, ast::Psig_modsubst>) {
             // pms_name is a string loc (not an option)
             d = make<Psig_modsubst>(Psig_modsubst{{K::Psig_modsubst},
-                make<ModuleSubstitution>(StrLoc{zstr(v.name.txt.value_or("_")), loc(v.name.loc)},
+                make<ModuleSubstitution>(StrLoc{zborrow(v.name.txt.value_or("_")), loc(v.name.loc)},
                                          lidloc(v.manifest), Attributes{}, l)});
           } else if constexpr (std::is_same_v<T, ast::Psig_open>) {
             d = make<Psig_open>(Psig_open{{K::Psig_open}, open_description(v.ovr, v.id, l, attrs(v.attrs))});
@@ -1039,13 +1039,13 @@ struct Conv {
 
 Structure of_ast(const ast::Structure& s, std::string_view fname,
                  const std::vector<std::string>& dirfiles) {
-  Conv c{zstr(fname), dirfiles};
+  Conv c{zborrow(fname), dirfiles};
   return c.structure(s);
 }
 
 Signature of_ast_signature(const ast::Signature& s, std::string_view fname,
                            const std::vector<std::string>& dirfiles) {
-  Conv c{zstr(fname), dirfiles};
+  Conv c{zborrow(fname), dirfiles};
   return c.signature(s);
 }
 

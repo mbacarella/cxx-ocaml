@@ -64,4 +64,7 @@ bool irrefutable(const tt::Pattern* p);
 bool inactive(tt::Partial partial, const tt::Pattern* p);
 void check_ambiguous_bindings(const std::vector<const tt::Case*>& cases);
 
+// creates parmatch.ml's module-initialization values (extra_pat)
+void module_init();
+
 }  // namespace cppcaml::typing::parmatch

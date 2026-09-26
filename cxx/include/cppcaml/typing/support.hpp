@@ -44,8 +44,8 @@ struct ArgLabel {
   Kind kind = Kind::Nolabel;
   std::string_view name;
   static ArgLabel nolabel() { return {}; }
-  static ArgLabel labelled(std::string_view s) { return {Kind::Labelled, zstr(s)}; }
-  static ArgLabel optional(std::string_view s) { return {Kind::Optional, zstr(s)}; }
+  static ArgLabel labelled(std::string_view s) { return {Kind::Labelled, zborrow(s)}; }
+  static ArgLabel optional(std::string_view s) { return {Kind::Optional, zborrow(s)}; }
   bool operator==(const ArgLabel& o) const { return kind == o.kind && name == o.name; }
   bool operator!=(const ArgLabel& o) const { return !(*this == o); }
 };
@@ -55,7 +55,7 @@ struct OptStr {
   bool some = false;
   std::string_view v;
   static OptStr none() { return {}; }
-  static OptStr of(std::string_view s) { return {true, zstr(s)}; }
+  static OptStr of(std::string_view s) { return {true, zborrow(s)}; }
   bool operator==(const OptStr& o) const { return some == o.some && (!some || v == o.v); }
 };
 
@@ -69,6 +69,10 @@ struct Uid {
   std::string_view comp_unit;  // Compilation_unit / Item / Local_opaque_item; Predef name
   long id = 0;
   From from = From::Intf;
+  // The record's identity: OCaml passes a uid by reference, so copies of
+  // one uid are one object (the .cmi writer shares by it); nullptr for the
+  // immediate Internal.  Not part of equality.
+  const void* obj = nullptr;
 };
 
 // Unit_info.t, as far as typing needs it (modname and intf/impl kind).

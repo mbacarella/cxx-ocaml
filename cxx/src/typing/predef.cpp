@@ -254,7 +254,7 @@ const TypeDeclaration* decl_of_type_constr(TypeConstr c) {
   auto external = [&] {
     auto* k = make<TypeKind>();
     k->kind = TypeKind::Kind::Type_external;
-    k->external = zstr(name);
+    k->external = zborrow(name);
     return static_cast<const TypeKind*>(k);
   };
   auto decl0 = [&](TypeImmediacy immediate, const TypeKind* kind) {
@@ -341,7 +341,7 @@ const ExtensionConstructor* predef_extension(Ident::t id, Slice<TypeExpr*> args)
   // [Ast_helper.Attr.mk (mknoloc "ocaml.warn_on_literal_pattern") (PStr [])]
   auto* pstr_nil = make<OValue>(OValue::Kind::Block, 0L, std::string_view{}, 0.0, 0u);
   pstr_nil->fields = slice({static_cast<const OValue*>(make<OValue>(OValue::Kind::Int, 0L))});
-  auto* attr = make<Attribute>(zstr("ocaml.warn_on_literal_pattern"), location::none(),
+  auto* attr = make<Attribute>(zborrow("ocaml.warn_on_literal_pattern"), location::none(),
                                pstr_nil, location::none());
   return make<ExtensionConstructor>(paths().exn, Slice<TypeExpr*>{}, a, nullptr,
                                     PrivateFlag::Public, location::none(),

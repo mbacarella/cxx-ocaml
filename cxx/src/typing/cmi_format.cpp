@@ -7,10 +7,17 @@
 #include "cppcaml/typing/cmi_format.hpp"
 
 #include <fstream>
+#include <functional>
+#include <map>
+#include <tuple>
 #include <iterator>
 #include <unordered_map>
 
+#include <cstdio>
+
+#include "cppcaml/blake2.hpp"
 #include "cppcaml/marshal.hpp"
+#include "cppcaml/omarshal.hpp"
 
 namespace cppcaml::typing::cmi_format {
 
@@ -52,9 +59,14 @@ class Reader {
     if (x.kind != m::Value::Kind::Block || k >= x.fields.size()) throw Corrupt{};
     return x.fields[k];
   }
+  // one copy per marshaled string: input_value's sharing (a string the
+  // .cmi shares stays one string, which output_cmi shares again)
   std::string_view str(std::size_t id) {
     if (v(id).kind != m::Value::Kind::String) throw Corrupt{};
-    return zstr(v(id).str());
+    if (auto it = str_.find(id); it != str_.end()) return it->second;
+    std::string_view s = zstr(v(id).str());
+    str_[id] = s;
+    return s;
   }
   bool boolean(std::size_t id) const { return ival(id) != 0; }
 
@@ -104,7 +116,15 @@ class Reader {
     return u;
   }
 
+  // idents and paths are shared as input_value shares them: one object per
+  // marshaled block (a cmi's Predef idents, its repeated paths)
   Ident::t ident(std::size_t id) {
+    if (auto it = ident_.find(id); it != ident_.end()) return it->second;
+    Ident::t r = ident_raw(id);
+    ident_[id] = r;
+    return r;
+  }
+  Ident::t ident_raw(std::size_t id) {
     using K = Ident::Kind;
     switch (tag(id)) {
       case 0: return Ident::make_raw(K::Local, str(f(id, 0)), (int)ival(f(id, 1)), 0, nullptr);
@@ -119,6 +139,12 @@ class Reader {
   }
 
   Path::t path(std::size_t id) {
+    if (auto it = path_.find(id); it != path_.end()) return it->second;
+    Path::t r = path_raw(id);
+    path_[id] = r;
+    return r;
+  }
+  Path::t path_raw(std::size_t id) {
     switch (tag(id)) {
       case 0: return Path::pident(ident(f(id, 0)));
       case 1: return Path::pdot(path(f(id, 0)), str(f(id, 1)));
@@ -145,6 +171,10 @@ class Reader {
       u.kind = Uid::Kind::Internal;
       return u;
     }
+    // one identity per marshaled record (input_value's sharing)
+    auto [ot, fresh] = uid_obj_.try_emplace(id, nullptr);
+    if (fresh) ot->second = zone().alloc(1, 1);
+    u.obj = ot->second;
     switch (tag(id)) {
       case 0: u.kind = Uid::Kind::Compilation_unit; u.comp_unit = str(f(id, 0)); break;
       case 1:
@@ -462,6 +492,9 @@ class Reader {
         if (is_int(r)) {
           k->record_repr.kind = ival(r) == 0 ? RK::Record_regular : RK::Record_float;
         } else {
+          auto [ot, fresh] = repr_obj_.try_emplace(r, nullptr);
+          if (fresh) ot->second = zone().alloc(1, 1);
+          k->record_repr.obj = ot->second;
           switch (tag(r)) {
             case 0: k->record_repr.kind = RK::Record_unboxed;
                     k->record_repr.unboxed_inlined = boolean(f(r, 0)); break;
@@ -762,9 +795,636 @@ class Reader {
   std::unordered_map<std::size_t, ident::Unscoped*> us_;
   std::unordered_map<std::size_t, ClassSignature*> csig_;
   std::unordered_map<std::size_t, const OValue*> ov_;
+  std::unordered_map<std::size_t, std::string_view> str_;
+  std::unordered_map<std::size_t, Ident::t> ident_;
+  std::unordered_map<std::size_t, Path::t> path_;
+  std::unordered_map<std::size_t, const void*> uid_obj_;
+  std::unordered_map<std::size_t, const void*> repr_obj_;
+};
+
+
+// ---- write side: output_value of the Types graph ---------------------------
+// The inverse of Reader: the same layouts, built as omarshal values.  Every
+// node the port shares (type_exprs, their descs, the mutable cells, idents,
+// paths, declarations) becomes ONE value, created before its fields so that
+// cycles close, and omarshal emits a repeat as a back-reference: Marshal's
+// sharing of the physical graph.
+namespace o = cppcaml::omarshal;
+
+class Writer {
+ public:
+  using V = o::ValPtr;
+  V i(long n) { return o::vint(n); }
+  V b(bool x) { return o::vint(x ? 1 : 0); }
+  // A string is one value per zone copy: the port's string_views alias
+  // exactly where ocamlc's strings are one object (a copied name, a path
+  // component taken from an ident); a null view has no identity.
+  V str(std::string_view sv) {
+    if (!sv.data()) return o::vstr(std::string(sv));
+    auto [it, fresh] = strs_.try_emplace(std::make_pair(sv.data(), sv.size()), nullptr);
+    if (fresh) it->second = o::vstr(std::string(sv));
+    return it->second;
+  }
+  V some(V x) { return o::vblock(0, {std::move(x)}); }
+  V none() { return o::vint(0); }
+  template <class L, class F>
+  V list(const L& l, F&& elt) {
+    std::vector<V> xs;
+    for (auto& x : l) xs.push_back(elt(x));
+    return o::vlist(xs);
+  }
+  // A list the port keeps as a Slice: copies of a declaration share the
+  // Slice's storage exactly where ocamlc's copies share the list (Subst keeps
+  // type_variance / type_separability ...), so one value per storage.
+  template <class T, class F>
+  V list(const Slice<T>& l, F&& elt) {
+    if (l.empty() || getenv("CMIW_NOLISTSHARE")) {
+      std::vector<V> xs;
+      for (auto& x : l) xs.push_back(elt(x));
+      return o::vlist(xs);
+    }
+    auto key = std::make_pair(static_cast<const void*>(l.p), l.n);
+    if (auto it = lists_.find(key); it != lists_.end()) return it->second;
+    std::vector<V> xs;
+    for (auto& x : l) xs.push_back(elt(x));
+    V v = o::vlist(xs);
+    lists_[key] = v;
+    return v;
+  }
+  V opt_str(const OptStr& x) { return x.some ? some(str(x.v)) : none(); }
+  // a block registered under [key] before its fields are filled
+  template <class K>
+  V shared(std::unordered_map<const void*, V>& memo, const K* key, int tag,
+           const std::function<std::vector<V>()>& fields) {
+    if (auto it = memo.find(key); it != memo.end()) return it->second;
+    V v = o::vblock(tag, {});
+    memo[key] = v;
+    v->fields = fields();
+    return v;
+  }
+
+  // ---- Ident / Path ----
+  V unscoped(const ident::Unscoped* u) {
+    return shared(memo_, u, 0, [&]() -> std::vector<V> {  // { mutable state }
+      if (u->state == ident::Unscoped::State::Udesc)
+        return {o::vblock(0, {o::vblock(0, {str(u->name), i(u->stamp)})})};
+      return {o::vblock(1, {unscoped(u->ulink)})};
+    });
+  }
+  V ident(Ident::t id) {
+    using K = Ident::Kind;
+    int tag = static_cast<int>(id->kind);  // Local, Scoped, Global, Predef, Unscoped
+    return shared(memo_, id, tag, [&]() -> std::vector<V> {
+      switch (id->kind) {
+        case K::Local: return {str(id->name_), i(id->stamp_)};
+        case K::Scoped: return {str(id->name_), i(id->stamp_), i(id->scope_)};
+        case K::Global: return {str(id->name_)};
+        case K::Predef: return {str(id->name_), i(id->stamp_)};
+        case K::Unscoped: return {unscoped(id->us)};
+      }
+      return {};
+    });
+  }
+  V path(Path::t p) {
+    using K = Path::Kind;
+    return shared(memo_, p, static_cast<int>(p->kind), [&]() -> std::vector<V> {
+      switch (p->kind) {
+        case K::Pident: return {ident(p->id)};
+        case K::Pdot: return {path(p->p1), str(p->s)};
+        case K::Papply: return {path(p->p1), path(p->p2)};
+        case K::Pextra_ty:
+          return {path(p->p1), p->extra == Path::Extra::Pext_ty ? i(0) : o::vblock(0, {str(p->s)})};
+      }
+      return {};
+    });
+  }
+
+  // ---- support ----
+  // Sharing that ocamlc's values have physically and Marshal keeps.  The
+  // lexer makes one position per token boundary, all holding the one
+  // filename string, and parsed locations flow into the declarations by
+  // reference; so within a .cmi, equal positions are one value, filenames
+  // are one string, and equal locations one record (measured against
+  // ocamlc's .cmi files: cmi_port_parity.sh).
+  V fname(std::string_view f) {
+    auto [it, fresh] = fnames_.try_emplace(std::string(f), nullptr);
+    if (fresh) it->second = str(f);
+    return it->second;
+  }
+  V position(const Position& x) {
+    auto [it, fresh] = poss_.try_emplace(std::make_tuple(std::string(x.pos_fname), x.pos_lnum, x.pos_bol, x.pos_cnum),
+                                         nullptr);
+    if (fresh) it->second = o::vblock(0, {fname(x.pos_fname), i(x.pos_lnum), i(x.pos_bol), i(x.pos_cnum)});
+    return it->second;
+  }
+  V loc(const Location& l) {
+    V a = position(l.loc_start);
+    V e = position(l.loc_end);
+    auto [it, fresh] = locs_.try_emplace(std::make_tuple(a.get(), e.get(), l.loc_ghost), nullptr);
+    if (fresh) it->second = o::vblock(0, {a, e, b(l.loc_ghost)});
+    return it->second;
+  }
+  // The current unit's name: Uid.mk takes it from Unit_info, the string the
+  // cmi header's cmi_name also is, so the unit's uids and the header share
+  // one string.  A loaded unit's uids carry that unit's own name string
+  // (shared by identity, str()), which Env's hashconsed persistent idents
+  // share too.
+  void set_current_unit(std::string_view n) {
+    current_unit_ = std::string(n);
+    current_unit_name_ = o::vstr(current_unit_);
+  }
+  V unit_name(std::string_view n) {
+    if (current_unit_name_ && n == current_unit_) return current_unit_name_;
+    return str(n);
+  }
+ public:
+  template <class F>
+  V uid_shared(const Uid& u, F&& make_value) {
+    if (!u.obj) return make_value();
+    if (auto it = memo_.find(u.obj); it != memo_.end()) return it->second;
+    V v = make_value();
+    memo_[u.obj] = v;
+    return v;
+  }
+  V uid(const Uid& u) {
+    switch (u.kind) {
+      case Uid::Kind::Internal: return i(0);
+      case Uid::Kind::Compilation_unit:
+        return uid_shared(u, [&] { return o::vblock(0, {unit_name(u.comp_unit)}); });
+      // a uid is passed by reference: one value per record (Uid.obj)
+      case Uid::Kind::Item:
+        return uid_shared(u, [&] {
+          return o::vblock(1, {unit_name(u.comp_unit), i(u.id), i(u.from == Uid::From::Intf ? 0 : 1)});
+        });
+      case Uid::Kind::Local_opaque_item:
+        return uid_shared(u, [&] { return o::vblock(2, {unit_name(u.comp_unit), i(u.id)}); });
+      case Uid::Kind::Predef: return uid_shared(u, [&] { return o::vblock(3, {str(u.comp_unit)}); });
+    }
+    return i(0);
+  }
+  // An arg_label is copied by reference (Subst keeps Tarrow's label): one
+  // value per label whose name is one string.
+  V arg_label(const ArgLabel& l) {
+    if (l.kind == ArgLabel::Kind::Nolabel) return i(0);
+    int tag = l.kind == ArgLabel::Kind::Labelled ? 0 : 1;
+    if (l.name.empty()) return o::vblock(tag, {str(l.name)});
+    auto [it, fresh] = labels_.try_emplace(std::make_tuple(tag, l.name.data(), l.name.size()), nullptr);
+    if (fresh) it->second = o::vblock(tag, {str(l.name)});
+    return it->second;
+  }
+  V ovalue(const OValue* x) {
+    switch (x->kind) {
+      case OValue::Kind::Int: return i(x->i);
+      case OValue::Kind::String: return str(x->s);
+      case OValue::Kind::Double: return o::vdbl(x->d);
+      case OValue::Kind::Block:
+        // A Parsetree value's only {string; int; int; int} record is a
+        // Lexing.position: the lexer's positions, shared with the file's
+        // others (position()).
+        if (x->tag == 0 && x->fields.size() == 4 &&
+            x->fields[0]->kind == OValue::Kind::String && x->fields[1]->kind == OValue::Kind::Int &&
+            x->fields[2]->kind == OValue::Kind::Int && x->fields[3]->kind == OValue::Kind::Int)
+          return position(Position{x->fields[0]->s, x->fields[1]->i, x->fields[2]->i, x->fields[3]->i});
+        return shared(memo_, x, static_cast<int>(x->tag), [&]() -> std::vector<V> {
+          std::vector<V> fs;
+          for (const OValue* f : x->fields) fs.push_back(ovalue(f));
+          return fs;
+        });
+    }
+    return i(0);
+  }
+  V attributes(const Attributes& as) {
+    return list(as, [&](const Attribute* a) {
+      return o::vblock(0, {o::vblock(0, {str(a->attr_name), loc(a->attr_name_loc)}), ovalue(a->attr_payload),
+                           loc(a->attr_loc)});
+    });
+  }
+
+  // ---- type expressions ----
+  V commu(const Commutable* c) {
+    switch (c->kind) {
+      case Commutable::Kind::Cok: return i(0);
+      case Commutable::Kind::Cunknown: return i(1);
+      case Commutable::Kind::Cvar: return shared(memo_, c, 0, [&]() -> std::vector<V> { return {commu(c->commu)}; });
+    }
+    return i(0);
+  }
+  V field_kind(const FieldKind* k) {
+    switch (k->kind) {
+      case FieldKind::Kind::FKprivate: return i(0);
+      case FieldKind::Kind::FKpublic: return i(1);
+      case FieldKind::Kind::FKabsent: return i(2);
+      case FieldKind::Kind::FKvar:
+        return shared(memo_, k, 0, [&]() -> std::vector<V> { return {field_kind(k->field_kind)}; });
+    }
+    return i(0);
+  }
+  V path_args(const PathArgs* pa) {
+    return shared(memo_, pa, 0, [&]() -> std::vector<V> { return {path(pa->path), tys(pa->args)}; });
+  }
+  V name_ref(const NameRef* r) {
+    return shared(memo_, r, 0, [&]() -> std::vector<V> {
+      return {r->contents ? some(path_args(r->contents)) : none()};
+    });
+  }
+  V memo(const AbbrevMemo* m) {
+    switch (m->kind) {
+      case AbbrevMemo::Kind::Mnil: return i(0);
+      case AbbrevMemo::Kind::Mcons:
+        return shared(memo_, m, 0, [&]() -> std::vector<V> {
+          return {i(m->privacy == PrivateFlag::Private ? 0 : 1), path(m->path), ty(m->abbreviation),
+                  ty(m->expansion), memo(m->rem)};
+        });
+      case AbbrevMemo::Kind::Mlink:
+        return shared(memo_, m, 1, [&]() -> std::vector<V> { return {memo_ref(m->link)}; });
+    }
+    return i(0);
+  }
+  V memo_ref(const MemoRef* r) {
+    return shared(memo_, r, 0, [&]() -> std::vector<V> { return {memo(r->contents)}; });
+  }
+  V row_cell(const RowFieldCell* c) {
+    return shared(memo_, c, 0, [&]() -> std::vector<V> { return {row_field(c->contents)}; });
+  }
+  V row_field(const RowField* f) {
+    switch (f->kind) {
+      case RowField::Kind::RFabsent: return i(0);
+      case RowField::Kind::RFnone: return i(1);
+      case RowField::Kind::RFpresent:
+        return shared(memo_, f, 0, [&]() -> std::vector<V> { return {f->present ? some(ty(f->present)) : none()}; });
+      case RowField::Kind::RFeither:
+        return shared(memo_, f, 1, [&]() -> std::vector<V> {
+          return {b(f->no_arg), tys(f->arg_type), b(f->matched), row_cell(f->ext)};
+        });
+    }
+    return i(0);
+  }
+  V fixed(const FixedExplanation* x) {
+    using FK = FixedExplanation::Kind;
+    switch (x->kind) {
+      case FK::Fixed_private: return i(0);
+      case FK::Rigid: return i(1);
+      case FK::Univar: return o::vblock(0, {ty(x->univar)});
+      case FK::Reified: return o::vblock(1, {path(x->reified)});
+    }
+    return i(0);
+  }
+  V row(const RowDesc* r) {
+    return shared(memo_, r, 0, [&]() -> std::vector<V> {
+      return {list(r->row_fields, [&](const RowFieldEntry& e) { return o::vblock(0, {str(e.label), row_field(e.field)}); }),
+              ty(r->row_more), b(r->row_closed), r->row_fixed ? some(fixed(r->row_fixed)) : none(),
+              r->row_name ? some(path_args(r->row_name)) : none()};
+    });
+  }
+  V package(const Package* p) {
+    return shared(memo_, p, 0, [&]() -> std::vector<V> {
+      return {path(p->pack_path), list(p->pack_constraints, [&](const PackConstraint& c) {
+                return o::vblock(0, {list(c.path, [&](std::string_view s) { return str(s); }), ty(c.ty)});
+              })};
+    });
+  }
+  V tys(const Slice<TypeExpr*>& l) {
+    return list(l, [&](TypeExpr* t) { return ty(t); });
+  }
+  V desc(const TypeDesc* d) {
+    if (d->kind == DescKind::Tnil) return i(0);
+    // non-constant constructors in declaration order, Tnil (constant) skipped
+    int tag = static_cast<int>(d->kind);
+    if (d->kind > DescKind::Tnil) --tag;
+    return shared(memo_, d, tag, [&]() -> std::vector<V> {
+      switch (d->kind) {
+        case DescKind::Tvar: return {opt_str(as<Tvar>(d)->name)};
+        case DescKind::Tarrow: {
+          auto* a = as<Tarrow>(d);
+          return {arg_label(a->label), ty(a->t1), ty(a->t2), commu(a->commu)};
+        }
+        case DescKind::Ttuple:
+          return {list(as<Ttuple>(d)->elems, [&](const LabeledTy& e) { return o::vblock(0, {opt_str(e.label), ty(e.ty)}); })};
+        case DescKind::Tconstr: {
+          auto* c = as<Tconstr>(d);
+          return {path(c->path), tys(c->args), memo_ref(c->memo)};
+        }
+        case DescKind::Tobject: {
+          auto* ob = as<Tobject>(d);
+          return {ty(ob->fields), name_ref(ob->name)};
+        }
+        case DescKind::Tfield: {
+          auto* f = as<Tfield>(d);
+          return {str(f->label), field_kind(f->kind_), ty(f->ty), ty(f->rest)};
+        }
+        case DescKind::Tvariant: return {row(as<Tvariant>(d)->row)};
+        case DescKind::Tunivar: return {opt_str(as<Tunivar>(d)->name)};
+        case DescKind::Tpoly: {
+          auto* p = as<Tpoly>(d);
+          return {ty(p->body), tys(p->vars)};
+        }
+        case DescKind::Tpackage: return {package(as<Tpackage>(d)->pack)};
+        case DescKind::Tfunctor: {
+          auto* f = as<Tfunctor>(d);
+          return {arg_label(f->label), unscoped(f->id), package(f->pack), ty(f->body)};
+        }
+        case DescKind::Texpand: {
+          auto* e = as<Texpand>(d);
+          return {ty(e->ty), path(e->path), tys(e->args)};
+        }
+        case DescKind::Tlink: return {ty(as<Tlink>(d)->ty)};
+        case DescKind::Tsubst: {
+          auto* s = as<Tsubst>(d);
+          return {ty(s->ty), s->row ? some(ty(s->row)) : none()};
+        }
+        case DescKind::Tnil: break;
+      }
+      return {};
+    });
+  }
+  V ty(const TypeExpr* t) {
+    // transient_expr = { mutable desc; mutable level; mutable scope; id }
+    return shared(memo_, t, 0, [&]() -> std::vector<V> { return {desc(t->desc), i(t->level), i(t->scope), i(t->id)}; });
+  }
+
+  // ---- declarations ----
+  V label_decl(const LabelDeclaration* l) {
+    return shared(memo_, l, 0, [&]() -> std::vector<V> {
+      return {ident(l->ld_id), i(l->ld_mutable == MutableFlag::Immutable ? 0 : 1),
+              i(l->ld_atomic == AtomicFlag::Nonatomic ? 0 : 1), ty(l->ld_type), loc(l->ld_loc),
+              attributes(l->ld_attributes), uid(l->ld_uid)};
+    });
+  }
+  V cstr_args(const ConstructorArguments& a) {
+    if (a.kind == ConstructorArguments::Kind::Cstr_tuple) return o::vblock(0, {tys(a.tuple)});
+    return o::vblock(1, {list(a.record, [&](const LabelDeclaration* l) { return label_decl(l); })});
+  }
+  V cstr_decl(const ConstructorDeclaration* c) {
+    return shared(memo_, c, 0, [&]() -> std::vector<V> {
+      return {ident(c->cd_id), cstr_args(c->cd_args), c->cd_res ? some(ty(c->cd_res)) : none(), loc(c->cd_loc),
+              attributes(c->cd_attributes), uid(c->cd_uid)};
+    });
+  }
+  V private_flag(PrivateFlag p) { return i(p == PrivateFlag::Private ? 0 : 1); }
+  // a type_kind is shared by reference (Types.kind_abstract is one value)
+  V type_kind(const TypeKind* k) {
+    if (auto it = memo_.find(k); it != memo_.end()) return it->second;
+    V v = type_kind_(k);
+    memo_[k] = v;
+    return v;
+  }
+  V type_kind_(const TypeKind* k) {
+    using KK = TypeKind::Kind;
+    switch (k->kind) {
+      case KK::Type_open: return i(0);
+      case KK::Type_abstract: {
+        using OK = TypeOrigin::Kind;
+        V orig;
+        switch (k->origin.kind) {
+          case OK::Definition: orig = i(0); break;
+          case OK::Rec_check_regularity: orig = i(1); break;
+          case OK::Approx_recmod: orig = i(2); break;
+          case OK::Existential: orig = o::vblock(0, {str(k->origin.existential)}); break;
+          case OK::Equation: orig = o::vblock(1, {ty(k->origin.eq1), ty(k->origin.eq2)}); break;
+        }
+        return o::vblock(0, {orig});
+      }
+      case KK::Type_record: {
+        using RK = RecordRepresentation::Kind;
+        const RecordRepresentation& r = k->record_repr;
+        auto block = [&]() -> V {
+          switch (r.kind) {
+            case RK::Record_unboxed: return o::vblock(0, {b(r.unboxed_inlined)});
+            case RK::Record_inlined: return o::vblock(1, {i(r.inlined_tag)});
+            case RK::Record_extension: return o::vblock(2, {path(r.extension)});
+            default: return i(0);
+          }
+        };
+        V repr;
+        switch (r.kind) {
+          case RK::Record_regular: repr = i(0); break;
+          case RK::Record_float: repr = i(1); break;
+          default:
+            if (!r.obj) {
+              repr = block();
+            } else if (auto it = memo_.find(r.obj); it != memo_.end()) {
+              repr = it->second;
+            } else {
+              repr = block();
+              memo_[r.obj] = repr;
+            }
+        }
+        return o::vblock(1, {list(k->labels, [&](const LabelDeclaration* l) { return label_decl(l); }), repr});
+      }
+      case KK::Type_variant:
+        return o::vblock(2, {list(k->constructors, [&](const ConstructorDeclaration* c) { return cstr_decl(c); }),
+                             i(k->variant_repr == VariantRepresentation::Variant_regular ? 0 : 1)});
+      case KK::Type_external: return o::vblock(3, {str(k->external)});
+    }
+    return i(0);
+  }
+  V type_decl(const TypeDeclaration* d) {
+    return shared(memo_, d, 0, [&]() -> std::vector<V> {
+      return {tys(d->type_params), i(d->type_arity), type_kind(d->type_kind), private_flag(d->type_private),
+              d->type_manifest ? some(ty(d->type_manifest)) : none(),
+              list(d->type_variance, [&](variance::t v) { return i(v); }),
+              list(d->type_separability, [&](Separability x) { return i(static_cast<long>(x)); }),
+              b(d->type_is_newtype), i(d->type_expansion_scope), loc(d->type_loc), attributes(d->type_attributes),
+              i(static_cast<long>(d->type_immediate)), b(d->type_unboxed_default), uid(d->type_uid)};
+    });
+  }
+  V ext_constr(const ExtensionConstructor* e) {
+    return shared(memo_, e, 0, [&]() -> std::vector<V> {
+      return {path(e->ext_type_path), tys(e->ext_type_params), cstr_args(e->ext_args),
+              e->ext_ret_type ? some(ty(e->ext_ret_type)) : none(), private_flag(e->ext_private), loc(e->ext_loc),
+              attributes(e->ext_attributes), uid(e->ext_uid)};
+    });
+  }
+  template <class Val, class F>
+  V strmap(const StrMapNode<Val>* n, F&& data) {
+    if (!n) return i(0);
+    V l = strmap<Val>(n->l, data);
+    V k = str(n->v);
+    V d = data(n->d);
+    V r = strmap<Val>(n->r, data);
+    return o::vblock(0, {l, k, d, r, i(n->h)});
+  }
+  V virtual_flag(VirtualFlag v) { return i(v == VirtualFlag::Virtual ? 0 : 1); }
+  V mutable_flag(MutableFlag m) { return i(m == MutableFlag::Immutable ? 0 : 1); }
+  V class_sig(const ClassSignature* c) {
+    return shared(memo_, c, 0, [&]() -> std::vector<V> {
+      return {ty(c->csig_self), ty(c->csig_self_row), field_kind(c->csig_dummy_method),
+              strmap<VarEntry>(c->csig_vars.root(), [&](const VarEntry& e) {
+                return o::vblock(0, {mutable_flag(e.mut), virtual_flag(e.virt), ty(e.ty)});
+              }),
+              strmap<MethEntry>(c->csig_meths.root(), [&](const MethEntry& e) {
+                V p = e.priv.is_private ? o::vblock(0, {field_kind(e.priv.kind)}) : i(0);
+                return o::vblock(0, {p, virtual_flag(e.virt), ty(e.ty)});
+              })};
+    });
+  }
+  V class_type(const ClassType* c) {
+    using CK = ClassType::Kind;
+    return shared(memo_, c, static_cast<int>(c->kind), [&]() -> std::vector<V> {
+      switch (c->kind) {
+        case CK::Cty_constr: return {path(c->path), tys(c->args), class_type(c->cty)};
+        case CK::Cty_signature: return {class_sig(c->sign)};
+        case CK::Cty_arrow: return {arg_label(c->label), ty(c->arg), class_type(c->cty)};
+      }
+      return {};
+    });
+  }
+  V variances(const Slice<variance::t>& l) {
+    return list(l, [&](variance::t v) { return i(v); });
+  }
+  V native_repr(const NativeRepr& n) {
+    switch (n.kind) {
+      case NativeRepr::Kind::Same_as_ocaml_repr: return i(0);
+      case NativeRepr::Kind::Unboxed_float: return i(1);
+      case NativeRepr::Kind::Untagged_immediate: return i(2);
+      case NativeRepr::Kind::Unboxed_integer: return o::vblock(0, {i(static_cast<long>(n.bi))});
+    }
+    return i(0);
+  }
+  V value_kind(const ValueKind& k) {
+    switch (k.kind) {
+      case ValueKind::Kind::Val_reg: return i(0);
+      case ValueKind::Kind::Val_prim: {
+        const PrimitiveDescription* p = k.prim;
+        return o::vblock(0, {o::vblock(0, {str(p->prim_name), i(p->prim_arity), b(p->prim_alloc),
+                                           str(p->prim_native_name),
+                                           list(p->prim_native_repr_args, [&](const NativeRepr& n) { return native_repr(n); }),
+                                           native_repr(p->prim_native_repr_res)})});
+      }
+      case ValueKind::Kind::Val_ivar: return o::vblock(1, {mutable_flag(k.ivar_mut), str(k.ivar_name)});
+      default: throw std::logic_error("Cmi_format.output_cmi: Val_self / Val_anc in a signature");
+    }
+  }
+  V module_type(const ModuleType* mt) {
+    using MK = ModuleType::Kind;
+    return shared(memo_, mt, static_cast<int>(mt->kind), [&]() -> std::vector<V> {
+      switch (mt->kind) {
+        case MK::Mty_ident: return {path(mt->path)};
+        case MK::Mty_signature: return {signature(mt->sign)};
+        case MK::Mty_functor: {
+          V param = mt->param.is_unit
+                        ? i(0)
+                        : o::vblock(0, {mt->param.id ? some(ident(mt->param.id)) : none(), module_type(mt->param.mty)});
+          return {param, module_type(mt->res)};
+        }
+        case MK::Mty_alias: return {path(mt->path)};
+      }
+      return {};
+    });
+  }
+  V sig_item(const SignatureItem* it) {
+    using SK = SignatureItem::Kind;
+    V vis = i(it->vis == Visibility::Exported ? 0 : 1);
+    V rec = i(static_cast<long>(it->rec));
+    switch (it->kind) {
+      case SK::Sig_value: {
+        const ValueDescription* vd = it->value;
+        V d = shared(memo_, vd, 0, [&]() -> std::vector<V> {
+          return {ty(vd->val_type), value_kind(vd->val_kind), loc(vd->val_loc), attributes(vd->val_attributes),
+                  uid(vd->val_uid)};
+        });
+        return o::vblock(0, {ident(it->id), d, vis});
+      }
+      case SK::Sig_type: return o::vblock(1, {ident(it->id), type_decl(it->type), rec, vis});
+      case SK::Sig_typext:
+        return o::vblock(2, {ident(it->id), ext_constr(it->ext), i(static_cast<long>(it->ext_status)), vis});
+      case SK::Sig_module: {
+        const ModuleDeclaration* md = it->md;
+        V d = shared(memo_, md, 0, [&]() -> std::vector<V> {
+          return {module_type(md->md_type), attributes(md->md_attributes), loc(md->md_loc), uid(md->md_uid)};
+        });
+        return o::vblock(3, {ident(it->id), i(it->presence == ModulePresence::Mp_present ? 0 : 1), d, rec, vis});
+      }
+      case SK::Sig_modtype: {
+        const ModtypeDeclaration* mtd = it->mtd;
+        V d = shared(memo_, mtd, 0, [&]() -> std::vector<V> {
+          return {mtd->mtd_type ? some(module_type(mtd->mtd_type)) : none(), attributes(mtd->mtd_attributes),
+                  loc(mtd->mtd_loc), uid(mtd->mtd_uid)};
+        });
+        return o::vblock(4, {ident(it->id), d, vis});
+      }
+      case SK::Sig_class: {
+        const ClassDeclaration* cd = it->cls;
+        V d = shared(memo_, cd, 0, [&]() -> std::vector<V> {
+          return {tys(cd->cty_params), class_type(cd->cty_type), path(cd->cty_path),
+                  cd->cty_new ? some(ty(cd->cty_new)) : none(), variances(cd->cty_variance), loc(cd->cty_loc),
+                  attributes(cd->cty_attributes), uid(cd->cty_uid)};
+        });
+        return o::vblock(5, {ident(it->id), d, rec, vis});
+      }
+      case SK::Sig_class_type: {
+        const ClassTypeDeclaration* cd = it->clty;
+        V d = shared(memo_, cd, 0, [&]() -> std::vector<V> {
+          return {tys(cd->clty_params), class_type(cd->clty_type), path(cd->clty_path), type_decl(cd->clty_hash_type),
+                  variances(cd->clty_variance), loc(cd->clty_loc), attributes(cd->clty_attributes), uid(cd->clty_uid)};
+        });
+        return o::vblock(6, {ident(it->id), d, rec, vis});
+      }
+    }
+    return i(0);
+  }
+  V signature(const Signature& sg) {
+    return list(sg, [&](const SignatureItem* it) { return sig_item(it); });
+  }
+
+ private:
+  std::unordered_map<const void*, V> memo_;
+  std::map<std::string, V> fnames_;
+  std::string current_unit_;
+  V current_unit_name_;
+  std::map<std::pair<const char*, std::size_t>, V> strs_;
+  std::map<std::pair<const void*, std::size_t>, V> lists_;
+  std::map<std::tuple<int, const char*, std::size_t>, V> labels_;
+  std::map<std::tuple<std::string, long, long, long>, V> poss_;
+  std::map<std::tuple<const void*, const void*, bool>, V> locs_;
 };
 
 }  // namespace
+
+std::string output_cmi(const std::string& filename, const CmiInfos& cmi) {
+  // (the provided signature must have been substituted for saving)
+  Writer w;
+  w.set_current_unit(cmi.cmi_name);
+  o::ValPtr name = w.unit_name(cmi.cmi_name);
+  o::ValPtr header = o::vblock(0, {name, w.signature(cmi.cmi_sign)});
+  std::vector<std::uint8_t> hbytes = o::marshal(header);
+  std::string prefix(cmi_magic_number);
+  prefix.append(reinterpret_cast<const char*>(hbytes.data()), hbytes.size());
+  // Digest.BLAKE128.file filename, after the flush: the magic and the header
+  std::string crc = blake2::blake128(reinterpret_cast<const unsigned char*>(prefix.data()), prefix.size());
+  std::vector<o::ValPtr> crcs{o::vblock(0, {w.str(cmi.cmi_name), w.some(w.str(crc))})};
+  for (auto& [name, c] : cmi.cmi_crcs)
+    crcs.push_back(o::vblock(0, {w.str(name), c ? w.some(w.str(*c)) : w.none()}));
+  std::vector<std::uint8_t> cbytes = o::marshal(o::vlist(crcs));
+  std::vector<o::ValPtr> flags;
+  for (const PersFlag& f : cmi.cmi_flags) {
+    switch (f.kind) {
+      case PersFlag::Kind::Rectypes: flags.push_back(w.i(0)); break;
+      case PersFlag::Kind::Opaque: flags.push_back(w.i(1)); break;
+      case PersFlag::Kind::Alerts:
+        flags.push_back(o::vblock(0, {w.strmap<std::string_view>(f.alerts.root(), [&](std::string_view s) {
+          return w.str(s);
+        })}));
+        break;
+    }
+  }
+  std::vector<std::uint8_t> fbytes = o::marshal(o::vlist(flags));
+  // Misc.output_to_file_via_temporary
+  std::string tmp = filename + ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::binary);
+    if (!out) throw std::runtime_error("Cannot open " + tmp);
+    out.write(prefix.data(), static_cast<std::streamsize>(prefix.size()));
+    out.write(reinterpret_cast<const char*>(cbytes.data()), static_cast<std::streamsize>(cbytes.size()));
+    out.write(reinterpret_cast<const char*>(fbytes.data()), static_cast<std::streamsize>(fbytes.size()));
+    if (!out) throw std::runtime_error("Cannot write " + tmp);
+  }
+  if (std::rename(tmp.c_str(), filename.c_str()) != 0) {
+    std::remove(tmp.c_str());
+    throw std::runtime_error("Cannot rename " + tmp + " to " + filename);
+  }
+  return crc;
+}
 
 CmiInfos read_cmi(const std::string& filename) {
   std::ifstream in(filename, std::ios::binary);

@@ -363,7 +363,7 @@ void add_method(env::t env, std::string_view label, PrivateFlag priv, VirtualFla
     sign->csig_self_row = r.row;
     virt2 = virt;
   }
-  sign->csig_meths = meths.add(zstr(label), MethEntry{priv2, virt2, ty});
+  sign->csig_meths = meths.add(zborrow(label), MethEntry{priv2, virt2, ty});
 }
 
 void add_instance_variable(bool strict, env::t env, std::string_view label, MutableFlag mut,
@@ -387,7 +387,7 @@ void add_instance_variable(bool strict, env::t env, std::string_view label, Muta
       }
     }
   }
-  sign->csig_vars = vars.add(zstr(label), VarEntry{mut, virt2, ty});
+  sign->csig_vars = vars.add(zborrow(label), VarEntry{mut, virt2, ty});
 }
 
 static void unify_self_types(env::t env, const ClassSignature* sign1, const ClassSignature* sign2) {

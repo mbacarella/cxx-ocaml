@@ -659,7 +659,7 @@ Result<CoercionShape, E::SignatureSymptom> signatures_(const CoreRelation& core,
         btype::is_row_name(name2.name)) {
       // Do not report in case of failure, as the main type will generate an
       // error
-      name2 = FieldDesc{zstr(name2.name.substr(0, name2.name.size() - 4)), FieldKind::Field_type};
+      name2 = FieldDesc{zborrow(name2.name.substr(0, name2.name.size() - 4)), FieldKind::Field_type};
       report = false;
     }
     auto f = comps1.find(name2);
@@ -918,7 +918,7 @@ std::pair<const tt::ModuleCoercion*, shape::t> compunit(env::t env, bool mark, s
                                                        Signature intf_sig, shape::t unit_shape) {
   // Location.in_file impl_name
   Location loc = location::none();
-  loc.loc_start.pos_fname = loc.loc_end.pos_fname = zstr(impl_name);
+  loc.loc_start.pos_fname = loc.loc_end.pos_fname = zborrow(impl_name);
   loc.loc_start.pos_lnum = loc.loc_end.pos_lnum = 1;
   loc.loc_start.pos_bol = loc.loc_end.pos_bol = 0;
   loc.loc_start.pos_cnum = loc.loc_end.pos_cnum = -1;

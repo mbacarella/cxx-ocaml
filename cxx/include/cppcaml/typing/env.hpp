@@ -516,6 +516,11 @@ bool path_equiv(t env, Path::t p1, Path::t p2);
 
 // persistent structures
 Signature read_signature(const std::string& modname, const std::string& filename);
+// save_signature ~alerts sg modname filename (Env.save_signature): substitute
+// the signature for saving, write the .cmi and enter it in the persistent
+// table; returns the cmi written.
+cmi_format::CmiInfos save_signature(StrMap<std::string_view> alerts, Signature sg, const std::string& modname,
+                                    const std::string& filename);
 const ModuleData* find_pers_mod(bool allow_hidden, const std::string& name);
 std::vector<std::pair<std::string, std::optional<std::string>>> imports();
 std::string crc_of_unit(const std::string& name);

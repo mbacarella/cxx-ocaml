@@ -20,4 +20,6 @@ inline bool keep_docs = false;             // -keep-docs
 inline bool native_code = false;
 inline bool unboxed_types = false;
 inline bool typing_recovery = false;      // -typing-recovery
+inline bool opaque = false;               // -opaque
+inline bool dont_write_files = false;     // -i (print the interface, write nothing)
 }  // namespace cppcaml::typing::clflags

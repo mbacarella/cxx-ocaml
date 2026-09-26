@@ -327,7 +327,7 @@ static const tt::Pattern* type_pat_aux(TypePatState& tps, PC category,
       const tt::Pattern* arg = nullptr;
       // PR#6235: propagate type information
       if (v->arg && sv.arg_type.size() == 1) arg = type_pat_(tps, PC::Value, v->arg, sv.arg_type[0]);
-      return rvp(mkpat(make<tt::Tpat_variant>(tt::Tpat_variant{{PK::Tpat_variant}, zstr(v->label), arg,
+      return rvp(mkpat(make<tt::Tpat_variant>(tt::Tpat_variant{{PK::Tpat_variant}, zborrow(v->label), arg,
                                                                make<tt::RowDescRef>(tt::RowDescRef{sv.row})}),
                        loc, sv.expected_ty, penv->env, sp->ppat_attributes));
     }

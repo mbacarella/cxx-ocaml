@@ -37,12 +37,15 @@
 #include "cppcaml/lambda.hpp"
 #include "cppcaml/link.hpp"
 #include "cppcaml/parser.hpp"
+#include "cppcaml/typing/builtin_attributes.hpp"
 #include "cppcaml/typing/clflags.hpp"
 #include "cppcaml/typing/ctype.hpp"
 #include "cppcaml/typing/env.hpp"
 #include "cppcaml/typing/error_report.hpp"
 #include "cppcaml/typing/parsetree.hpp"
 #include "cppcaml/typing/persistent_env.hpp"
+#include "cppcaml/typing/includemod.hpp"
+#include "cppcaml/typing/typecore.hpp"
 #include "cppcaml/typing/typemod.hpp"
 
 namespace fs = std::filesystem;
@@ -226,6 +229,7 @@ static void set_typing_flag(const std::string& a) {
   else if (a == "-no-keep-locs") cf::keep_locs = false;
   else if (a == "-keep-docs") cf::keep_docs = true;
   else if (a == "-no-keep-docs") cf::keep_docs = false;
+  else if (a == "-opaque") cf::opaque = true;
 }
 
 // -stop-after parsing / typing
@@ -248,13 +252,17 @@ static bool g_nostdlib = false;
 
 // The type checker (the typing/ port, TYPECHECKER.md): Compmisc.init_path +
 // initial_env, then Typemod.type_implementation / type_interface, before
-// code generation as in ocamlc (when: typecheck_enabled).  Returns false
-// after reporting a type error (ocamlc's location line and the error's
-// constructor until Printtyp is ported).  A part of typing/ the port does not
-// have yet, or an internal failure, lets the compilation go on
-// (CPPCAML_TYPECHECK_DEBUG says why).
+// code generation as in ocamlc (when: typecheck_enabled).  A type error is
+// reported as ocamlc's location line and the error's constructor until
+// Printtyp is ported.  A part of typing/ the port does not have yet, or an
+// internal failure, lets the compilation go on (CPPCAML_TYPECHECK_DEBUG says
+// why).
 using PortBody = std::function<void(cppcaml::typing::env::t, const cppcaml::typing::typemod::UnitInfo&)>;
-static bool port_typecheck(const std::string& in_path, const std::string& mod, const std::string& stdlib_dir,
+// Typed: the port typed the unit (and, for an .ml without .mli, wrote its
+// .cmi); Fallback: it reached an unported part or failed internally, the
+// legacy pipeline carries on alone; Rejected: a type error was reported.
+enum class PortResult { Typed, Fallback, Rejected };
+static PortResult port_typecheck(const std::string& in_path, const std::string& mod, const std::string& stdlib_dir,
                            const std::string& out, bool intf, const PortBody& body) {
   namespace ty = cppcaml::typing;
   static bool installed = false;
@@ -296,10 +304,10 @@ static bool port_typecheck(const std::string& in_path, const std::string& mod, c
     target.has_mli = !intf && fs::exists(fs::path(in_path).replace_extension(".mli"));
     target.cmi_file = target.prefix + ".cmi";
     body(env0, target);
-    return true;
+    return PortResult::Typed;
   } catch (const std::bad_function_call&) {
     if (debug) std::cerr << "c++ocamlc: " << in_path << ": type checker: unported part of typing/\n";
-    return true;
+    return PortResult::Fallback;
   } catch (...) {
     std::optional<ty::error_report::Report> r = ty::error_report::classify(std::current_exception());
     if (!r) {
@@ -312,7 +320,7 @@ static bool port_typecheck(const std::string& in_path, const std::string& mod, c
           std::cerr << "c++ocamlc: " << in_path << ": type checker failed\n";
         }
       }
-      return true;
+      return PortResult::Fallback;
     }
     // an error without a location here: Location.in_file !input_name
     ty::Location l = ty::location::none();
@@ -322,7 +330,7 @@ static bool port_typecheck(const std::string& in_path, const std::string& mod, c
     std::cerr << ty::error_report::format_loc(l, in_path);
     std::cerr << ":\nError: " << r->name << '\n';
     if (debug && !r->detail.empty()) std::cerr << "  (" << r->detail << ")\n";
-    return false;
+    return PortResult::Rejected;
   }
 }
 
@@ -351,14 +359,16 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
     if (g_dump.parsetree)
       cppcaml::ast::print_dparsetree(structure, in_path, std::cout, dirfiles);
     if (g_stop_after == StopAfter::Parsing) return 0;
+    PortResult port = PortResult::Fallback;
     if (typecheck_enabled()) {
-      bool ok = port_typecheck(in_path, mod, stdlib_dir, cmo_out, /*intf=*/false,
-                               [&](cppcaml::typing::env::t env0, const cppcaml::typing::typemod::UnitInfo& target) {
-                                 namespace ty = cppcaml::typing;
-                                 ty::parsetree::Structure st = ty::parsetree::of_ast(structure, in_path, dirfiles);
-                                 ty::typemod::type_implementation(target, env0, st);
-                               });
-      if (!ok) return 2;
+      port = port_typecheck(in_path, mod, stdlib_dir, cmo_out, /*intf=*/false,
+                            [&](cppcaml::typing::env::t env0, const cppcaml::typing::typemod::UnitInfo& target) {
+                              namespace ty = cppcaml::typing;
+                              ty::parsetree::Structure st = ty::parsetree::of_ast(structure, in_path, dirfiles);
+                              // an .ml without .mli: its .cmi is written here (Typemod)
+                              ty::typemod::type_implementation(target, env0, st);
+                            });
+      if (port == PortResult::Rejected) return 2;
       lap("typecheck", tp);
       if (g_stop_after == StopAfter::Typing) return 0;
     }
@@ -375,10 +385,11 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
     if (g_dump.instr) cppcaml::bytecode::print_dinstr(instrs, std::cout);
     // Write the .cmi BEFORE the .cmo so write_cmo can read the interface CRCs it
     // records (a hand-written .mli's .cmi already exists on disk from earlier).
-    try {  // best-effort .cmi from inference (unless a hand-written .mli owns it)
+    try {  // best-effort .cmi from inference (unless a hand-written .mli owns it,
+           // or the type checker wrote it)
       fs::path cmi_path = fs::path(cmo_out).replace_extension(".cmi");
       bool has_mli = fs::exists(fs::path(in_path).replace_extension(".mli"));
-      if (!has_mli)  // inferred from the .ml -> Impl provenance in the uids
+      if (!has_mli && port != PortResult::Typed)  // inferred from the .ml -> Impl provenance in the uids
         // The source path is the file_id-0 entry of the location table: without
         // it every declaration's pos_fname came out "" (NOMLLOC reverts).
         // The saved stamps continue ocamlc's global ident counter: 273 after
@@ -455,14 +466,22 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
     auto sig = cppcaml::parse_signature(ss.str());
     if (g_stop_after == StopAfter::Parsing) return 0;
     if (typecheck_enabled()) {
-      bool ok = port_typecheck(in_path, module_name(in_path), g_stdlib_dir, cmi_out, /*intf=*/true,
-                               [&](cppcaml::typing::env::t env0, const cppcaml::typing::typemod::UnitInfo& target) {
-                                 namespace ty = cppcaml::typing;
-                                 ty::parsetree::Signature sg = ty::parsetree::of_ast_signature(sig, in_path, {});
-                                 ty::typemod::type_interface(target, env0, sg);
-                               });
-      if (!ok) return 2;
-      if (g_stop_after == StopAfter::Typing) return 0;
+      PortResult port = port_typecheck(
+          in_path, module_name(in_path), g_stdlib_dir, cmi_out, /*intf=*/true,
+          [&](cppcaml::typing::env::t env0, const cppcaml::typing::typemod::UnitInfo& target) {
+            namespace ty = cppcaml::typing;
+            ty::parsetree::Signature sg = ty::parsetree::of_ast_signature(sig, in_path, {});
+            // Compile_common.typecheck_intf
+            const ty::typedtree::Signature* tsg = ty::typemod::type_interface(target, env0, sg);
+            (void)ty::includemod::signatures(env0, true, tsg->sig_type, tsg->sig_type);
+            ty::typecore::force_delayed_checks();
+            if (g_stop_after == StopAfter::Typing) return;
+            // Compile_common.emit_signature
+            ty::env::save_signature(ty::builtin_attributes::alerts_of_sig(sg), tsg->sig_type, target.modname,
+                                    target.prefix + ".cmi");
+          });
+      if (port == PortResult::Rejected) return 2;
+      if (g_stop_after == StopAfter::Typing || port == PortResult::Typed) return 0;
     }
     cppcaml::cmi::cmiw::write_cmi(cmi_out, module_name(in_path), cppcaml::signature_to_cmi(sig),
                                   {}, /*intf=*/true, /*src_files=*/{in_path},

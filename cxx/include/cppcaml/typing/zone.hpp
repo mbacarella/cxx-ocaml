@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <new>
 #include <string_view>
@@ -39,6 +40,7 @@ class Zone {
       std::size_t sz = n > kBlock ? n : kBlock;
       blocks_.emplace_back(new char[sz]);
       cur_ = blocks_.back().get();
+      ranges_.emplace(cur_, sz);
       cap_ = sz;
       off = 0;
     }
@@ -56,8 +58,18 @@ class Zone {
     return t;
   }
 
+  // whether [p] points into this zone's storage
+  bool owns(const char* p) const {
+    auto it = ranges_.upper_bound(p);
+    if (it == ranges_.begin()) return false;
+    --it;
+    return p < it->first + it->second;
+  }
+
+  // A copy has an identity (its address), "" included: the .cmi writer
+  // shares strings by identity, as Marshal does.
   std::string_view str(std::string_view s) {
-    if (s.empty()) return {};
+    if (s.empty()) return {static_cast<char*>(alloc(1, 1)), 0};
     char* p = static_cast<char*>(alloc(s.size(), 1));
     std::memcpy(p, s.data(), s.size());
     return {p, s.size()};
@@ -66,6 +78,7 @@ class Zone {
  private:
   static constexpr std::size_t kBlock = 1 << 20;
   std::vector<std::unique_ptr<char[]>> blocks_;
+  std::map<const char*, std::size_t> ranges_;  // block start -> size
   char* cur_ = nullptr;
   std::size_t cap_ = 0, off_ = 0;
   std::vector<std::pair<void*, void (*)(void*)>> dtors_;
@@ -117,6 +130,11 @@ Slice<T> slice(std::initializer_list<T> l) {
 }
 
 inline std::string_view zstr(std::string_view s) { return zone().str(s); }
+// zborrow: [s] itself when it already lives in a zone (the zones are
+// process-long), else a zone copy.  OCaml passes a string by reference where
+// the port takes a string_view, so borrowing keeps one string one object --
+// which the .cmi writer turns back into Marshal's sharing.
+std::string_view zborrow(std::string_view s);
 
 // ---------------------------------------------------------------------------
 // A persistent balanced map: stdlib map.ml's AVL, ported.  `Cmp` is a

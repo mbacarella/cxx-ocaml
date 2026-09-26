@@ -373,7 +373,7 @@ const pt::Expression* type_format(const Location& loc0, std::string_view str, en
   };
   auto mk_int = [&](long n) {
     pt::ConstantDesc c{pt::ConstantDesc::Kind::Pconst_integer};
-    c.s = zstr(std::to_string(n));
+    c.s = zborrow(std::to_string(n));
     return mk_cst(c);
   };
   auto mk_string = [&](std::string_view s) {
@@ -474,12 +474,12 @@ static std::pair<tt::Pattern*, tt::Expression*> var_pair(env::t env, std::string
   auto* desc = make<ValueDescription>(ty, ValueKind{}, location::none(), Attributes{}, uid::mk(env::get_current_unit()));
   env::t exp_env = env::add_value(id, desc, env);
   auto* pat = make<tt::Pattern>(
-      make<tt::Tpat_var>(tt::Tpat_var{{tt::PatternDesc::Kind::Tpat_var}, id, pt::StrLoc{zstr(name), location::none()},
+      make<tt::Tpat_var>(tt::Tpat_var{{tt::PatternDesc::Kind::Tpat_var}, id, pt::StrLoc{zborrow(name), location::none()},
                                       desc->val_uid}),
       location::none(), Slice<tt::PatExtraItem>{}, ty, env, tt::Attributes{});
   auto* exp = make<tt::Expression>(
       make<tt::Texp_ident>(tt::Texp_ident{{XK::Texp_ident}, Path::pident(id),
-                                          pt::LidLoc{Longident::lident(zstr(name)), location::none()}, desc}),
+                                          pt::LidLoc{Longident::lident(zborrow(name)), location::none()}, desc}),
       location::none(), Slice<tt::ExpExtraItem>{}, ty, exp_env, tt::Attributes{});
   return {pat, exp};
 }

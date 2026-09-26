@@ -78,7 +78,7 @@ Slice<const tt::Case*> type_effect_cases(tt::PatternCategory category, env::t en
     const TypeDeclaration* decl = ctype::new_local_type(TypeOrigin{}, loc);
     long scope = ctype::create_scope();
     std::string name = ctype::get_new_abstract_name(env, "%eff");
-    Ident::t id = Ident::create_scoped(static_cast<int>(scope), zstr(name));
+    Ident::t id = Ident::create_scoped(static_cast<int>(scope), zborrow(name));
     env::t new_env = env::add_type(false, id, decl, env);
     TypeExpr* ty_eff = newgenty(tconstr(Path::pident(id), {}, make<MemoRef>(mnil())));
     // (new_env, Predef.type_eff ty_eff, Predef.type_continuation ty_eff ty_res): right to left
@@ -357,7 +357,7 @@ SendResult type_send(env::t env, const Location&, Explanation explanation, const
     } else {
       id = Ident::create_local(met);
       typ = ctype::newvar();
-      *vk.meths = vk.meths->add(zstr(met), id);
+      *vk.meths = vk.meths->add(zborrow(met), id);
       ctype::add_method(env, met, PrivateFlag::Private, VirtualFlag::Virtual, typ, vk.sign);
       // (the Undeclared_virtual_method warning is not emitted)
     }
@@ -371,7 +371,7 @@ SendResult type_send(env::t env, const Location&, Explanation explanation, const
     if (!f) undefined_self_method(*vk.meths);
     TypeExpr* typ = method_type(met, vk.sign);
     Path::t self_path =
-        env::find_value_by_name(Longident::lident(zstr(std::string("self-") + std::string(vk.cl_num))), env).first;
+        env::find_value_by_name(Longident::lident(zborrow(std::string("self-") + std::string(vk.cl_num))), env).first;
     tt::Meth m{tt::Meth::Kind::Tmeth_ancestor};
     m.id = *f;
     m.path = self_path;
@@ -416,7 +416,7 @@ SendResult type_send(env::t env, const Location&, Explanation explanation, const
     throw;
   }
   tt::Meth m{tt::Meth::Kind::Tmeth_name};
-  m.name = zstr(met);
+  m.name = zborrow(met);
   return {obj, m, ty};
 }
 

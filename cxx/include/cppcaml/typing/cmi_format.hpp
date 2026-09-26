@@ -41,4 +41,9 @@ struct Error : std::runtime_error {
 // Allocates in the current zone (typing::zone()).
 CmiInfos read_cmi(const std::string& filename);
 
+// output_cmi filename cmi: writes the .cmi (via a temporary file) and
+// returns its CRC, the raw BLAKE128 digest.  The signature must have been
+// substituted for saving (Env.save_signature does it).
+std::string output_cmi(const std::string& filename, const CmiInfos& cmi);
+
 }  // namespace cppcaml::typing::cmi_format

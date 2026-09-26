@@ -1104,7 +1104,7 @@ SolvedVariant solve_Ppat_variant(const Location& loc, ctype::PatternEnv* env,
                                  std::string_view tag, bool no_arg, TypeExpr* expected_ty) {
   std::vector<TypeExpr*> arg_type;
   if (!no_arg) arg_type.push_back(newgenvar());
-  std::vector<RowFieldEntry> fields{{zstr(tag), rf_either(nullptr, no_arg, slice(arg_type), true)}};
+  std::vector<RowFieldEntry> fields{{zborrow(tag), rf_either(nullptr, no_arg, slice(arg_type), true)}};
   auto make_row = [&](TypeExpr* more) {
     return create_row(slice(fields), more, false, nullptr, nullptr);
   };

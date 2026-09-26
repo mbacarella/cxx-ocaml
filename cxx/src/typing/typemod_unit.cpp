@@ -9,7 +9,9 @@
 #include <filesystem>
 #include <set>
 
+#include "cppcaml/typing/parmatch.hpp"
 #include "cppcaml/typing/persistent_env.hpp"
+#include "cppcaml/typing/shape.hpp"
 #include "typecore_internal.hpp"
 #include "typemod_internal.hpp"
 
@@ -177,6 +179,16 @@ static std::pair<const tt::ModuleExpr*, const Package*> type_package(env::t env,
 
 // ---- fill in the forward declarations ---------------------------------------------------------
 void install_forward_refs() {
+  // The idents ocamlc creates while its modules initialize, before the first
+  // Ident.reinit records the stamp level, in link order (shape, parmatch,
+  // typeclass): every later stamp, the saved .cmi's included, counts them.
+  static bool initialized = false;
+  if (!initialized) {
+    initialized = true;
+    (void)shape::for_unnamed_functor_param();
+    parmatch::module_init();
+    typeclass::module_init();
+  }
   typecore::type_module = [](env::t env, const pt::ModuleExpr* smod) {
     auto [me, s] = type_module_alias_with_shape(env, smod);
     return std::make_pair(me, static_cast<const void*>(s));
@@ -214,24 +226,28 @@ tt::Implementation type_implementation(const UnitInfo& target, env::t initial_en
   typecore::reset_delayed_checks();
   env::reset_required_globals();
   TypeStructureResult r = type_structure(initial_env, ast);
-  // (the shape's uid: Uid.of_compilation_unit_id (Ident.create_persistent modname))
+  shape::t shape0 = shape::set_uid_if_none(
+      r.shape, uid::of_compilation_unit_id(ident::name(Ident::create_persistent(target.modname))));
   Signature simple_sg = simplify(r.env, r.names, r.sg);
   if (target.has_mli) {
     Signature dclsig = env::read_signature(target.modname, target.cmi_file);
     auto [coercion, shape] = includemod::compunit(initial_env, true, target.source_file, r.sg,
                                                   target.source_file.substr(0, target.source_file.size() - 3) + ".mli",
-                                                  dclsig, shape::dummy_mod());
+                                                  dclsig, shape0);
     (void)shape;
     typecore::force_delayed_checks();
     return {r.str, coercion, dclsig};
   }
   // (the Missing_mli warning is not emitted)
   auto [coercion, shape] = includemod::compunit(initial_env, true, target.source_file, r.sg, "(inferred signature)",
-                                                simple_sg, shape::dummy_mod());
+                                                simple_sg, shape0);
   (void)shape;
   check_nongen_signature(r.env, simple_sg);
   normalize_signature(simple_sg);
   typecore::force_delayed_checks();
+  // (the shape's Shape_reduce.local_reduce is not ported: no cmt)
+  StrMap<std::string_view> alerts = builtin_attributes::alerts_of_str(ast);
+  if (!clflags::dont_write_files) env::save_signature(alerts, simple_sg, target.modname, target.prefix + ".cmi");
   return {r.str, coercion, simple_sg};
 }
 
@@ -263,7 +279,7 @@ env::t initial_env(const Location& loc, const std::optional<std::string>& initia
     std::size_t start = 0;
     for (;;) {
       std::size_t dot = m.find('.', start);
-      std::string_view part = zstr(m.substr(start, dot == std::string::npos ? std::string::npos : dot - start));
+      std::string_view part = zborrow(m.substr(start, dot == std::string::npos ? std::string::npos : dot - start));
       lid = lid ? Longident::ldot(lid, location::none(), part, location::none()) : Longident::lident(part);
       if (dot == std::string::npos) break;
       start = dot + 1;
@@ -271,7 +287,7 @@ env::t initial_env(const Location& loc, const std::optional<std::string>& initia
     return type_open_(nullptr, false, OverrideFlag::Override, e, loc, pt::LidLoc{lid, loc}).second;
   };
   auto add_units = [](env::t e, const std::set<std::string>& units) {
-    for (auto& name : units) e = env::add_persistent_structure(Ident::create_persistent(zstr(name)), e);
+    for (auto& name : units) e = env::add_persistent_structure(Ident::create_persistent(zborrow(name)), e);
     return e;
   };
   std::vector<std::set<std::string>> units;

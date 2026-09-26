@@ -2,6 +2,8 @@
 // typing/persistent_env.ml (TYPECHECKER.md).
 #pragma once
 
+#include <cstdio>
+
 #include <functional>
 #include <map>
 #include <optional>
@@ -237,6 +239,41 @@ class PersistentEnv {
   bool is_imported(const std::string& s) const { return imported_units_.count(s) != 0; }
   bool is_imported_opaque(const std::string& s) const {
     return imported_opaque_units_.count(s) != 0;
+  }
+
+  // make_cmi penv modname sign alerts
+  cmi_format::CmiInfos make_cmi(const std::string& modname, Signature sign, StrMap<std::string_view> alerts) const {
+    cmi_format::CmiInfos c;
+    c.cmi_name = zborrow(modname);
+    c.cmi_sign = sign;
+    c.cmi_crcs = imports();
+    if (clflags::recursive_types) c.cmi_flags.push_back({cmi_format::PersFlag::Kind::Rectypes, {}});
+    if (clflags::opaque) c.cmi_flags.push_back({cmi_format::PersFlag::Kind::Opaque, {}});
+    c.cmi_flags.push_back({cmi_format::PersFlag::Kind::Alerts, alerts});
+    return c;
+  }
+
+  // save_cmi penv psig pm: write the .cmi, then enter it in the persistent
+  // table so that imports() also returns its crc (save_pers_struct).
+  // Returns the crc.
+  std::string save_cmi(const PersistentSignature& psig, const PM& pm) {
+    const cmi_format::CmiInfos& cmi = psig.cmi;
+    std::string crc;
+    try {
+      crc = cmi_format::output_cmi(psig.filename, cmi);
+    } catch (...) {
+      std::remove(psig.filename.c_str());
+      throw;
+    }
+    std::string modname(cmi.cmi_name);
+    PersStruct ps{modname, cmi.cmi_crcs, psig.filename, cmi.cmi_flags, psig.visibility};
+    ps.ps_crcs.insert(ps.ps_crcs.begin(), {modname, crc});
+    persistent_structures_.insert_or_assign(modname, Info{true, ps, pm});
+    for (auto& f : ps.ps_flags)
+      if (f.kind == cmi_format::PersFlag::Kind::Opaque) register_import_as_opaque(modname);
+    crc_units_.check(modname, crc, psig.filename);
+    add_import(modname);
+    return crc;
   }
 
  private:

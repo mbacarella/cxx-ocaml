@@ -104,4 +104,7 @@ extern std::function<std::pair<const tt::OpenDescription*, env::t>(bool* used_sl
 // issues with the Typecore global.
 void install_forward_refs();
 
+// creates typeclass.ml's module-initialization values (unbound_class)
+void module_init();
+
 }  // namespace cppcaml::typing::typeclass
