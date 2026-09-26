@@ -1243,6 +1243,140 @@ let tc_error_name : Typecore.error -> string = function
   | Cannot_unify_tfunctor_to_tarrow _ -> "Cannot_unify_tfunctor_to_tarrow"
   | Cannot_omit_tfunctor_argument _ -> "Cannot_omit_tfunctor_argument"
 
+let td_error_name : Typedecl.error -> string = function
+  | Repeated_parameter -> "Repeated_parameter"
+  | Duplicate_constructor _ -> "Duplicate_constructor"
+  | Too_many_constructors -> "Too_many_constructors"
+  | Duplicate_label _ -> "Duplicate_label"
+  | Recursive_abbrev _ -> "Recursive_abbrev"
+  | Cycle_in_def _ -> "Cycle_in_def"
+  | Definition_mismatch _ -> "Definition_mismatch"
+  | Constraint_failed _ -> "Constraint_failed"
+  | Inconsistent_constraint _ -> "Inconsistent_constraint"
+  | Type_clash _ -> "Type_clash"
+  | Non_regular _ -> "Non_regular"
+  | Null_arity_external -> "Null_arity_external"
+  | Missing_native_external -> "Missing_native_external"
+  | Unbound_type_var _ -> "Unbound_type_var"
+  | Cannot_extend_private_type _ -> "Cannot_extend_private_type"
+  | Not_extensible_type _ -> "Not_extensible_type"
+  | Extension_mismatch _ -> "Extension_mismatch"
+  | Rebind_wrong_type _ -> "Rebind_wrong_type"
+  | Rebind_mismatch _ -> "Rebind_mismatch"
+  | Rebind_private _ -> "Rebind_private"
+  | Variance _ -> "Variance"
+  | Unavailable_type_constructor _ -> "Unavailable_type_constructor"
+  | Multiple_native_repr_attributes -> "Multiple_native_repr_attributes"
+  | Cannot_unbox_or_untag_type _ -> "Cannot_unbox_or_untag_type"
+  | Deep_unbox_or_untag_attribute _ -> "Deep_unbox_or_untag_attribute"
+  | Type_cannot_be_external _ -> "Type_cannot_be_external"
+  | Immediacy _ -> "Immediacy"
+  | Separability _ -> "Separability"
+  | Bad_unboxed_attribute _ -> "Bad_unboxed_attribute"
+  | Boxed_and_unboxed -> "Boxed_and_unboxed"
+  | Nonrec_gadt -> "Nonrec_gadt"
+  | Invalid_private_row_declaration _ -> "Invalid_private_row_declaration"
+  | Atomic_field_must_be_mutable _ -> "Atomic_field_must_be_mutable"
+  | External_with_non_syntactic_arity -> "External_with_non_syntactic_arity"
+  | Primitive_alias_does_not_refer_to_primitive _ -> "Primitive_alias_does_not_refer_to_primitive"
+  | Primitive_type_mismatch _ -> "Primitive_type_mismatch"
+
+let tm_error_name : Typemod.error -> string = function
+  | Cannot_apply _ -> "Cannot_apply"
+  | Not_included _ -> "Not_included"
+  | Cannot_eliminate_dependency _ -> "Cannot_eliminate_dependency"
+  | Signature_expected -> "Signature_expected"
+  | Structure_expected _ -> "Structure_expected"
+  | With_no_component _ -> "With_no_component"
+  | With_mismatch _ -> "With_mismatch"
+  | With_makes_applicative_functor_ill_typed _ -> "With_makes_applicative_functor_ill_typed"
+  | With_changes_module_alias _ -> "With_changes_module_alias"
+  | With_creates_invalid_aliases _ -> "With_creates_invalid_aliases"
+  | With_cannot_remove_constrained_type -> "With_cannot_remove_constrained_type"
+  | With_package_manifest _ -> "With_package_manifest"
+  | Repeated_name _ -> "Repeated_name"
+  | Non_generalizable _ -> "Non_generalizable"
+  | Non_generalizable_module _ -> "Non_generalizable_module"
+  | Implementation_is_required _ -> "Implementation_is_required"
+  | Interface_not_compiled _ -> "Interface_not_compiled"
+  | Not_allowed_in_functor_body -> "Not_allowed_in_functor_body"
+  | Not_a_packed_module _ -> "Not_a_packed_module"
+  | Incomplete_packed_module _ -> "Incomplete_packed_module"
+  | Scoping_pack _ -> "Scoping_pack"
+  | Recursive_module_require_explicit_type -> "Recursive_module_require_explicit_type"
+  | Apply_generative -> "Apply_generative"
+  | Cannot_scrape_alias _ -> "Cannot_scrape_alias"
+  | Cannot_scrape_package_type _ -> "Cannot_scrape_package_type"
+  | Badly_formed_signature _ -> "Badly_formed_signature"
+  | Cannot_hide_id _ -> "Cannot_hide_id"
+  | Invalid_type_subst_rhs -> "Invalid_type_subst_rhs"
+  | Non_packable_local_modtype_subst _ -> "Non_packable_local_modtype_subst"
+  | With_cannot_remove_packed_modtype _ -> "With_cannot_remove_packed_modtype"
+  | Cannot_alias _ -> "Cannot_alias"
+  | Val_in_structure -> "Val_in_structure"
+
+let tcl_error_name : Typeclass.error -> string = function
+  | Unconsistent_constraint _ -> "Unconsistent_constraint"
+  | Field_type_mismatch _ -> "Field_type_mismatch"
+  | Unexpected_field _ -> "Unexpected_field"
+  | Structure_expected _ -> "Structure_expected"
+  | Cannot_apply _ -> "Cannot_apply"
+  | Apply_wrong_label _ -> "Apply_wrong_label"
+  | Pattern_type_clash _ -> "Pattern_type_clash"
+  | Repeated_parameter -> "Repeated_parameter"
+  | Unbound_class_2 _ -> "Unbound_class_2"
+  | Unbound_class_type_2 _ -> "Unbound_class_type_2"
+  | Abbrev_type_clash _ -> "Abbrev_type_clash"
+  | Constructor_type_mismatch _ -> "Constructor_type_mismatch"
+  | Virtual_class _ -> "Virtual_class"
+  | Undeclared_methods _ -> "Undeclared_methods"
+  | Parameter_arity_mismatch _ -> "Parameter_arity_mismatch"
+  | Parameter_mismatch _ -> "Parameter_mismatch"
+  | Bad_parameters _ -> "Bad_parameters"
+  | Bad_class_type_parameters _ -> "Bad_class_type_parameters"
+  | Class_match_failure _ -> "Class_match_failure"
+  | Unbound_val _ -> "Unbound_val"
+  | Unbound_type_var _ -> "Unbound_type_var"
+  | Non_generalizable_class _ -> "Non_generalizable_class"
+  | Cannot_coerce_self _ -> "Cannot_coerce_self"
+  | Non_collapsable_conjunction _ -> "Non_collapsable_conjunction"
+  | Self_clash _ -> "Self_clash"
+  | Mutability_mismatch _ -> "Mutability_mismatch"
+  | No_overriding _ -> "No_overriding"
+  | Duplicate _ -> "Duplicate"
+  | Closing_self_type _ -> "Closing_self_type"
+  | Polymorphic_class_parameter -> "Polymorphic_class_parameter"
+
+let report (e : exn) =
+  s "ERR ";
+  (match e with
+   | Typecore.Error.In_context (l, _, err) ->
+       s "Typecore."; s (tc_error_name err); s " "; P.loc l
+   | Typetexp.Error.In_context (l, _, err) ->
+       s "Typetexp."; s (texp_error_name err); s " "; P.loc l
+   | Env.Error.In_context (Lookup_error (l, _, err)) ->
+       s "Env."; s (lookup_error_name err); s " "; P.loc l
+   | Env.Error.In_context _ -> s "Env.other"
+   | Typedecl.Error.In_context (l, err) ->
+       s "Typedecl."; s (td_error_name err); s " "; P.loc l
+   | Attr_helper.Error (l, _) -> s "Attr_helper "; P.loc l
+   | e when Printexc.exn_slot_name e = "Typemod.Error.In_context" ->
+       (* not exported by typemod.mli: In_context of loc * env * error *)
+       let r = Obj.repr e in
+       s "Typemod."; s (tm_error_name (Obj.obj (Obj.field r 3))); s " ";
+       P.loc (Obj.obj (Obj.field r 1) : Location.t)
+   | Includemod.Apply_error { loc = l; _ } -> s "Includemod.Apply_error "; P.loc l
+   | Includemod.Error _ -> s "Includemod.Error"
+   | Typeclass.Error.In_context (l, _, err) ->
+       s "Typeclass."; s (tcl_error_name err); s " "; P.loc l
+   | Typemod.Error_forward _ | Typeclass.Error_forward _ -> s "Error_forward"
+   | Primitive.Error (l, _) -> s "Primitive "; P.loc l
+   | Typecore.Error_forward _ -> s "Error_forward"
+   | e when Printexc.exn_slot_name e = "Typetexp.Error_forward" -> s "Error_forward"
+   | Syntaxerr.Error _ -> s "Syntaxerr"
+   | e -> raise e);
+  s "\n"
+
 (* Type the structure items a Typemod-free port can: `let` bindings
    (Typecore.type_binding) and evaluated expressions (type_expression), in
    Env.initial + open Stdlib; stop at the first other item. *)
@@ -1256,21 +1390,6 @@ let run_core dirs file =
     | Error _ -> failwith "open Stdlib"
   in
   let st = Pparse.parse_implementation ~tool_name:"ocamlc" file in
-  let report (e : exn) =
-    s "ERR ";
-    (match e with
-     | Typecore.Error.In_context (l, _, err) ->
-         s "Typecore."; s (tc_error_name err); s " "; P.loc l
-     | Typetexp.Error.In_context (l, _, err) ->
-         s "Typetexp."; s (texp_error_name err); s " "; P.loc l
-     | Env.Error.In_context (Lookup_error (l, _, err)) ->
-         s "Env."; s (lookup_error_name err); s " "; P.loc l
-     | Env.Error.In_context _ -> s "Env.other"
-     | Typecore.Error_forward _ -> s "Error_forward"
-     | Syntaxerr.Error _ -> s "Syntaxerr"
-     | e -> raise e);
-    s "\n"
-  in
   Typecore.reset_delayed_checks ();
   let rec go env = function
     | [] ->
@@ -1295,6 +1414,40 @@ let run_core dirs file =
              | exp ->
                  reset_numbering (); s "eval : "; ty exp.exp_type; s "\n";
                  go env rest)
+        | Pstr_type (rf, sdecls) ->
+            (match Typedecl.transl_type_decl env rf sdecls with
+             | exception e -> report e
+             | (decls, newenv, _) ->
+                 List.iter (fun (d : Typedtree.type_declaration) ->
+                     reset_numbering ();
+                     s "type "; s (Ident.name d.typ_id); s " : "; type_decl d.typ_type; s "\n")
+                   decls;
+                 go newenv rest)
+        | Pstr_typext te ->
+            (match Typedecl.transl_type_extension true env it.pstr_loc te with
+             | exception e -> report e
+             | (tyext, newenv, _) ->
+                 List.iter (fun (c : Typedtree.extension_constructor) ->
+                     reset_numbering ();
+                     s "ext "; s (Ident.name c.ext_id); s " : "; ext_constr c.ext_type; s "\n")
+                   tyext.tyext_constructors;
+                 go newenv rest)
+        | Pstr_exception te ->
+            (match Typedecl.transl_type_exception env te with
+             | exception e -> report e
+             | (texn, newenv, _) ->
+                 reset_numbering ();
+                 s "exn "; s (Ident.name texn.tyexn_constructor.ext_id); s " : ";
+                 ext_constr texn.tyexn_constructor.ext_type; s "\n";
+                 go newenv rest)
+        | Pstr_primitive pd ->
+            (match Typedecl.transl_prim_desc env it.pstr_loc pd with
+             | exception e -> report e
+             | (desc, newenv) ->
+                 reset_numbering ();
+                 s "val "; s (Ident.name desc.prim_id); s " : ";
+                 ty desc.prim_val.val_type; s " "; value_kind desc.prim_val.val_kind; s "\n";
+                 go newenv rest)
         | _ -> s "STOP\n"
   in
   go env st
@@ -1405,6 +1558,29 @@ let run_ctype file env =
    with End_of_file -> ());
   close_in ic
 
+(* ---- stage 5: Typemod.type_structure on a whole implementation ---- *)
+let run_struct dirs file =
+  parse_file := file;
+  Load_path.init ~auto_include:Load_path.no_auto_include
+    ~visible:(String.split_on_char ':' dirs) ~hidden:[];
+  let env =
+    match Env.open_pers_signature "Stdlib" Env.initial with
+    | Ok env -> env
+    | Error _ -> failwith "open Stdlib"
+  in
+  let st = Pparse.parse_implementation ~tool_name:"ocamlc" file in
+  Typecore.reset_delayed_checks ();
+  Env.reset_required_globals ();
+  match
+    let (_str, sg, names, _shape, finalenv) = Typemod.type_structure env st in
+    let simple_sg = Typemod.Signature_names.simplify finalenv names sg in
+    Typemod.check_nongen_signature finalenv simple_sg;
+    Typecore.force_delayed_checks ();
+    simple_sg
+  with
+  | sg -> reset_numbering (); s "sig"; signature 1 sg; s "\nEND\n"
+  | exception e -> report e
+
 let () =
   match Array.to_list Sys.argv with
   | _ :: "gen" :: files -> gen files
@@ -1422,6 +1598,9 @@ let () =
   | _ :: "typexp" :: dirs :: modname :: file :: _ ->
       canonical := true;
       run_typexp dirs modname file; print_string (Buffer.contents b)
+  | _ :: "struct" :: dirs :: file :: _ ->
+      canonical := true;
+      run_struct dirs file; print_string (Buffer.contents b)
   | _ :: "core" :: dirs :: file :: _ ->
       canonical := true;
       run_core dirs file; print_string (Buffer.contents b)

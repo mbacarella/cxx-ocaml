@@ -1529,12 +1529,13 @@ class Parser {
     CoreTypeBox t = parse_type_arrow();
     while (cur().kind == Kind::AS && peek(1).kind == Kind::QUOTE) {  // t as 'a
       advance();  // as
+      Position qstart = position(cur().start);
       advance();  // '
       const Token& id = cur();
       if (id.kind != Kind::LIDENT) throw ParseError("expected type variable", id.start);
       advance();
       Location l = span(symstart, position(id.end));
-      t = box(CoreType{Ptyp_alias{std::move(t), id.text}, l});
+      t = box(CoreType{Ptyp_alias{std::move(t), id.text, span(qstart, position(id.end))}, l});
     }
     // Attributes attach only at the outermost core_type (grammar rule
     // `core_type attribute`); the arrow codomain / tuple elements are

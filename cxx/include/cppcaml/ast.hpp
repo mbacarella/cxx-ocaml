@@ -134,7 +134,7 @@ struct Ptyp_package {  // (module S [with type t = u and …])
   Location loc{};
 };
 struct Ptyp_class { LongidentLoc id; std::vector<CoreTypeBox> args; };  // [args] #class
-struct Ptyp_alias { CoreTypeBox type; std::string name; };  // (t as 'a)
+struct Ptyp_alias { CoreTypeBox type; std::string name; Location name_loc{}; };  // (t as 'a); name_loc spans 'a
 struct Ptyp_poly { std::vector<std::string> vars; CoreTypeBox type; };  // 'a 'b. t
 struct Ptyp_open { LongidentLoc mod_; CoreTypeBox type; };  // M.(t)
 struct Ptyp_functor { ArgLabel label; StringLoc name; Ptyp_package pkg; CoreTypeBox body; };  // (module M : T) -> t

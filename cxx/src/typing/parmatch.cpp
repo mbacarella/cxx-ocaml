@@ -1352,18 +1352,18 @@ Seq<Pats> specialize_and_exhaust(Path::t ext, const std::vector<Pats>& pss0, lon
   return seq_flat_map_list<Pats, Item>(f, std::shared_ptr<const std::vector<Item>>(items), 0);
 }
 
-Seq<const tt::Pattern*> exhaust(Path::t ext, const std::vector<Pats>& pss, long n) {
-  Seq<Pats> s = exhaust_(ext, pss, n);
-  std::function<Seq<const tt::Pattern*>(Seq<Pats>)> m = [&m](Seq<Pats> s2) -> Seq<const tt::Pattern*> {
-    std::function<Seq<const tt::Pattern*>(Seq<Pats>)> mm = m;
-    return [s2, mm]() -> SeqNode<const tt::Pattern*> {
-      SeqNode<Pats> nd = s2();
-      if (nd.nil) return {true};
-      if (nd.value.size() != 1) throw std::logic_error("Parmatch.exhaust: row");
-      return {false, nd.value[0], mm(nd.next)};
-    };
+// Seq.map (function [x] -> x | _ -> assert false)
+Seq<const tt::Pattern*> exhaust_unrow(Seq<Pats> s) {
+  return [s]() -> SeqNode<const tt::Pattern*> {
+    SeqNode<Pats> nd = s();
+    if (nd.nil) return {true};
+    if (nd.value.size() != 1) throw std::logic_error("Parmatch.exhaust: row");
+    return {false, nd.value[0], exhaust_unrow(nd.next)};
   };
-  return m(s);
+}
+
+Seq<const tt::Pattern*> exhaust(Path::t ext, const std::vector<Pats>& pss, long n) {
+  return exhaust_unrow(exhaust_(ext, pss, n));
 }
 
 // ---- pressure_variants --------------------------------------------------------------------

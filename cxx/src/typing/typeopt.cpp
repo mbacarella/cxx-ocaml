@@ -1,6 +1,7 @@
 // Port of the typer-facing part of typing/typeopt.ml (and of
 // typing/typedecl_unboxed.ml, which it uses).
 #include "cppcaml/typing/typeopt.hpp"
+#include "cppcaml/typing/typedecl_unboxed.hpp"
 
 #include "cppcaml/typing/clflags.hpp"
 #include "cppcaml/typing/ctype.hpp"
@@ -16,39 +17,7 @@ using XK = tt::ExpressionDesc::Kind;
 // Config.flat_float_array (ocamlc's default configuration)
 static constexpr bool flat_float_array = true;
 
-// Typedecl_unboxed.get_unboxed_type_representation.  We use the
-// Ctype.expand_head_opt version of expand_head to get access to the
-// manifest type of private abbreviations.
-static TypeExpr* get_unboxed_type_representation(env::t env, TypeExpr* ty, int fuel) {
-  if (fuel < 0) return nullptr;
-  ty = ctype::expand_head_opt(env, ty);
-  auto* tc = as<Tconstr>(get_desc(ty));
-  if (!tc) return ty;
-  const TypeDeclaration* decl;
-  try {
-    decl = env::find_type(tc->path, env);
-  } catch (const env::NotFound&) {
-    return ty;
-  }
-  const TypeKind* k = decl->type_kind;
-  TypeExpr* ty2 = nullptr;
-  if (k->kind == TypeKind::Kind::Type_record && k->labels.size() == 1 &&
-      k->record_repr.kind == RecordRepresentation::Kind::Record_unboxed) {
-    ty2 = k->labels[0]->ld_type;
-  } else if (k->kind == TypeKind::Kind::Type_variant && k->constructors.size() == 1 &&
-             k->variant_repr == VariantRepresentation::Variant_unboxed) {
-    const ConstructorArguments& a = k->constructors[0]->cd_args;
-    if (a.kind == ConstructorArguments::Kind::Cstr_tuple && a.tuple.size() == 1) ty2 = a.tuple[0];
-    else if (a.kind == ConstructorArguments::Kind::Cstr_record && a.record.size() == 1) ty2 = a.record[0]->ld_type;
-  }
-  if (!ty2) return ty;
-  ty2 = ctype::maybe_instance_poly(ty2);
-  return get_unboxed_type_representation(env, ctype::apply(env, decl->type_params, ty2, tc->args), fuel - 1);
-}
-static TypeExpr* get_unboxed_type_representation(env::t env, TypeExpr* ty) {
-  // Do not give too much fuel: PR#7424
-  return get_unboxed_type_representation(env, ty, 100);
-}
+using typedecl_unboxed::get_unboxed_type_representation;
 
 TypeExpr* scrape_ty(env::t env, TypeExpr* ty) {
   ty = ctype::maybe_instance_poly(ty);

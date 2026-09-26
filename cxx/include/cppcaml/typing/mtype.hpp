@@ -1,6 +1,5 @@
-// Port of typing/mtype.ml (TYPECHECKER.md), so far the part Env needs:
-// scraping and strengthening.  The rest (nondep_*, enrich, remove_aliases,
-// ...) comes with Typemod.
+// Port of typing/mtype.ml (TYPECHECKER.md): operations on module types
+// (scraping, strengthening, nondep, enrich, alias removal, ...).
 #pragma once
 
 #include "cppcaml/typing/clflags.hpp"
@@ -19,6 +18,18 @@ const lz::ModuleDecl* strengthen_lazy_decl(bool aliasable, env::t env, const lz:
 const ModuleType* strengthen(bool aliasable, env::t env, const ModuleType* mty, Path::t p);
 const ModuleDeclaration* strengthen_decl(bool aliasable, env::t env, const ModuleDeclaration* md,
                                          Path::t p);
+const ModuleType* scrape_for_functor_arg(env::t env, const ModuleType* mty);
+const ModuleType* scrape_for_type_of(bool remove_aliases, env::t env, const ModuleType* mty);
+// raise ctype::NondepCannotErase
+const ModuleType* nondep_supertype(env::t env, const std::vector<Ident::t>& ids, const ModuleType* mty);
+const SignatureItem* nondep_sig_item(env::t env, const std::vector<Ident::t>& ids, const SignatureItem* item);
+bool no_code_needed(env::t env, const ModuleType* mty);
+bool no_code_needed_sig(env::t env, Signature sg);
+const ModuleType* enrich_modtype(env::t env, Path::t p, const ModuleType* mty);
+const TypeDeclaration* enrich_typedecl(env::t env, Path::t p, Ident::t id, const TypeDeclaration* decl);
+std::vector<Path::t> type_paths(env::t env, Path::t p, const ModuleType* mty);
+bool contains_type(env::t env, const ModuleType* mty);
+void lower_nongen(long nglev, const ModuleType* mty);
 
 
 }  // namespace cppcaml::typing::mtype

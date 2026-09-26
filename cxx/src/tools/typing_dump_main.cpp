@@ -14,6 +14,10 @@
 #include "cppcaml/typing/env.hpp"
 #include "cppcaml/typing/parsetree.hpp"
 #include "cppcaml/typing/typecore.hpp"
+#include "cppcaml/typing/typedecl.hpp"
+#include "cppcaml/typing/typemod.hpp"
+#include "cppcaml/typing/typeclass.hpp"
+#include "cppcaml/typing/primitive.hpp"
 #include "cppcaml/typing/typetexp.hpp"
 #include "cppcaml/parser.hpp"
 #include <sstream>
@@ -2200,6 +2204,149 @@ const char* const tc_error_names[] = {
     "Cannot_unify_tfunctor_to_tarrow",
     "Cannot_omit_tfunctor_argument"};
 
+const char* const td_error_names[] = {
+    "Repeated_parameter",
+    "Duplicate_constructor",
+    "Too_many_constructors",
+    "Duplicate_label",
+    "Recursive_abbrev",
+    "Cycle_in_def",
+    "Definition_mismatch",
+    "Constraint_failed",
+    "Inconsistent_constraint",
+    "Type_clash",
+    "Non_regular",
+    "Null_arity_external",
+    "Missing_native_external",
+    "Unbound_type_var",
+    "Cannot_extend_private_type",
+    "Not_extensible_type",
+    "Extension_mismatch",
+    "Rebind_wrong_type",
+    "Rebind_mismatch",
+    "Rebind_private",
+    "Variance",
+    "Unavailable_type_constructor",
+    "Multiple_native_repr_attributes",
+    "Cannot_unbox_or_untag_type",
+    "Deep_unbox_or_untag_attribute",
+    "Type_cannot_be_external",
+    "Immediacy",
+    "Separability",
+    "Bad_unboxed_attribute",
+    "Boxed_and_unboxed",
+    "Nonrec_gadt",
+    "Invalid_private_row_declaration",
+    "Atomic_field_must_be_mutable",
+    "External_with_non_syntactic_arity",
+    "Primitive_alias_does_not_refer_to_primitive",
+    "Primitive_type_mismatch"};
+
+const char* const tm_error_names[] = {
+    "Cannot_apply",
+    "Not_included",
+    "Cannot_eliminate_dependency",
+    "Signature_expected",
+    "Structure_expected",
+    "With_no_component",
+    "With_mismatch",
+    "With_makes_applicative_functor_ill_typed",
+    "With_changes_module_alias",
+    "With_creates_invalid_aliases",
+    "With_cannot_remove_constrained_type",
+    "With_package_manifest",
+    "Repeated_name",
+    "Non_generalizable",
+    "Non_generalizable_module",
+    "Implementation_is_required",
+    "Interface_not_compiled",
+    "Not_allowed_in_functor_body",
+    "Not_a_packed_module",
+    "Incomplete_packed_module",
+    "Scoping_pack",
+    "Recursive_module_require_explicit_type",
+    "Apply_generative",
+    "Cannot_scrape_alias",
+    "Cannot_scrape_package_type",
+    "Badly_formed_signature",
+    "Cannot_hide_id",
+    "Invalid_type_subst_rhs",
+    "Non_packable_local_modtype_subst",
+    "With_cannot_remove_packed_modtype",
+    "Cannot_alias",
+    "Val_in_structure"};
+const char* const tcl_error_names[] = {
+    "Unconsistent_constraint",
+    "Field_type_mismatch",
+    "Unexpected_field",
+    "Structure_expected",
+    "Cannot_apply",
+    "Apply_wrong_label",
+    "Pattern_type_clash",
+    "Repeated_parameter",
+    "Unbound_class_2",
+    "Unbound_class_type_2",
+    "Abbrev_type_clash",
+    "Constructor_type_mismatch",
+    "Virtual_class",
+    "Undeclared_methods",
+    "Parameter_arity_mismatch",
+    "Parameter_mismatch",
+    "Bad_parameters",
+    "Bad_class_type_parameters",
+    "Class_match_failure",
+    "Unbound_val",
+    "Unbound_type_var",
+    "Non_generalizable_class",
+    "Cannot_coerce_self",
+    "Non_collapsable_conjunction",
+    "Self_clash",
+    "Mutability_mismatch",
+    "No_overriding",
+    "Duplicate",
+    "Closing_self_type",
+    "Polymorphic_class_parameter"};
+// the typing error of an exception, as typing_dump.ml's `report`
+void report(std::exception_ptr ep) {
+  s("ERR ");
+  try {
+    std::rethrow_exception(ep);
+  } catch (const typecore::Error& er) {
+    s("Typecore."); s(tc_error_names[static_cast<int>(er.kind)]); s(" "); pd::loc(er.loc);
+  } catch (const typetexp::Error& er) {
+    s("Typetexp."); s(txd::texp_error_name(er.kind)); s(" "); pd::loc(er.loc);
+  } catch (const env::Error& er) {
+    if (er.kind == env::Error::Kind::Lookup_error) {
+      s("Env."); s(txd::lookup_error_name(er.err.kind)); s(" "); pd::loc(er.loc);
+    } else {
+      s("Env.other");
+    }
+  } catch (const typedecl::Error& er) {
+    s("Typedecl."); s(td_error_names[static_cast<int>(er.kind)]); s(" "); pd::loc(er.loc);
+  } catch (const attr_helper::Error& er) {
+    s("Attr_helper "); pd::loc(er.loc);
+  } catch (const primitive::Error& er) {
+    s("Primitive "); pd::loc(er.loc);
+  } catch (const typemod::Error& er) {
+    s("Typemod."); s(tm_error_names[static_cast<int>(er.kind)]); s(" "); pd::loc(er.loc);
+  } catch (const includemod::ApplyError& er) {
+    s("Includemod.Apply_error "); pd::loc(er.loc);
+  } catch (const includemod::Error&) {
+    s("Includemod.Error");
+  } catch (const typeclass::Error& er) {
+    s("Typeclass."); s(tcl_error_names[static_cast<int>(er.kind)]); s(" "); pd::loc(er.loc);
+  } catch (const typemod::ErrorForward&) {
+    s("Error_forward");
+  } catch (const typeclass::ErrorForward&) {
+    s("Error_forward");
+  } catch (const typetexp::ErrorForward&) {
+    s("Error_forward");
+  } catch (const typecore::VariableInScope&) {
+    s("Syntaxerr");
+  }
+  s("\n");
+}
+
 int run_core(const std::string& dirs, const std::string& file) {
   canonical = true;
   load_path::init(split_dirs(dirs), {});
@@ -2223,28 +2370,20 @@ int run_core(const std::string& dirs, const std::string& file) {
   pd::parse_file = zstr(file);
   parsetree::Structure st = parsetree::of_ast(ast, file, dirfiles);
   namespace tc = typecore;
-  // report: false when the exception is not a typing error
-  auto report = [&](std::exception_ptr ep) {
-    s("ERR ");
+  // attempt: run f; on an error or an unported forward, finish the output
+  auto attempt = [&](const std::function<void()>& f) {
     try {
-      std::rethrow_exception(ep);
-    } catch (const tc::Error& er) {
-      s("Typecore."); s(tc_error_names[static_cast<int>(er.kind)]); s(" "); pd::loc(er.loc);
-    } catch (const typetexp::Error& er) {
-      s("Typetexp."); s(txd::texp_error_name(er.kind)); s(" "); pd::loc(er.loc);
-    } catch (const env::Error& er) {
-      if (er.kind == env::Error::Kind::Lookup_error) {
-        s("Env."); s(txd::lookup_error_name(er.err.kind)); s(" "); pd::loc(er.loc);
-      } else {
-        s("Env.other");
-      }
-    } catch (const typetexp::ErrorForward&) {
-      s("Error_forward");
-    } catch (const tc::VariableInScope&) {
-      s("Syntaxerr");
+      f();
+      return true;
+    } catch (const std::bad_function_call&) {
+      s("UNSUPPORTED\n");
+    } catch (...) {
+      report(std::current_exception());
     }
-    s("\n");
+    std::cout << b;
+    return false;
   };
+  typemod::install_forward_refs();
   tc::reset_delayed_checks();
   env::t e = r.env;
   for (const parsetree::StructureItem* it : st) {
@@ -2283,6 +2422,36 @@ int run_core(const std::string& dirs, const std::string& file) {
       }
       reset_numbering();
       s("eval : "); ty(exp->exp_type); s("\n");
+    } else if (auto* tyd = parsetree::as<parsetree::Pstr_type>(it->pstr_desc)) {
+      typedecl::TranslTypeDeclResult res;
+      if (!attempt([&] { res = typedecl::transl_type_decl(e, tyd->rec, tyd->decls); })) return 0;
+      for (auto* d : res.decls) {
+        reset_numbering();
+        s("type "); s(ident::name(d->typ_id)); s(" : "); type_decl(d->typ_type); s("\n");
+      }
+      e = res.env;
+    } else if (auto* te = parsetree::as<parsetree::Pstr_typext>(it->pstr_desc)) {
+      std::pair<const typedtree::TTypeExtension*, env::t> res;
+      if (!attempt([&] { res = typedecl::transl_type_extension(true, e, it->pstr_loc, te->ext); })) return 0;
+      for (auto* c : res.first->tyext_constructors) {
+        reset_numbering();
+        s("ext "); s(ident::name(c->ext_id)); s(" : "); ext_constr(c->ext_type); s("\n");
+      }
+      e = res.second;
+    } else if (auto* ex = parsetree::as<parsetree::Pstr_exception>(it->pstr_desc)) {
+      std::pair<const typedtree::TTypeException*, env::t> res;
+      if (!attempt([&] { res = typedecl::transl_type_exception(e, ex->exn); })) return 0;
+      reset_numbering();
+      s("exn "); s(ident::name(res.first->tyexn_constructor->ext_id)); s(" : ");
+      ext_constr(res.first->tyexn_constructor->ext_type); s("\n");
+      e = res.second;
+    } else if (auto* pr = parsetree::as<parsetree::Pstr_primitive>(it->pstr_desc)) {
+      std::pair<const typedtree::TPrimitiveDescription*, env::t> res;
+      if (!attempt([&] { res = typedecl::transl_prim_desc(e, it->pstr_loc, pr->pd); })) return 0;
+      reset_numbering();
+      s("val "); s(ident::name(res.first->prim_id)); s(" : "); ty(res.first->prim_val->val_type); s(" ");
+      value_kind(res.first->prim_val->val_kind); s("\n");
+      e = res.second;
     } else {
       (void)SK::Pstr_eval;
       s("STOP\n");
@@ -2299,12 +2468,64 @@ int run_core(const std::string& dirs, const std::string& file) {
   std::cout << b;
   return 0;
 }
+int run_struct(const std::string& dirs, const std::string& file) {
+  canonical = true;
+  load_path::init(split_dirs(dirs), {});
+  env::OpenResult r = env::open_pers_signature("Stdlib", env::initial());
+  if (r.kind != env::OpenResult::Kind::Ok) {
+    std::cerr << "open Stdlib failed\n";
+    return 1;
+  }
+  std::ifstream in(file, std::ios::binary);
+  std::stringstream ss;
+  ss << in.rdbuf();
+  std::string src = ss.str();
+  std::vector<std::string> dirfiles;
+  cppcaml::ast::Structure ast;
+  try {
+    ast = cppcaml::parse_structure(src, dirfiles);
+  } catch (const cppcaml::ParseError& ex) {
+    std::cerr << "c++typing-dump: parse error: " << ex.what() << '\n';
+    return 1;
+  }
+  pd::parse_file = zstr(file);
+  parsetree::Structure st = parsetree::of_ast(ast, file, dirfiles);
+  typemod::install_forward_refs();
+  typecore::reset_delayed_checks();
+  env::reset_required_globals();
+  try {
+    typemod::TypeStructureResult res = typemod::type_structure(r.env, st);
+    Signature simple_sg = typemod::simplify(res.env, res.names, res.sg);
+    typemod::check_nongen_signature(res.env, simple_sg);
+    typecore::force_delayed_checks();
+    reset_numbering();
+    s("sig");
+    signature(1, simple_sg);
+    s("\nEND\n");
+  } catch (const std::bad_function_call&) {
+    s("UNSUPPORTED\n");
+  } catch (...) {
+    report(std::current_exception());
+  }
+  std::cout << b;
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   if (argc == 5 && std::string(argv[1]) == "typexp") {
     try {
       return run_typexp(argv[2], argv[3], argv[4]);
+    } catch (const std::exception& e) {
+      std::cerr << "c++typing-dump: " << e.what() << '\n';
+      std::cout << b;
+      return 1;
+    }
+  }
+  if (argc == 4 && std::string(argv[1]) == "struct") {
+    try {
+      return run_struct(argv[2], argv[3]);
     } catch (const std::exception& e) {
       std::cerr << "c++typing-dump: " << e.what() << '\n';
       std::cout << b;

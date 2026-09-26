@@ -19,11 +19,11 @@ namespace et = errortrace;
 
 enum class NativeReprKind { Unboxed, Untagged };
 struct ReachingTypeStep {  // Expands_to | Contains | Parameter
-  enum class Kind { Expands_to, Contains, Parameter };
+  enum class Kind { Expands_to, Contains, Parameter, Considered_abstract };
   Kind kind;
   TypeExpr* t1 = nullptr;
   TypeExpr* t2 = nullptr;
-  Path::t path = nullptr;  // Parameter
+  Path::t path = nullptr;  // Parameter / Considered_abstract
   long n = 0;
 };
 using ReachingTypePath = std::vector<ReachingTypeStep>;

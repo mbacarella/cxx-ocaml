@@ -155,7 +155,7 @@ from the port.  The two must be identical on every .cmi in the tree
    attach (`ocaml.doc` on a type declaration, typecore.ml / 
    includemod_errorprinter.ml).  Locations the parser does not record yet
    are built as `gap_loc()` and printed masked ("?") by both dumps:
-   `Ptyp_alias` / `Ptyp_poly` /
+   `Ptyp_poly` /
    `pcd_vars` / `Pext_decl` variable-name locations, `prf_loc`, `pof_loc`,
    `Rtag` label locations, `pvb_loc`, extension-name locations, the name
    location of floating attributes, the `ppt_loc` of packages outside a
@@ -193,7 +193,37 @@ from the port.  The two must be identical on every .cmi in the tree
    (`typing/warnings.hpp`), since `-w` and `[@warning]` are not
    interpreted yet.  Typing recovery (merlin) and the cmt partial trees are
    not ported.
-4. `CPPCAML_TYPECHECK` switches from the deprecated strict pass to the port
-   once Typemod can drive it (stage 5); ocamlc's error messages come with
-   Printtyp.
-5. `Typedecl`, `Typemod`, `Includemod`, `Includecore`, `Mtype`, then `Typeclass`.
+5. **DONE (except the deviations below):** `Typedecl` (with
+   `Typedecl_variance`, `_separability`, `_unboxed`, `_immediacy`,
+   `Primitive`), `Includecore`, `Includeclass`, `Includemod`, `Mtype`
+   (complete), `Shape` (what Typemod and Includemod create), `Typemod`
+   (signatures, structures, functors, recursive modules, first-class
+   modules, `with` constraints, compilation-unit entry points) and
+   `Typeclass`.  Attribute payloads are carried as OCaml values
+   (`parsetree_ovalue`), sharing locations the way ocamlc's parser does.
+   `MODE=struct typing_core_parity.sh` types every implementation with
+   `Typemod.type_structure` (then `Signature_names.simplify`,
+   `check_nongen_signature` and the delayed checks) and compares the whole
+   signature graph or the error kind and location: 1103 files identical
+   (8262 items) + 1011 identical errors, 1 different, 0 crashes; 61 files
+   are syntax errors for both.  The one DIFF
+   (typing-modules-bugs/gatien_baron_20131019_ok.ml) is a stamp collision:
+   the oracle process's fresh-ident counter happens to equal the stamps of
+   hashtbl.cmi's labels, and the port's counter is elsewhere (see below).
+   The stage-4c `core` mode is 1719 identical + 397 identical errors,
+   0 different, and the struct mode also covers the `core_probes`
+   (Typedecl `td_*` / `err_td_*` probes included).
+   Deviations: no warnings, typing recovery or cmt (as 4c); the Includecore
+   / Includemod error payloads are reduced to what Typemod branches on;
+   `Env` has no shape map, so Typemod keeps its own table of module
+   shapes; module-init values that OCaml creates at startup (`Ctype.none`,
+   Parmatch's `omega`, `Shape.for_unnamed_functor_param`, Typeclass's
+   `*undef*` idents) are created lazily, so absolute ident stamps differ
+   from ocamlc's process (it matters for .cmi bytes, not for typing).
+   C++ parser gaps found by the payload encoder: a `[@@foo: val y : int]`
+   payload, `a, r.f <- v` inside a payload and `;; let exception E in ...`
+   are rejected, and `functor ... -> sig end with ...` attaches the `with`
+   differently.
+6. `CPPCAML_TYPECHECK` switches from the deprecated strict pass to the port
+   (Typemod.type_implementation); ocamlc's error messages come with
+   Printtyp, then the .cmi writer and warnings.

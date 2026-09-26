@@ -68,6 +68,24 @@ add_library(cppcaml_core
   src/typing/parmatch.cpp
   src/typing/typeopt.cpp
   src/typing/value_rec_check.cpp
+  src/typing/primitive.cpp
+  src/typing/typedecl_unboxed.cpp
+  src/typing/typedecl_variance.cpp
+  src/typing/typedecl_separability.cpp
+  src/typing/typedecl.cpp
+  src/typing/typedecl_ext.cpp
+  src/typing/includecore.cpp
+  src/typing/includeclass.cpp
+  src/typing/shape.cpp
+  src/typing/signature_group.cpp
+  src/typing/includemod.cpp
+  src/typing/parsetree_ovalue.cpp
+  src/typing/typemod_util.cpp
+  src/typing/typemod_sig.cpp
+  src/typing/typemod_str.cpp
+  src/typing/typemod_unit.cpp
+  src/typing/typecore_class.cpp
+  src/typing/typeclass.cpp
   src/typing/cmi_format.cpp)
 target_include_directories(cppcaml_core PUBLIC include)
 # The typing/ port initializes aggregates partially on purpose (an OCaml

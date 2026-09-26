@@ -19,6 +19,12 @@ inline bool has_attribute(std::string_view nm, const parsetree::Attributes& attr
     if (attr_equals_builtin(a->attr_name.txt, nm)) return true;
   return false;
 }
+// the same, over Types attributes (type_attributes, val_attributes, ...)
+inline bool has_attribute(std::string_view nm, const Attributes& attrs) {
+  for (const Attribute* a : attrs)
+    if (attr_equals_builtin(a->attr_name, nm)) return true;
+  return false;
+}
 inline bool explicit_arity(const parsetree::Attributes& attrs) {
   return has_attribute("explicit_arity", attrs);
 }

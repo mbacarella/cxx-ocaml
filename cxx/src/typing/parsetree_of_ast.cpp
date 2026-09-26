@@ -7,6 +7,7 @@
 // span for the declarations it wraps), and otherwise set to `gap_loc()`:
 // Location.none marked with pos_cnum = -2, so the parsetree dump can print
 // them as masked.  TYPECHECKER.md lists the gaps.
+#include "cppcaml/typing/parsetree_ovalue.hpp"
 #include <stdexcept>
 
 #include "cppcaml/typing/parsetree.hpp"
@@ -15,9 +16,11 @@ namespace cppcaml::typing::parsetree {
 
 typing::Attributes types_attributes(const Attributes& l) {
   std::vector<const typing::Attribute*> out;
-  for (const Attribute* a : l)
+  for (const Attribute* a : l) {
+    bool doc = a->attr_name.txt == "ocaml.doc" || a->attr_name.txt == "ocaml.text";
     out.push_back(make<typing::Attribute>(
-        typing::Attribute{a->attr_name.txt, a->attr_name.loc, nullptr, a->attr_loc, a}));
+        typing::Attribute{a->attr_name.txt, a->attr_name.loc, ovalue_of_payload(a->attr_payload, doc), a->attr_loc, a}));
+  }
   return slice(out);
 }
 
@@ -235,7 +238,7 @@ struct Conv {
           } else if constexpr (std::is_same_v<T, ast::Ptyp_class>) {
             d = make<Ptyp_class>(Ptyp_class{{K::Ptyp_class}, lidloc(v.id), core_types(v.args)});
           } else if constexpr (std::is_same_v<T, ast::Ptyp_alias>) {
-            d = make<Ptyp_alias>(Ptyp_alias{{K::Ptyp_alias}, core_type(*v.type), str_gap(v.name)});
+            d = make<Ptyp_alias>(Ptyp_alias{{K::Ptyp_alias}, core_type(*v.type), StrLoc{zstr(v.name), loc(v.name_loc)}});
           } else if constexpr (std::is_same_v<T, ast::Ptyp_poly>) {
             auto vars = map_slice<StrLoc>(v.vars, [&](const std::string& s) { return str_gap(s); });
             d = make<Ptyp_poly>(Ptyp_poly{{K::Ptyp_poly}, vars, core_type(*v.type)});
