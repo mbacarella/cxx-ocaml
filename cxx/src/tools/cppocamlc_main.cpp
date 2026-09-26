@@ -49,6 +49,8 @@
 #include "cppcaml/typing/typecore.hpp"
 #include "cppcaml/typing/typemod.hpp"
 #include "cppcaml/typing/printlambda.hpp"
+#include "cppcaml/typing/bytegen.hpp"
+#include "cppcaml/typing/printinstr.hpp"
 #include "cppcaml/typing/simplif.hpp"
 #include "cppcaml/typing/translmod.hpp"
 #include "cppcaml/typing/warnings.hpp"
@@ -392,6 +394,12 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
       if (g_dump.lambda) std::cerr << ty::printlambda::dump(lam);
       lap("lambda (port)", tp);
       if (g_stop_after == StopAfter::Lambda) return 0;
+      ty::instruct::code bytecode = ty::bytegen::compile_implementation(mod, lam);
+      if (g_dump.instr) std::cerr << ty::printinstr::dump(bytecode);
+      lap("bytegen (port)", tp);
+      // TODO(stage 10): emitcode::to_file(...) writes the .cmo here (the
+      // Emitcode port); until it lands the new path stops after Bytegen.
+      return 0;
     }
     // The .cmi of this unit's .mli comes from the type checker; the legacy
     // translator reads its own writer's view of the interface instead

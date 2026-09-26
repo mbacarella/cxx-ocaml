@@ -6,7 +6,9 @@
 # in a scratch directory against the stdlib, by ocamlc.opt and by
 # c++ocamlc's new translation path (CPPCAML_NEWLAMBDA=1).
 #
-# Usage: lambda_port_parity.sh [file.ml ...]   (JOBS=, DUMP=drawlambda|dlambda,
+# DUMP=dinstr compares Bytegen's instructions (Printinstr) the same way.
+#
+# Usage: lambda_port_parity.sh [file.ml ...]   (JOBS=, DUMP=drawlambda|dlambda|dinstr,
 #   FLAGS= extra flags for both compilers, e.g. absolute -I dirs)
 #   no args: cxx/harness/stamp_probes
 #   SAME / DIFF / CFAIL (the port failed or produced nothing) / OFAIL
@@ -17,7 +19,9 @@ cd "$ROOT" || exit 1
 JOBS="${JOBS:-8}"
 DUMP="${DUMP:-drawlambda}"
 FLAGS="${FLAGS:-}"
-export DUMP FLAGS
+STOP="-stop-after lambda"
+[ "$DUMP" = dinstr ] && STOP=""  # the port stops after Bytegen until Emitcode lands
+export DUMP FLAGS STOP
 CPP="${CPP:-$ROOT/cxx/build-release/c++ocamlc}"
 OUT=/tmp/lambda_port_parity
 
@@ -32,7 +36,7 @@ if [ "${1:-}" == "--worker" ]; then
   fi
   ( cd "$w/o" && timeout 120 "$ROOT/ocamlc.opt" -nostdlib -I "$ROOT/stdlib" -w -a $FLAGS -"$DUMP" -c "$b" ) \
       >/dev/null 2>"$OUT/$key.o"; orc=$?
-  ( cd "$w/c" && CPPCAML_NEWLAMBDA=1 timeout 120 "$CPP" -I "$ROOT/stdlib" -w -a $FLAGS -"$DUMP" -stop-after lambda -c "$b" ) \
+  ( cd "$w/c" && CPPCAML_NEWLAMBDA=1 timeout 120 "$CPP" -I "$ROOT/stdlib" -w -a $FLAGS -"$DUMP" $STOP -c "$b" ) \
       >/dev/null 2>"$OUT/$key.c"; crc=$?
   rm -rf "${w:?}"
   if [ $orc -ne 0 ]; then printf 'OFAIL %s\n' "$f"

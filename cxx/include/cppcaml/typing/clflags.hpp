@@ -15,6 +15,7 @@ inline bool no_std_include = false;        // -nostdlib
 inline bool unsafe = false;                // -unsafe
 inline bool noassert = false;              // -noassert
 inline bool debug = false;                 // -g
+inline bool link_everything = false;       // -linkall
 inline bool keep_locs = true;              // -keep-locs
 inline bool keep_docs = false;             // -keep-docs
 inline bool native_code = false;
