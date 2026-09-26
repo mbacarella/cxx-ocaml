@@ -18,6 +18,8 @@
 #include "cppcaml/blake2.hpp"
 #include "cppcaml/marshal.hpp"
 #include "cppcaml/omarshal.hpp"
+#include "cppcaml/typing/env.hpp"
+#include "cppcaml/typing/instruct.hpp"
 
 namespace cppcaml::typing::cmi_format {
 
@@ -1332,8 +1334,34 @@ class Writer {
                                            native_repr(p->prim_native_repr_res)})});
       }
       case ValueKind::Kind::Val_ivar: return o::vblock(1, {mutable_flag(k.ivar_mut), str(k.ivar_name)});
-      default: throw std::logic_error("Cmi_format.output_cmi: Val_self / Val_anc in a signature");
+      // (never in a signature: a debug event's Env summary)
+      case ValueKind::Kind::Val_self: {
+        V meths;
+        if (!k.self_virtual) {
+          meths = o::vblock(0, {ident_map(*k.meths)});  // Self_concrete
+        } else {                                        // Self_virtual of a ref
+          V r = shared(memo_, k.meths, 0, [&]() -> std::vector<V> { return {ident_map(*k.meths)}; });
+          meths = o::vblock(1, {r});
+        }
+        return o::vblock(2, {class_sig(k.sign), meths, ident_map(k.vars), str(k.cl_num)});
+      }
+      case ValueKind::Kind::Val_anc:
+        return o::vblock(3, {class_sig(k.sign), ident_map(*k.meths), str(k.cl_num)});
     }
+    return i(0);
+  }
+  // an `Ident.t Meths.t` / `Vars.t`: one value per map node
+  V ident_map(const StrMap<Ident::t>& m) { return strmap_shared<Ident::t>(m.root(), [&](Ident::t id) { return ident(id); }); }
+  template <class Val, class F>
+  V strmap_shared(const StrMapNode<Val>* n, F&& data) {
+    if (!n) return i(0);
+    return shared(memo_, n, 0, [&]() -> std::vector<V> {
+      V l = strmap_shared<Val>(n->l, data);
+      V k = str(n->v);
+      V d = data(n->d);
+      V r = strmap_shared<Val>(n->r, data);
+      return {l, k, d, r, i(n->h)};
+    });
   }
   V module_type(const ModuleType* mt) {
     using MK = ModuleType::Kind;
@@ -1352,54 +1380,52 @@ class Writer {
       return {};
     });
   }
+  // the declarations, one value per record
+  V value_desc(const ValueDescription* vd) {
+    return shared(memo_, vd, 0, [&]() -> std::vector<V> {
+      return {ty(vd->val_type), value_kind(vd->val_kind), loc(vd->val_loc), attributes(vd->val_attributes),
+              uid(vd->val_uid)};
+    });
+  }
+  V module_decl(const ModuleDeclaration* md) {
+    return shared(memo_, md, 0, [&]() -> std::vector<V> {
+      return {module_type(md->md_type), attributes(md->md_attributes), loc(md->md_loc), uid(md->md_uid)};
+    });
+  }
+  V modtype_decl(const ModtypeDeclaration* mtd) {
+    return shared(memo_, mtd, 0, [&]() -> std::vector<V> {
+      return {mtd->mtd_type ? some(module_type(mtd->mtd_type)) : none(), attributes(mtd->mtd_attributes),
+              loc(mtd->mtd_loc), uid(mtd->mtd_uid)};
+    });
+  }
+  V class_decl(const ClassDeclaration* cd) {
+    return shared(memo_, cd, 0, [&]() -> std::vector<V> {
+      return {tys(cd->cty_params), class_type(cd->cty_type), path(cd->cty_path),
+              cd->cty_new ? some(ty(cd->cty_new)) : none(), variances(cd->cty_variance), loc(cd->cty_loc),
+              attributes(cd->cty_attributes), uid(cd->cty_uid)};
+    });
+  }
+  V cltype_decl(const ClassTypeDeclaration* cd) {
+    return shared(memo_, cd, 0, [&]() -> std::vector<V> {
+      return {tys(cd->clty_params), class_type(cd->clty_type), path(cd->clty_path), type_decl(cd->clty_hash_type),
+              variances(cd->clty_variance), loc(cd->clty_loc), attributes(cd->clty_attributes), uid(cd->clty_uid)};
+    });
+  }
   V sig_item(const SignatureItem* it) {
     using SK = SignatureItem::Kind;
     V vis = i(it->vis == Visibility::Exported ? 0 : 1);
     V rec = i(static_cast<long>(it->rec));
     switch (it->kind) {
-      case SK::Sig_value: {
-        const ValueDescription* vd = it->value;
-        V d = shared(memo_, vd, 0, [&]() -> std::vector<V> {
-          return {ty(vd->val_type), value_kind(vd->val_kind), loc(vd->val_loc), attributes(vd->val_attributes),
-                  uid(vd->val_uid)};
-        });
-        return o::vblock(0, {ident(it->id), d, vis});
-      }
+      case SK::Sig_value: return o::vblock(0, {ident(it->id), value_desc(it->value), vis});
       case SK::Sig_type: return o::vblock(1, {ident(it->id), type_decl(it->type), rec, vis});
       case SK::Sig_typext:
         return o::vblock(2, {ident(it->id), ext_constr(it->ext), i(static_cast<long>(it->ext_status)), vis});
-      case SK::Sig_module: {
-        const ModuleDeclaration* md = it->md;
-        V d = shared(memo_, md, 0, [&]() -> std::vector<V> {
-          return {module_type(md->md_type), attributes(md->md_attributes), loc(md->md_loc), uid(md->md_uid)};
-        });
-        return o::vblock(3, {ident(it->id), i(it->presence == ModulePresence::Mp_present ? 0 : 1), d, rec, vis});
-      }
-      case SK::Sig_modtype: {
-        const ModtypeDeclaration* mtd = it->mtd;
-        V d = shared(memo_, mtd, 0, [&]() -> std::vector<V> {
-          return {mtd->mtd_type ? some(module_type(mtd->mtd_type)) : none(), attributes(mtd->mtd_attributes),
-                  loc(mtd->mtd_loc), uid(mtd->mtd_uid)};
-        });
-        return o::vblock(4, {ident(it->id), d, vis});
-      }
-      case SK::Sig_class: {
-        const ClassDeclaration* cd = it->cls;
-        V d = shared(memo_, cd, 0, [&]() -> std::vector<V> {
-          return {tys(cd->cty_params), class_type(cd->cty_type), path(cd->cty_path),
-                  cd->cty_new ? some(ty(cd->cty_new)) : none(), variances(cd->cty_variance), loc(cd->cty_loc),
-                  attributes(cd->cty_attributes), uid(cd->cty_uid)};
-        });
-        return o::vblock(5, {ident(it->id), d, rec, vis});
-      }
-      case SK::Sig_class_type: {
-        const ClassTypeDeclaration* cd = it->clty;
-        V d = shared(memo_, cd, 0, [&]() -> std::vector<V> {
-          return {tys(cd->clty_params), class_type(cd->clty_type), path(cd->clty_path), type_decl(cd->clty_hash_type),
-                  variances(cd->clty_variance), loc(cd->clty_loc), attributes(cd->clty_attributes), uid(cd->clty_uid)};
-        });
-        return o::vblock(6, {ident(it->id), d, rec, vis});
-      }
+      case SK::Sig_module:
+        return o::vblock(3, {ident(it->id), i(it->presence == ModulePresence::Mp_present ? 0 : 1), module_decl(it->md),
+                             rec, vis});
+      case SK::Sig_modtype: return o::vblock(4, {ident(it->id), modtype_decl(it->mtd), vis});
+      case SK::Sig_class: return o::vblock(5, {ident(it->id), class_decl(it->cls), rec, vis});
+      case SK::Sig_class_type: return o::vblock(6, {ident(it->id), cltype_decl(it->clty), rec, vis});
     }
     return i(0);
   }
@@ -1420,7 +1446,166 @@ class Writer {
   std::map<std::tuple<const void*, const void*, bool>, V> locs_;
 };
 
+// ---- the debugging events of a .cmo (Emitcode.to_file with -g) ------------
+// Instruct.debug_event records, whose typing values (Env summaries, the
+// declarations and types they hold) go through the Writer, and whose
+// compilation environments are Ident.tbl trees: one value per node / record.
+class EventWriter {
+ public:
+  using V = o::ValPtr;
+  explicit EventWriter(Writer& w) : w_(w) {}
+
+  V summary(const env::Summary* s) {
+    using K = env::Summary::Kind;
+    if (s->kind == K::Env_empty) return w_.i(0);
+    int tag = static_cast<int>(s->kind) - 1;  // Env_empty is the constant constructor
+    return w_.shared(memo_, s, tag, [&]() -> std::vector<V> {
+      V next = summary(s->next);
+      switch (s->kind) {
+        case K::Env_empty: break;
+        case K::Env_value: return {next, w_.ident(s->id), w_.value_desc(s->value)};
+        case K::Env_type: return {next, w_.ident(s->id), w_.type_decl(s->type)};
+        case K::Env_extension: return {next, w_.ident(s->id), w_.ext_constr(s->ext)};
+        case K::Env_module:
+          return {next, w_.ident(s->id), w_.i(s->presence == ModulePresence::Mp_present ? 0 : 1),
+                  w_.module_decl(s->md)};
+        case K::Env_modtype: return {next, w_.ident(s->id), w_.modtype_decl(s->mtd)};
+        case K::Env_class: return {next, w_.ident(s->id), w_.class_decl(s->cls)};
+        case K::Env_cltype: return {next, w_.ident(s->id), w_.cltype_decl(s->clty)};
+        case K::Env_open: return {next, w_.path(s->path)};
+        case K::Env_not_aliasable: return {next, w_.ident(s->id)};
+        case K::Env_constraints:
+          return {next, path_map(s->constraints.root(), [&](const TypeDeclaration* d) { return w_.type_decl(d); })};
+        case K::Env_copy_types: return {next};
+        case K::Env_persistent: return {next, w_.ident(s->id)};
+        case K::Env_value_unbound: {
+          using RK = env::ValueUnboundReason::Kind;
+          V reason;
+          switch (s->value_reason.kind) {
+            case RK::Val_unbound_instance_variable: reason = w_.i(0); break;
+            case RK::Val_unbound_self: reason = w_.i(1); break;
+            case RK::Val_unbound_ancestor: reason = w_.i(2); break;
+            case RK::Val_unbound_ghost_recursive: reason = o::vblock(0, {w_.loc(s->value_reason.ghost_loc)}); break;
+          }
+          return {next, w_.str(s->name), reason};
+        }
+        case K::Env_module_unbound:
+          return {next, w_.str(s->name),
+                  o::vblock(0, {w_.opt_str(s->module_reason.container), w_.str(s->module_reason.unbound)})};
+      }
+      return {};
+    });
+  }
+  // a Path.Map: one value per node
+  template <class Val, class F>
+  V path_map(const PMapNode<Path::t, Val>* n, F&& data) {
+    if (!n) return w_.i(0);
+    return w_.shared(memo_, n, 0, [&]() -> std::vector<V> {
+      V l = path_map<Val>(n->l, data);
+      V k = w_.path(n->v);
+      V d = data(n->d);
+      V r = path_map<Val>(n->r, data);
+      return {l, k, d, r, w_.i(n->h)};
+    });
+  }
+  // an 'a Ident.tbl: one value per node and per data record
+  template <class A, class F>
+  V tbl(const typename ident::Tbl<A>::Node* n, F&& data) {
+    if (!n) return w_.i(0);
+    return w_.shared(memo_, n, 0, [&]() -> std::vector<V> {
+      V l = tbl<A>(n->l, data);
+      V d = tbl_data<A>(n->d, data);
+      V r = tbl<A>(n->r, data);
+      return {l, d, r, w_.i(n->h)};
+    });
+  }
+  template <class A, class F>
+  V tbl_data(const ident::TblData<A>* d, F&& data) {
+    return w_.shared(memo_, d, 0, [&]() -> std::vector<V> {
+      return {w_.ident(d->ident), w_.str(d->name), w_.i(d->stamp), data(d->data),
+              d->previous ? w_.some(tbl_data<A>(d->previous, data)) : w_.none()};
+    });
+  }
+  V closure_env(const instruct::ClosureEnv& c) {
+    if (!c.in_closure) return w_.i(0);  // Not_in_closure
+    auto make = [&]() {
+      return o::vblock(0, {tbl<instruct::ClosureEntry>(c.entries.root(), [&](const instruct::ClosureEntry& e) {
+                             return o::vblock(e.k == instruct::ClosureEntry::K::Free_variable ? 0 : 1, {w_.i(e.pos)});
+                           }),
+                           w_.i(c.env_pos)});
+    };
+    if (c.obj) {
+      if (auto it = memo_.find(c.obj); it != memo_.end()) return it->second;
+      return memo_[c.obj] = make();
+    }
+    auto key = std::make_pair(static_cast<const void*>(c.entries.root()), c.env_pos);
+    if (auto it = closures_.find(key); it != closures_.end()) return it->second;
+    return closures_[key] = make();
+  }
+  V compenv(const instruct::CompilationEnv& e) {
+    auto make = [&]() {
+      return o::vblock(0, {tbl<long>(e.ce_stack.root(), [&](long pos) { return w_.i(pos); }), closure_env(e.ce_closure)});
+    };
+    if (e.obj) {
+      if (auto it = memo_.find(e.obj); it != memo_.end()) return it->second;
+      return memo_[e.obj] = make();
+    }
+    auto key = std::make_tuple(static_cast<const void*>(e.ce_stack.root()), e.ce_closure.in_closure,
+                               e.ce_closure.obj ? e.ce_closure.obj : static_cast<const void*>(e.ce_closure.entries.root()),
+                               e.ce_closure.env_pos);
+    if (auto it = envs_.find(key); it != envs_.end()) return it->second;
+    return envs_[key] = make();
+  }
+  V event(const instruct::DebugEvent* ev) {
+    using EK = instruct::DebugEventKindK;
+    using IK = instruct::DebugEventInfoK;
+    using RK = instruct::DebugEventReprK;
+    return w_.shared(memo_, ev, 0, [&]() -> std::vector<V> {
+      V kind;
+      switch (ev->ev_kind.k) {
+        case EK::Event_before: kind = w_.i(0); break;
+        case EK::Event_after: kind = o::vblock(0, {w_.ty(ev->ev_kind.after_type)}); break;
+        case EK::Event_pseudo: kind = w_.i(1); break;
+      }
+      V info;
+      switch (ev->ev_info.k) {
+        case IK::Event_function: info = w_.i(0); break;
+        case IK::Event_return: info = o::vblock(0, {w_.i(ev->ev_info.return_arity)}); break;
+        case IK::Event_other: info = w_.i(1); break;
+      }
+      V repr = w_.i(0);  // Event_none
+      if (ev->ev_repr.k != RK::Event_none) {
+        const lambda::IntRef* r = ev->ev_repr.ref;
+        V ref = w_.shared(memo_, r, 0, [&]() -> std::vector<V> { return {w_.i(r->contents)}; });
+        repr = o::vblock(ev->ev_repr.k == RK::Event_parent ? 0 : 1, {ref});
+      }
+      // ev_typsubst: Bytegen's is Subst.identity, one static record
+      if (!identity_)
+        identity_ = o::vblock(0, {w_.i(0), w_.i(0), w_.i(0), w_.b(false), w_.none()});
+      return {w_.i(ev->ev_pos), w_.unit_name(ev->ev_module), w_.loc(ev->ev_loc), kind, w_.str(ev->ev_defname),
+              info, summary(ev->ev_typenv), identity_, compenv(ev->ev_compenv), w_.i(ev->ev_stacksize), repr};
+    });
+  }
+
+ private:
+  Writer& w_;
+  std::unordered_map<const void*, V> memo_;
+  std::map<std::pair<const void*, long>, V> closures_;
+  std::map<std::tuple<const void*, bool, const void*, long>, V> envs_;
+  V identity_;
+};
+
 }  // namespace
+
+std::vector<std::uint8_t> marshal_debug_events(const std::vector<const instruct::DebugEvent*>& events) {
+  Writer w;
+  // the uids' and ev_module's unit name: the one Unit_info string
+  if (!events.empty()) w.set_current_unit(events.front()->ev_module);
+  EventWriter ew(w);
+  std::vector<o::ValPtr> evs;
+  for (const instruct::DebugEvent* ev : events) evs.push_back(ew.event(ev));
+  return o::marshal(o::vlist(evs));
+}
 
 std::string output_cmi(const std::string& filename, const CmiInfos& cmi) {
   // (the provided signature must have been substituted for saving)

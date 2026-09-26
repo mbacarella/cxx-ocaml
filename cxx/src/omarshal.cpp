@@ -31,6 +31,10 @@ ValPtr vcustom(std::string raw, long long data_bytes) {
   auto v = std::make_shared<Value>(); v->k = Value::Custom; v->s = std::move(raw);
   v->custom_bytes = data_bytes; return v;
 }
+ValPtr vcustom2(std::string raw, long long bytes32, long long bytes64) {
+  auto v = std::make_shared<Value>(); v->k = Value::Custom; v->s = std::move(raw);
+  v->custom_bytes = bytes64; v->custom_bytes32 = bytes32; return v;
+}
 ValPtr vlist(const std::vector<ValPtr>& xs) {
   ValPtr acc = vint(0);  // []
   for (auto it = xs.rbegin(); it != xs.rend(); ++it) acc = vblock(0, {*it, acc});  // hd :: tl
@@ -59,7 +63,8 @@ struct Marshaler {
     if (n >= 0 && n < 0x40) byte(0x40 | (int)n);
     else if (n >= -128 && n < 128) { byte(0x0); byte((int)n & 0xFF); }
     else if (n >= -32768 && n < 32768) { byte(0x1); byte(n >> 8); byte(n); }
-    else if (n >= -(1LL << 31) && n < (1LL << 31)) { byte(0x2); be32((std::uint32_t)n); }
+    // extern.c: CODE_INT32 only for a 31-bit int (the 32-bit platforms' range)
+    else if (n >= -(1LL << 30) && n < (1LL << 30)) { byte(0x2); be32((std::uint32_t)n); }
     else { byte(0x3); for (int s = 56; s >= 0; s -= 8) byte(n >> s); }
   }
   void emit_str(const std::string& s) {
@@ -126,7 +131,7 @@ struct Marshaler {
           long long words = 1 + (v->custom_bytes + 7) / 8;
           w32 += 1 + words; w64 += 1 + words;
         } else {
-          w32 += 2 + ((v->custom_bytes + 3) >> 2);
+          w32 += 2 + (((v->custom_bytes32 >= 0 ? v->custom_bytes32 : v->custom_bytes) + 3) >> 2);
           w64 += 2 + ((v->custom_bytes + 7) >> 3);
         }
         return;

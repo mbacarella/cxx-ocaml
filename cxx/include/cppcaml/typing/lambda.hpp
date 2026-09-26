@@ -171,6 +171,7 @@ struct StructuredConstant {
   Kind kind;
   long i = 0;                   // Const_int, Const_char (the char code), Const_block tag
   std::int64_t boxed = 0;       // Const_int32 / Const_int64 / Const_nativeint
+  const void* box = nullptr;    // the box's identity when it is a typed constant's (typedtree.hpp)
   std::string_view s;           // Const_float / Const_immstring
   Slice<const StructuredConstant*> fields;  // Const_block
   Slice<std::string_view> floats;           // Const_float_array

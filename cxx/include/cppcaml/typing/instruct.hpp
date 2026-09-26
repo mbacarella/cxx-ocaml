@@ -23,11 +23,18 @@ struct ClosureEnv {  // Not_in_closure | In_closure of { entries; env_pos }
   bool in_closure = false;
   ident::Tbl<ClosureEntry> entries;
   long env_pos = 0;
+  // In_closure's block identity (the debug events marshal it): a fresh
+  // token where Bytegen builds a new In_closure, kept by copies; nullptr =
+  // none (then equal contents are taken as one block)
+  const void* obj = nullptr;
 };
 
 struct CompilationEnv {
   ident::Tbl<long> ce_stack;  // positions of variables in the stack
   ClosureEnv ce_closure;      // structure of the heap-allocated env
+  // the record's identity, as ClosureEnv::obj (a fresh token per `{ce_stack;
+  // ce_closure}` record Bytegen builds)
+  const void* obj = nullptr;
 };
 
 // ---- debugging events (runtime/backtrace_byt.c reads these) --------------------

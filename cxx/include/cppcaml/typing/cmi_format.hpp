@@ -12,6 +12,10 @@
 
 #include "cppcaml/typing/types.hpp"
 
+namespace cppcaml::typing::instruct {
+struct DebugEvent;
+}
+
 namespace cppcaml::typing::cmi_format {
 
 inline constexpr const char* cmi_magic_number = "Caml1999I038";
@@ -45,5 +49,10 @@ CmiInfos read_cmi(const std::string& filename);
 // returns its CRC, the raw BLAKE128 digest.  The signature must have been
 // substituted for saving (Env.save_signature does it).
 std::string output_cmi(const std::string& filename, const CmiInfos& cmi);
+
+// The debugging events of a .cmo (Emitcode.to_file with -g): the marshaled
+// `debug_event list`, whose typing values (types, Env summaries, Subst.t)
+// go through the .cmi Writer.  (Not in cmi_format.mli.)
+std::vector<std::uint8_t> marshal_debug_events(const std::vector<const instruct::DebugEvent*>& events);
 
 }  // namespace cppcaml::typing::cmi_format

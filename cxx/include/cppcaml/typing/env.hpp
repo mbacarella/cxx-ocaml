@@ -521,8 +521,10 @@ Signature read_signature(const std::string& modname, const std::string& filename
 // table; returns the cmi written.
 cmi_format::CmiInfos save_signature(StrMap<std::string_view> alerts, Signature sg, const std::string& modname,
                                     const std::string& filename);
-const ModuleData* find_pers_mod(bool allow_hidden, const std::string& name);
+const ModuleData* find_pers_mod(bool allow_hidden, std::string_view name);
 std::vector<std::pair<std::string, std::optional<std::string>>> imports();
+// the string object Env.imports carries for an imported unit's name
+std::string_view import_name(std::string_view name);
 std::string crc_of_unit(const std::string& name);
 bool is_imported_opaque(const std::string& modname);
 void register_import_as_opaque(const std::string& modname);

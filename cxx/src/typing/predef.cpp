@@ -1,6 +1,8 @@
 // Port of typing/predef.ml.  See predef.hpp.
 #include "cppcaml/typing/predef.hpp"
 
+#include <map>
+
 namespace cppcaml::typing::predef {
 
 using namespace types;
@@ -115,8 +117,14 @@ Ident::t ident_of_type_constr(TypeConstr c) {
   return nullptr;
 }
 
+// names used for Type_external: predef.ml's string literals, one object
+// per constructor (not the ident's name)
 std::string_view name_of_type_constr(TypeConstr c) {
-  return ident::name(ident_of_type_constr(c));
+  static std::map<TypeConstr, std::string_view> names;
+  auto it = names.find(c);
+  if (it != names.end()) return it->second;
+  ZoneScope perm(permanent_zone());
+  return names[c] = zstr(ident::name(ident_of_type_constr(c)));
 }
 
 const Paths& paths() {
@@ -338,11 +346,15 @@ const TypeDeclaration* decl_of_type_constr(TypeConstr c) {
 const ExtensionConstructor* predef_extension(Ident::t id, Slice<TypeExpr*> args) {
   ConstructorArguments a;
   a.tuple = args;
-  // [Ast_helper.Attr.mk (mknoloc "ocaml.warn_on_literal_pattern") (PStr [])]
-  auto* pstr_nil = make<OValue>(OValue::Kind::Block, 0L, std::string_view{}, 0.0, 0u);
-  pstr_nil->fields = slice({static_cast<const OValue*>(make<OValue>(OValue::Kind::Int, 0L))});
-  auto* attr = make<Attribute>(zborrow("ocaml.warn_on_literal_pattern"), location::none(),
-                               pstr_nil, location::none());
+  // [Ast_helper.Attr.mk (mknoloc "ocaml.warn_on_literal_pattern") (PStr [])]:
+  // the name literal and `PStr []` are static constants, one object each
+  static const std::pair<std::string_view, const OValue*> shared = [] {
+    ZoneScope perm(permanent_zone());
+    auto* pstr_nil = make<OValue>(OValue::Kind::Block, 0L, std::string_view{}, 0.0, 0u);
+    pstr_nil->fields = slice({static_cast<const OValue*>(make<OValue>(OValue::Kind::Int, 0L))});
+    return std::make_pair(zstr("ocaml.warn_on_literal_pattern"), static_cast<const OValue*>(pstr_nil));
+  }();
+  auto* attr = make<Attribute>(shared.first, location::none(), shared.second, location::none());
   return make<ExtensionConstructor>(paths().exn, Slice<TypeExpr*>{}, a, nullptr,
                                     PrivateFlag::Public, location::none(),
                                     slice({static_cast<const Attribute*>(attr)}),

@@ -465,7 +465,7 @@ cmi_format::CmiInfos save_signature(StrMap<std::string_view> alerts, Signature s
   return cmi;
 }
 
-const ModuleData* find_pers_mod(bool allow_hidden, const std::string& name) {
+const ModuleData* find_pers_mod(bool allow_hidden, std::string_view name) {
   try {
     return g_persistent_env.find(allow_hidden, read_sign_of_cmi, name);
   } catch (const load_path::NotFound&) {
@@ -483,6 +483,8 @@ void without_cmis(const std::function<void()>& f) {
 std::vector<std::pair<std::string, std::optional<std::string>>> imports() {
   return g_persistent_env.imports();
 }
+
+std::string_view import_name(std::string_view name) { return g_persistent_env.import_name(name); }
 std::string crc_of_unit(const std::string& name) {
   return g_persistent_env.crc_of_unit(read_sign_of_cmi, name);
 }
@@ -554,7 +556,7 @@ static const ModuleData* find_ident_module(Ident::t id, t env) {
   switch (e->kind) {
     case ModuleEntry::Kind::Mod_local: return e->data;
     case ModuleEntry::Kind::Mod_unbound: throw NotFound{};
-    case ModuleEntry::Kind::Mod_persistent: return find_pers_mod(true, std::string(ident::name(id)));
+    case ModuleEntry::Kind::Mod_persistent: return find_pers_mod(true, ident::name(id));
   }
   throw NotFound{};
 }
@@ -1722,10 +1724,7 @@ t remove_last_open(Path::t root, t env0) {
 
 // Read a signature from a file (Persistent_env.read)
 Signature read_signature(const std::string& modname, const std::string& filename) {
-  g_persistent_env.add_import(modname);
-  persistent_env::PersistentSignature ps{filename, cmi_format::read_cmi(filename),
-                                         load_path::Visibility::Visible};
-  const ModuleData* mda = read_sign_of_cmi(ps);
+  const ModuleData* mda = g_persistent_env.read(read_sign_of_cmi, modname, filename);  // read_pers_mod
   const ModuleDeclaration* d = lz::force_module_decl(mda->mda_declaration);
   if (d->md_type->kind != ModuleType::Kind::Mty_signature)
     throw std::logic_error("Env.read_signature");
@@ -1796,11 +1795,11 @@ static std::pair<Path::t, const ModuleData*> lookup_ident_module(bool load, bool
       throw NotFound{};
     case ModuleEntry::Kind::Mod_persistent:
       if (!load) {
-        g_persistent_env.check(std::string(s));  // check_pers_mod ~allow_hidden:false
+        g_persistent_env.check(s);  // check_pers_mod ~allow_hidden:false
         return {path, nullptr};
       }
       try {
-        return {path, find_pers_mod(false, std::string(s))};
+        return {path, find_pers_mod(false, s)};
       } catch (const NotFound&) {
         may_lookup_error(errors, loc, env,
                          lerr(LookupError::Kind::Unbound_module, Longident::lident(s)));
@@ -2325,7 +2324,7 @@ bool bound_module(std::string_view name, t env) {
   }
   if (current_unit_is(name)) return false;
   try {
-    find_pers_mod(false, std::string(name));
+    find_pers_mod(false, name);
     return true;
   } catch (const NotFound&) {
     return false;

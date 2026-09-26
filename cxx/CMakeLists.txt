@@ -96,6 +96,7 @@ add_library(cppcaml_core
   src/typing/matching.cpp
   src/typing/bytegen.cpp
   src/typing/printinstr.cpp
+  src/typing/emitcode.cpp
   src/typing/typemod_sig.cpp
   src/typing/typemod_str.cpp
   src/typing/typemod_unit.cpp

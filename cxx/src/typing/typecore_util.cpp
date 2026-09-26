@@ -207,12 +207,15 @@ std::optional<tt::Constant> constant(const pt::Constant& cst, Error* err_out) {
         } else if (d.suffix == 'l') {
           c.kind = CK::Const_int32;
           c.boxed = wrap_bits(cvt_int_aux(d.s, 32), 32);
+          c.box = fresh_identity();
         } else if (d.suffix == 'L') {
           c.kind = CK::Const_int64;
           c.boxed = cvt_int_aux(d.s, 64);
+          c.box = fresh_identity();
         } else if (d.suffix == 'n') {
           c.kind = CK::Const_nativeint;
           c.boxed = cvt_int_aux(d.s, 64);
+          c.box = fresh_identity();
         } else {
           Error e(location::none(), nullptr, EK::Unknown_literal);
           e.name = std::string(d.s);

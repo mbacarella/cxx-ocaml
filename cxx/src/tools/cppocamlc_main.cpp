@@ -50,6 +50,7 @@
 #include "cppcaml/typing/typemod.hpp"
 #include "cppcaml/typing/printlambda.hpp"
 #include "cppcaml/typing/bytegen.hpp"
+#include "cppcaml/typing/emitcode.hpp"
 #include "cppcaml/typing/printinstr.hpp"
 #include "cppcaml/typing/simplif.hpp"
 #include "cppcaml/typing/translmod.hpp"
@@ -397,8 +398,21 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
       ty::instruct::code bytecode = ty::bytegen::compile_implementation(mod, lam);
       if (g_dump.instr) std::cerr << ty::printinstr::dump(bytecode);
       lap("bytegen (port)", tp);
-      // TODO(stage 10): emitcode::to_file(...) writes the .cmo here (the
-      // Emitcode port); until it lands the new path stops after Bytegen.
+      // emit_bytecode: Emitcode.to_file, the .cmo removed on failure
+      std::FILE* oc = std::fopen(cmo_out.c_str(), "wb");
+      if (!oc) {
+        std::cerr << "c++ocamlc: cannot open " << cmo_out << "\n";
+        return 2;
+      }
+      try {
+        ty::emitcode::to_file(oc, cmo_out, mod, prog.required_globals, bytecode);
+      } catch (...) {
+        std::fclose(oc);
+        std::remove(cmo_out.c_str());
+        throw;
+      }
+      std::fclose(oc);
+      lap("emitcode (port)", tp);
       return 0;
     }
     // The .cmi of this unit's .mli comes from the type checker; the legacy

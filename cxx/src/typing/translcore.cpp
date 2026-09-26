@@ -138,7 +138,7 @@ lam_t mkapply(lam_t func, std::vector<lam_t> args, const ScopedLocation& loc,
 const StructuredConstant* const_immstring(std::string_view s) {
   auto* c = make<StructuredConstant>();
   c->kind = StructuredConstant::Kind::Const_immstring;
-  c->s = zstr(s);
+  c->s = zborrow(s);  // Const_immstring s: the string itself
   return c;
 }
 const StructuredConstant* const_block(long tag, const std::vector<const StructuredConstant*>& fields) {

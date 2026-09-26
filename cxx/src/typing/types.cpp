@@ -18,7 +18,8 @@ ZoneScope::~ZoneScope() { g_zone = saved; }
 const void* fresh_identity() { return zone().alloc(1, 1); }
 
 std::string_view zborrow(std::string_view s) {
-  if (s.data() && (g_default_zone.owns(s.data()) || g_zone->owns(s.data()))) return s;
+  if (s.data() && (g_default_zone.owns(s.data()) || g_zone->owns(s.data()) || permanent_zone().owns(s.data())))
+    return s;
   return zone().str(s);
 }
 
@@ -63,7 +64,7 @@ Uid of_compilation_unit_id(std::string_view name) {
 Uid of_predef_id(std::string_view name) {
   Uid u;
   u.kind = Uid::Kind::Predef;
-  u.comp_unit = zstr(name);
+  u.comp_unit = zborrow(name);  // Predef (Ident.name id): the ident's name
   u.obj = fresh_obj();
   return u;
 }

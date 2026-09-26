@@ -20,8 +20,10 @@ JOBS="${JOBS:-8}"
 DUMP="${DUMP:-drawlambda}"
 FLAGS="${FLAGS:-}"
 STOP="-stop-after lambda"
-[ "$DUMP" = dinstr ] && STOP=""  # the port stops after Bytegen until Emitcode lands
-export DUMP FLAGS STOP
+DFLAG="-$DUMP"
+[ "$DUMP" = dinstr ] && STOP=""
+[ "$DUMP" = cmo ] && { STOP=""; DFLAG=""; }  # compare the .cmo files' bytes
+export DUMP FLAGS STOP DFLAG
 CPP="${CPP:-$ROOT/cxx/build-release/c++ocamlc}"
 OUT=/tmp/lambda_port_parity
 
@@ -34,10 +36,14 @@ if [ "${1:-}" == "--worker" ]; then
     ( cd "$w/o" && timeout 120 "$ROOT/ocamlc.opt" -nostdlib -I "$ROOT/stdlib" -w -a $FLAGS -c "${b}i" ) >/dev/null 2>&1
     ( cd "$w/c" && timeout 120 "$CPP" -I "$ROOT/stdlib" -w -a $FLAGS -c "${b}i" ) >/dev/null 2>&1
   fi
-  ( cd "$w/o" && timeout 120 "$ROOT/ocamlc.opt" -nostdlib -I "$ROOT/stdlib" -w -a $FLAGS -"$DUMP" -c "$b" ) \
+  ( cd "$w/o" && timeout 120 "$ROOT/ocamlc.opt" -nostdlib -I "$ROOT/stdlib" -w -a $FLAGS $DFLAG -c "$b" ) \
       >/dev/null 2>"$OUT/$key.o"; orc=$?
-  ( cd "$w/c" && CPPCAML_NEWLAMBDA=1 timeout 120 "$CPP" -I "$ROOT/stdlib" -w -a $FLAGS -"$DUMP" $STOP -c "$b" ) \
+  ( cd "$w/c" && CPPCAML_NEWLAMBDA=1 timeout 120 "$CPP" -I "$ROOT/stdlib" -w -a $FLAGS $DFLAG $STOP -c "$b" ) \
       >/dev/null 2>"$OUT/$key.c"; crc=$?
+  if [ "$DUMP" = cmo ]; then
+    cp "$w/o/${b%.ml}.cmo" "$OUT/$key.o" 2>/dev/null || orc=1
+    cp "$w/c/${b%.ml}.cmo" "$OUT/$key.c" 2>/dev/null || crc=1
+  fi
   rm -rf "${w:?}"
   if [ $orc -ne 0 ]; then printf 'OFAIL %s\n' "$f"
   elif [ $crc -ne 0 ] || [ ! -s "$OUT/$key.c" ]; then printf 'CFAIL %s\n' "$f"

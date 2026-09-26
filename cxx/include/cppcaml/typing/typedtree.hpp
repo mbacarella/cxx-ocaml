@@ -38,6 +38,10 @@ struct Constant {
   Kind kind;
   long i = 0;                  // Const_int / Const_char
   std::int64_t boxed = 0;      // Const_int32 / Const_int64 / Const_nativeint
+  // the boxed integer's identity: typecore's Int64.of_string allocates one
+  // box per literal, which every copy of the constant (and the Lambda
+  // constants made of it -- Symtable.transl_const) shares
+  const void* box = nullptr;
   std::string_view s;          // Const_string / Const_float
   Location str_loc;            // Const_string
   OptStr delim;                // Const_string

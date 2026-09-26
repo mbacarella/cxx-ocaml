@@ -121,7 +121,18 @@ class PersistentEnv {
       it = it->second.found ? std::next(it) : persistent_structures_.erase(it);
   }
 
-  void add_import(const std::string& s) { imported_units_.insert(s); }
+  // String.Set.add keeps the set's own string when the name is already in
+  // it: the first string added for a name is the one Env.imports returns
+  // (Emitcode's cu_imports shares it -- e.g. with the name of the persistent
+  // ident a required global is), so keep its identity.
+  void add_import(std::string_view s) {
+    if (!imported_units_.count(s)) imported_units_.emplace(std::string(s), zborrow(s));
+  }
+  // the string Env.imports carries for [name] (added by add_import)
+  std::string_view import_name(std::string_view name) const {
+    auto it = imported_units_.find(name);
+    return it == imported_units_.end() ? std::string_view{} : it->second;
+  }
   void register_import_as_opaque(const std::string& s) { imported_opaque_units_.insert(s); }
 
   const PM* find_in_cache(const std::string& s) const {
@@ -188,9 +199,9 @@ class PersistentEnv {
   // throws load_path::NotFound when there is no such unit
   const Info& find_pers_struct(bool allow_hidden,
                                const std::function<PM(const PersistentSignature&)>& val_of_pers_sig,
-                               bool check, const std::string& name) {
+                               bool check, std::string_view name) {
     if (name == "*predef*") throw load_path::NotFound{};
-    auto it = persistent_structures_.find(name);
+    auto it = persistent_structures_.find(std::string(name));
     if (it != persistent_structures_.end()) {
       if (!it->second.found) throw load_path::NotFound{};
       if (allow_hidden || it->second.ps.ps_visibility == load_path::Visibility::Visible)
@@ -198,25 +209,34 @@ class PersistentEnv {
       throw load_path::NotFound{};
     }
     if (!can_load_cmis_) throw load_path::NotFound{};
-    std::optional<PersistentSignature> psig = load(allow_hidden, name);
+    std::optional<PersistentSignature> psig = load(allow_hidden, std::string(name));
     if (!psig) {
-      if (allow_hidden) persistent_structures_[name] = Info{false, {}, {}};
+      if (allow_hidden) persistent_structures_[std::string(name)] = Info{false, {}, {}};
       throw load_path::NotFound{};
     }
     add_import(name);
     PM pm = val_of_pers_sig(*psig);
-    return acknowledge_pers_struct(check, name, *psig, pm);
+    return acknowledge_pers_struct(check, std::string(name), *psig, pm);
+  }
+
+  // read penv f cmi: read_pers_struct ~check:true
+  PM read(const std::function<PM(const PersistentSignature&)>& f, const std::string& modname,
+          const std::string& filename) {
+    add_import(modname);
+    PersistentSignature pers_sig{filename, cmi_format::read_cmi(filename), load_path::Visibility::Visible};
+    PM pm = f(pers_sig);
+    return acknowledge_pers_struct(true, modname, pers_sig, pm).pm;
   }
 
   PM find(bool allow_hidden, const std::function<PM(const PersistentSignature&)>& f,
-          const std::string& name) {
+          std::string_view name) {
     return find_pers_struct(allow_hidden, f, true, name).pm;
   }
 
   // `check`: record the weak dependency (the No_cmi_file warning check is
   // not ported yet).
-  void check(const std::string& name) {
-    if (!persistent_structures_.count(name)) add_import(name);
+  void check(std::string_view name) {
+    if (!persistent_structures_.count(std::string(name))) add_import(name);
   }
 
   std::string crc_of_unit(const std::function<PM(const PersistentSignature&)>& f,
@@ -231,12 +251,14 @@ class PersistentEnv {
   }
 
   std::vector<std::pair<std::string, std::optional<std::string>>> imports() const {
-    return crc_units_.extract({imported_units_.begin(), imported_units_.end()});
+    std::vector<std::string> l;
+    for (auto& [name, _] : imported_units_) l.push_back(name);
+    return crc_units_.extract(l);
   }
   bool looked_up(const std::string& modname) const {
     return persistent_structures_.count(modname) != 0;
   }
-  bool is_imported(const std::string& s) const { return imported_units_.count(s) != 0; }
+  bool is_imported(std::string_view s) const { return imported_units_.count(s) != 0; }
   bool is_imported_opaque(const std::string& s) const {
     return imported_opaque_units_.count(s) != 0;
   }
@@ -294,7 +316,7 @@ class PersistentEnv {
   }
 
   std::map<std::string, Info> persistent_structures_;
-  std::set<std::string> imported_units_;
+  std::map<std::string, std::string_view, std::less<>> imported_units_;
   std::set<std::string> imported_opaque_units_;
   Consistbl crc_units_;
   bool can_load_cmis_ = true;

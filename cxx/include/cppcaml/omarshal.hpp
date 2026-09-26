@@ -25,6 +25,9 @@ struct Value {
   // data -- and the 32- and 64-bit counts therefore differ for the same block,
   // which a word count taken on one of them cannot express.
   long long custom_bytes = 0;
+  // the 32-bit data size when it differs from the 64-bit one (nativeint:
+  // 4 / 8, runtime/ints.c); -1 = custom_bytes
+  long long custom_bytes32 = -1;
 };
 
 ValPtr vint(long long n);
@@ -33,6 +36,8 @@ ValPtr vdbl(double d);
 ValPtr vblock(int tag, std::vector<ValPtr> f);
 ValPtr vdblarr(std::vector<double> ds);
 ValPtr vcustom(std::string raw, long long data_bytes);  // verbatim custom bytes
+// ... with the serializer's 32- and 64-bit data sizes (extern.c sz_32 / sz_64)
+ValPtr vcustom2(std::string raw, long long bytes32, long long bytes64);
 ValPtr vlist(const std::vector<ValPtr>& xs);  // OCaml list (cons / [])
 
 // Serialize `root` to a complete marshaled blob (20-byte small header + body).

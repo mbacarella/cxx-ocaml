@@ -379,9 +379,9 @@ lambda lambda_of_const(const typedtree::Constant& c) {
     case CK::Const_int: sc->kind = SK::Const_int; sc->i = c.i; break;
     case CK::Const_char: sc->kind = SK::Const_char; sc->i = c.i; break;
     case CK::Const_float: sc->kind = SK::Const_float; sc->s = c.s; break;
-    case CK::Const_int32: sc->kind = SK::Const_int32; sc->boxed = c.boxed; break;
-    case CK::Const_int64: sc->kind = SK::Const_int64; sc->boxed = c.boxed; break;
-    case CK::Const_nativeint: sc->kind = SK::Const_nativeint; sc->boxed = c.boxed; break;
+    case CK::Const_int32: sc->kind = SK::Const_int32; sc->boxed = c.boxed; sc->box = c.box; break;
+    case CK::Const_int64: sc->kind = SK::Const_int64; sc->boxed = c.boxed; sc->box = c.box; break;
+    case CK::Const_nativeint: sc->kind = SK::Const_nativeint; sc->boxed = c.boxed; sc->box = c.box; break;
     case CK::Const_string: sc->kind = SK::Const_immstring; sc->s = c.s; break;
   }
   return lconst(sc);

@@ -3,6 +3,7 @@
 // several effectful expressions in one application or constructor (right to
 // left), the order here is the same, since it decides which Failure is raised
 // first.
+#include <map>
 #include "cppcaml/typing/camlinternal_format.hpp"
 
 #include <optional>
@@ -28,6 +29,20 @@ const V* vint(long n) {
 const V* vstring(std::string_view s) {
   V v{VK::String};
   v.s = zone().str(s);
+  return make<V>(v);
+}
+// A string literal of camlinternalFormat.ml ("@,", "@ ", "@;", ""): one
+// static object, and ocamlopt (which built the reference ocamlc.opt) merges
+// the equal immutable string constants of a unit -- so one per content.
+const V* vliteral(std::string_view s) {
+  static std::map<std::string, std::string_view, std::less<>> interned;
+  auto it = interned.find(s);
+  if (it == interned.end()) {
+    ZoneScope perm(permanent_zone());
+    it = interned.emplace(std::string(s), zone().str(s)).first;
+  }
+  V v{VK::String};
+  v.s = it->second;
   return make<V>(v);
 }
 const V* vchar(char c) {
@@ -212,6 +227,17 @@ class Parser {
   char at(long i) const { return str[static_cast<std::size_t>(i)]; }
   std::string sub(long pos, long len) const {
     return std::string(str.substr(static_cast<std::size_t>(pos), static_cast<std::size_t>(len)));
+  }
+  // String.sub str pos len as a string value: String.sub s 0 (length s) is
+  // s itself (string.ml), so a format that is one literal shares its string
+  // with the Format's own (the .cmo's constant shares it)
+  const V* vsub(long pos, long len) const {
+    if (pos == 0 && len == static_cast<long>(str.size())) {
+      V v{VK::String};
+      v.s = zborrow(str);
+      return make<V>(v);
+    }
+    return vstring(sub(pos, len));
   }
 
   // ---- messages ----
@@ -618,11 +644,11 @@ class Parser {
       case '}': return lit(constr("Close_tag"), str_ind + 1);
       case ',': {
         const V* fmt_rest = parse(str_ind + 1, end_ind);
-        return constr("Formatting_lit", {constr("Break", {vstring("@,"), vint(0), vint(0)}), fmt_rest});
+        return constr("Formatting_lit", {constr("Break", {vliteral("@,"), vint(0), vint(0)}), fmt_rest});
       }
       case ' ': {
         const V* fmt_rest = parse(str_ind + 1, end_ind);
-        return constr("Formatting_lit", {constr("Break", {vstring("@ "), vint(1), vint(0)}), fmt_rest});
+        return constr("Formatting_lit", {constr("Break", {vliteral("@ "), vint(1), vint(0)}), fmt_rest});
       }
       case ';': return parse_good_break(str_ind + 1, end_ind);
       case '?': return lit(constr("FFlush"), str_ind + 1);
@@ -656,7 +682,7 @@ class Parser {
     }
     // with Not_found
     const V* fmt_rest = parse(str_ind, end_ind);
-    const V* sub_format = constr("Format", {constr("End_of_format"), vstring("")});
+    const V* sub_format = constr("Format", {constr("End_of_format"), vliteral("")});
     return constr("Formatting_gen", {constr(gen, {sub_format}), fmt_rest});
   }
 
@@ -688,10 +714,10 @@ class Parser {
       }
     } catch (const NotFound&) {
       next_ind = str_ind;
-      formatting_lit = constr("Break", {vstring("@;"), vint(1), vint(0)});
+      formatting_lit = constr("Break", {vliteral("@;"), vint(1), vint(0)});
     } catch (const Failure&) {
       next_ind = str_ind;
-      formatting_lit = constr("Break", {vstring("@;"), vint(1), vint(0)});
+      formatting_lit = constr("Break", {vliteral("@;"), vint(1), vint(0)});
     }
     const V* fmt_rest = parse(next_ind, end_ind);
     return constr("Formatting_lit", {formatting_lit, fmt_rest});
@@ -861,7 +887,7 @@ class Parser {
     long size = str_ind - lit_start;
     if (size == 0) return fmt;
     if (size == 1) return constr("Char_literal", {vchar(at(lit_start)), fmt});
-    return constr("String_literal", {vstring(sub(lit_start, size)), fmt});
+    return constr("String_literal", {vsub(lit_start, size), fmt});
   }
 
   // Search the end of the current sub-format (the "%}" or "%)")

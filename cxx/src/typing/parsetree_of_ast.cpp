@@ -47,13 +47,26 @@ struct Conv {
   const std::vector<std::string>& dirfiles;
 
   // ---- locations ----
+  // One zone string per file name: the lexer's positions all carry the one
+  // pos_fname string of their lexbuf (Location.init), which the .cmo's
+  // Assert_failure / Match_failure literals share.
+  mutable std::string_view zfname, znone;
+  mutable std::vector<std::string_view> zdirfiles;
   Position pos(const ast::Position& p) const {
     std::string_view f;
-    if (p.cnum == -1) f = "_none_";
-    else if (p.file_id > 0 && p.file_id <= static_cast<int>(dirfiles.size()))
-      f = dirfiles[p.file_id - 1];
-    else f = fname;
-    return Position{zborrow(f), p.lnum, p.bol, p.cnum};
+    if (p.cnum == -1) {
+      if (!znone.data()) znone = zborrow("_none_");
+      f = znone;
+    } else if (p.file_id > 0 && p.file_id <= static_cast<int>(dirfiles.size())) {
+      if (zdirfiles.empty()) zdirfiles.resize(dirfiles.size());
+      std::string_view& z = zdirfiles[p.file_id - 1];
+      if (!z.data()) z = zborrow(dirfiles[p.file_id - 1]);
+      f = z;
+    } else {
+      if (!zfname.data()) zfname = zborrow(fname);
+      f = zfname;
+    }
+    return Position{f, p.lnum, p.bol, p.cnum};
   }
   Location loc(const ast::Location& l) const {
     return Location{pos(l.start), pos(l.end), l.ghost};

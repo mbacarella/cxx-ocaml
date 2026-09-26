@@ -711,7 +711,7 @@ std::string string_escaped(std::string_view s) {
 const StructuredConstant* const_immstring(std::string_view s) {
   auto* c = make<StructuredConstant>();
   c->kind = StructuredConstant::Kind::Const_immstring;
-  c->s = zstr(s);
+  c->s = zborrow(s);  // Const_immstring s: the string itself
   return c;
 }
 const StructuredConstant* const_block(long tag, std::vector<const StructuredConstant*> fields) {

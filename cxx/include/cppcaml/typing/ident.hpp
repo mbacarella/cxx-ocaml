@@ -119,6 +119,7 @@ class Tbl {
   explicit Tbl(const Node* n) : t_(n) {}
   bool is_empty() const { return t_ == nullptr; }
   bool same_as(const Tbl& o) const { return t_ == o.t_; }
+  const Node* root() const { return t_; }  // the tree (marshaled by the debug events)
 
   Tbl add(Ident::t id, const A& data) const { return Tbl(add_(id, data, t_)); }
   Tbl remove(Ident::t id) const { return Tbl(remove_(id, t_)); }

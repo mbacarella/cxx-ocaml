@@ -121,6 +121,18 @@ const StructuredConstant* const_immstring(std::string_view s) {
 
 Lam transl_label(std::string_view l) { return translobj::share(const_immstring(l)); }
 
+// translclass.ml's "" literals (bind_id_as_val's name, new_variable's
+// label): a string literal is one static object, and ocamlopt (which built
+// the reference ocamlc.opt) merges equal immutable string constants of a
+// compilation unit, so both sites are the same object.
+std::string_view static_literal_empty() {
+  static std::string_view s = [] {
+    ZoneScope perm(permanent_zone());
+    return zone().str("");
+  }();
+  return s;
+}
+
 template <class Strs>
 Lam transl_meth_list(const Strs& lst) {
   if (lst.empty()) return L::lconst(L::const_int(0));
@@ -548,7 +560,7 @@ std::pair<InhList, Lam> build_class_init(scopes sc, Ident::t cla, bool cstr, con
       auto [ii, ci] = build_class_init(sc, cla, cstr, super, std::move(inh_init), cl_init, msubst, top, ce);
       // Create anonymous instance variables and define them in the table
       std::vector<NameId> vs;
-      for (const tt::IdentExpression& v : vals) vs.push_back(NameId{"", v.id});  // bind_id_as_val
+      for (const tt::IdentExpression& v : vals) vs.push_back(NameId{static_literal_empty(), v.id});  // bind_id_as_val
       return {std::move(ii), transl_vals(cla, true, LetKind::StrictOpt, vs, ci)};
     }
     case K::Tcl_apply:
@@ -1127,7 +1139,7 @@ LamKind transl_class_(scopes sc, Slice<Ident::t> ids, Ident::t cl_id, Slice<std:
     return {L::llet(LetKind::StrictOpt, VK::gen(), envs, e, lk.first), lk.second};
   };
   auto def_ids = [&](Ident::t cla, Lam lam) {
-    Lam lbl = transl_label("");
+    Lam lbl = transl_label(static_literal_empty());
     return L::llet(LetKind::StrictOpt, VK::gen(), env2, mkappl(oo_prim("new_variable"), {L::lvar(cla), lbl}), lam);
   };
   std::vector<Lam> inh_keys;
