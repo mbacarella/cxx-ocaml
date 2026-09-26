@@ -2705,8 +2705,14 @@ struct TyEmit {
           bool conj = i < t->pv_conj.size() && t->pv_conj[i];
           o::ValPtr rf;
           if (t->row_kind == 1 && !present.count(t->pv_tags[i])) {
+            std::vector<o::ValPtr> tl;
+            if (arg) {
+              tl.push_back(emit(arg));
+              if (i < t->pv_conj_args.size())
+                for (auto& c : t->pv_conj_args[i]) tl.push_back(emit(c));
+            }
             rf = o::vblock(1, {o::vint((!arg || conj) ? 1 : 0) /*no_arg*/,
-                               arg ? o::vlist({emit(arg)}) : o::vint(0) /*arg_type*/,
+                               arg ? o::vlist(tl) : o::vint(0) /*arg_type*/,
                                o::vint(0) /*matched=false*/,
                                o::vblock(0, {o::vint(1)}) /*ext=ref RFnone*/});  // RFeither
           } else {

@@ -479,6 +479,9 @@ struct Ty {
   std::vector<char> pv_conj;   // Variant: per-tag CONJUNCTIVE-constant flag
                                // (`` `A of & t ``: Reither no_arg=true WITH an
                                // arg list); empty = none
+  std::vector<std::vector<TyPtr>> pv_conj_args;  // Variant: per-tag further
+                               // conjuncts of an upper row's tag (`` `B of
+                               // int & t ``), after args[i]; empty = none
   bool univar = false;         // Var: a universally-quantified var (Tunivar) --
                                // a poly field's `'a.` binder
   std::vector<int> poly_ids;   // Poly: the quantified vars' ids (args[0] = body)

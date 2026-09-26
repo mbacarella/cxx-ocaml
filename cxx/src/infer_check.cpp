@@ -156,6 +156,50 @@ std::unordered_map<const void*, int>& unit_annot_prov() {
   static std::unordered_map<const void*, int> m;
   return m;
 }
+// S630: the conjuncts the DISPLAY pass's matches add to a `[<` row's tag
+// (pv_apply), keyed by the tag's slot node, for bridge_ty to write as the
+// Reither's argument list (`` `B of int & (int -> int) ``).  Per unit like
+// the provenance memos.
+std::unordered_map<const void*, std::vector<cppcaml::infer::TypePtr>>&
+unit_pvconj() {
+  static std::unordered_map<const void*, std::vector<cppcaml::infer::TypePtr>> m;
+  return m;
+}
+// ... and the tags a later closed match left absent (S630).
+std::unordered_set<const void*>& unit_pvabsent() {
+  static std::unordered_set<const void*> m;
+  return m;
+}
+// `Ctype.is_equal Env.empty false`: structural, no expansion, a variable
+// equal only to itself; rows and objects only when shared.
+static bool pv_struct_eq(const cppcaml::infer::TypePtr& a0,
+                         const cppcaml::infer::TypePtr& b0, int depth = 0) {
+  namespace I = cppcaml::infer;
+  auto a = I::Engine::repr(a0), b = I::Engine::repr(b0);
+  if (a == b) return true;
+  if (depth > 32 || a->kind != b->kind) return false;
+  using K = I::Type::Kind;
+  switch (a->kind) {
+    case K::Constr:
+    case K::Tuple:
+      if (a->kind == K::Constr && a->path != b->path) return false;
+      if (a->args.size() != b->args.size()) return false;
+      for (size_t i = 0; i < a->args.size(); ++i)
+        if (!pv_struct_eq(a->args[i], b->args[i], depth + 1)) return false;
+      return true;
+    case K::Arrow:
+      return a->arrow_label == b->arrow_label && a->arrow_lbl == b->arrow_lbl &&
+             pv_struct_eq(a->dom, b->dom, depth + 1) &&
+             pv_struct_eq(a->cod, b->cod, depth + 1);
+    default:
+      return false;
+  }
+}
+static bool pvdisp_off() {
+  static const bool off = cppcaml::dbg_env("NOPVDISP") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE630") != nullptr;
+  return off;
+}
 std::unordered_map<const void*, int>& unit_annot_openprov() {
   static std::unordered_map<const void*, int> m;
   return m;
@@ -10073,6 +10117,9 @@ struct Checker {
         else {
           mvar[key] = r->args[i];
           pvconj_[slot.get()].push_back(r->args[i]);
+          // The folded pass's are the .cmi's (S630).
+          if (fold_abbrevs_ && !strict && !pvdisp_off())
+            unit_pvconj()[slot.get()].push_back(r->args[i]);
         }
         r->args[i] = slot;
       }
@@ -10221,7 +10268,11 @@ struct Checker {
       if (open) continue;
       for (auto& tg : pre[pos].tags)
         if (!men.count(tg))
-          if (TypePtr slot = pv_slot(pre[pos], tg)) pvabsent_.insert(slot.get());
+          if (TypePtr slot = pv_slot(pre[pos], tg)) {
+            pvabsent_.insert(slot.get());
+            if (fold_abbrevs_ && !strict && !pvdisp_off())
+              unit_pvabsent().insert(slot.get());
+          }
     }
   }
   static const Pattern& pv_strip(const Pattern& p) {
@@ -15400,6 +15451,8 @@ struct Checker {
 // this where it clears the head-cmi cache, once per compiled unit.
 void clear_unit_annot_provs() {
   unit_annot_prov().clear();
+  unit_pvconj().clear();
+  unit_pvabsent().clear();
   unit_annot_openprov().clear();
 }
 
@@ -17077,9 +17130,52 @@ static cmi::cmiw::TyPtr bridge_ty_body(const TypePtr& t,
         conj.push_back(c ? 1 : 0);
         any_conj |= c;
       }
-      auto ty = cmi::cmiw::ty_variant_row(t->labels, std::move(targs),
+      // A matched `[<` tag's further conjuncts (S630), one per later match,
+      // in order, repeats dropped as `Ctype.normalize_type` drops them at
+      // save time (`is_equal`: structural, variables by identity) --
+      // `moregen`/`eqtype` pair the lists positionally, so the count is
+      // part of the type.
+      std::vector<std::vector<cmi::cmiw::TyPtr>> extra(t->labels.size());
+      bool any_extra = false;
+      if (!pvdisp_off() && t->variant_kind == 1)
+        for (std::size_t i = 0; i < t->labels.size(); ++i) {
+          if (!targs[i]) continue;
+          auto cj = unit_pvconj().find(t->args[i].get());
+          if (cj == unit_pvconj().end()) continue;
+          std::vector<TypePtr> kept{t->args[i]};
+          for (auto& c : cj->second) {
+            bool dup = false;
+            for (auto& k : kept) dup = dup || pv_struct_eq(k, c);
+            if (dup) continue;
+            kept.push_back(c);
+            extra[i].push_back(bridge_ty(c, vars, nextvar));
+            any_extra = true;
+          }
+        }
+      // A `[<` tag a later closed match omitted is absent (S630).
+      std::vector<std::string> labels = t->labels;
+      if (!pvdisp_off() && t->variant_kind == 1 && !unit_pvabsent().empty()) {
+        std::vector<std::string> l2;
+        std::vector<cmi::cmiw::TyPtr> a2;
+        std::vector<char> c2;
+        std::vector<std::vector<cmi::cmiw::TyPtr>> e2;
+        for (std::size_t i = 0; i < labels.size(); ++i) {
+          if (targs[i] && unit_pvabsent().count(t->args[i].get()) &&
+              std::find(t->present.begin(), t->present.end(), labels[i]) ==
+                  t->present.end())
+            continue;
+          l2.push_back(labels[i]);
+          a2.push_back(targs[i]);
+          c2.push_back(i < conj.size() ? conj[i] : 0);
+          e2.push_back(std::move(extra[i]));
+        }
+        labels = std::move(l2); targs = std::move(a2);
+        conj = std::move(c2); extra = std::move(e2);
+      }
+      auto ty = cmi::cmiw::ty_variant_row(labels, std::move(targs),
                                           t->variant_kind, t->present);
       if (any_conj) ty->pv_conj = std::move(conj);
+      if (any_extra) ty->pv_conj_args = std::move(extra);
       if (named_bound) {
         ty->row_name = t->abbrev;
         for (auto& a : t->abbrev_args)
