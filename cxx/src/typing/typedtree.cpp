@@ -249,3 +249,13 @@ const ModuleExpr* remove_module_constraint(const ModuleExpr* me) {
 }
 
 }  // namespace cppcaml::typing::typedtree
+
+namespace cppcaml::typing::typedtree {
+const ModuleCoercion* tcoerce_none() {
+  static const ModuleCoercion* c = [] {
+    ZoneScope perm(permanent_zone());
+    return make<ModuleCoercion>(ModuleCoercion{ModuleCoercion::Kind::Tcoerce_none});
+  }();
+  return c;
+}
+}  // namespace cppcaml::typing::typedtree

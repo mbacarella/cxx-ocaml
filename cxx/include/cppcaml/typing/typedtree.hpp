@@ -565,17 +565,41 @@ struct ClassStructure {
 };
 
 // ---- module language ---------------------------------------------------------------------
+struct ModuleCoercion;
+struct PrimitiveCoercion {
+  const PrimitiveDescription* pc_desc;
+  TypeExpr* pc_type;
+  env::t pc_env;
+  Location pc_loc;
+};
+struct PosCoercion {  // int * module_coercion
+  long pos;
+  const ModuleCoercion* cc;
+};
+struct IdPosCoercion {  // Ident.t * int * module_coercion
+  Ident::t id;
+  long pos;
+  const ModuleCoercion* cc;
+};
 struct ModuleCoercion {
   enum class Kind : std::uint8_t {
     Tcoerce_none, Tcoerce_structure, Tcoerce_functor, Tcoerce_primitive, Tcoerce_alias
   };
   Kind kind;
-  // Tcoerce_alias of Env.t * Path.t * module_coercion (the other payloads
-  // come with Typemod)
+  // Tcoerce_alias of Env.t * Path.t * module_coercion
   env::t alias_env = nullptr;
   Path::t alias_path = nullptr;
   const ModuleCoercion* alias_coercion = nullptr;
+  // Tcoerce_structure of (int * module_coercion) list * (Ident.t * int * module_coercion) list
+  Slice<PosCoercion> pos_cc;
+  Slice<IdPosCoercion> id_pos_cc;
+  // Tcoerce_functor of module_coercion * module_coercion
+  const ModuleCoercion* arg = nullptr;
+  const ModuleCoercion* res = nullptr;
+  // Tcoerce_primitive of primitive_coercion
+  const PrimitiveCoercion* prim = nullptr;
 };
+const ModuleCoercion* tcoerce_none();
 struct FunctorParameter {  // Unit | Named of Ident.t option * string option loc * module_type
   bool is_unit;
   Ident::t id = nullptr;  // option
@@ -792,6 +816,132 @@ struct ClassDeclarationItem {  // class_declaration * string list
   Slice<std::string_view> names;
 };
 TT_CTOR(StructureItemDesc, Tstr_class) Slice<ClassDeclarationItem> classes; TT_END
+
+// ---- signatures, module types and class types (Typemod / Typeclass) ----------------------
+struct Signature;
+struct TModuleDeclaration {
+  Ident::t md_id;  // option
+  OptStrLoc md_name;
+  Uid md_uid;
+  ModulePresence md_presence;
+  const ModuleType* md_type;
+  Attributes md_attributes;
+  Location md_loc;
+};
+struct TModuleSubstitution {
+  Ident::t ms_id;
+  StrLoc ms_name;
+  Uid ms_uid;
+  Path::t ms_manifest;
+  LidLoc ms_txt;
+  Attributes ms_attributes;
+  Location ms_loc;
+};
+struct WithConstraint {
+  enum class Kind : std::uint8_t {
+    Twith_type, Twith_module, Twith_modtype, Twith_typesubst, Twith_modsubst, Twith_modtypesubst
+  };
+  Kind kind;
+  const TTypeDeclaration* decl = nullptr;  // Twith_type / Twith_typesubst
+  Path::t path = nullptr;                  // Twith_module / Twith_modsubst
+  LidLoc lid;                              // Twith_module / Twith_modsubst
+  const ModuleType* mty = nullptr;         // Twith_modtype / Twith_modtypesubst
+};
+struct WithConstraintItem {  // Path.t * Longident.t loc * with_constraint
+  Path::t path;
+  LidLoc lid;
+  WithConstraint cstr;
+};
+TT_CTOR(ModuleTypeDesc, Tmty_signature) const Signature* sig; TT_END
+TT_CTOR(ModuleTypeDesc, Tmty_with) const ModuleType* mty; Slice<WithConstraintItem> cstrs; TT_END
+
+// class types
+struct TClassSignature;
+TT_CTOR(ClassTypeDesc, Tcty_constr) Path::t path; LidLoc lid; Slice<const CoreType*> args; TT_END
+TT_CTOR(ClassTypeDesc, Tcty_signature) const TClassSignature* sig; TT_END
+TT_CTOR(ClassTypeDesc, Tcty_arrow) ArgLabel label; const CoreType* arg; const ClassType* cty; TT_END
+TT_CTOR(ClassTypeDesc, Tcty_open) const OpenDescription* od; const ClassType* cty; TT_END
+struct ClassTypeFieldDesc {
+  enum class Kind : std::uint8_t { Tctf_inherit, Tctf_val, Tctf_method, Tctf_constraint, Tctf_attribute };
+  Kind kind;
+};
+struct ClassTypeField {
+  const ClassTypeFieldDesc* ctf_desc;
+  Location ctf_loc;
+  Attributes ctf_attributes;
+};
+struct TClassSignature {
+  const CoreType* csig_self;
+  Slice<const ClassTypeField*> csig_fields;
+  const typing::ClassSignature* csig_type;
+};
+TT_CTOR(ClassTypeFieldDesc, Tctf_inherit) const ClassType* cty; TT_END
+TT_CTOR(ClassTypeFieldDesc, Tctf_val)
+  std::string_view name;
+  MutableFlag mut;
+  VirtualFlag virt;
+  const CoreType* ty;
+TT_END
+TT_CTOR(ClassTypeFieldDesc, Tctf_method)
+  std::string_view name;
+  PrivateFlag priv;
+  VirtualFlag virt;
+  const CoreType* ty;
+TT_END
+TT_CTOR(ClassTypeFieldDesc, Tctf_constraint) const CoreType* t1; const CoreType* t2; TT_END
+TT_CTOR(ClassTypeFieldDesc, Tctf_attribute) const Attribute* attr; TT_END
+using TClassDescription = ClassInfos<const ClassType*>;
+using TClassTypeDeclaration = ClassInfos<const ClassType*>;
+struct ClassTypeDeclarationItem {  // Ident.t * string loc * class_type_declaration
+  Ident::t id;
+  StrLoc name;
+  const TClassTypeDeclaration* decl;
+};
+TT_CTOR(StructureItemDesc, Tstr_class_type) Slice<ClassTypeDeclarationItem> classes; TT_END
+
+// signatures
+struct SignatureItemDesc {
+  enum class Kind : std::uint8_t {
+    Tsig_value, Tsig_primitive, Tsig_type, Tsig_typesubst, Tsig_typext, Tsig_exception, Tsig_module,
+    Tsig_modsubst, Tsig_recmodule, Tsig_modtype, Tsig_modtypesubst, Tsig_open, Tsig_include,
+    Tsig_class, Tsig_class_type, Tsig_attribute
+  };
+  Kind kind;
+};
+struct SignatureItem {
+  const SignatureItemDesc* sig_desc;
+  env::t sig_env;
+  Location sig_loc;
+};
+struct Signature {
+  Slice<const SignatureItem*> sig_items;
+  typing::Signature sig_type;
+  env::t sig_final_env;
+};
+TT_CTOR(SignatureItemDesc, Tsig_value) const TValueDescription* vd; TT_END
+TT_CTOR(SignatureItemDesc, Tsig_primitive) const TPrimitiveDescription* pd; TT_END
+TT_CTOR(SignatureItemDesc, Tsig_type) RecFlag rec; Slice<const TTypeDeclaration*> decls; TT_END
+TT_CTOR(SignatureItemDesc, Tsig_typesubst) Slice<const TTypeDeclaration*> decls; TT_END
+TT_CTOR(SignatureItemDesc, Tsig_typext) const TTypeExtension* ext; TT_END
+TT_CTOR(SignatureItemDesc, Tsig_exception) const TTypeException* exn; TT_END
+TT_CTOR(SignatureItemDesc, Tsig_module) const TModuleDeclaration* md; TT_END
+TT_CTOR(SignatureItemDesc, Tsig_modsubst) const TModuleSubstitution* ms; TT_END
+TT_CTOR(SignatureItemDesc, Tsig_recmodule) Slice<const TModuleDeclaration*> mds; TT_END
+TT_CTOR(SignatureItemDesc, Tsig_modtype) const TModuleTypeDeclaration* mtd; TT_END
+TT_CTOR(SignatureItemDesc, Tsig_modtypesubst) const TModuleTypeDeclaration* mtd; TT_END
+TT_CTOR(SignatureItemDesc, Tsig_open) const OpenDescription* od; TT_END
+TT_CTOR(SignatureItemDesc, Tsig_include) const IncludeDescription* incl; TT_END
+TT_CTOR(SignatureItemDesc, Tsig_class) Slice<const TClassDescription*> classes; TT_END
+TT_CTOR(SignatureItemDesc, Tsig_class_type) Slice<const TClassTypeDeclaration*> classes; TT_END
+TT_CTOR(SignatureItemDesc, Tsig_attribute) const Attribute* attr; TT_END
+
+// A typechecked implementation (the shape is not ported: it only feeds the
+// cmt file)
+struct Implementation {
+  const Structure* structure;
+  const ModuleCoercion* coercion;
+  typing::Signature signature;
+};
 
 #undef TT_CTOR
 #undef TT_END
