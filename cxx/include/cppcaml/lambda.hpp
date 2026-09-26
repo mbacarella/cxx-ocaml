@@ -597,4 +597,11 @@ void set_module_dirs(std::vector<std::string> dirs);
 // Stdlib re-export field (GETGLOBALFIELD Stdlib, N).
 void set_nopervasives(bool b);
 
+// The unit's own interface as the legacy .cmi writer would have written it:
+// when the .cmi on disk comes from the typing/ port (ocamlc's layout, which
+// keeps named module types unexpanded), this translator still reads the
+// legacy view it was validated against.  "" = read the .cmi next to the
+// source.  A bridge until lambda/ is ported (TYPECHECKER.md stage 10).
+void set_legacy_own_cmi(std::string path);
+
 }  // namespace cppcaml::lambda

@@ -12,20 +12,23 @@ consume its results (the .cmi writer, `lambda/`, `bytecomp/`), each verified
 against ocamlc.  That is the parser, lambda and bytecode method again:
 transcribe ocamlc's algorithms and check them against ocamlc.
 
-**The typing/ port is c++ocamlc's type checker**: it type-checks units
-before code generation, as in ocamlc (by default once stage 8 lands).  The
-earlier C++ typers are deleted or scheduled for deletion; see "Legacy code"
-below.
+**The typing/ port is c++ocamlc's type checker**: every unit is type-checked
+before code generation, as in ocamlc, and the .cmi is the port's (stage 8).
+The earlier C++ typers are deleted or scheduled for deletion; see "Legacy
+code" below.
 
 ## Status (2026-09-26)
 
-With `CPPCAML_TYPECHECK=1` (on by default after stage 8) c++ocamlc
-type-checks every unit with the typing/ port before code generation, and
-rejects what ocamlc rejects (exit 2, nothing written).  Its
-error report is ocamlc's location line and the error's constructor
-(`Error: Typecore.Expr_type_clash`) until Printtyp is ported (stage 9);
-`-stop-after typing` type-checks only.  `CPPCAML_TYPECHECK_DEBUG=1` says
-when a file reached an unported part (it is then accepted).
+c++ocamlc type-checks every unit with the typing/ port before code
+generation and rejects what ocamlc rejects (exit 2, nothing written); the
+.cmi it writes is the port's, byte-identical to ocamlc's on the compiler's
+interfaces.  Its error report is ocamlc's location line and the error's
+constructor (`Error: Typecore.Expr_type_clash`) until Printtyp is ported
+(stage 9); `-stop-after typing` type-checks only (and, as ocamlc, still
+writes an .ml's inferred .cmi).  `CPPCAML_NOTYPECHECK=1` skips the checker
+(a debugging hatch: the legacy writer then writes the .cmi);
+`CPPCAML_TYPECHECK_DEBUG=1` says when a file reached an unported part (it
+is then accepted).
 
 Accept/reject parity with ocamlc (`-stop-after typing`, same flags):
 
@@ -237,22 +240,39 @@ from the port.  The two must be identical on every .cmi in the tree
    would let the second copy's units shadow the opened Stdlib's).
 7. **DONE:** `typer.cpp`, `c++type`, the strict pass and the harnesses and
    roadmap that scored them are deleted; `false_accept.sh` /
-   `valid_reject.sh` run the port (`port_check.sh`).  Type checking is
-   still opt-in (`CPPCAML_TYPECHECK=1` / `-stop-after typing`): turning it
-   on showed that the legacy .cmi writer can write an interface that
-   disagrees with its own .mli (camlinternalFormatBasics' GADTs), which
-   the checker rejects exactly as ocamlc does against that .cmi.  The
-   default flips (`kTypecheckByDefault` in cppocamlc_main.cpp) with
-   stage 8.  The bootstrap harness
-   now passes the stdlib's and the compiler's real typing flags
-   (`-principal`, `-no-alias-deps`, ...) and compiles the stdlib to a
-   dependency fixpoint: its hand-written link order was never a valid
-   compile order, which only a type checker notices.
-8. **The .cmi from the port** (`Env.save_signature`: `Subst` for saving,
-   `Cmi_format.output_cmi`, the CRCs), replacing the infer-driven writer.
-   Oracle: .cmi bytes identical to ocamlc's.  Needs ident stamps to follow
-   ocamlc's process order, so the lazily created module-init values
-   (stage 5 deviations) must be created where ocamlc creates them.
+   `valid_reject.sh` run the port (`port_check.sh`).  The bootstrap harness
+   passes the stdlib's and the compiler's real typing flags (`-principal`,
+   `-no-alias-deps`, ...) and compiles to a dependency fixpoint across both
+   libraries: its hand-written lists are link orders (obj.mli needs
+   Int32, clflags.mli Profile, meta.mli Instruct), which only a type
+   checker notices.  `cmx_format.mli` (native back end only) is left out.
+8. **DONE (bytes: the remaining sharing classes below):** the .cmi comes
+   from the port: `Env.save_signature` (`Btype.cleanup_abbrev_memo`,
+   `Subst.for_saving` with `Make_local`, `Persistent_env.make_cmi` /
+   `save_cmi`) and `Cmi_format.output_cmi`, whose encoder is the Reader's
+   inverse.  Byte identity with ocamlc needed: the idents ocamlc creates
+   while its modules initialize (Shape, Parmatch, Typeclass) created at
+   startup in link order; the real structure shape passed to
+   `Includemod.compunit`; `Env.hashcons_name`; OCaml's object identity
+   kept for strings (`zborrow` borrows zone strings instead of copying,
+   and a copy of "" has an identity), uids and record representations
+   (identity tokens), arg labels, and what `input_value` shares (the
+   Reader memoizes idents, paths and strings per marshaled block);
+   positions, locations and filenames shared as the lexer shares them;
+   the driver's `Compile_common.typecheck_intf` (the interface's
+   self-inclusion check forces what ocamlc forces).  `cmi_port_parity.sh`:
+   compiler interfaces **145/145 byte-identical** (cmx_format.mli is
+   rejected by both); standalone .ml probes (`--standalone`) 6204/6531
+   byte-identical, 314 identical graphs whose sharing differs, 13
+   different -- 11 of them only because `-w -a` is not interpreted yet
+   (Parmatch.check_unused, run under warning 11, creates uids), the 2 left
+   an attribute payload's sharing and a uid.  With the port's .cmi on
+   disk, the legacy translator (lambda.cpp) still reads its own writer's
+   view of the unit's .mli (a private temporary .cmi,
+   `lambda::set_legacy_own_cmi`): ocamlc's .cmi keeps a functor
+   parameter as a named module type (`EngineTypes.TABLE`) that the legacy
+   generator cannot resolve.  Type checking is on by default; DDC
+   139/139 .cmo + 216 .cmi and effid 139/139 with it.
 9. **Messages:** `Printtyp` (+ `Out_type`, `Oprint`, `Errortrace_report`),
    the `report_error` functions and `Location`'s reporting; then `Warnings`
    and the checks that emit them.  Oracle: ocamlc's stderr, byte for byte

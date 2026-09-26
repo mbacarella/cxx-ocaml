@@ -89,6 +89,9 @@ cp "$STD/std_exit.ml" "$WD/"; ( cd "$WD" && "$CPP" -c -stdlib "$WD" -I "$WD" std
 echo "stdlib: built"
 
 # ---- 2. compiler sources, in dependency order ------------------------------
+# (file_formats/cmx_format.mli is left out: it needs the native back end's
+# Clambda / Export_info, which the bytecode compiler neither builds nor uses;
+# ocamlc rejects it here too.)
 # Authoritative module order (ocamlcommon then ocamlbytecomp). .mll/.mly use the
 # in-tree generated .ml/.mli.  Comments mark interface-only modules.
 CL_COMMON="utils/config.mli utils/config.ml
@@ -213,7 +216,6 @@ lambda/tmc.mli lambda/tmc.ml
 lambda/simplif.mli lambda/simplif.ml
 lambda/runtimedef.mli lambda/runtimedef.ml
 file_formats/cmo_format.mli
-file_formats/cmx_format.mli
 file_formats/cmxs_format.mli
 bytecomp/meta.mli bytecomp/meta.ml
 bytecomp/opcodes.mli bytecomp/opcodes.ml
@@ -248,20 +250,42 @@ driver/main.mli driver/main.ml"
 INCS="-I $WD"
 
 ok=0; fail=0; order=""
+# The lists are LINK orders; an interface can need a later unit's .cmi
+# (clflags.mli uses Profile.column), which make finds through .depend.  So
+# compile to a fixpoint -- retry the failures until none is left or none
+# makes progress -- and keep the list order for the link.
 compile_list() {
+  local pending="" left f base
   for f in $1; do
     base=$(basename "$f"); [ -f "$ROOT/$f" ] || { echo "MISSING $f"; exit 1; }
     cp "$ROOT/$f" "$WD/$base"
-    # Makefile.build_config's OC_COMMON_COMPFLAGS (the typing ones)
-    if ( cd "$WD" && "$CPP" -c -strict-sequence -principal -strict-formats -stdlib "$WD" $INCS "$base" ) >"$WD/cerr" 2>&1; then
-      ok=$((ok+1)); [ "${base##*.}" = ml ] && order="$order ${base%.ml}"
-    else
-      fail=$((fail+1)); echo "[FAIL $f]"; sed 's/^/   /' "$WD/cerr" | head -6
-    fi
+    pending="$pending $f"
+  done
+  while [ -n "$pending" ]; do
+    left=""
+    for f in $pending; do
+      base=$(basename "$f")
+      # Makefile.build_config's OC_COMMON_COMPFLAGS (the typing ones)
+      if ( cd "$WD" && "$CPP" -c -strict-sequence -principal -strict-formats -stdlib "$WD" $INCS "$base" ) >"$WD/cerr.$base" 2>&1
+      then ok=$((ok+1)); rm -f "$WD/cerr.$base"
+      else left="$left $f"; fi
+    done
+    [ "$left" = "$pending" ] && break
+    pending="$left"
+  done
+  for f in $left; do
+    base=$(basename "$f")
+    fail=$((fail+1)); echo "[FAIL $f]"; sed 's/^/   /' "$WD/cerr.$base" | head -6
+  done
+  for f in $1; do
+    base=$(basename "$f")
+    [ "${base##*.}" = ml ] && [ ! -f "$WD/cerr.$base" ] && order="$order ${base%.ml}"
   done
 }
-echo "--- compiling ocamlcommon ---"; compile_list "$CL_COMMON"
-echo "--- compiling ocamlbytecomp ---"; compile_list "$CL_BYTE"
+# One fixpoint over both libraries: an ocamlcommon interface can need an
+# ocamlbytecomp one (meta.mli uses Instruct), as make's .depend allows.
+echo "--- compiling ocamlcommon + ocamlbytecomp ---"; compile_list "$CL_COMMON
+$CL_BYTE"
 echo "=== compiler: ok=$ok fail=$fail ==="
 [ "$fail" = 0 ] || exit 1
 

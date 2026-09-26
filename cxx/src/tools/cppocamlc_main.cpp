@@ -15,6 +15,7 @@
 // flags that would silently change the meaning of the output if ignored (-pp,
 // -ppx, -pack, -a, -open, ...) are reported as unsupported rather than dropped.
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <cctype>
 #include <chrono>
@@ -235,10 +236,10 @@ static void set_typing_flag(const std::string& a) {
 // -stop-after parsing / typing
 enum class StopAfter { None, Parsing, Typing };
 static StopAfter g_stop_after = StopAfter::None;
-// On by default once the .cmi comes from the port (TYPECHECKER.md stage 8):
-// until then c++ocamlc's own .cmi files (the legacy writer) can disagree
-// with their .mli, which the checker, like ocamlc, rejects.
-static constexpr bool kTypecheckByDefault = false;
+// Type checking runs on every unit, as in ocamlc; CPPCAML_NOTYPECHECK=1
+// skips it (a debugging hatch only: the .cmi then comes from the legacy
+// writer).
+static constexpr bool kTypecheckByDefault = true;
 static bool typecheck_enabled() {
   if (g_stop_after == StopAfter::Typing) return true;
   if (kTypecheckByDefault) return !cppcaml::dbg_env("CPPCAML_NOTYPECHECK");
@@ -372,6 +373,39 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
       lap("typecheck", tp);
       if (g_stop_after == StopAfter::Typing) return 0;
     }
+    // The .cmi of this unit's .mli comes from the type checker; the legacy
+    // translator reads its own writer's view of the interface instead
+    // (lambda.hpp set_legacy_own_cmi), written to a private temporary file.
+    std::string legacy_own_cmi;
+    {
+      fs::path mli = fs::path(in_path).replace_extension(".mli");
+      if (port == PortResult::Typed && fs::exists(mli)) {
+        std::ifstream mi(mli, std::ios::binary);
+        std::ostringstream ms;
+        ms << mi.rdbuf();
+        try {
+          auto isig = cppcaml::parse_signature(ms.str());
+          fs::path tmp = fs::temp_directory_path() /
+                         ("c++ocamlc-" + std::to_string(::getpid()) + "-" + fs::path(cmo_out).stem().string());
+          fs::create_directories(tmp);
+          legacy_own_cmi = (tmp / fs::path(cmo_out).filename().replace_extension(".cmi")).string();
+          cppcaml::cmi::cmiw::write_cmi(legacy_own_cmi, mod, cppcaml::signature_to_cmi(isig), {}, /*intf=*/true,
+                                        /*src_files=*/{mli.string()}, 274 + cppcaml::typing_ident_count(isig));
+        } catch (const std::exception&) {
+          legacy_own_cmi.clear();
+        }
+      }
+    }
+    cppcaml::lambda::set_legacy_own_cmi(legacy_own_cmi);
+    struct RemoveLegacyCmi {
+      std::string path;
+      ~RemoveLegacyCmi() {
+        if (path.empty()) return;
+        std::error_code ec;
+        fs::remove_all(fs::path(path).parent_path(), ec);
+        cppcaml::lambda::set_legacy_own_cmi("");
+      }
+    } remove_legacy_cmi{legacy_own_cmi};
     std::vector<std::string> required_globals;
     std::size_t eta_sites = 0, pv_reify = 0;
     std::set<const cppcaml::ast::Expression*> eta_nodes;

@@ -38180,6 +38180,9 @@ void set_module_dirs(std::vector<std::string> dirs) { g_module_dirs = std::move(
 static bool g_nopervasives = false;
 void set_nopervasives(bool b) { g_nopervasives = b; }
 
+static std::string g_legacy_own_cmi;
+void set_legacy_own_cmi(std::string path) { g_legacy_own_cmi = std::move(path); }
+
 LamPtr translate_implementation(const ast::Structure& s, const std::string& module_name,
                                 const std::string& stdlib_dir, const std::string& file_name,
                                 std::vector<std::string>* required_globals,
@@ -38211,6 +38214,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
     namespace fs = std::filesystem;
     fs::path mli = fs::path(file_name); mli.replace_extension(".mli");
     fs::path cmi = fs::path(file_name); cmi.replace_extension(".cmi");
+    if (!g_legacy_own_cmi.empty()) cmi = g_legacy_own_cmi;
     if (fs::exists(mli) && fs::exists(cmi)) {
       try {
         if (cmi::CmiFile::load(cmi.string()).module_name() == module_name)
@@ -38252,6 +38256,7 @@ LamPtr translate_implementation(const ast::Structure& s, const std::string& modu
     namespace fs = std::filesystem;
     fs::path mli = fs::path(file_name); mli.replace_extension(".mli");
     fs::path cmi = fs::path(file_name); cmi.replace_extension(".cmi");
+    if (!g_legacy_own_cmi.empty()) cmi = g_legacy_own_cmi;
     if (fs::exists(mli) && fs::exists(cmi)) {
       try {
         const auto& c = cmi::CmiFile::load(cmi.string());

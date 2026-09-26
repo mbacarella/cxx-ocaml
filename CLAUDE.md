@@ -9,8 +9,8 @@ This is a self-bootstrapping compiler: pre-built bytecode images of `ocamlc`/`oc
 **Read `TYPECHECKER.md` first.**  c++ocamlc must match ocamlc's semantics
 exactly, by faithfully porting the compiler (`cxx/src/typing/` is the port
 of `typing/`, verified against compiler-libs oracles).  The port is
-c++ocamlc's type checker (`CPPCAML_TYPECHECK=1` / `-stop-after typing`; on
-by default once the .cmi is written from it).  `typer.cpp`, `c++type` and
+c++ocamlc's type checker (on by default; `CPPCAML_NOTYPECHECK=1` is a
+debugging hatch) and writes its .cmi.  `typer.cpp`, `c++type` and
 their harnesses are deleted.  `cxx/src/infer_check.cpp` + `infer.cpp` are
 legacy, scheduled for deletion: they still feed `lambda.cpp` and the old
 .cmi writer, so fix output bugs only and never grow them.
