@@ -975,6 +975,8 @@ class Writer {
         V a = position(l.loc_start);
         V e = position(l.loc_end);
         it->second = o::vblock(0, {a, e, b(l.loc_ghost)});
+        // a copy of it the port rebuilt from its positions is this record too
+        locs_.try_emplace(std::make_tuple(a.get(), e.get(), l.loc_ghost), it->second);
       }
       return it->second;
     }
@@ -1063,7 +1065,30 @@ class Writer {
   V attributes(const Attributes& as) {
     return list(as, [&](const Attribute* a) {
       return shared(memo_, a, 0, [&]() -> std::vector<V> {
-        return {o::vblock(0, {str(a->attr_name), loc(a->attr_name_loc)}), ovalue(a->attr_payload), loc(a->attr_loc)};
+        V name;
+        if (a->name_obj) {
+          V l = loc(a->attr_name_loc);
+          auto [it, fresh] = attr_names_.try_emplace(std::make_pair(a->name_obj, l.get()), nullptr);
+          if (fresh) it->second = o::vblock(0, {str(a->attr_name), l});
+          name = it->second;
+        } else {
+          name = o::vblock(0, {str(a->attr_name), loc(a->attr_name_loc)});
+        }
+        V payload = ovalue(a->attr_payload);
+        // a doc attribute (Docstrings): its attr_loc is its payload item's
+        // loc record, PStr [{pstr_desc; pstr_loc}]
+        if (a->name_obj) {
+          const OValue* p = a->attr_payload;
+          if (p && p->kind == OValue::Kind::Block && p->tag == 0 && p->fields.size() == 1) {
+            const OValue* cons = p->fields[0];
+            if (cons->kind == OValue::Kind::Block && cons->fields.size() == 2) {
+              const OValue* item = cons->fields[0];
+              if (item->kind == OValue::Kind::Block && item->fields.size() == 2)
+                return {name, payload, ovalue(item->fields[1])};
+            }
+          }
+        }
+        return {name, payload, loc(a->attr_loc)};
       });
     });
   }
@@ -1488,6 +1513,7 @@ class Writer {
   std::map<std::tuple<const void*, long, long, long>, V> poss_;
   std::map<std::tuple<const void*, const void*, bool>, V> locs_;
   std::unordered_map<const void*, V> pos_objs_, loc_objs_;
+  std::map<std::pair<const void*, const void*>, V> attr_names_;
 };
 
 // ---- the debugging events of a .cmo (Emitcode.to_file with -g) ------------

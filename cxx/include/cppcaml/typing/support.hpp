@@ -160,6 +160,9 @@ struct Attribute {
   const OValue* attr_payload = nullptr;
   Location attr_loc;
   const parsetree::Attribute* ast = nullptr;
+  // the {txt; loc} name record's identity where it is one object: a doc
+  // attribute's is Docstrings's doc_loc / text_loc (nullptr: its own)
+  const void* name_obj = nullptr;
 };
 using Attributes = Slice<const Attribute*>;
 

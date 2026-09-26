@@ -18,8 +18,13 @@ typing::Attributes types_attributes(const Attributes& l) {
   std::vector<const typing::Attribute*> out;
   for (const Attribute* a : l) {
     bool doc = a->attr_name.txt == "ocaml.doc" || a->attr_name.txt == "ocaml.text";
-    out.push_back(make<typing::Attribute>(
-        typing::Attribute{a->attr_name.txt, a->attr_name.loc, ovalue_of_payload(a->attr_payload, doc), a->attr_loc, a}));
+    // Docstrings's doc_loc / text_loc: one {txt; loc} record each
+    static const std::string_view doc_name = OCAML_LIT("ocaml.doc"), text_name = OCAML_LIT("ocaml.text");
+    std::string_view name = !doc ? a->attr_name.txt : a->attr_name.txt == "ocaml.doc" ? doc_name : text_name;
+    auto* ta = make<typing::Attribute>(
+        typing::Attribute{name, a->attr_name.loc, ovalue_of_payload(a->attr_payload, doc), a->attr_loc, a});
+    if (doc) ta->name_obj = name.data();
+    out.push_back(ta);
   }
   return slice(out);
 }
