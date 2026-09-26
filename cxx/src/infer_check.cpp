@@ -1054,8 +1054,17 @@ struct Checker {
     std::unordered_map<std::string, TypePtr> vals;
     std::vector<std::string> own_types, own_mods;
     std::vector<const TypeDeclaration*> own_decls;  // parallel to own_types
+    // An ASCRIBED body (`F (X : S) : R = struct .. end`): vals come from R,
+    // whose own members are qualified by this placeholder (the functor's
+    // name) and re-rooted at the application's path (S627).
+    std::string own_qual;
   };
   std::unordered_map<std::string, FunctorReal> functor_real_env_;
+  static bool ascfapp_off() {
+    static const bool off = cppcaml::dbg_env("NOASCFAPP") != nullptr ||
+                            cppcaml::dbg_env("NOSHARE627") != nullptr;
+    return off;
+  }
   static bool locfapp_off() {
     static const bool off = cppcaml::dbg_env("NOLOCFAPP") != nullptr ||
                             cppcaml::dbg_env("NOSHARE608") != nullptr;
@@ -4118,6 +4127,9 @@ struct Checker {
               if (t->path == n) cites_own = true;
             for (auto& n : fr->second.own_mods)
               if (t->path.rfind(n + ".", 0) == 0) cites_own = true;
+            if (!fr->second.own_qual.empty() &&
+                t->path.rfind(fr->second.own_qual + ".", 0) == 0)
+              cites_own = true;
           }
           if (t->kind == I::Type::Kind::Arrow) { walk(t->dom); walk(t->cod); }
           for (auto& a : t->args) walk(a);
@@ -4152,6 +4164,10 @@ struct Checker {
       for (auto& n : fr->second.own_mods) {
         std::unordered_map<I::Type*, TypePtr> m2;
         t = subst_path_head(t, n + ".", tpfx + n + ".", m2);
+      }
+      if (!fr->second.own_qual.empty()) {
+        std::unordered_map<I::Type*, TypePtr> m3;
+        t = subst_path_head(t, fr->second.own_qual + ".", tpfx, m3);
       }
       out[k] = t;
     }
@@ -15130,6 +15146,22 @@ struct Checker {
                       if (bm->binding.name.txt)
                         fr.own_mods.push_back(*bm->binding.name.txt);
                     }
+                  functor_real_env_[*mb->binding.name.txt] = std::move(fr);
+                }
+              // An ASCRIBED body (`module F (X : S) : R = struct .. end`) is
+              // seen only through R: its application's values were fresh vars
+              // (`module C = F(A) let e = C.e` saved `e : 'a`, a consumer
+              // accepted any type).  R's values, its own types qualified by
+              // the functor's name, re-rooted at the application (S627).
+              // NOASCFAPP reverts.
+              if (!strict && fparams.size() == 1 && !ascfapp_off())
+                if (auto* mc = std::get_if<Pmod_constraint>(&me->desc);
+                    mc && mc->mt &&
+                    !std::holds_alternative<Pmty_functor>(mc->mt->desc)) {
+                  FunctorReal fr;
+                  fr.param = fparams[0].first;
+                  fr.own_qual = *mb->binding.name.txt;
+                  fr.vals = param_sig_value_schemes(*mc->mt, {}, fr.own_qual);
                   functor_real_env_[*mb->binding.name.txt] = std::move(fr);
                 }
               for (auto& [k, v] : ex) v = generic_var();
