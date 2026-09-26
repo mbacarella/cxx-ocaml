@@ -286,9 +286,17 @@ from the port.  The two must be identical on every .cmi in the tree
    `-alert` and `[@warning]` scopes drive `Warnings.is_active`) and the
    checks that emit them.  Oracle: ocamlc's stderr, byte for byte
    (the testsuite's expect outputs are a second oracle).
-10. **The back end from the port:** `lambda/` (`Translcore`, `Translmod`,
-   `Translprim`, `Translobj`/`Translclass`, `Matching`, `Switch`,
-   `Simplif`, `Tmc`, `Value_rec_compiler`, `Printlambda`) and `bytecomp/`
-   (`Bytegen`, `Emitcode`, `Bytelink`), on the port's typed tree.  Oracles:
-   `-dlambda` / `-dinstr` text, then .cmo bytes and DDC.  Then delete
-   `lambda.cpp`, `infer_check.cpp`, `infer.cpp` and the old .cmi writer.
+10. **Next (decided 2026-09-26): the translators from the port.**  Port
+   only `lambda/` -- `Translcore`, `Translprim`, `Translattribute`,
+   `Matching`, `Switch`, `Translmod`, `Translobj`/`Translclass`,
+   `Value_rec_compiler`, `Simplif`, `Tmc` (+ `Printlambda` for the oracle)
+   -- onto the port's typed tree.  The bytecode back end is already a
+   faithful, DDC-verified port and stays: `bytecode.cpp` (bytegen.ml),
+   `cmo.cpp` (emitcode.ml + the .cmo), `link.cpp` (bytelink/symtable).
+   First check that the existing Lam IR (`lambda.hpp`) represents
+   ocamlc's Lambda exactly with its imitation flags unset (adjust it
+   minimally if not); reuse genuine ports inside `lambda.cpp` only after
+   checking them against their .ml.  Oracles: `-drawlambda` / `-dlambda`
+   text, then `-dinstr` and .cmo bytes, then DDC.  Then delete
+   `lambda.cpp`'s AST translator, `infer_check.cpp`, `infer.cpp`, the
+   legacy .cmi writer and the `lambda::set_legacy_own_cmi` bridge.
