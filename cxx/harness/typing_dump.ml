@@ -633,8 +633,8 @@ module P = struct
   let rec lid (l : Longident.t) =
     match l with
     | Lident n -> s "Lident "; q n
-    | Ldot (a, b) -> s "Ldot("; lid a.txt; s " "; gloc a.loc; s " "; q b.txt; s " "; gloc b.loc; s ")"
-    | Lapply (a, b) -> s "Lapply("; lid a.txt; s " "; gloc a.loc; s " "; lid b.txt; s " "; gloc b.loc; s ")"
+    | Ldot (a, b) -> s "Ldot("; lid a.txt; s " "; loc a.loc; s " "; q b.txt; s " "; loc b.loc; s ")"
+    | Lapply (a, b) -> s "Lapply("; lid a.txt; s " "; loc a.loc; s " "; lid b.txt; s " "; loc b.loc; s ")"
   let lid_loc (x : Longident.t Asttypes.loc) = s "{"; lid x.txt; s " "; loc x.loc; s "}"
   let optstr = opt q
   let flag_closed = function Asttypes.Closed -> s "Closed" | Open -> s "Open"
@@ -1046,6 +1046,123 @@ let dump_parse file =
   let st = Pparse.parse_implementation ~tool_name:"ocamlc" file in
   P.structure st; s "\n"
 
+(* ---- stage 4b: Typetexp ---- *)
+
+let texp_error_name : Typetexp.error -> string = function
+  | Unbound_type_variable _ -> "Unbound_type_variable"
+  | No_type_wildcards -> "No_type_wildcards"
+  | Undefined_type_constructor _ -> "Undefined_type_constructor"
+  | Type_arity_mismatch _ -> "Type_arity_mismatch"
+  | Bound_type_variable _ -> "Bound_type_variable"
+  | Recursive_type -> "Recursive_type"
+  | Type_mismatch _ -> "Type_mismatch"
+  | Alias_type_mismatch _ -> "Alias_type_mismatch"
+  | Present_has_conjunction _ -> "Present_has_conjunction"
+  | Present_has_no_type _ -> "Present_has_no_type"
+  | Constructor_mismatch _ -> "Constructor_mismatch"
+  | Not_a_variant _ -> "Not_a_variant"
+  | Variant_tags _ -> "Variant_tags"
+  | Invalid_variable_name _ -> "Invalid_variable_name"
+  | Cannot_quantify _ -> "Cannot_quantify"
+  | Multiple_constraints_on_type _ -> "Multiple_constraints_on_type"
+  | Method_mismatch _ -> "Method_mismatch"
+  | Opened_object _ -> "Opened_object"
+  | Not_an_object _ -> "Not_an_object"
+  | Repeated_tuple_label _ -> "Repeated_tuple_label"
+  | Polymorphic_optional_param _ -> "Polymorphic_optional_param"
+  | Functor_optional_param _ -> "Functor_optional_param"
+
+let lookup_error_name : Env.lookup_error -> string = function
+  | Unbound_value _ -> "Unbound_value" | Unbound_type _ -> "Unbound_type"
+  | Unbound_constructor _ -> "Unbound_constructor" | Unbound_label _ -> "Unbound_label"
+  | Unbound_module _ -> "Unbound_module" | Unbound_class _ -> "Unbound_class"
+  | Unbound_modtype _ -> "Unbound_modtype" | Unbound_cltype _ -> "Unbound_cltype"
+  | Unbound_instance_variable _ -> "Unbound_instance_variable"
+  | Not_an_instance_variable _ -> "Not_an_instance_variable"
+  | Masked_instance_variable _ -> "Masked_instance_variable"
+  | Masked_self_variable _ -> "Masked_self_variable"
+  | Masked_ancestor_variable _ -> "Masked_ancestor_variable"
+  | Structure_used_as_functor _ -> "Structure_used_as_functor"
+  | Abstract_used_as_functor _ -> "Abstract_used_as_functor"
+  | Functor_used_as_structure _ -> "Functor_used_as_structure"
+  | Abstract_used_as_structure _ -> "Abstract_used_as_structure"
+  | Generative_used_as_applicative _ -> "Generative_used_as_applicative"
+  | Illegal_reference_to_recursive_module _ -> "Illegal_reference_to_recursive_module"
+  | Illegal_reference_to_recursive_class_type _ ->
+      "Illegal_reference_to_recursive_class_type"
+  | Cannot_scrape_alias _ -> "Cannot_scrape_alias"
+
+let rec ctyp (c : Typedtree.core_type) =
+  s "(CT "; P.loc c.ctyp_loc; s " ";
+  (match c.ctyp_desc with
+   | Ttyp_any -> s "Ttyp_any"
+   | Ttyp_var n -> s "Ttyp_var "; q n
+   | Ttyp_arrow (l, a, b) -> s "Ttyp_arrow "; arg_label l; s " "; ctyp a; s " "; ctyp b
+   | Ttyp_tuple l -> s "Ttyp_tuple "; list (fun (l, c) -> opt q l; s ":"; ctyp c) l
+   | Ttyp_constr (p, l, a) -> s "Ttyp_constr "; path p; s " "; P.lid_loc l; s " "; list ctyp a
+   | Ttyp_object (fl, c) ->
+       s "Ttyp_object ";
+       list (fun (f : Typedtree.object_field) ->
+           (match f.of_desc with
+            | OTtag (n, c) -> s "OTtag "; P.str_loc n; s " "; ctyp c
+            | OTinherit c -> s "OTinherit "; ctyp c)) fl;
+       s " "; P.flag_closed c
+   | Ttyp_class (p, l, a) -> s "Ttyp_class "; path p; s " "; P.lid_loc l; s " "; list ctyp a
+   | Ttyp_alias (c, n) -> s "Ttyp_alias "; ctyp c; s " "; q n.txt
+   | Ttyp_variant (fl, c, ls) ->
+       s "Ttyp_variant ";
+       list (fun (f : Typedtree.row_field) ->
+           (match f.rf_desc with
+            | Ttag (n, b, cl) -> s "Ttag "; q n.txt; s " "; bool b; s " "; list ctyp cl
+            | Tinherit c -> s "Tinherit "; ctyp c)) fl;
+       s " "; P.flag_closed c; s " "; opt (list q) ls
+   | Ttyp_poly (vs, c) -> s "Ttyp_poly "; list q vs; s " "; ctyp c
+   | Ttyp_package p ->
+       s "Ttyp_package "; path p.tpt_path; s " ";
+       list (fun (l, c) -> P.lid_loc l; s "="; ctyp c) p.tpt_constraints
+   | Ttyp_open (p, l, c) -> s "Ttyp_open "; path p; s " "; P.lid_loc l; s " "; ctyp c
+   | Ttyp_functor (lb, id, p, c) ->
+       s "Ttyp_functor "; arg_label lb; s " "; ident id.txt; s " "; path p.tpt_path; s " "; ctyp c);
+  s " : "; ty c.ctyp_type; s ")"
+
+let run_typexp dirs modname file =
+  parse_file := file;
+  Load_path.init ~auto_include:Load_path.no_auto_include
+    ~visible:(String.split_on_char ':' dirs) ~hidden:[];
+  let env =
+    match Env.open_pers_signature "Stdlib" Env.initial with
+    | Ok env -> env
+    | Error _ -> failwith "open Stdlib"
+  in
+  let env =
+    if modname = "-" then env
+    else match Env.open_pers_signature modname env with
+      | Ok env -> env
+      | Error _ -> env
+      | exception _ -> env
+  in
+  let sg = Pparse.parse_interface ~tool_name:"ocamlc" file in
+  List.iter (fun (it : Parsetree.signature_item) ->
+      let one name (sty : Parsetree.core_type) =
+        reset_numbering ();
+        s name; s " => ";
+        (try ctyp (Typetexp.transl_type_scheme env sty) with
+         | Typetexp.Error.In_context (l, _, e) ->
+             s "ERR "; s (texp_error_name e); s " "; P.loc l
+         | Env.Error.In_context (Lookup_error (l, _, e)) ->
+             s "ERR Env."; s (lookup_error_name e); s " "; P.loc l
+         | Env.Error.In_context _ -> s "ERR Env.other");
+        s "\n"
+      in
+      match it.psig_desc with
+      | Psig_value vd -> one vd.pval_name.txt vd.pval_type
+      | Psig_primitive pd ->
+          (match pd.pprim_kind with
+           | Pprim_decl (t, _) | Pprim_alias (Some t, _) -> one pd.pprim_name.txt t
+           | Pprim_alias (None, _) -> ())
+      | _ -> ())
+    sg
+
 (* ---- stage 3: Ctype operations ---- *)
 
 let elt_name (e : _ Errortrace.elt) =
@@ -1166,6 +1283,9 @@ let () =
       in
       run_queries queries env;
       print_string (Buffer.contents b)
+  | _ :: "typexp" :: dirs :: modname :: file :: _ ->
+      canonical := true;
+      run_typexp dirs modname file; print_string (Buffer.contents b)
   | _ :: "parse" :: file :: _ ->
       dump_parse file; print_string (Buffer.contents b)
   | _ :: "ctype" :: stdlib_dir :: queries :: _ ->

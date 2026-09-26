@@ -34,6 +34,12 @@ struct Longident {
 namespace longident {
 using t = Longident::t;
 std::string_view last(t lid);
+// Longident.same: equality ignoring locations
+bool same(t a, t b);
+// OCaml's polymorphic `compare` on Longident.t (the component locations
+// included, as `compare` sees them)
+int compare_poly(t a, t b);
+int compare_location(const Location& a, const Location& b);
 // flatten: the components of a path without applications
 std::vector<std::string_view> flatten(t lid);
 // Pprintast.longident

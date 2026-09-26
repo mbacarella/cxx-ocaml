@@ -73,8 +73,10 @@ using Attributes = std::vector<Attribute>;
 struct Longident;
 using LongidentBox = std::shared_ptr<Longident>;
 struct Lident { std::string name; };
-struct Ldot { LongidentBox prefix; std::string name; };
-struct Lapply { LongidentBox f; LongidentBox x; };
+// The inner component locations (Longident.t's `t loc` / `string loc`,
+// parser.mly `ldot` / `lapply`); zero-initialized = not recorded.
+struct Ldot { LongidentBox prefix; std::string name; Location prefix_loc{}; Location name_loc{}; };
+struct Lapply { LongidentBox f; LongidentBox x; Location f_loc{}; Location x_loc{}; };
 struct Longident { std::variant<Lident, Ldot, Lapply> v; };
 struct LongidentLoc { Longident txt; Location loc; };
 
@@ -348,6 +350,7 @@ struct PrimitiveDescription {
   Location loc;
   Attributes attrs;  // post-item attributes (`[@@noalloc]` …)
   std::optional<StringLoc> alias;  // `external f [: t] = path` -> Pprim_alias path
+  std::optional<LongidentLoc> alias_lid;  // the same path as a Longident (inner locations)
 };
 
 // --- module types / signatures ---

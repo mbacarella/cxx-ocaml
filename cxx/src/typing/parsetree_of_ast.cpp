@@ -56,13 +56,18 @@ struct Conv {
     return o ? OptStr::of(*o) : OptStr::none();
   }
 
-  // Longident: the parser keeps no inner locations yet (gap).
+  // Longident inner locations: a component location the parser did not
+  // record (zero-initialized) is a gap.
+  Location inner(const ast::Location& l) const {
+    bool unset = l.start.cnum == 0 && l.end.cnum == 0 && l.start.lnum <= 1 && !l.ghost;
+    return unset ? gap_loc() : loc(l);
+  }
   Longident::t lid(const ast::Longident& l) const {
     if (auto* i = std::get_if<ast::Lident>(&l.v)) return Longident::lident(i->name);
     if (auto* d = std::get_if<ast::Ldot>(&l.v))
-      return Longident::ldot(lid(*d->prefix), gap_loc(), d->name, gap_loc());
+      return Longident::ldot(lid(*d->prefix), inner(d->prefix_loc), d->name, inner(d->name_loc));
     auto& a = std::get<ast::Lapply>(l.v);
-    return Longident::lapply(lid(*a.f), gap_loc(), lid(*a.x), gap_loc());
+    return Longident::lapply(lid(*a.f), inner(a.f_loc), lid(*a.x), inner(a.x_loc));
   }
   LidLoc lidloc(const ast::LongidentLoc& l) const { return {lid(l.txt), loc(l.loc)}; }
 
@@ -632,17 +637,11 @@ struct Conv {
     if (p.alias) {
       k.kind = PrimitiveKind::Kind::Pprim_alias;
       k.ty = p.type ? core_type(*p.type) : nullptr;
-      // the alias path is a Longident.t loc (the ast keeps its dotted text)
-      Longident::t l = nullptr;
-      std::string_view t = p.alias->txt;
-      for (std::size_t st = 0;;) {
-        std::size_t dot = t.find('.', st);
-        std::string_view comp = t.substr(st, dot == std::string_view::npos ? dot : dot - st);
-        l = l ? Longident::ldot(l, gap_loc(), comp, gap_loc()) : Longident::lident(comp);
-        if (dot == std::string_view::npos) break;
-        st = dot + 1;
+      if (p.alias_lid) {
+        k.alias = lidloc(*p.alias_lid);
+      } else {  // `( op )`: an operator name
+        k.alias = LidLoc{Longident::lident(p.alias->txt), loc(p.alias->loc)};
       }
-      k.alias = LidLoc{l, loc(p.alias->loc)};
     } else {
       k.kind = PrimitiveKind::Kind::Pprim_decl;
       k.ty = core_type(*p.type);

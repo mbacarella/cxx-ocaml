@@ -337,7 +337,8 @@ class Parser {
       advance();
       const Token& nm = cur();
       advance();
-      lid = Longident{Ldot{std::make_shared<Longident>(std::move(lid)), nm.text}};
+      lid = Longident{Ldot{std::make_shared<Longident>(std::move(lid)), nm.text,
+                           span(position(first.start), position(last->end)), tokloc(nm)}};
       last = &nm;
       upper = nm.kind == Kind::UIDENT;
     }
@@ -364,7 +365,8 @@ class Parser {
         advance();  // (
         advance();  // ::
         const Token& c = cur(); advance();  // )
-        Longident qual{Ldot{std::make_shared<Longident>(pr.lid.txt), "::"}};
+        Longident qual{Ldot{std::make_shared<Longident>(pr.lid.txt), "::", pr.lid.loc,
+                            span(position(lp.start), position(c.end))}};
         Location cloc = span(openStart, position(c.end));
         LongidentLoc ctorid{std::move(qual), cloc};
         if (is_atom_start(cur().kind)) {  // `M.(::) arg`  -> constructor application
@@ -378,7 +380,8 @@ class Parser {
         advance();  // (
         auto op = operator_name(cur()); advance();
         const Token& c = cur(); advance();  // )
-        Longident qual{Ldot{std::make_shared<Longident>(pr.lid.txt), *op}};
+        Longident qual{Ldot{std::make_shared<Longident>(pr.lid.txt), *op, pr.lid.loc,
+                            span(position(lp.start), position(c.end))}};
         Location l = span(openStart, position(c.end));
         return E({Pexp_ident{LongidentLoc{std::move(qual), l}}, l});
       }
@@ -411,7 +414,8 @@ class Parser {
       advance();
       const Token& nm = cur();
       advance();
-      lid = Longident{Ldot{std::make_shared<Longident>(std::move(lid)), nm.text}};
+      lid = Longident{Ldot{std::make_shared<Longident>(std::move(lid)), nm.text,
+                           span(position(first.start), position(last->end)), tokloc(nm)}};
       last = &nm;
     }
     return LongidentLoc{std::move(lid), span(position(first.start), position(last->end))};
@@ -419,7 +423,8 @@ class Parser {
 
   // postfix record-field access  e.lbl (.lbl)*
   ExprBox qualified_ident(const char* mod, const char* fn, Location l) {
-    Longident lid{Ldot{std::make_shared<Longident>(Longident{Lident{mod}}), fn}};
+    Longident lid{Ldot{std::make_shared<Longident>(Longident{Lident{mod}}), fn, none_loc(),
+                       none_loc()}};  // parser.mly: mknoloc
     return E({Pexp_ident{.id = LongidentLoc{std::move(lid), l}}, l});
   }
   LongidentLoc lid_of_dotted(const std::string& s, Location l) {
@@ -429,7 +434,8 @@ class Parser {
       if (i == s.size() || s[i] == '.') { parts.push_back(s.substr(start, i - start)); start = i + 1; }
     Longident lid{Lident{parts[0]}};
     for (size_t i = 1; i < parts.size(); ++i)
-      lid = Longident{Ldot{std::make_shared<Longident>(std::move(lid)), parts[i]}};
+      lid = Longident{Ldot{std::make_shared<Longident>(std::move(lid)), parts[i], none_loc(),
+                           none_loc()}};  // parser.mly: mknoloc
     return LongidentLoc{std::move(lid), l};
   }
   // a.{i[,j[,k]]}  ->  Bigarray.ArrayN.get a i [j [k]]  (Genarray for >3 indices)
@@ -492,7 +498,8 @@ class Parser {
       Longident prefix{Lident{mods[0]}};
       for (size_t i = 1; i < mods.size(); ++i)
         prefix = Longident{Ldot{std::make_shared<Longident>(std::move(prefix)), mods[i]}};
-      lid = Longident{Ldot{std::make_shared<Longident>(std::move(prefix)), name}};
+      lid = Longident{Ldot{std::make_shared<Longident>(std::move(prefix)), name, none_loc(),
+                           none_loc()}};  // parser.mly: Ldot (mknoloc p, mknoloc name)
     }
     ExprBox fn = E({Pexp_ident{LongidentLoc{std::move(lid), gl}}, gl});
     std::vector<std::pair<ArgLabel, ExprBox>> args;
@@ -966,7 +973,7 @@ class Parser {
               (nm.back() == ')' || nm.back() == ']' || nm.back() == '}')) {
             Location gl{l.start, l.end, true};
             Longident newlid{Lident{nm + "<-"}};
-            if (dot) newlid = Longident{Ldot{dot->prefix, nm + "<-"}};
+            if (dot) newlid = Longident{Ldot{dot->prefix, nm + "<-", none_loc(), none_loc()}};
             ExprBox fn = E({Pexp_ident{LongidentLoc{std::move(newlid), gl}}, gl});
             std::vector<std::pair<ArgLabel, ExprBox>> args = std::move(ap->args);
             // a multi-index array arg's $sloc is the whole `e.op[…] <- v` rule.
@@ -982,7 +989,7 @@ class Parser {
         if (nm == "get") {
           // rebuild fn as Mod.set (ghost over the whole assignment), append rhs
           Longident newlid{Ldot{std::make_shared<Longident>(*std::get_if<Ldot>(&id->id.txt.v)->prefix),
-                                "set"}};
+                                "set", none_loc(), none_loc()}};
           Location gl{l.start, l.end, true};  // ghost ident spans `a.(i) <- v`
           ExprBox fn = E({Pexp_ident{.id = LongidentLoc{std::move(newlid), gl}}, gl});
           std::vector<std::pair<ArgLabel, ExprBox>> args = std::move(ap->args);
@@ -1429,7 +1436,8 @@ class Parser {
       advance();
       const Token& nm = cur();
       advance();
-      lid = Longident{Ldot{std::make_shared<Longident>(std::move(lid)), nm.text}};
+      lid = Longident{Ldot{std::make_shared<Longident>(std::move(lid)), nm.text,
+                           span(position(first.start), position(last->end)), tokloc(nm)}};
       last = &nm;
     }
     return LongidentLoc{std::move(lid), span(position(first.start), position(last->end))};
@@ -1448,13 +1456,15 @@ class Parser {
         LongidentLoc arg = parse_type_path();
         const Token& c = cur(); expect(Kind::RPAREN, ")");
         lid = Longident{Lapply{std::make_shared<Longident>(std::move(lid)),
-                               std::make_shared<Longident>(std::move(arg.txt))}};
+                               std::make_shared<Longident>(std::move(arg.txt)),
+                               span(start, end), arg.loc}};
         end = position(c.end);
       } else if (cur().kind == Kind::DOT &&
                  (peek(1).kind == Kind::LIDENT || peek(1).kind == Kind::UIDENT)) {
         advance();
         const Token& nm = cur(); advance();
-        lid = Longident{Ldot{std::make_shared<Longident>(std::move(lid)), nm.text}};
+        lid = Longident{Ldot{std::make_shared<Longident>(std::move(lid)), nm.text,
+                             span(start, end), tokloc(nm)}};
         end = position(nm.end);
       } else {
         break;
@@ -2124,10 +2134,13 @@ class Parser {
       LongidentLoc cl = parse_longident_path();
       if (cur().kind == Kind::DOT && peek(1).kind == Kind::LPAREN &&
           peek(2).kind == Kind::COLONCOLON && peek(3).kind == Kind::RPAREN) {  // M.(::) qualified cons
-        advance(); advance();  // . (
+        advance();  // .
+        Position lp = position(cur().start);
+        advance();  // (
         advance();  // ::
         const Token& rp = cur(); advance();  // )
-        cl = LongidentLoc{Longident{Ldot{std::make_shared<Longident>(cl.txt), "::"}},
+        cl = LongidentLoc{Longident{Ldot{std::make_shared<Longident>(cl.txt), "::", cl.loc,
+                                         span(lp, position(rp.end))}},
                           span(cl.loc.start, position(rp.end))};
         // fall through to the constructor-argument handling below
       } else if (cur().kind == Kind::DOT && peek(1).kind == Kind::LPAREN) {  // M.(P) local open
@@ -2871,7 +2884,9 @@ class Parser {
     return StringLoc{nm.text, tokloc(nm)};
   }
   // `external f [: t] = path` alias target: a value path printed as a dotted string.
+  std::optional<LongidentLoc> last_prim_alias_lid_;  // set by parse_prim_alias
   StringLoc parse_prim_alias() {
+    last_prim_alias_lid_.reset();
     if (auto op = try_paren_operator()) return std::move(*op);  // ( + )
     const Token& first = cur();
     if (first.kind != Kind::LIDENT && first.kind != Kind::UIDENT)
@@ -2879,12 +2894,17 @@ class Parser {
     advance();
     std::string s = first.text;
     const Token* last = &first;
+    Longident lid{Lident{first.text}};
     while (last->kind == Kind::UIDENT && cur().kind == Kind::DOT &&
            (peek(1).kind == Kind::LIDENT || peek(1).kind == Kind::UIDENT)) {
       advance(); const Token& nm = cur(); advance();
+      lid = Longident{Ldot{std::make_shared<Longident>(std::move(lid)), nm.text,
+                           span(position(first.start), position(last->end)), tokloc(nm)}};
       s += "." + nm.text; last = &nm;
     }
-    return StringLoc{s, span(position(first.start), position(last->end))};
+    Location l = span(position(first.start), position(last->end));
+    last_prim_alias_lid_ = LongidentLoc{std::move(lid), l};
+    return StringLoc{s, l};
   }
   ValueBinding parse_value_binding_core() {
     // val_ident form (`let f p.. = e` / `let (+) p.. = e`) vs pattern form.
@@ -3295,6 +3315,7 @@ class Parser {
       attach_docs(pattrs, l.start.cnum, l.end.cnum);
       PrimitiveDescription pd{std::move(ename), std::move(ty), std::move(prims), l,
                               std::move(pattrs), std::move(alias)};
+      if (pd.alias) pd.alias_lid = std::move(last_prim_alias_lid_);
       StructureItem item{Pstr_primitive{std::move(pd)}, l};
       if (ext_ext) {  // `external%ext …` wraps the (ghost) Pstr_primitive in a Pstr_extension
         item.loc.ghost = true;
@@ -3771,8 +3792,10 @@ class Parser {
       while (cur().kind == Kind::LBRACKETATAT) { advance(); attrs.push_back(parse_attribute_body()); }
       Location l = here();
       attach_docs(attrs, l.start.cnum, l.end.cnum);
-      return wrap_sig_ext(SignatureItem{Psig_primitive{PrimitiveDescription{
-          std::move(ename), std::move(ty), std::move(prims), l, std::move(attrs), std::move(alias)}}, l}, std::move(ext));
+      PrimitiveDescription pd{std::move(ename), std::move(ty), std::move(prims), l,
+                              std::move(attrs), std::move(alias)};
+      if (pd.alias) pd.alias_lid = std::move(last_prim_alias_lid_);
+      return wrap_sig_ext(SignatureItem{Psig_primitive{std::move(pd)}, l}, std::move(ext));
     }
     if (t.kind == Kind::TYPE) {
       advance();

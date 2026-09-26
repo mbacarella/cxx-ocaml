@@ -19,4 +19,5 @@ inline bool keep_locs = true;              // -keep-locs
 inline bool keep_docs = false;             // -keep-docs
 inline bool native_code = false;
 inline bool unboxed_types = false;
+inline bool typing_recovery = false;      // -typing-recovery
 }  // namespace cppcaml::typing::clflags

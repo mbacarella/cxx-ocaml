@@ -13,6 +13,7 @@
 #include "cppcaml/typing/ctype.hpp"
 #include "cppcaml/typing/env.hpp"
 #include "cppcaml/typing/parsetree.hpp"
+#include "cppcaml/typing/typetexp.hpp"
 #include "cppcaml/parser.hpp"
 #include <sstream>
 #include <fstream>
@@ -827,10 +828,10 @@ void lid(Longident::t l) {
   switch (l->kind) {
     case Longident::Kind::Lident: s("Lident "); q(l->s); break;
     case Longident::Kind::Ldot:
-      s("Ldot("); lid(l->l1); s(" "); gloc(l->l1_loc); s(" "); q(l->s); s(" "); gloc(l->s_loc); s(")");
+      s("Ldot("); lid(l->l1); s(" "); loc(l->l1_loc); s(" "); q(l->s); s(" "); loc(l->s_loc); s(")");
       break;
     case Longident::Kind::Lapply:
-      s("Lapply("); lid(l->l1); s(" "); gloc(l->l1_loc); s(" "); lid(l->l2); s(" "); gloc(l->l2_loc);
+      s("Lapply("); lid(l->l1); s(" "); loc(l->l1_loc); s(" "); lid(l->l2); s(" "); loc(l->l2_loc);
       s(")");
       break;
   }
@@ -1908,9 +1909,228 @@ int run_ctype(const std::string& stdlib_dir, const std::string& queries) {
   return 0;
 }
 
+// ---- stage 4b: Typetexp (the typing_dump.ml `typexp` mode) ----
+namespace txd {
+namespace tt = typedtree;
+const char* texp_error_name(typetexp::Error::Kind k) {
+  using K = typetexp::Error::Kind;
+  switch (k) {
+    case K::Unbound_type_variable: return "Unbound_type_variable";
+    case K::No_type_wildcards: return "No_type_wildcards";
+    case K::Undefined_type_constructor: return "Undefined_type_constructor";
+    case K::Type_arity_mismatch: return "Type_arity_mismatch";
+    case K::Bound_type_variable: return "Bound_type_variable";
+    case K::Recursive_type: return "Recursive_type";
+    case K::Type_mismatch: return "Type_mismatch";
+    case K::Alias_type_mismatch: return "Alias_type_mismatch";
+    case K::Present_has_conjunction: return "Present_has_conjunction";
+    case K::Present_has_no_type: return "Present_has_no_type";
+    case K::Constructor_mismatch: return "Constructor_mismatch";
+    case K::Not_a_variant: return "Not_a_variant";
+    case K::Variant_tags: return "Variant_tags";
+    case K::Invalid_variable_name: return "Invalid_variable_name";
+    case K::Cannot_quantify: return "Cannot_quantify";
+    case K::Multiple_constraints_on_type: return "Multiple_constraints_on_type";
+    case K::Method_mismatch: return "Method_mismatch";
+    case K::Opened_object: return "Opened_object";
+    case K::Not_an_object: return "Not_an_object";
+    case K::Repeated_tuple_label: return "Repeated_tuple_label";
+    case K::Polymorphic_optional_param: return "Polymorphic_optional_param";
+    case K::Functor_optional_param: return "Functor_optional_param";
+  }
+  return "?";
+}
+const char* lookup_error_name(env::LookupError::Kind k) {
+  using K = env::LookupError::Kind;
+  switch (k) {
+    case K::Unbound_value: return "Unbound_value";
+    case K::Unbound_type: return "Unbound_type";
+    case K::Unbound_constructor: return "Unbound_constructor";
+    case K::Unbound_label: return "Unbound_label";
+    case K::Unbound_module: return "Unbound_module";
+    case K::Unbound_class: return "Unbound_class";
+    case K::Unbound_modtype: return "Unbound_modtype";
+    case K::Unbound_cltype: return "Unbound_cltype";
+    case K::Unbound_instance_variable: return "Unbound_instance_variable";
+    case K::Not_an_instance_variable: return "Not_an_instance_variable";
+    case K::Masked_instance_variable: return "Masked_instance_variable";
+    case K::Masked_self_variable: return "Masked_self_variable";
+    case K::Masked_ancestor_variable: return "Masked_ancestor_variable";
+    case K::Structure_used_as_functor: return "Structure_used_as_functor";
+    case K::Abstract_used_as_functor: return "Abstract_used_as_functor";
+    case K::Functor_used_as_structure: return "Functor_used_as_structure";
+    case K::Abstract_used_as_structure: return "Abstract_used_as_structure";
+    case K::Generative_used_as_applicative: return "Generative_used_as_applicative";
+    case K::Illegal_reference_to_recursive_module: return "Illegal_reference_to_recursive_module";
+    case K::Illegal_reference_to_recursive_class_type:
+      return "Illegal_reference_to_recursive_class_type";
+    case K::Cannot_scrape_alias: return "Cannot_scrape_alias";
+  }
+  return "?";
+}
+void ctyp(const tt::CoreType* c);
+void ctyps(const Slice<const tt::CoreType*>& l) { list(l, [](const tt::CoreType* c) { ctyp(c); }); }
+void ctyp(const tt::CoreType* c) {
+  s("(CT "); pd::loc(c->ctyp_loc); s(" ");
+  const tt::CoreTypeDesc* d = c->ctyp_desc;
+  using K = tt::CoreTypeDesc::Kind;
+  using parsetree::as;
+  switch (d->kind) {
+    case K::Ttyp_any: s("Ttyp_any"); break;
+    case K::Ttyp_var: s("Ttyp_var "); q(as<tt::Ttyp_var>(d)->name); break;
+    case K::Ttyp_arrow: {
+      auto* a = as<tt::Ttyp_arrow>(d);
+      s("Ttyp_arrow "); arg_label(a->label); s(" "); ctyp(a->t1); s(" "); ctyp(a->t2);
+      break;
+    }
+    case K::Ttyp_tuple:
+      s("Ttyp_tuple ");
+      list(as<tt::Ttyp_tuple>(d)->tl, [](const tt::LabeledCoreType& x) { pd::optstr(x.label); s(":"); ctyp(x.ty); });
+      break;
+    case K::Ttyp_constr: {
+      auto* x = as<tt::Ttyp_constr>(d);
+      s("Ttyp_constr "); path_(x->path); s(" "); pd::lid_loc(x->lid); s(" "); ctyps(x->args);
+      break;
+    }
+    case K::Ttyp_object: {
+      auto* o = as<tt::Ttyp_object>(d);
+      s("Ttyp_object ");
+      list(o->fields, [](const tt::ObjectField* f) {
+        if (f->of_desc.is_tag) { s("OTtag "); pd::str_loc(f->of_desc.label); s(" "); ctyp(f->of_desc.ty); }
+        else { s("OTinherit "); ctyp(f->of_desc.ty); }
+      });
+      s(" "); pd::flag_closed(o->closed);
+      break;
+    }
+    case K::Ttyp_class: {
+      auto* x = as<tt::Ttyp_class>(d);
+      s("Ttyp_class "); path_(x->path); s(" "); pd::lid_loc(x->lid); s(" "); ctyps(x->args);
+      break;
+    }
+    case K::Ttyp_alias: {
+      auto* x = as<tt::Ttyp_alias>(d);
+      s("Ttyp_alias "); ctyp(x->ty); s(" "); q(x->name.txt);
+      break;
+    }
+    case K::Ttyp_variant: {
+      auto* v = as<tt::Ttyp_variant>(d);
+      s("Ttyp_variant ");
+      list(v->fields, [](const tt::RowField* f) {
+        if (f->rf_desc.is_tag) {
+          s("Ttag "); q(f->rf_desc.label.txt); s(" "); bool_(f->rf_desc.constant); s(" ");
+          ctyps(f->rf_desc.types);
+        } else {
+          s("Tinherit "); ctyp(f->rf_desc.inherit);
+        }
+      });
+      s(" "); pd::flag_closed(v->closed); s(" ");
+      if (!v->has_labels) s("None");
+      else { s("(Some "); list(v->labels, [](std::string_view l) { q(l); }); s(")"); }
+      break;
+    }
+    case K::Ttyp_poly: {
+      auto* p = as<tt::Ttyp_poly>(d);
+      s("Ttyp_poly "); list(p->vars, [](std::string_view v) { q(v); }); s(" "); ctyp(p->ty);
+      break;
+    }
+    case K::Ttyp_package: {
+      auto* p = as<tt::Ttyp_package>(d)->pack;
+      s("Ttyp_package "); path_(p->tpt_path); s(" ");
+      list(p->tpt_constraints, [](const std::pair<parsetree::LidLoc, const tt::CoreType*>& x) {
+        pd::lid_loc(x.first); s("="); ctyp(x.second);
+      });
+      break;
+    }
+    case K::Ttyp_open: {
+      auto* o = as<tt::Ttyp_open>(d);
+      s("Ttyp_open "); path_(o->path); s(" "); pd::lid_loc(o->lid); s(" "); ctyp(o->ty);
+      break;
+    }
+    case K::Ttyp_functor: {
+      auto* f = as<tt::Ttyp_functor>(d);
+      s("Ttyp_functor "); arg_label(f->label); s(" "); ident_(f->id); s(" "); path_(f->pack->tpt_path);
+      s(" "); ctyp(f->ty);
+      break;
+    }
+  }
+  s(" : "); ty(c->ctyp_type); s(")");
+}
+}  // namespace txd
+
+int run_typexp(const std::string& dirs, const std::string& modname, const std::string& file) {
+  canonical = true;
+  load_path::init(split_dirs(dirs), {});
+  env::t e0 = env::initial();
+  env::OpenResult r = env::open_pers_signature("Stdlib", e0);
+  if (r.kind != env::OpenResult::Kind::Ok) {
+    std::cerr << "open Stdlib failed\n";
+    return 1;
+  }
+  env::t e = r.env;
+  if (modname != "-") {
+    try {
+      env::OpenResult r2 = env::open_pers_signature(modname, e);
+      if (r2.kind == env::OpenResult::Kind::Ok) e = r2.env;
+    } catch (...) {
+    }
+  }
+  std::ifstream in(file, std::ios::binary);
+  std::stringstream ss;
+  ss << in.rdbuf();
+  std::string src = ss.str();
+  cppcaml::ast::Signature asg;
+  try {
+    asg = cppcaml::parse_signature(src);
+  } catch (const cppcaml::ParseError& ex) {
+    std::cerr << "c++typing-dump: parse error: " << ex.what() << '\n';
+    return 1;
+  }
+  pd::parse_file = zstr(file);
+  parsetree::Signature sg = parsetree::of_ast_signature(asg, file, {});
+  for (const parsetree::SignatureItem* it : sg) {
+    auto one = [&](std::string_view name, const parsetree::CoreType* sty) {
+      reset_numbering();
+      s(name); s(" => ");
+      try {
+        txd::ctyp(typetexp::transl_type_scheme(e, sty));
+      } catch (const typetexp::Error& er) {
+        s("ERR "); s(txd::texp_error_name(er.kind)); s(" "); pd::loc(er.loc);
+      } catch (const env::Error& er) {
+        if (er.kind == env::Error::Kind::Lookup_error) {
+          s("ERR Env."); s(txd::lookup_error_name(er.err.kind)); s(" "); pd::loc(er.loc);
+        } else {
+          s("ERR Env.other");
+        }
+      } catch (const std::bad_function_call&) {
+        s("UNSUPPORTED");
+      }
+      s("\n");
+    };
+    using SK = parsetree::SignatureItemDesc::Kind;
+    if (it->psig_desc->kind == SK::Psig_value) {
+      auto* vd = parsetree::as<parsetree::Psig_value>(it->psig_desc)->vd;
+      one(vd->pval_name.txt, vd->pval_type);
+    } else if (it->psig_desc->kind == SK::Psig_primitive) {
+      auto* pd2 = parsetree::as<parsetree::Psig_primitive>(it->psig_desc)->pd;
+      if (pd2->pprim_kind.ty) one(pd2->pprim_name.txt, pd2->pprim_kind.ty);
+    }
+  }
+  std::cout << b;
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc == 5 && std::string(argv[1]) == "typexp") {
+    try {
+      return run_typexp(argv[2], argv[3], argv[4]);
+    } catch (const std::exception& e) {
+      std::cerr << "c++typing-dump: " << e.what() << '\n';
+      std::cout << b;
+      return 1;
+    }
+  }
   if (argc == 3 && std::string(argv[1]) == "parse") {
     try {
       return run_parse(argv[2]);

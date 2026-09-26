@@ -155,13 +155,24 @@ from the port.  The two must be identical on every .cmi in the tree
    attach (`ocaml.doc` on a type declaration, typecore.ml / 
    includemod_errorprinter.ml).  Locations the parser does not record yet
    are built as `gap_loc()` and printed masked ("?") by both dumps:
-   Longident inner component locations, `Ptyp_alias` / `Ptyp_poly` /
+   `Ptyp_alias` / `Ptyp_poly` /
    `pcd_vars` / `Pext_decl` variable-name locations, `prf_loc`, `pof_loc`,
    `Rtag` label locations, `pvb_loc`, extension-name locations, the name
    location of floating attributes, the `ppt_loc` of packages outside a
    core type, the variances of class and type-extension parameters, and
    every `*_loc_stack` except the innermost location of `Pexp_assert` (the
    only one Typecore reads).  They only affect error positions.
+4b. **DONE:** `Typedtree` (the expression / pattern / core-type parts;
+   the module, signature and class parts come with stage 5) and
+   `Typetexp`.  `typing_typexp_parity.sh` runs `transl_type_scheme` on every
+   `val` / `external` of stdlib, the compiler and testsuite interfaces (in
+   Env.initial + open Stdlib + the unit's own cmi) and compares the typed
+   core types, types included, or the error kind and location:
+   4788/4791 identical, 0 different; the 3 left need Typemod's forward
+   references (first-class modules, `M.(t)`).  Deviation: warnings are not
+   ported (`Builtin_attributes.warning_scope` only runs its body).
+   The parser now records Longident inner locations (parser.mly `ldot` /
+   `lapply`), which Env reports lookup errors at.
 4. `Typetexp`, `Typecore` (core expressions and patterns, `Parmatch`), with
    ocamlc's error messages.  `CPPCAML_TYPECHECK` switches from the
    deprecated strict pass to the port here.
