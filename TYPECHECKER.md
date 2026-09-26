@@ -69,9 +69,9 @@ ported).  `port_check.sh` adapts
   harnesses that scored them (`lambda_parity.sh`, `instr_parity.sh`,
   `bootstrap_instr_parity.sh`, `qmark.sh`, `lambda_residue.sh`):
   **deleted** (stage 10).
-- **`cmi.cpp`'s .cmi writer** (and `c++cmi`, `modsig.hpp`): still used by
-  `-pack` (`link::pack` writes the packed .cmi with it) until Bytepackager
-  and `Typemod.package_units` are ported.
+- **`cmi.cpp`** (the legacy .cmi reader/writer, with its mmap cmi cache),
+  `c++cmi`, `modsig.hpp` / `c++modsig-test` and `link::pack`: **deleted**
+  once `-pack` was ported (Bytepackager, `Typemod.package_units`).
 
 ## What counts as progress
 
@@ -309,5 +309,10 @@ from the port.  The two must be identical on every .cmi in the tree
    merged (the reference ocamlc.opt is ocamlopt-built), a boxed-integer
    literal's box shared.  The driver also gained `-open`, `-pp` and
    ocamlc's output prefix (`-o stdlib__Arg.cmo` names the unit).
-   Left: the `-g` debug events (live type ids, summary sharing), `-pack`
-   (Bytepackager), and deleting `cmi.cpp` after it.
+   `-pack` is ported too (Bytepackager, `Typemod.package_units`,
+   `-for-pack`): `pack_parity.sh`'s 12 scenarios, members compiled by
+   c++ocamlc or by ocamlc.opt, give byte-identical packed .cmo and .cmi
+   and identical program output (24/24); a .cmi's filenames are one value
+   per string object, as the members' signatures come from several .cmi.
+   Left: the `-g` debug events (live type ids, summary sharing, the
+   `"??"` defname), which the `-g` packs wait on too.

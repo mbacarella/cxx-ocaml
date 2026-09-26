@@ -5,7 +5,6 @@
 // and concatenate its code, append STOP, and write the CODE/PRIM/DATA sections
 // plus the TOC trailer the runtime reads.
 #include "cppcaml/link.hpp"
-#include "cppcaml/cmi.hpp"
 #include "cppcaml/builtin_prims.hpp"
 
 #include <algorithm>
@@ -547,126 +546,6 @@ void archive(const std::vector<std::string>& cmos, const std::string& out_path) 
   std::ofstream f(out_path, std::ios::binary);
   if (!f) throw std::runtime_error("cannot write " + out_path);
   f.write(reinterpret_cast<const char*>(out.data()), (std::streamsize)out.size());
-}
-
-// ---- `ocamlc -pack`: consolidate .cmo members into one packed unit ---------
-// Concatenate each member's code, renaming its global M -> Pack.M (and sibling
-// references likewise), then append the structure block that builds the Pack
-// record `{M0; ..; Mn-1}` from those globals and SETGLOBALs Pack.  Members must
-// appear in dependency order (a sibling reference may only be backward).
-void pack(const std::vector<std::string>& cmos, const std::string& pack_name,
-          const std::string& out_path) {
-  // opcodes (runtime/caml/opcodes.h order): see cmo.cpp's enum.
-  enum { PUSH = 9, GETGLOBAL = 53, SETGLOBAL = 57, ATOM0 = 58, MAKEBLOCK = 62 };
-  std::vector<std::uint8_t> code;
-  std::vector<ValPtr> reloc_entries;  // (reloc_info * int) list elements
-  std::vector<ValPtr> primitives;
-  std::set<std::string> members, processed;
-  // Every member in pack order, paired with whether it carries code.  An
-  // interface-only (.cmi) member (PM_intf, like ocamlbuild's signatures.cmi)
-  // contributes no code, but STILL occupies a slot in the pack record: the
-  // packed .cmi lists it as a module, so a consumer counts it when computing a
-  // sibling's field offset.  Its slot holds an empty block.
-  std::vector<std::pair<bool, std::string>> all_members;  // (has_code, name)
-  auto is_intf = [](const std::string& p) {
-    return p.size() >= 4 && p.compare(p.size() - 4, 4, ".cmi") == 0;
-  };
-  for (const std::string& path : cmos) {
-    if (is_intf(path)) { all_members.push_back({false, std::string()}); continue; }
-    InputFile in = read_objects(path);
-    if (in.archive || in.units.size() != 1)
-      throw std::runtime_error(path + ": -pack expects a single .cmo");
-    members.insert(in.units[0].name);
-    all_members.push_back({true, in.units[0].name});
-  }
-  auto reloc_info = [&](const Reloc& r) -> ValPtr {
-    switch (r.k) {
-      case Reloc::Literal:     return omarshal::vblock(0, {r.lit});
-      case Reloc::GetCompunit: return omarshal::vblock(1, {omarshal::vstr(r.name)});
-      case Reloc::GetPredef:   return omarshal::vblock(2, {omarshal::vstr(r.name)});
-      case Reloc::SetCompunit: return omarshal::vblock(3, {omarshal::vstr(r.name)});
-      case Reloc::Primitive:   return omarshal::vblock(4, {omarshal::vstr(r.name)});
-    }
-    return omarshal::vint(0);
-  };
-  auto add_reloc = [&](Reloc r, int pos) {
-    reloc_entries.push_back(omarshal::vblock(0, {reloc_info(r), omarshal::vint(pos)}));
-  };
-  // Members: copy code, rebase + rename relocations.
-  for (const std::string& path : cmos) {
-    if (is_intf(path)) continue;  // PM_intf: no code
-    Unit u = read_objects(path).units[0];
-    int base = (int)code.size();
-    code.insert(code.end(), u.code.begin(), u.code.end());
-    for (Reloc r : u.relocs) {
-      if (r.k == Reloc::SetCompunit && members.count(r.name)) r.name = pack_name + "." + r.name;
-      else if (r.k == Reloc::GetCompunit && members.count(r.name)) {
-        if (!processed.count(r.name))
-          throw std::runtime_error(path + ": forward reference to pack member " + r.name);
-        r.name = pack_name + "." + r.name;
-      } else if (r.k == Reloc::Primitive)
-        primitives.push_back(omarshal::vstr(r.name));
-      add_reloc(r, base + r.pos);
-    }
-    processed.insert(u.name);
-  }
-  // Structure block: `setglobal Pack (makeblock N [getglobal Pack.M0; ..])`.
-  auto word = [&](int op) {
-    code.push_back((std::uint8_t)op); code.push_back(0); code.push_back(0); code.push_back(0);
-  };
-  auto operand0 = [&] { for (int k = 0; k < 4; ++k) code.push_back(0); };  // reloc placeholder
-  int N = (int)all_members.size();
-  for (int i = N - 1; i >= 0; --i) {                 // push args N-1..1, acc = arg 0
-    if (all_members[i].first) {                      // impl member: getglobal Pack.M
-      word(GETGLOBAL);
-      add_reloc(Reloc{Reloc::GetCompunit, pack_name + "." + all_members[i].second,
-                      nullptr, (int)code.size()}, (int)code.size());
-      operand0();
-    } else {                                         // interface-only: empty block
-      word(ATOM0);
-    }
-    if (i != 0) word(PUSH);
-  }
-  if (N == 0) word(ATOM0);
-  else { word(MAKEBLOCK);
-         auto put_int = [&](int n) { code.push_back(n & 0xFF); code.push_back((n >> 8) & 0xFF);
-                                     code.push_back((n >> 16) & 0xFF); code.push_back((n >> 24) & 0xFF); };
-         put_int(N); put_int(0); }
-  word(SETGLOBAL);
-  add_reloc(Reloc{Reloc::SetCompunit, pack_name, nullptr, (int)code.size()}, (int)code.size());
-  operand0();
-
-  // Write the packed .cmo (mirror cmo.cpp's compilation_unit layout).
-  const int pos_code = 16;  // magic(12) + 4-byte descriptor offset
-  ValPtr compunit = omarshal::vblock(0, {
-      omarshal::vstr(pack_name), omarshal::vint(pos_code), omarshal::vint((long long)code.size()),
-      omarshal::vlist(reloc_entries), omarshal::vint(0), omarshal::vint(0),
-      omarshal::vlist(primitives), omarshal::vint(0), omarshal::vint(0), omarshal::vint(0),
-      omarshal::vint(0), omarshal::vint(0)});
-  std::vector<std::uint8_t> cu_bytes = omarshal::marshal(compunit);
-  std::vector<std::uint8_t> out;
-  const char* magic = "Caml1999O038";
-  out.insert(out.end(), magic, magic + 12);
-  put_be32(out, (std::uint32_t)(pos_code + code.size()));
-  out.insert(out.end(), code.begin(), code.end());
-  out.insert(out.end(), cu_bytes.begin(), cu_bytes.end());
-  std::ofstream f(out_path, std::ios::binary);
-  if (!f) throw std::runtime_error("cannot write " + out_path);
-  f.write(reinterpret_cast<const char*>(out.data()), (std::streamsize)out.size());
-
-  // Emit the packed .cmi: each member's own .cmi signature wrapped one level
-  // deeper as `module <Member> : sig ... end`, so dependents can compile
-  // against `Pack.Member.x`.  A member compiled without a .cmi is skipped.
-  std::vector<std::string> member_cmis;
-  for (const auto& c : cmos) {
-    std::string mc = c.substr(0, c.find_last_of('.')) + ".cmi";
-    std::ifstream probe(mc, std::ios::binary);
-    if (probe) member_cmis.push_back(mc);
-  }
-  if (member_cmis.size() == cmos.size()) {
-    std::string cmi_out = out_path.substr(0, out_path.find_last_of('.')) + ".cmi";
-    cppcaml::cmi::cmiw::write_packed_cmi(cmi_out, pack_name, member_cmis);
-  }
 }
 
 }  // namespace cppcaml::link

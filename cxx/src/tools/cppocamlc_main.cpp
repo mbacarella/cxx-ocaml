@@ -31,7 +31,6 @@
 #include <string>
 #include <vector>
 
-#include "cppcaml/cmi.hpp"
 #include "cppcaml/dbgenv.hpp"
 #include "cppcaml/link.hpp"
 #include "cppcaml/parser.hpp"
@@ -623,7 +622,6 @@ static int run_main(int argc, char** argv) {
   g_nostdlib = nostdlib;
   cppcaml::typing::clflags::nopervasives = nopervasives;
   cppcaml::typing::clflags::no_std_include = nostdlib;
-  cppcaml::cmi::cmiw::set_module_dirs(stdlib_dir, incdirs);
 
   if (runtime.empty()) {
     fs::path r = fs::absolute(fs::path(stdlib_dir)).parent_path() / "runtime" / "ocamlrun";

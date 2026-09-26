@@ -11,8 +11,8 @@ exactly, by faithfully porting the compiler (`cxx/src/typing/` holds the
 ports of `typing/`, `lambda/` and `bytecomp/`'s Bytegen/Emitcode, each
 verified against ocamlc oracles).  c++ocamlc type-checks every unit, writes
 the port's .cmi and generates code from the port's typed tree; the old
-approximating typers and translator are deleted.  `cxx/src/cmi.cpp`'s
-legacy .cmi writer only serves `-pack` until Bytepackager is ported.
+approximating typers and translator and the legacy .cmi code
+(`cxx/src/cmi.cpp`) are deleted; `-pack` is Bytepackager's port.
 
 ## AI contribution policy
 

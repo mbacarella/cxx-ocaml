@@ -12,12 +12,6 @@ endif()
 
 add_compile_options(-Wall -Wextra -Wpedantic -Wno-unused-parameter)
 
-# A GNU build-id note in every binary.  The mmap cmi cache stamps its blobs
-# with the producing compiler's build-id: any rebuild (struct layout, decoder
-# logic, libstdc++ headers) yields a new id and silently invalidates every
-# blob, so a stale cache can never survive a compiler change.
-add_link_options(-Wl,--build-id=sha1)
-
 # Core compiler library (grows one pipeline stage at a time).
 add_library(cppcaml_core
   src/token.cpp
@@ -26,7 +20,6 @@ add_library(cppcaml_core
   src/ast_print.cpp
   src/marshal.cpp
   src/blake2.cpp
-  src/cmi.cpp
   src/omarshal.cpp
   src/link.cpp
   # The typing/ port (TYPECHECKER.md).
@@ -144,16 +137,6 @@ target_link_libraries(c++lex PRIVATE cppcaml_core)
 
 add_executable(c++parse src/tools/cppparse_main.cpp)
 target_link_libraries(c++parse PRIVATE cppcaml_core)
-
-add_executable(c++cmi src/tools/cppcmi_main.cpp)
-target_link_libraries(c++cmi PRIVATE cppcaml_core)
-
-
-
-# Header-only: modsig.hpp needs no library, so no static-lib link (avoids the
-# llvm-ar gotcha).  Just the include dir.
-add_executable(c++modsig-test src/tools/cppmodsig_test.cpp)
-target_include_directories(c++modsig-test PRIVATE include)
 
 add_executable(c++link src/tools/cpplink_main.cpp)
 target_link_libraries(c++link PRIVATE cppcaml_core)
