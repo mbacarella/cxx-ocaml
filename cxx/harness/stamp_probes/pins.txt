@@ -4416,6 +4416,9 @@ xpka_e12 -130
 xpka_e13 0
 xpka_e14 0
 xpka_e15 0
+xpke_1 0
+xpke_2 0
+xpke_3 0
 xpki_a5 0
 xpki_a6 0
 xpki_a7 0

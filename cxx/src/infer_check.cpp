@@ -1184,6 +1184,24 @@ struct Checker {
                 scheme = eng.arrow(from_coretype(**it2, vars), scheme);
             cenv.back()[ec.name.txt] = scheme;
           }
+    // ... and its exceptions (`exception Ex [of u]`): a pattern `M.Ex` was
+    // a fresh variable, so `f ((module M) : (module E)) (M.Ex | _)` saved
+    // its second parameter as `'a` (S632).  NOPKGEXN / NOSHARE632 revert.
+    static const bool no_pkgexn = cppcaml::dbg_env("NOPKGEXN") != nullptr ||
+                                  cppcaml::dbg_env("NOSHARE632") != nullptr;
+    if (!no_pkgexn)
+      for (auto& it : items)
+        if (auto* ex = std::get_if<Psig_exception>(&it.desc))
+          if (auto* d = std::get_if<Pext_decl>(&ex->exn.ctor.kind)) {
+            std::unordered_map<std::string, TypePtr> vars;
+            TypePtr scheme = eng.constr("exn", {});
+            if (auto* tup = std::get_if<Pcstr_tuple>(&d->args))
+              for (auto it2 = tup->elems.rbegin(); it2 != tup->elems.rend(); ++it2)
+                scheme = eng.arrow(from_coretype(**it2, vars), scheme);
+            else if (std::holds_alternative<Pcstr_record>(d->args))
+              scheme = eng.arrow(generic_var(), scheme);
+            cenv.back()[ex->exn.ctor.name.txt] = scheme;
+          }
   }
   // Value schemes of modtype S's signature, with S's own type names qualified
   // as `M.<name>` (the unpack param's view of its abstract types).
