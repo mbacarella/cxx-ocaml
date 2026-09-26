@@ -218,7 +218,6 @@ Error::Error(Kind k, std::string a_, std::string b_, std::string c_)
       }()),
       kind(k), a(std::move(a_)), b(std::move(b_)), c(std::move(c_)) {}
 
-bool recursive_types = false;
 
 std::function<std::optional<PersistentSignature>(bool, const std::string&)> load =
     [](bool allow_hidden, const std::string& unit_name) -> std::optional<PersistentSignature> {

@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "cppcaml/typing/clflags.hpp"
 #include "cppcaml/typing/cmi_format.hpp"
 #include "cppcaml/typing/lazy_backtrack.hpp"
 
@@ -94,8 +95,6 @@ struct PersStruct {
   load_path::Visibility ps_visibility;
 };
 
-// -rectypes (Clflags.recursive_types)
-extern bool recursive_types;
 
 template <class PM>
 class PersistentEnv {
@@ -248,7 +247,7 @@ class PersistentEnv {
     if (ps.ps_name != modname)
       throw Error(Error::Kind::Illegal_renaming, modname, ps.ps_name, pers_sig.filename);
     for (auto& f : ps.ps_flags) {
-      if (f.kind == cmi_format::PersFlag::Kind::Rectypes && !recursive_types)
+      if (f.kind == cmi_format::PersFlag::Kind::Rectypes && !clflags::recursive_types)
         throw Error(Error::Kind::Need_recursive_types, ps.ps_name);
       if (f.kind == cmi_format::PersFlag::Kind::Opaque) register_import_as_opaque(modname);
     }

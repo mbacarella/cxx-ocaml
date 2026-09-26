@@ -112,7 +112,7 @@ variable naming and set orders, drift from ocamlc.
 into `typing::Types`, value by value: that is `input_value`.  It doesn't go
 through the deprecated `cmi.hpp` model.
 
-**Stage 1 oracle.**  `cxx/harness/typing_cmidump.ml` (compiler-libs) prints a
+**Stage 1 oracle.**  `cxx/harness/typing_dump.ml` (compiler-libs) prints a
 structural dump of a cmi's `Types` graph: every constructor, every field,
 sharing as first-visit numbering.  The C++ `c++typing-dump` prints the same
 from the port.  The two must be identical on every .cmi in the tree
@@ -131,8 +131,21 @@ from the port.  The two must be identical on every .cmi in the tree
    (Includemod) is not installed yet, so `Map.Make(Map.Make(String)).t`
    resolves where ocamlc reports it unbound; trunk's `Longident` inner
    locations come from the enclosing location (parser gap).
-3. `Ctype`: levels, `newvar`, `instance`/`copy`, `generalize`, `expand_head`
-   and abbreviation memos, `unify`, `moregen`, `eqtype`, `filter_arrow`, ...
+3. **DONE (except the deviations below):** `Ctype` (all of ctype.ml:
+   levels and pools, `instance`/`copy`, generalization, `expand_head` and
+   abbreviation memos, `unify` incl. GADT pattern mode, `filter_arrow` /
+   `filter_method`, class signatures, `moregen`, `eqtype` / `equal`,
+   `matches`, class type matching, `subtype` / `enlarge_type`, `nondep_*`,
+   `normalize_type`, `arrow_spine`, `immediacy`), with `Errortrace` and a
+   `Clflags` subset.  Split by area into `ctype*.cpp`.
+   `typing_ctype_parity.sh`: 154607/154607 operations (instance,
+   generalize, expand/full_expand, unify, moregeneral, equal, filter_arrow,
+   subtype, matches, arrow_labels, nongen_vars, enlarge_type) on every
+   value and type of stdlib and the compiler's cmis are dump-identical,
+   error traces included.  Deviations still open: the Typemod / Includemod
+   hooks `modtype_of_package` and `package_subtype` are not installed (so
+   first-class-module types with different package paths can't be compared
+   yet; ocamlc's are `assert false` until Typemod loads too); no `Printtyp`.
 4. `Typetexp`, `Typecore` (core expressions and patterns, `Parmatch`), with
    ocamlc's error messages.  `CPPCAML_TYPECHECK` switches from the
    deprecated strict pass to the port here.

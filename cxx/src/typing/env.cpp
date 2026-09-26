@@ -380,8 +380,7 @@ static std::pair<Path::t, const ModuleEntry*> find_name_module(
   }
 }
 
-// Clflags.no_alias_deps (off by default)
-static constexpr bool no_alias_deps = false;
+static const bool& no_alias_deps = clflags::no_alias_deps;
 
 t add_persistent_structure(Ident::t id, t env) {
   if (!ident::persistent(id)) throw std::invalid_argument("Env.add_persistent_structure");

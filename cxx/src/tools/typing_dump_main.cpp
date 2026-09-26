@@ -1,6 +1,6 @@
-// c++typing-dump: the C++ half of the stage-1 oracle for the typing/ port
+// c++typing-dump: the C++ half of the oracles for the typing/ port
 // (TYPECHECKER.md).  Decodes a .cmi with typing::cmi_format::read_cmi and
-// prints the same structural dump as cxx/harness/typing_cmidump.ml, statement
+// prints the same structural dump as cxx/harness/typing_dump.ml, statement
 // for statement, so first-visit numbering follows the same traversal order.
 #include <cmath>
 #include <cstdio>
@@ -10,6 +10,7 @@
 #include <unordered_map>
 
 #include "cppcaml/typing/cmi_format.hpp"
+#include "cppcaml/typing/ctype.hpp"
 #include "cppcaml/typing/env.hpp"
 #include <fstream>
 #include <functional>
@@ -748,9 +749,194 @@ int run_env(const std::string& stdlib_dir, const std::string& queries) {
   return 0;
 }
 
+// ---- stage 3: Ctype operations (the typing_dump.ml `ctype` mode) ----
+namespace et = errortrace;
+
+const char* elt_name(et::Elt<et::ExpandedType>::Kind k) {
+  using K = et::Elt<et::ExpandedType>::Kind;
+  switch (k) {
+    case K::Diff: return "Diff";
+    case K::Variant: return "Variant";
+    case K::Obj: return "Obj";
+    case K::Escape: return "Escape";
+    case K::Function_label_mismatch: return "Function_label_mismatch";
+    case K::Tuple_label_mismatch: return "Tuple_label_mismatch";
+    case K::Incompatible_fields: return "Incompatible_fields";
+    case K::First_class_module: return "First_class_module";
+    case K::Univar: return "Univar";
+    case K::Rec_occur: return "Rec_occur";
+  }
+  return "?";
+}
+
+void expanded(const et::ExpandedType& e) { s("<"); ty(e.ty); s(" "); ty(e.expanded); s(">"); }
+
+void err_trace(const et::ErrorTrace& tr) {
+  list(tr, [](const et::Elt<et::ExpandedType>& e) {
+    using K = et::Elt<et::ExpandedType>::Kind;
+    s(elt_name(e.kind));
+    if (e.kind == K::Diff) {
+      s("("); expanded(e.diff.got); s(" "); expanded(e.diff.expected); s(")");
+    } else if (e.kind == K::Incompatible_fields) {
+      s("("); q(e.field_name); s(" "); ty(e.field_diff.got); s(" "); ty(e.field_diff.expected);
+      s(")");
+    }
+  });
+}
+
+std::vector<std::string> split_dirs(const std::string& d) {
+  std::vector<std::string> dirs;
+  for (std::size_t st = 0;;) {
+    std::size_t c = d.find(':', st);
+    dirs.push_back(d.substr(st, c == std::string::npos ? std::string::npos : c - st));
+    if (c == std::string::npos) break;
+    st = c + 1;
+  }
+  return dirs;
+}
+
+int run_ctype(const std::string& stdlib_dir, const std::string& queries) {
+  canonical = true;
+  load_path::init(split_dirs(stdlib_dir), {});
+  env::t e0 = env::initial();
+  env::OpenResult r = env::open_pers_signature("Stdlib", e0);
+  if (r.kind != env::OpenResult::Kind::Ok) {
+    std::cerr << "open Stdlib failed\n";
+    return 1;
+  }
+  env::t e = r.env;
+  auto value = [&](const std::string& name) {
+    return env::find_value_by_name(lid_of_string(name), e).second->val_type;
+  };
+  std::ifstream in(queries);
+  std::string line;
+  while (std::getline(in, line)) {
+    std::vector<std::string> w;  // the words of the line
+    for (std::size_t st = 0;;) {
+      std::size_t c = line.find(' ', st);
+      w.push_back(line.substr(st, c == std::string::npos ? std::string::npos : c - st));
+      if (c == std::string::npos) break;
+      st = c + 1;
+    }
+    if (line.empty()) continue;
+    const std::string& op = w[0];
+    std::size_t n = w.size() - 1;
+    reset_numbering();
+    s(line); s(" => ");
+    try {
+      if (op == "inst" && n == 1) {
+        ty(ctype::instance(value(w[1])));
+      } else if (op == "gen" && n == 1) {
+        TypeExpr* vt = value(w[1]);
+        ty(ctype::with_local_level_generalize([&] { return ctype::instance(vt); }));
+      } else if (op == "expand" && n == 1) {
+        auto [p, td] = env::find_type_by_name(lid_of_string(w[1]), e);
+        std::vector<TypeExpr*> args;
+        for (std::size_t k = 0; k < td->type_params.size(); ++k) args.push_back(ctype::newvar());
+        TypeExpr* t = ctype::newconstr(p, slice(args));
+        TypeExpr* ex = ctype::expand_head(e, t);
+        ty(ex); s(" | "); ty(ctype::full_expand(false, e, t));
+      } else if (op == "unify" && n == 2) {
+        TypeExpr* t1 = ctype::instance(value(w[1]));
+        TypeExpr* t2 = ctype::instance(value(w[2]));
+        try {
+          ctype::unify(e, t1, t2);
+          s("OK "); ty(t1);
+        } catch (const ctype::Unify& u) {
+          s("ERR "); err_trace(u.err.trace);
+        }
+      } else if (op == "moregen" && n == 2) {
+        try {
+          ctype::moregeneral(e, value(w[1]), value(w[2]));
+          s("OK");
+        } catch (const ctype::Moregen& m) {
+          s("ERR "); err_trace(m.err.trace);
+        }
+      } else if (op == "equal" && n == 2) {
+        try {
+          TypeExpr* a = value(w[1]);
+          TypeExpr* bb = value(w[2]);
+          ctype::equal(e, true, slice({a}), slice({bb}));
+          s("OK");
+        } catch (const ctype::Equality& q2) {
+          s("ERR "); err_trace(q2.err.trace); s(" ");
+          list(q2.err.subst, [](const std::pair<TypeExpr*, TypeExpr*>& pr) {
+            ty(pr.first); s("="); ty(pr.second);
+          });
+        }
+      } else if (op == "arrow" && n == 1) {
+        auto res = ctype::filter_arrow(e, false, ctype::instance(value(w[1])), ArgLabel::nolabel(),
+                                       false);
+        if (res.ok) {
+          s("OK "); ty(res.value.ty_param); s(" "); ty(res.value.ty_ret);
+        } else {
+          using FK = ctype::FilterArrowFailure::Kind;
+          switch (res.error.kind) {
+            case FK::Unification_error: s("ERR "); err_trace(res.error.err.trace); break;
+            case FK::Label_mismatch:
+              s("Label_mismatch "); arg_label(res.error.got); s(" ");
+              arg_label(res.error.expected); s(" "); ty(res.error.expected_type);
+              break;
+            case FK::Not_a_function: s("Not_a_function"); break;
+          }
+        }
+      } else if (op == "subtype" && n == 2) {
+        TypeExpr* t1 = ctype::instance(value(w[1]));
+        TypeExpr* t2 = ctype::instance(value(w[2]));
+        try {
+          ctype::subtype(e, t1, t2)();
+          s("OK "); ty(t1); s(" "); ty(t2);
+        } catch (const ctype::Subtype& st) {
+          s("ERR ");
+          list(st.err.trace, [](const et::Diff<et::ExpandedType>& d) {
+            expanded(d.got); s(" "); expanded(d.expected);
+          });
+          s(" "); err_trace(st.err.unification_trace);
+        }
+      } else if (op == "match" && n == 2) {
+        TypeExpr* t1 = ctype::instance(value(w[1]));
+        TypeExpr* t2 = ctype::instance(value(w[2]));
+        try {
+          ctype::matches(true, e, t1, t2);
+          s("OK");
+        } catch (const ctype::MatchesFailure& m) {
+          s("ERR "); err_trace(m.err.trace);
+        }
+      } else if (op == "labels" && n == 1) {
+        auto [labels, is_ret_tvar] = ctype::arrow_labels(e, value(w[1]));
+        list(labels, [](const ArgLabel& l) { arg_label(l); });
+        s(" "); bool_(is_ret_tvar);
+      } else if (op == "nongen" && n == 1) {
+        auto r2 = ctype::nongen_vars_in_schema(e, ctype::instance(value(w[1])));
+        if (!r2) s("None");
+        else { s("Some "); list(r2->elements(), [](TypeExpr* t) { ty(t); }); }
+      } else if (op == "enlarge" && n == 1) {
+        auto [t, warn] = ctype::enlarge_type(e, ctype::instance(value(w[1])));
+        ty(t); s(" "); bool_(warn);
+      } else {
+        s("BADOP");
+      }
+    } catch (const env::NotFound&) {
+      s("NOTFOUND");
+    }
+    s("\n");
+  }
+  std::cout << b;
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc == 4 && std::string(argv[1]) == "ctype") {
+    try {
+      return run_ctype(argv[2], argv[3]);
+    } catch (const std::exception& e) {
+      std::cerr << "c++typing-dump: " << e.what() << '\n';
+      std::cout << b;
+      return 1;
+    }
+  }
   if (argc == 4 && std::string(argv[1]) == "env") {
     try {
       return run_env(argv[2], argv[3]);

@@ -4,6 +4,10 @@
    be byte-identical.
 
    Modes:
+     typing_dump ctype STDLIB OPS  run Ctype operations (instance, expand,
+                                 unify, moregen, equal, filter_arrow,
+                                 subtype, matches, ...) on the types of
+                                 named values/types (stage 3)
      typing_dump FILE.cmi        a .cmi's raw Types graph (stage 1)
      typing_dump gen CMI...      Env queries naming every item of the cmis
      typing_dump env QUERIES     run the queries through Env.find_*_by_name
@@ -607,6 +611,112 @@ let run_queries file env =
    with End_of_file -> ());
   close_in ic
 
+(* ---- stage 3: Ctype operations ---- *)
+
+let elt_name (e : _ Errortrace.elt) =
+  match e with
+  | Diff _ -> "Diff" | Variant _ -> "Variant" | Obj _ -> "Obj"
+  | Escape _ -> "Escape" | Function_label_mismatch _ -> "Function_label_mismatch"
+  | Tuple_label_mismatch _ -> "Tuple_label_mismatch"
+  | Incompatible_fields _ -> "Incompatible_fields"
+  | First_class_module _ -> "First_class_module" | Univar _ -> "Univar"
+  | Rec_occur _ -> "Rec_occur"
+
+let expanded (e : Errortrace.expanded_type) = s "<"; ty e.ty; s " "; ty e.expanded; s ">"
+
+let err_trace (tr : (Errortrace.expanded_type, _) Errortrace.elt list) =
+  list (fun (e : (Errortrace.expanded_type, _) Errortrace.elt) ->
+      s (elt_name e);
+      match e with
+      | Diff { got; expected } -> s "("; expanded got; s " "; expanded expected; s ")"
+      | Incompatible_fields { name; diff = { got; expected } } ->
+          s "("; q name; s " "; ty got; s " "; ty expected; s ")"
+      | _ -> ()) tr
+
+let run_ctype file env =
+  let value name =
+    let _, vd = Env.find_value_by_name (lid_of_string name) env in
+    vd.val_type
+  in
+  let ic = open_in file in
+  (try
+     while true do
+       let line = input_line ic in
+       match String.split_on_char ' ' line with
+       | op :: args ->
+           reset_numbering ();
+           s line; s " => ";
+           (try
+              match op, args with
+              | "inst", [v] -> ty (Ctype.instance (value v))
+              | "gen", [v] ->
+                  let vt = value v in
+                  ty (Ctype.with_local_level_generalize (fun () -> Ctype.instance vt))
+              | "expand", [t] ->
+                  let p, td = Env.find_type_by_name (lid_of_string t) env in
+                  let t = Ctype.newconstr p (List.map (fun _ -> Ctype.newvar ()) td.type_params) in
+                  let e = Ctype.expand_head env t in
+                  ty e; s " | "; ty (Ctype.full_expand ~may_forget_scope:false env t)
+              | "unify", [v1; v2] ->
+                  let t1 = Ctype.instance (value v1) in
+                  let t2 = Ctype.instance (value v2) in
+                  (match Ctype.unify env t1 t2 with
+                   | () -> s "OK "; ty t1
+                   | exception Ctype.Unify { trace } -> s "ERR "; err_trace trace)
+              | "moregen", [v1; v2] ->
+                  (match Ctype.moregeneral env (value v1) (value v2) with
+                   | () -> s "OK"
+                   | exception Ctype.Moregen { trace } -> s "ERR "; err_trace trace)
+              | "equal", [v1; v2] ->
+                  (match Ctype.equal env true [value v1] [value v2] with
+                   | () -> s "OK"
+                   | exception Ctype.Equality { trace; subst } ->
+                       s "ERR "; err_trace trace; s " ";
+                       list (fun (a, b) -> ty a; s "="; ty b) subst)
+              | "arrow", [v] ->
+                  (match Ctype.filter_arrow env ~in_apply:false (Ctype.instance (value v))
+                           Nolabel ~param_hole:false with
+                   | Ok { ty_param; ty_ret } -> s "OK "; ty ty_param; s " "; ty ty_ret
+                   | Error (Unification_error { trace }) -> s "ERR "; err_trace trace
+                   | Error (Label_mismatch { got; expected; expected_type }) ->
+                       s "Label_mismatch "; arg_label got; s " "; arg_label expected; s " ";
+                       ty expected_type
+                   | Error Not_a_function -> s "Not_a_function")
+              | "subtype", [v1; v2] ->
+                  let t1 = Ctype.instance (value v1) in
+                  let t2 = Ctype.instance (value v2) in
+                  (match (Ctype.subtype env t1 t2) () with
+                   | () -> s "OK "; ty t1; s " "; ty t2
+                   | exception Ctype.Subtype { trace; unification_trace } ->
+                       s "ERR ";
+                       list (fun (Errortrace.Subtype.Diff { got; expected }) ->
+                           expanded got; s " "; expanded expected) trace;
+                       s " "; err_trace unification_trace)
+              | "match", [v1; v2] ->
+                  let t1 = Ctype.instance (value v1) in
+                  let t2 = Ctype.instance (value v2) in
+                  (match Ctype.matches ~expand_error_trace:true env t1 t2 with
+                   | () -> s "OK"
+                   | exception Ctype.Matches_failure (_, { trace }) ->
+                       s "ERR "; err_trace trace)
+              | "labels", [v] ->
+                  let labels, ~is_ret_tvar = Ctype.arrow_labels env (value v) in
+                  list arg_label labels; s " "; bool is_ret_tvar
+              | "nongen", [v] ->
+                  (match Ctype.nongen_vars_in_schema env (Ctype.instance (value v)) with
+                   | None -> s "None"
+                   | Some set -> s "Some "; list ty (Btype.TypeSet.elements set))
+              | "enlarge", [v] ->
+                  let t, warn = Ctype.enlarge_type env (Ctype.instance (value v)) in
+                  ty t; s " "; bool warn
+              | _ -> s "BADOP"
+            with Not_found -> s "NOTFOUND");
+           s "\n"
+       | [] -> ()
+     done
+   with End_of_file -> ());
+  close_in ic
+
 let () =
   match Array.to_list Sys.argv with
   | _ :: "gen" :: files -> gen files
@@ -620,6 +730,17 @@ let () =
         | Error _ -> failwith "open Stdlib"
       in
       run_queries queries env;
+      print_string (Buffer.contents b)
+  | _ :: "ctype" :: stdlib_dir :: queries :: _ ->
+      canonical := true;
+      Load_path.init ~auto_include:Load_path.no_auto_include
+        ~visible:(String.split_on_char ':' stdlib_dir) ~hidden:[];
+      let env =
+        match Env.open_pers_signature "Stdlib" Env.initial with
+        | Ok env -> env
+        | Error _ -> failwith "open Stdlib"
+      in
+      run_ctype queries env;
       print_string (Buffer.contents b)
   | _ :: file :: _ -> dump_cmi file; print_string (Buffer.contents b)
   | _ -> prerr_endline "usage: typing_dump FILE.cmi | gen CMI... | env STDLIB QUERIES"

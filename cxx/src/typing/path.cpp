@@ -175,6 +175,25 @@ t subst(const std::vector<std::pair<Ident::t, t>>& id_map, t p) {
   return changed ? r : p;
 }
 
+ident::Unscoped* check_for_unbound_unscoped_idents(const UnscopedSet& idl, t p) {
+  switch (p->kind) {
+    case K::Pident: {
+      ident::Unscoped* us = ident::find_unscoped(p->id);
+      if (!us) return nullptr;
+      for (ident::Unscoped* x : idl)
+        if (ident::Unscoped::same(us, x)) return nullptr;
+      return us;
+    }
+    case K::Pdot:
+    case K::Pextra_ty:
+      return check_for_unbound_unscoped_idents(idl, p->p1);
+    case K::Papply:
+      if (auto* r = check_for_unbound_unscoped_idents(idl, p->p1)) return r;
+      return check_for_unbound_unscoped_idents(idl, p->p2);
+  }
+  return nullptr;
+}
+
 bool contains_unscoped_ident(t p) {
   switch (p->kind) {
     case K::Pident: return ident::find_unscoped(p->id) != nullptr;

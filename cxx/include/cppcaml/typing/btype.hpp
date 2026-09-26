@@ -27,6 +27,18 @@ struct TypeSet {
   void add(TypeExpr* t) { s.insert(types::repr(t)); }
   bool mem(TypeExpr* t) const { return s.count(types::repr(t)) != 0; }
   std::vector<TypeExpr*> elements() const { return {s.begin(), s.end()}; }
+  bool is_empty() const { return s.empty(); }
+  bool subset(const TypeSet& o) const {
+    for (TypeExpr* t : s)
+      if (!o.s.count(t)) return false;
+    return true;
+  }
+  TypeSet inter(const TypeSet& o) const {
+    TypeSet r;
+    for (TypeExpr* t : s)
+      if (o.s.count(t)) r.s.insert(t);
+    return r;
+  }
 };
 template <class V>
 using TransientTypeMap = std::map<TypeExpr*, V, ById>;

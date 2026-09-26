@@ -1,0 +1,22 @@
+// The Clflags settings the typer reads (utils/clflags.ml), with ocamlc's
+// defaults.  The c++ocamlc driver sets them from the command line.
+#pragma once
+
+namespace cppcaml::typing::clflags {
+inline bool principal = false;             // -principal
+inline bool recursive_types = false;       // -rectypes
+inline bool strict_sequence = false;       // -strict-sequence
+inline bool strict_formats = true;         // -strict-formats
+inline bool applicative_functors = true;   // -no-app-funct
+inline bool no_alias_deps = false;         // -no-alias-deps
+inline bool classic = false;               // -nolabels
+inline bool nopervasives = false;          // -nopervasives
+inline bool no_std_include = false;        // -nostdlib
+inline bool unsafe = false;                // -unsafe
+inline bool noassert = false;              // -noassert
+inline bool debug = false;                 // -g
+inline bool keep_locs = true;              // -keep-locs
+inline bool keep_docs = false;             // -keep-docs
+inline bool native_code = false;
+inline bool unboxed_types = false;
+}  // namespace cppcaml::typing::clflags

@@ -3,6 +3,7 @@
 // ...) comes with Typemod.
 #pragma once
 
+#include "cppcaml/typing/clflags.hpp"
 #include "cppcaml/typing/env.hpp"
 
 namespace cppcaml::typing::mtype {
@@ -19,8 +20,6 @@ const ModuleType* strengthen(bool aliasable, env::t env, const ModuleType* mty, 
 const ModuleDeclaration* strengthen_decl(bool aliasable, env::t env, const ModuleDeclaration* md,
                                          Path::t p);
 
-// Clflags.applicative_functors (on by default)
-extern bool applicative_functors;
 
 }  // namespace cppcaml::typing::mtype
 

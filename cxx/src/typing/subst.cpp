@@ -5,6 +5,8 @@
 
 #include <algorithm>
 
+#include "cppcaml/typing/clflags.hpp"
+
 namespace cppcaml::typing::subst {
 
 using namespace types;
@@ -47,9 +49,8 @@ t change_locs(t s, const Location& l) {
   return r;
 }
 
-// Clflags defaults: -keep-locs is on, -keep-docs is off.
-static constexpr bool keep_locs = true;
-static constexpr bool keep_docs = false;
+static const bool& keep_locs = clflags::keep_locs;
+static const bool& keep_docs = clflags::keep_docs;
 
 static Location loc(t s, const Location& x) {
   if (s->loc) return *s->loc;

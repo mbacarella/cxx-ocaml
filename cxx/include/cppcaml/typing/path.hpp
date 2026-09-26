@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -50,6 +51,16 @@ std::vector<Ident::t> heads(t p);
 std::string last(t p);
 t scrape_extra_ty(t p);
 bool is_constructor_typath(t p);
+// Ident.Unscoped.Set (ordered by stamp)
+struct UnscopedLess {
+  bool operator()(const ident::Unscoped* a, const ident::Unscoped* b) const {
+    return ident::Unscoped::stamp_of(a) < ident::Unscoped::stamp_of(b);
+  }
+};
+using UnscopedSet = std::set<ident::Unscoped*, UnscopedLess>;
+// check_for_unbound_unscoped_idents idl p: the first unscoped ident of p not
+// in idl (nullptr = None)
+ident::Unscoped* check_for_unbound_unscoped_idents(const UnscopedSet& idl, t p);
 // `flatten`: `Ok (id, components) or `Contains_apply (nullopt).
 std::optional<std::pair<Ident::t, std::vector<std::string_view>>> flatten(t p);
 

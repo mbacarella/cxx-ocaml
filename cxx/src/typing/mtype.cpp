@@ -1,12 +1,12 @@
 // Port of typing/mtype.ml (scraping and strengthening).  See mtype.hpp.
 #include "cppcaml/typing/mtype.hpp"
+#include "cppcaml/typing/ctype.hpp"
 
 namespace cppcaml::typing::mtype {
 
 using namespace types;
 using namespace btype;
 
-bool applicative_functors = true;
 
 const lz::Modtype* scrape_lazy(env::t env, const lz::Modtype* mty) {
   while (mty->kind == lz::Modtype::Kind::MtyL_ident) {
@@ -40,7 +40,7 @@ const lz::Modtype* strengthen_lazy(bool aliasable, env::t env, const lz::Modtype
     r->sign = strengthen_lazy_sig(aliasable, env, mty->sign, p);
     return r;
   }
-  if (mty->kind == MK::MtyL_functor && !mty->param.is_unit && applicative_functors) {
+  if (mty->kind == MK::MtyL_functor && !mty->param.is_unit && clflags::applicative_functors) {
     Ident::t param = mty->param.id;
     env::t env2 = env;
     if (param) {
@@ -162,5 +162,9 @@ void install_forward_refs() {
   if (done) return;
   done = true;
   env::strengthen = mtype::strengthen_lazy;
+  ctype::forward_try_expand_safe = ctype::try_expand_safe_no_link;
+  ctype::unify_var_ref = ctype::unify_var_uenv;
+  ctype::nondep_type_ref = ctype::nondep_type;
+  env::same_constr = ctype::same_constr;
 }
 }  // namespace cppcaml::typing
