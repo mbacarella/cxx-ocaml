@@ -1111,6 +1111,9 @@ struct Checker {
     std::unordered_map<std::string,
         std::vector<std::pair<std::string, std::string>>> submod_types;
   };
+  // Set while `include F(A)` harvests its exports: the including
+  // structure's prefix (S633).
+  std::optional<std::string> locfapp_include_target_;
   // Filled by applied_local_functor for the binding site (S628).
   std::unordered_map<std::string,
                      std::unordered_map<std::string, TypePtr>> locfapp_submods_;
@@ -4171,15 +4174,22 @@ struct Checker {
     // An `open F(struct .. end)` has no path to name the result by: its
     // values are taken only when none cites the body's own types (S618).
     const bool anon_open = locfapp_open_anon_ && func_bind_name_.empty();
-    if (strict || locfapp_off() || (func_bind_name_.empty() && !anon_open)) return {};
+    // `include F(A)`: the result's members become the including
+    // structure's own, named under its prefix (S633).
+    const bool via_inc = locfapp_include_target_.has_value();
+    if (strict || locfapp_off() ||
+        (func_bind_name_.empty() && !anon_open && !via_inc))
+      return {};
     const std::string bind = func_bind_name_ + ".";
     const bool via_open = !locfapp_open_target_.empty() || anon_open;
-    if (!via_open &&
+    if (!via_open && !via_inc &&
         (proc_mod_prefix_.size() < bind.size() ||
          proc_mod_prefix_.compare(proc_mod_prefix_.size() - bind.size(),
                                   bind.size(), bind) != 0))
       return {};
-    const std::string& tpfx = via_open ? locfapp_open_target_ : proc_mod_prefix_;
+    const std::string& tpfx = via_open  ? locfapp_open_target_
+                              : via_inc ? *locfapp_include_target_
+                                        : proc_mod_prefix_;
     auto comps = mod_components(fpath);
     if (comps.size() != 1) return {};
     auto fr = functor_real_env_.find(comps[0]);
@@ -4253,7 +4263,7 @@ struct Checker {
     }
     // The ascription's submodules, for `C.N.z` (S628): handed to the
     // binding site, which keys them under the binding's name.
-    if (!via_open)
+    if (!via_open && !via_inc)
       for (auto& [sk, svals] : fr->second.submods) {
         auto& dst = locfapp_submods_[sk];
         auto sts = fr->second.submod_types.find(sk);
@@ -15455,7 +15465,16 @@ struct Checker {
           bool saved_ir = include_result_;
           include_result_ = !no_inc_app && !strict &&
                             std::holds_alternative<Pmod_apply>(in->expr.desc);
+          static const bool no_inc_loc =
+              cppcaml::dbg_env("NOINCLOCF") != nullptr ||
+              cppcaml::dbg_env("NOSHARE633") != nullptr;
+          auto saved_it = locfapp_include_target_;
+          locfapp_include_target_.reset();
+          if (!no_inc_loc && !strict &&
+              std::holds_alternative<Pmod_apply>(in->expr.desc))
+            locfapp_include_target_ = proc_mod_prefix_;
           for (auto& [k, v] : module_exports(in->expr)) venv.back()[k] = v;
+          locfapp_include_target_ = std::move(saved_it);
           include_result_ = saved_ir;
           if (auto* pi = std::get_if<Pmod_ident>(&in->expr.desc))  // include M -> M's submodules
             for (auto& s : module_submodule_names(pi->id.txt)) opened_submodules_.insert(s);
