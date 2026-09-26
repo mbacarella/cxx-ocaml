@@ -10086,6 +10086,41 @@ struct Checker {
     if (!any) out.clear();
     return out;
   }
+  // A match's patterns meet an existing `[<` row as ONE closed row (typed
+  // together against a fresh variable, typecore.ml:7164), and two upper
+  // bounds INTERSECT: a tag only the later match names is absent
+  // (`` `C -> .. `` against `[< `A | `B ]`).  Our arms merge one at a time,
+  // which unions; restrict the row back to its tags before the match
+  // (S631).  Folded (the .cmi's) pass only.  NOPVMEET / NOSHARE631 revert.
+  void pv_intersect(const std::vector<PvPre>& pre) {
+    static const bool off = cppcaml::dbg_env("NOPVMEET") != nullptr ||
+                            cppcaml::dbg_env("NOSHARE631") != nullptr;
+    if (off || !fold_abbrevs_ || strict) return;
+    for (auto& p : pre) {
+      if (!p.row) continue;
+      TypePtr r = I::Engine::repr(p.row);
+      if (r->kind != I::Type::Kind::Variant || r->variant_kind != 1 ||
+          !r->inherited.empty())
+        continue;
+      std::vector<std::string> l2;
+      std::vector<TypePtr> a2;
+      std::vector<char> h2;
+      for (size_t i = 0; i < r->labels.size(); ++i) {
+        const std::string& tg = r->labels[i];
+        if (!p.all.count(tg) &&
+            std::find(r->present.begin(), r->present.end(), tg) ==
+                r->present.end())
+          continue;
+        l2.push_back(tg);
+        a2.push_back(i < r->args.size() ? r->args[i] : nullptr);
+        h2.push_back(i < r->tag_has_arg.size() ? r->tag_has_arg[i] : 0);
+      }
+      if (l2.size() == r->labels.size()) continue;
+      r->labels = std::move(l2);
+      r->args = std::move(a2);
+      r->tag_has_arg = std::move(h2);
+    }
+  }
   TypePtr pv_slot(const PvPre& p, const std::string& tg) {
     if (!p.row) return nullptr;
     TypePtr r = I::Engine::repr(p.row);
@@ -11773,6 +11808,7 @@ struct Checker {
       }
       if (window && all_ground && !ground_clash && gacc) soft_unify(rt, gacc);
       if (!pvpre.empty()) pv_check(m->cases, pvpre);
+      if (!pvpre.empty()) pv_intersect(pvpre);
       bool tproven = false;                                         // for the
       // An imported GADT (its ctors live only in the cmi, so gadt/gadt_ctors
       // never fire) is detectable HERE: the arms' full unify has pinned the
@@ -13339,6 +13375,7 @@ struct Checker {
       if (window && pat_all_ground && !pat_clash && pacc) soft_unify(arg, pacc);
       if (window && res_all_ground && !res_clash && racc) soft_unify(rt, racc);
       if (!pvpre.empty()) pv_check(fc.cases, pvpre);
+      if (!pvpre.empty()) pv_intersect(pvpre);
       // Exhaustiveness of the cases against the parameter type, for the dump's
       // Tfunction_cases (Partial) marker (same conservative check as a match).
       // GADT scrutinees are exempt: refinement (a ctor at an incompatible type

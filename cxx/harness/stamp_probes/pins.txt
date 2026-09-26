@@ -4682,6 +4682,9 @@ xpvc_4 0
 xpvc_5 0
 xpvc_6 0
 xpvc_7 0
+xpvm_1 0
+xpvm_2 0
+xpvm_3 -3
 xpv_a1 0
 xpv_a2 0
 xpv_a3 0
