@@ -663,7 +663,7 @@ module P = struct
     | PSig sg -> s "PSig "; signature sg
     | PTyp t -> s "PTyp "; core_type t
     | PPat (p, g) -> s "PPat "; pattern p; s " "; opt expression g
-  and extension ((n, p) : extension) = s "{ext "; str_gloc n; s " "; payload p; s "}"
+  and extension ((n, p) : extension) = s "{ext "; str_loc n; s " "; payload p; s "}"
 
   and package_type ~gap (p : package_type) =
     s "{pack "; lid_loc p.ppt_path; s " ";
@@ -1356,7 +1356,10 @@ let report (e : exn) =
        s "Typetexp."; s (texp_error_name err); s " "; P.loc l
    | Env.Error.In_context (Lookup_error (l, _, err)) ->
        s "Env."; s (lookup_error_name err); s " "; P.loc l
-   | Env.Error.In_context _ -> s "Env.other"
+   | Env.Error.In_context (Missing_module (l, _, _)) ->
+       s "Env.Missing_module "; P.loc l
+   | Env.Error.In_context (Illegal_value_name (l, _)) ->
+       s "Env.Illegal_value_name "; P.loc l
    | Typedecl.Error.In_context (l, err) ->
        s "Typedecl."; s (td_error_name err); s " "; P.loc l
    | Attr_helper.Error (l, _) -> s "Attr_helper "; P.loc l
@@ -1369,10 +1372,15 @@ let report (e : exn) =
    | Includemod.Error _ -> s "Includemod.Error"
    | Typeclass.Error.In_context (l, _, err) ->
        s "Typeclass."; s (tcl_error_name err); s " "; P.loc l
-   | Typemod.Error_forward _ | Typeclass.Error_forward _ -> s "Error_forward"
+   | Typemod.Error_forward err | Typeclass.Error_forward err ->
+       s "Error_forward "; P.loc err.Location.main.loc
    | Primitive.Error (l, _) -> s "Primitive "; P.loc l
-   | Typecore.Error_forward _ -> s "Error_forward"
-   | e when Printexc.exn_slot_name e = "Typetexp.Error_forward" -> s "Error_forward"
+   | Typecore.Error_forward err ->
+       s "Error_forward "; P.loc err.Location.main.loc
+   | e when Printexc.exn_slot_name e = "Typetexp.Error_forward" ->
+       (* not exported: Error_forward of Location.error *)
+       let err : Location.error = Obj.obj (Obj.field (Obj.repr e) 1) in
+       s "Error_forward "; P.loc err.Location.main.loc
    | Syntaxerr.Error _ -> s "Syntaxerr"
    | e -> raise e);
   s "\n"

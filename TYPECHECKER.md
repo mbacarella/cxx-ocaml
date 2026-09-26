@@ -17,21 +17,33 @@ as a type checker.
 
 ## Status (2026-09-26)
 
-c++ocamlc **does not reject ill-typed programs**.  `let x = 1 + "a"` compiles
-to a .cmo, exit 0.  The only error it reports is an unbound module.
+By default c++ocamlc **still does not reject ill-typed programs**: `let x =
+1 + "a"` compiles to a .cmo, exit 0, and the only error it reports is an
+unbound module.  The ported checker (stages 1-5) runs with
+`CPPCAML_TYPECHECK=1` (before code generation; on a type error nothing is
+written and the exit status is 2) or with `-stop-after typing` (type-check
+only).  It prints ocamlc's location line and the error's constructor
+(`Error: Typecore.Expr_type_clash`) until Printtyp is ported;
+`CPPCAML_TYPECHECK_DEBUG=1` also says when a file reached an unported part
+(it is then accepted).
 
-Measured with the opt-in `CPPCAML_TYPECHECK=1` (runs the strict pass below
-after the outputs are written and removes them on rejection):
+Accept/reject parity with ocamlc (`-stop-after typing`, same flags):
 
-| What | Result |
-|---|---|
-| compiler corpus (139 modules, all valid) | **70 falsely rejected** |
-| `cxx/harness/false_accept.sh` (137 ill-typed one-liners) | **94 falsely accepted** |
-| `cxx/harness/valid_reject.sh` (6531 ocamlc-valid stamp probes) | **41 falsely rejected** |
-| testsuite `reject_parity.sh` / `accept_parity.sh` | 4 false rejects / 38 false accepts |
+| What | Ported checker | Deprecated strict pass (before) |
+|---|---|---|
+| compiler corpus (139 .ml + 146 .mli, in /tmp/effid_ref) | **0 false rejects**, 0 false accepts | 70 false rejects |
+| `false_accept.sh` (137 ill-typed one-liners) | **0 false accepts**, 137/137 error locations identical | 94 false accepts |
+| `valid_reject.sh` (6531 ocamlc-valid stamp probes) | **0 false rejects** | 41 false rejects |
+| `port_parity.sh` over stamp/core/false-accept probes + stdlib + testsuite/tests (8844 files) | 0 false rejects, 2 false accepts, 1353 identical rejections | -- |
 
-The testsuite gates look good only because their files are small and their
-ill-typed tests exercise advanced features.  Don't read them as soundness.
+The 2 false accepts: stdlib/camlinternalFormatBasics.ml (ocamlc dies with a
+Consistbl inconsistency between the tree's cmis, not a type error) and
+typing-objects-bugs/pr7284_bad.ml (a warning made an error by
+`[@@warnerror "+8"]`; warnings are not ported).  Of the identical rejections, the
+error line differs for 60 syntax errors (the C++ parser's messages) and
+for files where ocamlc prints a warning or alert first (warnings are not
+ported).  `port_check.sh` adapts
+`false_accept.sh` / `valid_reject.sh` (`CPP=cxx/harness/port_check.sh`).
 
 ## Deprecated checkers (do not extend as type checkers)
 
@@ -157,7 +169,7 @@ from the port.  The two must be identical on every .cmi in the tree
    are built as `gap_loc()` and printed masked ("?") by both dumps:
    `Ptyp_poly` /
    `pcd_vars` / `Pext_decl` variable-name locations, `prf_loc`, `pof_loc`,
-   `Rtag` label locations, `pvb_loc`, extension-name locations, the name
+   `Rtag` label locations, `pvb_loc`, the name
    location of floating attributes, the `ppt_loc` of packages outside a
    core type, the variances of class and type-extension parameters, and
    every `*_loc_stack` except the innermost location of `Pexp_assert` (the
@@ -224,6 +236,14 @@ from the port.  The two must be identical on every .cmi in the tree
    payload, `a, r.f <- v` inside a payload and `;; let exception E in ...`
    are rejected, and `functor ... -> sig end with ...` attaches the `with`
    differently.
-6. `CPPCAML_TYPECHECK` switches from the deprecated strict pass to the port
-   (Typemod.type_implementation); ocamlc's error messages come with
-   Printtyp, then the .cmi writer and warnings.
+6. **DONE (opt-in):** c++ocamlc runs the port (`Typemod.type_implementation`
+   / `type_interface` after `Compmisc.init_path` + `initial_env`) under
+   `CPPCAML_TYPECHECK` or `-stop-after typing`, replacing the deprecated
+   strict pass; see Status for the parity figures.  The error report is
+   `typing/error_report` (Location's printer ported, including where
+   ocamlc's printers move the location: Duplicate_label at `_none_`,
+   Apply_non_function over the application).  When c++ocamlc finds its
+   stdlib through `-I`, that directory is not added a second time (ocamlc
+   would let the second copy's units shadow the opened Stdlib's).
+7. Next: turn it on by default; Printtyp and ocamlc's error messages;
+   warnings; the .cmi writer from the port's signature.

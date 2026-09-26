@@ -199,7 +199,7 @@ class Parser {
   size_t idx_ = 0;
   Position last_seq_end_{};  // end of the most recent parse_expr, incl. a trailing `;`
   bool last_type_subst_ = false;  // most recent type decl used `:=` (substitution)
-  std::optional<std::string> let_ext_;  // `let%ext …` extension name on the last let
+  std::optional<ExtName> let_ext_;  // `let%ext …` extension name on the last let
   bool letext_pun_ = false;  // inside a `let%ext` binding list, `let%ext x` puns to `x = x`
   bool suppress_pat_cons_attr_ = false;  // one-shot: the next cons-pattern's trailing `[@attr]`
                                          // belongs to an enclosing `exception P` (prec_constr_appl)
@@ -568,7 +568,7 @@ class Parser {
         return E({Pexp_constant{const_of(t)}, tokloc(t)});
       case Kind::QUOTED_STRING_EXPR:  // {%ext|…|} -> Pexp_extension
         advance();
-        return E({Pexp_extension{t.ext_id, quoted_payload(t)},
+        return E({Pexp_extension{quoted_ext_name(t, 2), quoted_payload(t)},
                   span(position(t.start), position(t.end))});
       case Kind::LIDENT: {
         advance();
@@ -598,7 +598,7 @@ class Parser {
         }
         if (cur().kind == Kind::MODULE) {  // (module ME [: S [with type …]])  first-class module
           advance();
-          std::optional<std::string> ext = take_ext(); Attributes attrs = take_attrs();  // (module%ext[@attr] …)
+          std::optional<ExtName> ext = take_ext(); Attributes attrs = take_attrs();  // (module%ext[@attr] …)
           ModuleExpr me = parse_module_expr();
           std::optional<Ptyp_package> pkg;
           if (cur().kind == Kind::COLON) {
@@ -713,7 +713,7 @@ class Parser {
       }
       case Kind::BEGIN: {
         advance();
-        std::optional<std::string> ext = take_ext();  // `begin%ext … end`
+        std::optional<ExtName> ext = take_ext();  // `begin%ext … end`
         Attributes battrs;  // `begin[@attr] … end` -> on the inner expression
         while (cur().kind == Kind::LBRACKETAT) { advance(); battrs.push_back(parse_attribute_body()); }
         if (cur().kind == Kind::END) {  // `begin end` -> unit, spanning begin..end
@@ -749,7 +749,7 @@ class Parser {
       }
       case Kind::OBJECT: {
         advance();
-        std::optional<std::string> ext = take_ext(); Attributes attrs = take_attrs();  // object%ext[@attr]
+        std::optional<ExtName> ext = take_ext(); Attributes attrs = take_attrs();  // object%ext[@attr]
         ClassStructure cs = parse_class_structure_body();
         const Token& c = cur(); expect(Kind::END, "end");
         return wrap_ext(E({Pexp_object{box(std::move(cs))}, span(position(t.start), position(c.end))}),
@@ -757,7 +757,7 @@ class Parser {
       }
       case Kind::NEW: {
         advance();
-        std::optional<std::string> ext = take_ext(); Attributes attrs = take_attrs();  // new%ext[@attr]
+        std::optional<ExtName> ext = take_ext(); Attributes attrs = take_attrs();  // new%ext[@attr]
         LongidentLoc id = parse_longident_path();
         return wrap_ext(E({Pexp_new{id}, span(position(t.start), id.loc.end)}), std::move(ext), std::move(attrs));
       }
@@ -855,7 +855,7 @@ class Parser {
   ExprBox parse_app() {
     if (cur().kind == Kind::ASSERT) {
       const Token& t = cur(); advance();
-      std::optional<std::string> ext = take_ext(); Attributes attrs = take_attrs();  // assert%ext[@attr]
+      std::optional<ExtName> ext = take_ext(); Attributes attrs = take_attrs();  // assert%ext[@attr]
       ExprBox arg = parse_atom_postfix();
       Position ae = arg->loc.end;
       Location kw = span(position(t.start), ae);  // the `assert …` span (survives paren reloc)
@@ -863,7 +863,7 @@ class Parser {
     }
     if (cur().kind == Kind::LAZY) {
       const Token& t = cur(); advance();
-      std::optional<std::string> ext = take_ext(); Attributes attrs = take_attrs();  // lazy%ext[@attr]
+      std::optional<ExtName> ext = take_ext(); Attributes attrs = take_attrs();  // lazy%ext[@attr]
       ExprBox arg = parse_atom_postfix();
       Position ae = arg->loc.end;
       return wrap_ext(E({Pexp_lazy{std::move(arg)}, span(position(t.start), ae)}), std::move(ext), std::move(attrs));
@@ -1185,7 +1185,7 @@ class Parser {
     ExprBox e = parse_expr_no_seq();
     if (cur().kind == Kind::SEMI && peek(1).kind == Kind::PERCENT) {  // `e1 ;%foo e2`
       advance();  // ;
-      std::optional<std::string> ext = take_ext();  // %foo
+      std::optional<ExtName> ext = take_ext();  // %foo
       ExprBox e2 = parse_expr();
       Location l = span(e->loc.start, last_seq_end_);
       ExprBox seq = E({Pexp_sequence{std::move(e), std::move(e2)}, l});
@@ -1210,17 +1210,29 @@ class Parser {
 
   // `KEYWORD%ext …` -> Pexp_extension(ext, [ghost Pstr_eval(ghost keyword-expr)])
   // (mkexp_attrs/wrap_exp_attrs).  Consumed right after the keyword token.
-  std::optional<std::string> take_ext() {
+  // `%foo` after a keyword: the name and its attr_id span
+  std::optional<ExtName> take_ext() {
     if (cur().kind != Kind::PERCENT) return std::nullopt;
     advance();
-    return parse_attr_name();
+    return parse_ext_name();
+  }
+  ExtName parse_ext_name() {
+    Position nstart = position(cur().start);
+    std::string name = parse_attr_name();
+    return ExtName(std::move(name), span(nstart, position(tokens_[idx_ - 1].end)));
+  }
+  // The id of `{%id|…|}` (shift 2) / `{%%id|…|}` (shift 3): lexer.mll's
+  // compute_quoted_string_idloc
+  ExtName quoted_ext_name(const Token& t, size_t shift) {
+    size_t a = t.start + shift;
+    return ExtName(t.ext_id, span(position(a), position(a + t.ext_id.size())));
   }
   Attributes take_attrs() {  // `[@attr]` immediately after a keyword/`%ext`
     Attributes a;
     while (cur().kind == Kind::LBRACKETAT) { advance(); a.push_back(parse_attribute_body()); }
     return a;
   }
-  ExprBox wrap_ext(ExprBox e, std::optional<std::string> ext, Attributes attrs = {}) {
+  ExprBox wrap_ext(ExprBox e, std::optional<ExtName> ext, Attributes attrs = {}) {
     for (auto& a : attrs) e->attrs.push_back(std::move(a));
     if (!ext) return e;
     Location outer{e->loc.start, e->loc.end, false};  // the Pexp_extension is not ghost
@@ -1249,7 +1261,7 @@ class Parser {
           return E({Pexp_struct_item{box(std::move(si)), std::move(body)}, l});
         }
         auto [rf, binds] = parse_value_bindings();
-        std::optional<std::string> ext = std::move(let_ext_);  // `let%ext … in e`
+        std::optional<ExtName> ext = std::move(let_ext_);  // `let%ext … in e`
         let_ext_ = std::nullopt;
         expect(Kind::IN, "in");
         ExprBox body = parse_expr();
@@ -1258,7 +1270,7 @@ class Parser {
       }
       case Kind::IF: {
         advance();
-        std::optional<std::string> ext = take_ext();  // `if%ext …`
+        std::optional<ExtName> ext = take_ext();  // `if%ext …`
         Attributes attrs = take_attrs();
         ExprBox c = parse_expr();
         expect(Kind::THEN, "then");
@@ -1271,7 +1283,7 @@ class Parser {
       }
       case Kind::MATCH: {
         advance();
-        std::optional<std::string> ext = take_ext();  // `match%ext …`
+        std::optional<ExtName> ext = take_ext();  // `match%ext …`
         Attributes attrs = take_attrs();
         ExprBox e0 = parse_expr();
         expect(Kind::WITH, "with");
@@ -1281,7 +1293,7 @@ class Parser {
       }
       case Kind::TRY: {
         advance();
-        std::optional<std::string> ext = take_ext();  // `try%ext …`
+        std::optional<ExtName> ext = take_ext();  // `try%ext …`
         Attributes attrs = take_attrs();
         ExprBox e0 = parse_expr();
         expect(Kind::WITH, "with");
@@ -1291,7 +1303,7 @@ class Parser {
       }
       case Kind::FUNCTION: {
         advance();
-        std::optional<std::string> ext = take_ext();  // `function%ext …`
+        std::optional<ExtName> ext = take_ext();  // `function%ext …`
         Attributes fattrs;  // `function[@attr] …`
         while (cur().kind == Kind::LBRACKETAT) { advance(); fattrs.push_back(parse_attribute_body()); }
         std::vector<Case> cs = parse_cases();
@@ -1304,7 +1316,7 @@ class Parser {
       }
       case Kind::FUN: {
         advance();
-        std::optional<std::string> ext = take_ext();  // `fun%ext …`
+        std::optional<ExtName> ext = take_ext();  // `fun%ext …`
         Attributes funattrs;  // `fun[@attr] …`  -> on the resulting expression
         while (cur().kind == Kind::LBRACKETAT) { advance(); funattrs.push_back(parse_attribute_body()); }
         auto withattrs = [&](ExprBox e) {
@@ -1354,7 +1366,7 @@ class Parser {
       }
       case Kind::WHILE: {
         advance();
-        std::optional<std::string> ext = take_ext();  // `while%ext …`
+        std::optional<ExtName> ext = take_ext();  // `while%ext …`
         Attributes attrs = take_attrs();
         ExprBox cond = parse_expr();
         expect(Kind::DO, "do");
@@ -1366,7 +1378,7 @@ class Parser {
       }
       case Kind::FOR: {
         advance();
-        std::optional<std::string> ext = take_ext();  // `for%ext …`
+        std::optional<ExtName> ext = take_ext();  // `for%ext …`
         Attributes attrs = take_attrs();
         Pattern var = parse_pattern();  // grammar: `for pattern = …` (not just an ident)
         expect(Kind::EQUAL, "=");
@@ -1713,7 +1725,7 @@ class Parser {
     if (t.kind == Kind::UNDERSCORE) { advance(); return box(CoreType{Ptyp_any{}, tokloc(t)}); }
     if (t.kind == Kind::QUOTED_STRING_EXPR) {  // {%ext|…|} -> Ptyp_extension
       advance();
-      return box(CoreType{Ptyp_extension{t.ext_id, quoted_payload(t)},
+      return box(CoreType{Ptyp_extension{quoted_ext_name(t, 2), quoted_payload(t)},
                           span(position(t.start), position(t.end))});
     }
     if (t.kind == Kind::QUOTE) {
@@ -1761,7 +1773,7 @@ class Parser {
     }
     if (t.kind == Kind::LPAREN && peek(1).kind == Kind::MODULE) {  // (module S [with type …])
       advance(); advance();  // ( module
-      std::optional<std::string> pext = take_ext(); Attributes pattrs = take_attrs();  // (module%ext[@attr] …)
+      std::optional<ExtName> pext = take_ext(); Attributes pattrs = take_attrs();  // (module%ext[@attr] …)
       LongidentLoc path = parse_type_path();  // package path may be F(X).S
       std::vector<std::pair<LongidentLoc, CoreTypeBox>> cons;
       if (cur().kind == Kind::WITH) {
@@ -1958,7 +1970,7 @@ class Parser {
   Pattern parse_pat_or_operand() {
     if (cur().kind == Kind::EXCEPTION) {
       const Token& e = cur(); advance();
-      std::optional<std::string> ext = take_ext(); Attributes attrs = take_attrs();  // exception%ext[@attr]
+      std::optional<ExtName> ext = take_ext(); Attributes attrs = take_attrs();  // exception%ext[@attr]
       bool save = suppress_pat_cons_attr_;
       suppress_pat_cons_attr_ = true;  // a trailing `[@a]` binds to `exception P`, not P
       Pattern inner = parse_pat_tuple();
@@ -2102,7 +2114,7 @@ class Parser {
                    Location{ls, re, false}};
   }
   // `KEYWORD%ext p` pattern -> Ppat_extension(ext, PPat(ghost p-with-attrs)).
-  Pattern wrap_pat_ext(Pattern p, std::optional<std::string> ext, Attributes attrs) {
+  Pattern wrap_pat_ext(Pattern p, std::optional<ExtName> ext, Attributes attrs) {
     for (auto& a : attrs) p.attrs.push_back(std::move(a));
     if (!ext) return p;
     Location outer{p.loc.start, p.loc.end, false};  // the Ppat_extension itself is not ghost
@@ -2113,7 +2125,7 @@ class Parser {
   Pattern parse_pat_app() {
     if (cur().kind == Kind::LAZY) {
       const Token& t = cur(); advance();
-      std::optional<std::string> ext = take_ext(); Attributes attrs = take_attrs();  // lazy%ext[@attr]
+      std::optional<ExtName> ext = take_ext(); Attributes attrs = take_attrs();  // lazy%ext[@attr]
       Pattern arg = parse_simple_pattern();
       Location l = span(position(t.start), arg.loc.end);
       return wrap_pat_ext(Pattern{Ppat_lazy{box(std::move(arg))}, l}, std::move(ext), std::move(attrs));
@@ -2216,7 +2228,7 @@ class Parser {
       case Kind::UNDERSCORE: advance(); return {Ppat_any{}, tokloc(t)};
       case Kind::QUOTED_STRING_EXPR:  // {%ext|…|} -> Ppat_extension
         advance();
-        return {Ppat_extension{t.ext_id, quoted_payload(t)},
+        return {Ppat_extension{quoted_ext_name(t, 2), quoted_payload(t)},
                 span(position(t.start), position(t.end))};
       case Kind::LIDENT: advance(); return {Ppat_var{StringLoc{t.text, tokloc(t)}}, tokloc(t)};
       case Kind::MINUS: case Kind::PLUS:  // signed_constant: {- +} {INT FLOAT}
@@ -3053,7 +3065,7 @@ class Parser {
   std::pair<RecFlag, std::vector<ValueBinding>> parse_value_bindings() {
     expect(Kind::LET, "let");
     let_ext_ = std::nullopt;
-    if (cur().kind == Kind::PERCENT) { advance(); let_ext_ = parse_attr_name(); }  // let%ext
+    if (cur().kind == Kind::PERCENT) { advance(); let_ext_ = parse_ext_name(); }  // let%ext
     bool saved_pun = letext_pun_;
     letext_pun_ = let_ext_.has_value();  // `let%ext` bindings may pun (`let%ext x` = `x = x`)
     Attributes letattrs;  // `let[@attr] …`  -> attached to the first binding
@@ -3100,8 +3112,8 @@ class Parser {
   }
   // Parse `[%id payload]` / `[%%id payload]` after the opening bracket is consumed:
   // returns the name and the payload (PStr/PTyp/PSig/PPat per parser.mly `payload`).
-  std::pair<std::string, ExtPayload> parse_ext_body() {
-    std::string name = parse_attr_name();
+  std::pair<ExtName, ExtPayload> parse_ext_body() {
+    ExtName name = parse_ext_name();
     ExtPayload ep;
     if (cur().kind == Kind::COLON) {  // `: core_type` (PTyp) or `: signature` (PSig)
       advance();
@@ -3125,7 +3137,7 @@ class Parser {
     const Token& t = cur();
     if (t.kind == Kind::QUOTED_STRING_ITEM) {  // {%%ext|…|} -> Pstr_extension(ext, [string])
       advance();
-      return StructureItem{Pstr_extension{t.ext_id, quoted_payload(t)},
+      return StructureItem{Pstr_extension{quoted_ext_name(t, 3), quoted_payload(t)},
                            span(position(t.start), position(t.end))};
     }
     if (t.kind == Kind::LET) {
@@ -3148,7 +3160,7 @@ class Parser {
         attach_docs(binds[0].attrs, l.start.cnum,
                     binds.size() == 1 ? l.end.cnum : static_cast<size_t>(-1));
       if (let_ext_) {  // `let%ext …`  -> Pstr_extension over the (ghost-wrapped) let item
-        std::string ext = std::move(*let_ext_);
+        ExtName ext = std::move(*let_ext_);
         let_ext_ = std::nullopt;
         ExtPayload payload;
         payload.str.push_back(StructureItem{Pstr_value{rf, std::move(binds)}, l});
@@ -3159,7 +3171,7 @@ class Parser {
     }
     if (t.kind == Kind::INCLUDE) {
       advance();
-      std::optional<std::string> inc_ext = take_ext();  // `include%ext …`
+      std::optional<ExtName> inc_ext = take_ext();  // `include%ext …`
       Attributes iattrs = take_attrs();  // `include%ext[@attr] …` -> pincl_attributes (prefix attrs1)
       ModuleExpr me = parse_module_expr();
       while (cur().kind == Kind::LBRACKETATAT) { advance(); iattrs.push_back(parse_attribute_body()); }
@@ -3175,7 +3187,7 @@ class Parser {
     }
     if (t.kind == Kind::TYPE) {
       advance();
-      std::optional<std::string> type_ext = take_ext();  // `type%ext …`
+      std::optional<ExtName> type_ext = take_ext();  // `type%ext …`
       Attributes typeattrs;  // `type[@attr] …`  -> on the first declaration
       while (cur().kind == Kind::LBRACKETAT) { advance(); typeattrs.push_back(parse_attribute_body()); }
       RecFlag rf = RecFlag::Recursive;  // `type` is recursive by default
@@ -3240,8 +3252,8 @@ class Parser {
     }
     if (t.kind == Kind::OPEN) {
       advance();
-      std::optional<std::string> open_ext;  // `open%ext …`
-      if (cur().kind == Kind::PERCENT) { advance(); open_ext = parse_attr_name(); }
+      std::optional<ExtName> open_ext;  // `open%ext …`
+      if (cur().kind == Kind::PERCENT) { advance(); open_ext = parse_ext_name(); }
       OverrideFlag ovr = OverrideFlag::Fresh;
       if (cur().kind == Kind::BANG) { advance(); ovr = OverrideFlag::Override; }
       Attributes oattrs;  // `open%ext[@attr] …`  (item attrs collected after the keyword)
@@ -3260,7 +3272,7 @@ class Parser {
     }
     if (t.kind == Kind::EXCEPTION) {
       advance();
-      std::optional<std::string> exc_ext = take_ext();  // `exception%ext …`
+      std::optional<ExtName> exc_ext = take_ext();  // `exception%ext …`
       Attributes prefixattrs = take_attrs();  // `exception%ext[@attr] X` -> on the constructor
       // extension_constructor loc spans the `exception` keyword
       ExtensionConstructor ctor = parse_ext_ctor(position(t.start));
@@ -3280,7 +3292,7 @@ class Parser {
     }
     if (t.kind == Kind::VAL) {  // `val x : t` in a structure -> Pstr_val (fork feature)
       advance();
-      std::optional<std::string> val_ext = take_ext();  // `val%ext …`
+      std::optional<ExtName> val_ext = take_ext();  // `val%ext …`
       Attributes attrs = take_attrs();  // `val%ext[@attr] …` -> val_attributes (prefix)
       StringLoc vname = parse_value_name();  // LIDENT or ( op )
       expect(Kind::COLON, ":");
@@ -3298,7 +3310,7 @@ class Parser {
     }
     if (t.kind == Kind::EXTERNAL) {
       advance();
-      std::optional<std::string> ext_ext = take_ext();  // `external%ext …`
+      std::optional<ExtName> ext_ext = take_ext();  // `external%ext …`
       Attributes pattrs = take_attrs();  // `external%ext[@attr] …` (item attrs, prefix)
       StringLoc ename = parse_value_name();  // LIDENT or ( op )
       CoreTypeBox ty;  // optional: absent in `external f = g`
@@ -3327,7 +3339,7 @@ class Parser {
     }
     if (t.kind == Kind::MODULE && peek(1).kind == Kind::TYPE) {
       advance(); advance();  // module type
-      std::optional<std::string> mt_ext = take_ext();  // `module type%ext …`
+      std::optional<ExtName> mt_ext = take_ext();  // `module type%ext …`
       Attributes mtattrs = take_attrs();  // `module type%ext[@attr] …` -> pmtd_attributes (prefix)
       const Token& nm = cur();
       if (nm.kind != Kind::UIDENT && nm.kind != Kind::LIDENT)
@@ -3354,8 +3366,8 @@ class Parser {
     }
     if (t.kind == Kind::MODULE) {
       advance();
-      std::optional<std::string> mod_ext;  // `module%ext …`
-      if (cur().kind == Kind::PERCENT) { advance(); mod_ext = parse_attr_name(); }
+      std::optional<ExtName> mod_ext;  // `module%ext …`
+      if (cur().kind == Kind::PERCENT) { advance(); mod_ext = parse_ext_name(); }
       Attributes itemattrs;  // `module%ext[@attr] …` -> pmb_attributes
       while (cur().kind == Kind::LBRACKETAT) { advance(); itemattrs.push_back(parse_attribute_body()); }
       if (cur().kind == Kind::REC) {  // `module%ext[@attr] rec M … and …`
@@ -3406,7 +3418,7 @@ class Parser {
     if (t.kind == Kind::CLASS && peek(1).kind == Kind::TYPE) {
       Position kw = position(t.start);
       advance(); advance();  // class type
-      std::optional<std::string> ct_ext = take_ext();  // `class type%ext …`
+      std::optional<ExtName> ct_ext = take_ext();  // `class type%ext …`
       Attributes prefixattrs = take_attrs();  // `class type%ext[@attr] …`
       std::vector<ClassTypeDeclaration> decls;
       decls.push_back(parse_one_class_type_decl(kw));
@@ -3429,7 +3441,7 @@ class Parser {
     if (t.kind == Kind::CLASS) {
       Position kw = position(t.start);
       advance();
-      std::optional<std::string> class_ext = take_ext();  // `class%ext …`
+      std::optional<ExtName> class_ext = take_ext();  // `class%ext …`
       Attributes prefixattrs = take_attrs();  // `class%ext[@attr] …` -> on the first decl
       std::vector<ClassDeclaration> decls;
       decls.push_back(parse_one_class_decl(kw));
@@ -3741,7 +3753,7 @@ class Parser {
     return items;
   }
   // `KEYWORD%ext …` signature item -> Psig_extension(ext, PSig [ghost item]).
-  SignatureItem wrap_sig_ext(SignatureItem item, std::optional<std::string> ext) {
+  SignatureItem wrap_sig_ext(SignatureItem item, std::optional<ExtName> ext) {
     if (!ext) return item;
     Location outer{item.loc.start, item.loc.end, false};
     item.loc.ghost = true;
@@ -3754,12 +3766,12 @@ class Parser {
     auto here = [&] { return span(position(t.start), position(tokens_[idx_ - 1].end)); };
     if (t.kind == Kind::QUOTED_STRING_ITEM) {  // {%%ext|…|} -> Psig_extension
       advance();
-      return SignatureItem{Psig_extension{t.ext_id, quoted_payload(t)},
+      return SignatureItem{Psig_extension{quoted_ext_name(t, 3), quoted_payload(t)},
                            span(position(t.start), position(t.end))};
     }
     if (t.kind == Kind::VAL) {
       advance();
-      std::optional<std::string> ext = take_ext();  // `val%ext …`
+      std::optional<ExtName> ext = take_ext();  // `val%ext …`
       Attributes attrs = take_attrs();  // `val%ext[@attr] …` -> val_attributes (prefix)
       const Token& nm = cur();
       if (nm.kind != Kind::LIDENT && nm.kind != Kind::LPAREN)
@@ -3778,7 +3790,7 @@ class Parser {
     }
     if (t.kind == Kind::EXTERNAL) {
       advance();
-      std::optional<std::string> ext = take_ext(); Attributes attrs = take_attrs();  // external%ext[@attr]
+      std::optional<ExtName> ext = take_ext(); Attributes attrs = take_attrs();  // external%ext[@attr]
       StringLoc ename = parse_value_name();  // LIDENT or ( op )
       CoreTypeBox ty;  // optional: absent in `external f = g`
       if (cur().kind == Kind::COLON) { advance(); ty = parse_poly_type(/*ghost=*/false); }
@@ -3800,7 +3812,7 @@ class Parser {
     }
     if (t.kind == Kind::TYPE) {
       advance();
-      std::optional<std::string> type_ext = take_ext();  // `type%ext …`
+      std::optional<ExtName> type_ext = take_ext();  // `type%ext …`
       Attributes typeprefix = take_attrs();  // `type%ext[@attr] …` -> on the first decl
       RecFlag rf = RecFlag::Recursive;
       if (cur().kind == Kind::NONREC) { advance(); rf = RecFlag::Nonrecursive; }
@@ -3857,7 +3869,7 @@ class Parser {
     }
     if (t.kind == Kind::EXCEPTION) {
       advance();
-      std::optional<std::string> ext = take_ext();  // `exception%ext …`
+      std::optional<ExtName> ext = take_ext();  // `exception%ext …`
       Attributes prefixattrs = take_attrs();  // `exception%ext[@attr] X` -> on the constructor
       ExtensionConstructor ctor = parse_ext_ctor(position(t.start));
       ctor.attrs.insert(ctor.attrs.begin(), std::make_move_iterator(prefixattrs.begin()),
@@ -3870,7 +3882,7 @@ class Parser {
     }
     if (t.kind == Kind::OPEN) {
       advance();
-      std::optional<std::string> ext = take_ext();  // `open%ext …`
+      std::optional<ExtName> ext = take_ext();  // `open%ext …`
       OverrideFlag ovr = OverrideFlag::Fresh;
       if (cur().kind == Kind::BANG) { advance(); ovr = OverrideFlag::Override; }
       Attributes oattrs = take_attrs();  // `open%ext[@attr] …` -> popen_attributes (prefix)
@@ -3882,7 +3894,7 @@ class Parser {
     }
     if (t.kind == Kind::INCLUDE) {
       advance();
-      std::optional<std::string> ext = take_ext();  // `include%ext …`
+      std::optional<ExtName> ext = take_ext();  // `include%ext …`
       Attributes iattrs = take_attrs();  // `include%ext[@attr] …` -> pincl_attributes (prefix attrs1)
       ModuleType mt = parse_module_type();
       while (cur().kind == Kind::LBRACKETATAT) { advance(); iattrs.push_back(parse_attribute_body()); }
@@ -3892,7 +3904,7 @@ class Parser {
     }
     if (t.kind == Kind::MODULE && peek(1).kind == Kind::TYPE) {
       advance(); advance();  // module type
-      std::optional<std::string> mt_ext = take_ext();  // `module type%ext …`
+      std::optional<ExtName> mt_ext = take_ext();  // `module type%ext …`
       Attributes mtattrs = take_attrs();  // `module type%ext[@attr] …` -> pmtd_attributes (prefix)
       const Token& nm = cur();
       if (nm.kind != Kind::UIDENT && nm.kind != Kind::LIDENT)
@@ -3914,7 +3926,7 @@ class Parser {
     // (take_ext yields none), which also captures per-declaration `[@@attr]`.
     if (t.kind == Kind::MODULE) {
       advance();
-      std::optional<std::string> mod_ext = take_ext();  // `module%ext …`
+      std::optional<ExtName> mod_ext = take_ext();  // `module%ext …`
       Attributes prefixattrs = take_attrs();  // `module%ext[@attr] …` -> pmd_attributes (prefix)
       if (cur().kind == Kind::REC) {  // `module%ext[@attr] rec M : S and …`
         advance();
@@ -3972,7 +3984,7 @@ class Parser {
     if (t.kind == Kind::CLASS && peek(1).kind == Kind::TYPE) {
       Position kw = position(t.start);
       advance(); advance();
-      std::optional<std::string> ext = take_ext();  // `class type%ext …`
+      std::optional<ExtName> ext = take_ext();  // `class type%ext …`
       Attributes prefix = take_attrs();
       std::vector<ClassTypeDeclaration> decls;
       decls.push_back(parse_one_class_type_decl(kw));
@@ -3989,7 +4001,7 @@ class Parser {
     if (t.kind == Kind::CLASS) {  // class c : ct [and …]  (class_description)
       Position kw = position(t.start);
       advance();
-      std::optional<std::string> ext = take_ext();  // `class%ext …`
+      std::optional<ExtName> ext = take_ext();  // `class%ext …`
       Attributes prefix = take_attrs();
       std::vector<ClassTypeDeclaration> decls;
       decls.push_back(parse_one_class_description(kw));

@@ -81,6 +81,7 @@ add_library(cppcaml_core
   src/typing/includemod.cpp
   src/typing/parsetree_ovalue.cpp
   src/typing/typemod_util.cpp
+  src/typing/error_report.cpp
   src/typing/typemod_sig.cpp
   src/typing/typemod_str.cpp
   src/typing/typemod_unit.cpp

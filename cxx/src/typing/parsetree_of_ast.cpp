@@ -161,8 +161,8 @@ struct Conv {
                                   const Location& item_loc) const {
     return make<Attribute>(StrLoc{zstr(name), gap_loc()}, payload_str(payload), item_loc);
   }
-  const Extension* extension(const std::string& name, const ast::ExtPayload& p) const {
-    return make<Extension>(StrLoc{zstr(name), gap_loc()}, ext_payload(p));
+  const Extension* extension(const ast::ExtName& name, const ast::ExtPayload& p) const {
+    return make<Extension>(StrLoc{zstr(name), name.has_loc ? loc(name.loc) : gap_loc()}, ext_payload(p));
   }
 
   // ---- constants ----

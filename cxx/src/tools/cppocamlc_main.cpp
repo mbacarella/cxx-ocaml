@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <set>
 #include <sstream>
@@ -35,6 +36,13 @@
 #include "cppcaml/lambda.hpp"
 #include "cppcaml/link.hpp"
 #include "cppcaml/parser.hpp"
+#include "cppcaml/typing/clflags.hpp"
+#include "cppcaml/typing/ctype.hpp"
+#include "cppcaml/typing/env.hpp"
+#include "cppcaml/typing/error_report.hpp"
+#include "cppcaml/typing/parsetree.hpp"
+#include "cppcaml/typing/persistent_env.hpp"
+#include "cppcaml/typing/typemod.hpp"
 
 namespace fs = std::filesystem;
 
@@ -132,7 +140,7 @@ static bool ends_with(const std::string& s, const char* suf) {
 // it is not mistaken for a source file).
 static const std::set<std::string> kArgIgnore = {
     "-w", "-warn-error", "-alert", "-color", "-error-style", "-cclib", "-ccopt",
-    "-dllib", "-dllpath", "-stop-after", "-intf-suffix", "-intf_suffix",
+    "-dllib", "-dllpath", "-intf-suffix", "-intf_suffix",
     "-cmi-file", "-dump-dir", "-inline", "-afl-inst-ratio", "-function-sections",
     "-match-context-rows", "-runtime-variant"};
 // Boolean flags we accept and ignore (meaning-preserving for our bytecode output).
@@ -192,6 +200,121 @@ struct DumpFlags { bool parsetree = false, lambda = false, instr = false; };
 static DumpFlags g_dump;
 static bool g_nopervasives = false;  // -nopervasives: no implicit Stdlib import
 
+// Clflags the ported type checker reads (the code generator ignores them)
+static void set_typing_flag(const std::string& a) {
+  namespace cf = cppcaml::typing::clflags;
+  if (a == "-principal") cf::principal = true;
+  else if (a == "-no-principal") cf::principal = false;
+  else if (a == "-rectypes") cf::recursive_types = true;
+  else if (a == "-no-rectypes") cf::recursive_types = false;
+  else if (a == "-strict-sequence") cf::strict_sequence = true;
+  else if (a == "-no-strict-sequence") cf::strict_sequence = false;
+  else if (a == "-strict-formats") cf::strict_formats = true;
+  else if (a == "-no-strict-formats") cf::strict_formats = false;
+  else if (a == "-app-funct") cf::applicative_functors = true;
+  else if (a == "-no-app-funct") cf::applicative_functors = false;
+  else if (a == "-no-alias-deps") cf::no_alias_deps = true;
+  else if (a == "-alias-deps") cf::no_alias_deps = false;
+  else if (a == "-nolabels") cf::classic = true;
+  else if (a == "-labels") cf::classic = false;
+  else if (a == "-unsafe") cf::unsafe = true;
+  else if (a == "-noassert") cf::noassert = true;
+  else if (a == "-g") cf::debug = true;
+  else if (a == "-no-g") cf::debug = false;
+  else if (a == "-keep-locs") cf::keep_locs = true;
+  else if (a == "-no-keep-locs") cf::keep_locs = false;
+  else if (a == "-keep-docs") cf::keep_docs = true;
+  else if (a == "-no-keep-docs") cf::keep_docs = false;
+}
+
+// -stop-after parsing / typing
+enum class StopAfter { None, Parsing, Typing };
+static StopAfter g_stop_after = StopAfter::None;
+
+// -I directories (resolved) and -nostdlib, for the ported type checker
+static std::vector<std::string> g_incdirs;
+static std::string g_stdlib_dir;
+static bool g_nostdlib = false;
+
+// The ported type checker (typing/, TYPECHECKER.md), opt-in with
+// CPPCAML_TYPECHECK: Compmisc.init_path + initial_env, then
+// Typemod.type_implementation.  Returns false after reporting a type error
+// (ocamlc's location line and the error's constructor until Printtyp is
+// ported).  A part of typing/ the port does not have yet, or an internal
+// failure, lets the compilation go on (CPPCAML_TYPECHECK_DEBUG says why).
+using PortBody = std::function<void(cppcaml::typing::env::t, const cppcaml::typing::typemod::UnitInfo&)>;
+static bool port_typecheck(const std::string& in_path, const std::string& mod, const std::string& stdlib_dir,
+                           const std::string& out, bool intf, const PortBody& body) {
+  namespace ty = cppcaml::typing;
+  static bool installed = false;
+  if (!installed) {
+    ty::typemod::install_forward_refs();
+    installed = true;
+  }
+  const bool debug = cppcaml::dbg_env("CPPCAML_TYPECHECK_DEBUG");
+  try {
+    // Compmisc.init_path: the cwd, the -I directories in command-line
+    // order, then the stdlib
+    std::vector<std::string> visible{""};
+    for (auto& d : g_incdirs) visible.push_back(d);
+    // c++ocamlc finds its stdlib through -I when given one (ocamlc has
+    // Config.standard_library); that directory is not added twice, as the
+    // units of a later duplicate would shadow the opened Stdlib's
+    bool listed = false;
+    for (auto& d : g_incdirs) {
+      std::error_code ec;
+      if (fs::equivalent(d, stdlib_dir, ec)) listed = true;
+    }
+    if (!g_nostdlib && !listed) visible.push_back(stdlib_dir);
+    ty::load_path::init(visible, {});
+    ty::env::reset_cache();
+    // Compile_common: Env.set_current_unit; Compmisc.initial_env
+    ty::env::set_current_unit(ty::UnitInfo{mod, intf ? ty::Uid::From::Intf : ty::Uid::From::Impl});
+    ty::ident::reinit();
+    ty::uid::reinit();
+    ty::types::reset();
+    ty::ctype::reset();
+    ty::Location cmdline = ty::location::none();
+    cmdline.loc_start.pos_fname = cmdline.loc_end.pos_fname = "command line";
+    ty::env::t env0 = ty::typemod::initial_env(
+        cmdline, ty::clflags::nopervasives ? std::nullopt : std::optional<std::string>("Stdlib"), {});
+    ty::typemod::UnitInfo target;
+    target.source_file = in_path;
+    target.modname = mod;
+    target.prefix = fs::path(out).replace_extension("").string();
+    target.has_mli = !intf && fs::exists(fs::path(in_path).replace_extension(".mli"));
+    target.cmi_file = target.prefix + ".cmi";
+    body(env0, target);
+    return true;
+  } catch (const std::bad_function_call&) {
+    if (debug) std::cerr << "c++ocamlc: " << in_path << ": type checker: unported part of typing/\n";
+    return true;
+  } catch (...) {
+    std::optional<ty::error_report::Report> r = ty::error_report::classify(std::current_exception());
+    if (!r) {
+      if (debug) {
+        try {
+          throw;
+        } catch (const std::exception& e) {
+          std::cerr << "c++ocamlc: " << in_path << ": type checker failed: " << e.what() << '\n';
+        } catch (...) {
+          std::cerr << "c++ocamlc: " << in_path << ": type checker failed\n";
+        }
+      }
+      return true;
+    }
+    // an error without a location here: Location.in_file !input_name
+    ty::Location l = ty::location::none();
+    if (r->printed_loc) l = *r->printed_loc;
+    else if (r->loc) l = *r->loc;
+    else l.loc_start.pos_fname = l.loc_end.pos_fname = "";
+    std::cerr << ty::error_report::format_loc(l, in_path);
+    std::cerr << ":\nError: " << r->name << '\n';
+    if (debug && !r->detail.empty()) std::cerr << "  (" << r->detail << ")\n";
+    return false;
+  }
+}
+
 static int compile_ml(const std::string& in_path, const std::string& cmo_out,
                       const std::string& stdlib_dir, bool prof) {
   std::ifstream in(in_path, std::ios::binary);
@@ -216,6 +339,18 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
     lap("parse", tp);
     if (g_dump.parsetree)
       cppcaml::ast::print_dparsetree(structure, in_path, std::cout, dirfiles);
+    if (g_stop_after == StopAfter::Parsing) return 0;
+    if (g_stop_after == StopAfter::Typing || cppcaml::dbg_env("CPPCAML_TYPECHECK")) {
+      bool ok = port_typecheck(in_path, mod, stdlib_dir, cmo_out, /*intf=*/false,
+                               [&](cppcaml::typing::env::t env0, const cppcaml::typing::typemod::UnitInfo& target) {
+                                 namespace ty = cppcaml::typing;
+                                 ty::parsetree::Structure st = ty::parsetree::of_ast(structure, in_path, dirfiles);
+                                 ty::typemod::type_implementation(target, env0, st);
+                               });
+      if (!ok) return 2;
+      lap("typecheck", tp);
+      if (g_stop_after == StopAfter::Typing) return 0;
+    }
     std::vector<std::string> required_globals;
     std::size_t eta_sites = 0, pv_reify = 0;
     std::set<const cppcaml::ast::Expression*> eta_nodes;
@@ -282,22 +417,6 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
     }
     cppcaml::cmo::write_cmo(instrs, mod, cmo_out, required_globals);
     lap("write_cmo", tp);
-    // The strict type check (c++type --check's pass).  Opt-in while its
-    // false-reject rate on real code is measured; it runs AFTER the outputs
-    // are written so it cannot perturb them, and removes them on rejection.
-    if (cppcaml::dbg_env("CPPCAML_TYPECHECK")) {
-      auto errs = cppcaml::structure_typecheck(structure);
-      lap("typecheck", tp);
-      if (!errs.empty()) {
-        for (auto& e : errs)
-          std::cerr << "File \"" << in_path << "\":\nError: " << e << '\n';
-        std::error_code ec;
-        fs::remove(cmo_out, ec);
-        if (!fs::exists(fs::path(in_path).replace_extension(".mli")))
-          fs::remove(fs::path(cmo_out).replace_extension(".cmi"), ec);
-        return 2;
-      }
-    }
     if (prof)
       std::cerr << "  TOTAL compile " << in_path << ": "
                 << std::chrono::duration<double, std::milli>(clk::now() - t0).count() << " ms\n";
@@ -323,6 +442,17 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
   cppcaml::clear_unit_annot_provs();  // S571: annotation provs are per UNIT
   try {
     auto sig = cppcaml::parse_signature(ss.str());
+    if (g_stop_after == StopAfter::Parsing) return 0;
+    if (g_stop_after == StopAfter::Typing || cppcaml::dbg_env("CPPCAML_TYPECHECK")) {
+      bool ok = port_typecheck(in_path, module_name(in_path), g_stdlib_dir, cmi_out, /*intf=*/true,
+                               [&](cppcaml::typing::env::t env0, const cppcaml::typing::typemod::UnitInfo& target) {
+                                 namespace ty = cppcaml::typing;
+                                 ty::parsetree::Signature sg = ty::parsetree::of_ast_signature(sig, in_path, {});
+                                 ty::typemod::type_interface(target, env0, sg);
+                               });
+      if (!ok) return 2;
+      if (g_stop_after == StopAfter::Typing) return 0;
+    }
     cppcaml::cmi::cmiw::write_cmi(cmi_out, module_name(in_path), cppcaml::signature_to_cmi(sig),
                                   {}, /*intf=*/true, /*src_files=*/{in_path},
                                   cppcaml::dbg_env("NOSTAMPBASE")
@@ -401,13 +531,20 @@ static int run_main(int argc, char** argv) {
       return 0;
     } else if (a == "-impl") inputs.push_back(need_arg("-impl"));   // force .ml kind
     else if (a == "-intf") inputs.push_back(need_arg("-intf"));     // force .mli kind
+    else if (a == "-stop-after") {
+      // `typing`: type-check with the ported checker, write nothing
+      std::string pass = need_arg("-stop-after");
+      if (pass == "parsing") g_stop_after = StopAfter::Parsing;
+      else if (pass == "typing") g_stop_after = StopAfter::Typing;
+    }
     else if (kArgIgnore.count(a)) {
       if (strict_flags) reject_ignored(a);
       (void)need_arg(a.c_str());
     }
     else if (kBoolIgnore.count(a) || kBoolIgnore2.count(a)) {
       if (strict_flags) reject_ignored(a);
-      /* else accept, ignore */
+      /* else accept; only the ported type checker reads these */
+      set_typing_flag(a);
     }
     else if (kUnsupportedArg.count(a)) {
       std::cerr << "c++ocamlc: " << a << " is not supported yet\n";
@@ -455,6 +592,11 @@ static int run_main(int argc, char** argv) {
   cppcaml::lambda::set_module_dirs(incdirs);
   cppcaml::lambda::set_nopervasives(nopervasives);
   g_nopervasives = nopervasives;
+  g_incdirs = incdirs;
+  g_stdlib_dir = stdlib_dir;
+  g_nostdlib = nostdlib;
+  cppcaml::typing::clflags::nopervasives = nopervasives;
+  cppcaml::typing::clflags::no_std_include = nostdlib;
   cppcaml::set_infer_module_dirs(incdirs);
   cppcaml::set_infer_stdlib_dir(stdlib_dir);
   cppcaml::cmi::cmiw::set_module_dirs(stdlib_dir, incdirs);
