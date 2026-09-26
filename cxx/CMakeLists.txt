@@ -35,7 +35,12 @@ add_library(cppcaml_core
   src/bytecode.cpp
   src/omarshal.cpp
   src/cmo.cpp
-  src/link.cpp)
+  src/link.cpp
+  # The typing/ port (TYPECHECKER.md).
+  src/typing/ident.cpp
+  src/typing/path.cpp
+  src/typing/types.cpp
+  src/typing/cmi_format.cpp)
 target_include_directories(cppcaml_core PUBLIC include)
 
 # mimalloc: statically link its malloc override into every tool that uses the
@@ -104,3 +109,8 @@ target_link_libraries(c++link PRIVATE cppcaml_core)
 
 add_executable(c++ocamlc src/tools/cppocamlc_main.cpp)
 target_link_libraries(c++ocamlc PRIVATE cppcaml_core)
+
+# Stage-1 oracle for the typing/ port: dump a cmi's decoded Types graph
+# (compared against cxx/harness/typing_cmidump.ml).
+add_executable(c++typing-dump src/tools/typing_dump_main.cpp)
+target_link_libraries(c++typing-dump PRIVATE cppcaml_core)

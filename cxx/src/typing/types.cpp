@@ -1,0 +1,808 @@
+// Port of typing/types.ml.  See types.hpp.
+#include "cppcaml/typing/types.hpp"
+
+#include <algorithm>
+#include <stdexcept>
+#include <unordered_set>
+
+namespace cppcaml::typing {
+
+// zone.hpp's current zone lives here (the first typing/ translation unit).
+static Zone g_default_zone;
+static Zone* g_zone = &g_default_zone;
+Zone& zone() { return *g_zone; }
+void set_zone(Zone* z) { g_zone = z ? z : &g_default_zone; }
+ZoneScope::ZoneScope(Zone& z) : saved(g_zone) { g_zone = &z; }
+ZoneScope::~ZoneScope() { g_zone = saved; }
+
+Location location::none() {
+  Position p{"_none_", 1, 0, -1};
+  return Location{p, p, true};
+}
+
+namespace ident {
+extern void (*unscoped_change_log)(const Unscoped::Change&);
+}
+
+// ---- Variance ------------------------------------------------------------
+namespace variance {
+long single(F f) {
+  switch (f) {
+    case F::May_pos: return 1;
+    case F::May_neg: return 2 + 4;
+    case F::May_weak: return 4;
+    case F::Inj: return 8;
+    case F::Pos: return 16 + 8 + 1;
+    case F::Neg: return 32 + 8 + 4 + 2;
+    case F::Inv: return 63;
+  }
+  return 0;
+}
+t full() { return single(F::Inv); }
+t covariant() { return single(F::Pos); }
+t contravariant() { return single(F::Neg); }
+static t swap(F f1, F f2, t v, t v2) {
+  return set_if(mem(f2, v), f1, set_if(mem(f1, v), f2, v2));
+}
+t conjugate(t v) {
+  t v2 = inter(v, union_(single(F::Inj), single(F::May_weak)));
+  return swap(F::Pos, F::Neg, v, swap(F::May_pos, F::May_neg, v, v2));
+}
+t compose(t v1, t v2) {
+  if (mem(F::Inv, v1) && mem(F::Inj, v2)) return full();
+  bool mp = (mem(F::May_pos, v1) && mem(F::May_pos, v2)) ||
+            (mem(F::May_neg, v1) && mem(F::May_neg, v2));
+  bool mn = (mem(F::May_pos, v1) && mem(F::May_neg, v2)) ||
+            (mem(F::May_neg, v1) && mem(F::May_pos, v2));
+  bool mw = (mem(F::May_weak, v1) && v2 != null) || (v1 != null && mem(F::May_weak, v2));
+  bool inj = mem(F::Inj, v1) && mem(F::Inj, v2);
+  bool pos = (mem(F::Pos, v1) && mem(F::Pos, v2)) || (mem(F::Neg, v1) && mem(F::Neg, v2));
+  bool neg = (mem(F::Pos, v1) && mem(F::Neg, v2)) || (mem(F::Neg, v1) && mem(F::Pos, v2));
+  t v = null;
+  v = set_if(mp, F::May_pos, v);
+  v = set_if(mn, F::May_neg, v);
+  v = set_if(mw, F::May_weak, v);
+  v = set_if(inj, F::Inj, v);
+  v = set_if(pos, F::Pos, v);
+  v = set_if(neg, F::Neg, v);
+  return v;
+}
+t strengthen(t v) {
+  if (mem(F::May_neg, v)) return v;
+  return v & (full() - single(F::May_weak));
+}
+std::vector<t> unknown_signature(bool injective, long arity) {
+  t v = injective ? set(F::Inj, unknown) : unknown;
+  return std::vector<t>(static_cast<std::size_t>(arity), v);
+}
+}  // namespace variance
+
+namespace types {
+
+// ---- singletons ------------------------------------------------------------
+static const Tnil g_tnil{{DescKind::Tnil}};
+static Commutable g_cok{Commutable::Kind::Cok, nullptr};
+static Commutable g_cunknown{Commutable::Kind::Cunknown, nullptr};
+static FieldKind g_fkprivate{FieldKind::Kind::FKprivate, nullptr};
+static FieldKind g_fkpublic{FieldKind::Kind::FKpublic, nullptr};
+static FieldKind g_fkabsent{FieldKind::Kind::FKabsent, nullptr};
+static const RowField g_rfabsent{RowField::Kind::RFabsent};
+static const RowField g_rfnone{RowField::Kind::RFnone};
+static const AbbrevMemo g_mnil{AbbrevMemo::Kind::Mnil};
+
+const TypeDesc* tnil() { return &g_tnil; }
+Commutable* cok() { return &g_cok; }
+Commutable* cunknown() { return &g_cunknown; }
+FieldKind* fkprivate() { return &g_fkprivate; }
+FieldKind* fkpublic() { return &g_fkpublic; }
+FieldKind* fkabsent() { return &g_fkabsent; }
+const RowField* rfabsent() { return &g_rfabsent; }
+const RowField* rfnone() { return &g_rfnone; }
+const AbbrevMemo* mnil() { return &g_mnil; }
+
+// ---- desc constructors ------------------------------------------------------
+const TypeDesc* tvar(OptStr name) { return make<Tvar>(TypeDesc{DescKind::Tvar}, name); }
+const TypeDesc* tarrow(ArgLabel l, TypeExpr* a, TypeExpr* b, Commutable* c) {
+  return make<Tarrow>(TypeDesc{DescKind::Tarrow}, l, a, b, c);
+}
+const TypeDesc* ttuple(Slice<LabeledTy> l) {
+  return make<Ttuple>(TypeDesc{DescKind::Ttuple}, l);
+}
+const TypeDesc* tconstr(Path::t p, Slice<TypeExpr*> args, MemoRef* memo) {
+  return make<Tconstr>(TypeDesc{DescKind::Tconstr}, p, args, memo);
+}
+const TypeDesc* tobject(TypeExpr* f, NameRef* nm) {
+  return make<Tobject>(TypeDesc{DescKind::Tobject}, f, nm);
+}
+const TypeDesc* tfield(std::string_view l, FieldKind* k, TypeExpr* a, TypeExpr* b) {
+  return make<Tfield>(TypeDesc{DescKind::Tfield}, l, k, a, b);
+}
+const TypeDesc* tvariant(const RowDesc* row) {
+  return make<Tvariant>(TypeDesc{DescKind::Tvariant}, row);
+}
+const TypeDesc* tunivar(OptStr name) {
+  return make<Tunivar>(TypeDesc{DescKind::Tunivar}, name);
+}
+const TypeDesc* tpoly(TypeExpr* a, Slice<TypeExpr*> vars) {
+  return make<Tpoly>(TypeDesc{DescKind::Tpoly}, a, vars);
+}
+const TypeDesc* tpackage(const Package* p) {
+  return make<Tpackage>(TypeDesc{DescKind::Tpackage}, p);
+}
+const TypeDesc* tfunctor(ArgLabel l, ident::Unscoped* id, const Package* p, TypeExpr* a) {
+  return make<Tfunctor>(TypeDesc{DescKind::Tfunctor}, l, id, p, a);
+}
+const TypeDesc* texpand(TypeExpr* a, Path::t p, Slice<TypeExpr*> args) {
+  return make<Texpand>(TypeDesc{DescKind::Texpand}, a, p, args);
+}
+const TypeDesc* tlink(TypeExpr* a) { return make<Tlink>(TypeDesc{DescKind::Tlink}, a); }
+const TypeDesc* tsubst(TypeExpr* a, TypeExpr* row) {
+  return make<Tsubst>(TypeDesc{DescKind::Tsubst}, a, row);
+}
+
+// ---- trail (types.ml "Definitions for backtracking") ----------------------
+struct Change {
+  enum class Kind : std::uint8_t {
+    Ctype, Ccompress, Clevel, Cscope, Cname, Crow, Ckind, Ccommu, Cuniv, Cuident
+  };
+  Kind kind;
+  TypeExpr* ty = nullptr;
+  const TypeDesc* desc = nullptr;   // Ctype / Ccompress (old)
+  const TypeDesc* desc2 = nullptr;  // Ccompress (new)
+  long n = 0;                       // Clevel / Cscope
+  NameRef* name = nullptr;          // Cname
+  const PathArgs* name_old = nullptr;
+  RowFieldCell* row = nullptr;      // Crow
+  FieldKind* kind_ = nullptr;       // Ckind
+  Commutable* commu = nullptr;      // Ccommu
+  TyOptRef* univ = nullptr;         // Cuniv
+  TypeExpr* univ_old = nullptr;
+  ident::Unscoped::Change uident{};  // Cuident
+};
+
+struct Changes;  // Change of change * changes ref | Unchanged | Invalid
+struct ChangesRef {
+  const Changes* contents;
+};
+struct Changes {
+  enum class Kind : std::uint8_t { Change, Unchanged, Invalid };
+  Kind kind;
+  const Change* ch = nullptr;
+  ChangesRef* next = nullptr;
+};
+static const Changes g_unchanged{Changes::Kind::Unchanged};
+static const Changes g_invalid{Changes::Kind::Invalid};
+
+// `trail = Local_store.s_table ref Unchanged`: a ref holding the current ref.
+static ChangesRef* g_trail = make<ChangesRef>(&g_unchanged);
+
+static void log_change(const Change& ch) {
+  ChangesRef* r2 = make<ChangesRef>(&g_unchanged);
+  const Change* c = make<Change>(ch);
+  g_trail->contents = make<Changes>(Changes::Kind::Change, c, r2);
+  g_trail = r2;
+}
+
+static void log_uident(const ident::Unscoped::Change& c) {
+  Change ch{Change::Kind::Cuident};
+  ch.uident = c;
+  log_change(ch);
+}
+static const bool g_uident_installed =
+    (ident::unscoped_change_log = &log_uident, true);
+
+// ---- field_kind ------------------------------------------------------------
+FieldKind* field_kind_internal_repr(FieldKind* fk) {
+  while (fk->kind == FieldKind::Kind::FKvar &&
+         fk->field_kind->kind != FieldKind::Kind::FKprivate)
+    fk = fk->field_kind;
+  return fk;
+}
+FieldKindView field_kind_repr(FieldKind* fk) {
+  switch (field_kind_internal_repr(fk)->kind) {
+    case FieldKind::Kind::FKvar: return FieldKindView::Fprivate;
+    case FieldKind::Kind::FKpublic: return FieldKindView::Fpublic;
+    default: return FieldKindView::Fabsent;
+  }
+}
+FieldKind* field_public() { return fkpublic(); }
+FieldKind* field_absent() { return fkabsent(); }
+FieldKind* field_private() {
+  return make<FieldKind>(FieldKind::Kind::FKvar, fkprivate());
+}
+
+// ---- commutable --------------------------------------------------------------
+bool is_commu_ok(const Commutable* c) {
+  while (c->kind == Commutable::Kind::Cvar) c = c->commu;
+  return c->kind == Commutable::Kind::Cok;
+}
+Commutable* commu_ok() { return cok(); }
+Commutable* commu_var() { return make<Commutable>(Commutable::Kind::Cvar, cunknown()); }
+
+// ---- representative ----------------------------------------------------------
+static void repr_update(TypeExpr* t_orig, const TypeDesc* d) {
+  Change ch{Change::Kind::Ccompress};
+  ch.ty = t_orig;
+  ch.desc = t_orig->desc;
+  ch.desc2 = d;
+  log_change(ch);
+  t_orig->desc = d;
+}
+
+static bool absent_field(const TypeDesc* d) {
+  auto* f = as<Tfield>(d);
+  return f && field_kind_internal_repr(f->kind_)->kind == FieldKind::Kind::FKabsent;
+}
+
+static TypeExpr* repr_expand(bool update, TypeExpr* t_orig, TypeExpr* t, Path::t path,
+                             Slice<TypeExpr*> args) {
+  for (;;) {
+    const TypeDesc* d = t->desc;
+    if (auto* l = as<Tlink>(d)) { update = true; t = l->ty; continue; }
+    if (auto* e = as<Texpand>(d)) { update = true; t = e->ty; continue; }
+    if (absent_field(d)) { update = true; t = as<Tfield>(d)->rest; continue; }
+    if (update) repr_update(t_orig, texpand(t, path, args));
+    return t;
+  }
+}
+
+static TypeExpr* repr_link(bool update, TypeExpr* t_orig, TypeExpr* t) {
+  for (;;) {
+    const TypeDesc* d = t->desc;
+    if (auto* l = as<Tlink>(d)) { update = true; t = l->ty; continue; }
+    if (auto* e = as<Texpand>(d)) return repr_expand(true, t_orig, e->ty, e->path, e->args);
+    if (absent_field(d)) { update = true; t = as<Tfield>(d)->rest; continue; }
+    if (update) repr_update(t_orig, tlink(t));
+    return t;
+  }
+}
+
+TypeExpr* repr(TypeExpr* t) {
+  const TypeDesc* d = t->desc;
+  if (auto* l = as<Tlink>(d)) return repr_link(false, t, l->ty);
+  if (auto* e = as<Texpand>(d)) return repr_expand(false, t, e->ty, e->path, e->args);
+  if (absent_field(d)) return repr_link(true, t, as<Tfield>(d)->rest);
+  return t;
+}
+
+const TypeDesc* get_desc(TypeExpr* t) { return repr(t)->desc; }
+long get_level(TypeExpr* t) { return repr(t)->level; }
+long get_scope(TypeExpr* t) { return repr(t)->scope & scope_mask; }
+long get_id(TypeExpr* t) { return repr(t)->id; }
+
+// ---- marks -------------------------------------------------------------------
+struct TypeMark {
+  bool is_hash;
+  long mark = 0;
+  std::vector<TypeExpr*> marked;
+  std::unordered_set<TypeExpr*> visited;
+};
+
+// type_marks = all the bits in marks_mask (Sys.int_size - 27 = 36 of them)
+static std::vector<long> g_available_marks = [] {
+  std::vector<long> v;
+  for (int x = 0; x < 63 - 27; ++x) v.push_back(1L << (x + 27));
+  return v;
+}();
+
+void with_type_mark(const std::function<void(TypeMark&)>& f) {
+  if (!g_available_marks.empty()) {
+    auto old = g_available_marks;
+    TypeMark mk{false, g_available_marks.front()};
+    g_available_marks.erase(g_available_marks.begin());
+    struct Restore {
+      std::vector<long>& avail;
+      std::vector<long> old;
+      TypeMark& mk;
+      ~Restore() {
+        avail = std::move(old);
+        for (TypeExpr* ty : mk.marked) ty->scope &= ~mk.mark;
+      }
+    } restore{g_available_marks, std::move(old), mk};
+    f(mk);
+  } else {
+    TypeMark mk{true};
+    f(mk);
+  }
+}
+
+bool not_marked_node(TypeMark& mark, TypeExpr* t) {
+  if (!mark.is_hash) return (repr(t)->scope & mark.mark) == 0;
+  return !mark.visited.count(repr(t));
+}
+
+static bool try_mark_transient(TypeMark& mark, TypeExpr* ty) {
+  if (!mark.is_hash) {
+    if (ty->scope & mark.mark) return false;
+    ty->scope |= mark.mark;
+    mark.marked.push_back(ty);
+    return true;
+  }
+  return mark.visited.insert(ty).second;
+}
+bool try_mark_node(TypeMark& mark, TypeExpr* t) { return try_mark_transient(mark, repr(t)); }
+
+// ---- kept abbreviations ------------------------------------------------------
+const PathArgs* get_abbrev(TypeExpr* t) {
+  repr(t);
+  if (auto* e = as<Texpand>(t->desc)) return make<PathArgs>(e->path, e->args);
+  return nullptr;
+}
+TypeExpr* ignore_abbrev(TypeExpr* t) { return repr(t); }
+
+// ---- Transient_expr ------------------------------------------------------------
+namespace transient_expr {
+TypeExpr* create(const TypeDesc* desc, long level, long scope, long id) {
+  return make<TypeExpr>(desc, level, scope, id);
+}
+void set_desc(TypeExpr* ty, const TypeDesc* d) { ty->desc = d; }
+void set_stub_desc(TypeExpr* ty, const TypeDesc* d) {
+  auto* v = as<Tvar>(ty->desc);
+  if (!v || v->name.some) throw std::logic_error("Types.Transient_expr.set_stub_desc");
+  ty->desc = d;
+}
+void set_level(TypeExpr* ty, long lv) { ty->level = lv; }
+long get_scope(TypeExpr* ty) { return ty->scope & scope_mask; }
+long get_marks(TypeExpr* ty) { return static_cast<long>(static_cast<unsigned long>(ty->scope) >> 27); }
+void set_scope(TypeExpr* ty, long sc) {
+  if (sc & marks_mask) throw std::invalid_argument("Types.Transient_expr.set_scope");
+  ty->scope = (ty->scope & marks_mask) | sc;
+}
+}  // namespace transient_expr
+
+bool eq_type(TypeExpr* a, TypeExpr* b) { return a == b || repr(a) == repr(b); }
+int compare_type(TypeExpr* a, TypeExpr* b) {
+  long x = get_id(a), y = get_id(b);
+  return x < y ? -1 : x > y ? 1 : 0;
+}
+
+// ---- rows ----------------------------------------------------------------------
+const RowDesc* create_row(Slice<RowFieldEntry> fields, TypeExpr* more, bool closed,
+                          const FixedExplanation* fixed, const PathArgs* name) {
+  return make<RowDesc>(fields, more, closed, fixed, name);
+}
+
+std::vector<RowFieldEntry> row_fields(const RowDesc* row) {
+  std::vector<RowFieldEntry> out;
+  for (;;) {
+    out.insert(out.end(), row->row_fields.begin(), row->row_fields.end());
+    auto* v = as<Tvariant>(get_desc(row->row_more));
+    if (!v) return out;
+    row = v->row;
+  }
+}
+
+static const RowDesc* row_repr_no_fields(const RowDesc* row) {
+  for (;;) {
+    auto* v = as<Tvariant>(get_desc(row->row_more));
+    if (!v) return row;
+    row = v->row;
+  }
+}
+
+TypeExpr* row_more(const RowDesc* row) { return row_repr_no_fields(row)->row_more; }
+bool row_closed(const RowDesc* row) { return row_repr_no_fields(row)->row_closed; }
+const FixedExplanation* row_fixed(const RowDesc* row) {
+  return row_repr_no_fields(row)->row_fixed;
+}
+const PathArgs* row_name(const RowDesc* row) { return row_repr_no_fields(row)->row_name; }
+
+const RowField* get_row_field(std::string_view tag, const RowDesc* row) {
+  for (;;) {
+    for (auto& e : row->row_fields)
+      if (e.label == tag) return e.field;
+    auto* v = as<Tvariant>(get_desc(row->row_more));
+    if (!v) return rfabsent();
+    row = v->row;
+  }
+}
+
+const RowDesc* set_row_name(const RowDesc* row, const PathArgs* name) {
+  auto fields = row_fields(row);
+  const RowDesc* r = row_repr_no_fields(row);
+  return make<RowDesc>(slice(fields), r->row_more, r->row_closed, r->row_fixed, name);
+}
+
+const RowDesc* subst_row_name_path(
+    const std::vector<std::pair<Ident::t, Path::t>>& id_map, const RowDesc* row) {
+  const PathArgs* nm = row_name(row);
+  if (!nm) return row;
+  return set_row_name(row, make<PathArgs>(path::subst(id_map, nm->path), nm->args));
+}
+
+RowDescRepr row_repr(const RowDesc* row) {
+  auto fields = row_fields(row);
+  const RowDesc* r = row_repr_no_fields(row);
+  return {std::move(fields), r->row_more, r->row_closed, r->row_fixed, r->row_name};
+}
+
+// row_field_repr_aux: follow the ext chain, accumulating conjunct lists.
+static const RowField* row_field_repr_aux(std::vector<TypeExpr*> tl, const RowField* f) {
+  for (;;) {
+    switch (f->kind) {
+      case RowField::Kind::RFeither: {
+        const RowField* nxt = f->ext->contents;
+        if (nxt->kind == RowField::Kind::RFnone) {
+          std::vector<TypeExpr*> args = tl;
+          args.insert(args.end(), f->arg_type.begin(), f->arg_type.end());
+          return make<RowField>(RowField::Kind::RFeither, nullptr, f->no_arg, slice(args),
+                                f->matched, f->ext);
+        }
+        tl.insert(tl.end(), f->arg_type.begin(), f->arg_type.end());
+        f = nxt;
+        continue;
+      }
+      case RowField::Kind::RFpresent:
+        if (f->present && !tl.empty())
+          return make<RowField>(RowField::Kind::RFpresent, tl.front());
+        return f;
+      default:
+        return f;
+    }
+  }
+}
+
+RowFieldView row_field_repr(const RowField* fi) {
+  const RowField* r = row_field_repr_aux({}, fi);
+  RowFieldView v;
+  switch (r->kind) {
+    case RowField::Kind::RFeither:
+      v.kind = RowFieldView::Kind::Reither;
+      v.constant = r->no_arg;
+      v.arg_types.assign(r->arg_type.begin(), r->arg_type.end());
+      v.matched = r->matched;
+      break;
+    case RowField::Kind::RFpresent:
+      v.kind = RowFieldView::Kind::Rpresent;
+      v.present = r->present;
+      break;
+    default:
+      v.kind = RowFieldView::Kind::Rabsent;
+  }
+  return v;
+}
+
+static RowFieldCell* row_field_ext(const RowField* fi) {
+  for (;;) {
+    if (fi->kind != RowField::Kind::RFeither) throw std::logic_error("Types.row_field_ext");
+    if (fi->ext->contents->kind == RowField::Kind::RFnone) return fi->ext;
+    fi = fi->ext->contents;
+  }
+}
+
+const RowField* rf_present(TypeExpr* oty) {
+  return make<RowField>(RowField::Kind::RFpresent, oty);
+}
+const RowField* rf_absent() { return rfabsent(); }
+const RowField* rf_either(const RowField* use_ext_of, bool no_arg,
+                          Slice<TypeExpr*> arg_type, bool matched) {
+  RowFieldCell* ext = use_ext_of ? row_field_ext(use_ext_of) : make<RowFieldCell>(rfnone());
+  return make<RowField>(RowField::Kind::RFeither, nullptr, no_arg, arg_type, matched, ext);
+}
+const RowField* rf_either_of(TypeExpr* oty) {
+  if (!oty) return rf_either(nullptr, true, {}, false);
+  return rf_either(nullptr, false, slice({oty}), false);
+}
+bool eq_row_field_ext(const RowField* a, const RowField* b) {
+  return row_field_ext(a) == row_field_ext(b);
+}
+bool changed_row_field_exts(const std::vector<const RowField*>& l,
+                            const std::function<void()>& f) {
+  std::vector<RowFieldCell*> exts;
+  for (auto* x : l) exts.push_back(row_field_ext(x));
+  f();
+  for (auto* r : exts)
+    if (r->contents->kind != RowField::Kind::RFnone) return true;
+  return false;
+}
+
+// ---- signature helpers ----------------------------------------------------------
+Visibility item_visibility(const SignatureItem* it) { return it->vis; }
+
+std::vector<Ident::t> bound_value_identifiers(Signature sg) {
+  std::vector<Ident::t> out;
+  using SK = SignatureItem::Kind;
+  for (auto* it : sg) {
+    switch (it->kind) {
+      case SK::Sig_value:
+        if (it->value->val_kind.kind == ValueKind::Kind::Val_reg) out.push_back(it->id);
+        break;
+      case SK::Sig_typext:
+        out.push_back(it->id);
+        break;
+      case SK::Sig_module:
+        if (it->presence == ModulePresence::Mp_present) out.push_back(it->id);
+        break;
+      case SK::Sig_class:
+        out.push_back(it->id);
+        break;
+      default:
+        break;
+    }
+  }
+  return out;
+}
+
+Ident::t signature_item_id(const SignatureItem* it) { return it->id; }
+
+// ---- type creators -------------------------------------------------------------
+static long g_new_id = -1;
+long& new_id() { return g_new_id; }
+void reset() { g_new_id = -1; }
+
+TypeExpr* create_expr(const TypeDesc* desc, long level, long scope, long id) {
+  return transient_expr::create(desc, level, scope, id);
+}
+
+TypeExpr* proto_newty3(long level, long scope, const TypeDesc* desc) {
+  ++g_new_id;
+  return create_expr(desc, level, scope, g_new_id);
+}
+
+// ---- backtracking utilities ----------------------------------------------------
+static void undo_change(const Change& c) {
+  switch (c.kind) {
+    case Change::Kind::Ctype:
+    case Change::Kind::Ccompress:
+      transient_expr::set_desc(c.ty, c.desc);
+      break;
+    case Change::Kind::Clevel:
+      transient_expr::set_level(c.ty, c.n);
+      break;
+    case Change::Kind::Cscope:
+      transient_expr::set_scope(c.ty, c.n);
+      break;
+    case Change::Kind::Cname:
+      c.name->contents = c.name_old;
+      break;
+    case Change::Kind::Crow:
+      c.row->contents = rfnone();
+      break;
+    case Change::Kind::Ckind:
+      c.kind_->field_kind = fkprivate();
+      break;
+    case Change::Kind::Ccommu:
+      c.commu->commu = cunknown();
+      break;
+    case Change::Kind::Cuniv:
+      c.univ->contents = c.univ_old;
+      break;
+    case Change::Kind::Cuident:
+      ident::Unscoped::undo_change(c.uident);
+      break;
+  }
+}
+
+static long g_last_snapshot = 0;
+
+static void log_type(TypeExpr* ty) {
+  if (ty->id <= g_last_snapshot) {
+    Change ch{Change::Kind::Ctype};
+    ch.ty = ty;
+    ch.desc = ty->desc;
+    log_change(ch);
+  }
+}
+
+void link_expand(TypeExpr* ty, TypeExpr* ty2) {
+  ty = repr(ty);
+  ty2 = repr(ty2);
+  if (ty == ty2) return;
+  auto* c = as<Tconstr>(ty->desc);
+  if (!c) throw std::logic_error("Types.link_expand");
+  log_type(ty);
+  transient_expr::set_desc(ty, texpand(ty2, c->path, c->args));
+}
+
+void forget_abbrev(TypeExpr* ty) {
+  repr(ty);
+  auto* e = as<Texpand>(ty->desc);
+  if (!e) throw std::logic_error("Types.forget_abbrev");
+  log_type(ty);
+  ty->desc = tlink(e->ty);
+}
+
+void link_type(TypeExpr* ty, TypeExpr* ty2) {
+  ty = repr(ty);
+  TypeExpr* ty3 = repr(ty2);
+  if (ty == ty3) return;
+  log_type(ty);
+  const TypeDesc* desc = ty->desc;
+  if (ty2->desc->kind == DescKind::Tlink || ty2->desc->kind == DescKind::Texpand)
+    transient_expr::set_desc(ty, ty2->desc);  // keep Texpand for printing
+  else
+    transient_expr::set_desc(ty, tlink(ty2));
+  auto* v1 = as<Tvar>(desc);
+  auto* v2 = as<Tvar>(ty3->desc);
+  if (v1 && v2) {
+    if (v1->name.some && !v2->name.some) {
+      log_type(ty3);
+      transient_expr::set_desc(ty3, tvar(v1->name));
+    } else if (v1->name.some && v2->name.some) {
+      if (ty->level < ty3->level) {
+        log_type(ty3);
+        transient_expr::set_desc(ty3, tvar(v1->name));
+      }
+    }
+  }
+}
+
+void set_type_desc(TypeExpr* ty, const TypeDesc* td) {
+  ty = repr(ty);
+  if (td != ty->desc) {
+    log_type(ty);
+    transient_expr::set_desc(ty, td);
+  }
+}
+
+void set_level(TypeExpr* ty, long level) {
+  ty = repr(ty);
+  if (level != ty->level) {
+    if (ty->id <= g_last_snapshot) {
+      Change ch{Change::Kind::Clevel};
+      ch.ty = ty;
+      ch.n = ty->level;
+      log_change(ch);
+    }
+    transient_expr::set_level(ty, level);
+  }
+}
+
+void set_scope(TypeExpr* ty, long scope) {
+  ty = repr(ty);
+  long prev_scope = ty->scope & scope_mask;
+  if (scope != prev_scope) {
+    if (ty->id <= g_last_snapshot) {
+      Change ch{Change::Kind::Cscope};
+      ch.ty = ty;
+      ch.n = prev_scope;
+      log_change(ch);
+    }
+    transient_expr::set_scope(ty, scope);
+  }
+}
+
+void set_univar(TyOptRef* rty, TypeExpr* ty) {
+  Change ch{Change::Kind::Cuniv};
+  ch.univ = rty;
+  ch.univ_old = rty->contents;
+  log_change(ch);
+  rty->contents = ty;
+}
+
+void set_name(NameRef* nm, const PathArgs* v) {
+  Change ch{Change::Kind::Cname};
+  ch.name = nm;
+  ch.name_old = nm->contents;
+  log_change(ch);
+  nm->contents = v;
+}
+
+void link_row_field_ext(const RowField* inside, const RowField* v) {
+  for (;;) {
+    if (inside->kind != RowField::Kind::RFeither)
+      throw std::logic_error("Types.link_row_field_ext");
+    RowFieldCell* e = inside->ext;
+    if (e->contents->kind == RowField::Kind::RFnone) {
+      if (v->kind == RowField::Kind::RFnone)
+        throw std::logic_error("Types.link_row_field_ext: RFnone");
+      Change ch{Change::Kind::Crow};
+      ch.row = e;
+      log_change(ch);
+      e->contents = v;
+      return;
+    }
+    inside = e->contents;
+  }
+}
+
+void link_kind(FieldKind* inside, FieldKind* k) {
+  for (;;) {
+    if (inside->kind != FieldKind::Kind::FKvar) throw std::logic_error("Types.link_kind");
+    if (inside->field_kind->kind == FieldKind::Kind::FKprivate) {
+      // prevent a loop by normalizing k and comparing it with inside
+      k = field_kind_internal_repr(k);
+      if (k != inside) {
+        Change ch{Change::Kind::Ckind};
+        ch.kind_ = inside;
+        log_change(ch);
+        inside->field_kind = k;
+      }
+      return;
+    }
+    inside = inside->field_kind;
+  }
+}
+
+static Commutable* commu_repr(Commutable* c) {
+  while (c->kind == Commutable::Kind::Cvar &&
+         c->commu->kind != Commutable::Kind::Cunknown)
+    c = c->commu;
+  return c;
+}
+
+void link_commu(Commutable* inside, Commutable* c) {
+  for (;;) {
+    if (inside->kind != Commutable::Kind::Cvar) throw std::logic_error("Types.link_commu");
+    if (inside->commu->kind == Commutable::Kind::Cunknown) {
+      c = commu_repr(c);
+      if (c != inside) {
+        Change ch{Change::Kind::Ccommu};
+        ch.commu = inside;
+        log_change(ch);
+        inside->commu = c;
+      }
+      return;
+    }
+    inside = inside->commu;
+  }
+}
+
+void set_commu_ok(Commutable* c) { link_commu(c, cok()); }
+
+Snapshot snapshot() {
+  long old = g_last_snapshot;
+  g_last_snapshot = g_new_id;
+  return {g_trail, old};
+}
+
+void backtrack(const std::function<void()>& cleanup, Snapshot s) {
+  const Changes* c = s.changes->contents;
+  switch (c->kind) {
+    case Changes::Kind::Unchanged:
+      g_last_snapshot = s.old;
+      return;
+    case Changes::Kind::Invalid:
+      throw std::runtime_error("Types.backtrack");
+    case Changes::Kind::Change: {
+      cleanup();
+      // rev_log accumulates oldest-first then the list is walked in that
+      // order: `rev_log [] change` builds newest-first, and List.iter undoes
+      // newest-first.
+      std::vector<const Change*> backlog;
+      for (const Changes* x = c;;) {
+        if (x->kind == Changes::Kind::Unchanged) break;
+        if (x->kind == Changes::Kind::Invalid) throw std::logic_error("Types.rev_log");
+        const Changes* d = x->next->contents;
+        x->next->contents = &g_invalid;
+        backlog.insert(backlog.begin(), x->ch);
+        x = d;
+      }
+      for (const Change* ch : backlog) undo_change(*ch);
+      s.changes->contents = &g_unchanged;
+      g_last_snapshot = s.old;
+      g_trail = s.changes;
+      return;
+    }
+  }
+}
+
+void undo_first_change_after(Snapshot s) {
+  const Changes* c = s.changes->contents;
+  if (c->kind == Changes::Kind::Change) undo_change(*c->ch);
+}
+
+void undo_compress(Snapshot s) {
+  const Changes* c = s.changes->contents;
+  if (c->kind != Changes::Kind::Change) return;
+  // rev_compress_log: the refs whose change is a Ccompress, newest first.
+  std::vector<ChangesRef*> log;
+  for (ChangesRef* r = s.changes;;) {
+    const Changes* x = r->contents;
+    if (x->kind != Changes::Kind::Change) break;
+    if (x->ch->kind == Change::Kind::Ccompress) log.insert(log.begin(), r);
+    r = x->next;
+  }
+  for (ChangesRef* r : log) {
+    const Changes* x = r->contents;
+    if (x->kind == Changes::Kind::Change && x->ch->kind == Change::Kind::Ccompress &&
+        x->ch->ty->desc == x->ch->desc2) {
+      transient_expr::set_desc(x->ch->ty, x->ch->desc);
+      r->contents = x->next->contents;
+    }
+  }
+}
+
+}  // namespace types
+
+}  // namespace cppcaml::typing

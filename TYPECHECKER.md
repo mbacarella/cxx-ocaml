@@ -72,3 +72,49 @@ The ported typer, validated against ocamlc:
 Staging: until its typedtree is trusted, the ported typer only decides
 accept/reject in c++ocamlc, so .cmo/.cmi output (and DDC) cannot regress.
 Replacing `infer_check` as codegen's source of types comes after that.
+
+## Port plan (decided 2026-09-26)
+
+**Layout.**  Namespace `cppcaml::typing`.  One C++ module per OCaml module,
+same name: `cxx/include/cppcaml/typing/<m>.hpp` + `cxx/src/typing/<m>.cpp`
+(`ident`, `path`, `types`, `btype`, `subst`, `predef`, `env`, `ctype`,
+`typetexp`, `typecore`, ...).  Functions keep ocamlc's names and structure,
+and comments cite the OCaml source (`ctype.ml unify3`).  Deviate only where
+C++ forces it, and say so at the site.
+
+**Memory.**  OCaml's heap becomes arenas (`typing/zone.hpp`).  `type_expr`
+nodes, descs, paths, idents and persistent-map nodes are allocated in a zone
+and never freed individually.  Cached cmis live in a long-lived zone; each
+compilation unit's typing lives in its own zone, dropped after the unit.
+(ocamlc allocates ~430 MB in total typing typecore.ml, but most of that is
+short-lived lists and closures that become C++ locals.)  Immutable OCaml
+values stay immutable; OCaml lists inside them become zone `Slice`s.
+
+**Representation.**  `type_expr` is `transient_expr {desc, level, scope,
+id}`, and `desc` points to an immutable `type_desc` node (one struct per
+constructor, switch on `kind`), so the trail can log and restore old descs
+exactly as `types.ml` does.  `row_field`, `field_kind` and `commutable`
+keep their mutable indirection cells.  The trail (`Types.snapshot` /
+`backtrack`) is ported verbatim.
+
+**Loading cmis.**  `typing/cmi_format` decodes the marshal arena
+(`marshal.hpp`, which already reconstructs sharing and cycles) straight
+into `typing::Types`, value by value: that is `input_value`.  It doesn't go
+through the deprecated `cmi.hpp` model.
+
+**Stage 1 oracle.**  `cxx/harness/typing_cmidump.ml` (compiler-libs) prints a
+structural dump of a cmi's `Types` graph: every constructor, every field,
+sharing as first-visit numbering.  The C++ `c++typing-dump` prints the same
+from the port.  The two must be identical on every .cmi in the tree
+(`cxx/harness/typing_cmi_parity.sh`).
+
+**Stages.**
+1. `Ident`, `Path`, `Types` (+ trail), `Cmi_format` read: dump parity on all cmis.
+2. `Btype`, `Subst`, `Predef`, `Persistent_env`, `Env` (lookups, lazy
+   components, strengthening via `Mtype`).
+3. `Ctype`: levels, `newvar`, `instance`/`copy`, `generalize`, `expand_head`
+   and abbreviation memos, `unify`, `moregen`, `eqtype`, `filter_arrow`, ...
+4. `Typetexp`, `Typecore` (core expressions and patterns, `Parmatch`), with
+   ocamlc's error messages.  `CPPCAML_TYPECHECK` switches from the
+   deprecated strict pass to the port here.
+5. `Typedecl`, `Typemod`, `Includemod`, `Includecore`, `Mtype`, then `Typeclass`.
