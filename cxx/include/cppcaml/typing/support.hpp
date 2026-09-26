@@ -71,6 +71,24 @@ struct Uid {
   From from = From::Intf;
 };
 
+// Unit_info.t, as far as typing needs it (modname and intf/impl kind).
+struct UnitInfo {
+  std::string modname;
+  Uid::From kind = Uid::From::Impl;
+};
+
+// Shape.Uid functions (shape.ml).
+namespace uid {
+Uid mk(const UnitInfo* current_unit);
+Uid mk_local_opaque(const UnitInfo* current_unit);
+Uid of_compilation_unit_id(std::string_view name);
+Uid of_predef_id(std::string_view name);
+inline Uid internal_not_actually_unique() { return Uid{}; }
+bool for_actual_declaration(const Uid& u);
+bool equal(const Uid& a, const Uid& b);
+void reinit();
+}  // namespace uid
+
 // ---- Primitive.description ---------------------------------------------
 enum class BoxedInteger : std::uint8_t { Pnativeint, Pint32, Pint64 };
 struct NativeRepr {

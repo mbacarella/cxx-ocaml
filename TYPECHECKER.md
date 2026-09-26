@@ -97,6 +97,16 @@ exactly as `types.ml` does.  `row_field`, `field_kind` and `commutable`
 keep their mutable indirection cells.  The trail (`Types.snapshot` /
 `backtrack`) is ported verbatim.
 
+**Evaluation order.**  OCaml evaluates the arguments of a constructor, a
+tuple, a list literal or a function application right to left, and a record
+literal's fields right to left in the record type's *definition* order,
+whatever order the source writes them in (`{b; a; c}` of `{a; b; c}` runs
+c, b, a).  `let .. and ..` and `List.map` run left to right, and `let`
+sequences explicitly (all verified with ocamlc).  Where those arguments have effects (fresh
+type ids, levels, the trail, marks, warnings), the port evaluates them in
+the same order, spelled out with locals.  Otherwise fresh ids, and with them
+variable naming and set orders, drift from ocamlc.
+
 **Loading cmis.**  `typing/cmi_format` decodes the marshal arena
 (`marshal.hpp`, which already reconstructs sharing and cycles) straight
 into `typing::Types`, value by value: that is `input_value`.  It doesn't go

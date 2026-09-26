@@ -536,6 +536,7 @@ bool try_mark_node(TypeMark& mark, TypeExpr* t);
 
 // kept abbreviations
 const PathArgs* get_abbrev(TypeExpr* t);  // (path, args) option
+void iter_abbrev(const std::function<void(Path::t, Slice<TypeExpr*>)>& f, TypeExpr* t);
 TypeExpr* ignore_abbrev(TypeExpr* t);
 void forget_abbrev(TypeExpr* t);
 

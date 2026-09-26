@@ -55,4 +55,11 @@ std::optional<std::pair<Ident::t, std::vector<std::string_view>>> flatten(t p);
 
 }  // namespace path
 
+// Path.Map (keys ordered by Path.compare)
+struct PathCmp {
+  int operator()(Path::t a, Path::t b) const { return path::compare(a, b); }
+};
+template <class V>
+using PathMap = PMap<Path::t, V, PathCmp>;
+
 }  // namespace cppcaml::typing

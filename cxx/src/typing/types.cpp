@@ -11,14 +11,55 @@ namespace cppcaml::typing {
 static Zone g_default_zone;
 static Zone* g_zone = &g_default_zone;
 Zone& zone() { return *g_zone; }
+Zone& permanent_zone() { return g_default_zone; }
 void set_zone(Zone* z) { g_zone = z ? z : &g_default_zone; }
 ZoneScope::ZoneScope(Zone& z) : saved(g_zone) { g_zone = &z; }
 ZoneScope::~ZoneScope() { g_zone = saved; }
 
 Location location::none() {
-  Position p{"_none_", 1, 0, -1};
+  Position p{"_none_", 0, 0, -1};  // Lexing.dummy_pos with pos_fname "_none_"
   return Location{p, p, true};
 }
+
+namespace uid {
+static long g_id = -1, g_id_param = -1;
+void reinit() { g_id = -1; g_id_param = -1; }
+Uid mk(const UnitInfo* current_unit) {
+  Uid u;
+  u.kind = Uid::Kind::Item;
+  if (current_unit) {
+    u.comp_unit = zstr(current_unit->modname);
+    u.from = current_unit->kind;
+  } else {
+    u.from = Uid::From::Impl;
+  }
+  u.id = ++g_id;
+  return u;
+}
+Uid mk_local_opaque(const UnitInfo* current_unit) {
+  Uid u;
+  u.kind = Uid::Kind::Local_opaque_item;
+  if (current_unit) u.comp_unit = zstr(current_unit->modname);
+  u.id = ++g_id_param;
+  return u;
+}
+Uid of_compilation_unit_id(std::string_view name) {
+  Uid u;
+  u.kind = Uid::Kind::Compilation_unit;
+  u.comp_unit = zstr(name);
+  return u;
+}
+Uid of_predef_id(std::string_view name) {
+  Uid u;
+  u.kind = Uid::Kind::Predef;
+  u.comp_unit = zstr(name);
+  return u;
+}
+bool for_actual_declaration(const Uid& u) { return u.kind == Uid::Kind::Item; }
+bool equal(const Uid& a, const Uid& b) {
+  return a.kind == b.kind && a.comp_unit == b.comp_unit && a.id == b.id && a.from == b.from;
+}
+}  // namespace uid
 
 namespace ident {
 extern void (*unscoped_change_log)(const Unscoped::Change&);
@@ -327,6 +368,10 @@ const PathArgs* get_abbrev(TypeExpr* t) {
   repr(t);
   if (auto* e = as<Texpand>(t->desc)) return make<PathArgs>(e->path, e->args);
   return nullptr;
+}
+void iter_abbrev(const std::function<void(Path::t, Slice<TypeExpr*>)>& f, TypeExpr* t) {
+  repr(t);
+  if (auto* e = as<Texpand>(t->desc)) f(e->path, e->args);
 }
 TypeExpr* ignore_abbrev(TypeExpr* t) { return repr(t); }
 

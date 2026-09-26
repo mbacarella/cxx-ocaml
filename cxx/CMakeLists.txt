@@ -40,8 +40,18 @@ add_library(cppcaml_core
   src/typing/ident.cpp
   src/typing/path.cpp
   src/typing/types.cpp
+  src/typing/btype.cpp
+  src/typing/datarepr.cpp
+  src/typing/predef.cpp
+  src/typing/subst.cpp
+  src/typing/persistent_env.cpp
   src/typing/cmi_format.cpp)
 target_include_directories(cppcaml_core PUBLIC include)
+# The typing/ port initializes aggregates partially on purpose (an OCaml
+# constructor's unused fields stay defaulted).
+file(GLOB CPPCAML_TYPING_SOURCES CONFIGURE_DEPENDS src/typing/*.cpp)
+set_source_files_properties(${CPPCAML_TYPING_SOURCES} src/tools/typing_dump_main.cpp
+  PROPERTIES COMPILE_OPTIONS -Wno-missing-field-initializers)
 
 # mimalloc: statically link its malloc override into every tool that uses the
 # core library.  glibc malloc is the measured bottleneck (the compiler is

@@ -75,6 +75,9 @@ class Zone {
 // unit each install their own (ZoneScope).
 Zone& zone();
 void set_zone(Zone* z);
+// Never dropped: process-long singletons (Predef's idents and types, the
+// shared constant descs) are allocated here, whatever zone is current.
+Zone& permanent_zone();
 struct ZoneScope {
   Zone* saved;
   explicit ZoneScope(Zone& z);
@@ -116,63 +119,65 @@ Slice<T> slice(std::initializer_list<T> l) {
 inline std::string_view zstr(std::string_view s) { return zone().str(s); }
 
 // ---------------------------------------------------------------------------
-// A persistent balanced map with string keys: stdlib map.ml's AVL, ported
-// (Misc.Stdlib.String.Map -- Types.Meths / Types.Vars, Env's tables).
-// Nodes are zone-allocated and immutable; an empty map is nullptr.
+// A persistent balanced map: stdlib map.ml's AVL, ported.  `Cmp` is a
+// functor returning <0 / 0 / >0 like OCaml's `compare`.  Nodes are
+// zone-allocated and immutable; an empty map is nullptr.  StrMap is
+// Misc.Stdlib.String.Map (Types.Meths / Vars); Path.Map lives in path.hpp.
 
-template <class V>
-struct StrMapNode {
-  const StrMapNode* l;
-  std::string_view v;
+template <class K, class V>
+struct PMapNode {
+  const PMapNode* l;
+  K v;
   V d;
-  const StrMapNode* r;
+  const PMapNode* r;
   int h;
 };
 
-template <class V>
-class StrMap {
+template <class K, class V, class Cmp>
+class PMap {
  public:
-  using Node = StrMapNode<V>;
-  StrMap() = default;
-  explicit StrMap(const Node* t) : t_(t) {}
+  using Node = PMapNode<K, V>;
+  PMap() = default;
+  explicit PMap(const Node* t) : t_(t) {}
   const Node* root() const { return t_; }
   bool is_empty() const { return t_ == nullptr; }
+  bool same_as(const PMap& o) const { return t_ == o.t_; }
 
-  const V* find_opt(std::string_view k) const {
+  const V* find_opt(const K& k) const {
     for (const Node* n = t_; n;) {
-      int c = k.compare(n->v);
+      int c = Cmp{}(k, n->v);
       if (c == 0) return &n->d;
       n = c < 0 ? n->l : n->r;
     }
     return nullptr;
   }
-  bool mem(std::string_view k) const { return find_opt(k) != nullptr; }
-  StrMap add(std::string_view k, const V& d) const { return StrMap(add_(k, d, t_)); }
+  bool mem(const K& k) const { return find_opt(k) != nullptr; }
+  PMap add(const K& k, const V& d) const { return PMap(add_(k, d, t_)); }
+  PMap remove(const K& k) const { return PMap(remove_(k, t_)); }
 
+  // in increasing key order (Map.iter / Map.fold)
   template <class F>
   void iter(F&& f) const { iter_(t_, f); }
-  std::vector<std::pair<std::string_view, V>> bindings() const {
-    std::vector<std::pair<std::string_view, V>> out;
-    iter([&](std::string_view k, const V& d) { out.emplace_back(k, d); });
+  std::vector<std::pair<K, V>> bindings() const {
+    std::vector<std::pair<K, V>> out;
+    iter([&](const K& k, const V& d) { out.emplace_back(k, d); });
     return out;
   }
+  template <class F>
+  PMap map(F&& f) const { return PMap(map_(t_, f)); }
 
-  // map.ml `create` / `bal`, used by the cmi decoder to rebuild a marshaled
-  // tree node by node (the shape is kept exactly).
-  static const Node* create(const Node* l, std::string_view x, const V& d,
-                            const Node* r) {
+  static const Node* create(const Node* l, const K& x, const V& d, const Node* r) {
     int hl = height(l), hr = height(r);
     return make<Node>(l, x, d, r, hl >= hr ? hl + 1 : hr + 1);
   }
-  static const Node* node(const Node* l, std::string_view x, const V& d,
-                          const Node* r, int h) {
+  // Rebuild a marshaled node exactly (the cmi decoder).
+  static const Node* node(const Node* l, const K& x, const V& d, const Node* r, int h) {
     return make<Node>(l, x, d, r, h);
   }
 
  private:
   static int height(const Node* n) { return n ? n->h : 0; }
-  static const Node* bal(const Node* l, std::string_view x, const V& d,
-                         const Node* r) {
+  static const Node* bal(const Node* l, const K& x, const V& d, const Node* r) {
     int hl = height(l), hr = height(r);
     if (hl > hr + 2) {
       const Node* ll = l->l; const Node* lr = l->r;
@@ -186,12 +191,37 @@ class StrMap {
     }
     return create(l, x, d, r);
   }
-  static const Node* add_(std::string_view x, const V& data, const Node* m) {
+  static const Node* add_(const K& x, const V& data, const Node* m) {
     if (!m) return make<Node>(nullptr, x, data, nullptr, 1);
-    int c = x.compare(m->v);
+    int c = Cmp{}(x, m->v);
     if (c == 0) return make<Node>(m->l, x, data, m->r, m->h);
     if (c < 0) return bal(add_(x, data, m->l), m->v, m->d, m->r);
     return bal(m->l, m->v, m->d, add_(x, data, m->r));
+  }
+  static const Node* min_binding(const Node* t) {
+    while (t->l) t = t->l;
+    return t;
+  }
+  static const Node* remove_min_binding(const Node* t) {
+    if (!t->l) return t->r;
+    return bal(remove_min_binding(t->l), t->v, t->d, t->r);
+  }
+  static const Node* merge(const Node* t1, const Node* t2) {
+    if (!t1) return t2;
+    if (!t2) return t1;
+    const Node* m = min_binding(t2);
+    return bal(t1, m->v, m->d, remove_min_binding(t2));
+  }
+  static const Node* remove_(const K& x, const Node* m) {
+    if (!m) return nullptr;
+    int c = Cmp{}(x, m->v);
+    if (c == 0) return merge(m->l, m->r);
+    if (c < 0) {
+      const Node* ll = remove_(x, m->l);
+      return ll == m->l ? m : bal(ll, m->v, m->d, m->r);
+    }
+    const Node* rr = remove_(x, m->r);
+    return rr == m->r ? m : bal(m->l, m->v, m->d, rr);
   }
   template <class F>
   static void iter_(const Node* n, F& f) {
@@ -200,7 +230,26 @@ class StrMap {
     f(n->v, n->d);
     iter_(n->r, f);
   }
+  template <class F>
+  static const Node* map_(const Node* n, F& f) {
+    if (!n) return nullptr;
+    const Node* l = map_(n->l, f);
+    V d = f(n->d);
+    const Node* r = map_(n->r, f);
+    return make<Node>(l, n->v, d, r, n->h);
+  }
   const Node* t_ = nullptr;
 };
+
+struct StrCmp {
+  int operator()(std::string_view a, std::string_view b) const {
+    int c = a.compare(b);
+    return c < 0 ? -1 : c > 0 ? 1 : 0;
+  }
+};
+template <class V>
+using StrMap = PMap<std::string_view, V, StrCmp>;
+template <class V>
+using StrMapNode = PMapNode<std::string_view, V>;
 
 }  // namespace cppcaml::typing
