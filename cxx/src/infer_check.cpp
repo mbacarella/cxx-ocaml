@@ -3342,8 +3342,12 @@ struct Checker {
     auto comps = mod_components(*ld->prefix);
     if (comps.empty()) return nullptr;
     auto st = mx_module_structs_.find(comps[0]);
-    if (st == mx_module_structs_.end()) return nullptr;
-    const ast::Structure* items = st->second;
+    const ast::Structure* items = nullptr;
+    if (st != mx_module_structs_.end()) items = st->second;
+    else if (auto o = outer_mx_structs_.find(comps[0]);
+             o != outer_mx_structs_.end())
+      items = o->second;
+    if (!items) return nullptr;
     for (size_t i = 1; i < comps.size() && items; ++i) {
       const ast::Structure* next = nullptr;
       for (auto& it : *items)
@@ -7789,6 +7793,17 @@ struct Checker {
   // local_module_structs_ (the `let module` map): widening that one's domain
   // would also widen its `#M.t` / first-class-module-packing consumers.
   std::unordered_map<std::string, const ast::Structure*> mx_module_structs_;
+  // The ENCLOSING levels' struct bodies (those ending before this structure
+  // starts), for local_dotted_modtype_sig only: a functor or submodule body
+  // is re-inferred by a fresh Checker, so `module F (X : Order.Total)` with
+  // Order a local module found no Order and bound X's members at fresh vars
+  // (`X.compare 1` accepted, `f : 'a` saved; S634).
+  std::unordered_map<std::string, const ast::Structure*> outer_mx_structs_;
+  static bool outerdotmt_off() {
+    static const bool off = cppcaml::dbg_env("NOOUTERDOTMT") != nullptr ||
+                            cppcaml::dbg_env("NOSHARE634") != nullptr;
+    return off;
+  }
   // See mx_functor_app_manifests_.  Best-effort: any unresolved corner leaves
   // the map unpopulated and the total proof declines exactly as before.
   void register_functor_app_types(const std::string& bind, const ModuleExpr& me0) {
@@ -22846,6 +22861,17 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
     for (auto& [n, fr] : o.functor_real_env_) ck.functor_real_env_.emplace(n, fr);
     for (auto& [n, b] : o.functor_body_exprs_) ck.functor_body_exprs_.emplace(n, b);
     for (auto& p : o.local_module_prefixes_) ck.local_module_prefixes_.insert(p);
+  }
+  if (g_outer_fields && !Checker::outerdotmt_off() && !s.empty()) {
+    auto& o = *g_outer_fields;
+    const auto& lo = s.front().loc.start;
+    auto before = [&](const ast::Structure* b) {
+      return b && !b->empty() && b->back().loc.end.cnum <= lo.cnum;
+    };
+    for (auto& [n, b] : o.mx_module_structs_)
+      if (before(b)) ck.outer_mx_structs_.emplace(n, b);
+    for (auto& [n, b] : o.outer_mx_structs_)
+      if (before(b)) ck.outer_mx_structs_.emplace(n, b);
   }
   if (fparams) {
     if (g_outer_modtype_asts) ck.modtype_sig_asts_ = *g_outer_modtype_asts;
