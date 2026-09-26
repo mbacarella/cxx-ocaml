@@ -19389,6 +19389,37 @@ static bool fident_body_off() {
 // Unresolved, `module X = P1(M0)` was DROPPED from the result, and every
 // later field of it sat one slot too low.
 static const std::vector<cmi::cmiw::SigItem>* g_fparam_functors = nullptr;
+// The path an all-path module application denotes (`G(M0)`, `Set.Make(
+// Int)`), or "" when a part is not a path (S626, NOAPPARG reverts).
+static bool applied_arg_off() {
+  static const bool off = cppcaml::dbg_env("NOAPPARG") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE626") != nullptr;
+  return off;
+}
+static std::string applied_mod_path(const ast::ModuleExpr* me, Checker* ckp) {
+  while (me)
+    if (auto* c = std::get_if<Pmod_constraint>(&me->desc)) me = c->me.get();
+    else break;
+  if (!me) return "";
+  if (auto* pi = std::get_if<Pmod_ident>(&me->desc)) {
+    if (std::holds_alternative<Lapply>(pi->id.txt.v)) return "";
+    std::string p = lid_full(pi->id.txt);
+    if (ckp) {
+      std::string head = p.substr(0, p.find('.'));
+      if (auto q = ckp->opened_submod_quals_.find(head);
+          q != ckp->opened_submod_quals_.end())
+        p = q->second + p.substr(head.size());
+    }
+    return p;
+  }
+  if (auto* pa = std::get_if<Pmod_apply>(&me->desc)) {
+    std::string f = applied_mod_path(pa->f.get(), ckp);
+    std::string a = applied_mod_path(pa->arg.get(), ckp);
+    if (f.empty() || a.empty()) return "";
+    return f + "(" + a + ")";
+  }
+  return "";
+}
 static bool hoapp_off() {
   static const bool off = cppcaml::dbg_env("NOHOAPP") != nullptr ||
                           cppcaml::dbg_env("NOSHARE625") != nullptr;
@@ -19739,6 +19770,30 @@ static bool functor_modtype_off() {
                           cppcaml::dbg_env("NOSHARE599") != nullptr;
   return off;
 }
+// The emitting file's `module type` ASTs (see infer_signature).
+static const std::unordered_map<std::string, const ast::Signature*>*
+    g_outer_modtype_asts = nullptr;
+// The module types an inline signature being emitted can name: each
+// enclosing structure level's OWN `module type` decls, inner levels
+// shadowing outer (set by infer_signature; S625).  Not the checker's flat
+// map, which also holds decls nested inside sibling modules.
+static const std::unordered_map<std::string, const ast::Signature*>*
+    g_emit_modtype_asts = nullptr;
+static bool sig_inc_outer_off() {
+  static const bool off = cppcaml::dbg_env("NOSIGINCOUTER") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE625") != nullptr;
+  return off;
+}
+// S626: S625 read the checker's FLAT map (a sibling module's nested
+// `module type T` answered a signature's own abstract T -- a dangling
+// `M.M.t`); now the per-level map, and a local decl shadows.  NOEMITMT
+// (alias NOSHARE626) restores S625's reading.
+static bool emit_mt_off() {
+  static const bool off = cppcaml::dbg_env("NOEMITMT") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE626") != nullptr;
+  return off;
+}
+
 static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
     const ast::Signature& s,
     const std::unordered_map<std::string, const ast::Signature*>* outer,
@@ -19844,7 +19899,11 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
           ck.type_substs_[d.name.txt] = std::move(al);
           ck.opened_type_quals_.erase(d.name.txt);
         }
-    if (auto* pmt = std::get_if<Psig_modtype>(&it.desc))
+    if (auto* pmt = std::get_if<Psig_modtype>(&it.desc)) {
+      // A local decl the map can't describe (abstract `module type T`, a
+      // functor type ..) still SHADOWS an outer T of the same name.
+      if (!sig_inc_outer_off() && !emit_mt_off())
+        modtypes.erase(pmt->name.txt);
       if (pmt->type) {
         if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc))
           modtypes[pmt->name.txt] = &ps->items;
@@ -19854,6 +19913,7 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
             if (auto f = modtypes.find(l->name); f != modtypes.end())
               modtypes[pmt->name.txt] = f->second;
       }
+    }
     // `module type S := sig .. end` (a destructive modtype SUBSTITUTION): S takes
     // no field and is erased from the output, but a later `include S with ..` must
     // still expand to its members.  printtyp.mli declares `module type Printers :=`
@@ -20695,15 +20755,6 @@ static std::vector<cmi::cmiw::SigItem> signature_to_cmi_i(
   return out;
 }
 
-// The emitting file's `module type` ASTs (see infer_signature).
-static const std::unordered_map<std::string, const ast::Signature*>*
-    g_outer_modtype_asts = nullptr;
-static bool sig_inc_outer_off() {
-  static const bool off = cppcaml::dbg_env("NOSIGINCOUTER") != nullptr ||
-                          cppcaml::dbg_env("NOSHARE625") != nullptr;
-  return off;
-}
-
 std::vector<cmi::cmiw::SigItem> signature_to_cmi(
     const ast::Signature& s,
     const std::unordered_map<std::string, const ast::Signature*>* outer,
@@ -20713,7 +20764,8 @@ std::vector<cmi::cmiw::SigItem> signature_to_cmi(
   // own `module type` decls: `include S0` of one resolved to nothing, the
   // included members were DROPPED, and `M.z` sat in k's slot -- a consumer
   // read the wrong field (S625; NOSIGINCOUTER reverts).
-  if (!outer && !sig_inc_outer_off()) outer = g_outer_modtype_asts;
+  if (!outer && !sig_inc_outer_off())
+    outer = emit_mt_off() ? g_outer_modtype_asts : g_emit_modtype_asts;
   return signature_to_cmi_i(s, outer, outer_mods, nullptr);
 }
 
@@ -22201,6 +22253,14 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
                 s.arg_path = q->second + s.arg_path.substr(head.size());
             }
           }
+        } else if (std::holds_alternative<Pmod_apply>(am->desc) &&
+                   !applied_arg_off()) {
+          // An APPLIED argument `F(G(M0))`: its path is the application
+          // (`X.t` -> `G(M0).t`, as ocamlc's Papply); one with a non-path
+          // part (`G(struct .. end)`) has none -- the citing manifests are
+          // erased like an anonymous struct's (S626; they dangled as `X.t`).
+          s.arg_path = applied_mod_path(am, ckp);
+          if (s.arg_path.empty()) s.anon = true;
         } else if (auto* ast_ = std::get_if<Pmod_structure>(&am->desc)) {
           // An anonymous struct argument's ABSTRACT types have no path to
           // rewrite to: a result manifest citing one is erased (nondep), as
@@ -22340,6 +22400,10 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
             ap = q->second + ap.substr(head.size());
         }
         argpaths.push_back(std::move(ap));
+      } else if (std::string ap2 = applied_arg_off() ? std::string()
+                                                     : applied_mod_path(a, ckp);
+                 !ap2.empty()) {
+        argpaths.push_back(std::move(ap2));  // `F(G(M0)).w` (S626)
       } else { all_paths = false; break; }
     }
     // A partial application strengthens with the remaining params applied too
@@ -22496,11 +22560,28 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
   auto* saved_fields = g_outer_fields;
   g_outer_fields = &ck;
   g_outer_modtype_asts = &ck.modtype_sig_asts_;
-  // A nested structure's own checker knows only ITS modtypes: overlay them
-  // on the enclosing levels' so `module B : sig include S0 .. end` inside
-  // `module A = struct .. end` resolves an outer S0 (S625, NOSIGINCOUTER).
+  // This level's own `module type` decls over the enclosing levels', for
+  // the inline signatures emitted below (`module B : sig include S0 .. end`
+  // inside `module A = struct .. end` resolves an outer S0; S625).
+  auto* saved_emit_mt = g_emit_modtype_asts;
+  std::unordered_map<std::string, const ast::Signature*> emit_mt_asts;
+  if (saved_emit_mt) emit_mt_asts = *saved_emit_mt;
+  for (auto& it : s)
+    if (auto* pmt = std::get_if<Pstr_modtype>(&it.desc)) {
+      emit_mt_asts.erase(pmt->name.txt);
+      if (!pmt->type) continue;
+      if (auto* ps = std::get_if<Pmty_signature>(&pmt->type->desc))
+        emit_mt_asts[pmt->name.txt] = &ps->items;
+      else if (auto* pid = std::get_if<Pmty_ident>(&pmt->type->desc))
+        if (auto* l = std::get_if<Lident>(&pid->id.txt.v))
+          if (auto f = emit_mt_asts.find(l->name); f != emit_mt_asts.end())
+            emit_mt_asts[pmt->name.txt] = f->second;
+    }
+  g_emit_modtype_asts = &emit_mt_asts;
+  // S625's reading (NOSHARE626): the checker's flat map over the enclosing
+  // levels', also seen by nested functor-body checkers.
   std::unordered_map<std::string, const ast::Signature*> merged_mt_asts;
-  if (saved_mt_asts && !sig_inc_outer_off()) {
+  if (emit_mt_off() && saved_mt_asts && !sig_inc_outer_off()) {
     merged_mt_asts = *saved_mt_asts;
     for (auto& [n, sg] : ck.modtype_sig_asts_) merged_mt_asts[n] = sg;
     g_outer_modtype_asts = &merged_mt_asts;
@@ -23706,6 +23787,7 @@ std::vector<cmi::cmiw::SigItem> infer_signature(
     }
   }
   g_outer_modtype_asts = saved_mt_asts;
+  g_emit_modtype_asts = saved_emit_mt;
   g_outer_modtype_quals = saved_mt_quals;
   g_enclosing_struct_items = saved_enclosing;
   g_inherited_opens = saved_inherited_opens;

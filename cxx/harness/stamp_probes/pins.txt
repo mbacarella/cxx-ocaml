@@ -1532,6 +1532,11 @@ xgh_c5 0
 xgh_c6 0
 xgh_c7 0
 xgh_c8 0
+xhoa_1 0
+xhoa_2 0
+xhoa_3 0
+xhoa_4 0
+xhoa_5 0
 xhop_a1 0
 xhop_a2 0
 xhop_a3 0
@@ -5560,6 +5565,10 @@ xsh_e1 0
 xsh_e2 -94
 xsh_e3 0
 xsh_e4 -94
+xsio_1 0
+xsio_2 0
+xsio_3 0
+xsio_4 0
 xsm_a1 0
 xsm_a2 0
 xsm_a3 0
