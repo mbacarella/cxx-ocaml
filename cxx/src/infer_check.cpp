@@ -19375,6 +19375,13 @@ static bool fapp_body_off() {
                           cppcaml::dbg_env("NOSHARE602") != nullptr;
   return off;
 }
+// S624: a functor body naming a plain local module (`module F (X : S) =
+// M0`) and a functor ascribed a named modtype (`module M : S1 = functor ..`).
+static bool fident_body_off() {
+  static const bool off = cppcaml::dbg_env("NOFIDENTBODY") != nullptr ||
+                          cppcaml::dbg_env("NOSHARE624") != nullptr;
+  return off;
+}
 static bool with_local_mt_off() {
   static const bool off = cppcaml::dbg_env("NOWITHLOCMT") != nullptr ||
                           cppcaml::dbg_env("NOSHARE621") != nullptr;
@@ -21536,6 +21543,12 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
         if (!no_asc_alias && inner->k == cmi::cmiw::SigItem::Module &&
             !inner->alias.empty())
           inner = cmi::cmiw::sig_module(name, {});
+        // `module M : S1 = functor (P : ..) -> ..`: likewise Mty_ident S1,
+        // not the expression's own functor type (whose result is often
+        // left empty -- a consumer's `M(X).t` was rejected).
+        if (!fident_body_off() && inner->k == cmi::cmiw::SigItem::Module &&
+            inner->is_functor)
+          inner = cmi::cmiw::sig_module(name, {});
         if (inner->k == cmi::cmiw::SigItem::Module && !inner->is_functor &&
             inner->alias.empty())
           inner->modtype_ref = lid_full(pid->id.txt);
@@ -21778,6 +21791,65 @@ static std::optional<cmi::cmiw::SigItem> module_binding_sigitem(
           }
           break;
         }
+      // `module F (X : S) = M0` / `= M0.N`, M0 a LOCAL module (not a
+      // parameter): ocamlc's result is M0's signature strengthened at the
+      // NORMALIZED path, submodules as aliases (`sig type key = M0.key
+      // module N = M0.N end`); it was left EMPTY.  A local alias heading the
+      // path is chased (`C = A.M0` strengthens at A.M0); a module ascribed a
+      // named modtype (`B : SB`) contributes SB's items when it heads the
+      // path.  A functor, a compilation unit or a nested ascription bails.
+      bool is_param = false;
+      for (auto& p : ps) if (!hd.empty() && p.name == hd) is_param = true;
+      const auto* scope = prior ? prior : g_enclosing_struct_items;
+      if (!fident_body_off() && !is_param && !hd.empty() && scope) {
+        std::vector<std::string> comps{hd};
+        comps.insert(comps.end(), rest.begin(), rest.end());
+        std::deque<std::vector<cmi::cmiw::SigItem>> owned;
+        const std::vector<cmi::cmiw::SigItem>* found_items = nullptr;
+        std::string path;
+        for (int hop = 0; hop < 6 && !found_items && !comps.empty(); ++hop) {
+          const cmi::cmiw::SigItem* m = nullptr;
+          for (auto& si : *scope)
+            if (si.k == cmi::cmiw::SigItem::Module && si.name == comps[0])
+              m = &si;
+          path = comps[0];
+          bool restart = false;
+          for (std::size_t i = 0; m; ++i) {
+            if (m->is_functor) { m = nullptr; break; }
+            if (!m->alias.empty()) {
+              // a nested alias is relative to its own module: bail
+              if (i != 0) { m = nullptr; break; }
+              std::vector<std::string> nc = split_dotted(m->alias);
+              nc.insert(nc.end(), comps.begin() + i + 1, comps.end());
+              comps = std::move(nc);
+              restart = true;
+              break;
+            }
+            const std::vector<cmi::cmiw::SigItem>* items = &m->sub;
+            if (!m->modtype_ref.empty()) {
+              const std::string& ref = m->modtype_ref;
+              if (i != 0 || !ckp || ref.find('.') != std::string::npos ||
+                  ckp->opened_modtype_quals_.count(ref)) { m = nullptr; break; }
+              auto a = ckp->modtype_sig_asts_.find(ref);
+              if (a == ckp->modtype_sig_asts_.end()) { m = nullptr; break; }
+              owned.push_back(signature_to_cmi(*a->second));
+              items = &owned.back();
+            }
+            if (i + 1 == comps.size()) { found_items = items; break; }
+            const cmi::cmiw::SigItem* n = nullptr;
+            for (auto& si : *items)
+              if (si.k == cmi::cmiw::SigItem::Module && si.name == comps[i + 1])
+                n = &si;
+            m = n;
+            path += "." + comps[i + 1];
+          }
+          if (!restart) break;
+        }
+        if (found_items) {
+          result = *found_items;
+          strengthen_abstract(result, path, true);
+        }
+      }
     }
     else if (auto* bc = std::get_if<Pmod_constraint>(&cur->desc)) {
       if (bc->mt) {
