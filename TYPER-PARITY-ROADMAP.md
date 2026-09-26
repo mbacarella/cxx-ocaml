@@ -1,5 +1,12 @@
 # Typer-parity roadmap
 
+> **DEPRECATED (2026-09-26).**  This roadmap measured `typer.cpp` (a typedtree
+> *transcriber*) and `infer_check.cpp`'s approximating strict pass.  Neither is
+> ocamlc's type checker.  Their "0.0% false-reject" / "dump parity 100%" figures
+> do not mean c++ocamlc type-checks: it rejects nothing, and wiring the strict
+> pass in falsely rejects 70/139 compiler modules.  The goal is now a faithful
+> port of `typing/`.  **See [TYPECHECKER.md](TYPECHECKER.md).**  Kept for history.
+
 Goal: full type-checker parity with `ocamlc` for the C++ reimplementation
 (`c++type` / the strict pass in `infer_check.cpp`).
 

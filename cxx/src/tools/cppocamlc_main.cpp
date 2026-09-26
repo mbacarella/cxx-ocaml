@@ -282,6 +282,22 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
     }
     cppcaml::cmo::write_cmo(instrs, mod, cmo_out, required_globals);
     lap("write_cmo", tp);
+    // The strict type check (c++type --check's pass).  Opt-in while its
+    // false-reject rate on real code is measured; it runs AFTER the outputs
+    // are written so it cannot perturb them, and removes them on rejection.
+    if (cppcaml::dbg_env("CPPCAML_TYPECHECK")) {
+      auto errs = cppcaml::structure_typecheck(structure);
+      lap("typecheck", tp);
+      if (!errs.empty()) {
+        for (auto& e : errs)
+          std::cerr << "File \"" << in_path << "\":\nError: " << e << '\n';
+        std::error_code ec;
+        fs::remove(cmo_out, ec);
+        if (!fs::exists(fs::path(in_path).replace_extension(".mli")))
+          fs::remove(fs::path(cmo_out).replace_extension(".cmi"), ec);
+        return 2;
+      }
+    }
     if (prof)
       std::cerr << "  TOTAL compile " << in_path << ": "
                 << std::chrono::duration<double, std::milli>(clk::now() - t0).count() << " ms\n";

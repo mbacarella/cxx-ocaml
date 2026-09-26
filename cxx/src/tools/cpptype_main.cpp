@@ -1,3 +1,8 @@
+// DEPRECATED AS A TYPE CHECKER (2026-09-26) -- see TYPECHECKER.md.
+// c++type drives the deprecated transcriber (default), the approximating
+// inference (--infer) and the deprecated strict pass (--check).
+// The goal is a faithful port of ocamlc's typing/; do not grow this into a
+// checker.
 // c++type — type-check an OCaml source file and print the typedtree in
 // -dtypedtree format, byte-comparable (after stamp normalization) with
 // `ocamlc -dtypedtree -stop-after typing`.

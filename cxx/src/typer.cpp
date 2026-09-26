@@ -1,3 +1,8 @@
+// DEPRECATED AS A TYPE CHECKER (2026-09-26) -- see TYPECHECKER.md.
+// A typedtree TRANSCRIBER for already-valid programs: it does not unify and
+// rejects nothing.
+// The goal is a faithful port of ocamlc's typing/; do not grow this into a
+// checker.
 #include "cppcaml/typer.hpp"
 
 #include <filesystem>

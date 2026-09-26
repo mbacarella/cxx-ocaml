@@ -1,3 +1,10 @@
+// DEPRECATED AS A TYPE CHECKER (2026-09-26) -- see TYPECHECKER.md.
+// An approximating algorithm-W pass (last-component path matching, no real Env,
+// soft argument unification).  Its lenient passes still feed codegen and the
+// .cmi writer (verified by DDC/effid): fix OUTPUT bugs only.  Its strict pass
+// (structure_typecheck) is deprecated outright.
+// The goal is a faithful port of ocamlc's typing/; do not grow this into a
+// checker.
 // Slice 2 of the inference milestone: a best-effort algorithm-W pass over the
 // parsetree that computes a type for each expression/binding, using the HM core
 // (infer.hpp) and value schemes loaded from stdlib.cmi.

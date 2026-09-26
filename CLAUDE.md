@@ -4,6 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a self-bootstrapping compiler: pre-built bytecode images of `ocamlc`/`ocamllex` live in `boot/` and are used to compile a fresh compiler. See `BOOTSTRAP.adoc`.
 
+## C++ rewrite (`cxx/`): type checking
+
+**Read `TYPECHECKER.md` first.**  c++ocamlc does not type-check yet: it
+rejects no ill-typed program.  The goal is a faithful port of `typing/`.
+`cxx/src/typer.cpp` (a typedtree transcriber) and `cxx/src/infer_check.cpp`
+(an approximating inference) are **deprecated as type checkers**, and so are
+the parity figures that score them (`TYPER-PARITY-ROADMAP.md`,
+`reject_parity.sh`, `accept_parity.sh`, `typedtree_parity.sh`,
+`sig_parity.sh`).  Don't harden them into a checker.
+
 ## AI contribution policy
 
 `AI.md` is binding here. Key points: you (the contributor) take responsibility for *every part* of a contribution and must have read and reviewed it. Significant AI-generated code, PR text, or review comments **must be disclosed** (which tool, for what). Never submit code you don't understand.

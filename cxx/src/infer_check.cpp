@@ -1,3 +1,8 @@
+// DEPRECATED AS A TYPE CHECKER (2026-09-26) -- see TYPECHECKER.md.
+// Approximating inference; lenient passes feed codegen (fix output bugs only),
+// the strict pass (structure_typecheck) is deprecated.
+// The goal is a faithful port of ocamlc's typing/; do not grow this into a
+// checker.
 #include "cppcaml/infer_check.hpp"
 
 #include <algorithm>

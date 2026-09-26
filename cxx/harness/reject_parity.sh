@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# DEPRECATED AS A TYPE-CHECKING METRIC (2026-09-26) -- see TYPECHECKER.md.
+# This scores the deprecated strict pass (c++type --check);
+# keep it as a regression tripwire only.
 # Error-rejection parity (toward the full inferencer).  A correct type-checker
 # never rejects valid code, so the key baseline is the FALSE-REJECTION rate: of
 # the files the oracle ACCEPTS (non-empty cached -dtypedtree dump), how many does

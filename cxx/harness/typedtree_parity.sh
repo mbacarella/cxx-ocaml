@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# DEPRECATED AS A TYPE-CHECKING METRIC (2026-09-26) -- see TYPECHECKER.md.
+# This scores the deprecated typedtree transcriber (typer.cpp);
+# keep it as a regression tripwire only.
 # Typer parity: diff c++type against `ocamlc -dtypedtree` over the corpus, with
 # ident stamps normalized on both sides (decision 2026-06-05: normalize now,
 # exact stamps later).  Run inside the nix dev shell (needs ./ocamlc.opt).

@@ -1,3 +1,7 @@
+// DEPRECATED AS A TYPE CHECKER (2026-09-26) -- see TYPECHECKER.md.
+// The approximating HM engine behind infer_check.cpp (not ocamlc's Ctype).
+// The goal is a faithful port of ocamlc's typing/; do not grow this into a
+// checker.
 // Minimal Hindley-Milner core for the type-checker: a mutable, unifiable
 // type_expr with the levels-based generalization scheme (Rémy/OCaml-style).
 //

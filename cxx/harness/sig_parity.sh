@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# DEPRECATED AS A TYPE-CHECKING METRIC (2026-09-26) -- see TYPECHECKER.md.
+# This scores the deprecated approximating inference (c++type --infer);
+# keep it as a regression tripwire only.
 # Signature-inference parity: does c++ infer the same top-level VALUE signatures
 # as `ocamlc -i`?  This is the metric that gates separate compilation / .cmi
 # emission (and thus building real projects): to write a correct .cmi for a

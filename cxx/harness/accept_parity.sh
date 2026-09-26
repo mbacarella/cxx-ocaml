@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# DEPRECATED AS A TYPE-CHECKING METRIC (2026-09-26) -- see TYPECHECKER.md.
+# This scores the deprecated strict pass (c++type --check);
+# keep it as a regression tripwire only.
 # Soundness parity (the inverse of reject_parity.sh).  A correct type-checker
 # rejects invalid code, so the key soundness baseline is the FALSE-ACCEPTANCE
 # rate: of the files the oracle REJECTS (empty cached -dtypedtree dump), how many
