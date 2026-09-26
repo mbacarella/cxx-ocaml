@@ -186,6 +186,7 @@ void install_forward_refs() {
   if (!initialized) {
     initialized = true;
     (void)shape::for_unnamed_functor_param();
+    (void)env::initial();  // Env.initial (its type ids: module-init ids)
     parmatch::module_init();
     typeclass::module_init();
   }

@@ -33,7 +33,7 @@ struct Scopes {  // Cons {item; str; str_fun} (nullptr = Empty)
 };
 using scopes = const Scopes*;
 inline constexpr scopes empty_scopes = nullptr;
-std::string string_of_scopes(scopes s);
+std::string_view string_of_scopes(scopes s);  // the scope's own string
 scopes enter_anonymous_function(scopes s);
 scopes enter_value_definition(scopes s, Ident::t id);
 scopes enter_module_definition(scopes s, Ident::t id);
@@ -48,7 +48,7 @@ struct ScopedLocation {  // Loc_unknown | Loc_known {loc; scopes}
 inline ScopedLocation loc_unknown() { return {}; }
 ScopedLocation of_location(scopes s, const Location& loc);
 Location to_location(const ScopedLocation& l);
-std::string string_of_scoped_location(const ScopedLocation& l);
+std::string_view string_of_scoped_location(const ScopedLocation& l);
 }  // namespace debuginfo
 
 namespace lambda {

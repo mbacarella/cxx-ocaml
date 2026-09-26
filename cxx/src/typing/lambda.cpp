@@ -17,22 +17,32 @@ namespace cppcaml::typing {
 // ---- Debuginfo.Scoped_location ----------------------------------------------
 namespace debuginfo {
 
-static std::string_view str_fun(scopes s) { return s ? s->str_fun : std::string_view("(fun)"); }
-static scopes cons(Scopes::Item item, std::string str) {
-  std::string_view sv = zborrow(str);
-  std::string_view f = zborrow(str + ".(fun)");
-  return make<Scopes>(Scopes{item, sv, f});
+// The strings keep OCaml's identities (the debug events' ev_defname marshals
+// them): a top-level scope's str is the ident's own name, the literals are
+// one static object each, and each ^ is a fresh string.
+static std::string_view static_literal(std::string_view s) {
+  ZoneScope perm(permanent_zone());
+  return zone().str(s);
 }
-static std::string add_parens_if_symbolic(std::string_view s) {
-  if (s.empty()) return "";
+static std::string_view str_fun(scopes s) {
+  static const std::string_view fun = static_literal("(fun)");
+  return s ? s->str_fun : fun;
+}
+static scopes cons(Scopes::Item item, std::string_view str) {
+  std::string_view f = zone().str(std::string(str) + ".(fun)");
+  return make<Scopes>(Scopes{item, str, f});
+}
+static std::string_view add_parens_if_symbolic(std::string_view s) {
+  static const std::string_view empty = static_literal("");
+  if (s.empty()) return empty;
   char c = s[0];
-  if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || (c >= '0' && c <= '9')) return std::string(s);
-  return "(" + std::string(s) + ")";
+  if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || (c >= '0' && c <= '9')) return zborrow(s);
+  return zone().str("(" + std::string(s) + ")");
 }
-static std::string dot(scopes s, std::string_view x, std::string_view sep = ".") {
-  std::string p = add_parens_if_symbolic(x);
+static std::string_view dot(scopes s, std::string_view x, std::string_view sep = ".") {
+  std::string_view p = add_parens_if_symbolic(x);
   if (!s) return p;
-  return std::string(s->str) + std::string(sep) + p;
+  return zone().str(std::string(s->str) + std::string(sep) + std::string(p));
 }
 scopes enter_anonymous_function(scopes s) {
   std::string_view str = str_fun(s);
@@ -48,10 +58,13 @@ scopes enter_class_definition(scopes s, Ident::t id) {
   return cons(Scopes::Item::Sc_class_definition, dot(s, ident::name(id)));
 }
 scopes enter_method_definition(scopes s, std::string_view label) {
-  std::string str = s && s->item == Scopes::Item::Sc_class_definition ? dot(s, label, "#") : dot(s, label);
+  std::string_view str = s && s->item == Scopes::Item::Sc_class_definition ? dot(s, label, "#") : dot(s, label);
   return cons(Scopes::Item::Sc_method_definition, str);
 }
-std::string string_of_scopes(scopes s) { return s ? std::string(s->str) : "<unknown>"; }
+std::string_view string_of_scopes(scopes s) {
+  static const std::string_view unknown = static_literal("<unknown>");
+  return s ? s->str : unknown;
+}
 
 static bool is_none_loc(const Location& l) {
   // Location.is_none: l = Location.none (in_file "_none_")
@@ -67,8 +80,9 @@ ScopedLocation of_location(scopes s, const Location& loc) {
   return ScopedLocation{true, loc, s};
 }
 Location to_location(const ScopedLocation& l) { return l.known ? l.loc : location::none(); }
-std::string string_of_scoped_location(const ScopedLocation& l) {
-  return l.known ? string_of_scopes(l.sc) : "??";
+std::string_view string_of_scoped_location(const ScopedLocation& l) {
+  static const std::string_view unknown = static_literal("??");
+  return l.known ? string_of_scopes(l.sc) : unknown;
 }
 
 }  // namespace debuginfo

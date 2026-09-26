@@ -117,15 +117,10 @@ Ident::t ident_of_type_constr(TypeConstr c) {
   return nullptr;
 }
 
-// names used for Type_external: predef.ml's string literals, one object
-// per constructor (not the ident's name)
-std::string_view name_of_type_constr(TypeConstr c) {
-  static std::map<TypeConstr, std::string_view> names;
-  auto it = names.find(c);
-  if (it != names.end()) return it->second;
-  ZoneScope perm(permanent_zone());
-  return names[c] = zstr(ident::name(ident_of_type_constr(c)));
-}
+// names used for Type_external: predef.ml's string literals -- equal to the
+// ident_create literals of the same file, which ocamlopt (the reference
+// ocamlc.opt is native) merges into one object: the ident's name
+std::string_view name_of_type_constr(TypeConstr c) { return ident::name(ident_of_type_constr(c)); }
 
 const Paths& paths() {
   static const Paths ps = [] {

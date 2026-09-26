@@ -1747,15 +1747,23 @@ Signature read_signature(const std::string& modname, const std::string& filename
 }
 
 // Make the initial environment
+// Env.initial is a value, computed once while env.ml initializes -- before
+// the first Types.reset, so its declarations' type ids are module-init ids
+// and the per-unit id counter restarts at -1 after them.  (Typemod's
+// install_forward_refs forces it at the port's module-init time.)
 t initial() {
-  install_forward_refs();
-  predef::init();
-  return predef::build_initial_env<t>(
-      [](Ident::t id, const TypeDeclaration* d, t env) { return add_type(false, id, d, env); },
-      [](Ident::t id, const ExtensionConstructor* e, t env) {
-        return add_extension(false, false, id, e, env);
-      },
-      empty());
+  static const t initial_env = [] {
+    install_forward_refs();
+    predef::init();
+    ZoneScope perm(permanent_zone());
+    return predef::build_initial_env<t>(
+        [](Ident::t id, const TypeDeclaration* d, t env) { return add_type(false, id, d, env); },
+        [](Ident::t id, const ExtensionConstructor* e, t env) {
+          return add_extension(false, false, id, e, env);
+        },
+        empty());
+  }();
+  return initial_env;
 }
 
 // ============================================================================

@@ -29,21 +29,25 @@ OUT=/tmp/lambda_port_parity
 
 if [ "${1:-}" == "--worker" ]; then
   f="$2"; b=$(basename "$f"); key=$(echo "$f" | tr '/' '_')
-  w=$(mktemp -d); mkdir "$w/o" "$w/c"; cp "$f" "$w/o/"; cp "$f" "$w/c/"
+  # Both compilers run in the same directory, one after the other: -g's
+  # debug section records it (debug_dirs).
+  w=$(mktemp -d); mkdir "$w/x"
   i="${f%.ml}.mli"
+  prep() { rm -rf "${w:?}/x"; mkdir "$w/x"; cp "$f" "$w/x/"; [ -f "$i" ] && cp "$i" "$w/x/"; }
+  prep
   if [ -f "$i" ]; then  # a sibling interface: each compiler compiles it first
-    cp "$i" "$w/o/"; cp "$i" "$w/c/"
-    ( cd "$w/o" && timeout 120 "$ROOT/ocamlc.opt" -nostdlib -I "$ROOT/stdlib" -w -a $FLAGS -c "${b}i" ) >/dev/null 2>&1
-    ( cd "$w/c" && timeout 120 "$CPP" -I "$ROOT/stdlib" -w -a $FLAGS -c "${b}i" ) >/dev/null 2>&1
+    ( cd "$w/x" && timeout 120 "$ROOT/ocamlc.opt" -nostdlib -I "$ROOT/stdlib" -w -a $FLAGS -c "${b}i" ) >/dev/null 2>&1
   fi
-  ( cd "$w/o" && timeout 120 "$ROOT/ocamlc.opt" -nostdlib -I "$ROOT/stdlib" -w -a $FLAGS $DFLAG -c "$b" ) \
+  ( cd "$w/x" && timeout 120 "$ROOT/ocamlc.opt" -nostdlib -I "$ROOT/stdlib" -w -a $FLAGS $DFLAG -c "$b" ) \
       >/dev/null 2>"$OUT/$key.o"; orc=$?
-  ( cd "$w/c" && CPPCAML_NEWLAMBDA=1 timeout 120 "$CPP" -I "$ROOT/stdlib" -w -a $FLAGS $DFLAG $STOP -c "$b" ) \
-      >/dev/null 2>"$OUT/$key.c"; crc=$?
-  if [ "$DUMP" = cmo ]; then
-    cp "$w/o/${b%.ml}.cmo" "$OUT/$key.o" 2>/dev/null || orc=1
-    cp "$w/c/${b%.ml}.cmo" "$OUT/$key.c" 2>/dev/null || crc=1
+  if [ "$DUMP" = cmo ]; then cp "$w/x/${b%.ml}.cmo" "$OUT/$key.o" 2>/dev/null || orc=1; fi
+  prep
+  if [ -f "$i" ]; then
+    ( cd "$w/x" && timeout 120 "$CPP" -I "$ROOT/stdlib" -w -a $FLAGS -c "${b}i" ) >/dev/null 2>&1
   fi
+  ( cd "$w/x" && CPPCAML_NEWLAMBDA=1 timeout 120 "$CPP" -I "$ROOT/stdlib" -w -a $FLAGS $DFLAG $STOP -c "$b" ) \
+      >/dev/null 2>"$OUT/$key.c"; crc=$?
+  if [ "$DUMP" = cmo ]; then cp "$w/x/${b%.ml}.cmo" "$OUT/$key.c" 2>/dev/null || crc=1; fi
   rm -rf "${w:?}"
   if [ $orc -ne 0 ]; then printf 'OFAIL %s\n' "$f"
   elif [ $crc -ne 0 ] || [ ! -s "$OUT/$key.c" ]; then printf 'CFAIL %s\n' "$f"

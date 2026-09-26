@@ -961,6 +961,12 @@ class Writer {
     current_unit_ = std::string(n);
     current_unit_name_ = value ? value : o::vstr(current_unit_);
   }
+  // the same, the name being the string object [n] itself (one value with
+  // every other use of that storage)
+  void set_current_unit_shared(std::string_view n) {
+    current_unit_ = std::string(n);
+    current_unit_name_ = str(n);
+  }
   V unit_name(std::string_view n) {
     if (current_unit_name_ && n == current_unit_) return current_unit_name_;
     return str(n);
@@ -1613,8 +1619,9 @@ std::vector<o::ValPtr> debug_event_values(const std::vector<const instruct::Debu
 
 std::vector<std::uint8_t> marshal_debug_events(const std::vector<const instruct::DebugEvent*>& events) {
   Writer w;
-  // the uids' and ev_module's unit name: the one Unit_info string
-  if (!events.empty()) w.set_current_unit(events.front()->ev_module);
+  // the uids' and ev_module's unit name: the one Unit_info string, which
+  // the unit's module ident (a top-level scope's name) shares too
+  if (!events.empty()) w.set_current_unit_shared(events.front()->ev_module);
   EventWriter ew(w);
   std::vector<o::ValPtr> evs;
   for (const instruct::DebugEvent* ev : events) evs.push_back(ew.event(ev));

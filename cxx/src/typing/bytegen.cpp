@@ -305,7 +305,7 @@ const env::Summary* env_empty_summary() {
 // generating backtraces.
 code add_pseudo_event(const L::ScopedLocation& loc, std::string_view modname, code c) {
   if (!clflags::debug) return c;
-  std::string_view ev_defname = zstr(debuginfo::string_of_scoped_location(loc));
+  std::string_view ev_defname = debuginfo::string_of_scoped_location(loc);
   DebugEvent* ev = make<DebugEvent>();
   ev->ev_pos = 0;  // patched in emitcode
   ev->ev_module = modname;
@@ -1107,7 +1107,7 @@ code comp_expr(const StackInfo& si, const CompilationEnv& env, lambda exp, long 
       auto* le = L::as<L::Levent>(exp);
       lambda lam = le->l;
       const L::LambdaEvent* lev = le->ev;
-      std::string_view ev_defname = zstr(debuginfo::string_of_scoped_location(lev->lev_loc));
+      std::string_view ev_defname = debuginfo::string_of_scoped_location(lev->lev_loc);
       auto event = [&](DebugEventKind kind, DebugEventInfo info) {
         DebugEvent* ev = make<DebugEvent>();
         ev->ev_pos = 0;  // patched in emitcode
@@ -1283,7 +1283,7 @@ DebugEvent* merge_events(DebugEvent* ev1, DebugEvent* ev2) { return merge_events
 
 instruct::code compile_implementation(std::string_view modulename, L::lambda expr) {
   reset();
-  compunit_name = zstr(modulename);
+  compunit_name = zborrow(modulename);
   struct Finally {
     ~Finally() { reset(); }
   } finally;

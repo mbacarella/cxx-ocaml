@@ -409,13 +409,16 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
     // Simplif.simplify_lambda, -dlambda, Bytegen.compile_implementation,
     // -dinstr (the dumps on stderr, as ocamlc's ppf_dump)
     ty::translmod::install_forward_refs();
-    ty::lambda::Program prog = ty::translmod::transl_implementation(mod, impl->structure, impl->coercion);
+    // Unit_info.modname: one string, which Translmod's module ident,
+    // Bytegen's events and Emitcode's cu_name all share
+    std::string_view modname = ty::zborrow(mod);
+    ty::lambda::Program prog = ty::translmod::transl_implementation(modname, impl->structure, impl->coercion);
     if (g_dump.rawlambda) std::cerr << ty::printlambda::dump(prog.code);
     ty::lambda::lambda lam = ty::simplif::simplify_lambda(prog.code);
     if (g_dump.lambda) std::cerr << ty::printlambda::dump(lam);
     lap("lambda", tp);
     if (g_stop_after == StopAfter::Lambda) return 0;
-    ty::instruct::code bytecode = ty::bytegen::compile_implementation(mod, lam);
+    ty::instruct::code bytecode = ty::bytegen::compile_implementation(modname, lam);
     if (g_dump.instr) std::cerr << ty::printinstr::dump(bytecode);
     lap("bytegen", tp);
     // Compile.emit_bytecode: Emitcode.to_file, the .cmo removed on failure
@@ -425,7 +428,7 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
       return 2;
     }
     try {
-      ty::emitcode::to_file(oc, cmo_out, mod, prog.required_globals, bytecode);
+      ty::emitcode::to_file(oc, cmo_out, modname, prog.required_globals, bytecode);
     } catch (...) {
       std::fclose(oc);
       std::remove(cmo_out.c_str());
