@@ -7,13 +7,12 @@ This is a self-bootstrapping compiler: pre-built bytecode images of `ocamlc`/`oc
 ## C++ rewrite (`cxx/`): the faithful port
 
 **Read `TYPECHECKER.md` first.**  c++ocamlc must match ocamlc's semantics
-exactly, by faithfully porting the compiler (`cxx/src/typing/` is the port
-of `typing/`, verified against compiler-libs oracles).  The port is
-c++ocamlc's type checker (on by default; `CPPCAML_NOTYPECHECK=1` is a
-debugging hatch) and writes its .cmi.  `typer.cpp`, `c++type` and
-their harnesses are deleted.  `cxx/src/infer_check.cpp` + `infer.cpp` are
-legacy, scheduled for deletion: they still feed `lambda.cpp` and the old
-.cmi writer, so fix output bugs only and never grow them.
+exactly, by faithfully porting the compiler (`cxx/src/typing/` holds the
+ports of `typing/`, `lambda/` and `bytecomp/`'s Bytegen/Emitcode, each
+verified against ocamlc oracles).  c++ocamlc type-checks every unit, writes
+the port's .cmi and generates code from the port's typed tree; the old
+approximating typers and translator are deleted.  `cxx/src/cmi.cpp`'s
+legacy .cmi writer only serves `-pack` until Bytepackager is ported.
 
 ## AI contribution policy
 

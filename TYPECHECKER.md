@@ -25,10 +25,16 @@ generation and rejects what ocamlc rejects (exit 2, nothing written); the
 interfaces.  Its error report is ocamlc's location line and the error's
 constructor (`Error: Typecore.Expr_type_clash`) until Printtyp is ported
 (stage 9); `-stop-after typing` type-checks only (and, as ocamlc, still
-writes an .ml's inferred .cmi).  `CPPCAML_NOTYPECHECK=1` skips the checker
-(a debugging hatch: the legacy writer then writes the .cmi);
-`CPPCAML_TYPECHECK_DEBUG=1` says when a file reached an unported part (it
-is then accepted).
+writes an .ml's inferred .cmi).  An internal failure of the port is
+reported as one (`CPPCAML_TYPECHECK_DEBUG=1` adds the error's details).
+
+Code generation is the port's too (stage 10): Translmod, Simplif, Bytegen
+and Emitcode from the typed tree, as `driver/compile.ml` sequences them.
+The .cmo is byte-identical to ocamlc.opt's on the compiler's sources
+(145/145), the stdlib built as its Makefile builds it (72/72, the `-pp`
+units included) and the stamp probes (6525/6527: the two .cmi leftovers
+below reach the .cmo through the crc); without `-g` so far -- the debug
+events section is being brought up.
 
 Accept/reject parity with ocamlc (`-stop-after typing`, same flags):
 
@@ -56,15 +62,16 @@ ported).  `port_check.sh` adapts
   `gate_check.sh`, `TYPER-PARITY-ROADMAP.md`): **deleted** (stage 7).
 - **`infer_check.cpp`'s strict pass (`structure_typecheck`)** and the
   helpers only it used: **deleted** (stage 7).
-- **`infer_check.cpp` `Checker` + `infer.cpp` `Engine`** (an approximating
-  algorithm-W pass: last-component paths, no real Env, soft argument
-  unification): **scheduled for deletion.**  Its lenient passes are still
-  what `lambda.cpp` (value kinds, primitive specialisation, pattern
-  compilation) and the .cmi writer (`infer_signature`, stamps, uids) read,
-  and DDC plus the effid/cmi gates verify that output.  Fix output bugs
-  only; never grow it.  It goes when stage 8 (the .cmi from the port's
-  signature) and stage 10 (`lambda/` from the port's typed tree) land,
-  together with `lambda.cpp`'s bespoke IR.
+- **`infer_check.cpp` + `infer.cpp`** (an approximating algorithm-W
+  pass), **`lambda.cpp`** (an AST-to-Lambda translator over its own IR),
+  **`bytecode.cpp` / `cmo.cpp`** (bytegen/emitcode over that IR), the
+  `c++lambda` / `c++instr` / `c++cmo` / `c++infer-test` tools and the
+  harnesses that scored them (`lambda_parity.sh`, `instr_parity.sh`,
+  `bootstrap_instr_parity.sh`, `qmark.sh`, `lambda_residue.sh`):
+  **deleted** (stage 10).
+- **`cmi.cpp`'s .cmi writer** (and `c++cmi`, `modsig.hpp`): still used by
+  `-pack` (`link::pack` writes the packed .cmi with it) until Bytepackager
+  and `Typemod.package_units` are ported.
 
 ## What counts as progress
 
@@ -273,30 +280,34 @@ from the port.  The two must be identical on every .cmi in the tree
    pointer, and whole lists the Reader decoded (one Slice per marshaled
    list); Subst's `List.filter` of attributes always builds a new list;
    and the warning state (below) decides which checks run.  With the
-   port's .cmi on
-   disk, the legacy translator (lambda.cpp) still reads its own writer's
-   view of the unit's .mli (a private temporary .cmi,
-   `lambda::set_legacy_own_cmi`): ocamlc's .cmi keeps a functor
-   parameter as a named module type (`EngineTypes.TABLE`) that the legacy
-   generator cannot resolve.  Type checking is on by default; DDC
-   139/139 .cmo + 216 .cmi and effid 139/139 with it.
+   port's .cmi on disk the legacy translator needed a private copy of its
+   own writer's view of the unit's .mli, until stage 10 removed it.  Type
+   checking is on by default; DDC 139/139 .cmo + 216 .cmi and effid
+   139/139 with it.
 9. **Messages:** `Printtyp` (+ `Out_type`, `Oprint`, `Errortrace_report`),
    the `report_error` functions and `Location`'s reporting; then the
    warnings themselves (their state is ported: `-w` / `-warn-error` /
    `-alert` and `[@warning]` scopes drive `Warnings.is_active`) and the
    checks that emit them.  Oracle: ocamlc's stderr, byte for byte
    (the testsuite's expect outputs are a second oracle).
-10. **Next (decided 2026-09-26): the translators from the port.**  Port
-   only `lambda/` -- `Translcore`, `Translprim`, `Translattribute`,
-   `Matching`, `Switch`, `Translmod`, `Translobj`/`Translclass`,
-   `Value_rec_compiler`, `Simplif`, `Tmc` (+ `Printlambda` for the oracle)
-   -- onto the port's typed tree.  The bytecode back end is already a
-   faithful, DDC-verified port and stays: `bytecode.cpp` (bytegen.ml),
-   `cmo.cpp` (emitcode.ml + the .cmo), `link.cpp` (bytelink/symtable).
-   First check that the existing Lam IR (`lambda.hpp`) represents
-   ocamlc's Lambda exactly with its imitation flags unset (adjust it
-   minimally if not); reuse genuine ports inside `lambda.cpp` only after
-   checking them against their .ml.  Oracles: `-drawlambda` / `-dlambda`
-   text, then `-dinstr` and .cmo bytes, then DDC.  Then delete
-   `lambda.cpp`'s AST translator, `infer_check.cpp`, `infer.cpp`, the
-   legacy .cmi writer and the `lambda::set_legacy_own_cmi` bridge.
+10. **Done (2026-09-26): code generation from the port.**  `lambda/`
+   (Translcore, Translprim, Translattribute, Matching, Switch, Translmod,
+   Translobj, Translclass, Value_rec_compiler, Simplif, Tmc, Printlambda
+   on a Format engine port) onto a new faithful Lambda IR
+   (`typing/lambda.hpp`), and `bytecomp/`'s Instruct, Bytegen, Printinstr
+   and Emitcode (the legacy bytegen/emitcode were not faithful and were
+   married to the old IR; `link.cpp` stays, reading .cmo files).
+   `lambda_port_parity.sh` compares against ocamlc.opt byte for byte:
+   `-drawlambda` / `-dlambda` / `-dinstr` (with and without `-g`) 0 DIFF
+   on stamp probes 6527, compiler sources 145 and testsuite 777/779 (the
+   2: ocamlc's warning lines); `DUMP=cmo` .cmo bytes as in the status
+   above.  DDC 139/139 + 216 and stdlib DDC 65 + 71 with the new pipeline
+   building S1; effid 139/139 byte-identical.  Identity the .cmo exposed:
+   Persistent_env.read (the .mli's .cmi's crcs recorded), the import set's
+   first string, one pos_fname per file, Const_immstring keeping its
+   string, String.sub of a whole string, a unit's equal string literals
+   merged (the reference ocamlc.opt is ocamlopt-built), a boxed-integer
+   literal's box shared.  The driver also gained `-open`, `-pp` and
+   ocamlc's output prefix (`-o stdlib__Arg.cmo` names the unit).
+   Left: the `-g` debug events (live type ids, summary sharing), `-pack`
+   (Bytepackager), and deleting `cmi.cpp` after it.

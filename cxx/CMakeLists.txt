@@ -27,12 +27,7 @@ add_library(cppcaml_core
   src/marshal.cpp
   src/blake2.cpp
   src/cmi.cpp
-  src/infer.cpp
-  src/infer_check.cpp
-  src/lambda.cpp
-  src/bytecode.cpp
   src/omarshal.cpp
-  src/cmo.cpp
   src/link.cpp
   # The typing/ port (TYPECHECKER.md).
   src/typing/ident.cpp
@@ -152,22 +147,11 @@ add_executable(c++cmi src/tools/cppcmi_main.cpp)
 target_link_libraries(c++cmi PRIVATE cppcaml_core)
 
 
-add_executable(c++infer-test src/tools/cppinfer_test.cpp)
-target_link_libraries(c++infer-test PRIVATE cppcaml_core)
 
 # Header-only: modsig.hpp needs no library, so no static-lib link (avoids the
 # llvm-ar gotcha).  Just the include dir.
 add_executable(c++modsig-test src/tools/cppmodsig_test.cpp)
 target_include_directories(c++modsig-test PRIVATE include)
-
-add_executable(c++lambda src/tools/cpplambda_main.cpp)
-target_link_libraries(c++lambda PRIVATE cppcaml_core)
-
-add_executable(c++instr src/tools/cppinstr_main.cpp)
-target_link_libraries(c++instr PRIVATE cppcaml_core)
-
-add_executable(c++cmo src/tools/cppcmo_main.cpp)
-target_link_libraries(c++cmo PRIVATE cppcaml_core)
 
 add_executable(c++link src/tools/cpplink_main.cpp)
 target_link_libraries(c++link PRIVATE cppcaml_core)
