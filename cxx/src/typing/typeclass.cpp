@@ -359,7 +359,7 @@ const tt::ClassTypeField* class_type_field(env::t env, ClassSignature* sign, lon
       });
     }
     case pt::ClassTypeFieldDesc::Kind::Pctf_attribute:
-      // (Builtin_attributes.warning_attribute: warnings are not ported)
+      builtin_attributes::warning_attribute(as<pt::Pctf_attribute>(d)->attr);
       return mkctf(mkd(tt::Tctf_attribute{{FK::Tctf_attribute}, as<pt::Pctf_attribute>(d)->attr}));
     case pt::ClassTypeFieldDesc::Kind::Pctf_extension: throw ErrorForward(as<pt::Pctf_extension>(d)->ext);
   }
@@ -835,6 +835,7 @@ void class_field_first_pass(const Location& self_loc, std::string_view cl_num, F
       return;
     }
     case FK::Pcf_attribute: {
+      builtin_attributes::warning_attribute(as<pt::Pcf_attribute>(d)->attr);
       IntermediateClassField field{IK::Attribute};
       field.attribute = as<pt::Pcf_attribute>(d)->attr;
       field.loc = loc;

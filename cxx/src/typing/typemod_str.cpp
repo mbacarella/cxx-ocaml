@@ -950,7 +950,7 @@ static ItemTyped type_str_item(SignatureNames* names, bool toplevel, bool funct_
     }
     case K::Pstr_extension: throw ErrorForward(as<pt::Pstr_extension>(d)->ext);
     case K::Pstr_attribute:
-      // (Builtin_attributes.warning_attribute: warnings are not ported)
+      builtin_attributes::warning_attribute(as<pt::Pstr_attribute>(d)->attr);
       return mk(mkd(tt::Tstr_attribute{{STK::Tstr_attribute}, as<pt::Pstr_attribute>(d)->attr}), {}, shape_map, env);
   }
   throw std::logic_error("type_str_item");

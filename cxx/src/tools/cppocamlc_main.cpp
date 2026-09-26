@@ -48,6 +48,7 @@
 #include "cppcaml/typing/includemod.hpp"
 #include "cppcaml/typing/typecore.hpp"
 #include "cppcaml/typing/typemod.hpp"
+#include "cppcaml/typing/warnings.hpp"
 
 namespace fs = std::filesystem;
 
@@ -144,7 +145,7 @@ static bool ends_with(const std::string& s, const char* suf) {
 // Flags taking ONE argument that we accept and ignore (must consume the arg so
 // it is not mistaken for a source file).
 static const std::set<std::string> kArgIgnore = {
-    "-w", "-warn-error", "-alert", "-color", "-error-style", "-cclib", "-ccopt",
+    "-color", "-error-style", "-cclib", "-ccopt",
     "-dllib", "-dllpath", "-intf-suffix", "-intf_suffix",
     "-cmi-file", "-dump-dir", "-inline", "-afl-inst-ratio", "-function-sections",
     "-match-context-rows", "-runtime-variant"};
@@ -595,6 +596,18 @@ static int run_main(int argc, char** argv) {
       return 0;
     } else if (a == "-impl") inputs.push_back(need_arg("-impl"));   // force .ml kind
     else if (a == "-intf") inputs.push_back(need_arg("-intf"));     // force .mli kind
+    else if (a == "-w" || a == "-warn-error" || a == "-alert") {
+      // Warnings.parse_options / parse_alert_option, in command-line order
+      std::string v = need_arg(a.c_str());
+      namespace w = cppcaml::typing::warnings;
+      try {
+        if (a == "-alert") w::parse_alert_option(v);
+        else w::parse_options(a == "-warn-error", v);
+      } catch (const w::Bad& e) {
+        std::cerr << "c++ocamlc: bad argument '" << v << "' to option '" << a << "': " << e.what() << '\n';
+        return 2;
+      }
+    }
     else if (a == "-stop-after") {
       // `typing`: type-check with the ported checker, write nothing
       std::string pass = need_arg("-stop-after");

@@ -444,7 +444,7 @@ const tt::Signature* transl_signature_(env::t env0, pt::Signature ssg) {
         return {mksig(mkd(tt::Tsig_class_type{{TSK::Tsig_class_type}, slice(infos)}), env, loc), sg, newenv};
       }
       case K::Psig_attribute:
-        // (Builtin_attributes.warning_attribute: warnings are not ported)
+        builtin_attributes::warning_attribute(as<pt::Psig_attribute>(d)->attr);
         return {mksig(mkd(tt::Tsig_attribute{{TSK::Tsig_attribute}, as<pt::Psig_attribute>(d)->attr}), env, loc), {},
                 env};
       case K::Psig_extension: throw ErrorForward(as<pt::Psig_extension>(d)->ext);

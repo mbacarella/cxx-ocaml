@@ -1,8 +1,8 @@
 // Port of parsing/builtin_attributes.ml, as far as the typer has needed it.
 //
-// Deviation (TYPECHECKER.md): warnings are not ported yet, so
-// `warning_scope` does not process [@warning] / [@ocaml.warning]
-// attributes -- it only runs its body.  This matters for diagnostics only.
+// The warning *state* is ported (warnings.hpp): `warning_scope` and
+// `warning_attribute` apply [@warning] / [@warnerror] / [@alert]; the
+// warnings themselves are not reported yet.
 #pragma once
 
 #include <optional>
@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "cppcaml/typing/parsetree.hpp"
+#include "cppcaml/typing/warnings.hpp"
 
 namespace cppcaml::typing::builtin_attributes {
 
@@ -116,9 +117,41 @@ inline StrMap<std::string_view> alerts_of_str(const parsetree::Structure& str) {
   return alerts_of_attrs(a);
 }
 
+// warning_attribute ?ppwarning attr: [@warning "..."] / [@warnerror "..."]
+// / [@alert ...] update the warning state (the warnings they may report --
+// bad payloads, [@ppwarning] -- are not reported yet)
+inline void warning_attribute(const parsetree::Attribute* a, bool ppwarning = true) {
+  (void)ppwarning;
+  std::string_view n = a->attr_name.txt;
+  bool warning = attr_equals_builtin(n, "warning"), warnerror = attr_equals_builtin(n, "warnerror");
+  if (warning || warnerror) {
+    if (std::optional<std::string_view> s = string_of_payload(a->attr_payload)) {
+      try {
+        warnings::parse_options(warnerror, *s);
+      } catch (const warnings::Bad&) {
+      }
+    }
+  } else if (attr_equals_builtin(n, "alert")) {
+    if (std::optional<std::string_view> s = string_of_payload(a->attr_payload)) {
+      try {
+        warnings::parse_alert_option(*s);
+      } catch (const warnings::Bad&) {
+      }
+    }
+  }
+}
+
+// warning_scope ?ppwarning attrs f: f under the attributes' warning
+// settings, the state restored afterwards (an exception included)
 template <class F>
-auto warning_scope(const parsetree::Attributes&, F&& f) -> decltype(f()) {
+auto warning_scope(const parsetree::Attributes& attrs, F&& f, bool ppwarning = true) -> decltype(f()) {
+  struct Restore {
+    warnings::State prev;
+    ~Restore() { warnings::restore(prev); }
+  } r{warnings::backup()};
+  for (std::size_t k = attrs.size(); k-- > 0;) warning_attribute(attrs[k], ppwarning);
   return f();
 }
+
 
 }  // namespace cppcaml::typing::builtin_attributes
