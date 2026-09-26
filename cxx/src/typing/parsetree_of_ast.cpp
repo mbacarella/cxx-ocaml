@@ -100,6 +100,19 @@ struct Conv {
   }
   LidLoc lidloc(const ast::LongidentLoc& l) const { return {lid(l.txt), loc(l.loc)}; }
 
+  // A punned label (`~x`, `~(x:t)`, `?x`, `?(x ..)`: parser.mly's
+  // label_var / mkexpvar) is the variable's own string.
+  static std::string_view punned_name(const Pattern* p) {
+    if (auto* c = as<Ppat_constraint>(p->ppat_desc)) p = c->pat;
+    if (auto* v = as<Ppat_var>(p->ppat_desc)) return v->name.txt;
+    return {};
+  }
+  static std::string_view punned_name(const Expression* e) {
+    if (auto* c = as<Pexp_constraint>(e->pexp_desc)) e = c->exp;
+    if (auto* i = as<Pexp_ident>(e->pexp_desc); i && i->lid.txt->kind == Longident::Kind::Lident) return i->lid.txt->s;
+    return {};
+  }
+  static OptStr pun_label(std::string_view name) { return OptStr{true, name, fresh_identity()}; }
   static ArgLabel label(const ast::ArgLabel& l) {
     if (auto* p = std::get_if<ast::Labelled>(&l)) return ArgLabel::labelled(p->name);
     if (auto* p = std::get_if<ast::Optional>(&l)) return ArgLabel::optional(p->name);
@@ -329,9 +342,14 @@ struct Conv {
             d = make<Ppat_interval>(Ppat_interval{{K::Ppat_interval}, constant(v.c1), constant(v.c2)});
           } else if constexpr (std::is_same_v<T, ast::Ppat_tuple>) {
             std::vector<LabeledPattern> pl;
-            for (std::size_t k = 0; k < v.elems.size(); ++k)
-              pl.push_back({k < v.labels.size() ? optstr_of(v.labels[k]) : OptStr::none(),
-                            pattern(*v.elems[k])});
+            for (std::size_t k = 0; k < v.elems.size(); ++k) {
+              // the label after the element (OCaml's evaluation order is
+              // immaterial: neither allocates stamps)
+              const Pattern* ep = pattern(*v.elems[k]);
+              std::string_view pn = k < v.puns.size() && v.puns[k] ? punned_name(ep) : std::string_view{};
+              pl.push_back({pn.data() ? pun_label(pn) : k < v.labels.size() ? optstr_of(v.labels[k]) : OptStr::none(),
+                            ep});
+            }
             d = make<Ppat_tuple>(Ppat_tuple{{K::Ppat_tuple}, slice(pl), closed(v.closed)});
           } else if constexpr (std::is_same_v<T, ast::Ppat_construct>) {
             const ConstructArg* arg = nullptr;
@@ -422,6 +440,7 @@ struct Conv {
     d.label = label(pv.label);
     d.default_ = pv.default_ ? expression(**pv.default_) : nullptr;
     d.pat = pattern(pv.pat);
+    if (std::string_view n = pv.pun ? punned_name(d.pat) : std::string_view{}; n.data()) d.label.name = n;
     return make<FunctionParam>(loc(pv.loc), d);
   }
   const Expression* expression(const ast::Expression& e) const {
@@ -470,9 +489,12 @@ struct Conv {
             d = make<Pexp_try>(Pexp_try{{K::Pexp_try}, expression(*v.e), cases(v.cases)});
           } else if constexpr (std::is_same_v<T, ast::Pexp_tuple>) {
             std::vector<LabeledExpression> el;
-            for (std::size_t k = 0; k < v.elems.size(); ++k)
-              el.push_back({k < v.labels.size() ? optstr_of(v.labels[k]) : OptStr::none(),
-                            expression(*v.elems[k])});
+            for (std::size_t k = 0; k < v.elems.size(); ++k) {
+              const Expression* ee = expression(*v.elems[k]);
+              std::string_view pn = k < v.puns.size() && v.puns[k] ? punned_name(ee) : std::string_view{};
+              el.push_back({pn.data() ? pun_label(pn) : k < v.labels.size() ? optstr_of(v.labels[k]) : OptStr::none(),
+                            ee});
+            }
             d = make<Pexp_tuple>(Pexp_tuple{{K::Pexp_tuple}, slice(el)});
           } else if constexpr (std::is_same_v<T, ast::Pexp_construct>) {
             d = make<Pexp_construct>(Pexp_construct{{K::Pexp_construct}, lidloc(v.id),

@@ -1073,6 +1073,7 @@ class Parser {
       advance();
       const Token& id = cur(); advance();
       ExprBox e = E({Pexp_ident{LongidentLoc{{Lident{id.text}}, tokloc(id)}}, tokloc(id)});
+      elem_pun_ = true;
       return {id.text, std::move(e)};
     }
     if (cur().kind == Kind::TILDE && peek(1).kind == Kind::LPAREN) {  // ~(x:t) punning+constraint
@@ -1085,12 +1086,14 @@ class Parser {
       ExprBox ide = E({Pexp_ident{LongidentLoc{{Lident{id.text}}, tokloc(id)}}, tokloc(id)});
       Location cl = span(position(lp.start), position(rp.end));
       elem_punned_constr_ = true;
+      elem_pun_ = true;
       return {id.text, E({Pexp_constraint{std::move(ide), std::move(ty)}, cl})};
     }
     return {std::nullopt, parse_binop(0)};
   }
   Position last_case_end_{};  // end of last match/try arm (incl trailing ;)
   bool elem_punned_constr_ = false;  // last elem was `~(x:t)` (its loc-end quirk)
+  bool elem_pun_ = false;  // last labeled tuple elem (expr or pattern) was a pun
   // letop binding pattern: `p` or `p : t` (a ghost Ppat_constraint over `p : t`).
   Pattern parse_letop_binding_pat() {
     Pattern p = parse_pattern();
@@ -1105,26 +1108,31 @@ class Parser {
   ExprBox parse_tuple() {
     Position s = position(cur().start);
     elem_punned_constr_ = false;
+    elem_pun_ = false;
     auto first = parse_labeled_tuple_elem();
     bool firstPunned = elem_punned_constr_;
     if (cur().kind != Kind::COMMA) return std::move(first.second);  // single element
     std::vector<ExprBox> elems;
     std::vector<std::optional<std::string>> labels;
+    std::vector<bool> puns;
     elems.push_back(std::move(first.second));
     labels.push_back(first.first);
+    puns.push_back(elem_pun_);
     while (cur().kind == Kind::COMMA) {
       advance();
+      elem_pun_ = false;
       auto e = parse_labeled_tuple_elem();
       elems.push_back(std::move(e.second));
       labels.push_back(e.first);
+      puns.push_back(elem_pun_);
     }
     // menhir inlining quirk: a leading `~(x:t)` element's loc-end becomes the end
     // of the base-case reduction (i.e. the second element's end).
     if (firstPunned && elems.size() >= 2) elems[0]->loc.end = elems[1]->loc.end;
     Location l = span(s, elems.back()->loc.end);
     bool labeled = false; for (auto& x : labels) if (x) labeled = true;
-    if (!labeled) labels.clear();  // ordinary tuple: keep labels empty (printer emits None)
-    ExprBox tup = E({Pexp_tuple{std::move(elems), std::move(labels)}, l});
+    if (!labeled) { labels.clear(); puns.clear(); }  // ordinary tuple: keep labels empty (printer emits None)
+    ExprBox tup = E({Pexp_tuple{std::move(elems), std::move(labels), std::move(puns)}, l});
     // A labeled tuple's element values are simple_expr, so a trailing `::` conses
     // the *whole* tuple as the head (`(~a:x, ~b:y) :: l`).
     if (labeled && cur().kind == Kind::COLONCOLON) {
@@ -2017,6 +2025,7 @@ class Parser {
     if (cur().kind == Kind::TILDE && peek(1).kind == Kind::LIDENT) {  // ~x  (punning)
       advance();
       const Token& id = cur(); advance();
+      elem_pun_ = true;
       return {id.text, Pattern{Ppat_var{StringLoc{id.text, tokloc(id)}}, tokloc(id)}};
     }
     if (cur().kind == Kind::TILDE && peek(1).kind == Kind::LPAREN) {  // ~(x:t) punning+constraint
@@ -2028,6 +2037,7 @@ class Parser {
       const Token& rp = cur(); expect(Kind::RPAREN, ")");
       Pattern var{Ppat_var{StringLoc{id.text, tokloc(id)}}, tokloc(id)};
       Location cl = span(position(lp.start), position(rp.end));
+      elem_pun_ = true;
       return {id.text, Pattern{Ppat_constraint{box(std::move(var)), std::move(ty)}, cl}};
     }
     Pattern p = parse_pat_cons();
@@ -2046,24 +2056,29 @@ class Parser {
   }
   Pattern parse_pat_tuple() {
     Position s = position(cur().start);
+    elem_pun_ = false;
     auto first = parse_labeled_pat_elem();
     if (cur().kind != Kind::COMMA) return std::move(first.second);
     std::vector<PatBox> elems;
     std::vector<std::optional<std::string>> labels;
+    std::vector<bool> puns;
     ClosedFlag closed = ClosedFlag::Closed;
     elems.push_back(box(std::move(first.second)));
     labels.push_back(first.first);
+    puns.push_back(elem_pun_);
     while (cur().kind == Kind::COMMA) {
       advance();
       if (cur().kind == Kind::DOTDOT) { advance(); closed = ClosedFlag::Open; break; }  // (.., ..)
+      elem_pun_ = false;
       auto e = parse_labeled_pat_elem();
       elems.push_back(box(std::move(e.second)));
       labels.push_back(e.first);
+      puns.push_back(elem_pun_);
     }
     Location l = span(s, position(tokens_[idx_ - 1].end));
     bool any = false; for (auto& x : labels) if (x) any = true;
-    if (!any) labels.clear();
-    return Pattern{Ppat_tuple{std::move(elems), closed, std::move(labels)}, l};
+    if (!any) { labels.clear(); puns.clear(); }
+    return Pattern{Ppat_tuple{std::move(elems), closed, std::move(labels), std::move(puns)}, l};
   }
   Pattern parse_pat_cons() {
     // A trailing `[@attr]` binds to the whole (lowest-precedence) cons pattern,
@@ -2765,7 +2780,7 @@ class Parser {
       advance(); const Token& id = cur(); advance();
       Pattern p{Ppat_var{StringLoc{id.text, tokloc(id)}}, tokloc(id)};
       Location loc = span(position(t.start), position(id.end));
-      return FunctionParam{Pparam_val{loc, Labelled{id.text}, std::nullopt, std::move(p)}};
+      return FunctionParam{Pparam_val{loc, Labelled{id.text}, std::nullopt, std::move(p), true}};
     }
     // ~(x:t)  (labelled punning with a type constraint, possibly poly)
     if (t.kind == Kind::TILDE && peek(1).kind == Kind::LPAREN) {
@@ -2778,14 +2793,14 @@ class Parser {
       Location pl = span(position(id.start), ty->loc.end);  // inner: x..type
       Pattern p{Ppat_constraint{box(std::move(var)), std::move(ty)}, pl};
       Location loc = span(position(t.start), position(c.end));  // ~..)
-      return FunctionParam{Pparam_val{loc, Labelled{id.text}, std::nullopt, std::move(p)}};
+      return FunctionParam{Pparam_val{loc, Labelled{id.text}, std::nullopt, std::move(p), true}};
     }
     // ?x  (optional punning)
     if (t.kind == Kind::QUESTION && peek(1).kind == Kind::LIDENT) {
       advance(); const Token& id = cur(); advance();
       Pattern p{Ppat_var{StringLoc{id.text, tokloc(id)}}, tokloc(id)};
       Location loc = span(position(t.start), position(id.end));
-      return FunctionParam{Pparam_val{loc, Optional{id.text}, std::nullopt, std::move(p)}};
+      return FunctionParam{Pparam_val{loc, Optional{id.text}, std::nullopt, std::move(p), true}};
     }
     // ~lbl:pat   (labelled with explicit pattern)
     if (t.kind == Kind::LABEL) {
@@ -2831,7 +2846,7 @@ class Parser {
       if (cur().kind == Kind::EQUAL) { advance(); def = parse_expr(); }
       const Token& c = cur(); expect(Kind::RPAREN, ")");
       Location loc = span(position(t.start), position(c.end));
-      return FunctionParam{Pparam_val{loc, Optional{id.text}, std::move(def), std::move(p)}};
+      return FunctionParam{Pparam_val{loc, Optional{id.text}, std::move(def), std::move(p), true}};
     }
     Position ps = position(cur().start);
     Pattern p = parse_simple_pattern();

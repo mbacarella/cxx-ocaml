@@ -164,7 +164,10 @@ struct Ppat_any {};
 struct Ppat_var { StringLoc name; };
 struct Ppat_constant { Constant c; };
 struct Ppat_tuple { std::vector<PatBox> elems; ClosedFlag closed = ClosedFlag::Closed;
-                    std::vector<std::optional<std::string>> labels; };  // empty = all None
+                    std::vector<std::optional<std::string>> labels;  // empty = all None
+                    // `~x` / `~(x:t)` puns: the label is the variable's own string
+                    // (parser.mly's label_var); empty = none
+                    std::vector<bool> puns; };
 struct Ppat_construct { LongidentLoc id; std::optional<PatBox> arg;
                         std::vector<StringLoc> vars; };  // Constr (type a b) pat
 struct Ppat_or { PatBox l; PatBox r; };
@@ -214,7 +217,8 @@ struct Pexp_function {
   Box<FunctionBody> body;
 };
 struct Pexp_tuple { std::vector<ExprBox> elems;
-                    std::vector<std::optional<std::string>> labels; };  // empty = all None
+                    std::vector<std::optional<std::string>> labels;  // empty = all None
+                    std::vector<bool> puns; };  // as Ppat_tuple's
 struct Pexp_ifthenelse { ExprBox cond; ExprBox then_; std::optional<ExprBox> else_; };
 struct Case;
 struct Pexp_construct { LongidentLoc id; std::optional<ExprBox> arg; };
@@ -284,7 +288,8 @@ struct ValueBinding {
   std::optional<Location> loc;
 };
 
-struct Pparam_val { Location loc; ArgLabel label; std::optional<ExprBox> default_; Pattern pat; };
+struct Pparam_val { Location loc; ArgLabel label; std::optional<ExprBox> default_; Pattern pat;
+                    bool pun = false; };  // ~x, ~(x:t), ?x, ?(x..): the label is the var's string
 struct Pparam_newtype { StringLoc name; Location loc; };  // (type a)
 struct FunctionParam { std::variant<Pparam_val, Pparam_newtype> desc; };
 
