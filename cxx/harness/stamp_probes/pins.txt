@@ -1249,6 +1249,12 @@ xfa_f10 0
 xfa_f11 0
 xfa_f12 0
 xfa_f13 -47
+xfbs_1 0
+xfbs_2 0
+xfbs_3 0
+xfbs_4 0
+xfbs_5 0
+xfbs_6 0
 xfb_a1 0
 xfb_a2 0
 xfb_a3 0

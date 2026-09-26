@@ -1062,6 +1062,10 @@ struct Checker {
     // result (`N`, `N.M`), qualified like vals (S628).
     std::unordered_map<std::string,
                        std::unordered_map<std::string, TypePtr>> submods;
+    // A body submodule's own type names, cited bare by its values (S629).
+    // (bare name, path relative to the result), innermost first.
+    std::unordered_map<std::string,
+        std::vector<std::pair<std::string, std::string>>> submod_types;
   };
   // Filled by applied_local_functor for the binding site (S628).
   std::unordered_map<std::string,
@@ -4190,8 +4194,18 @@ struct Checker {
     if (!via_open)
       for (auto& [sk, svals] : fr->second.submods) {
         auto& dst = locfapp_submods_[sk];
+        auto sts = fr->second.submod_types.find(sk);
         for (auto& [k, v] : svals) {
-          TypePtr t = xf(v);
+          TypePtr v1 = v;
+          if (sts != fr->second.submod_types.end()) {
+            std::unordered_set<std::string> done;
+            for (auto& [n, rp] : sts->second) {
+              if (!done.insert(n).second) continue;  // shadowed
+              std::unordered_map<I::Type*, TypePtr> ms;
+              v1 = subst_path_head(v1, n, tpfx + rp, ms, /*exact=*/true);
+            }
+          }
+          TypePtr t = xf(v1);
           if (!t) { locfapp_submods_.clear(); return out; }
           dst[k] = t;
         }
@@ -15168,8 +15182,48 @@ struct Checker {
                         fr.own_decls.push_back(&d);
                       }
                     } else if (auto* bm = std::get_if<Pstr_module>(&bi.desc)) {
-                      if (bm->binding.name.txt)
+                      if (bm->binding.name.txt) {
                         fr.own_mods.push_back(*bm->binding.name.txt);
+                        // The body's submodule values, as the harvest left
+                        // them in the flat map, for `C.N.z` (S629).
+                        static const bool no_bodysub =
+                            cppcaml::dbg_env("NOFBODYSUB") != nullptr ||
+                            cppcaml::dbg_env("NOSHARE629") != nullptr;
+                        // Nested submodules too (`C.N.M.q`): each level's
+                        // bare type names map to their path in the result,
+                        // an inner declaration shadowing an outer one.
+                        std::function<void(const ModuleBinding&,
+                                           const std::string&,
+                                           std::vector<std::pair<
+                                               std::string, std::string>>)>
+                            capture = [&](const ModuleBinding& b,
+                                          const std::string& rel,
+                                          std::vector<std::pair<
+                                              std::string, std::string>> tys) {
+                              auto* ss = std::get_if<Pmod_structure>(
+                                  &b.expr.desc);
+                              if (!ss) return;
+                              auto f = modenv.find(*b.name.txt);
+                              if (f == modenv.end()) return;
+                              for (auto& si : ss->items)
+                                if (auto* st = std::get_if<Pstr_type>(&si.desc))
+                                  for (auto& d : st->decls)
+                                    tys.insert(tys.begin(),
+                                               {d.name.txt,
+                                                rel + "." + d.name.txt});
+                              fr.submods[rel] = f->second;
+                              fr.submod_types[rel] = tys;
+                              for (auto& si : ss->items)
+                                if (auto* sm = std::get_if<Pstr_module>(
+                                        &si.desc);
+                                    sm && sm->binding.name.txt)
+                                  capture(sm->binding,
+                                          rel + "." + *sm->binding.name.txt,
+                                          tys);
+                            };
+                        if (!no_bodysub)
+                          capture(bm->binding, *bm->binding.name.txt, {});
+                      }
                     }
                   functor_real_env_[*mb->binding.name.txt] = std::move(fr);
                 }
