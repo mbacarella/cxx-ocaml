@@ -421,7 +421,7 @@ static std::pair<TypeExpr*, Change> build_subtype(env::t env, const Visited& vis
           // this occurrence might break the occur check.
           if (deep_occur_list(ty, std::vector<TypeExpr*>(tl1.begin(), tl1.end())))
             throw env::NotFound{};
-          set_type_desc(ty, tvar(OptStr::none()));
+          set_type_desc(ty, TVAR_NONE_LIT());
           TypeExpr* t2 = newvar();
           Loops loops2 = loops;
           loops2.insert(loops2.begin(), {get_id(ty), t2});

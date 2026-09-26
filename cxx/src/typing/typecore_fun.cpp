@@ -138,9 +138,9 @@ TypeFunctionResult type_function(env::t env, Slice<const pt::FunctionParam*> par
     tt::FunctionParamKind fp_kind{tt::FunctionParamKind::Kind::Tparam_pat, r.pat};
     Ident::t fp_param;
     if (!default_arg) {
-      fp_param = name_pattern("param", {r.pat});
+      fp_param = name_pattern(OCAML_LIT("param"), {r.pat});
     } else {
-      fp_param = Ident::create_local("*opt*");
+      fp_param = Ident::create_local(OCAML_LIT("*opt*"));
       fp_kind = tt::FunctionParamKind{tt::FunctionParamKind::Kind::Tparam_optional_default, r.pat, default_arg};
     }
     auto* param =
@@ -203,7 +203,7 @@ TypeFunctionResult type_function(env::t env, Slice<const pt::FunctionParam*> par
     tbody->kind = tt::FunctionBody::Kind::Tfunction_cases;
     tbody->cases = cp.first;
     tbody->partial = cp.second;
-    tbody->param = name_cases("param", cp.first);
+    tbody->param = name_cases(OCAML_LIT("param"), cp.first);
     tbody->loc = loc;
     tbody->exp_extra = exp_extra;
     tbody->attributes = attributes;
@@ -585,7 +585,7 @@ const tt::Expression* type_argument_x(Explanation explanation, Recarg recarg, en
     std::vector<const tt::Case*> cases{make<tt::Case>(eta_pat, nullptr, nullptr, e)};
     Location cases_loc = texp1->exp_loc;
     cases_loc.loc_ghost = true;
-    Ident::t param = name_cases("param", slice(cases));
+    Ident::t param = name_cases(OCAML_LIT("param"), slice(cases));
     tt::FunctionBody* fb = make<tt::FunctionBody>();
     fb->kind = tt::FunctionBody::Kind::Tfunction_cases;
     fb->cases = slice(cases);

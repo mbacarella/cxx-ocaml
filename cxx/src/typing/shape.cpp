@@ -69,7 +69,7 @@ std::pair<Ident::t, t> fresh_var(const Uid& uid, std::string_view name) {
 Ident::t for_unnamed_functor_param() {
   static Ident::t id = [] {
     ZoneScope perm(permanent_zone());
-    return Ident::create_local("()");
+    return Ident::create_local(OCAML_LIT("()"));
   }();
   return id;
 }
@@ -168,7 +168,7 @@ t for_persistent_unit(std::string_view s) {
 }
 t leaf_for_unpack() {
   Shape* r = mk(nullptr, Shape::Kind::Pack);
-  r->var = Ident::create_local("Pkg");
+  r->var = Ident::create_local(OCAML_LIT("Pkg"));
   return r;
 }
 t set_uid_if_none(t s, const Uid& u) {

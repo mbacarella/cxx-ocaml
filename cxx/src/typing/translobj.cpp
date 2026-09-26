@@ -38,7 +38,7 @@ Lam share(const StructuredConstant* c) {
   if (c->kind == StructuredConstant::Kind::Const_block && !c->fields.empty()) {
     for (const ConstEntry& e : consts)
       if (equal_structured_constant(e.c, c)) return lvar(e.id);
-    Ident::t id = Ident::create_local("shared");
+    Ident::t id = Ident::create_local(OCAML_LIT("shared"));
     consts.push_back({c, id});
     return lvar(id);
   }
@@ -140,7 +140,7 @@ Lam transl_label_init_general(const std::function<Lam()>& f) {
 }
 
 Lam transl_label_init_flambda(const std::function<Lam()>& f) {
-  Ident::t method_cache_id = Ident::create_local("method_cache");
+  Ident::t method_cache_id = Ident::create_local(OCAML_LIT("method_cache"));
   method_cache_ = lvar(method_cache_id);
   Lam expr = f();
   if (method_count != 0) {

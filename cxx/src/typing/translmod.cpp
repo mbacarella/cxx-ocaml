@@ -185,7 +185,7 @@ Lam apply_coercion(const ScopedLocation& loc, LetKind strict, const MC* restr, L
                                 get_field, lam);
       });
     case MC::Kind::Tcoerce_functor: {
-      Ident::t param = Ident::create_local("funarg");
+      Ident::t param = Ident::create_local(OCAML_LIT("funarg"));
       Lam carg = apply_coercion(loc, LetKind::Alias, restr->arg, L::lvar(param));
       return apply_coercion_result(loc, strict, arg, {L::Param{param, VK::gen()}}, {carg}, restr->res);
     }
@@ -206,7 +206,7 @@ Lam apply_coercion(const ScopedLocation& loc, LetKind strict, const MC* restr, L
 Lam apply_coercion_result(const ScopedLocation& loc, LetKind strict, Lam funct, std::vector<L::Param> params,
                           std::vector<Lam> args, const MC* cc_res) {
   if (cc_res->kind == MC::Kind::Tcoerce_functor) {
-    Ident::t param = Ident::create_local("funarg");
+    Ident::t param = Ident::create_local(OCAML_LIT("funarg"));
     Lam arg = apply_coercion(loc, LetKind::Alias, cc_res->arg, L::lvar(param));
     params.push_back(L::Param{param, VK::gen()});
     args.push_back(arg);
@@ -639,9 +639,9 @@ Merged merge_functors(scopes sc, const tt::ModuleExpr* mexp, const MC* coercion,
     Ident::t param;
     if (f->param.is_unit) {
       path = nullptr;
-      param = Ident::create_local("*");
+      param = Ident::create_local(OCAML_LIT("*"));
     } else if (!f->param.id) {
-      Ident::t id = Ident::create_local("_");
+      Ident::t id = Ident::create_local(OCAML_LIT("_"));
       path = functor_path(m.path, id);
       param = id;
     } else {
@@ -888,7 +888,7 @@ Lam transl_struct_item(scopes sc, Fields fields, Path::t rootpath, const tt::Str
       const tt::IncludeDeclaration* incl = tt::as<tt::Tstr_include>(d)->incl;
       std::vector<Ident::t> ids = types::bound_value_identifiers(incl->incl_type);
       const tt::ModuleExpr* modl = incl->incl_mod;
-      Ident::t mid = Ident::create_local("include");
+      Ident::t mid = Ident::create_local(OCAML_LIT("include"));
       Lam body = rebind_idents(sc, mid, incl->incl_loc, ids, 0, fields, next);
       Lam m = transl_module(sc, tt::tcoerce_none(), nullptr, modl);
       return L::llet(translcore::pure_module(modl), VK::gen(), mid, m, body);
@@ -901,7 +901,7 @@ Lam transl_struct_item(scopes sc, Fields fields, Path::t rootpath, const tt::Str
       // But since [scan_used_globals] runs before Simplif, we need to do it.
       if (od->open_bound_items.empty() && pure == LetKind::Alias) return next(fields);
       std::vector<Ident::t> ids = types::bound_value_identifiers(od->open_bound_items);
-      Ident::t mid = Ident::create_local("open");
+      Ident::t mid = Ident::create_local(OCAML_LIT("open"));
       Lam body = rebind_idents(sc, mid, od->open_loc, ids, 0, fields, next);
       Lam m = transl_module(sc, tt::tcoerce_none(), nullptr, od->open_expr);
       return L::llet(pure, VK::gen(), mid, m, body);

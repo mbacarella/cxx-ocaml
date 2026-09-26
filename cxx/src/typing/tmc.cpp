@@ -83,7 +83,7 @@ Lam with_placeholder(const Constr& constr, const std::function<Lam(const Dst&)>&
   Lam k_with_placeholder = constr_apply(mc, dummy_constant());
   long placeholder_pos = static_cast<long>(constr.before.size());
   Lam placeholder_pos_lam = lconst(const_int(placeholder_pos));
-  Ident::t block_var = Ident::create_local("block");
+  Ident::t block_var = Ident::create_local(OCAML_LIT("block"));
   Lam b = body(Dst{block_var, placeholder_pos_lam, constr.loc});
   return llet(LetKind::Strict, ValueKind::gen(), block_var, k_with_placeholder, b);
 }
@@ -563,8 +563,8 @@ std::vector<std::pair<Ident::t, const LFunction*>> make_dps_variant(Ident::t var
       lfunction_(lfun->kind, lfun->params, lfun->return_, choice_direct(fun_choice), lfun->attr, lfun->loc);
   // { var = create_local "dst"; offset = create_local "offset"; loc }: a
   // record, right to left
-  Ident::t offset_id = Ident::create_local("offset");
-  Ident::t dst_var = Ident::create_local("dst");
+  Ident::t offset_id = Ident::create_local(OCAML_LIT("offset"));
+  Ident::t dst_var = Ident::create_local(OCAML_LIT("dst"));
   Dst dst{dst_var, lvar(offset_id), lfun->loc};
   // lfunction' ~kind ~params ~return ~body ~attr ~loc: only ~body has
   // effects

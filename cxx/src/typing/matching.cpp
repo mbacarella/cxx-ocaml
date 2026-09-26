@@ -1844,9 +1844,9 @@ lam call_force_lazy_block(lam varg, const L::ScopedLocation& loc) {
 }
 
 lam inline_lazy_force_cond(lam arg, const L::ScopedLocation& loc) {
-  Ident::t idarg = Ident::create_local("lzarg");
+  Ident::t idarg = Ident::create_local(OCAML_LIT("lzarg"));
   lam varg = L::lvar(idarg);
-  Ident::t tag = Ident::create_local("tag");
+  Ident::t tag = Ident::create_local(OCAML_LIT("tag"));
   auto test_tag = [&](long t) {
     return lprim(pintcomp(L::IntegerComparison::Ceq), {L::lvar(tag), lconst_int(t)}, loc);
   };
@@ -1861,7 +1861,7 @@ lam inline_lazy_force_cond(lam arg, const L::ScopedLocation& loc) {
 }
 
 lam inline_lazy_force_switch(lam arg, const L::ScopedLocation& loc) {
-  Ident::t idarg = Ident::create_local("lzarg");
+  Ident::t idarg = Ident::create_local(OCAML_LIT("lzarg"));
   lam varg = L::lvar(idarg);
   L::LambdaSwitch sw;
   sw.sw_numblocks = 0;
@@ -2029,7 +2029,7 @@ const PrimitiveDescription* prim_string_compare_desc() {
 
 lam bind_sw(lam arg, const std::function<lam(lam)>& k) {
   if (L::as<L::Lvar>(arg)) return k(arg);
-  Ident::t id = Ident::create_local("switch");
+  Ident::t id = Ident::create_local(OCAML_LIT("switch"));
   return L::llet(LetKind::Strict, L::ValueKind::gen(), id, arg, k(L::lvar(id)));
 }
 
@@ -2206,7 +2206,7 @@ struct SArg {
       newvar = v->id;
       newarg = a;
     } else {
-      newvar = Ident::create_local("switcher");
+      newvar = Ident::create_local(OCAML_LIT("switcher"));
       newarg = L::lvar(newvar);
     }
     return L::bind(LetKind::Alias, newvar, a, body(newarg));
@@ -2693,7 +2693,7 @@ std::pair<lam, Jumps> combine_extension_constructor(const L::ScopedLocation& loc
   lam nonconst_lambda;
   if (nonconsts.empty()) nonconst_lambda = deflt;
   else {
-    Ident::t tag = Ident::create_local("tag");
+    Ident::t tag = Ident::create_local(OCAML_LIT("tag"));
     lam tests = deflt;
     for (auto it = nonconsts.rbegin(); it != nonconsts.rend(); ++it) {
       lam ext = L::transl_extension_path(loc, pat_env, it->first);
@@ -2794,7 +2794,7 @@ lam call_switcher_variant_constant(const L::ScopedLocation& loc, lam fail, lam a
 }
 
 lam call_switcher_variant_constr(const L::ScopedLocation& loc, lam fail, lam arg, const IntCases& l) {
-  Ident::t v = Ident::create_local("variant");
+  Ident::t v = Ident::create_local(OCAML_LIT("variant"));
   lam sw = call_switcher(loc, fail, L::lvar(v), l);
   return L::llet(LetKind::Alias, L::ValueKind::gen(), v,
                  lprim(pfield(0, L::ImmediateOrPointer::Pointer, MutableFlag::Immutable), {arg}, loc), sw);
@@ -2857,7 +2857,7 @@ std::pair<lam, Jumps> combine_array(const L::ScopedLocation& loc, lam arg, L::Ar
                                     const ArgPartiality& partial, const Context& ctx, const DefaultEnv& def,
                                     const CDiv<long>& c_div) {
   auto [fail, local_jumps] = mk_failaction_neg(partial, ctx, def);
-  Ident::t newvar = Ident::create_local("len");
+  Ident::t newvar = Ident::create_local(OCAML_LIT("len"));
   lam sw = call_switcher(loc, fail, L::lvar(newvar), 0, switch_::ocaml_max_int, c_div.cases);
   lam lambda1 = L::bind(LetKind::Alias, newvar, lprim(parray(PrimK::Parraylength, kind), {arg}, loc), sw);
   return {lambda1, jumps::union_(local_jumps, c_div.total)};
@@ -3059,7 +3059,7 @@ std::pair<lam, Jumps> comp_match_handlers(const CompFun<P>& comp_fun, const Part
 }
 
 // To find reasonable names for variables
-Ident::t name_pattern(const char* deflt, const std::vector<Clause>& cls) {
+Ident::t name_pattern(std::string_view deflt, const std::vector<Clause>& cls) {
   for (auto& c : cls) {
     if (auto* v = as<tt::Tpat_var>(c.p->pat_desc)) return v->id;
     if (auto* a = as<tt::Tpat_alias>(c.p->pat_desc)) return a->id;
@@ -3068,7 +3068,7 @@ Ident::t name_pattern(const char* deflt, const std::vector<Clause>& cls) {
 }
 Ident::t arg_to_var(lam arg, const std::vector<Clause>& cls) {
   if (auto* v = L::as<L::Lvar>(arg)) return v->id;
-  return name_pattern("*match*", cls);
+  return name_pattern(OCAML_LIT("*match*"), cls);
 }
 
 ArgPartiality compute_arg_partial(const Partiality& partial, MutableFlag mut) {
@@ -3608,7 +3608,7 @@ lam for_multiple_match(scopes sc, const Location& loc, Slice<lam> paraml, Slice<
   std::vector<std::pair<Ident::t, lam>> v_paraml;
   for (lam param : paraml) {
     if (auto* v = L::as<L::Lvar>(param)) v_paraml.push_back({v->id, nullptr});
-    else v_paraml.push_back({Ident::create_local("*match*"), param});
+    else v_paraml.push_back({Ident::create_local(OCAML_LIT("*match*")), param});
   }
   std::vector<Ident::t> vl;
   for (auto& [v, _] : v_paraml) vl.push_back(v);

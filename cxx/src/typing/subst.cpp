@@ -255,7 +255,7 @@ static TypeExpr* typexp(CopyScope& copy_scope, t s, TypeExpr* ty) {
   TypeExpr* tm = row_of_type(ty);
   bool has_fixed_row = !is_Tconstr(ty) && is_constr_row(false, tm);
   // Make a stub
-  TypeExpr* ty2 = s->for_saving ? newpersty(tvar(OptStr::none())) : newgenstub(get_scope(ty));
+  TypeExpr* ty2 = s->for_saving ? newpersty(tvar_none()) : newgenstub(get_scope(ty));
   if (get_desc(ty) == desc) redirect_desc(copy_scope, ty, tsubst(ty2, nullptr));
   auto rec = [&](TypeExpr* x) { return typexp(copy_scope, s, x); };
   const TypeDesc* desc2;

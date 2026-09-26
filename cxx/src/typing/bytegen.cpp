@@ -76,11 +76,21 @@ long new_label() { return ++label_counter; }
 
 // ---- Operations on compilation environments ----
 
-CompilationEnv empty_env() { return CompilationEnv{}; }
+// (the records' identities are Marshal's sharing in the debug events:
+// empty_env is one static record, every other construction a fresh one)
+CompilationEnv empty_env() {
+  static const void* const obj = [] {
+    ZoneScope perm(permanent_zone());
+    return fresh_identity();
+  }();
+  CompilationEnv e{};
+  e.obj = obj;
+  return e;
+}
 
 // Add a stack-allocated variable
 CompilationEnv add_var(Ident::t id, long pos, CompilationEnv env) {
-  return CompilationEnv{env.ce_stack.add(id, pos), env.ce_closure};
+  return CompilationEnv{env.ce_stack.add(id, pos), env.ce_closure, fresh_identity()};
 }
 
 CompilationEnv add_vars(Slice<Ident::t> idlist, long pos, CompilationEnv env) {
@@ -1253,7 +1263,7 @@ code comp_function(const FunctionToCompile& tc, code cont) {
   long arity = static_cast<long>(tc.params.size());
   auto [ce_stack, last_pos] = add_positions(ident::Tbl<long>{}, [](long pos) { return pos; }, arity, -1, tc.params);
   (void)last_pos;
-  CompilationEnv env{ce_stack, ClosureEnv{true, tc.entries, 3 * tc.rec_pos}};
+  CompilationEnv env{ce_stack, ClosureEnv{true, tc.entries, 3 * tc.rec_pos, fresh_identity()}, fresh_identity()};
   code c = comp_block(env, tc.body, arity, cons(K(IK::Kreturn, arity), cont));
   if (arity > 1) return cons(K(IK::Krestart), cons(K(IK::Klabel, tc.lbl), cons(K(IK::Kgrab, arity - 1), c)));
   return cons(K(IK::Klabel, tc.lbl), c);

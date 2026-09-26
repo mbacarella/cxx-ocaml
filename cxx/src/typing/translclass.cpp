@@ -210,7 +210,7 @@ struct Created {
 };
 
 Lam create_object(Ident::t cl, Lam obj, InhInit* inh_out, const std::function<Created(Ident::t)>& init) {
-  Ident::t obj2 = Ident::create_local("self");
+  Ident::t obj2 = Ident::create_local(OCAML_LIT("self"));
   Created c = init(obj2);
   *inh_out = std::move(c.inh_init);
   if (lam_is_unit(c.obj_init)) {
@@ -245,7 +245,7 @@ Lam build_fun(scopes sc, const tt::Pattern* pat, tt::Partial partial, Lam obj_in
     params.assign(f->f->params.begin(), f->f->params.end());
     rem = f->f->body;
   }
-  Ident::t param = name_pattern("param", pat);
+  Ident::t param = name_pattern(OCAML_LIT("param"), pat);
   Lam body = matching::for_function(sc, pat->pat_loc, nullptr, L::lvar(param),
                                     slice<matching::PatAction>({matching::PatAction{pat, rem}}), partial);
   params.insert(params.begin(), L::Param{param, VK::gen()});
@@ -271,7 +271,7 @@ std::pair<InhInit, Lam> build_object_init(scopes sc, Ident::t cl_table, Lam obj,
       auto* x = tt::as<tt::Tcl_ident>(d);
       // The object initialiser for the class in [path], specialised
       // to the class being defined
-      Ident::t obj_init_id = Ident::create_local("obj_init");
+      Ident::t obj_init_id = Ident::create_local(OCAML_LIT("obj_init"));
       std::vector<Lam> args;
       if (inh_init.envs)
         args.push_back(L::lprim(pfield(static_cast<long>(inh_init.l.size()) + 1),
@@ -368,8 +368,8 @@ std::pair<InhList, Lam> build_object_init_0(scopes sc, Ident::t cl_table, const 
     return build_object_init_0(sc, cl_table, append_vals(x->vals, params), x->ce, copy_env, subst_env, top, ids);
   if (auto* x = tt::as<tt::Tcl_open>(cl->cl_desc))
     return build_object_init_0(sc, cl_table, params, x->ce, copy_env, subst_env, top, ids);
-  Ident::t self = Ident::create_local("self");
-  Ident::t env = Ident::create_local("env");
+  Ident::t self = Ident::create_local(OCAML_LIT("self"));
+  Ident::t env = Ident::create_local(OCAML_LIT("env"));
   Lam obj = ids.empty() ? L::lambda_unit() : L::lvar(self);
   Ident::t envs = top ? nullptr : env;
   auto [ii, obj_init] = build_object_init(sc, cl_table, obj, params, InhInit{envs, {}}, copy_env, cl);
@@ -393,7 +393,7 @@ Lam bind_methods(Ident::t tbl, const StrMap<Ident::t>& meths, const std::vector<
     return cl_init;
   }
   if (len == 0 && nvals < 2) return transl_vals(tbl, true, LetKind::Strict, vals, cl_init);
-  Ident::t ids = Ident::create_local("ids");
+  Ident::t ids = Ident::create_local(OCAML_LIT("ids"));
   long i = static_cast<long>(len + nvals);
   std::string_view getter;
   std::vector<Lam> names;
@@ -586,7 +586,7 @@ std::pair<InhList, Lam> build_class_init(scopes sc, Ident::t cla, bool cstr, con
         InhEntry e = inh_init.front();
         inh_init.erase(inh_init.begin());
         if (!path::same(ci->path, e.path)) assert_false("Translclass.build_class_init");
-        Ident::t inh = Ident::create_local("inh");
+        Ident::t inh = Ident::create_local(OCAML_LIT("inh"));
         long ofs = static_cast<long>(x->vals.size()) + 1;
         const std::vector<NameId>& valids = super.vals;
         const std::vector<MethGet>& methids = super.meths;
@@ -731,19 +731,19 @@ Rebind transl_class_rebind_0(scopes sc, Ident::t self, Lam obj_init, const tt::C
 
 Lam transl_class_rebind(scopes sc, const tt::ClassExpr* cl, VirtualFlag vf) {
   try {
-    Ident::t obj_init = Ident::create_local("obj_init");
-    Ident::t self = Ident::create_local("self");
+    Ident::t obj_init = Ident::create_local(OCAML_LIT("obj_init"));
+    Ident::t self = Ident::create_local(OCAML_LIT("self"));
     Lam obj_init0 = lapply_(apply_record(L::lvar(obj_init), slice<Lam>({L::lvar(self)})));
     Rebind r = transl_class_rebind_0(sc, self, obj_init0, cl, vf);
     Lam path_lam = r.path_lam;
     Lam obj_init2 = r.obj_init;
     bool id = L::equal_lambda(obj_init2, lfunction1(self, obj_init0));
     if (id) return path_lam;
-    Ident::t cla = Ident::create_local("class");
-    Ident::t new_init = Ident::create_local("new_init");
-    Ident::t env_init = Ident::create_local("env_init");
-    Ident::t table = Ident::create_local("table");
-    Ident::t envs = Ident::create_local("envs");
+    Ident::t cla = Ident::create_local(OCAML_LIT("class"));
+    Ident::t new_init = Ident::create_local(OCAML_LIT("new_init"));
+    Ident::t env_init = Ident::create_local(OCAML_LIT("env_init"));
+    Ident::t table = Ident::create_local(OCAML_LIT("table"));
+    Ident::t envs = Ident::create_local(OCAML_LIT("envs"));
     Lam f_envs = lfunction1(envs, mkappl(L::lvar(new_init), {mkappl(L::lvar(env_init), {L::lvar(envs)})}));
     Lam f_table = lfunction1(
         table, L::llet(LetKind::Strict, VK::gen(), env_init, mkappl(lfield(cla, 1), {L::lvar(table)}), f_envs));
@@ -952,7 +952,7 @@ LamKind transl_class_(scopes sc, Slice<Ident::t> ids, Ident::t cl_id, Slice<std:
   // The manual specifies that toplevel lets *must* be evaluated outside of the class
   auto [cl_env, llets] = build_class_lets(sc, cl);
   std::vector<Ident::t> new_ids = top ? std::vector<Ident::t>{} : env::diff(top_env, cl_env);
-  Ident::t env2 = Ident::create_local("env");
+  Ident::t env2 = Ident::create_local(OCAML_LIT("env"));
   L::IdentSet meth_ids = get_class_meths(cl);
   auto subst = [&](Ident::t env, Lam lam, long i0, std::vector<Ident::t>& new_ids2) {
     L::IdentSet fv = L::free_variables(lam);
@@ -991,7 +991,7 @@ LamKind transl_class_(scopes sc, Slice<Ident::t> ids, Ident::t cl_id, Slice<std:
     Ident::t self = f->f->params[0].id;
     std::vector<L::Param> args(f->f->params.begin() + 1, f->f->params.end());
     Lam body = f->f->body;
-    Ident::t env = Ident::create_local("env");
+    Ident::t env = Ident::create_local(OCAML_LIT("env"));
     Lam body2 = new_ids.empty() ? body : L::subst(no_env_update, false, subst(env, body, 0, new_ids_meths), body);
     try {
       // Doesn't seem to improve size for bytecode
@@ -1011,8 +1011,8 @@ LamKind transl_class_(scopes sc, Slice<Ident::t> ids, Ident::t cl_id, Slice<std:
     }
   };
   std::vector<Ident::t> new_ids_init;
-  Ident::t env1 = Ident::create_local("env");
-  Ident::t env1p = Ident::create_local("env'");
+  Ident::t env1 = Ident::create_local(OCAML_LIT("env"));
+  Ident::t env1p = Ident::create_local(OCAML_LIT("env'"));
   ObjInitFn copy_env = [&](Ident::t self) -> Lam {
     if (top) return L::lambda_unit();
     Primitive p = L::prim(Primitive::K::Psetfield_computed);
@@ -1030,15 +1030,15 @@ LamKind transl_class_(scopes sc, Slice<Ident::t> ids, Ident::t cl_id, Slice<std:
   };
 
   // Now we start compiling the class
-  Ident::t cla = Ident::create_local("class");
+  Ident::t cla = Ident::create_local(OCAML_LIT("class"));
   auto [inh_init, obj_init] = build_object_init_0(sc, cla, {}, cl, copy_env, subst_env, top, ids);
   InhList inh_init_r(inh_init.rbegin(), inh_init.rend());
   auto [inh_left, cl_init] = build_class_init(sc, cla, true, Super{}, std::move(inh_init_r), obj_init, msubst, top, cl);
   if (!inh_left.empty()) assert_false("Translclass.transl_class");
-  Ident::t table = Ident::create_local("table");
+  Ident::t table = Ident::create_local(OCAML_LIT("table"));
   Ident::t class_init = Ident::create_local(std::string(ident::name(cl_id)) + "_init");
-  Ident::t env_init = Ident::create_local("env_init");
-  Ident::t obj_init_id = Ident::create_local("obj_init");
+  Ident::t env_init = Ident::create_local(OCAML_LIT("env_init"));
+  Ident::t obj_init_id = Ident::create_local(OCAML_LIT("obj_init"));
   // Sort methods by hash
   std::vector<std::string_view> pub_meths(pub_meths_in.begin(), pub_meths_in.end());
   std::stable_sort(pub_meths.begin(), pub_meths.end(), [](std::string_view s, std::string_view s2) {
@@ -1105,8 +1105,8 @@ LamKind transl_class_(scopes sc, Slice<Ident::t> ids, Ident::t cl_id, Slice<std:
   if (top) return llets(lbody_virt(L::lambda_unit()));
 
   // Now for the hard stuff: prepare for table caching
-  Ident::t envs = Ident::create_local("envs");
-  Ident::t cached = Ident::create_local("cached");
+  Ident::t envs = Ident::create_local(OCAML_LIT("envs"));
+  Ident::t cached = Ident::create_local(OCAML_LIT("cached"));
   Lam lenvs = new_ids_meths.empty() && new_ids_init.empty() && inh_init.empty() ? L::lambda_unit() : L::lvar(envs);
   Lam lenv;
   {

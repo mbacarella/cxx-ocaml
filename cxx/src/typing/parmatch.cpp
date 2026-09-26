@@ -257,7 +257,7 @@ namespace {
 const tt::Pattern* extra_pat() {
   static const tt::Pattern* p = [] {
     ZoneScope perm(permanent_zone());
-    return make_pat(mkd(tt::Tpat_var{{PK::Tpat_var}, Ident::create_local("+"), tt::StrLoc{"+", location::none()},
+    return make_pat(mkd(tt::Tpat_var{{PK::Tpat_var}, Ident::create_local(OCAML_LIT("+")), tt::StrLoc{"+", location::none()},
                                      uid::internal_not_actually_unique()}),
                     ctype::none(), env::empty());
   }();
@@ -974,7 +974,7 @@ const tt::Pattern* build_other(Path::t ext, const std::vector<std::pair<const He
     case HK::Construct: {
       if (d->cstr->cstr_tag.kind == ConstructorTag::Kind::Cstr_extension) {
         // PR#7330
-        return make_pat(mkd(tt::Tpat_var{{PK::Tpat_var}, Ident::create_local("*extension*"),
+        return make_pat(mkd(tt::Tpat_var{{PK::Tpat_var}, Ident::create_local(OCAML_LIT("*extension*")),
                                          tt::StrLoc{"*extension*", d->pat_loc}, uid::internal_not_actually_unique()}),
                         ctype::none(), env::empty());
       }

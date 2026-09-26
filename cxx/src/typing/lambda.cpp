@@ -582,7 +582,7 @@ std::optional<lambda> make_key(lambda e) {
 // ---- naming ----------------------------------------------------------------
 lambda name_lambda(LetKind str, lambda arg, const std::function<lambda(Ident::t)>& fn) {
   if (auto* v = as<Lvar>(arg)) return fn(v->id);
-  Ident::t id = Ident::create_local("let");
+  Ident::t id = Ident::create_local(OCAML_LIT("let"));
   return llet(str, ValueKind::gen(), id, arg, fn(id));
 }
 
@@ -595,7 +595,7 @@ lambda name_lambda_list(Slice<lambda> args, const std::function<lambda(Slice<lam
       names.push_back(arg);
       return name_list(names, k + 1);
     }
-    Ident::t id = Ident::create_local("let");
+    Ident::t id = Ident::create_local(OCAML_LIT("let"));
     names.push_back(lvar(id));
     return llet(LetKind::Strict, ValueKind::gen(), id, arg, name_list(names, k + 1));
   };

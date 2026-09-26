@@ -1074,7 +1074,7 @@ CompleteResult internal::complete_type_list(et::Position pos, env::t env,
     f.lhs.assign(lhs.begin(), lhs.end());
     return ExitEx{f};
   };
-  Ident::t id2 = Ident::create_local("Pkg");
+  Ident::t id2 = Ident::create_local(OCAML_LIT("Pkg"));
   auto* mt = make<ModuleType>(ModuleType::Kind::Mty_ident);
   mt->path = pack2->pack_path;
   env::t env2 = env::add_module(id2, ModulePresence::Mp_present, mt, env);
@@ -1693,7 +1693,7 @@ static void unify_row(const Uenv& uenv, const RowDesc* row1, const RowDesc* row2
   if (fixed1 && fixed2) more = get_level(rm2) < get_level(rm1) ? rm2 : rm1;
   else if (fixed1) more = rm1;
   else if (fixed2) more = rm2;
-  else more = newty2(std::min(get_level(rm1), get_level(rm2)), tvar(OptStr::none()));
+  else more = newty2(std::min(get_level(rm1), get_level(rm2)), TVAR_NONE_LIT());
   // `let fixed = .. and closed = ..`
   const FixedExplanation* fixed = merge_fixed_explanation(fixed1, fixed2);
   bool closed = r1d.closed || r2d.closed;

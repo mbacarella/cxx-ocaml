@@ -450,7 +450,7 @@ lam_t transl_exp0(bool in_new_scope, scopes sc, const tt::Expression* e) {
     case EK::Texp_try: {
       auto* x = static_cast<const tt::Texp_try*>(d);
       if (x->eff_cases.empty()) {
-        Ident::t id = typecore::name_cases("exn", x->exn_cases);
+        Ident::t id = typecore::name_cases(OCAML_LIT("exn"), x->exn_cases);
         std::vector<matching::PatAction> cases = transl_cases_try(sc, x->exn_cases);
         lam_t handler = matching::for_trywith(sc, e->exp_loc, L::lvar(id), slice(cases));
         return L::ltrywith(transl_exp_(sc, x->exp), id, handler);
@@ -707,7 +707,7 @@ lam_t transl_exp0(bool in_new_scope, scopes sc, const tt::Expression* e) {
       auto* x = static_cast<const tt::Texp_override*>(d);
       ScopedLocation loc = of_location(sc, e->exp_loc);
       lam_t self = L::transl_value_path(loc, e->exp_env, x->self_path);
-      Ident::t cpy = Ident::create_local("copy");
+      Ident::t cpy = Ident::create_local(OCAML_LIT("copy"));
       // List.fold_right: from the end
       lam_t rem = L::lvar(cpy);
       for (std::size_t k = x->fields.size(); k-- > 0;) {
@@ -743,7 +743,7 @@ lam_t transl_exp0(bool in_new_scope, scopes sc, const tt::Expression* e) {
       ScopedLocation loc = of_location(sc, le->exp_loc);
       FunctionAttribute attr = function_attribute_disallowing_arity_fusion();
       lam_t body = transl_exp_(sc, le);
-      Ident::t param = Ident::create_local("param");
+      Ident::t param = Ident::create_local(OCAML_LIT("param"));
       lam_t fn = L::lfunction(L::FunctionKind::Curried, slice({Param{param, ValueKind::gen()}}), ValueKind::gen(),
                               body, attr, loc);
       Primitive p = L::prim(PK::Pmakelazyblock);
@@ -752,7 +752,7 @@ lam_t transl_exp0(bool in_new_scope, scopes sc, const tt::Expression* e) {
     }
     case EK::Texp_object: {
       auto* x = static_cast<const tt::Texp_object*>(d);
-      Ident::t cl = Ident::create_local("object");
+      Ident::t cl = Ident::create_local(OCAML_LIT("object"));
       auto* desc = make<tt::Tcl_structure>();
       desc->kind = tt::Tcl_structure::K;
       desc->cs = x->cs;
@@ -885,7 +885,7 @@ FunInfo transl_tupled_function(scopes sc, const Location& loc, ValueKind return_
             kinds[i] = typeopt::value_kind_union(kinds[i], typeopt::value_kind(pat->pat_env, pat->pat_type));
           }
         std::vector<Param> tparams;
-        for (const ValueKind& kind : kinds) tparams.push_back(Param{Ident::create_local("param"), kind});
+        for (const ValueKind& kind : kinds) tparams.push_back(Param{Ident::create_local(OCAML_LIT("param")), kind});
         std::vector<Ident::t> ps;
         for (const Param& p : tparams) ps.push_back(p.id);
         // transl_tupled_cases
@@ -1017,7 +1017,7 @@ lam_t transl_record(scopes sc, const Location& loc, env::t env, Slice<tt::Record
   if (no_init || size < config_max_young_wosize) {
     // Allocate new record with given fields (and remaining fields taken from
     // init_expr if any
-    Ident::t init_id = Ident::create_local("init");
+    Ident::t init_id = Ident::create_local(OCAML_LIT("init"));
     std::vector<lam_t> ll;
     std::vector<ValueKind> shape;
     for (long i = 0; i < size; i++) {  // Array.mapi
@@ -1095,7 +1095,7 @@ lam_t transl_record(scopes sc, const Location& loc, env::t env, Slice<tt::Record
     return L::llet(L::LetKind::Strict, ValueKind::gen(), init_id, transl_exp_(sc, opt_init_expr), lam);
   }
   // Take a shallow copy of the init record, then mutate the fields of the copy
-  Ident::t copy_id = Ident::create_local("newrecord");
+  Ident::t copy_id = Ident::create_local(OCAML_LIT("newrecord"));
   lam_t cont = L::lvar(copy_id);
   for (const tt::RecordField& f : fields) {  // Array.fold_left update_field
     if (f.def.kept) continue;
@@ -1193,7 +1193,7 @@ lam_t transl_match(scopes sc, const tt::Expression* e, const tt::Expression* arg
   auto static_catch = [&](const std::vector<lam_t>& scrutinees, const std::vector<Param>& val_ids, lam_t handler) {
     std::vector<const tt::Pattern*> pats;
     for (const matching::PatAction& pa : exn_cases) pats.push_back(pa.pat);
-    Ident::t id = typecore::name_pattern("exn", pats);
+    Ident::t id = typecore::name_pattern(OCAML_LIT("exn"), pats);
     long static_exception_id = L::next_raise_count();
     lam_t h = matching::for_trywith(sc, e->exp_loc, L::lvar(id), slice(exn_cases));
     return L::lstaticcatch(L::ltrywith(L::lstaticraise(static_exception_id, slice(scrutinees)), id, h),
@@ -1211,7 +1211,7 @@ lam_t transl_match(scopes sc, const tt::Expression* e, const tt::Expression* arg
       std::vector<Param> val_ids;
       for (const tt::Expression* a : argl) {
         ValueKind k = typeopt::value_kind(a->exp_env, a->exp_type);
-        val_ids.push_back(Param{typecore::name_pattern("val", {}), k});
+        val_ids.push_back(Param{typecore::name_pattern(OCAML_LIT("val"), {}), k});
       }
       std::vector<lam_t> lvars;
       for (const Param& p : val_ids) lvars.push_back(L::lvar(p.id));
@@ -1226,7 +1226,7 @@ lam_t transl_match(scopes sc, const tt::Expression* e, const tt::Expression* arg
   } else {
     std::vector<const tt::Pattern*> pats;
     for (const matching::PatAction& pa : val_cases) pats.push_back(pa.pat);
-    Ident::t val_id = typecore::name_pattern("val", pats);
+    Ident::t val_id = typecore::name_pattern(OCAML_LIT("val"), pats);
     ValueKind k = typeopt::value_kind(arg->exp_env, arg->exp_type);
     lam_t handler = matching::for_function(sc, e->exp_loc, nullptr, L::lvar(val_id), slice(val_cases), partial);
     std::vector<Param> val_ids{Param{val_id, k}};
@@ -1244,12 +1244,12 @@ lam_t transl_handler(scopes sc, const tt::Expression* e, const tt::Expression* b
   ScopedLocation unk = debuginfo::loc_unknown();
   lam_t val_fun;
   if (!val_caselist) {
-    Ident::t param = Ident::create_local("param");
+    Ident::t param = Ident::create_local(OCAML_LIT("param"));
     val_fun = L::lfunction(L::FunctionKind::Curried, slice({Param{param, ValueKind::gen()}}), ValueKind::gen(),
                            L::lvar(param), dattr, unk);
   } else {
     std::vector<matching::PatAction> val_cases = transl_cases(sc, nullptr, slice(val_caselist->cases));
-    Ident::t param = typecore::name_cases("param", slice(val_caselist->cases));
+    Ident::t param = typecore::name_cases(OCAML_LIT("param"), slice(val_caselist->cases));
     lam_t b = matching::for_function(sc, e->exp_loc, nullptr, L::lvar(param), slice(val_cases), val_caselist->partial);
     val_fun = L::lfunction(L::FunctionKind::Curried, slice({Param{param, ValueKind::gen()}}), ValueKind::gen(), b,
                            dattr, unk);
@@ -1257,15 +1257,15 @@ lam_t transl_handler(scopes sc, const tt::Expression* e, const tt::Expression* b
   lam_t exn_fun;
   {
     std::vector<matching::PatAction> exn_cases = transl_cases(sc, nullptr, exn_caselist);
-    Ident::t param = typecore::name_cases("exn", exn_caselist);
+    Ident::t param = typecore::name_cases(OCAML_LIT("exn"), exn_caselist);
     lam_t b = matching::for_trywith(sc, e->exp_loc, L::lvar(param), slice(exn_cases));
     exn_fun = L::lfunction(L::FunctionKind::Curried, slice({Param{param, ValueKind::gen()}}), ValueKind::gen(), b,
                            dattr, unk);
   }
   lam_t eff_fun;
   {
-    Ident::t param = typecore::name_cases("eff", eff_caselist);
-    Ident::t cont = Ident::create_local("k");
+    Ident::t param = typecore::name_cases(OCAML_LIT("eff"), eff_caselist);
+    Ident::t cont = Ident::create_local(OCAML_LIT("k"));
     std::vector<matching::PatAction> eff_cases = transl_cases(sc, cont, eff_caselist);
     lam_t b = matching::for_handler(sc, e->exp_loc, L::lvar(param), L::lvar(cont), slice(eff_cases));
     eff_fun = L::lfunction(L::FunctionKind::Curried,
@@ -1279,7 +1279,7 @@ lam_t transl_handler(scopes sc, const tt::Expression* e, const tt::Expression* b
     body_fun = ap->ap.ap_func;
     arg = ap->ap.ap_args[0];
   } else {
-    Ident::t param = Ident::create_local("param");
+    Ident::t param = Ident::create_local(OCAML_LIT("param"));
     body_fun = L::lfunction(L::FunctionKind::Curried, slice({Param{param, ValueKind::gen()}}), ValueKind::gen(), tb,
                             dattr, unk);
     arg = L::lconst(L::const_int(0));
@@ -1293,8 +1293,8 @@ lam_t transl_letop(scopes sc, const Location& loc, env::t env, const tt::Binding
   std::function<lam_t(lam_t, std::size_t)> loop = [&](lam_t prev_lam, std::size_t i) -> lam_t {
     if (i >= ands.size()) return prev_lam;
     const tt::BindingOp* and_ = ands[i];
-    Ident::t left_id = Ident::create_local("left");
-    Ident::t right_id = Ident::create_local("right");
+    Ident::t left_id = Ident::create_local(OCAML_LIT("left"));
+    Ident::t right_id = Ident::create_local(OCAML_LIT("right"));
     lam_t op = transl_ident(of_location(sc, and_->bop_op_name.loc), env, and_->bop_op_type, and_->bop_op_path,
                             and_->bop_op_val);
     lam_t exp = transl_exp_(sc, and_->bop_exp);
@@ -1437,7 +1437,7 @@ lam_t transl_apply(scopes sc, TailcallAttribute tailcall, InlineAttribute inline
     // Evaluate the remaining arguments
     for (TArg& a : rest)
       if (a.arg) a.arg = protect("arg", a.arg);
-    Ident::t id_arg = Ident::create_local("param");
+    Ident::t id_arg = Ident::create_local(OCAML_LIT("param"));
     // Process remaining arguments and build closure
     std::vector<TArg> nargs{TArg{L::lvar(id_arg), optional}};
     nargs.insert(nargs.end(), args2.begin(), args2.end());

@@ -68,7 +68,7 @@ TypeExpr* newty2(long level, const TypeDesc* desc) {
 TypeExpr* newgenty(const TypeDesc* desc) { return newty2(generic_level, desc); }
 TypeExpr* newgenmono(TypeExpr* ty) { return newgenty(tpoly(ty, {})); }
 TypeExpr* newgenvar(OptStr name) { return newgenty(tvar(name)); }
-TypeExpr* newgenstub(long scope) { return newty3(generic_level, scope, tvar(OptStr::none())); }
+TypeExpr* newgenstub(long scope) { return newty3(generic_level, scope, TVAR_NONE_LIT()); }
 
 // ---- checks -----------------------------------------------------------------
 bool is_Tvar(TypeExpr* ty) { return get_desc(ty)->kind == DescKind::Tvar; }
@@ -534,7 +534,7 @@ const TypeDesc* copy_type_desc(const std::function<TypeExpr*(TypeExpr*)>& f,
                                const TypeDesc* d, bool keep_names) {
   switch (d->kind) {
     case DescKind::Tvar:
-      return keep_names ? d : tvar(OptStr::none());
+      return keep_names ? d : TVAR_NONE_LIT();
     case DescKind::Tarrow: {
       // OCaml evaluates constructor arguments right to left.
       auto* a = as<Tarrow>(d);

@@ -60,7 +60,7 @@ static const tt::TExtensionConstructor* transl_extension_constructor(long scope,
           if (!(v && v->name.some && v->name.v == "_")) continue;
           bool used = false;
           for (TypeExpr* x : vars) used = used || eq_type(ty, x);
-          if (used) set_type_desc(ty, make<Tvar>(Tvar{{DescKind::Tvar}, OptStr::none()}));
+          if (used) set_type_desc(ty, TVAR_NONE_LIT());
         }
       }
       // Ensure that constructor's type matches the type being extended

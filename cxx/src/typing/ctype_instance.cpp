@@ -70,7 +70,7 @@ TypeExpr* copy(CopyScope& copy_scope, TypeExpr* ty, const Partial* partial, bool
   } else {
     forget = generic_level;
   }
-  if (forget != generic_level) return newty2(forget, tvar(OptStr::none()));
+  if (forget != generic_level) return newty2(forget, TVAR_NONE_LIT());
   long ty_scope = scope ? std::max(*scope, get_scope(ty)) : get_scope(ty);
   const PathArgs* ty_expand = get_abbrev(ty);
   TypeExpr* t = newstub(ty_scope);
@@ -480,7 +480,7 @@ static TypeExpr* copy_sep(CopyScope& copy_scope, bool fixed, TypeHash<TypeExpr*>
         // to correct the levels
         if (keep) {
           add_delayed_copy(unscoped, t, ty);
-          desc2 = tvar(OptStr::none());
+          desc2 = TVAR_NONE_LIT();
           break;
         }
         TypeExpr* more2 = copy_rec(false, unscoped, more);

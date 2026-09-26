@@ -70,7 +70,7 @@ tt::CoreType* ctyp(const tt::CoreTypeDesc* desc, TypeExpr* typ, env::t env, cons
 Path::t unbound_class() {
   static Path::t p = [] {
     ZoneScope perm(permanent_zone());
-    return Path::pident(Ident::create_local("*undef*"));
+    return Path::pident(Ident::create_local(OCAML_LIT("*undef*")));
   }();
   return p;
 }

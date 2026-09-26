@@ -181,7 +181,7 @@ TypeExpr* new_scoped_ty(long scope, const TypeDesc* desc) {
 TypeExpr* newvar(OptStr name) { return newty2(current_level, tvar(name)); }
 TypeExpr* newvar2(long level, OptStr name) { return newty2(level, tvar(name)); }
 TypeExpr* new_global_var(OptStr name) { return newty2(global_level, tvar(name)); }
-TypeExpr* newstub(long scope) { return newty3(current_level, scope, tvar(OptStr::none())); }
+TypeExpr* newstub(long scope) { return newty3(current_level, scope, TVAR_NONE_LIT()); }
 TypeExpr* newobj(TypeExpr* fields) { return newty(tobject(fields, make<NameRef>(nullptr))); }
 TypeExpr* newconstr(Path::t path, Slice<TypeExpr*> tyl) {
   return newty(tconstr(path, tyl, make<MemoRef>(mnil())));

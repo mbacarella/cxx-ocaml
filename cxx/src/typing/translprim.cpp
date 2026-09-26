@@ -782,7 +782,7 @@ lam_t lambda_of_atomic(std::string_view prim_name, const ScopedLocation& loc, At
         a.insert(a.end(), rest.begin(), rest.end());
         return lprim(prim, slice(a), loc);
       }
-      Ident::t varg = Ident::create_local("atomic_arg");
+      Ident::t varg = Ident::create_local(OCAML_LIT("atomic_arg"));
       lam_t ptr = lprim(pfield(0, ImmediateOrPointer::Pointer, MutableFlag::Immutable), slice({lvar(varg)}), loc);
       lam_t ofs = lprim(pfield(1, ImmediateOrPointer::Immediate, MutableFlag::Immutable), slice({lvar(varg)}), loc);
       std::vector<lam_t> a{ptr, ofs};
@@ -855,7 +855,7 @@ lam_t lambda_of_prim(std::string_view prim_name, const Prim& prim, const ScopedL
     }
     case K::Raise_with_backtrace: {
       if (n != 2) return wrong_arity();
-      Ident::t vexn = Ident::create_local("exn");
+      Ident::t vexn = Ident::create_local(OCAML_LIT("exn"));
       lam_t raise_arg = lvar(vexn);
       if (arg_exps) {
         if (arg_exps->size() != 2) throw std::logic_error("Translprim.lambda_of_prim");
@@ -1002,7 +1002,7 @@ lam_t transl_primitive(const ScopedLocation& loc, const PrimitiveDescription* p,
   // the tail first, so the last parameter is created first
   long n = p->prim_arity > 0 ? p->prim_arity : 0;
   std::vector<Param> params(static_cast<std::size_t>(n));
-  for (long i = n; i-- > 0;) params[i] = Param{Ident::create_local("prim"), ValueKind::gen()};
+  for (long i = n; i-- > 0;) params[i] = Param{Ident::create_local(OCAML_LIT("prim")), ValueKind::gen()};
   std::vector<lam_t> args;
   for (const Param& pa : params) args.push_back(lvar(pa.id));
   lam_t body = lambda_of_prim(p->prim_name, prim, loc, slice(args), nullptr);

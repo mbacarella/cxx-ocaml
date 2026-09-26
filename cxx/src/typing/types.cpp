@@ -2,6 +2,7 @@
 #include "cppcaml/typing/types.hpp"
 
 #include <algorithm>
+#include <map>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -16,6 +17,26 @@ void set_zone(Zone* z) { g_zone = z ? z : &g_default_zone; }
 ZoneScope::ZoneScope(Zone& z) : saved(g_zone) { g_zone = &z; }
 ZoneScope::~ZoneScope() { g_zone = saved; }
 const void* fresh_identity() { return zone().alloc(1, 1); }
+
+// the OCaml unit a port file belongs to: its basename, a split of a large
+// module (typecore_exp.cpp, ctype_unify.cpp ...) counting as that module
+static std::string ocaml_unit_of_file(std::string_view file) {
+  std::string_view b = file.substr(file.find_last_of('/') + 1);
+  b = b.substr(0, b.find('.'));
+  for (std::string_view m : {"typecore", "ctype", "typemod"})
+    if (b.substr(0, m.size()) == m) return std::string(m);
+  if (b == "typedecl_ext") return "typedecl";
+  return std::string(b);
+}
+
+std::string_view ocaml_literal(const char* unit, std::string_view s) {
+  static std::map<std::pair<std::string, std::string>, std::string_view> interned;
+  auto key = std::make_pair(ocaml_unit_of_file(unit), std::string(s));
+  auto it = interned.find(key);
+  if (it != interned.end()) return it->second;
+  ZoneScope perm(permanent_zone());
+  return interned[key] = zone().str(s);
+}
 
 std::string_view zborrow(std::string_view s) {
   if (s.data() && (g_default_zone.owns(s.data()) || g_zone->owns(s.data()) || permanent_zone().owns(s.data())))
@@ -168,6 +189,14 @@ const AbbrevMemo* mnil() { return &g_mnil; }
 
 // ---- desc constructors ------------------------------------------------------
 const TypeDesc* tvar(OptStr name) { return make<Tvar>(TypeDesc{DescKind::Tvar}, name); }
+const TypeDesc* tvar_none_literal(const char* unit) {
+  static std::map<std::string, const TypeDesc*> lits;
+  std::string u = ocaml_unit_of_file(unit);
+  auto it = lits.find(u);
+  if (it != lits.end()) return it->second;
+  ZoneScope perm(permanent_zone());
+  return lits[u] = tvar(OptStr::none());
+}
 const TypeDesc* tarrow(ArgLabel l, TypeExpr* a, TypeExpr* b, Commutable* c) {
   return make<Tarrow>(TypeDesc{DescKind::Tarrow}, l, a, b, c);
 }

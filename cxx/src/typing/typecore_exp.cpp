@@ -129,7 +129,7 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
         // Terrible hack for format strings
         TypeExpr* ty_exp = ctype::expand_head(env, protect_expansion(env, ty_expected));
         Path::t fmt6_path =
-            Path::pdot(Path::pident(Ident::create_persistent("CamlinternalFormatBasics")), "format6");
+            Path::pdot(Path::pident(Ident::create_persistent(OCAML_LIT("CamlinternalFormatBasics"))), "format6");
         bool is_format = false;
         if (auto* tc = as<Tconstr>(get_desc(ty_exp)); tc && path::same(tc->path, fmt6_path))
           is_format = true;  // (the -principal warning is not emitted)
@@ -609,7 +609,7 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
       env::t new_env;
       const pt::Pattern* param = f->pat;
       if (param->ppat_desc->kind == SPK::Ppat_any) {
-        id = Ident::create_local("_for");
+        id = Ident::create_local(OCAML_LIT("_for"));
         new_env = env;
       } else if (auto* v = as<pt::Ppat_var>(param->ppat_desc)) {
         // record fields right to left: val_uid first
@@ -915,7 +915,7 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
                                          nullptr, true, loc, slice(scase));
       if (cases.size() != 1) throw std::logic_error("type_expect_: Pexp_letop");
       const tt::Case* body = cases[0];
-      Ident::t param = name_cases("param", cases);
+      Ident::t param = name_cases(OCAML_LIT("param"), cases);
       auto* let_ = make<tt::BindingOp>(r.op_path, slet->pbop_op, r.op_desc, r.op_type, exp, slet->pbop_loc);
       return rue(mk(mkd(tt::Texp_letop{{XK::Texp_letop}, let_, ands, param, body, partial}), sexp->pexp_loc,
                     ctype::instance(r.ty_result), env, sexp->pexp_attributes));

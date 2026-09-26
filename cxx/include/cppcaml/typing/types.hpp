@@ -502,6 +502,11 @@ const AbbrevMemo* mnil();
 
 // Desc constructors (fresh immutable nodes).
 const TypeDesc* tvar(OptStr name);
+// the `Tvar None` literal of an OCaml unit: a static structured constant,
+// one object per unit (ocamlopt merges a unit's equal constants), which
+// every node made from it shares (the -g debug events marshal the sharing)
+const TypeDesc* tvar_none_literal(const char* unit);
+#define TVAR_NONE_LIT() ::cppcaml::typing::types::tvar_none_literal(__FILE__)
 const TypeDesc* tarrow(ArgLabel l, TypeExpr* a, TypeExpr* b, Commutable* c);
 const TypeDesc* ttuple(Slice<LabeledTy> l);
 const TypeDesc* tconstr(Path::t p, Slice<TypeExpr*> args, MemoRef* memo);

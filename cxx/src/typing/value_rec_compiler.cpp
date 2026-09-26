@@ -332,7 +332,7 @@ SplitResult<lam_t> split_static_function(Ident::t block_var, const IdentSet& loc
     case LK::Lvar: {
       // Eta-expand
       Ident::t v = static_cast<const Lvar*>(lam)->id;
-      Ident::t param = Ident::create_local("let_rec_param");
+      Ident::t param = Ident::create_local(OCAML_LIT("let_rec_param"));
       lam_t ap_func = lprim(pfield(0), slice({lvar(block_var)}), no_loc);
       LambdaApply ap;
       ap.ap_func = ap_func;
@@ -557,7 +557,7 @@ lam_t compile_letrec(Slice<RecBinding> input_bindings, lam_t body) {
           functions_rev.insert(functions_rev.begin(), FunctionBinding{b.id, lf->f});
           break;
         }
-        Ident::t ctx_id = Ident::create_local("letrec_function_context");
+        Ident::t ctx_id = Ident::create_local(OCAML_LIT("letrec_function_context"));
         SplitResult<lam_t> r = split_static_function(ctx_id, IdentSet{}, b.def);
         if (!r.reachable) fatal_error("letrec: no function for binding");
         functions_rev.insert(functions_rev.begin(), FunctionBinding{b.id, r.func.lfun});
