@@ -12,6 +12,9 @@
 #include "cppcaml/typing/cmi_format.hpp"
 #include "cppcaml/typing/ctype.hpp"
 #include "cppcaml/typing/env.hpp"
+#include "cppcaml/typing/parsetree.hpp"
+#include "cppcaml/parser.hpp"
+#include <sstream>
 #include <fstream>
 #include <functional>
 
@@ -749,6 +752,986 @@ int run_env(const std::string& stdlib_dir, const std::string& queries) {
   return 0;
 }
 
+// ---- stage 4a: Parsetree (the typing_dump.ml `parse` mode) ----
+namespace pd {
+using namespace parsetree;
+using parsetree::Signature;
+using parsetree::Structure;
+using parsetree::SignatureItem;
+using parsetree::StructureItem;
+using parsetree::ModuleType;
+using parsetree::ModuleExpr;
+using parsetree::ClassType;
+using parsetree::ClassExpr;
+using parsetree::TypeDeclaration;
+using parsetree::Attribute;
+using parsetree::Attributes;
+using parsetree::Extension;
+using parsetree::Payload;
+using parsetree::ValueDescription;
+using parsetree::PrimitiveDescription;
+using parsetree::ClassSignature;
+using parsetree::ClassStructure;
+using parsetree::ClassDeclaration;
+using parsetree::ClassTypeDeclaration;
+using parsetree::ClassDescription;
+using parsetree::ExtensionConstructor;
+using parsetree::LabelDeclaration;
+using parsetree::ConstructorDeclaration;
+using parsetree::ConstructorArguments;
+using parsetree::TypeKind;
+using parsetree::ModuleDeclaration;
+using parsetree::ModuleTypeDeclaration;
+using parsetree::ModuleBinding;
+using parsetree::TypeExtension;
+using parsetree::TypeException;
+using parsetree::Constant;
+using parsetree::CoreType;
+using parsetree::Pattern;
+using parsetree::Expression;
+using parsetree::Case;
+using parsetree::ValueBinding;
+using parsetree::PackageType;
+using parsetree::TypeParam;
+using parsetree::FunctionParam;
+using parsetree::OpenDescription;
+using parsetree::FunctorParameter;
+using parsetree::WithConstraint;
+using parsetree::ClassField;
+using parsetree::ClassTypeField;
+using parsetree::ClassFieldKind;
+using parsetree::ValueConstraint;
+using parsetree::BindingOp;
+using parsetree::ArgExpression;
+using parsetree::StrLoc;
+using parsetree::RowField;
+using parsetree::ObjectField;
+using parsetree::LidLoc;
+std::string_view parse_file;
+bool mask_gaps = true;
+
+void ppos(const Position& p) {
+  if (p.pos_fname != parse_file) { q(p.pos_fname); s(":"); }
+  i(p.pos_lnum); s(","); i(p.pos_bol); s(","); i(p.pos_cnum);
+}
+void loc(const Location& l) {
+  s("<"); ppos(l.loc_start); s("-"); ppos(l.loc_end); if (l.loc_ghost) s(" g"); s(">");
+}
+void gloc(const Location& l) {
+  if (mask_gaps) s("?");
+  else loc(l);
+}
+void str_loc(const StrLoc& x) { q(x.txt); s(" "); loc(x.loc); }
+void str_gloc(const StrLoc& x) { q(x.txt); s(" "); gloc(x.loc); }
+void lid(Longident::t l) {
+  switch (l->kind) {
+    case Longident::Kind::Lident: s("Lident "); q(l->s); break;
+    case Longident::Kind::Ldot:
+      s("Ldot("); lid(l->l1); s(" "); gloc(l->l1_loc); s(" "); q(l->s); s(" "); gloc(l->s_loc); s(")");
+      break;
+    case Longident::Kind::Lapply:
+      s("Lapply("); lid(l->l1); s(" "); gloc(l->l1_loc); s(" "); lid(l->l2); s(" "); gloc(l->l2_loc);
+      s(")");
+      break;
+  }
+}
+void lid_loc(const LidLoc& x) { s("{"); lid(x.txt); s(" "); loc(x.loc); s("}"); }
+void optstr(const OptStr& o) {
+  if (!o.some) s("None");
+  else { s("(Some "); q(o.v); s(")"); }
+}
+void flag_closed(ClosedFlag c) { s(c == ClosedFlag::Closed ? "Closed" : "Open"); }
+void flag_rec(RecFlag r) { s(r == RecFlag::Nonrecursive ? "Nonrec" : "Rec"); }
+void flag_mut(MutableFlag m) { s(m == MutableFlag::Immutable ? "Immutable" : "Mutable"); }
+void flag_priv(PrivateFlag p) { s(p == PrivateFlag::Private ? "Private" : "Public"); }
+void flag_virt(VirtualFlag v) { s(v == VirtualFlag::Virtual ? "Virtual" : "Concrete"); }
+void flag_ovr(OverrideFlag o) { s(o == OverrideFlag::Override ? "Override" : "Fresh"); }
+void char_opt(bool has, char c) {
+  if (!has) s("None");
+  else { s("Some "); i(static_cast<unsigned char>(c)); }
+}
+template <class T, class F>
+void popt(const T* p, F&& f) {
+  if (!p) { s("None"); return; }
+  s("(Some "); f(p); s(")");
+}
+
+void constant(const Constant& c) {
+  s("{");
+  const ConstantDesc& d = c.pconst_desc;
+  switch (d.kind) {
+    case ConstantDesc::Kind::Pconst_integer:
+      s("Pconst_integer "); q(d.s); s(" "); char_opt(d.has_suffix, d.suffix); break;
+    case ConstantDesc::Kind::Pconst_char: s("Pconst_char "); i(static_cast<unsigned char>(d.c)); break;
+    case ConstantDesc::Kind::Pconst_string:
+      s("Pconst_string "); q(d.s); s(" "); loc(d.str_loc); s(" "); optstr(d.delim); break;
+    case ConstantDesc::Kind::Pconst_float:
+      s("Pconst_float "); q(d.s); s(" "); char_opt(d.has_suffix, d.suffix); break;
+  }
+  s(" "); loc(c.pconst_loc); s("}");
+}
+
+void core_type(const CoreType* t);
+void pattern(const Pattern* p);
+void expression(const Expression* e);
+void structure(const Structure& st);
+void signature(const Signature& sg);
+void structure_item(const StructureItem* it);
+void module_expr(const ModuleExpr* m);
+void module_type(const ModuleType* m);
+void class_structure(const ClassStructure* cs);
+void class_type(const ClassType* x);
+void class_expr(const ClassExpr* x);
+void value_binding(const ValueBinding* vb);
+void type_declaration(const TypeDeclaration* d);
+
+void payload(const Payload& p) {
+  switch (p.kind) {
+    case Payload::Kind::PStr: s("PStr "); structure(p.str); break;
+    case Payload::Kind::PSig: s("PSig "); signature(p.sig); break;
+    case Payload::Kind::PTyp: s("PTyp "); core_type(p.typ); break;
+    case Payload::Kind::PPat: s("PPat "); pattern(p.pat); s(" "); popt(p.guard, expression); break;
+  }
+}
+void attribute(const Attribute* a, bool gap_name = false) {
+  s("{attr ");
+  if (gap_name) str_gloc(a->attr_name);
+  else str_loc(a->attr_name);
+  s(" "); payload(a->attr_payload); s(" "); loc(a->attr_loc); s("}");
+}
+void attrs(const Attributes& l) { list(l, [](const Attribute* a) { attribute(a); }); }
+void extension(const Extension* e) { s("{ext "); str_gloc(e->name); s(" "); payload(e->payload); s("}"); }
+
+void package_type(const PackageType* p, bool gap) {
+  s("{pack "); lid_loc(p->ppt_path); s(" ");
+  list(p->ppt_constraints, [](const std::pair<LidLoc, const CoreType*>& c) {
+    lid_loc(c.first); s("="); core_type(c.second);
+  });
+  s(" ");
+  if (gap) gloc(p->ppt_loc);
+  else loc(p->ppt_loc);
+  s(" "); attrs(p->ppt_attrs); s("}");
+}
+void core_types(const Slice<const CoreType*>& l) { list(l, [](const CoreType* t) { core_type(t); }); }
+
+void core_type(const CoreType* t) {
+  s("(T "); loc(t->ptyp_loc); s(" "); attrs(t->ptyp_attributes); s(" ");
+  const CoreTypeDesc* d = t->ptyp_desc;
+  using K = CoreTypeDesc::Kind;
+  switch (d->kind) {
+    case K::Ptyp_any: s("Ptyp_any"); break;
+    case K::Ptyp_var: s("Ptyp_var "); q(as<Ptyp_var>(d)->name); break;
+    case K::Ptyp_arrow: {
+      auto* a = as<Ptyp_arrow>(d);
+      s("Ptyp_arrow "); arg_label(a->label); s(" "); core_type(a->t1); s(" "); core_type(a->t2);
+      break;
+    }
+    case K::Ptyp_tuple:
+      s("Ptyp_tuple ");
+      list(as<Ptyp_tuple>(d)->tl, [](const LabeledCoreType& x) { optstr(x.label); s(":"); core_type(x.ty); });
+      break;
+    case K::Ptyp_constr: {
+      auto* c = as<Ptyp_constr>(d);
+      s("Ptyp_constr "); lid_loc(c->lid); s(" "); core_types(c->args);
+      break;
+    }
+    case K::Ptyp_object: {
+      auto* o = as<Ptyp_object>(d);
+      s("Ptyp_object ");
+      list(o->fields, [](const ObjectField* f) {
+        s("{");
+        if (auto* ot = as<Otag>(f->pof_desc)) { s("Otag "); str_loc(ot->label); s(" "); core_type(ot->ty); }
+        else { s("Oinherit "); core_type(as<Oinherit>(f->pof_desc)->ty); }
+        s(" "); gloc(f->pof_loc); s(" "); attrs(f->pof_attributes); s("}");
+      });
+      s(" "); flag_closed(o->closed);
+      break;
+    }
+    case K::Ptyp_class: {
+      auto* c = as<Ptyp_class>(d);
+      s("Ptyp_class "); lid_loc(c->lid); s(" "); core_types(c->args);
+      break;
+    }
+    case K::Ptyp_alias: {
+      auto* a = as<Ptyp_alias>(d);
+      s("Ptyp_alias "); core_type(a->ty); s(" "); str_gloc(a->name);
+      break;
+    }
+    case K::Ptyp_variant: {
+      auto* v = as<Ptyp_variant>(d);
+      s("Ptyp_variant ");
+      list(v->fields, [](const RowField* f) {
+        s("{");
+        if (auto* rt = as<Rtag>(f->prf_desc)) {
+          s("Rtag "); str_gloc(rt->label); s(" "); bool_(rt->constant); s(" "); core_types(rt->types);
+        } else {
+          s("Rinherit "); core_type(as<Rinherit>(f->prf_desc)->ty);
+        }
+        s(" "); gloc(f->prf_loc); s(" "); attrs(f->prf_attributes); s("}");
+      });
+      s(" "); flag_closed(v->closed); s(" ");
+      if (!v->has_labels) s("None");
+      else { s("(Some "); list(v->labels, [](std::string_view l) { q(l); }); s(")"); }
+      break;
+    }
+    case K::Ptyp_poly: {
+      auto* p = as<Ptyp_poly>(d);
+      s("Ptyp_poly "); list(p->vars, [](const StrLoc& v) { str_gloc(v); }); s(" "); core_type(p->ty);
+      break;
+    }
+    case K::Ptyp_package: s("Ptyp_package "); package_type(as<Ptyp_package>(d)->pack, false); break;
+    case K::Ptyp_open: {
+      auto* o = as<Ptyp_open>(d);
+      s("Ptyp_open "); lid_loc(o->lid); s(" "); core_type(o->ty);
+      break;
+    }
+    case K::Ptyp_extension: s("Ptyp_extension "); extension(as<Ptyp_extension>(d)->ext); break;
+    case K::Ptyp_functor: {
+      auto* f = as<Ptyp_functor>(d);
+      s("Ptyp_functor "); arg_label(f->label); s(" "); str_loc(f->name); s(" ");
+      package_type(f->pack, true); s(" "); core_type(f->ty);
+      break;
+    }
+  }
+  s(")");
+}
+
+void patterns(const Slice<const Pattern*>& l) { list(l, [](const Pattern* p) { pattern(p); }); }
+void pattern(const Pattern* p) {
+  s("(P "); loc(p->ppat_loc); s(" "); attrs(p->ppat_attributes); s(" ");
+  const PatternDesc* d = p->ppat_desc;
+  using K = PatternDesc::Kind;
+  switch (d->kind) {
+    case K::Ppat_any: s("Ppat_any"); break;
+    case K::Ppat_var: s("Ppat_var "); str_loc(as<Ppat_var>(d)->name); break;
+    case K::Ppat_alias: {
+      auto* a = as<Ppat_alias>(d);
+      s("Ppat_alias "); pattern(a->pat); s(" "); str_loc(a->name);
+      break;
+    }
+    case K::Ppat_constant: s("Ppat_constant "); constant(as<Ppat_constant>(d)->c); break;
+    case K::Ppat_interval: {
+      auto* v = as<Ppat_interval>(d);
+      s("Ppat_interval "); constant(v->c1); s(" "); constant(v->c2);
+      break;
+    }
+    case K::Ppat_tuple: {
+      auto* t = as<Ppat_tuple>(d);
+      s("Ppat_tuple ");
+      list(t->pl, [](const LabeledPattern& x) { optstr(x.label); s(":"); pattern(x.pat); });
+      s(" "); flag_closed(t->closed);
+      break;
+    }
+    case K::Ppat_construct: {
+      auto* c = as<Ppat_construct>(d);
+      s("Ppat_construct "); lid_loc(c->lid); s(" ");
+      popt(c->arg, [](const ConstructArg* a) {
+        list(a->vars, [](const StrLoc& v) { str_loc(v); }); s(" "); pattern(a->pat);
+      });
+      break;
+    }
+    case K::Ppat_variant: {
+      auto* v = as<Ppat_variant>(d);
+      s("Ppat_variant "); q(v->label); s(" "); popt(v->arg, pattern);
+      break;
+    }
+    case K::Ppat_record: {
+      auto* r = as<Ppat_record>(d);
+      s("Ppat_record ");
+      list(r->fields, [](const std::pair<LidLoc, const Pattern*>& f) {
+        lid_loc(f.first); s("="); pattern(f.second);
+      });
+      s(" "); flag_closed(r->closed);
+      break;
+    }
+    case K::Ppat_array: s("Ppat_array "); patterns(as<Ppat_array>(d)->pats); break;
+    case K::Ppat_or: {
+      auto* o = as<Ppat_or>(d);
+      s("Ppat_or "); pattern(o->p1); s(" "); pattern(o->p2);
+      break;
+    }
+    case K::Ppat_constraint: {
+      auto* c = as<Ppat_constraint>(d);
+      s("Ppat_constraint "); pattern(c->pat); s(" "); core_type(c->ty);
+      break;
+    }
+    case K::Ppat_type: s("Ppat_type "); lid_loc(as<Ppat_type>(d)->lid); break;
+    case K::Ppat_lazy: s("Ppat_lazy "); pattern(as<Ppat_lazy>(d)->pat); break;
+    case K::Ppat_unpack: {
+      auto* u = as<Ppat_unpack>(d);
+      s("Ppat_unpack "); optstr(u->name.txt); s(" "); loc(u->name.loc); s(" ");
+      popt(u->pack, [](const PackageType* p) { package_type(p, true); });
+      break;
+    }
+    case K::Ppat_exception: s("Ppat_exception "); pattern(as<Ppat_exception>(d)->pat); break;
+    case K::Ppat_effect: {
+      auto* e = as<Ppat_effect>(d);
+      s("Ppat_effect "); pattern(e->eff); s(" "); pattern(e->cont);
+      break;
+    }
+    case K::Ppat_extension: s("Ppat_extension "); extension(as<Ppat_extension>(d)->ext); break;
+    case K::Ppat_open: {
+      auto* o = as<Ppat_open>(d);
+      s("Ppat_open "); lid_loc(o->lid); s(" "); pattern(o->pat);
+      break;
+    }
+  }
+  s(")");
+}
+
+void case_(const Case* c) {
+  s("{case "); pattern(c->pc_lhs); s(" "); popt(c->pc_guard, expression); s(" ");
+  expression(c->pc_rhs); s("}");
+}
+void cases(const Slice<const Case*>& l) { list(l, [](const Case* c) { case_(c); }); }
+void binding_op(const BindingOp* b) {
+  s("{bop "); str_loc(b->pbop_op); s(" "); pattern(b->pbop_pat); s(" "); expression(b->pbop_exp);
+  s(" "); loc(b->pbop_loc); s("}");
+}
+void args(const Slice<ArgExpression>& l) {
+  list(l, [](const ArgExpression& a) { arg_label(a.label); s(":"); expression(a.exp); });
+}
+void exprs(const Slice<const Expression*>& l) { list(l, [](const Expression* e) { expression(e); }); }
+void vbs(const Slice<const ValueBinding*>& l) { list(l, [](const ValueBinding* v) { value_binding(v); }); }
+
+void expression(const Expression* e) {
+  s("(E "); loc(e->pexp_loc); s(" "); attrs(e->pexp_attributes); s(" ");
+  const ExpressionDesc* d = e->pexp_desc;
+  using K = ExpressionDesc::Kind;
+  switch (d->kind) {
+    case K::Pexp_ident: s("Pexp_ident "); lid_loc(as<Pexp_ident>(d)->lid); break;
+    case K::Pexp_constant: s("Pexp_constant "); constant(as<Pexp_constant>(d)->c); break;
+    case K::Pexp_let: {
+      auto* l = as<Pexp_let>(d);
+      s("Pexp_let "); flag_rec(l->rec); s(" "); vbs(l->vbs); s(" "); expression(l->body);
+      break;
+    }
+    case K::Pexp_function: {
+      auto* f = as<Pexp_function>(d);
+      s("Pexp_function ");
+      list(f->params, [](const FunctionParam* p) {
+        s("{"); loc(p->pparam_loc); s(" ");
+        if (p->pparam_desc.kind == FunctionParamDesc::Kind::Pparam_val) {
+          s("Pparam_val "); arg_label(p->pparam_desc.label); s(" ");
+          popt(p->pparam_desc.default_, expression); s(" "); pattern(p->pparam_desc.pat);
+        } else {
+          s("Pparam_newtype "); str_loc(p->pparam_desc.newtype);
+        }
+        s("}");
+      });
+      s(" ");
+      popt(f->constraint, [](const TypeConstraint* tc) {
+        if (tc->kind == TypeConstraint::Kind::Pconstraint) { s("Pconstraint "); core_type(tc->ty); }
+        else { s("Pcoerce "); popt(tc->from, core_type); s(" "); core_type(tc->ty); }
+      });
+      s(" ");
+      if (f->body->kind == FunctionBody::Kind::Pfunction_body) {
+        s("Pfunction_body "); expression(f->body->body);
+      } else {
+        s("Pfunction_cases "); cases(f->body->cases); s(" "); loc(f->body->loc); s(" ");
+        attrs(f->body->attrs);
+      }
+      break;
+    }
+    case K::Pexp_apply: {
+      auto* a = as<Pexp_apply>(d);
+      s("Pexp_apply "); expression(a->fn); s(" "); args(a->args);
+      break;
+    }
+    case K::Pexp_match: {
+      auto* m = as<Pexp_match>(d);
+      s("Pexp_match "); expression(m->exp); s(" "); cases(m->cases);
+      break;
+    }
+    case K::Pexp_try: {
+      auto* m = as<Pexp_try>(d);
+      s("Pexp_try "); expression(m->exp); s(" "); cases(m->cases);
+      break;
+    }
+    case K::Pexp_tuple:
+      s("Pexp_tuple ");
+      list(as<Pexp_tuple>(d)->el, [](const LabeledExpression& x) { optstr(x.label); s(":"); expression(x.exp); });
+      break;
+    case K::Pexp_construct: {
+      auto* c = as<Pexp_construct>(d);
+      s("Pexp_construct "); lid_loc(c->lid); s(" "); popt(c->arg, expression);
+      break;
+    }
+    case K::Pexp_variant: {
+      auto* v = as<Pexp_variant>(d);
+      s("Pexp_variant "); q(v->label); s(" "); popt(v->arg, expression);
+      break;
+    }
+    case K::Pexp_record: {
+      auto* r = as<Pexp_record>(d);
+      s("Pexp_record ");
+      list(r->fields, [](const std::pair<LidLoc, const Expression*>& f) {
+        lid_loc(f.first); s("="); expression(f.second);
+      });
+      s(" "); popt(r->base, expression);
+      break;
+    }
+    case K::Pexp_field: {
+      auto* f = as<Pexp_field>(d);
+      s("Pexp_field "); expression(f->exp); s(" "); lid_loc(f->lid);
+      break;
+    }
+    case K::Pexp_setfield: {
+      auto* f = as<Pexp_setfield>(d);
+      s("Pexp_setfield "); expression(f->exp); s(" "); lid_loc(f->lid); s(" "); expression(f->value);
+      break;
+    }
+    case K::Pexp_array: s("Pexp_array "); exprs(as<Pexp_array>(d)->el); break;
+    case K::Pexp_ifthenelse: {
+      auto* x = as<Pexp_ifthenelse>(d);
+      s("Pexp_ifthenelse "); expression(x->cond); s(" "); expression(x->then_); s(" ");
+      popt(x->else_, expression);
+      break;
+    }
+    case K::Pexp_sequence: {
+      auto* x = as<Pexp_sequence>(d);
+      s("Pexp_sequence "); expression(x->e1); s(" "); expression(x->e2);
+      break;
+    }
+    case K::Pexp_while: {
+      auto* x = as<Pexp_while>(d);
+      s("Pexp_while "); expression(x->cond); s(" "); expression(x->body);
+      break;
+    }
+    case K::Pexp_for: {
+      auto* x = as<Pexp_for>(d);
+      s("Pexp_for "); pattern(x->pat); s(" "); expression(x->lo); s(" "); expression(x->hi); s(" ");
+      s(x->dir == DirectionFlag::Upto ? "Upto" : "Downto"); s(" "); expression(x->body);
+      break;
+    }
+    case K::Pexp_constraint: {
+      auto* x = as<Pexp_constraint>(d);
+      s("Pexp_constraint "); expression(x->exp); s(" "); core_type(x->ty);
+      break;
+    }
+    case K::Pexp_coerce: {
+      auto* x = as<Pexp_coerce>(d);
+      s("Pexp_coerce "); expression(x->exp); s(" "); popt(x->from, core_type); s(" "); core_type(x->to);
+      break;
+    }
+    case K::Pexp_send: {
+      auto* x = as<Pexp_send>(d);
+      s("Pexp_send "); expression(x->exp); s(" "); str_loc(x->meth);
+      break;
+    }
+    case K::Pexp_new: s("Pexp_new "); lid_loc(as<Pexp_new>(d)->lid); break;
+    case K::Pexp_setinstvar: {
+      auto* x = as<Pexp_setinstvar>(d);
+      s("Pexp_setinstvar "); str_loc(x->name); s(" "); expression(x->value);
+      break;
+    }
+    case K::Pexp_override:
+      s("Pexp_override ");
+      list(as<Pexp_override>(d)->fields, [](const std::pair<StrLoc, const Expression*>& f) {
+        str_loc(f.first); s("="); expression(f.second);
+      });
+      break;
+    case K::Pexp_struct_item: {
+      auto* x = as<Pexp_struct_item>(d);
+      s("Pexp_struct_item "); structure_item(x->item); s(" "); expression(x->body);
+      break;
+    }
+    case K::Pexp_assert: s("Pexp_assert "); expression(as<Pexp_assert>(d)->exp); break;
+    case K::Pexp_lazy: s("Pexp_lazy "); expression(as<Pexp_lazy>(d)->exp); break;
+    case K::Pexp_poly: {
+      auto* x = as<Pexp_poly>(d);
+      s("Pexp_poly "); expression(x->exp); s(" "); popt(x->ty, core_type);
+      break;
+    }
+    case K::Pexp_object: s("Pexp_object "); class_structure(as<Pexp_object>(d)->cs); break;
+    case K::Pexp_newtype: {
+      auto* x = as<Pexp_newtype>(d);
+      s("Pexp_newtype "); str_loc(x->name); s(" "); expression(x->body);
+      break;
+    }
+    case K::Pexp_pack: {
+      auto* x = as<Pexp_pack>(d);
+      s("Pexp_pack "); module_expr(x->me); s(" ");
+      popt(x->pack, [](const PackageType* p) { package_type(p, true); });
+      break;
+    }
+    case K::Pexp_letop: {
+      auto* x = as<Pexp_letop>(d)->letop;
+      s("Pexp_letop "); binding_op(x->let_); s(" ");
+      list(x->ands, [](const BindingOp* b) { binding_op(b); }); s(" "); expression(x->body);
+      break;
+    }
+    case K::Pexp_extension: s("Pexp_extension "); extension(as<Pexp_extension>(d)->ext); break;
+    case K::Pexp_unreachable: s("Pexp_unreachable"); break;
+  }
+  if (d->kind == K::Pexp_assert) {
+    s(" innermost ");
+    loc(e->pexp_loc_stack.empty() ? e->pexp_loc : e->pexp_loc_stack.back());
+  }
+  s(")");
+}
+
+void value_constraint(const ValueConstraint* vc) {
+  if (vc->kind == ValueConstraint::Kind::Pvc_constraint) {
+    s("Pvc_constraint "); list(vc->locally_abstract_univars, [](const StrLoc& v) { str_loc(v); });
+    s(" "); core_type(vc->typ);
+  } else {
+    s("Pvc_coercion "); popt(vc->ground, core_type); s(" "); core_type(vc->coercion);
+  }
+}
+void value_binding(const ValueBinding* vb) {
+  s("{vb "); pattern(vb->pvb_pat); s(" "); expression(vb->pvb_expr); s(" ");
+  popt(vb->pvb_constraint, value_constraint); s(" "); attrs(vb->pvb_attributes); s(" ");
+  gloc(vb->pvb_loc); s("}");
+}
+void value_description(const ValueDescription* v) {
+  s("{val "); str_loc(v->pval_name); s(" "); core_type(v->pval_type); s(" ");
+  attrs(v->pval_attributes); s(" "); loc(v->pval_loc); s("}");
+}
+void primitive(const PrimitiveDescription* p) {
+  s("{prim "); str_loc(p->pprim_name); s(" ");
+  if (p->pprim_kind.kind == PrimitiveKind::Kind::Pprim_decl) {
+    s("Pprim_decl "); core_type(p->pprim_kind.ty); s(" ");
+    list(p->pprim_kind.prims, [](std::string_view x) { q(x); });
+  } else {
+    s("Pprim_alias "); popt(p->pprim_kind.ty, core_type); s(" "); lid_loc(p->pprim_kind.alias);
+  }
+  s(" "); attrs(p->pprim_attributes); s(" "); loc(p->pprim_loc); s("}");
+}
+void type_param(const TypeParam& tp, bool gap) {
+  core_type(tp.ty); s(" ");
+  if (gap && mask_gaps) { s("?"); return; }
+  switch (tp.variance) {
+    case Variance::Covariant: s("+"); break;
+    case Variance::Contravariant: s("-"); break;
+    case Variance::NoVariance: s("."); break;
+    case Variance::Bivariant: s("+-"); break;
+  }
+  if (tp.injectivity == Injectivity::Injective) s("!");
+}
+void type_params(const Slice<TypeParam>& l, bool gap) {
+  list(l, [gap](const TypeParam& tp) { type_param(tp, gap); });
+}
+void label_decl(const LabelDeclaration* l) {
+  s("{ld "); str_loc(l->pld_name); s(" "); flag_mut(l->pld_mutable); s(" "); core_type(l->pld_type);
+  s(" "); loc(l->pld_loc); s(" "); attrs(l->pld_attributes); s("}");
+}
+void ctor_args(const ConstructorArguments& a) {
+  if (a.kind == ConstructorArguments::Kind::Pcstr_tuple) { s("Pcstr_tuple "); core_types(a.tuple); }
+  else { s("Pcstr_record "); list(a.record, [](const LabelDeclaration* l) { label_decl(l); }); }
+}
+void type_declaration(const TypeDeclaration* d) {
+  s("{td "); str_loc(d->ptype_name); s(" "); type_params(d->ptype_params, false); s(" ");
+  list(d->ptype_constraints, [](const TypeConstraintDecl& c) {
+    core_type(c.t1); s("="); core_type(c.t2); s(" "); loc(c.loc);
+  });
+  s(" ");
+  switch (d->ptype_kind.kind) {
+    case TypeKind::Kind::Ptype_abstract: s("Ptype_abstract"); break;
+    case TypeKind::Kind::Ptype_variant:
+      s("Ptype_variant ");
+      list(d->ptype_kind.constructors, [](const ConstructorDeclaration* c) {
+        s("{cd "); str_loc(c->pcd_name); s(" "); list(c->pcd_vars, [](const StrLoc& v) { str_gloc(v); });
+        s(" "); ctor_args(c->pcd_args); s(" "); popt(c->pcd_res, core_type); s(" "); loc(c->pcd_loc);
+        s(" "); attrs(c->pcd_attributes); s("}");
+      });
+      break;
+    case TypeKind::Kind::Ptype_record:
+      s("Ptype_record "); list(d->ptype_kind.labels, [](const LabelDeclaration* l) { label_decl(l); });
+      break;
+    case TypeKind::Kind::Ptype_open: s("Ptype_open"); break;
+    case TypeKind::Kind::Ptype_external: s("Ptype_external "); q(d->ptype_kind.external); break;
+  }
+  s(" "); flag_priv(d->ptype_private); s(" "); popt(d->ptype_manifest, core_type); s(" ");
+  attrs(d->ptype_attributes); s(" "); loc(d->ptype_loc); s("}");
+}
+void type_declarations(const Slice<const TypeDeclaration*>& l) {
+  list(l, [](const TypeDeclaration* d) { type_declaration(d); });
+}
+void extension_constructor(const ExtensionConstructor* c) {
+  s("{ext "); str_loc(c->pext_name); s(" ");
+  if (c->pext_kind.kind == ExtensionConstructorKind::Kind::Pext_decl) {
+    s("Pext_decl "); list(c->pext_kind.vars, [](const StrLoc& v) { str_gloc(v); }); s(" ");
+    ctor_args(c->pext_kind.args); s(" "); popt(c->pext_kind.res, core_type);
+  } else {
+    s("Pext_rebind "); lid_loc(c->pext_kind.rebind);
+  }
+  s(" "); loc(c->pext_loc); s(" "); attrs(c->pext_attributes); s("}");
+}
+void type_extension(const TypeExtension* x) {
+  s("{tyext "); lid_loc(x->ptyext_path); s(" "); type_params(x->ptyext_params, true); s(" ");
+  list(x->ptyext_constructors, [](const ExtensionConstructor* c) { extension_constructor(c); });
+  s(" "); flag_priv(x->ptyext_private); s(" "); loc(x->ptyext_loc); s(" "); attrs(x->ptyext_attributes);
+  s("}");
+}
+void type_exception(const TypeException* x) {
+  s("{tyexn "); extension_constructor(x->ptyexn_constructor); s(" "); loc(x->ptyexn_loc); s(" ");
+  attrs(x->ptyexn_attributes); s("}");
+}
+void open_description(const OpenDescription* o) {
+  s("{open "); lid_loc(o->popen_expr); s(" "); flag_ovr(o->popen_override); s(" "); loc(o->popen_loc);
+  s(" "); attrs(o->popen_attributes); s("}");
+}
+void class_signature(const ClassSignature* cs) {
+  s("{csig "); core_type(cs->pcsig_self); s(" ");
+  list(cs->pcsig_fields, [](const ClassTypeField* f) {
+    s("(CTF "); loc(f->pctf_loc); s(" "); attrs(f->pctf_attributes); s(" ");
+    const ClassTypeFieldDesc* d = f->pctf_desc;
+    using K = ClassTypeFieldDesc::Kind;
+    switch (d->kind) {
+      case K::Pctf_inherit: s("Pctf_inherit "); class_type(as<Pctf_inherit>(d)->cty); break;
+      case K::Pctf_val: {
+        auto* v = as<Pctf_val>(d);
+        s("Pctf_val "); str_loc(v->label); s(" "); flag_mut(v->mut); s(" "); flag_virt(v->virt); s(" ");
+        core_type(v->ty);
+        break;
+      }
+      case K::Pctf_method: {
+        auto* v = as<Pctf_method>(d);
+        s("Pctf_method "); str_loc(v->label); s(" "); flag_priv(v->priv); s(" "); flag_virt(v->virt);
+        s(" "); core_type(v->ty);
+        break;
+      }
+      case K::Pctf_constraint: {
+        auto* v = as<Pctf_constraint>(d);
+        s("Pctf_constraint "); core_type(v->t1); s(" "); core_type(v->t2);
+        break;
+      }
+      case K::Pctf_attribute: s("Pctf_attribute "); attribute(as<Pctf_attribute>(d)->attr, true); break;
+      case K::Pctf_extension: s("Pctf_extension "); extension(as<Pctf_extension>(d)->ext); break;
+    }
+    s(")");
+  });
+  s("}");
+}
+void class_type(const ClassType* x) {
+  s("(CT "); loc(x->pcty_loc); s(" "); attrs(x->pcty_attributes); s(" ");
+  const ClassTypeDesc* d = x->pcty_desc;
+  using K = ClassTypeDesc::Kind;
+  switch (d->kind) {
+    case K::Pcty_constr: {
+      auto* c = as<Pcty_constr>(d);
+      s("Pcty_constr "); lid_loc(c->lid); s(" "); core_types(c->args);
+      break;
+    }
+    case K::Pcty_signature: s("Pcty_signature "); class_signature(as<Pcty_signature>(d)->sign); break;
+    case K::Pcty_arrow: {
+      auto* a = as<Pcty_arrow>(d);
+      s("Pcty_arrow "); arg_label(a->label); s(" "); core_type(a->ty); s(" "); class_type(a->cty);
+      break;
+    }
+    case K::Pcty_extension: s("Pcty_extension "); extension(as<Pcty_extension>(d)->ext); break;
+    case K::Pcty_open: {
+      auto* o = as<Pcty_open>(d);
+      s("Pcty_open "); open_description(o->od); s(" "); class_type(o->cty);
+      break;
+    }
+  }
+  s(")");
+}
+template <class A, class F>
+void class_infos(const ClassInfos<A>* x, F&& f) {
+  s("{ci "); flag_virt(x->pci_virt); s(" "); type_params(x->pci_params, true); s(" ");
+  str_loc(x->pci_name); s(" "); f(x->pci_expr); s(" "); loc(x->pci_loc); s(" ");
+  attrs(x->pci_attributes); s("}");
+}
+void class_field_kind(const ClassFieldKind& k) {
+  if (k.kind == ClassFieldKind::Kind::Cfk_virtual) { s("Cfk_virtual "); core_type(k.ty); }
+  else { s("Cfk_concrete "); flag_ovr(k.ovr); s(" "); expression(k.exp); }
+}
+void class_expr(const ClassExpr* x) {
+  s("(CE "); loc(x->pcl_loc); s(" "); attrs(x->pcl_attributes); s(" ");
+  const ClassExprDesc* d = x->pcl_desc;
+  using K = ClassExprDesc::Kind;
+  switch (d->kind) {
+    case K::Pcl_constr: {
+      auto* c = as<Pcl_constr>(d);
+      s("Pcl_constr "); lid_loc(c->lid); s(" "); core_types(c->args);
+      break;
+    }
+    case K::Pcl_structure: s("Pcl_structure "); class_structure(as<Pcl_structure>(d)->cs); break;
+    case K::Pcl_fun: {
+      auto* f = as<Pcl_fun>(d);
+      s("Pcl_fun "); arg_label(f->label); s(" "); popt(f->default_, expression); s(" ");
+      pattern(f->pat); s(" "); class_expr(f->body);
+      break;
+    }
+    case K::Pcl_apply: {
+      auto* a = as<Pcl_apply>(d);
+      s("Pcl_apply "); class_expr(a->ce); s(" "); args(a->args);
+      break;
+    }
+    case K::Pcl_let: {
+      auto* l = as<Pcl_let>(d);
+      s("Pcl_let "); flag_rec(l->rec); s(" "); vbs(l->vbs); s(" "); class_expr(l->body);
+      break;
+    }
+    case K::Pcl_constraint: {
+      auto* c = as<Pcl_constraint>(d);
+      s("Pcl_constraint "); class_expr(c->ce); s(" "); class_type(c->cty);
+      break;
+    }
+    case K::Pcl_extension: s("Pcl_extension "); extension(as<Pcl_extension>(d)->ext); break;
+    case K::Pcl_open: {
+      auto* o = as<Pcl_open>(d);
+      s("Pcl_open "); open_description(o->od); s(" "); class_expr(o->ce);
+      break;
+    }
+  }
+  s(")");
+}
+void class_structure(const ClassStructure* cs) {
+  s("{cstr "); pattern(cs->pcstr_self); s(" ");
+  list(cs->pcstr_fields, [](const ClassField* f) {
+    s("(CF "); loc(f->pcf_loc); s(" "); attrs(f->pcf_attributes); s(" ");
+    const ClassFieldDesc* d = f->pcf_desc;
+    using K = ClassFieldDesc::Kind;
+    switch (d->kind) {
+      case K::Pcf_inherit: {
+        auto* v = as<Pcf_inherit>(d);
+        s("Pcf_inherit "); flag_ovr(v->ovr); s(" "); class_expr(v->ce); s(" ");
+        popt(v->as, [](const StrLoc* x) { str_loc(*x); });
+        break;
+      }
+      case K::Pcf_val: {
+        auto* v = as<Pcf_val>(d);
+        s("Pcf_val "); str_loc(v->label); s(" "); flag_mut(v->mut); s(" "); class_field_kind(v->kind_);
+        break;
+      }
+      case K::Pcf_method: {
+        auto* v = as<Pcf_method>(d);
+        s("Pcf_method "); str_loc(v->label); s(" "); flag_priv(v->priv); s(" "); class_field_kind(v->kind_);
+        break;
+      }
+      case K::Pcf_constraint: {
+        auto* v = as<Pcf_constraint>(d);
+        s("Pcf_constraint "); core_type(v->t1); s(" "); core_type(v->t2);
+        break;
+      }
+      case K::Pcf_initializer: s("Pcf_initializer "); expression(as<Pcf_initializer>(d)->exp); break;
+      case K::Pcf_attribute: s("Pcf_attribute "); attribute(as<Pcf_attribute>(d)->attr, true); break;
+      case K::Pcf_extension: s("Pcf_extension "); extension(as<Pcf_extension>(d)->ext); break;
+    }
+    s(")");
+  });
+  s("}");
+}
+void functor_param(const FunctorParameter& p) {
+  if (p.is_unit) { s("Unit"); return; }
+  s("Named "); optstr(p.name.txt); s(" "); loc(p.name.loc); s(" "); module_type(p.mty);
+}
+void module_type(const ModuleType* m) {
+  s("(MT "); loc(m->pmty_loc); s(" "); attrs(m->pmty_attributes); s(" ");
+  const ModuleTypeDesc* d = m->pmty_desc;
+  using K = ModuleTypeDesc::Kind;
+  switch (d->kind) {
+    case K::Pmty_ident: s("Pmty_ident "); lid_loc(as<Pmty_ident>(d)->lid); break;
+    case K::Pmty_signature: s("Pmty_signature "); signature(as<Pmty_signature>(d)->sg); break;
+    case K::Pmty_functor: {
+      auto* f = as<Pmty_functor>(d);
+      s("Pmty_functor "); functor_param(f->param); s(" "); module_type(f->body);
+      break;
+    }
+    case K::Pmty_with: {
+      auto* w = as<Pmty_with>(d);
+      s("Pmty_with "); module_type(w->mty); s(" ");
+      list(w->cstrs, [](const WithConstraint* c) {
+        using WK = WithConstraint::Kind;
+        switch (c->kind) {
+          case WK::Pwith_type: s("Pwith_type "); lid_loc(c->lid); s(" "); type_declaration(c->decl); break;
+          case WK::Pwith_module: s("Pwith_module "); lid_loc(c->lid); s(" "); lid_loc(c->lid2); break;
+          case WK::Pwith_modtype: s("Pwith_modtype "); lid_loc(c->lid); s(" "); module_type(c->mty); break;
+          case WK::Pwith_modtypesubst:
+            s("Pwith_modtypesubst "); lid_loc(c->lid); s(" "); module_type(c->mty); break;
+          case WK::Pwith_typesubst:
+            s("Pwith_typesubst "); lid_loc(c->lid); s(" "); type_declaration(c->decl); break;
+          case WK::Pwith_modsubst: s("Pwith_modsubst "); lid_loc(c->lid); s(" "); lid_loc(c->lid2); break;
+        }
+      });
+      break;
+    }
+    case K::Pmty_typeof: s("Pmty_typeof "); module_expr(as<Pmty_typeof>(d)->me); break;
+    case K::Pmty_extension: s("Pmty_extension "); extension(as<Pmty_extension>(d)->ext); break;
+    case K::Pmty_alias: s("Pmty_alias "); lid_loc(as<Pmty_alias>(d)->lid); break;
+  }
+  s(")");
+}
+void module_declaration(const ModuleDeclaration* md) {
+  s("{md "); optstr(md->pmd_name.txt); s(" "); loc(md->pmd_name.loc); s(" "); module_type(md->pmd_type);
+  s(" "); attrs(md->pmd_attributes); s(" "); loc(md->pmd_loc); s("}");
+}
+void modtype_declaration(const ModuleTypeDeclaration* m) {
+  s("{mtd "); str_loc(m->pmtd_name); s(" "); popt(m->pmtd_type, module_type); s(" ");
+  attrs(m->pmtd_attributes); s(" "); loc(m->pmtd_loc); s("}");
+}
+void signature_item(const SignatureItem* it) {
+  s("(SI "); loc(it->psig_loc); s(" ");
+  const SignatureItemDesc* d = it->psig_desc;
+  using K = SignatureItemDesc::Kind;
+  switch (d->kind) {
+    case K::Psig_value: s("Psig_value "); value_description(as<Psig_value>(d)->vd); break;
+    case K::Psig_primitive: s("Psig_primitive "); primitive(as<Psig_primitive>(d)->pd); break;
+    case K::Psig_type: {
+      auto* t = as<Psig_type>(d);
+      s("Psig_type "); flag_rec(t->rec); s(" "); type_declarations(t->decls);
+      break;
+    }
+    case K::Psig_typesubst: s("Psig_typesubst "); type_declarations(as<Psig_typesubst>(d)->decls); break;
+    case K::Psig_typext: s("Psig_typext "); type_extension(as<Psig_typext>(d)->ext); break;
+    case K::Psig_exception: s("Psig_exception "); type_exception(as<Psig_exception>(d)->exn); break;
+    case K::Psig_module: s("Psig_module "); module_declaration(as<Psig_module>(d)->md); break;
+    case K::Psig_modsubst: {
+      auto* ms = as<Psig_modsubst>(d)->ms;
+      s("Psig_modsubst "); str_loc(ms->pms_name); s(" "); lid_loc(ms->pms_manifest); s(" ");
+      attrs(ms->pms_attributes); s(" "); loc(ms->pms_loc);
+      break;
+    }
+    case K::Psig_recmodule:
+      s("Psig_recmodule ");
+      list(as<Psig_recmodule>(d)->mds, [](const ModuleDeclaration* md) { module_declaration(md); });
+      break;
+    case K::Psig_modtype: s("Psig_modtype "); modtype_declaration(as<Psig_modtype>(d)->mtd); break;
+    case K::Psig_modtypesubst:
+      s("Psig_modtypesubst "); modtype_declaration(as<Psig_modtypesubst>(d)->mtd); break;
+    case K::Psig_open: s("Psig_open "); open_description(as<Psig_open>(d)->od); break;
+    case K::Psig_include: {
+      auto* x = as<Psig_include>(d)->incl;
+      s("Psig_include "); module_type(x->pincl_mod); s(" "); loc(x->pincl_loc); s(" ");
+      attrs(x->pincl_attributes);
+      break;
+    }
+    case K::Psig_class:
+      s("Psig_class ");
+      list(as<Psig_class>(d)->decls, [](const ClassDescription* x) { class_infos(x, class_type); });
+      break;
+    case K::Psig_class_type:
+      s("Psig_class_type ");
+      list(as<Psig_class_type>(d)->decls, [](const ClassTypeDeclaration* x) { class_infos(x, class_type); });
+      break;
+    case K::Psig_attribute: s("Psig_attribute "); attribute(as<Psig_attribute>(d)->attr, true); break;
+    case K::Psig_extension: {
+      auto* x = as<Psig_extension>(d);
+      s("Psig_extension "); extension(x->ext); s(" "); attrs(x->attrs);
+      break;
+    }
+  }
+  s(")");
+}
+void signature(const Signature& sg) { list(sg, [](const SignatureItem* it) { signature_item(it); }); }
+void module_expr(const ModuleExpr* m) {
+  s("(ME "); loc(m->pmod_loc); s(" "); attrs(m->pmod_attributes); s(" ");
+  const ModuleExprDesc* d = m->pmod_desc;
+  using K = ModuleExprDesc::Kind;
+  switch (d->kind) {
+    case K::Pmod_ident: s("Pmod_ident "); lid_loc(as<Pmod_ident>(d)->lid); break;
+    case K::Pmod_structure: s("Pmod_structure "); structure(as<Pmod_structure>(d)->str); break;
+    case K::Pmod_functor: {
+      auto* f = as<Pmod_functor>(d);
+      s("Pmod_functor "); functor_param(f->param); s(" "); module_expr(f->body);
+      break;
+    }
+    case K::Pmod_apply: {
+      auto* a = as<Pmod_apply>(d);
+      s("Pmod_apply "); module_expr(a->fn); s(" "); module_expr(a->arg);
+      break;
+    }
+    case K::Pmod_apply_unit: s("Pmod_apply_unit "); module_expr(as<Pmod_apply_unit>(d)->fn); break;
+    case K::Pmod_constraint: {
+      auto* c = as<Pmod_constraint>(d);
+      s("Pmod_constraint "); module_expr(c->me); s(" "); module_type(c->mty);
+      break;
+    }
+    case K::Pmod_unpack: s("Pmod_unpack "); expression(as<Pmod_unpack>(d)->exp); break;
+    case K::Pmod_extension: s("Pmod_extension "); extension(as<Pmod_extension>(d)->ext); break;
+  }
+  s(")");
+}
+void module_binding(const ModuleBinding* mb) {
+  s("{mb "); optstr(mb->pmb_name.txt); s(" "); loc(mb->pmb_name.loc); s(" "); module_expr(mb->pmb_expr);
+  s(" "); attrs(mb->pmb_attributes); s(" "); loc(mb->pmb_loc); s("}");
+}
+void structure_item(const StructureItem* it) {
+  s("(SI "); loc(it->pstr_loc); s(" ");
+  const StructureItemDesc* d = it->pstr_desc;
+  using K = StructureItemDesc::Kind;
+  switch (d->kind) {
+    case K::Pstr_eval: {
+      auto* e = as<Pstr_eval>(d);
+      s("Pstr_eval "); expression(e->exp); s(" "); attrs(e->attrs);
+      break;
+    }
+    case K::Pstr_value: {
+      auto* v = as<Pstr_value>(d);
+      s("Pstr_value "); flag_rec(v->rec); s(" "); vbs(v->vbs);
+      break;
+    }
+    case K::Pstr_val: s("Pstr_val "); value_description(as<Pstr_val>(d)->vd); break;
+    case K::Pstr_primitive: s("Pstr_primitive "); primitive(as<Pstr_primitive>(d)->pd); break;
+    case K::Pstr_type: {
+      auto* t = as<Pstr_type>(d);
+      s("Pstr_type "); flag_rec(t->rec); s(" "); type_declarations(t->decls);
+      break;
+    }
+    case K::Pstr_typext: s("Pstr_typext "); type_extension(as<Pstr_typext>(d)->ext); break;
+    case K::Pstr_exception: s("Pstr_exception "); type_exception(as<Pstr_exception>(d)->exn); break;
+    case K::Pstr_module: s("Pstr_module "); module_binding(as<Pstr_module>(d)->mb); break;
+    case K::Pstr_recmodule:
+      s("Pstr_recmodule ");
+      list(as<Pstr_recmodule>(d)->mbs, [](const ModuleBinding* mb) { module_binding(mb); });
+      break;
+    case K::Pstr_modtype: s("Pstr_modtype "); modtype_declaration(as<Pstr_modtype>(d)->mtd); break;
+    case K::Pstr_open: {
+      auto* o = as<Pstr_open>(d)->od;
+      s("Pstr_open "); module_expr(o->popen_expr); s(" "); flag_ovr(o->popen_override); s(" ");
+      loc(o->popen_loc); s(" "); attrs(o->popen_attributes);
+      break;
+    }
+    case K::Pstr_class:
+      s("Pstr_class ");
+      list(as<Pstr_class>(d)->decls, [](const ClassDeclaration* x) { class_infos(x, class_expr); });
+      break;
+    case K::Pstr_class_type:
+      s("Pstr_class_type ");
+      list(as<Pstr_class_type>(d)->decls, [](const ClassTypeDeclaration* x) { class_infos(x, class_type); });
+      break;
+    case K::Pstr_include: {
+      auto* x = as<Pstr_include>(d)->incl;
+      s("Pstr_include "); module_expr(x->pincl_mod); s(" "); loc(x->pincl_loc); s(" ");
+      attrs(x->pincl_attributes);
+      break;
+    }
+    case K::Pstr_attribute: s("Pstr_attribute "); attribute(as<Pstr_attribute>(d)->attr, true); break;
+    case K::Pstr_extension: {
+      auto* x = as<Pstr_extension>(d);
+      s("Pstr_extension "); extension(x->ext); s(" "); attrs(x->attrs);
+      break;
+    }
+  }
+  s(")\n");
+}
+void structure(const Structure& st) { list(st, [](const StructureItem* it) { structure_item(it); }); }
+}  // namespace pd
+
+int run_parse(const std::string& file) {
+  std::ifstream in(file, std::ios::binary);
+  std::stringstream ss;
+  ss << in.rdbuf();
+  std::string src = ss.str();
+  std::vector<std::string> dirfiles;
+  cppcaml::ast::Structure st;
+  try {
+    st = cppcaml::parse_structure(src, dirfiles);
+  } catch (const cppcaml::ParseError& e) {
+    std::cerr << "c++typing-dump: parse error: " << e.what() << '\n';
+    return 1;
+  }
+  pd::parse_file = zstr(file);
+  pd::structure(parsetree::of_ast(st, file, dirfiles));
+  s("\n");
+  std::cout << b;
+  return 0;
+}
+
 // ---- stage 3: Ctype operations (the typing_dump.ml `ctype` mode) ----
 namespace et = errortrace;
 
@@ -928,6 +1911,14 @@ int run_ctype(const std::string& stdlib_dir, const std::string& queries) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc == 3 && std::string(argv[1]) == "parse") {
+    try {
+      return run_parse(argv[2]);
+    } catch (const std::exception& e) {
+      std::cerr << "c++typing-dump: " << e.what() << '\n';
+      return 1;
+    }
+  }
   if (argc == 4 && std::string(argv[1]) == "ctype") {
     try {
       return run_ctype(argv[2], argv[3]);

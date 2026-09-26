@@ -26,7 +26,7 @@ src=$ROOT/cxx/harness/typing_dump.ml
 if ! [ -f "$DUMP_ML" ] || ! [ "$DUMP_ML" -nt "$src" ]; then
   mkdir -p "$BIN" && cp "$src" "$BIN/typing_dump.ml"
   ./ocamlc.opt -nostdlib -I stdlib -I compilerlibs -I utils -I typing -I parsing \
-    -I file_formats compilerlibs/ocamlcommon.cma "$BIN/typing_dump.ml" \
+    -I file_formats -I driver compilerlibs/ocamlcommon.cma "$BIN/typing_dump.ml" \
     -o "$DUMP_ML" || { echo "FATAL: typing_dump build failed" >&2; exit 1; }
 fi
 

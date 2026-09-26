@@ -611,6 +611,441 @@ let run_queries file env =
    with End_of_file -> ());
   close_in ic
 
+(* ---- stage 4a: Parsetree ---- *)
+
+(* Locations the C++ parser does not record yet are printed through [gloc],
+   masked as "?" (TYPECHECKER.md lists them). *)
+let mask_gaps = ref true
+let parse_file = ref ""
+
+module P = struct
+  open Parsetree
+  (* compact: <lnum,bol,cnum-lnum,bol,cnum[ g]>, the file name when it is
+     not the unit's own *)
+  let pos (p : Lexing.position) =
+    if p.pos_fname <> !parse_file then (q p.pos_fname; s ":");
+    i p.pos_lnum; s ","; i p.pos_bol; s ","; i p.pos_cnum
+  let loc (l : Location.t) =
+    s "<"; pos l.loc_start; s "-"; pos l.loc_end; if l.loc_ghost then s " g"; s ">"
+  let gloc l = if !mask_gaps then s "?" else loc l
+  let str_loc (x : string Asttypes.loc) = q x.txt; s " "; loc x.loc
+  let str_gloc (x : string Asttypes.loc) = q x.txt; s " "; gloc x.loc
+  let rec lid (l : Longident.t) =
+    match l with
+    | Lident n -> s "Lident "; q n
+    | Ldot (a, b) -> s "Ldot("; lid a.txt; s " "; gloc a.loc; s " "; q b.txt; s " "; gloc b.loc; s ")"
+    | Lapply (a, b) -> s "Lapply("; lid a.txt; s " "; gloc a.loc; s " "; lid b.txt; s " "; gloc b.loc; s ")"
+  let lid_loc (x : Longident.t Asttypes.loc) = s "{"; lid x.txt; s " "; loc x.loc; s "}"
+  let optstr = opt q
+  let flag_closed = function Asttypes.Closed -> s "Closed" | Open -> s "Open"
+  let flag_rec = function Asttypes.Nonrecursive -> s "Nonrec" | Recursive -> s "Rec"
+  let flag_mut = function Asttypes.Immutable -> s "Immutable" | Mutable -> s "Mutable"
+  let flag_priv = function Asttypes.Private -> s "Private" | Public -> s "Public"
+  let flag_virt = function Asttypes.Virtual -> s "Virtual" | Concrete -> s "Concrete"
+  let flag_ovr = function Asttypes.Override -> s "Override" | Fresh -> s "Fresh"
+  let char_opt = function None -> s "None" | Some c -> s "Some "; i (Char.code c)
+
+  let constant (c : constant) =
+    s "{";
+    (match c.pconst_desc with
+     | Pconst_integer (t, suf) -> s "Pconst_integer "; q t; s " "; char_opt suf
+     | Pconst_char c -> s "Pconst_char "; i (Char.code c)
+     | Pconst_string (t, l, d) -> s "Pconst_string "; q t; s " "; loc l; s " "; optstr d
+     | Pconst_float (t, suf) -> s "Pconst_float "; q t; s " "; char_opt suf);
+    s " "; loc c.pconst_loc; s "}"
+
+  let rec attribute ?(gap_name = false) (a : attribute) =
+    s "{attr "; if gap_name then str_gloc a.attr_name else str_loc a.attr_name;
+    s " "; payload a.attr_payload; s " "; loc a.attr_loc; s "}"
+  and attrs l = list (fun a -> attribute a) l
+  and payload = function
+    | PStr st -> s "PStr "; structure st
+    | PSig sg -> s "PSig "; signature sg
+    | PTyp t -> s "PTyp "; core_type t
+    | PPat (p, g) -> s "PPat "; pattern p; s " "; opt expression g
+  and extension ((n, p) : extension) = s "{ext "; str_gloc n; s " "; payload p; s "}"
+
+  and package_type ~gap (p : package_type) =
+    s "{pack "; lid_loc p.ppt_path; s " ";
+    list (fun (l, t) -> lid_loc l; s "="; core_type t) p.ppt_constraints;
+    s " "; if gap then gloc p.ppt_loc else loc p.ppt_loc; s " "; attrs p.ppt_attrs; s "}"
+
+  and core_type (t : core_type) =
+    s "(T "; loc t.ptyp_loc; s " "; attrs t.ptyp_attributes; s " ";
+    (match t.ptyp_desc with
+     | Ptyp_any -> s "Ptyp_any"
+     | Ptyp_var v -> s "Ptyp_var "; q v
+     | Ptyp_arrow (l, a, b) -> s "Ptyp_arrow "; arg_label l; s " "; core_type a; s " "; core_type b
+     | Ptyp_tuple tl -> s "Ptyp_tuple "; list (fun (l, t) -> optstr l; s ":"; core_type t) tl
+     | Ptyp_constr (l, tl) -> s "Ptyp_constr "; lid_loc l; s " "; list core_type tl
+     | Ptyp_object (fl, c) ->
+         s "Ptyp_object ";
+         list (fun (f : object_field) ->
+             s "{"; (match f.pof_desc with
+              | Otag (l, t) -> s "Otag "; str_loc l; s " "; core_type t
+              | Oinherit t -> s "Oinherit "; core_type t);
+             s " "; gloc f.pof_loc; s " "; attrs f.pof_attributes; s "}") fl;
+         s " "; flag_closed c
+     | Ptyp_class (l, tl) -> s "Ptyp_class "; lid_loc l; s " "; list core_type tl
+     | Ptyp_alias (t, n) -> s "Ptyp_alias "; core_type t; s " "; str_gloc n
+     | Ptyp_variant (fl, c, ls) ->
+         s "Ptyp_variant ";
+         list (fun (f : row_field) ->
+             s "{"; (match f.prf_desc with
+              | Rtag (l, b, tl) -> s "Rtag "; str_gloc l; s " "; bool b; s " "; list core_type tl
+              | Rinherit t -> s "Rinherit "; core_type t);
+             s " "; gloc f.prf_loc; s " "; attrs f.prf_attributes; s "}") fl;
+         s " "; flag_closed c; s " "; opt (list q) ls
+     | Ptyp_poly (vs, t) -> s "Ptyp_poly "; list str_gloc vs; s " "; core_type t
+     | Ptyp_package p -> s "Ptyp_package "; package_type ~gap:false p
+     | Ptyp_open (l, t) -> s "Ptyp_open "; lid_loc l; s " "; core_type t
+     | Ptyp_extension e -> s "Ptyp_extension "; extension e
+     | Ptyp_functor (l, n, p, t) ->
+         s "Ptyp_functor "; arg_label l; s " "; str_loc n; s " "; package_type ~gap:true p;
+         s " "; core_type t);
+    s ")"
+
+  and pattern (p : pattern) =
+    s "(P "; loc p.ppat_loc; s " "; attrs p.ppat_attributes; s " ";
+    (match p.ppat_desc with
+     | Ppat_any -> s "Ppat_any"
+     | Ppat_var n -> s "Ppat_var "; str_loc n
+     | Ppat_alias (p, n) -> s "Ppat_alias "; pattern p; s " "; str_loc n
+     | Ppat_constant c -> s "Ppat_constant "; constant c
+     | Ppat_interval (a, b) -> s "Ppat_interval "; constant a; s " "; constant b
+     | Ppat_tuple (pl, c) ->
+         s "Ppat_tuple "; list (fun (l, p) -> optstr l; s ":"; pattern p) pl; s " "; flag_closed c
+     | Ppat_construct (l, a) ->
+         s "Ppat_construct "; lid_loc l; s " ";
+         opt (fun (vs, p) -> list str_loc vs; s " "; pattern p) a
+     | Ppat_variant (l, a) -> s "Ppat_variant "; q l; s " "; opt pattern a
+     | Ppat_record (fl, c) ->
+         s "Ppat_record "; list (fun (l, p) -> lid_loc l; s "="; pattern p) fl; s " "; flag_closed c
+     | Ppat_array pl -> s "Ppat_array "; list pattern pl
+     | Ppat_or (a, b) -> s "Ppat_or "; pattern a; s " "; pattern b
+     | Ppat_constraint (p, t) -> s "Ppat_constraint "; pattern p; s " "; core_type t
+     | Ppat_type l -> s "Ppat_type "; lid_loc l
+     | Ppat_lazy p -> s "Ppat_lazy "; pattern p
+     | Ppat_unpack (n, pk) ->
+         s "Ppat_unpack "; opt q n.txt; s " "; loc n.loc; s " "; opt (package_type ~gap:true) pk
+     | Ppat_exception p -> s "Ppat_exception "; pattern p
+     | Ppat_effect (a, b) -> s "Ppat_effect "; pattern a; s " "; pattern b
+     | Ppat_extension e -> s "Ppat_extension "; extension e
+     | Ppat_open (l, p) -> s "Ppat_open "; lid_loc l; s " "; pattern p);
+    s ")"
+
+  and case (c : case) =
+    s "{case "; pattern c.pc_lhs; s " "; opt expression c.pc_guard; s " "; expression c.pc_rhs; s "}"
+  and binding_op (b : binding_op) =
+    s "{bop "; str_loc b.pbop_op; s " "; pattern b.pbop_pat; s " "; expression b.pbop_exp;
+    s " "; loc b.pbop_loc; s "}"
+  and args l = list (fun (lb, e) -> arg_label lb; s ":"; expression e) l
+
+  and expression (e : expression) =
+    s "(E "; loc e.pexp_loc; s " "; attrs e.pexp_attributes; s " ";
+    (match e.pexp_desc with
+     | Pexp_ident l -> s "Pexp_ident "; lid_loc l
+     | Pexp_constant c -> s "Pexp_constant "; constant c
+     | Pexp_let (r, vbs, b) ->
+         s "Pexp_let "; flag_rec r; s " "; list value_binding vbs; s " "; expression b
+     | Pexp_function (ps, tc, body) ->
+         s "Pexp_function ";
+         list (fun (p : function_param) ->
+             s "{"; loc p.pparam_loc; s " ";
+             (match p.pparam_desc with
+              | Pparam_val (l, d, p) ->
+                  s "Pparam_val "; arg_label l; s " "; opt expression d; s " "; pattern p
+              | Pparam_newtype n -> s "Pparam_newtype "; str_loc n);
+             s "}") ps;
+         s " ";
+         opt (function
+             | Pconstraint t -> s "Pconstraint "; core_type t
+             | Pcoerce (f, t) -> s "Pcoerce "; opt core_type f; s " "; core_type t) tc;
+         s " ";
+         (match body with
+          | Pfunction_body e -> s "Pfunction_body "; expression e
+          | Pfunction_cases (cs, l, a) ->
+              s "Pfunction_cases "; list case cs; s " "; loc l; s " "; attrs a)
+     | Pexp_apply (f, a) -> s "Pexp_apply "; expression f; s " "; args a
+     | Pexp_match (e, cs) -> s "Pexp_match "; expression e; s " "; list case cs
+     | Pexp_try (e, cs) -> s "Pexp_try "; expression e; s " "; list case cs
+     | Pexp_tuple el -> s "Pexp_tuple "; list (fun (l, e) -> optstr l; s ":"; expression e) el
+     | Pexp_construct (l, a) -> s "Pexp_construct "; lid_loc l; s " "; opt expression a
+     | Pexp_variant (l, a) -> s "Pexp_variant "; q l; s " "; opt expression a
+     | Pexp_record (fl, b) ->
+         s "Pexp_record "; list (fun (l, e) -> lid_loc l; s "="; expression e) fl;
+         s " "; opt expression b
+     | Pexp_field (e, l) -> s "Pexp_field "; expression e; s " "; lid_loc l
+     | Pexp_setfield (a, l, b) ->
+         s "Pexp_setfield "; expression a; s " "; lid_loc l; s " "; expression b
+     | Pexp_array el -> s "Pexp_array "; list expression el
+     | Pexp_ifthenelse (a, b, c) ->
+         s "Pexp_ifthenelse "; expression a; s " "; expression b; s " "; opt expression c
+     | Pexp_sequence (a, b) -> s "Pexp_sequence "; expression a; s " "; expression b
+     | Pexp_while (a, b) -> s "Pexp_while "; expression a; s " "; expression b
+     | Pexp_for (p, a, b, d, c) ->
+         s "Pexp_for "; pattern p; s " "; expression a; s " "; expression b; s " ";
+         s (match d with Upto -> "Upto" | Downto -> "Downto"); s " "; expression c
+     | Pexp_constraint (e, t) -> s "Pexp_constraint "; expression e; s " "; core_type t
+     | Pexp_coerce (e, f, t) ->
+         s "Pexp_coerce "; expression e; s " "; opt core_type f; s " "; core_type t
+     | Pexp_send (e, m) -> s "Pexp_send "; expression e; s " "; str_loc m
+     | Pexp_new l -> s "Pexp_new "; lid_loc l
+     | Pexp_setinstvar (n, e) -> s "Pexp_setinstvar "; str_loc n; s " "; expression e
+     | Pexp_override fl ->
+         s "Pexp_override "; list (fun (n, e) -> str_loc n; s "="; expression e) fl
+     | Pexp_struct_item (it, e) -> s "Pexp_struct_item "; structure_item it; s " "; expression e
+     | Pexp_assert e -> s "Pexp_assert "; expression e
+     | Pexp_lazy e -> s "Pexp_lazy "; expression e
+     | Pexp_poly (e, t) -> s "Pexp_poly "; expression e; s " "; opt core_type t
+     | Pexp_object cs -> s "Pexp_object "; class_structure cs
+     | Pexp_newtype (n, e) -> s "Pexp_newtype "; str_loc n; s " "; expression e
+     | Pexp_pack (m, p) -> s "Pexp_pack "; module_expr m; s " "; opt (package_type ~gap:true) p
+     | Pexp_letop { let_; ands; body } ->
+         s "Pexp_letop "; binding_op let_; s " "; list binding_op ands; s " "; expression body
+     | Pexp_extension e -> s "Pexp_extension "; extension e
+     | Pexp_unreachable -> s "Pexp_unreachable");
+    (match e.pexp_desc with
+     | Pexp_assert _ ->
+         (* all Typecore reads of pexp_loc_stack: its innermost location *)
+         let rec innermost = function [] -> e.pexp_loc | [l] -> l | _ :: l -> innermost l in
+         s " innermost "; loc (innermost e.pexp_loc_stack)
+     | _ -> ());
+    s ")"
+
+  and value_constraint = function
+    | Pvc_constraint { locally_abstract_univars; typ } ->
+        s "Pvc_constraint "; list str_loc locally_abstract_univars; s " "; core_type typ
+    | Pvc_coercion { ground; coercion } ->
+        s "Pvc_coercion "; opt core_type ground; s " "; core_type coercion
+  and value_binding (vb : value_binding) =
+    s "{vb "; pattern vb.pvb_pat; s " "; expression vb.pvb_expr; s " ";
+    opt value_constraint vb.pvb_constraint; s " "; attrs vb.pvb_attributes; s " ";
+    gloc vb.pvb_loc; s "}"
+
+  and value_description (v : value_description) =
+    s "{val "; str_loc v.pval_name; s " "; core_type v.pval_type; s " ";
+    attrs v.pval_attributes; s " "; loc v.pval_loc; s "}"
+  and primitive (p : primitive_description) =
+    s "{prim "; str_loc p.pprim_name; s " ";
+    (match p.pprim_kind with
+     | Pprim_decl (t, l) -> s "Pprim_decl "; core_type t; s " "; list q l
+     | Pprim_alias (t, l) -> s "Pprim_alias "; opt core_type t; s " "; lid_loc l);
+    s " "; attrs p.pprim_attributes; s " "; loc p.pprim_loc; s "}"
+
+  and type_param ~gap ((t, (v, inj)) : core_type * (Asttypes.variance * Asttypes.injectivity)) =
+    core_type t; s " ";
+    if gap && !mask_gaps then s "?" else begin
+      s (match v with Covariant -> "+" | Contravariant -> "-" | NoVariance -> "."
+                    | Bivariant -> "+-");
+      s (match inj with Injective -> "!" | NoInjectivity -> "")
+    end
+  and label_decl (l : label_declaration) =
+    s "{ld "; str_loc l.pld_name; s " "; flag_mut l.pld_mutable; s " "; core_type l.pld_type;
+    s " "; loc l.pld_loc; s " "; attrs l.pld_attributes; s "}"
+  and ctor_args = function
+    | Pcstr_tuple tl -> s "Pcstr_tuple "; list core_type tl
+    | Pcstr_record ll -> s "Pcstr_record "; list label_decl ll
+  and type_declaration (d : type_declaration) =
+    s "{td "; str_loc d.ptype_name; s " "; list (type_param ~gap:false) d.ptype_params; s " ";
+    list (fun (a, b, l) -> core_type a; s "="; core_type b; s " "; loc l) d.ptype_constraints;
+    s " ";
+    (match d.ptype_kind with
+     | Ptype_abstract -> s "Ptype_abstract"
+     | Ptype_variant cds ->
+         s "Ptype_variant ";
+         list (fun (c : constructor_declaration) ->
+             s "{cd "; str_loc c.pcd_name; s " "; list str_gloc c.pcd_vars; s " ";
+             ctor_args c.pcd_args; s " "; opt core_type c.pcd_res; s " "; loc c.pcd_loc;
+             s " "; attrs c.pcd_attributes; s "}") cds
+     | Ptype_record lds -> s "Ptype_record "; list label_decl lds
+     | Ptype_open -> s "Ptype_open"
+     | Ptype_external n -> s "Ptype_external "; q n);
+    s " "; flag_priv d.ptype_private; s " "; opt core_type d.ptype_manifest; s " ";
+    attrs d.ptype_attributes; s " "; loc d.ptype_loc; s "}"
+  and extension_constructor (c : extension_constructor) =
+    s "{ext "; str_loc c.pext_name; s " ";
+    (match c.pext_kind with
+     | Pext_decl (vs, a, r) ->
+         s "Pext_decl "; list str_gloc vs; s " "; ctor_args a; s " "; opt core_type r
+     | Pext_rebind l -> s "Pext_rebind "; lid_loc l);
+    s " "; loc c.pext_loc; s " "; attrs c.pext_attributes; s "}"
+  and type_extension (x : type_extension) =
+    s "{tyext "; lid_loc x.ptyext_path; s " "; list (type_param ~gap:true) x.ptyext_params; s " ";
+    list extension_constructor x.ptyext_constructors; s " "; flag_priv x.ptyext_private; s " ";
+    loc x.ptyext_loc; s " "; attrs x.ptyext_attributes; s "}"
+  and type_exception (x : type_exception) =
+    s "{tyexn "; extension_constructor x.ptyexn_constructor; s " "; loc x.ptyexn_loc; s " ";
+    attrs x.ptyexn_attributes; s "}"
+
+  and open_description (o : open_description) =
+    s "{open "; lid_loc o.popen_expr; s " "; flag_ovr o.popen_override; s " "; loc o.popen_loc;
+    s " "; attrs o.popen_attributes; s "}"
+  and class_type (x : class_type) =
+    s "(CT "; loc x.pcty_loc; s " "; attrs x.pcty_attributes; s " ";
+    (match x.pcty_desc with
+     | Pcty_constr (l, tl) -> s "Pcty_constr "; lid_loc l; s " "; list core_type tl
+     | Pcty_signature cs -> s "Pcty_signature "; class_signature cs
+     | Pcty_arrow (l, t, c) -> s "Pcty_arrow "; arg_label l; s " "; core_type t; s " "; class_type c
+     | Pcty_extension e -> s "Pcty_extension "; extension e
+     | Pcty_open (o, c) -> s "Pcty_open "; open_description o; s " "; class_type c);
+    s ")"
+  and class_signature (cs : class_signature) =
+    s "{csig "; core_type cs.pcsig_self; s " ";
+    list (fun (f : class_type_field) ->
+        s "(CTF "; loc f.pctf_loc; s " "; attrs f.pctf_attributes; s " ";
+        (match f.pctf_desc with
+         | Pctf_inherit c -> s "Pctf_inherit "; class_type c
+         | Pctf_val (n, m, v, t) ->
+             s "Pctf_val "; str_loc n; s " "; flag_mut m; s " "; flag_virt v; s " "; core_type t
+         | Pctf_method (n, p, v, t) ->
+             s "Pctf_method "; str_loc n; s " "; flag_priv p; s " "; flag_virt v; s " "; core_type t
+         | Pctf_constraint (a, b) -> s "Pctf_constraint "; core_type a; s " "; core_type b
+         | Pctf_attribute a -> s "Pctf_attribute "; attribute ~gap_name:true a
+         | Pctf_extension e -> s "Pctf_extension "; extension e);
+        s ")") cs.pcsig_fields;
+    s "}"
+  and class_infos : 'a. ('a -> unit) -> 'a class_infos -> unit = fun f x ->
+    s "{ci "; flag_virt x.pci_virt; s " "; list (type_param ~gap:true) x.pci_params; s " ";
+    str_loc x.pci_name; s " "; f x.pci_expr; s " "; loc x.pci_loc; s " ";
+    attrs x.pci_attributes; s "}"
+  and class_expr (x : class_expr) =
+    s "(CE "; loc x.pcl_loc; s " "; attrs x.pcl_attributes; s " ";
+    (match x.pcl_desc with
+     | Pcl_constr (l, tl) -> s "Pcl_constr "; lid_loc l; s " "; list core_type tl
+     | Pcl_structure cs -> s "Pcl_structure "; class_structure cs
+     | Pcl_fun (l, d, p, c) ->
+         s "Pcl_fun "; arg_label l; s " "; opt expression d; s " "; pattern p; s " "; class_expr c
+     | Pcl_apply (c, a) -> s "Pcl_apply "; class_expr c; s " "; args a
+     | Pcl_let (r, vbs, c) ->
+         s "Pcl_let "; flag_rec r; s " "; list value_binding vbs; s " "; class_expr c
+     | Pcl_constraint (c, t) -> s "Pcl_constraint "; class_expr c; s " "; class_type t
+     | Pcl_extension e -> s "Pcl_extension "; extension e
+     | Pcl_open (o, c) -> s "Pcl_open "; open_description o; s " "; class_expr c);
+    s ")"
+  and class_field_kind = function
+    | Cfk_virtual t -> s "Cfk_virtual "; core_type t
+    | Cfk_concrete (o, e) -> s "Cfk_concrete "; flag_ovr o; s " "; expression e
+  and class_structure (cs : class_structure) =
+    s "{cstr "; pattern cs.pcstr_self; s " ";
+    list (fun (f : class_field) ->
+        s "(CF "; loc f.pcf_loc; s " "; attrs f.pcf_attributes; s " ";
+        (match f.pcf_desc with
+         | Pcf_inherit (o, c, a) ->
+             s "Pcf_inherit "; flag_ovr o; s " "; class_expr c; s " "; opt str_loc a
+         | Pcf_val (n, m, k) ->
+             s "Pcf_val "; str_loc n; s " "; flag_mut m; s " "; class_field_kind k
+         | Pcf_method (n, p, k) ->
+             s "Pcf_method "; str_loc n; s " "; flag_priv p; s " "; class_field_kind k
+         | Pcf_constraint (a, b) -> s "Pcf_constraint "; core_type a; s " "; core_type b
+         | Pcf_initializer e -> s "Pcf_initializer "; expression e
+         | Pcf_attribute a -> s "Pcf_attribute "; attribute ~gap_name:true a
+         | Pcf_extension e -> s "Pcf_extension "; extension e);
+        s ")") cs.pcstr_fields;
+    s "}"
+
+  and functor_param = function
+    | Unit -> s "Unit"
+    | Named (n, mt) -> s "Named "; opt q n.txt; s " "; loc n.loc; s " "; module_type mt
+  and module_type (m : module_type) =
+    s "(MT "; loc m.pmty_loc; s " "; attrs m.pmty_attributes; s " ";
+    (match m.pmty_desc with
+     | Pmty_ident l -> s "Pmty_ident "; lid_loc l
+     | Pmty_signature sg -> s "Pmty_signature "; signature sg
+     | Pmty_functor (p, b) -> s "Pmty_functor "; functor_param p; s " "; module_type b
+     | Pmty_with (mt, cs) ->
+         s "Pmty_with "; module_type mt; s " ";
+         list (function
+             | Pwith_type (l, d) -> s "Pwith_type "; lid_loc l; s " "; type_declaration d
+             | Pwith_module (a, b) -> s "Pwith_module "; lid_loc a; s " "; lid_loc b
+             | Pwith_modtype (l, m) -> s "Pwith_modtype "; lid_loc l; s " "; module_type m
+             | Pwith_modtypesubst (l, m) -> s "Pwith_modtypesubst "; lid_loc l; s " "; module_type m
+             | Pwith_typesubst (l, d) -> s "Pwith_typesubst "; lid_loc l; s " "; type_declaration d
+             | Pwith_modsubst (a, b) -> s "Pwith_modsubst "; lid_loc a; s " "; lid_loc b) cs
+     | Pmty_typeof me -> s "Pmty_typeof "; module_expr me
+     | Pmty_extension e -> s "Pmty_extension "; extension e
+     | Pmty_alias l -> s "Pmty_alias "; lid_loc l);
+    s ")"
+  and module_declaration (md : module_declaration) =
+    s "{md "; opt q md.pmd_name.txt; s " "; loc md.pmd_name.loc; s " "; module_type md.pmd_type;
+    s " "; attrs md.pmd_attributes; s " "; loc md.pmd_loc; s "}"
+  and modtype_declaration (m : module_type_declaration) =
+    s "{mtd "; str_loc m.pmtd_name; s " "; opt module_type m.pmtd_type; s " ";
+    attrs m.pmtd_attributes; s " "; loc m.pmtd_loc; s "}"
+  and signature_item (it : signature_item) =
+    s "(SI "; loc it.psig_loc; s " ";
+    (match it.psig_desc with
+     | Psig_value v -> s "Psig_value "; value_description v
+     | Psig_primitive p -> s "Psig_primitive "; primitive p
+     | Psig_type (r, l) -> s "Psig_type "; flag_rec r; s " "; list type_declaration l
+     | Psig_typesubst l -> s "Psig_typesubst "; list type_declaration l
+     | Psig_typext x -> s "Psig_typext "; type_extension x
+     | Psig_exception x -> s "Psig_exception "; type_exception x
+     | Psig_module md -> s "Psig_module "; module_declaration md
+     | Psig_modsubst ms ->
+         s "Psig_modsubst "; str_loc ms.pms_name; s " "; lid_loc ms.pms_manifest; s " ";
+         attrs ms.pms_attributes; s " "; loc ms.pms_loc
+     | Psig_recmodule l -> s "Psig_recmodule "; list module_declaration l
+     | Psig_modtype m -> s "Psig_modtype "; modtype_declaration m
+     | Psig_modtypesubst m -> s "Psig_modtypesubst "; modtype_declaration m
+     | Psig_open o -> s "Psig_open "; open_description o
+     | Psig_include x ->
+         s "Psig_include "; module_type x.pincl_mod; s " "; loc x.pincl_loc; s " ";
+         attrs x.pincl_attributes
+     | Psig_class l -> s "Psig_class "; list (class_infos class_type) l
+     | Psig_class_type l -> s "Psig_class_type "; list (class_infos class_type) l
+     | Psig_attribute a -> s "Psig_attribute "; attribute ~gap_name:true a
+     | Psig_extension (e, a) -> s "Psig_extension "; extension e; s " "; attrs a);
+    s ")"
+  and signature sg = list signature_item sg
+
+  and module_expr (m : module_expr) =
+    s "(ME "; loc m.pmod_loc; s " "; attrs m.pmod_attributes; s " ";
+    (match m.pmod_desc with
+     | Pmod_ident l -> s "Pmod_ident "; lid_loc l
+     | Pmod_structure st -> s "Pmod_structure "; structure st
+     | Pmod_functor (p, b) -> s "Pmod_functor "; functor_param p; s " "; module_expr b
+     | Pmod_apply (a, b) -> s "Pmod_apply "; module_expr a; s " "; module_expr b
+     | Pmod_apply_unit a -> s "Pmod_apply_unit "; module_expr a
+     | Pmod_constraint (a, t) -> s "Pmod_constraint "; module_expr a; s " "; module_type t
+     | Pmod_unpack e -> s "Pmod_unpack "; expression e
+     | Pmod_extension e -> s "Pmod_extension "; extension e);
+    s ")"
+  and module_binding (mb : module_binding) =
+    s "{mb "; opt q mb.pmb_name.txt; s " "; loc mb.pmb_name.loc; s " "; module_expr mb.pmb_expr;
+    s " "; attrs mb.pmb_attributes; s " "; loc mb.pmb_loc; s "}"
+  and structure_item (it : structure_item) =
+    s "(SI "; loc it.pstr_loc; s " ";
+    (match it.pstr_desc with
+     | Pstr_eval (e, a) -> s "Pstr_eval "; expression e; s " "; attrs a
+     | Pstr_value (r, vbs) -> s "Pstr_value "; flag_rec r; s " "; list value_binding vbs
+     | Pstr_val v -> s "Pstr_val "; value_description v
+     | Pstr_primitive p -> s "Pstr_primitive "; primitive p
+     | Pstr_type (r, l) -> s "Pstr_type "; flag_rec r; s " "; list type_declaration l
+     | Pstr_typext x -> s "Pstr_typext "; type_extension x
+     | Pstr_exception x -> s "Pstr_exception "; type_exception x
+     | Pstr_module mb -> s "Pstr_module "; module_binding mb
+     | Pstr_recmodule l -> s "Pstr_recmodule "; list module_binding l
+     | Pstr_modtype m -> s "Pstr_modtype "; modtype_declaration m
+     | Pstr_open o ->
+         s "Pstr_open "; module_expr o.popen_expr; s " "; flag_ovr o.popen_override; s " ";
+         loc o.popen_loc; s " "; attrs o.popen_attributes
+     | Pstr_class l -> s "Pstr_class "; list (class_infos class_expr) l
+     | Pstr_class_type l -> s "Pstr_class_type "; list (class_infos class_type) l
+     | Pstr_include x ->
+         s "Pstr_include "; module_expr x.pincl_mod; s " "; loc x.pincl_loc; s " ";
+         attrs x.pincl_attributes
+     | Pstr_attribute a -> s "Pstr_attribute "; attribute ~gap_name:true a
+     | Pstr_extension (e, a) -> s "Pstr_extension "; extension e; s " "; attrs a);
+    s ")\n"
+  and structure st = list structure_item st
+end
+
+let dump_parse file =
+  parse_file := file;
+  let st = Pparse.parse_implementation ~tool_name:"ocamlc" file in
+  P.structure st; s "\n"
+
 (* ---- stage 3: Ctype operations ---- *)
 
 let elt_name (e : _ Errortrace.elt) =
@@ -731,6 +1166,8 @@ let () =
       in
       run_queries queries env;
       print_string (Buffer.contents b)
+  | _ :: "parse" :: file :: _ ->
+      dump_parse file; print_string (Buffer.contents b)
   | _ :: "ctype" :: stdlib_dir :: queries :: _ ->
       canonical := true;
       Load_path.init ~auto_include:Load_path.no_auto_include

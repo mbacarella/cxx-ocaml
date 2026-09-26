@@ -146,6 +146,22 @@ from the port.  The two must be identical on every .cmi in the tree
    hooks `modtype_of_package` and `package_subtype` are not installed (so
    first-class-module types with different package paths can't be compared
    yet; ocamlc's are `assert false` until Typemod loads too); no `Printtyp`.
+4a. **DONE (except the location gaps below):** `Parsetree`
+   (`typing/parsetree.hpp`, field for field) built from the C++ parser's
+   `ast::` by `parsetree::of_ast`.  `typing_parse_parity.sh` dumps every
+   field of both trees (compiler-libs `Pparse` vs the port):
+   2015/2017 oracle-parseable files of testsuite + stdlib + compiler
+   sources identical; the 2 left are doc comments the C++ parser does not
+   attach (`ocaml.doc` on a type declaration, typecore.ml / 
+   includemod_errorprinter.ml).  Locations the parser does not record yet
+   are built as `gap_loc()` and printed masked ("?") by both dumps:
+   Longident inner component locations, `Ptyp_alias` / `Ptyp_poly` /
+   `pcd_vars` / `Pext_decl` variable-name locations, `prf_loc`, `pof_loc`,
+   `Rtag` label locations, `pvb_loc`, extension-name locations, the name
+   location of floating attributes, the `ppt_loc` of packages outside a
+   core type, the variances of class and type-extension parameters, and
+   every `*_loc_stack` except the innermost location of `Pexp_assert` (the
+   only one Typecore reads).  They only affect error positions.
 4. `Typetexp`, `Typecore` (core expressions and patterns, `Parmatch`), with
    ocamlc's error messages.  `CPPCAML_TYPECHECK` switches from the
    deprecated strict pass to the port here.

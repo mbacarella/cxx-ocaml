@@ -306,7 +306,7 @@ struct TypeDeclaration {
   StringLoc name;
   std::vector<CoreTypeBox> params;  // type_parameter
   // Written variance/injectivity per param as raw Variance.t ints (`+'a`=1,
-  // `-'a`=6, unannotated=7; `!` sets bit 8: `!'a`=15, `+!'a`=9).  Parallel
+  // `-'a`=6, unannotated=7; `!` sets bit 8: `!'a`=15, `+!'a`=9; `+-'a` counts as `-'a`).  Parallel
   // to params; may be empty when the parse path carries no variance slot.
   std::vector<int> param_variances;
   TypeKind kind;
@@ -315,6 +315,10 @@ struct TypeDeclaration {
   Location loc;
   Attributes attrs;  // post-item attributes (`[@@unboxed]` …)
   std::vector<TypeConstraint> constraints;  // ptype_constraints
+  // The written variances for the typing/ port (parsetree_of_ast.cpp): as
+  // param_variances, plus bit 16 for `+-'a` (Asttypes.Bivariant), and also
+  // recorded for `with type` declarations (whose param_variances is empty).
+  std::vector<int> written_variances;
 };
 
 // --- extension constructors / exceptions ---
@@ -444,7 +448,8 @@ struct ClassSignature { CoreTypeBox self; std::vector<ClassTypeField> fields; };
 struct Pcty_constr { LongidentLoc id; std::vector<CoreTypeBox> args; };
 struct Pcty_signature { ClassSignature cs; };
 struct Pcty_arrow { ArgLabel label; CoreTypeBox dom; ClassTypeBox cod; };
-struct Pcty_open { OverrideFlag ovr; LongidentLoc id; ClassTypeBox body; };  // let open M in ct
+struct Pcty_open { OverrideFlag ovr; LongidentLoc id; ClassTypeBox body;
+                   Location open_loc; };  // let open M in ct (open_loc: `open M`)
 struct Pcty_extension { std::string name; ExtPayload payload; };  // [%id]
 struct ClassType {
   std::variant<Pcty_constr, Pcty_signature, Pcty_arrow, Pcty_open, Pcty_extension> desc;
@@ -473,7 +478,8 @@ struct Pcl_fun { ArgLabel label; std::optional<ExprBox> default_; Pattern pat; C
 struct Pcl_apply { ClassExprBox ce; std::vector<std::pair<ArgLabel, ExprBox>> args; };
 struct Pcl_let { RecFlag rf; std::vector<ValueBinding> bindings; ClassExprBox body; };
 struct Pcl_constraint { ClassExprBox ce; ClassTypeBox ct; };
-struct Pcl_open { OverrideFlag ovr; LongidentLoc id; ClassExprBox body; };  // let open M in ce
+struct Pcl_open { OverrideFlag ovr; LongidentLoc id; ClassExprBox body;
+                  Location open_loc; };  // let open M in ce (open_loc: `open M`)
 struct Pcl_extension { std::string name; ExtPayload payload; };  // [%id]
 struct ClassExpr {
   std::variant<Pcl_constr, Pcl_structure, Pcl_fun, Pcl_apply, Pcl_let, Pcl_constraint,

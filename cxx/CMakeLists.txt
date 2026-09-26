@@ -55,6 +55,7 @@ add_library(cppcaml_core
   src/typing/ctype_filter.cpp
   src/typing/ctype_moregen.cpp
   src/typing/ctype_misc.cpp
+  src/typing/parsetree_of_ast.cpp
   src/typing/cmi_format.cpp)
 target_include_directories(cppcaml_core PUBLIC include)
 # The typing/ port initializes aggregates partially on purpose (an OCaml
