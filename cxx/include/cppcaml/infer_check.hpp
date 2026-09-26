@@ -1,10 +1,9 @@
-// DEPRECATED AS A TYPE CHECKER (2026-09-26) -- see TYPECHECKER.md.
-// An approximating algorithm-W pass (last-component path matching, no real Env,
-// soft argument unification).  Its lenient passes still feed codegen and the
-// .cmi writer (verified by DDC/effid): fix OUTPUT bugs only.  Its strict pass
-// (structure_typecheck) is deprecated outright.
-// The goal is a faithful port of ocamlc's typing/; do not grow this into a
-// checker.
+// SCHEDULED FOR DELETION -- see TYPECHECKER.md.  Type checking is the typing/
+// port's (c++ocamlc runs it by default); the strict pass that used to live
+// here is gone.  This approximating algorithm-W pass (last-component path
+// matching, no real Env, soft argument unification) survives only because its
+// lenient passes still feed codegen (lambda.cpp) and the .cmi writer, until
+// the lambda/ and cmi-writer ports replace them: fix OUTPUT bugs only.
 // Slice 2 of the inference milestone: a best-effort algorithm-W pass over the
 // parsetree that computes a type for each expression/binding, using the HM core
 // (infer.hpp) and value schemes loaded from stdlib.cmi.
@@ -31,70 +30,14 @@
 
 namespace cppcaml {
 
-// Infer types for the top-level value bindings of a structure (best-effort).
-// Returns (name, rendered-type) pairs in source order.
-std::vector<std::pair<std::string, std::string>> infer_structure_types(
-    const ast::Structure& s);
-
-// Best-effort exhaustiveness: map each `match` expression node to whether it is
-// (certainly) non-exhaustive — i.e. should print `Texp_match (Partial)`.  Only
-// set true when certain, so consulting it cannot cause false-positive Partials.
-std::unordered_map<const ast::Expression*, bool> infer_match_partiality(
-    const ast::Structure& s);
-
-// Slice 3 dump side-tables computed in ONE inference pass (so the transcriber
-// doesn't pay for inference twice): per `match` node, whether it is certainly
-// non-exhaustive; and per `Pexp_apply` node, the reconstructed argument slots
-// (callee-parameter order, omitted optionals filled with None, labelled args
-// reordered) -- present only when the call's args don't already match a plain
-// positional pass-through.
 // One parameter position of an optional-erasure eta-expansion (`?x:.. -> y -> ..`
 // used where `y -> ..` is expected): erased => filled with None, else an eta
 // parameter passed through.  `label` is 0/1/2 (Nolabel/Labelled/Optional).
 struct EtaSlot { bool erased; int label; std::string name; };
-struct DumpAux {
-  std::unordered_map<const ast::Expression*, bool> match_partial;
-  // Partiality of a bare `function .. | ..` (Tfunction_cases), keyed by the
-  // Pfunction_cases node pointer (its cases match the single parameter).
-  std::unordered_map<const void*, bool> function_cases_partial;
-  // Param-pattern node -> is-partial (Param_pat (Partial)), against its type.
-  std::unordered_map<const void*, bool> param_partial;
-  std::unordered_map<const ast::Expression*, std::vector<applymatch::Slot>> apply_plans;
-  // Construct nodes (Pexp_construct / Ppat_construct) whose argument tuple the
-  // dump flattens because the resolved constructor has arity>1 (incl. cmi ctors).
-  std::unordered_set<const void*> flatten_construct;
-  // `C _` pattern nodes where C resolved to arity N>1 (incl. cmi ctors): the
-  // lone `_` fills every slot (N Tpat_any) in the dump.
-  std::unordered_map<const void*, int> construct_any_arity;
-  // `_ M.t` core-type nodes where M.t is a cmi type of arity N>1: the lone `_`
-  // fills every parameter slot (N Ttyp_any) in the dump.
-  std::unordered_map<const void*, int> type_any_arity;
-  // Functional record-update nodes whose base is an EXTERNAL record type -> its
-  // full ordered field list (for the dump's <kept> fields).
-  std::unordered_map<const ast::Expression*, std::vector<std::string>> record_fields;
-  // Record-construction/update nodes whose type is an EXTERNAL record with a
-  // non-default representation (currently: all-`float` fields -> Record_float).
-  // Local records carry their repr in the transcriber's own field registry.
-  std::unordered_map<const ast::Expression*, std::string> record_reprs;
-  // String-literal expressions inferred at a printf-family format type (`printf
-  // "%d"`, `let f : _ format = "%d"`, ...): the dump desugars them to the
-  // CamlinternalFormatBasics.Format(...) tree, exactly as OCaml's type_format.
-  std::set<const ast::Expression*> format_lits;
-  // Array literals `[| .. |]` whose expected/inferred type is `iarray` (not
-  // `array`): the dump prints them as `Texp_array Immutable`.  Type-directed --
-  // `[||]` is polymorphic between array and iarray, resolved by expected type.
-  std::set<const ast::Expression*> iarray_lits;
-  // Argument expressions of type `?l:.. -> ..` used where a NON-optional arrow is
-  // expected: OCaml eta-expands them (`let arg = e in fun eta -> arg ?l:None
-  // eta`).  The slot list drives the ghost desugaring in the dump.
-  std::unordered_map<const ast::Expression*, std::vector<EtaSlot>> eta_erasures;
-};
-DumpAux infer_dump_aux(const ast::Structure& s);
 
-// Strict type-check (toward error-rejection parity): the definite type errors in
-// a structure; empty => accepted.  Conservative (only certain errors), so the
-// false-rejection rate over oracle-accepted files measures engine completeness.
-std::vector<std::string> structure_typecheck(const ast::Structure& s);
+
+
+
 
 // For the Lambda back end: inferred value kinds (Lambda's value_kind, as a
 // short string "int"/"float"/"int32"/"int64"/"nativeint", or "" for generic),
@@ -219,7 +162,6 @@ void set_infer_stdlib_dir(const std::string& dir);
 // Extra -I dirs the inferencer searches for a separately-compiled local module's
 // .cmi (so a dependent gets real types for `A.x`, not Any).
 void set_infer_module_dirs(std::vector<std::string> dirs);
-const std::vector<std::string>& infer_module_dirs();
 
 // Drop the module-name -> .cmi-path memo.  Must run before each compiled unit:
 // a unit compiled earlier in the same invocation writes a .cmi that a later

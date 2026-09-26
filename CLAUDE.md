@@ -4,15 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a self-bootstrapping compiler: pre-built bytecode images of `ocamlc`/`ocamllex` live in `boot/` and are used to compile a fresh compiler. See `BOOTSTRAP.adoc`.
 
-## C++ rewrite (`cxx/`): type checking
+## C++ rewrite (`cxx/`): the faithful port
 
-**Read `TYPECHECKER.md` first.**  c++ocamlc does not type-check yet: it
-rejects no ill-typed program.  The goal is a faithful port of `typing/`.
-`cxx/src/typer.cpp` (a typedtree transcriber) and `cxx/src/infer_check.cpp`
-(an approximating inference) are **deprecated as type checkers**, and so are
-the parity figures that score them (`TYPER-PARITY-ROADMAP.md`,
-`reject_parity.sh`, `accept_parity.sh`, `typedtree_parity.sh`,
-`sig_parity.sh`).  Don't harden them into a checker.
+**Read `TYPECHECKER.md` first.**  c++ocamlc must match ocamlc's semantics
+exactly, by faithfully porting the compiler (`cxx/src/typing/` is the port
+of `typing/`, verified against compiler-libs oracles).  The port is
+c++ocamlc's type checker (`CPPCAML_TYPECHECK=1` / `-stop-after typing`; on
+by default once the .cmi is written from it).  `typer.cpp`, `c++type` and
+their harnesses are deleted.  `cxx/src/infer_check.cpp` + `infer.cpp` are
+legacy, scheduled for deletion: they still feed `lambda.cpp` and the old
+.cmi writer, so fix output bugs only and never grow them.
 
 ## AI contribution policy
 

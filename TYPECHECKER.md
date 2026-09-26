@@ -4,32 +4,32 @@
 
 ## The goal
 
-c++ocamlc must type-check exactly as ocamlc does.  It accepts what ocamlc
-accepts, rejects what ocamlc rejects, and infers the types ocamlc infers.  The
-only way to get there is a **faithful port of ocamlc's `typing/`**: `Types`,
-`Btype`, `Ident`/`Path`, `Subst`, `Env`, `Ctype` (expand / unify / generalize /
-instance / moregen), `Typetexp`, `Typecore`, `Typedecl`, `Typemod`,
-`Includemod`, `Mtype`, `Typeclass`.  That is the parser, lambda and bytecode
-method again: transcribe ocamlc's algorithms and verify them against ocamlc.
+c++ocamlc must match ocamlc's semantics exactly: accept what ocamlc accepts,
+reject what ocamlc rejects with the same messages, infer the same types, and
+produce the same .cmi and .cmo.  The only way there is a **faithful port**:
+ocamlc's `typing/` first (done, stages 1-5), then the compiler parts that
+consume its results (the .cmi writer, `lambda/`, `bytecomp/`), each verified
+against ocamlc.  That is the parser, lambda and bytecode method again:
+transcribe ocamlc's algorithms and check them against ocamlc.
 
-**No C++ checker in the tree does this yet.**  Everything below is deprecated
-as a type checker.
+**The typing/ port is c++ocamlc's type checker**: it type-checks units
+before code generation, as in ocamlc (by default once stage 8 lands).  The
+earlier C++ typers are deleted or scheduled for deletion; see "Legacy code"
+below.
 
 ## Status (2026-09-26)
 
-By default c++ocamlc **still does not reject ill-typed programs**: `let x =
-1 + "a"` compiles to a .cmo, exit 0, and the only error it reports is an
-unbound module.  The ported checker (stages 1-5) runs with
-`CPPCAML_TYPECHECK=1` (before code generation; on a type error nothing is
-written and the exit status is 2) or with `-stop-after typing` (type-check
-only).  It prints ocamlc's location line and the error's constructor
-(`Error: Typecore.Expr_type_clash`) until Printtyp is ported;
-`CPPCAML_TYPECHECK_DEBUG=1` also says when a file reached an unported part
-(it is then accepted).
+With `CPPCAML_TYPECHECK=1` (on by default after stage 8) c++ocamlc
+type-checks every unit with the typing/ port before code generation, and
+rejects what ocamlc rejects (exit 2, nothing written).  Its
+error report is ocamlc's location line and the error's constructor
+(`Error: Typecore.Expr_type_clash`) until Printtyp is ported (stage 9);
+`-stop-after typing` type-checks only.  `CPPCAML_TYPECHECK_DEBUG=1` says
+when a file reached an unported part (it is then accepted).
 
 Accept/reject parity with ocamlc (`-stop-after typing`, same flags):
 
-| What | Ported checker | Deprecated strict pass (before) |
+| What | typing/ port | Deleted strict pass (for the record) |
 |---|---|---|
 | compiler corpus (139 .ml + 146 .mli, in /tmp/effid_ref) | **0 false rejects**, 0 false accepts | 70 false rejects |
 | `false_accept.sh` (137 ill-typed one-liners) | **0 false accepts**, 137/137 error locations identical | 94 false accepts |
@@ -45,45 +45,35 @@ for files where ocamlc prints a warning or alert first (warnings are not
 ported).  `port_check.sh` adapts
 `false_accept.sh` / `valid_reject.sh` (`CPP=cxx/harness/port_check.sh`).
 
-## Deprecated checkers (do not extend as type checkers)
+## Legacy code, and what is left of it
 
-- **`cxx/src/typer.cpp` (`type_structure`, `c++type` default mode)** is a
-  *transcriber*.  It rebuilds the typedtree's shape (names, stamps,
-  locations) to match `ocamlc -dtypedtree` on programs that are already
-  valid.  It does not unify and rejects nothing: it accepts all 137 battery
-  programs.  "Typed-tree dump parity 100%" measures transcription, not
-  typing.
-- **`cxx/src/infer_check.cpp` `Checker` + `cxx/src/infer.cpp` `Engine`** is
-  a best-effort algorithm-W approximation over the parsetree.  It matches
-  constructor paths by their last component, has no real `Env`, unifies
-  application arguments softly, and in strict mode reports only "certain"
-  clashes.
-  - *Lenient / value-kinds passes:* still what codegen and the .cmi writer
-    consume, and DDC plus the effid/cmi gates verify that OUTPUT.  Keep them
-    working until the ported typer replaces them, but fix output bugs only.
-    Don't grow them into a checker.
-  - *Strict pass (`structure_typecheck`, `c++type --check`):* **deprecated.**
-    Don't harden it false-reject by false-reject.  That approach was tried
-    and rejected (2026-09-26).
-- **Harnesses that score the deprecated checkers:** `reject_parity.sh`,
-  `accept_parity.sh`, `typedtree_parity.sh`, `sig_parity.sh`.  They remain
-  useful as regression tripwires for the output pipeline.  They are not
-  progress metrics for type checking.  `TYPER-PARITY-ROADMAP.md` records
-  that deprecated effort.
+- **`typer.cpp` (a typedtree transcriber), the `c++type` tool, and the
+  harnesses that scored them** (`reject_parity.sh`, `accept_parity.sh`,
+  `typedtree_parity.sh`, `sig_parity.sh`, `expect_soundness.sh`,
+  `gate_check.sh`, `TYPER-PARITY-ROADMAP.md`): **deleted** (stage 7).
+- **`infer_check.cpp`'s strict pass (`structure_typecheck`)** and the
+  helpers only it used: **deleted** (stage 7).
+- **`infer_check.cpp` `Checker` + `infer.cpp` `Engine`** (an approximating
+  algorithm-W pass: last-component paths, no real Env, soft argument
+  unification): **scheduled for deletion.**  Its lenient passes are still
+  what `lambda.cpp` (value kinds, primitive specialisation, pattern
+  compilation) and the .cmi writer (`infer_signature`, stamps, uids) read,
+  and DDC plus the effid/cmi gates verify that output.  Fix output bugs
+  only; never grow it.  It goes when stage 8 (the .cmi from the port's
+  signature) and stage 10 (`lambda/` from the port's typed tree) land,
+  together with `lambda.cpp`'s bespoke IR.
 
 ## What counts as progress
 
-The ported typer, validated against ocamlc:
+Parity with ocamlc, stage by stage, each with an oracle:
 
-1. **Accept/reject parity.**  0 false rejects on the compiler corpus, stdlib,
-   testsuite and probes (`valid_reject.sh`); 0 false accepts on
-   `false_accept.sh`, which should keep growing.
-2. **Same error messages** as ocamlc.
-3. **Same types:** the `-dtypedtree` dumps' types, then the .cmi.
-
-Staging: until its typedtree is trusted, the ported typer only decides
-accept/reject in c++ocamlc, so .cmo/.cmi output (and DDC) cannot regress.
-Replacing `infer_check` as codegen's source of types comes after that.
+1. **Accept/reject parity.**  Reached (see Status): 0 false rejects on the
+   compiler, stdlib, testsuite and probes; the false accepts left are
+   warnings made errors (warnings are not ported).
+2. **Same messages:** Printtyp and the report functions; warnings.
+3. **Same .cmi:** written from the port's signature (`Env.save_signature`).
+4. **Same .cmo:** `lambda/` and `bytecomp/` ported onto the port's typed
+   tree; then the legacy inference goes.
 
 ## Port plan (decided 2026-09-26)
 
@@ -236,7 +226,7 @@ from the port.  The two must be identical on every .cmi in the tree
    payload, `a, r.f <- v` inside a payload and `;; let exception E in ...`
    are rejected, and `functor ... -> sig end with ...` attaches the `with`
    differently.
-6. **DONE (opt-in):** c++ocamlc runs the port (`Typemod.type_implementation`
+6. **DONE:** c++ocamlc runs the port (`Typemod.type_implementation`
    / `type_interface` after `Compmisc.init_path` + `initial_env`) under
    `CPPCAML_TYPECHECK` or `-stop-after typing`, replacing the deprecated
    strict pass; see Status for the parity figures.  The error report is
@@ -245,5 +235,31 @@ from the port.  The two must be identical on every .cmi in the tree
    Apply_non_function over the application).  When c++ocamlc finds its
    stdlib through `-I`, that directory is not added a second time (ocamlc
    would let the second copy's units shadow the opened Stdlib's).
-7. Next: turn it on by default; Printtyp and ocamlc's error messages;
-   warnings; the .cmi writer from the port's signature.
+7. **DONE:** `typer.cpp`, `c++type`, the strict pass and the harnesses and
+   roadmap that scored them are deleted; `false_accept.sh` /
+   `valid_reject.sh` run the port (`port_check.sh`).  Type checking is
+   still opt-in (`CPPCAML_TYPECHECK=1` / `-stop-after typing`): turning it
+   on showed that the legacy .cmi writer can write an interface that
+   disagrees with its own .mli (camlinternalFormatBasics' GADTs), which
+   the checker rejects exactly as ocamlc does against that .cmi.  The
+   default flips (`kTypecheckByDefault` in cppocamlc_main.cpp) with
+   stage 8.  The bootstrap harness
+   now passes the stdlib's and the compiler's real typing flags
+   (`-principal`, `-no-alias-deps`, ...) and compiles the stdlib to a
+   dependency fixpoint: its hand-written link order was never a valid
+   compile order, which only a type checker notices.
+8. **The .cmi from the port** (`Env.save_signature`: `Subst` for saving,
+   `Cmi_format.output_cmi`, the CRCs), replacing the infer-driven writer.
+   Oracle: .cmi bytes identical to ocamlc's.  Needs ident stamps to follow
+   ocamlc's process order, so the lazily created module-init values
+   (stage 5 deviations) must be created where ocamlc creates them.
+9. **Messages:** `Printtyp` (+ `Out_type`, `Oprint`, `Errortrace_report`),
+   the `report_error` functions and `Location`'s reporting; then `Warnings`
+   and the checks that emit them.  Oracle: ocamlc's stderr, byte for byte
+   (the testsuite's expect outputs are a second oracle).
+10. **The back end from the port:** `lambda/` (`Translcore`, `Translmod`,
+   `Translprim`, `Translobj`/`Translclass`, `Matching`, `Switch`,
+   `Simplif`, `Tmc`, `Value_rec_compiler`, `Printlambda`) and `bytecomp/`
+   (`Bytegen`, `Emitcode`, `Bytelink`), on the port's typed tree.  Oracles:
+   `-dlambda` / `-dinstr` text, then .cmo bytes and DDC.  Then delete
+   `lambda.cpp`, `infer_check.cpp`, `infer.cpp` and the old .cmi writer.

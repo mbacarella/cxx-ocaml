@@ -5,12 +5,12 @@
 # same test directory (multi-file tests: Store, Waitgroup, M/A/B, ...).  The
 # real testsuite compiles those siblings first; our per-file oracle calls do
 # not, so such files were "oracle-rejected" (Unbound module) and invisible to
-# every typer gate -- and c++type kept an absorbing any() for them (site A).
+# every gate.
 # This script gives BOTH sides the same build context, like the otherlibs -I
 # wiring did: for each directory that needs it, compile every sibling .ml/.mli
 # to .cmi under $SIBROOT/<dir> (fixpoint, so in-dir dependency chains resolve).
-# The oracle then adds `-I $SIBROOT/<dir>` and c++type derives the same dir
-# from $CPPCAML_SIB_CMI_ROOT.
+# The oracle then adds `-I $SIBROOT/<dir>` and the C++ side derives the same
+# dir from $CPPCAML_SIB_CMI_ROOT.
 #
 # Only directories where an oracle-rejected file fails with "Unbound module X"
 # AND x.ml exists as a sibling are populated (blast-radius control: dirs whose
@@ -18,14 +18,13 @@
 # persisted in $SIBROOT/DIRS so cache rebuilds are reproducible after the
 # sibling files themselves start typing.
 #
-# Usage: sib_cmis.sh            # probe + build (probe needs the oracle cache)
+# Usage: sib_cmis.sh            # probe + build
 #        sib_cmis.sh --rebuild  # rebuild cmis for the persisted DIRS only
 set -u
 SELF="$(readlink -f "$0")"
 cd "$(dirname "$SELF")/../.." || exit 1
 ROOT="$PWD"
 SIBROOT="${SIBROOT:-/tmp/sib_cmi}"
-CACHE="${CACHE:-/tmp/ttp_oracle_cache}"
 JOBS="${JOBS:-$(nproc)}"
 OTHERLIBS="-I $ROOT/otherlibs/unix -I $ROOT/otherlibs/str \
   -I $ROOT/otherlibs/systhreads -I $ROOT/otherlibs/runtime_events \
@@ -76,14 +75,9 @@ DIRS="$SIBROOT/DIRS"
 touch "$DIRS"
 
 if [ "${1:-}" != "--rebuild" ]; then
-  # Probe: oracle-rejected corpus files = empty entries in the ttp oracle cache.
-  if [ ! -d "$CACHE" ]; then
-    echo "sib_cmis.sh: no oracle cache at $CACHE -- build it first" >&2; exit 1
-  fi
-  rejected=$(find testsuite/tests -name '*.ml' | sort | while read -r f; do
-    c="$CACHE/$(key "$f")"
-    [ -f "$c" ] && [ ! -s "$c" ] && echo "$f"
-  done)
+  # Probe every testsuite file: --probe-one runs ocamlc on it and reports
+  # its directory only for a sibling-resolvable "Unbound module".
+  rejected=$(find testsuite/tests -name '*.ml' | sort)
   echo "probing $(wc -l <<<"$rejected") oracle-rejected files ..." >&2
   probed=$(xargs -P "$JOBS" -I{} bash "$SELF" --probe-one {} <<<"$rejected" | sort -u)
   sort -u "$DIRS" <(printf '%s\n' "$probed") | grep -v '^$' > "$DIRS.new"

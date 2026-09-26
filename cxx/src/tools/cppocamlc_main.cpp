@@ -4,7 +4,8 @@
 //   c++ocamlc a.cmo b.cmo -o prog          # link into a runnable bytecode exe
 //   c++ocamlc -I src -w +a-4 -c src/x.ml   # accepts ocamlc's flag vocabulary
 //
-// Runs the whole c++caml pipeline (parse -> infer -> Lambda -> Bytegen ->
+// Runs the whole c++caml pipeline (parse -> type check (the typing/ port) ->
+// infer (the types codegen still reads) -> Lambda -> Bytegen ->
 // emitcode) then links against the stdlib and writes a `#!ocamlrun` launcher so
 // the result is directly executable.  No ocamlc involved; only ocamlrun (the C
 // VM) and the prebuilt stdlib objects are reused.
@@ -230,18 +231,28 @@ static void set_typing_flag(const std::string& a) {
 // -stop-after parsing / typing
 enum class StopAfter { None, Parsing, Typing };
 static StopAfter g_stop_after = StopAfter::None;
+// On by default once the .cmi comes from the port (TYPECHECKER.md stage 8):
+// until then c++ocamlc's own .cmi files (the legacy writer) can disagree
+// with their .mli, which the checker, like ocamlc, rejects.
+static constexpr bool kTypecheckByDefault = false;
+static bool typecheck_enabled() {
+  if (g_stop_after == StopAfter::Typing) return true;
+  if (kTypecheckByDefault) return !cppcaml::dbg_env("CPPCAML_NOTYPECHECK");
+  return cppcaml::dbg_env("CPPCAML_TYPECHECK");
+}
 
 // -I directories (resolved) and -nostdlib, for the ported type checker
 static std::vector<std::string> g_incdirs;
 static std::string g_stdlib_dir;
 static bool g_nostdlib = false;
 
-// The ported type checker (typing/, TYPECHECKER.md), opt-in with
-// CPPCAML_TYPECHECK: Compmisc.init_path + initial_env, then
-// Typemod.type_implementation.  Returns false after reporting a type error
-// (ocamlc's location line and the error's constructor until Printtyp is
-// ported).  A part of typing/ the port does not have yet, or an internal
-// failure, lets the compilation go on (CPPCAML_TYPECHECK_DEBUG says why).
+// The type checker (the typing/ port, TYPECHECKER.md): Compmisc.init_path +
+// initial_env, then Typemod.type_implementation / type_interface, before
+// code generation as in ocamlc (when: typecheck_enabled).  Returns false
+// after reporting a type error (ocamlc's location line and the error's
+// constructor until Printtyp is ported).  A part of typing/ the port does not
+// have yet, or an internal failure, lets the compilation go on
+// (CPPCAML_TYPECHECK_DEBUG says why).
 using PortBody = std::function<void(cppcaml::typing::env::t, const cppcaml::typing::typemod::UnitInfo&)>;
 static bool port_typecheck(const std::string& in_path, const std::string& mod, const std::string& stdlib_dir,
                            const std::string& out, bool intf, const PortBody& body) {
@@ -340,7 +351,7 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
     if (g_dump.parsetree)
       cppcaml::ast::print_dparsetree(structure, in_path, std::cout, dirfiles);
     if (g_stop_after == StopAfter::Parsing) return 0;
-    if (g_stop_after == StopAfter::Typing || cppcaml::dbg_env("CPPCAML_TYPECHECK")) {
+    if (typecheck_enabled()) {
       bool ok = port_typecheck(in_path, mod, stdlib_dir, cmo_out, /*intf=*/false,
                                [&](cppcaml::typing::env::t env0, const cppcaml::typing::typemod::UnitInfo& target) {
                                  namespace ty = cppcaml::typing;
@@ -443,7 +454,7 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
   try {
     auto sig = cppcaml::parse_signature(ss.str());
     if (g_stop_after == StopAfter::Parsing) return 0;
-    if (g_stop_after == StopAfter::Typing || cppcaml::dbg_env("CPPCAML_TYPECHECK")) {
+    if (typecheck_enabled()) {
       bool ok = port_typecheck(in_path, module_name(in_path), g_stdlib_dir, cmi_out, /*intf=*/true,
                                [&](cppcaml::typing::env::t env0, const cppcaml::typing::typemod::UnitInfo& target) {
                                  namespace ty = cppcaml::typing;

@@ -24,7 +24,20 @@ echo "WD=$WD"
 
 gname() { case "$1" in camlinternal*|stdlib) echo "$1";;
   *) cap="$(tr '[:lower:]' '[:upper:]' <<< ${1:0:1})${1:1}"; echo "stdlib__$cap";; esac; }
-flags() { case "$1" in camlinternalFormatBasics|stdlib) echo "-nopervasives";; *) echo "";; esac; }
+# stdlib/Makefile's COMPFLAGS (the typing ones) + stdlib/Compflags, per unit
+# ($1 = module, $2 = cmi|cmo).  The code generator ignores the typing flags;
+# the type checker needs them as ocamlc does (stdlib.mli's aliases only type
+# with -no-alias-deps, before their targets exist).
+flags() {
+  local f="-strict-sequence -principal"
+  case "$1:$2" in
+    stdlib:*) f="$f -nopervasives -no-alias-deps";;
+    camlinternalFormatBasics:*) f="$f -nopervasives";;
+    *Labels:cmo|float:cmo) f="$f -nolabels -no-alias-deps";;
+    oo:cmi) f="$f -no-principal";;
+  esac
+  echo "$f"
+}
 needs_awk() { case "$1" in stdlib|*Labels) return 0;; *) return 1;; esac; }
 
 STDORDER="camlinternalFormatBasics stdlib either sys obj type atomic mutex condition \
@@ -36,18 +49,40 @@ dynarray format camlinternalMod pqueue ephemeron filename complex effect \
 arrayLabels bytesLabels listLabels stringLabels moreLabels stdLabels"
 
 # ---- 1. all-ours stdlib (.cmi then .cmo) -----------------------------------
+for m in $STDORDER; do
+  s=$(gname "$m")
+  for ext in mli ml; do
+    [ -f "$STD/$m.$ext" ] || continue
+    if needs_awk "$m"; then awk -f "$STD/expand_module_aliases.awk" "$STD/$m.$ext" > "$WD/$s.$ext"
+    else cp "$STD/$m.$ext" "$WD/$s.$ext"; fi
+  done
+done
+# STDORDER is the LINK order; an interface can need a later unit's .cmi
+# (obj.mli uses Int32.t), which make finds through .depend.  So compile each
+# phase to a fixpoint: retry the units that failed until none is left, or
+# none makes progress (then report the first).
 for phase in cmi cmo; do
+  pending=""
   for m in $STDORDER; do
     s=$(gname "$m")
-    for ext in mli ml; do
-      [ -f "$STD/$m.$ext" ] || continue
-      if needs_awk "$m"; then awk -f "$STD/expand_module_aliases.awk" "$STD/$m.$ext" > "$WD/$s.$ext"
-      else cp "$STD/$m.$ext" "$WD/$s.$ext"; fi
+    if [ "$phase" = cmi ]; then [ -f "$WD/$s.mli" ] && pending="$pending $m"
+    else [ -f "$WD/$s.ml" ] && pending="$pending $m"; fi
+  done
+  while [ -n "$pending" ]; do
+    left=""; first_err=""
+    for m in $pending; do
+      s=$(gname "$m")
+      if [ "$phase" = cmi ]; then src="$WD/$s.mli"; else src="$WD/$s.ml"; fi
+      if ( cd "$WD" && "$CPP" -c $(flags "$m" "$phase") -stdlib "$WD" -I "$WD" "$(basename "$src")" ) 2>"$WD/err"
+      then :
+      else
+        left="$left $m"
+        [ -z "$first_err" ] && first_err="FAIL: stdlib $(basename "$src")
+$(sed 's/^/  /' "$WD/err")"
+      fi
     done
-    if [ "$phase" = cmi ]; then [ -f "$WD/$s.mli" ] || continue; src="$WD/$s.mli"
-    else src="$WD/$s.ml"; [ -f "$src" ] || continue; fi
-    ( cd "$WD" && "$CPP" -c $(flags "$m") -stdlib "$WD" -I "$WD" "$(basename "$src")" ) 2>"$WD/err" \
-      || { echo "FAIL: stdlib $(basename "$src")"; sed 's/^/  /' "$WD/err"; exit 1; }
+    if [ "$left" = "$pending" ]; then echo "$first_err"; exit 1; fi
+    pending="$left"
   done
 done
 cp "$STD/std_exit.ml" "$WD/"; ( cd "$WD" && "$CPP" -c -stdlib "$WD" -I "$WD" std_exit.ml ) 2>/dev/null
@@ -217,7 +252,8 @@ compile_list() {
   for f in $1; do
     base=$(basename "$f"); [ -f "$ROOT/$f" ] || { echo "MISSING $f"; exit 1; }
     cp "$ROOT/$f" "$WD/$base"
-    if ( cd "$WD" && "$CPP" -c -stdlib "$WD" $INCS "$base" ) >"$WD/cerr" 2>&1; then
+    # Makefile.build_config's OC_COMMON_COMPFLAGS (the typing ones)
+    if ( cd "$WD" && "$CPP" -c -strict-sequence -principal -strict-formats -stdlib "$WD" $INCS "$base" ) >"$WD/cerr" 2>&1; then
       ok=$((ok+1)); [ "${base##*.}" = ml ] && order="$order ${base%.ml}"
     else
       fail=$((fail+1)); echo "[FAIL $f]"; sed 's/^/   /' "$WD/cerr" | head -6

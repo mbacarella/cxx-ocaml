@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
 # False-accept battery: small ill-typed programs (cxx/harness/false_accept/,
-# every one rejected by ocamlc with a type error).  The testsuite accept gate
-# (accept_parity.sh) cannot see this class -- its ill-typed files exercise
-# advanced features, while the checker let plain argument/let-bound mismatches
-# through.  Counts the files `c++type --check` wrongly ACCEPTS.
+# every one rejected by ocamlc with a type error).  Counts the files the type
+# checker (c++ocamlc -stop-after typing, via port_check.sh) wrongly ACCEPTS.
 #
 # Usage: false_accept.sh        (CPP=, JOBS=, CPP_TIMEOUT= overridable; HOOKENV=
-#                                prefixes the checker, e.g. "env NOSHARE635=1")
+#                                prefixes the checker)
 set -u
 SELF="$(readlink -f "$0")"
 cd "$(dirname "$SELF")/../.." || exit 1
-CPP="${CPP:-./cxx/build/c++type}"
+CPP="${CPP:-./cxx/harness/port_check.sh}"
 JOBS="${JOBS:-8}"
 TIMEOUT="${CPP_TIMEOUT:-10}"
 DIR=cxx/harness/false_accept

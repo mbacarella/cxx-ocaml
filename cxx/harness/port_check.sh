@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# `c++type --check FILE` for the ported type checker (TYPECHECKER.md): runs
+# `CHECKER --check FILE` for the type checker (TYPECHECKER.md): runs
 # c++ocamlc -stop-after typing on a copy of FILE in a scratch directory (so
 # neither its neighbours' .cmi files nor its own outputs interfere).  Exit
 # status 0 = accepted, 2 = type error.  For the false_accept.sh /
-# valid_reject.sh harnesses: CPP=cxx/harness/port_check.sh.
+# valid_reject.sh harnesses (their default CPP).
 set -u
 [ "${1:-}" == "--check" ] && shift
 f="$1"
