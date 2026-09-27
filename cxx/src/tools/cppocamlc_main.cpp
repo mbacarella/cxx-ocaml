@@ -45,6 +45,8 @@
 #include "cppcaml/typing/typecore.hpp"
 #include "cppcaml/typing/typemod.hpp"
 #include "cppcaml/typing/printlambda.hpp"
+#include "cppcaml/typing/location.hpp"
+#include "cppcaml/typing/reporters.hpp"
 #include "cppcaml/typing/printtyp.hpp"
 #include "cppcaml/typing/bytegen.hpp"
 #include "cppcaml/typing/bytepackager.hpp"
@@ -210,6 +212,8 @@ static void set_typing_flag(const std::string& a) {
   else if (a == "-keep-docs") cf::keep_docs = true;
   else if (a == "-no-keep-docs") cf::keep_docs = false;
   else if (a == "-opaque") cf::opaque = true;
+  else if (a == "-absname") cf::absname = true;
+  else if (a == "-no-absname") cf::absname = false;
 }
 
 // -stop-after parsing / typing
@@ -349,10 +353,21 @@ static PortResult port_typecheck(const std::string& in_path, const std::string& 
     std::cerr << "c++ocamlc: " << in_path << ": internal error: an unported part of typing/\n";
     return PortResult::Failed;
   } catch (...) {
-    std::optional<ty::error_report::Report> r = ty::error_report::classify(std::current_exception());
+    // Location.report_exception Format.err_formatter exn (Maindriver: exit 2)
+    ty::reporters::install();
+    std::exception_ptr ep = std::current_exception();
+    bool reported = false;
+    try {
+      reported = ty::location::report_exception(ty::location::err_formatter(), ep);
+    } catch (...) {
+      ep = std::current_exception();
+    }
+    ty::location::err_flush();
+    if (reported) return PortResult::Rejected;
+    std::optional<ty::error_report::Report> r = ty::error_report::classify(ep);
     if (!r) {
       try {
-        throw;
+        std::rethrow_exception(ep);
       } catch (const std::exception& e) {
         std::cerr << "c++ocamlc: " << in_path << ": internal error in the type checker: " << e.what() << '\n';
       } catch (...) {
@@ -377,6 +392,9 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
   namespace ty = cppcaml::typing;
   std::string src;  // Pparse.parse_file: the (preprocessed) source text
   if (!read_source(in_path, src)) return 2;
+  // Pparse: Location.input_name, the lexbuf holding the whole source
+  cppcaml::typing::location::input_name = in_path;
+  cppcaml::typing::location::input_source = src;
   // Unit_info.modname: from the output prefix (-o stdlib__Arg.cmo -> Stdlib__Arg)
   std::string mod = module_name(cmo_out);
   using clk = std::chrono::steady_clock;
@@ -456,6 +474,9 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
 static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
   std::string src;  // Pparse.parse_file: the (preprocessed) source text
   if (!read_source(in_path, src)) return 2;
+  // Pparse: Location.input_name, the lexbuf holding the whole source
+  cppcaml::typing::location::input_name = in_path;
+  cppcaml::typing::location::input_source = src;
   try {
     auto sig = cppcaml::parse_signature(src);
     if (g_stop_after == StopAfter::Parsing) return 0;

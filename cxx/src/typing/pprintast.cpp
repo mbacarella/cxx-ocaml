@@ -92,4 +92,57 @@ void type_longident(Formatter& ppf, Longident::t l) { any_longident(LongidentKin
 void value_longident(Formatter& ppf, Longident::t l) { any_longident(LongidentKind::Value, ppf, l); }
 void tyvar(Formatter& ppf, std::string_view s) { oprint::tyvar(ppf, s); }
 
+namespace {
+// nominal_exp doc exp: appends to [ppf]; false = None
+bool nominal_exp_rec(Formatter& ppf, const parsetree::Expression* exp) {
+  namespace pt = parsetree;
+  if (!exp->pexp_attributes.empty()) return false;
+  const pt::ExpressionDesc* d = exp->pexp_desc;
+  if (auto* i = pt::as<pt::Pexp_ident>(d)) {
+    any_longident(LongidentKind::Value, ppf, i->lid.txt);
+    return true;
+  }
+  if (auto* v = pt::as<pt::Pexp_variant>(d)) {
+    if (v->arg) return false;
+    fprintf(ppf, "`%s", v->label);
+    return true;
+  }
+  if (auto* c = pt::as<pt::Pexp_construct>(d)) {
+    if (c->arg) return false;
+    any_longident(LongidentKind::Constr, ppf, c->lid.txt);
+    return true;
+  }
+  if (auto* f = pt::as<pt::Pexp_field>(d)) {
+    if (!nominal_exp_rec(ppf, f->exp)) return false;
+    fprintf(ppf, ".%t", [&](Formatter& ff) { any_longident(LongidentKind::Value, ff, f->lid.txt); });
+    return true;
+  }
+  if (auto* sd = pt::as<pt::Pexp_send>(d)) {
+    if (!nominal_exp_rec(ppf, sd->exp)) return false;
+    fprintf(ppf, "#%s", sd->meth.txt);
+    return true;
+  }
+  if (auto* c = pt::as<pt::Pexp_constant>(d)) {
+    const pt::ConstantDesc& cd = c->c.pconst_desc;
+    switch (cd.kind) {
+      case pt::ConstantDesc::Kind::Pconst_string: return false;
+      case pt::ConstantDesc::Kind::Pconst_char: fprintf(ppf, "%C", cd.c); return true;
+      case pt::ConstantDesc::Kind::Pconst_integer:
+      case pt::ConstantDesc::Kind::Pconst_float:
+        fprintf(ppf, "%s%t", cd.s, [&](Formatter& ff) {
+          if (cd.has_suffix) pp_print_char(ff, cd.suffix);
+        });
+        return true;
+    }
+  }
+  return false;
+}
+}  // namespace
+
+std::optional<Doc> nominal_exp(const parsetree::Expression* exp) {
+  Formatter f;
+  if (!nominal_exp_rec(f, exp)) return std::nullopt;
+  return std::move(f.doc);
+}
+
 }  // namespace cppcaml::typing::pprintast

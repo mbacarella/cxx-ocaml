@@ -20,6 +20,7 @@ inline bool no_std_include = false;        // -nostdlib
 inline bool unsafe = false;                // -unsafe
 inline bool noassert = false;              // -noassert
 inline bool debug = false;                 // -g
+inline bool absname = false;               // -absname (Location.show_filename)
 inline bool link_everything = false;       // -linkall
 inline bool print_variance = false;        // -i-variance
 inline bool real_paths = true;             // -short-paths clears it

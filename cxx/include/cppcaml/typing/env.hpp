@@ -303,6 +303,8 @@ std::string get_current_unit_name();
 
 // ---- construction ---------------------------------------------------------------
 t empty();
+// env = Env.empty (structural equality, as `env <> Env.empty` tests it)
+bool is_empty(t env);
 t initial();  // Predef.build_initial_env (add_type ~check:false) (add_extension ..) empty
 t in_signature(bool b, t env);
 bool is_in_signature(t env);
@@ -503,6 +505,12 @@ void fold_modules(const std::function<void(std::string_view, Path::t, const Modu
 void fold_constructors(const std::function<void(const ConstructorDescription*)>& f,
                        Longident::t lid, t env);
 void fold_labels(const std::function<void(const LabelDescription*)>& f, Longident::t lid, t env);
+void fold_modtypes(const std::function<void(std::string_view, Path::t, const ModtypeDeclaration*)>& f,
+                   Longident::t lid, t env);
+void fold_classes(const std::function<void(std::string_view, Path::t, const ClassDeclaration*)>& f,
+                  Longident::t lid, t env);
+void fold_cltypes(const std::function<void(std::string_view, Path::t, const ClassTypeDeclaration*)>& f,
+                  Longident::t lid, t env);
 
 // ---- misc -------------------------------------------------------------------------
 const Summary* summary(t env);

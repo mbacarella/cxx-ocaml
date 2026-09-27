@@ -2,10 +2,12 @@
 // (TYPECHECKER.md stage 9): Pprintast.Doc's longident / identifier printers.
 #pragma once
 
+#include <optional>
 #include <string_view>
 
 #include "cppcaml/typing/format_doc.hpp"
 #include "cppcaml/typing/longident.hpp"
+#include "cppcaml/typing/parsetree.hpp"
 
 namespace cppcaml::typing::pprintast {
 
@@ -18,5 +20,8 @@ void constr(format_doc::Formatter& ppf, Longident::t l);          // ~kind:Const
 void type_longident(format_doc::Formatter& ppf, Longident::t l);  // ~kind:Type
 void value_longident(format_doc::Formatter& ppf, Longident::t l); // ~kind:Value
 void tyvar(format_doc::Formatter& ppf, std::string_view s);
+// Doc.nominal_exp: the expression as the subject of a message, when it is
+// identifier-like or a short constant
+std::optional<format_doc::Doc> nominal_exp(const parsetree::Expression* exp);
 
 }  // namespace cppcaml::typing::pprintast

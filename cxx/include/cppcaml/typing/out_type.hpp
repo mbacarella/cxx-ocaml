@@ -40,8 +40,9 @@ namespace ident_conflicts {
 void reset();
 bool exists();
 // err_msg: the explanation document of the collisions seen, None if none
-// (its locations need Location's printer: stage 9b)
 std::optional<format_doc::Doc> err_msg();
+// err_print ppf: "@,%a" of err_msg, if any
+void err_print(format_doc::Formatter& ppf);
 }  // namespace ident_conflicts
 
 // Ident_names
@@ -127,6 +128,7 @@ ExpansionDiff trees_of_type_expansion(Mode mode, const ExpansionPair& e);
 void pp_type(format_doc::Formatter& ppf, const ot::OutType* t);
 void pp_type_expansion(format_doc::Formatter& ppf, const ExpansionDiff& d);
 ExpansionPair prepare_expansion(const ExpansionPair& e);
+TypeExpr* hide_variant_name(TypeExpr* t);
 bool same_path(TypeExpr* t, TypeExpr* t2);
 
 // Internal_names

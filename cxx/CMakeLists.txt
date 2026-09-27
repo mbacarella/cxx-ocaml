@@ -78,6 +78,12 @@ add_library(cppcaml_core
   src/typing/out_type.cpp
   src/typing/printtyp.cpp
   src/typing/printpat.cpp
+  src/typing/misc.cpp
+  src/typing/location.cpp
+  src/typing/errortrace_report.cpp
+  src/typing/reporters.cpp
+  src/typing/env_report.cpp
+  src/typing/typecore_report.cpp
   src/typing/simplif.cpp
   src/typing/tmc.cpp
   src/typing/translobj.cpp

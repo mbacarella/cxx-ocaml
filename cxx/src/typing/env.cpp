@@ -277,14 +277,23 @@ static const Summary* summ(Summary s) { return make<Summary>(s); }
 
 static EnvT* copy_env(t env) { return make<EnvT>(*env); }
 
+// Env.empty: one value (Out_type compares the printing environment with it
+// physically)
 t empty() {
-  static const Summary* s_empty = [] {
+  static t e_empty = [] {
     ZoneScope perm(permanent_zone());
-    return make<Summary>(Summary{Summary::Kind::Env_empty});
+    const Summary* s_empty = make<Summary>(Summary{Summary::Kind::Env_empty});
+    EnvT* e = make<EnvT>();
+    e->summary = s_empty;
+    return e;
   }();
-  EnvT* e = make<EnvT>();
-  e->summary = s_empty;
-  return e;
+  return e_empty;
+}
+
+bool is_empty(t env) {
+  // env = Env.empty, structurally: nothing bound, no summary
+  return env == empty() || (env->summary->kind == Summary::Kind::Env_empty && env->flags == 0 &&
+                            env->local_constraints.is_empty());
 }
 
 t in_signature(bool b, t env) {
@@ -2530,6 +2539,39 @@ void fold_labels(const std::function<void(const LabelDescription*)>& f, Longiden
   r->structure->comp_labels.iter([&](std::string_view, const Slice<LabelData>& l) {
     if (!l.empty()) f(l.front());
   });
+}
+
+template <class D, class R, class Proj1, class Proj2, class Get>
+static void find_all_names(const std::function<void(std::string_view, Path::t, R)>& f, Proj1 proj1, Proj2 proj2,
+                           Get get, Longident::t lid, t env) {
+  if (!lid) {
+    idtbl_fold_name<D, D>(
+        wrap_identity<D>, [&](std::string_view name, Path::t p, const D& d) { f(name, p, get(d)); }, proj1(env));
+    return;
+  }
+  auto [p, desc] = lookup_module_components(false, false, location::none(), lid, env);
+  const ModuleComponentsRepr* r = get_components(desc);
+  if (!r->is_structure) return;
+  proj2(r->structure).iter([&](std::string_view s, const D& d) { f(s, Path::pdot(p, s), get(d)); });
+}
+
+void fold_modtypes(const std::function<void(std::string_view, Path::t, const ModtypeDeclaration*)>& f,
+                   Longident::t lid, t env) {
+  find_all_names<const ModtypeData*, const ModtypeDeclaration*>(
+      f, [](t e) -> const auto& { return e->modtypes; }, [](auto* sc) -> const auto& { return sc->comp_modtypes; },
+      [](const ModtypeData* d) { return lz::force_modtype_decl(d->mtda_declaration); }, lid, env);
+}
+void fold_classes(const std::function<void(std::string_view, Path::t, const ClassDeclaration*)>& f,
+                  Longident::t lid, t env) {
+  find_all_names<const ClassData*, const ClassDeclaration*>(
+      f, [](t e) -> const auto& { return e->classes; }, [](auto* sc) -> const auto& { return sc->comp_classes; },
+      [](const ClassData* d) { return d->clda_declaration; }, lid, env);
+}
+void fold_cltypes(const std::function<void(std::string_view, Path::t, const ClassTypeDeclaration*)>& f,
+                  Longident::t lid, t env) {
+  find_all_names<const CltypeData*, const ClassTypeDeclaration*>(
+      f, [](t e) -> const auto& { return e->cltypes; }, [](auto* sc) -> const auto& { return sc->comp_cltypes; },
+      [](const CltypeData* d) { return d->cltda_declaration; }, lid, env);
 }
 
 // ---- summaries and unscoped pairs -----------------------------------------------------

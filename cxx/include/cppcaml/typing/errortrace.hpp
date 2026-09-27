@@ -1,12 +1,12 @@
 // Port of typing/errortrace.ml (TYPECHECKER.md): the traces carried by
 // unification / equality / moregen / subtyping failures.  The OCaml GADT
-// indices (unification vs comparison) become a runtime `variety`; the
-// Format_doc documents in first-class-module errors are rendered strings.
+// indices (unification vs comparison) become a runtime `variety`.
 #pragma once
 
 #include <string>
 #include <vector>
 
+#include "cppcaml/typing/format_doc.hpp"
 #include "cppcaml/typing/types.hpp"
 
 namespace cppcaml::typing::errortrace {
@@ -86,7 +86,7 @@ struct FirstClassModule {
   };
   Kind kind;
   Path::t path = nullptr;
-  std::string doc;  // Package_inclusion / Package_coercion
+  format_doc::Doc doc;  // Package_inclusion / Package_coercion
   Position pos = Position::First;
   std::vector<std::string_view> lhs;
   const TypeDeclaration* decl = nullptr;

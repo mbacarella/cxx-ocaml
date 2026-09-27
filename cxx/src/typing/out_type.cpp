@@ -1,6 +1,8 @@
 // Port of typing/out_type.ml (TYPECHECKER.md stage 9).
 #include "cppcaml/typing/out_type.hpp"
 
+#include "cppcaml/typing/location.hpp"
+
 #include <algorithm>
 #include <map>
 #include <set>
@@ -160,22 +162,46 @@ void reset() { explanations.clear(); }
 bool exists() { return !explanations.empty(); }
 
 std::optional<Doc> err_msg() {
-  // the explanations' printing (Location.Doc.loc) is stage 9b's; the
-  // collisions are reported with their names
-  if (explanations.empty()) return std::nullopt;
+  // list_explanations: the bindings, sorted with Stdlib.compare
   std::vector<Explanation> l;
   for (auto& [_, e] : explanations) l.push_back(e);
   explanations.clear();
+  auto cmp_pos = [](const Position& a, const Position& b) {
+    if (a.pos_fname != b.pos_fname) return a.pos_fname < b.pos_fname ? -1 : 1;
+    if (a.pos_lnum != b.pos_lnum) return a.pos_lnum < b.pos_lnum ? -1 : 1;
+    if (a.pos_bol != b.pos_bol) return a.pos_bol < b.pos_bol ? -1 : 1;
+    if (a.pos_cnum != b.pos_cnum) return a.pos_cnum < b.pos_cnum ? -1 : 1;
+    return 0;
+  };
+  std::stable_sort(l.begin(), l.end(), [&](const Explanation& a, const Explanation& b) {
+    if (a.kind != b.kind) return a.kind < b.kind;
+    if (a.name != b.name) return a.name < b.name;
+    if (a.root_name != b.root_name) return a.root_name < b.root_name;
+    if (int c = cmp_pos(a.location.loc_start, b.location.loc_start)) return c < 0;
+    if (int c = cmp_pos(a.location.loc_end, b.location.loc_end)) return c < 0;
+    return a.location.loc_ghost < b.location.loc_ghost;
+  });
+  // (the toplevel's explanations, isolated in ocamlc, do not arise here)
+  if (l.empty()) return std::nullopt;
   Formatter f;
   fprintf(f, "@[<v>");
   bool first = true;
   for (auto& r : l) {
     if (!first) pp_print_cut(f);
     first = false;
-    fprintf(f, "@[<v 2>Definition of %s %s@]", namespace_to_string(r.kind), r.name);
+    fprintf(f, "@[<v 2>%a:@,Definition of %s %a@]", [&](Formatter& ff) { location::doc::loc(ff, r.location); },
+            namespace_to_string(r.kind), [&](Formatter& ff) {
+              pp_open_stag(ff, "inline_code");
+              pp_print_string(ff, r.name);
+              pp_close_stag(ff);
+            });
   }
   fprintf(f, "@]");
   return f.doc;
+}
+
+void err_print(Formatter& ppf) {
+  if (std::optional<Doc> d = err_msg()) fprintf(ppf, "@,%a", [&](Formatter& ff) { pp_doc(ff, *d); });
 }
 }  // namespace ident_conflicts
 
@@ -2176,7 +2202,6 @@ void pp_type_expansion(Formatter& ppf, const ExpansionDiff& d) {
   }
 }
 
-namespace {
 // Hide variant name and var, to force printing the expanded type
 TypeExpr* hide_variant_name(TypeExpr* t) {
   auto* v = as<Tvariant>(printer_get_desc(t));
@@ -2187,7 +2212,6 @@ TypeExpr* hide_variant_name(TypeExpr* t) {
                     types::tvariant(types::create_row(slice(r.fields), ctype::newvar2(types::get_level(r.more)), r.closed,
                                                    r.fixed, nullptr)));
 }
-}  // namespace
 
 ExpansionPair prepare_expansion(const ExpansionPair& e) {
   TypeExpr* expanded = hide_variant_name(e.expanded);
