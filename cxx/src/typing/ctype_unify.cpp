@@ -631,6 +631,7 @@ static void reify(const Uenv& uenv, TypeExpr* t, TypeExpr* eqn_lhs = nullptr,
     origin.kind = TypeOrigin::Kind::Equation;
     origin.eq1 = eqn_lhs;
     origin.eq2 = eqn_rhs;
+    origin.obj = fresh_identity();
   }
   auto create_fresh_constr = [&](long lev, OptStr name) -> std::pair<Path::t, TypeExpr*> {
     std::string nm = name.some ? "$'" + std::string(name.v) : "$";

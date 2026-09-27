@@ -583,6 +583,14 @@ static RowFieldCell* row_field_ext(const RowField* fi) {
 const RowField* rf_present(TypeExpr* oty) {
   return make<RowField>(RowField::Kind::RFpresent, oty);
 }
+const RowField* rf_present_none_literal(const char* unit) {
+  static std::map<std::string, const RowField*> lits;
+  std::string u = ocaml_unit_of_file(unit);
+  auto it = lits.find(u);
+  if (it != lits.end()) return it->second;
+  ZoneScope perm(permanent_zone());
+  return lits[u] = rf_present(nullptr);
+}
 const RowField* rf_absent() { return rfabsent(); }
 const RowField* rf_either(const RowField* use_ext_of, bool no_arg,
                           Slice<TypeExpr*> arg_type, bool matched) {

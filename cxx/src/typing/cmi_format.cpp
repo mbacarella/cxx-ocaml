@@ -503,10 +503,12 @@ class Reader {
         } else if (tag(o) == 0) {
           k->origin.kind = OK::Existential;
           k->origin.existential = str(f(o, 0));
+          k->origin.obj = block_identity(o);
         } else {
           k->origin.kind = OK::Equation;
           k->origin.eq1 = ty(f(o, 0));
           k->origin.eq2 = ty(f(o, 1));
+          k->origin.obj = block_identity(o);
         }
         break;
       }
@@ -836,6 +838,13 @@ class Reader {
   std::unordered_map<std::size_t, Path::t> path_;
   std::unordered_map<std::size_t, const void*> uid_obj_;
   std::unordered_map<std::size_t, const void*> some_obj_;
+  std::unordered_map<std::size_t, const void*> block_obj_;
+  // one identity per marshaled block
+  const void* block_identity(std::size_t id) {
+    auto [it, fresh] = block_obj_.try_emplace(id, nullptr);
+    if (fresh) it->second = zone().alloc(1, 1);
+    return it->second;
+  }
   std::unordered_map<std::size_t, const Position*> pos_;
   std::unordered_map<std::size_t, const Location*> loc_;
   std::unordered_map<std::size_t, const void*> repr_obj_;
@@ -867,6 +876,15 @@ class Writer {
     return it->second;
   }
   V some(V x) { return o::vblock(0, {std::move(x)}); }
+  // a value built by [make], one per identity token (nullptr: a fresh one)
+  template <class F>
+  V shared_by(const void* obj, F&& make) {
+    if (!obj) return make();
+    if (auto it = by_obj_.find(obj); it != by_obj_.end()) return it->second;
+    V v = make();
+    by_obj_[obj] = v;
+    return v;
+  }
   // `Some x`, one block per identity token (nullptr: a fresh block)
   template <class F>
   V some_shared(const void* obj, F&& x) {
@@ -1291,8 +1309,12 @@ class Writer {
           case OK::Definition: orig = i(0); break;
           case OK::Rec_check_regularity: orig = i(1); break;
           case OK::Approx_recmod: orig = i(2); break;
-          case OK::Existential: orig = o::vblock(0, {str(k->origin.existential)}); break;
-          case OK::Equation: orig = o::vblock(1, {ty(k->origin.eq1), ty(k->origin.eq2)}); break;
+          case OK::Existential:
+            orig = shared_by(k->origin.obj, [&] { return o::vblock(0, {str(k->origin.existential)}); });
+            break;
+          case OK::Equation:
+            orig = shared_by(k->origin.obj, [&] { return o::vblock(1, {ty(k->origin.eq1), ty(k->origin.eq2)}); });
+            break;
         }
         return o::vblock(0, {orig});
       }
@@ -1541,6 +1563,7 @@ class Writer {
   std::unordered_map<const void*, V> pos_objs_, loc_objs_;
   std::unordered_map<const void*, V> somes_;
   std::unordered_map<const void*, V> val_prims_;
+  std::unordered_map<const void*, V> by_obj_;
   std::map<std::pair<const void*, const void*>, V> attr_names_;
 };
 

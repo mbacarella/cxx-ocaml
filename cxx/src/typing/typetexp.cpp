@@ -644,7 +644,7 @@ static const tt::CoreType* transl_type_aux(env::t env, const RowContext& row_con
               e.name = std::string(rt->label.txt);
               raise_(e);
             }
-            f = tl.empty() ? rf_present_opt(nullptr) : rf_present_opt(tl[0]->ctyp_type);
+            f = tl.empty() ? RF_PRESENT_NONE_LIT() : rf_present_opt(tl[0]->ctyp_type);
           }
           add_typed_field(styp->ptyp_loc, rt->label.txt, f);
           rf_desc.is_tag = true;

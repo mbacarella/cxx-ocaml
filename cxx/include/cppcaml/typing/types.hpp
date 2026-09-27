@@ -284,6 +284,9 @@ struct TypeOrigin {
   std::string_view existential;
   TypeExpr* eq1 = nullptr;
   TypeExpr* eq2 = nullptr;
+  // Existential / Equation: the block's identity (one reify call's origin
+  // is shared by all the types it creates); nullptr = none recorded
+  const void* obj = nullptr;
 };
 
 struct RecordRepresentation {
@@ -608,6 +611,11 @@ struct RowFieldView {  // Rpresent of type_expr option | Reither of .. | Rabsent
 };
 RowFieldView row_field_repr(const RowField* fi);
 const RowField* rf_present(TypeExpr* oty);
+// `rf_present None` in an OCaml unit: ocamlopt (which built the reference
+// ocamlc.opt) inlines rf_present, and `RFpresent None` becomes a static
+// structured constant -- one per unit, shared by every row field built so
+const RowField* rf_present_none_literal(const char* unit);
+#define RF_PRESENT_NONE_LIT() ::cppcaml::typing::types::rf_present_none_literal(__FILE__)
 const RowField* rf_absent();
 const RowField* rf_either(const RowField* use_ext_of, bool no_arg,
                           Slice<TypeExpr*> arg_type, bool matched);

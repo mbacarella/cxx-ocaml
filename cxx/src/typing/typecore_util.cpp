@@ -489,7 +489,7 @@ static void finalize_variant(const tt::Pattern* pat, std::string_view tag, const
   using RK = RowFieldView::Kind;
   if (fv.kind == RK::Rabsent) return;  // assert false
   if (fv.kind == RK::Reither && fv.constant && fv.arg_types.empty() && !row_closed(row)) {
-    link_row_field_ext(f, rf_present(nullptr));
+    link_row_field_ext(f, RF_PRESENT_NONE_LIT());
   } else if (fv.kind == RK::Reither && !fv.constant && !fv.arg_types.empty() && !row_closed(row)) {
     TypeExpr* ty = fv.arg_types[0];
     link_row_field_ext(f, rf_present(ty));
