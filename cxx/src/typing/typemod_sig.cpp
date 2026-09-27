@@ -130,6 +130,7 @@ static const tt::ModuleType* transl_modtype_aux(env::t env, const pt::ModuleType
         t_arg = tt::FunctorParameter{false, id, f->param.name, arg};
         ty_arg.is_unit = false;
         ty_arg.id = id;
+        ty_arg.some_obj = id ? fresh_identity() : nullptr;
         ty_arg.mty = arg->mty_type;
       }
       const tt::ModuleType* res = transl_modtype(newenv, f->body);

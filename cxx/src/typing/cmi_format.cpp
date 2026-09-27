@@ -709,6 +709,11 @@ class Reader {
         if (!is_int(p)) {
           mt->param.is_unit = false;
           mt->param.id = opt_ptr(f(p, 0), [&](std::size_t x) { return ident(x); });
+          if (!is_int(f(p, 0))) {  // one identity per marshaled `Some` block
+            auto [ot, fresh] = some_obj_.try_emplace(f(p, 0), nullptr);
+            if (fresh) ot->second = zone().alloc(1, 1);
+            mt->param.some_obj = ot->second;
+          }
           mt->param.mty = module_type(f(p, 1));
         }
         mt->res = module_type(f(id, 1));
@@ -830,6 +835,7 @@ class Reader {
   std::unordered_map<std::size_t, Ident::t> ident_;
   std::unordered_map<std::size_t, Path::t> path_;
   std::unordered_map<std::size_t, const void*> uid_obj_;
+  std::unordered_map<std::size_t, const void*> some_obj_;
   std::unordered_map<std::size_t, const Position*> pos_;
   std::unordered_map<std::size_t, const Location*> loc_;
   std::unordered_map<std::size_t, const void*> repr_obj_;
@@ -861,6 +867,15 @@ class Writer {
     return it->second;
   }
   V some(V x) { return o::vblock(0, {std::move(x)}); }
+  // `Some x`, one block per identity token (nullptr: a fresh block)
+  template <class F>
+  V some_shared(const void* obj, F&& x) {
+    if (!obj) return some(x());
+    if (auto it = somes_.find(obj); it != somes_.end()) return it->second;
+    V v = some(x());
+    somes_[obj] = v;
+    return v;
+  }
   V none() { return o::vint(0); }
   template <class L, class F>
   V list(const L& l, F&& elt) {
@@ -1440,7 +1455,9 @@ class Writer {
         case MK::Mty_functor: {
           V param = mt->param.is_unit
                         ? i(0)
-                        : o::vblock(0, {mt->param.id ? some(ident(mt->param.id)) : none(), module_type(mt->param.mty)});
+                        : o::vblock(0, {mt->param.id ? some_shared(mt->param.some_obj, [&] { return ident(mt->param.id); })
+                                                     : none(),
+                                        module_type(mt->param.mty)});
           return {param, module_type(mt->res)};
         }
         case MK::Mty_alias: return {path(mt->path)};
@@ -1513,6 +1530,7 @@ class Writer {
   std::map<std::tuple<const void*, long, long, long>, V> poss_;
   std::map<std::tuple<const void*, const void*, bool>, V> locs_;
   std::unordered_map<const void*, V> pos_objs_, loc_objs_;
+  std::unordered_map<const void*, V> somes_;
   std::map<std::pair<const void*, const void*>, V> attr_names_;
 };
 

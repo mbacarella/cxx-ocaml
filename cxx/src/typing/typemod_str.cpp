@@ -500,6 +500,7 @@ static Typed type_module_aux(bool alias, bool strengthen, bool funct_body, Path:
         t_arg = tt::FunctorParameter{false, id, f->param.name, mty};
         ty_arg.is_unit = false;
         ty_arg.id = id;
+        ty_arg.some_obj = id ? fresh_identity() : nullptr;
         ty_arg.mty = mty->mty_type;
         funct_body2 = true;
       }

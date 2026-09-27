@@ -46,11 +46,12 @@ const lz::Modtype* strengthen_lazy(bool aliasable, env::t env, const lz::Modtype
     if (param) {
       env2 = env::add_module_lazy(false, param, ModulePresence::Mp_present, mty->param.mty, env);
     } else {
-      param = Ident::create_scoped(path::scope(p), "Arg");
+      param = Ident::create_scoped(path::scope(p), OCAML_LIT("Arg"));
     }
     auto* r = make<lz::Modtype>(MK::MtyL_functor);
     r->param.is_unit = false;
     r->param.id = param;
+    r->param.some_obj = fresh_identity();  // Named (Some param, arg): a new block
     r->param.mty = mty->param.mty;
     r->res = strengthen_lazy(false, env2, mty->res, Path::papply(p, Path::pident(param)));
     return r;

@@ -440,6 +440,10 @@ struct ModuleType;
 struct FunctorParameter {  // Unit | Named of Ident.t option * module_type
   bool is_unit = true;
   Ident::t id = nullptr;  // Named: nullptr = None
+  // the `Some id` block's identity: fresh where the compiler builds a new
+  // one (Typemod, Mtype.strengthen, Subst's renaming), kept where it passes
+  // the option on (Subst.Lazy, nondep); nullptr = none recorded
+  const void* some_obj = nullptr;
   const ModuleType* mty = nullptr;
 };
 

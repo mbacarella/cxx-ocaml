@@ -575,7 +575,7 @@ const tt::Expression* type_argument_x(Explanation explanation, Recarg recarg, en
   }
   if (args.empty()) return texp;
   // eta-expand to avoid side effects
-  auto [eta_pat, eta_var] = var_pair(env, "eta", ty_arg);
+  auto [eta_pat, eta_var] = var_pair(env, OCAML_LIT("eta"), ty_arg);
   auto func = [&, eta_pat = eta_pat, eta_var = eta_var](const tt::Expression* texp1) {
     std::vector<tt::LabeledArg> a2 = args;
     a2.push_back({ArgLabel::nolabel(), tt::ApplyArg{false, eta_var}});
@@ -599,7 +599,7 @@ const tt::Expression* type_argument_x(Explanation explanation, Recarg recarg, en
   };
   // (the Eliminated_optional_arguments warning is not emitted)
   // let-expand to have side effects
-  auto [let_pat, let_var] = var_pair(env, "arg", texp->exp_type);
+  auto [let_pat, let_var] = var_pair(env, OCAML_LIT("arg"), texp->exp_type);
   auto* vb = make<tt::ValueBinding>(let_pat, texp, tt::RecursiveBindingKind::Dynamic, tt::Attributes{},
                                     location::none());
   std::vector<const tt::ValueBinding*> vbs{vb};

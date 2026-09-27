@@ -667,6 +667,7 @@ const Modtype* of_modtype(const ModuleType* m) {
         r->res = of_modtype(m->res);
         r->param.is_unit = false;
         r->param.id = m->param.id;
+        r->param.some_obj = m->param.some_obj;
         r->param.mty = of_modtype(m->param.mty);
       }
       return r;
@@ -750,6 +751,7 @@ const Modtype* modtype(Scoping sc, subst::t s, const Modtype* m) {
         r->res = modtype(sc, add_module(m->param.id, Path::pident(id2), s), m->res);
         r->param.is_unit = false;
         r->param.id = id2;
+        r->param.some_obj = fresh_identity();
         r->param.mty = modtype(sc, s, m->param.mty);
       }
       return r;
@@ -796,6 +798,7 @@ const ModuleType* force_modtype(const Modtype* m) {
       if (!m->param.is_unit) {
         r->param.is_unit = false;
         r->param.id = m->param.id;
+        r->param.some_obj = m->param.some_obj;
         r->param.mty = force_modtype(m->param.mty);
       }
       r->res = force_modtype(m->res);

@@ -931,6 +931,7 @@ static const ModuleType* approx_modtype_(env::t env, const pt::ModuleType* smty)
           auto [id, e2] = env::enter_module(static_cast<int>(scope), f->param.name.txt.v, ModulePresence::Mp_present,
                                             rarg, env, true);
           param.id = id;
+          param.some_obj = fresh_identity();
           newenv = e2;
         }
       }
