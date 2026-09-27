@@ -1,6 +1,8 @@
 // Port of utils/config.mli's driver-facing part (see config.hpp).
 #include "cppcaml/typing/config.hpp"
 
+#include <unistd.h>
+
 #include <iostream>
 
 namespace cppcaml::typing::config {
@@ -18,6 +20,29 @@ const Var kVars[] = {
 std::string standard_library_default;
 std::string standard_library;
 std::string interface_suffix = ".mli";
+
+std::string target_bindir() {
+  if (target_bindir_raw != ".") return target_bindir_raw;
+  // Filename.dirname Sys.executable_name
+  char buf[4096];
+  ssize_t n = ::readlink("/proc/self/exe", buf, sizeof buf - 1);
+  if (n <= 0) return ".";
+  std::string exe(buf, static_cast<std::size_t>(n));
+  std::size_t slash = exe.rfind('/');
+  return slash == std::string::npos ? "." : slash == 0 ? "/" : exe.substr(0, slash);
+}
+
+LaunchMethod launch_method() {
+  if (launch_method_raw == "exe") return {LaunchMethod::K::Executable, std::nullopt};
+  if (launch_method_raw == "sh") return {LaunchMethod::K::Shebang, std::nullopt};
+  return {LaunchMethod::K::Shebang, launch_method_raw};
+}
+
+SearchMethod search_method() {
+  if (search_method_raw == "enable") return SearchMethod::Enable;
+  if (search_method_raw == "fallback") return SearchMethod::Fallback;
+  return SearchMethod::Disable;
+}
 
 const std::string& version() {
   static const std::string v = [] {

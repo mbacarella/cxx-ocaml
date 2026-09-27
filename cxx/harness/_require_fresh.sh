@@ -12,7 +12,7 @@
 #
 # Usage (source, then call with the ninja target(s) the harness needs):
 #     source "$(dirname "${BASH_SOURCE[0]}")/_require_fresh.sh"
-#     require_fresh c++ocamlc c++link
+#     require_fresh c++ocamlc
 #
 # Escape hatch: CPPCAML_SKIP_FRESH=1 skips the check (e.g. bisecting a
 # hand-built binary).  It prints a loud warning so a skip is never silent.

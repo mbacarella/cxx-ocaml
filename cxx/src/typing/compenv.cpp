@@ -8,6 +8,7 @@
 #include <iostream>
 #include <sstream>
 
+#include "cppcaml/typing/ccomp.hpp"
 #include "cppcaml/typing/config.hpp"
 #include "cppcaml/typing/format.hpp"
 #include "cppcaml/typing/location.hpp"
@@ -577,8 +578,10 @@ void process_action(const ActionContext& ctx, const DeferredAction& action) {
     case K::ProcessCFile: {
       readenv(Position::Before_compile, action.name);
       location::input_name = action.name;
-      // Ccomp.compile_file: c++ocamlc does not drive a C compiler
-      fatal("c++ocamlc: compiling C files (" + action.name + ") is not supported yet");
+      std::string obj_name = cf::output_name ? *cf::output_name : c_object_of_filename(action.name);
+      if (ccomp::compile_file(action.name, cf::output_name) != 0) throw ExitWithStatus{2};
+      cf::ccobjs.insert(cf::ccobjs.begin(), obj_name);
+      break;
     }
     case K::ProcessObjects:
       cf::ccobjs.insert(cf::ccobjs.begin(), action.names.begin(), action.names.end());

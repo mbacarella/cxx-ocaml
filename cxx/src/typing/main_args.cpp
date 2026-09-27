@@ -277,13 +277,23 @@ std::map<std::string, arg::Spec> actions() {
   a["-use-runtime"] = string([](const std::string& s) { cf::use_runtime = s; });
   a["-use_runtime"] = string([](const std::string& s) { cf::use_runtime = s; });
   a["-launch-method"] = string([](const std::string& s0) {
-    std::string s = s0;
-    std::size_t sp = s.find(' ');
-    if (sp != std::string::npos) s = s.substr(0, sp);  // (target_bindir: the rest)
-    if (s == "exe" || s == "sh" || (!s.empty() && s[0] == '/')) cf::launch_method_set = true;
+    std::string setting = s0;
+    std::size_t sp = s0.find(' ');  // Misc.cut_at s ' '
+    if (sp != std::string::npos) {
+      setting = s0.substr(0, sp);
+      cf::target_bindir = s0.substr(sp + 1);
+    }
+    if (setting == "exe") cf::launch_method = config::LaunchMethod{config::LaunchMethod::K::Executable, std::nullopt};
+    else if (setting == "sh") cf::launch_method = config::LaunchMethod{config::LaunchMethod::K::Shebang, std::nullopt};
+    else if (!setting.empty() && setting[0] == '/')
+      cf::launch_method = config::LaunchMethod{config::LaunchMethod::K::Shebang, setting};
     else compenv::fatal("-launch-method: expect sh, exe or an absolute path for <method>");
   });
-  a["-runtime-search"] = symbol([](const std::string& s) { cf::search_method_set = s != "disable"; });
+  a["-runtime-search"] = symbol([](const std::string& s) {
+    cf::search_method = s == "enable"     ? config::SearchMethod::Enable
+                        : s == "fallback" ? config::SearchMethod::Fallback
+                                          : config::SearchMethod::Disable;
+  });
   a["-v"] = unit([] { compenv::print_version_and_library("compiler"); });
   a["-vmthread"] = unit([] {
     compenv::fatal(
@@ -333,27 +343,11 @@ std::string unsupported_compile_option() {
 }
 
 std::string unsupported_link_option() {
-  if (cf::make_runtime) return "-make-runtime";
-  if (cf::output_complete_executable) return "-output-complete-exe";
-  if (cf::output_complete_object) return "-output-complete-obj";
-  if (cf::output_c_object) return "-output-obj";
-  if (cf::custom_runtime) return "-custom";
-  if (!cf::dllibs.empty()) return "-dllib";
-  if (!cf::dllpaths.empty()) return "-dllpath";
-  if (!cf::ccobjs.empty()) return "-cclib";
-  if (cf::bytecode_hints) return "-bytecode-hints";
-  if (cf::launch_method_set) return "-launch-method";
-  if (cf::search_method_set) return "-runtime-search";
-  if (cf::standard_library_default_override) return "-set-runtime-default";
   if (cf::profile) return requested_profile.empty() ? "-dtimings" : requested_profile.front();
   return "";
 }
 
 std::string unsupported_archive_option() {
-  if (cf::custom_runtime) return "-custom";
-  if (!cf::ccobjs.empty()) return "-cclib";
-  if (!cf::all_ccopts.empty()) return "-ccopt";
-  if (!cf::dllibs.empty()) return "-dllib";
   if (cf::profile) return requested_profile.empty() ? "-dtimings" : requested_profile.front();
   return "";
 }

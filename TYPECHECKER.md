@@ -109,31 +109,45 @@ ocamlc).
   `-without-runtime` `-v` `-version` `-vnum` `-where` `-vmthread` `-w`
   `-warn-error` `-warn-help` `-args` `-args0` `-` `--`, the typing flags,
   and OCAMLPARAM (all of `read_one_param`; the native-only settings parsed
-  and checked, then unused).  `-a` copies each unit's debug and hint
-  sections and keeps what the unit descriptor shared (byte-identical .cma).
+  and checked, then unused).
+- **The linker and the librarian** are ports of `bytecomp/`'s Bytelink,
+  Symtable, Bytelibrarian, Dll (its link-time primitive check reads the
+  stub DLLs' dynamic symbols with `utils/binutils.ml`'s port) and
+  `utils/`'s Ccomp and Linkdeps (`typing/bytelink.cpp` & co.; the legacy
+  `link.cpp` / `c++link` are gone): the executable's launcher header
+  (`runtime-launch-info`, `-launch-method`, `-runtime-search`,
+  `-use-runtime`, `-runtime-variant`, `-with/-without-runtime`), its
+  sections (CODE DLPT DLLS PRIM DATA OSLD SYMB CRCS DBUG HINT, `-dllpath`,
+  `-dllib` / `-dllib-suffixed`, `-set-runtime-default`,
+  `-bytecode-hints`), `-custom` / `-make-runtime` / `-output-obj` /
+  `-output-complete-obj` / `-output-complete-exe` through the C compiler
+  and linker (`-cc`, `-ccopt`, `-cclib`, `-dcamlprimc`, `.c` / `.o` / `.a` /
+  `.so` inputs, `-verbose`), `-use-prims`, `-no-check-prims`, `-linkall`,
+  `-noautolink`, and `-a`'s .cma with its C objects, options and DLLs
+  (`lib_ccobjs` / `lib_ccopts` / `lib_dllibs` / `lib_custom`; each unit's
+  debug and hint sections copied, the descriptors' sharing kept).
+  `cxx/harness/link_parity.sh` links a battery with both compilers in the
+  same directory: 46 cases byte-identical (executables, .cma, the generated
+  C file, `-dcamlprimc`'s C, `-make-runtime`, the link errors) and 6 whose
+  C-toolchain binaries ocamlc.opt itself does not reproduce (temporary
+  file names reach them) compared on behaviour; the C-toolchain cases need
+  an installed stdlib (`INST=`).
 - **Accepted, no effect to reproduce**: `-bin-annot-occurrences` (the
   .cmt's cmt_ident_occurrences stay [] -- Shape_reduce's occurrence
-  resolution is not ported), `-cc` (no C compilation takes place otherwise), `-dcamlprimc` (only with
-  `-custom`), `-dno-canonical-ids`, `-dparsetree-loc-ghost-invariants`,
-  `-no-check-prims` / `-use-prims` (c++ocamlc's linker checks no
-  primitives), `-safe-string`.
+  resolution is not ported), `-dno-canonical-ids`,
+  `-dparsetree-loc-ghost-invariants`, `-safe-string`.
 - **Refused where their effect would take place** (`option -X is not
   supported yet`, exit 2): when compiling a unit, `-annot` / `-dtypes`,
   `-ppx`, `-dsource`, `-dtypedtree`, `-dshape`, `-dmatchcomp`,
-  `-dcanonical-ids`, `-compat-32`, `-dtimings` / `-dprofile`; when linking,
-  `-custom`, `-output-obj`, `-output-complete-obj`, `-output-complete-exe`,
-  `-make-runtime`, `-dllib` / `-dllib-suffixed`, `-dllpath`, `-cclib` / C
-  object inputs, `-bytecode-hints`, `-launch-method`, `-runtime-search`,
-  `-set-runtime-default`; when building a library, `-custom`, `-cclib`,
-  `-ccopt`, `-dllib`; `.c` inputs; `-depend`.  (`cli_parity.sh` checks the
-  refusals too.)
+  `-dcanonical-ids`, `-compat-32`, `-dtimings` / `-dprofile`; when linking or
+  building a library, `-dtimings` / `-dprofile`; `-depend`.
+  (`cli_parity.sh` checks the refusals too.)
 - c++ocamlc's own: `-stdlib <dir>` (Config.standard_library, undocumented:
   the bootstrap harnesses build against a stdlib being built).
 - Development switches (environment, not ocamlc's): `CPPCAML_PROFILE=1`
   (phase timers on stderr; `cxx/harness/bench.sh PHASES=1` sums them),
   `CPPCAML_TYPECHECK_DEBUG=1` / `CPPCAML_REPORT_DEBUG=1` (the details of an
   internal failure / of an error reporter that raised),
-  `CPPCAML_LINKMAP=1` (a `.linkmap` sidecar next to a linked program),
   `CPPCAML_NO_FASTEXIT=1` (tear the process down normally instead of
   `_exit`, e.g. for leak checkers).
 

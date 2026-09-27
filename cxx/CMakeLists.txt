@@ -21,7 +21,6 @@ add_library(cppcaml_core
   src/marshal.cpp
   src/blake2.cpp
   src/omarshal.cpp
-  src/link.cpp
   # The typing/ port (TYPECHECKER.md).
   src/typing/ident.cpp
   src/typing/path.cpp
@@ -115,6 +114,16 @@ add_library(cppcaml_core
   src/typing/compenv.cpp
   src/typing/main_args.cpp
   src/typing/bytepackager.cpp
+  src/typing/filename.cpp
+  src/typing/linkdeps.cpp
+  src/typing/bytesections.cpp
+  src/typing/binutils.cpp
+  src/typing/dll.cpp
+  src/typing/ccomp.cpp
+  src/typing/cmo_format.cpp
+  src/typing/symtable.cpp
+  src/typing/bytelink.cpp
+  src/typing/bytelibrarian.cpp
   src/typing/typemod_sig.cpp
   src/typing/typemod_str.cpp
   src/typing/typemod_unit.cpp
@@ -166,9 +175,6 @@ target_link_libraries(c++lex PRIVATE cppcaml_core)
 
 add_executable(c++parse src/tools/cppparse_main.cpp)
 target_link_libraries(c++parse PRIVATE cppcaml_core)
-
-add_executable(c++link src/tools/cpplink_main.cpp)
-target_link_libraries(c++link PRIVATE cppcaml_core)
 
 add_executable(c++ocamlc src/tools/cppocamlc_main.cpp)
 target_link_libraries(c++ocamlc PRIVATE cppcaml_core)

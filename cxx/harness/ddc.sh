@@ -30,17 +30,17 @@ set -o pipefail                       # FOOTGUN 1: never let a pipe hide a rc
 SELF="$(readlink -f "$0")"
 cd "$(dirname "$SELF")/../.." || exit 1
 ROOT=$PWD
-source cxx/harness/_require_fresh.sh; require_fresh c++ocamlc c++link
+source cxx/harness/_require_fresh.sh; require_fresh c++ocamlc
 RUN=$ROOT/runtime/ocamlrun
 OPT=$ROOT/ocamlc.opt
-LINK=$ROOT/cxx/build/c++link
+CPPC=$ROOT/cxx/build/c++ocamlc   # links too (-nopervasives -use-runtime)
 DEPSORT=$ROOT/tools/ocamldep.opt
 BOOTSTRAP=$ROOT/cxx/harness/ocamlc_bootstrap.sh
 FLAGS="-strict-sequence -strict-formats -w +a-4-9-40-41-42-44-45-48-70"
 
 die() { echo "FATAL: $*" >&2; exit 1; }
 
-for t in "$OPT" "$LINK" "$DEPSORT" "$RUN"; do [ -x "$t" ] || die "missing tool: $t"; done
+for t in "$OPT" "$CPPC" "$DEPSORT" "$RUN"; do [ -x "$t" ] || die "missing tool: $t"; done
 
 # ---------------------------------------------------------------------------
 # 0. Obtain S1 = the bytecode ocamlc built by c++ocamlc (a KEEP=1 bootstrap WD).
@@ -117,7 +117,7 @@ for f in "$WD"/*.cmo; do bb=$(basename "$f"); [ -f "$S2/$bb" ] || cp "$f" "$S2/$
 cp "$WD/std_exit.cmo" "$WD/runtime-launch-info" "$WD/stdlib.cma" "$S2"/ 2>/dev/null
 stdobjs=""; for m in $STDORDER; do o="$S2/$(gname "$m").cmo"; [ -f "$o" ] && stdobjs="$stdobjs $o"; done
 clobjs="";  for n in $(cat "$WD/.cl_order"); do clobjs="$clobjs $S2/$n.cmo"; done
-"$LINK" -nostdlib -runtime "$RUN" $stdobjs $clobjs "$S2/std_exit.cmo" -o "$S2/ocamlc" 2>"$S2/lerr" \
+"$CPPC" -nopervasives -use-runtime "$RUN" -I "$S2" $stdobjs $clobjs "$S2/std_exit.cmo" -o "$S2/ocamlc" 2>"$S2/lerr" \
   || { sed 's/^/  /' "$S2/lerr" | head; die "S2 link failed"; }
 # smoke S2
 echo 'let()=print_string"ok\n"' > "$S2/smoke.ml"
