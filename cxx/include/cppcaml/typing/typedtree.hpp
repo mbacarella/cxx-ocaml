@@ -609,6 +609,9 @@ struct FunctorParameter {  // Unit | Named of Ident.t option * string option loc
   Ident::t id = nullptr;  // option
   OptStrLoc name;
   const ModuleType* mty = nullptr;
+  // the `Some id` block's identity: Typemod's one option value, which the
+  // Types.Named of the module type holds too (types.hpp's some_obj)
+  const void* some_obj = nullptr;
 };
 struct ModuleExprDesc {
   enum class Kind : std::uint8_t {

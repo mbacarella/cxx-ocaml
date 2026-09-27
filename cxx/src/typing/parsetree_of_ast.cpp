@@ -947,10 +947,17 @@ struct Conv {
   const WithConstraint* with_constraint(const ast::WithConstraint& w) const {
     using K = WithConstraint::Kind;
     WithConstraint* r = make<WithConstraint>(K::Pwith_type);
+    // Type.mk (loc_last lid): the declaration's name is the longident's
+    // last component and its location record
+    auto loc_last = [](const WithConstraint* c, const TypeDeclaration* d) {
+      auto* d2 = make<TypeDeclaration>(*d);
+      d2->ptype_name = StrLoc{c->lid.txt->s, c->lid.loc};
+      return d2;
+    };
     if (auto* p = std::get_if<ast::Pwith_type>(&w)) {
-      r->kind = K::Pwith_type; r->lid = lidloc(p->lid); r->decl = type_declaration(*p->td);
+      r->kind = K::Pwith_type; r->lid = lidloc(p->lid); r->decl = loc_last(r, type_declaration(*p->td));
     } else if (auto* p = std::get_if<ast::Pwith_typesubst>(&w)) {
-      r->kind = K::Pwith_typesubst; r->lid = lidloc(p->lid); r->decl = type_declaration(*p->td);
+      r->kind = K::Pwith_typesubst; r->lid = lidloc(p->lid); r->decl = loc_last(r, type_declaration(*p->td));
     } else if (auto* p = std::get_if<ast::Pwith_module>(&w)) {
       r->kind = K::Pwith_module; r->lid = lidloc(p->lid1); r->lid2 = lidloc(p->lid2);
     } else if (auto* p = std::get_if<ast::Pwith_modsubst>(&w)) {

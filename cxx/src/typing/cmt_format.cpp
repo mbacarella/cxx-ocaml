@@ -835,8 +835,11 @@ class TreeWriter {
 
   // ---- declarations ----
   V type_param(const tt::TypeParam& p) {  // tuple2 (typ) id: right to left
-    V vi = o::vblock(0, {w_.i(static_cast<long>(p.variance)), w_.i(static_cast<long>(p.injectivity))});
-    return o::vblock(0, {typ(p.ty), vi});
+    // the (variance, injectivity) pair: parser.mly's type_variance returns
+    // literal tuples, static constants (one per value)
+    auto [it, fresh] = var_inj_.try_emplace(std::make_pair(static_cast<int>(p.variance), static_cast<int>(p.injectivity)), nullptr);
+    if (fresh) it->second = o::vblock(0, {w_.i(static_cast<long>(p.variance)), w_.i(static_cast<long>(p.injectivity))});
+    return o::vblock(0, {typ(p.ty), it->second});
   }
   V type_params(const Slice<tt::TypeParam>& ps) {
     std::vector<V> xs;
@@ -1009,7 +1012,8 @@ class TreeWriter {
   V functor_parameter(const tt::FunctorParameter& p) {
     if (p.is_unit) return w_.i(0);
     V mt = module_type(p.mty);
-    return o::vblock(0, {ident_opt(p.id), opt_str_loc(p.name), mt});
+    V id = p.id ? w_.some_shared(p.some_obj, [&] { return w_.ident(p.id); }) : w_.none();
+    return o::vblock(0, {id, opt_str_loc(p.name), mt});
   }
   V module_expr(const tt::ModuleExpr* m) {
     V l = loc(m->mod_loc);
@@ -1596,6 +1600,7 @@ class TreeWriter {
   V empty_tbl_;
   std::unordered_map<const void*, V> memo_;
   std::unordered_map<const void*, V> decls_;
+  std::map<std::pair<int, int>, V> var_inj_;
 };
 
 // ---- index_declarations: Tast_iterator's walk, calling item_declaration --------

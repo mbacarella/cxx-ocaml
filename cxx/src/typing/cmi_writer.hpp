@@ -717,7 +717,15 @@ class Writer {
               variances(cd->clty_variance), loc(cd->clty_loc), attributes(cd->clty_attributes), uid(cd->clty_uid)};
     });
   }
+  // one value per signature item: an item is one object in every list
+  // holding it (a structure's str_type and an include's incl_type ...)
   V sig_item(const SignatureItem* it) {
+    if (auto m = sig_items_.find(it); m != sig_items_.end()) return m->second;
+    V v = sig_item_(it);
+    sig_items_[it] = v;
+    return v;
+  }
+  V sig_item_(const SignatureItem* it) {
     using SK = SignatureItem::Kind;
     V vis = i(it->vis == Visibility::Exported ? 0 : 1);
     V rec = i(static_cast<long>(it->rec));
@@ -755,6 +763,7 @@ class Writer {
   std::unordered_map<const void*, V> somes_;
   std::unordered_map<const void*, V> val_prims_;
   std::unordered_map<const void*, V> prim_descs_;
+  std::unordered_map<const void*, V> sig_items_;
   std::unordered_map<const void*, V> by_obj_;
   std::map<std::pair<const void*, const void*>, V> attr_names_;
 };
