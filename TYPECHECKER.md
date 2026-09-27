@@ -153,11 +153,29 @@ writer is the .cmi Writer and the -g EventWriter (`typing/cmi_writer.hpp`).
 Typedecl's type and extension shapes, recursive modules' `Shape.var`
 shapes, and location records' identity (one per parser location, kept by
 the typer's copies) came with it.  `cxx/harness/cmt_parity.sh` compares
-with ocamlc.opt (both invoked through one path, in one directory):
-contents identical (`cmt/cmtdump.ml`: every field, the typed tree through
-Printtyped) on the stamp probes but the two .cmi leftovers; bytes (Marshal's
-sharing) on a growing share.  Not ported: `-bin-annot-occurrences`' index,
-the partial .cmt of a failed compilation (written with no parts).
+with ocamlc.opt (both invoked through one path, in one directory; SAME =
+bytes, SHARING = contents (`cmt/cmtdump.ml`: every field, the typed tree
+through Printtyped) but not Marshal's sharing or type ids):
+- stdlib (`--stdlib`, stdlib/Makefile's flags incl. -g, -pp): 72/72 SAME;
+- compiler sources (`--compiler`, the Makefile's OC_COMMON_COMPFLAGS):
+  138/145 SAME, 7 SHARING;
+- testsuite .ml: 1747/1853 SAME, 39 SHARING, 3 DIFF (a constraint
+  attribute on a let-bound pattern, twice; one .cmi digest), 64 with no
+  .cmt on either side (parse errors); testsuite .mli: 73/87 SAME, 1 SHARING;
+- stamp probes: 6457/6531 SAME, 72 SHARING, 2 DIFF (the .cmi leftovers);
+- packs (`BIN_ANNOT=1 pack_parity.sh`: the members' and the pack's .cmt,
+  Cmt_format.Packed): 24/24 SAME.
+A failed implementation writes the partial .cmt: Cmt_format's saved types
+(typecore's re / rp / rcp, typeclass's rc, typemod's mkmty / mksig and
+Typing_recovery_state.with_saved_types around type_expect,
+transl_signature, type_structure and each structure item), mapped and
+indexed part by part.  Identity tokens that carry Marshal's sharing:
+declarations' `Some` blocks (types.hpp `SomeToken`), shapes' uid options,
+location records (docstrings' ds_loc, puns' one record, ghost copies as
+records of their own), parser.mly / lexer.mll / typecore.ml literals, the
+unit's name string (`uid::unit_name_string`).  Not ported:
+`-bin-annot-occurrences`' index (cmt_ident_occurrences is []), typing
+recovery (`-typing-recovery`).
 
 ## What counts as progress
 

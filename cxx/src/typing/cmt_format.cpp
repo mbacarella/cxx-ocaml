@@ -480,7 +480,10 @@ class TreeWriter {
     return o::vlist(xs);
   }
   V apply_arg(const tt::ApplyArg& a) {
-    if (a.omitted) return o::vblock(1, {w_.i(0)});  // Omitted ()
+    if (a.omitted) {  // Omitted (): a static constant, one block
+      if (!omitted_) omitted_ = o::vblock(1, {w_.i(0)});
+      return omitted_;
+    }
     return o::vblock(0, {expr(a.arg)});
   }
   V labeled_args(const Slice<tt::LabeledArg>& args) {
@@ -1571,6 +1574,7 @@ class TreeWriter {
     }
     return w_.i(0);
   }
+  V omitted_;
   // the value written for an item declaration node
   V decl(const void* node) const {
     auto it = decls_.find(node);
