@@ -163,9 +163,15 @@ std::pair<std::vector<Ret>, tt::Partial> map_half_typed_cases(
                 std::vector<PatternVariable> cont_vars, pvs;
                 for (auto& pv : htc.pat_vars)
                   (pv.pv_kind == PatternVariableKind::Continuation_var ? cont_vars : pvs).push_back(pv);
-                env::t when_env = add_pattern_variables(ext_env, pvs);
+                env::CheckFn check = [](std::string s) {
+                  return warnings::Warning::with_s(warnings::Warning::K::Unused_var_strict, s);
+                };
+                env::CheckFn check_as = [](std::string s) {
+                  return warnings::Warning::with_s(warnings::Warning::K::Unused_var, s);
+                };
+                env::t when_env = add_pattern_variables(ext_env, pvs, check, check_as);
                 when_env = add_module_variables(when_env, htc.module_vars);
-                env::t ext_env2 = add_pattern_variables(when_env, cont_vars);
+                env::t ext_env2 = add_pattern_variables(when_env, cont_vars, check, check_as);
                 // Take a generic copy of [ty_res] again to allow propagation
                 // of type information from preceding branches
                 TypeExpr* ty_expected = htc.contains_gadt && !clflags::principal ? ctype::duplicate_type(pr.ty_res)

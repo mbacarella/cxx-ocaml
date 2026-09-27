@@ -117,14 +117,15 @@ static const pt::Pexp_pack* extract_packing(const pt::Expression* sarg) {
   return as<pt::Pexp_pack>(sarg->pexp_desc);
 }
 
-static UntypedArg collect_arrow_arg(const ArgLabel& l, const tt::Expression*, bool optional,
-                                    const std::vector<std::pair<ArgLabel, const pt::Expression*>>& sargs,
+using MayWarn = std::function<void(const Location&, const warnings::Warning&)>;
+static UntypedArg collect_arrow_arg(const MayWarn& may_warn, const ArgLabel& l, const tt::Expression* funct,
+                                    bool optional, const std::vector<std::pair<ArgLabel, const pt::Expression*>>& sargs,
                                     TypeExpr* ty_arg, TypeExpr* ty_arg0, long lv,
                                     const std::optional<std::pair<const pt::Expression*, ArgLabel>>& arg_opt) {
-  // (the -principal warnings are not emitted)
   using UK = UntypedApplyArg::Kind;
   if (arg_opt) {
     bool wrapped_in_some = optional && !is_optional(arg_opt->second);
+    if (wrapped_in_some) may_warn(arg_opt->first->pexp_loc, not_principal("using an optional argument here"));
     UntypedApplyArg a{UK::Known_arg, arg_opt->first, ty_arg, ty_arg0, wrapped_in_some};
     return UntypedArg{l, false, a};
   }
@@ -132,11 +133,13 @@ static UntypedArg collect_arrow_arg(const ArgLabel& l, const tt::Expression*, bo
   for (auto& s : sargs)
     if (s.first.kind == ArgLabel::Kind::Nolabel) has_nolabel = true;
   if (optional && has_nolabel) {
+    may_warn(funct->exp_loc, warnings::Warning::with_s(WK::Non_principal_labels, "eliminated optional argument"));
     UntypedApplyArg a{UK::Eliminated_optional_arg, nullptr, ty_arg};
     a.level = lv;
     return UntypedArg{l, false, a};
   }
   // No argument was given for this parameter, we abstract over it.
+  may_warn(funct->exp_loc, warnings::Warning::with_s(WK::Non_principal_labels, "commuted an argument"));
   UntypedApplyArg a{UK::Eliminated_optional_arg, nullptr, ty_arg};
   a.level = lv;
   return UntypedArg{l, true, a};
@@ -217,7 +220,9 @@ static CollectedArgs collect_unknown_apply_args(env::t env, const tt::Expression
       TypeExpr* ta = ctype::newvar();
       TypeExpr* ty_param = ctype::newmono(ta);
       TypeExpr* tr = ctype::newvar();
-      // (Ignored_extra_argument warning not emitted)
+      // (-typing-recovery is never on in batch ocamlc)
+      if (get_level(tf) >= get_level(ty_param) && !is_prim("%identity", funct))
+        prerr_warning(sarg->pexp_loc, WK::Ignored_extra_argument);
       ctype::unify(env, tf, ctype::newty(tarrow(lbl, ty_param, tr, commu_var())));
       arg_kind = Arrow;
       ty_arg = ta;
@@ -292,11 +297,17 @@ CollectedArgs collect_apply_args(env::t env, const tt::Expression* funct, bool i
   TypeSet visited;
   std::vector<UntypedArg> rev_args;
   std::vector<std::pair<ArgLabel, const pt::Expression*>> sargs = sargs0;
+  bool warned = false;
   for (;;) {
     if (sargs.empty()) return collect_unknown_apply_args(env, funct, ty_fun0, rev_args, sargs);
     TypeExpr* ty_fun2 = ctype::expand_head(env, ty_fun);
     long lv = get_level(ty_fun2);
-    // (the -principal warnings of may_warn are not emitted)
+    MayWarn may_warn = [&warned, lv](const Location& loc, const warnings::Warning& w) {
+      if (!warned && clflags::principal && lv != generic_level) {
+        warned = true;
+        location::prerr_warning(loc, w);
+      }
+    };
     TypeExpr* e0 = ctype::expand_head(env, ty_fun0);
     const TypeDesc* d = get_desc(ty_fun2);
     const TypeDesc* d0 = get_desc(e0);
@@ -353,7 +364,9 @@ CollectedArgs collect_apply_args(env::t env, const tt::Expression* funct, bool i
       auto x = extract_label(name, sargs);
       if (x) {
         auto& [l2, sarg, commuted, rem] = *x;
-        (void)commuted;  // (the -principal and Nonoptional_label warnings are not emitted)
+        if (commuted) may_warn(sarg->pexp_loc, not_principal("commuting this argument"));
+        if (!optional && is_optional(l2))
+          prerr_warning(sarg->pexp_loc, WK::Nonoptional_label, std::string(label_name(l)));
         remaining_sargs = rem;
         arg_opt = std::make_pair(sarg, l2);
       } else {
@@ -366,7 +379,7 @@ CollectedArgs collect_apply_args(env::t env, const tt::Expression* funct, bool i
     visited = new_visited;
     if (terminate) return collect_unknown_apply_args(env, funct, ty_fun0, rev_args, remaining_sargs);
     if (is_arrow) {
-      UntypedArg arg = collect_arrow_arg(l, funct, optional, sargs, a->t1, a0->t1, lv, arg_opt);
+      UntypedArg arg = collect_arrow_arg(may_warn, l, funct, optional, sargs, a->t1, a0->t1, lv, arg_opt);
       rev_args.insert(rev_args.begin(), arg);
       ty_fun = a->t2;
       ty_fun0 = a0->t2;
@@ -375,7 +388,7 @@ CollectedArgs collect_apply_args(env::t env, const tt::Expression* funct, bool i
     }
     ctype::Tfunctor_ tfun{f->id, f->pack, f->body};
     ctype::Tfunctor_ tfun0{f0->id, f0->pack, f0->body};
-    // (the "applying a dependent function" -principal warning is not emitted)
+    may_warn(funct->exp_loc, not_principal("applying a dependent function"));
     FunctorArg fa;
     const pt::Pexp_pack* packing = arg_opt ? extract_packing(arg_opt->first) : nullptr;
     if (arg_opt && packing) {
@@ -386,8 +399,8 @@ CollectedArgs collect_apply_args(env::t env, const tt::Expression* funct, bool i
       auto r = ctype::filter_arrow(env, true, ty_fun2, l, false);
       auto r0 = ctype::filter_arrow(env, true, ty_fun0, l, false);
       if (r.ok && r0.ok) {
-        UntypedArg arg = collect_arrow_arg(l, funct, optional, sargs, r.value.ty_param, r0.value.ty_param, lv,
-                                           arg_opt);
+        UntypedArg arg = collect_arrow_arg(may_warn, l, funct, optional, sargs, r.value.ty_param,
+                                           r0.value.ty_param, lv, arg_opt);
         fa = FunctorArg{arg, r.value.ty_ret, r0.value.ty_ret};
       } else {
         const ctype::FilterArrowFailure& er = !r.ok ? r.error : r0.error;
@@ -834,13 +847,30 @@ void check_univars(env::t env, std::string_view kind, const tt::Expression* exp,
   }
 }
 
-// [check_statement] implements the [non-unit-statement] warning (not
-// emitted); its type expansion is kept.
-void check_statement(const tt::Expression* exp) { ctype::expand_head(exp->exp_env, exp->exp_type); }
+// [check_statement] implements the [non-unit-statement] warning.
+void check_statement(const tt::Expression* exp) {
+  const TypeDesc* ty = get_desc(ctype::expand_head(exp->exp_env, exp->exp_type));
+  if (auto* c = as<Tconstr>(ty); c && path::same(c->path, predef::paths().unit)) return;
+  if (ty->kind == DescKind::Tvar) return;
+  const tt::Expression* e = exp;
+  for (;;) {
+    const tt::ExpressionDesc* d = e->exp_desc;
+    if (d->kind == XK::Texp_let) e = as<tt::Texp_let>(d)->body;
+    else if (d->kind == XK::Texp_sequence) e = as<tt::Texp_sequence>(d)->e2;
+    else if (d->kind == XK::Texp_struct_item) e = as<tt::Texp_struct_item>(d)->body;
+    else break;
+  }
+  Location loc = e->exp_loc;
+  for (auto& x : e->exp_extra)
+    if (x.extra.kind == tt::ExpExtra::Kind::Texp_constraint) {
+      loc = x.loc;
+      break;
+    }
+  prerr_warning(loc, WK::Non_unit_statement);
+}
 
 // [check_partial_application] implements the [ignored-partial-application]
-// warning (not emitted): the type expansions it performs, and the delayed
-// check it schedules, are kept.
+// warning (and if [statement] is [true], also [non-unit-statement]).
 void check_partial_application(bool statement, const tt::Expression* exp) {
   auto check_statement_ = [=] {
     if (statement) check_statement(exp);
@@ -885,7 +915,7 @@ void check_partial_application(bool statement, const tt::Expression* exp) {
           case XK::Texp_apply:
           case XK::Texp_send:
           case XK::Texp_new:
-          case XK::Texp_letop: return;  // (Ignored_partial_application warning)
+          case XK::Texp_letop: prerr_warning(e->exp_loc, WK::Ignored_partial_application); return;
           default: check_statement_(); return;
         }
       };

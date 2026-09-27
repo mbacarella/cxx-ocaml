@@ -40,7 +40,8 @@ ClassArgPatternResult type_class_arg_pattern(std::string_view cl_num, env::t val
     ivar.ivar_mut = MutableFlag::Immutable;
     ivar.ivar_name = zborrow(cl_num);
     auto* d2 = make<ValueDescription>(v.pv_type, ivar, v.pv_loc, pt::types_attributes(v.pv_attributes), val_uid);
-    met_env = env::add_value(id2, d2, met_env);
+    WK wk = v.pv_kind == PatternVariableKind::As_var ? WK::Unused_var : WK::Unused_var_strict;
+    met_env = env::add_value(id2, d2, met_env, [wk](std::string s) { return warnings::Warning::with_s(wk, s); });
     pv.insert(pv.begin(), ClassArgPatternVar{id2, v.pv_id, v.pv_type});
   }
   return {pat, pv, val_env, met_env};

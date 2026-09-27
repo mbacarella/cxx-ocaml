@@ -8,12 +8,37 @@
 #include "cppcaml/typing/builtin_attributes.hpp"
 #include "cppcaml/typing/clflags.hpp"
 #include "cppcaml/typing/datarepr.hpp"
+#include "cppcaml/typing/location.hpp"
+#include "cppcaml/typing/misc.hpp"
+#include "cppcaml/typing/printtyp.hpp"
+#include "cppcaml/typing/warnings.hpp"
 #include "cppcaml/typing/ocaml_list.hpp"
 #include "cppcaml/typing/predef.hpp"
 #include "cppcaml/typing/typecore.hpp"
 #include "cppcaml/typing/typing_recovery.hpp"
 
 namespace cppcaml::typing::typecore {
+
+// ---- warnings ----
+using WK = warnings::Warning::K;
+inline void prerr_warning(const Location& loc, const warnings::Warning& w) { location::prerr_warning(loc, w); }
+inline void prerr_warning(const Location& loc, WK k) { location::prerr_warning(loc, warnings::Warning::make(k)); }
+inline void prerr_warning(const Location& loc, WK k, std::string s) {
+  location::prerr_warning(loc, warnings::Warning::with_s(k, std::move(s)));
+}
+// not_principal fmt: Warnings.Not_principal of the format's document
+template <class... Args>
+warnings::Warning not_principal(std::string_view fmt, Args&&... args) {
+  warnings::Warning w = warnings::Warning::make(WK::Not_principal);
+  w.doc = format_doc::doc_printf(fmt, std::forward<Args>(args)...);
+  return w;
+}
+// Style.as_inline_code Printtyp.Doc.type_expr, as a %a argument
+inline auto inline_type_expr(TypeExpr* ty) {
+  return [ty](format_doc::Formatter& ppf) {
+    misc::style::as_inline_code([](format_doc::Formatter& f, TypeExpr* t) { printtyp::type_expr(f, t); }, ppf, ty);
+  };
+}
 
 using EK = Error::Kind;
 
@@ -198,11 +223,13 @@ struct ExpectedTypePath {
   Path::t tpath;
   bool principal;
 };
+// ?warn (default Location.prerr_warning)
+using LabelWarn = std::function<void(const Location&, const warnings::Warning&)>;
 const LabelDescription* disambiguate_label(env::LabelUsage usage, const pt::LidLoc& lid, env::t env,
                                            const std::optional<ExpectedTypePath>& expected_type,
                                            const env::LookupAllLabels& candidates_in_scope,
                                            const std::vector<std::string_view>* filter_ids = nullptr,
-                                           bool filter_closed = false);
+                                           bool filter_closed = false, const LabelWarn& warn = nullptr);
 const ConstructorDescription* disambiguate_constructor(
     env::ConstructorUsage usage, const pt::LidLoc& lid, env::t env,
     const std::optional<ExpectedTypePath>& expected_type,

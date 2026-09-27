@@ -344,12 +344,14 @@ std::vector<Ident::t> extract_label_names(env::t env, TypeExpr* ty) {
 
 bool is_principal(TypeExpr* ty) { return !clflags::principal || get_level(ty) == generic_level; }
 
-// (the not-principal warning is not emitted: warnings are not ported)
-ArrayInfo disambiguate_array_literal(const Location&, env::t env, TypeExpr* expected_ty) {
-  if (is_floatarray_type(env, expected_ty))
-    return {ctype::instance(predef::type_float()), MutableFlag::Mutable};
-  if (is_iarray_type(env, expected_ty)) return {nullptr, MutableFlag::Immutable};
-  return {nullptr, MutableFlag::Mutable};
+ArrayInfo disambiguate_array_literal(const Location& loc, env::t env, TypeExpr* expected_ty) {
+  auto ret = [&](TypeExpr* ty_elt, MutableFlag mut) {
+    if (!is_principal(expected_ty)) prerr_warning(loc, not_principal("this type-based array disambiguation"));
+    return ArrayInfo{ty_elt, mut};
+  };
+  if (is_floatarray_type(env, expected_ty)) return ret(ctype::instance(predef::type_float()), MutableFlag::Mutable);
+  if (is_iarray_type(env, expected_ty)) return ret(nullptr, MutableFlag::Immutable);
+  return ret(nullptr, MutableFlag::Mutable);
 }
 
 bool has_poly_constraint(const pt::Pattern* spat) {
@@ -849,7 +851,8 @@ std::vector<pt::LabeledPattern> reorder_pat(const Location& loc, ctype::PatternE
     e.ty = expected_ty;
     raise_error(e);
   }
-  // (Unnecessarily_partial_tuple_pattern warning not emitted)
+  if (closed == ClosedFlag::Open && labeled_tl.size() == patl.size())
+    prerr_warning(loc, WK::Unnecessarily_partial_tuple_pattern);
   std::reverse(taken.begin(), taken.end());
   return taken;
 }
@@ -1049,13 +1052,16 @@ SolvedConstruct solve_Ppat_construct(TypePatState& tps, ctype::PatternEnv* penv,
     return R{ty_args, equated_types, existential_ctyp};
   });
   if (clflags::principal && !penv->in_counterexample) {
-    // Do not warn for counter-examples.  The check (fully_generic's marks
-    // and repr compressions) runs as ocamlc's; the Not_principal warning
-    // itself is not emitted yet (stage 9).
+    // Do not warn for counter-examples
     struct WarnOnlyOnce {};
     try {
       r.equated_types->iter([&](TypeExpr* t1, TypeExpr* t2) {
-        if (!(ctype::fully_generic(t1) && ctype::fully_generic(t2))) throw WarnOnlyOnce{};
+        if (!(ctype::fully_generic(t1) && ctype::fully_generic(t2))) {
+          prerr_warning(loc, not_principal("typing this pattern requires considering@ @[%a@]@ and@ @[%a@]@ as@ "
+                                           "equal.@ But@ the@ knowledge@ of@ these@ types",
+                                           inline_type_expr(t1), inline_type_expr(t2)));
+          throw WarnOnlyOnce{};
+        }
       });
     } catch (const WarnOnlyOnce&) {
     }
@@ -1278,6 +1284,7 @@ struct ConstructorName {
 template <class Name>
 struct NameChoice {
   using T = typename Name::T;
+  using Warn = std::function<void(const Location&, const warnings::Warning&)>;
   using Candidate = std::pair<const T*, std::function<void()>>;
   using Candidates = std::vector<Candidate>;
   // (candidate list, lookup error)
@@ -1322,6 +1329,71 @@ struct NameChoice {
     throw NotFound{};
   }
 
+  // ---- warnings ----
+  static std::vector<Path::t> unique(env::t env, std::vector<Path::t> acc, const std::vector<Path::t>& l) {
+    for (Path::t x : l) {
+      bool dup = false;
+      for (Path::t a : acc)
+        if (compare_type_path(env, x, a)) dup = true;
+      if (!dup) acc.push_back(x);
+    }
+    return acc;
+  }
+  static std::vector<std::string> ambiguous_types(env::t env, const T* lbl, const Candidates& others) {
+    Path::t tpath = get_type_path(lbl);
+    std::vector<Path::t> others_p;
+    for (auto& c : others) others_p.push_back(get_type_path(c.first));
+    std::vector<Path::t> tpaths = unique(env, {tpath}, others_p);
+    if (tpaths.size() == 1) return {};
+    std::vector<std::string> r;
+    printtyp::wrap_printing_env(true, env, [&] {
+      out_type::reset();
+      r = printtyp::strings_of_paths(out_type::Namespace::Type, tpaths);
+    });
+    return r;
+  }
+  // warn if there are several distinct candidates in scope
+  static void warn_if_ambiguous(const Warn& warn, const pt::LidLoc& lid, env::t env, const T* lbl,
+                                const Candidates& rest) {
+    if (!warnings::is_active(41)) return;
+    out_type::ident_conflicts::reset();
+    std::vector<std::string> paths = ambiguous_types(env, lbl, rest);
+    std::string expansion;
+    if (std::optional<format_doc::Doc> msg = out_type::ident_conflicts::err_msg())
+      expansion = format_doc::asprintf("%a", [&](format_doc::Formatter& f) { format_doc::pp_doc(f, *msg); });
+    if (!paths.empty()) {
+      warnings::Warning w = warnings::Warning::make(WK::Ambiguous_name);
+      w.l = {std::string(longident::last(lid.txt))};
+      w.l2 = paths;
+      w.b = false;
+      w.s = expansion;
+      warn(lid.loc, w);
+    }
+  }
+  // a non-principal type was used for disambiguation
+  static void warn_non_principal(const Warn& warn, const pt::LidLoc& lid) {
+    const char* name = Name::kind == DatatypeKind::Record ? "field" : "constructor";
+    warn(lid.loc, not_principal("this type-based %s disambiguation", name));
+  }
+  // we selected a name out of the lexical scope
+  static void warn_out_of_scope(const Warn& warn, const pt::LidLoc& lid, env::t env, Path::t tpath) {
+    if (!warnings::is_active(40)) return;
+    std::string path_s;
+    printtyp::wrap_printing_env(true, env, [&] {
+      path_s = format_doc::asprintf("%a", [&](format_doc::Formatter& f) { printtyp::type_path(f, tpath); });
+    });
+    warnings::Warning w = warnings::Warning::make(WK::Name_out_of_scope);
+    w.s = path_s;
+    w.l = {std::string(longident::last(lid.txt))};
+    w.b = false;
+    warn(lid.loc, w);
+  }
+  // warn if the selected name is not the last introduced in scope
+  static void warn_if_disambiguated_name(const Warn& warn, const pt::LidLoc& lid, const T* lbl, const Scope& scope) {
+    if (scope.ok && !scope.cands.empty() && scope.cands[0].first == lbl) return;
+    warn(lid.loc, warnings::Warning::with_s(WK::Disambiguated_name, std::string(Name::get_name(lbl))));
+  }
+
   [[noreturn]] static void force_error_raise(const Scope& s) {
     env::Error e(env::Error::Kind::Lookup_error);
     e.loc = s.err_loc;
@@ -1335,30 +1407,75 @@ struct NameChoice {
   }
 
   // [disambiguate] selects a concrete description for [lid] (see
-  // typecore.ml).  Warnings are not ported: the warn_* checks are omitted.
-  static const T* disambiguate(const Filter& filter, typename Name::Usage usage,
+  // typecore.ml)
+  static const T* disambiguate(const Warn& warn, const Filter& filter, typename Name::Usage usage,
                                const pt::LidLoc& lid, env::t env,
                                const std::optional<ExpectedTypePath>& expected_type,
                                const Scope& candidates_in_scope) {
+    const T* lbl = disambiguate_(warn, filter, usage, lid, env, expected_type, candidates_in_scope);
+    // warn only on nominal labels
+    if (Name::in_env(lbl)) warn_if_disambiguated_name(warn, lid, lbl, candidates_in_scope);
+    return lbl;
+  }
+  static const T* disambiguate_(const Warn& warn, const Filter& filter, typename Name::Usage usage,
+                                const pt::LidLoc& lid, env::t env,
+                                const std::optional<ExpectedTypePath>& expected_type,
+                                const Scope& candidates_in_scope) {
     if (!expected_type) {
       // no expected type => no disambiguation
       Filtered f = filter(force_error(candidates_in_scope));
       if (f.cands.empty()) throw std::logic_error("NameChoice.disambiguate");
       if (!f.ok) return f.cands[0].first;  // will fail later
       f.cands[0].second();
+      Candidates rest(f.cands.begin() + 1, f.cands.end());
+      warn_if_ambiguous(warn, lid, env, f.cands[0].first, rest);
       return f.cands[0].first;
     }
     Path::t tpath0 = expected_type->tpath0, tpath = expected_type->tpath;
+    bool principal = expected_type->principal;
+    std::optional<Candidate> by_type;
     try {
-      Candidate c = disambiguate_by_type(env, tpath, candidates_in_scope);
-      c.second();
-      return c.first;
+      by_type = disambiguate_by_type(env, tpath, candidates_in_scope);
     } catch (const NotFound&) {
     }
+    if (by_type) {
+      const T* lbl = by_type->first;
+      by_type->second();
+      if (!principal) {
+        // Check if non-principal type is affecting result
+        if (!candidates_in_scope.ok) {
+          warn_non_principal(warn, lid);
+        } else {
+          Filtered f = filter(candidates_in_scope.cands);
+          if (!f.ok) {
+            warn_non_principal(warn, lid);
+          } else {
+            if (f.cands.empty()) throw std::logic_error("NameChoice.disambiguate");
+            Path::t lbl_tpath = get_type_path(f.cands[0].first);
+            // no principality warning if the non-principal type-based
+            // selection corresponds to the last definition in scope
+            if (!compare_type_path(env, tpath, lbl_tpath)) {
+              warn_non_principal(warn, lid);
+            } else {
+              Candidates rest(f.cands.begin() + 1, f.cands.end());
+              warn_if_ambiguous(warn, lid, env, lbl, rest);
+            }
+          }
+        }
+      }
+      return lbl;
+    }
     // look outside the lexical scope
+    const T* found = nullptr;
     try {
-      return lookup_from_type(env, tpath, usage, lid);
+      found = lookup_from_type(env, tpath, usage, lid);
     } catch (const NotFound&) {
+    }
+    if (found) {
+      // warn only on nominal labels; structural labels cannot be qualified anyway
+      if (Name::in_env(found)) warn_out_of_scope(warn, lid, env, tpath);
+      if (!principal) warn_non_principal(warn, lid);
+      return found;
     }
     Filtered f = filter(force_error(candidates_in_scope));
     std::pair<Path::t, Path::t> tp{tpath0, expand_path(env, tpath)};
@@ -1418,7 +1535,7 @@ const LabelDescription* disambiguate_label(env::LabelUsage usage, const pt::LidL
                                            const std::optional<ExpectedTypePath>& expected_type,
                                            const env::LookupAllLabels& candidates_in_scope,
                                            const std::vector<std::string_view>* filter_ids,
-                                           bool filter_closed) {
+                                           bool filter_closed, const LabelWarn& warn) {
   Label::Filter filter = [](const Label::Candidates& c) { return Label::Filtered{true, c}; };
   if (filter_ids) {
     std::vector<std::string_view> ids = *filter_ids;
@@ -1426,7 +1543,8 @@ const LabelDescription* disambiguate_label(env::LabelUsage usage, const pt::LidL
       return disambiguate_label_by_ids(filter_closed, ids, c);
     };
   }
-  return Label::disambiguate(filter, usage, lid, env, expected_type, label_scope(candidates_in_scope));
+  return Label::disambiguate(warn ? warn : Label::Warn(location::prerr_warning), filter, usage, lid, env, expected_type,
+                             label_scope(candidates_in_scope));
 }
 
 const ConstructorDescription* disambiguate_constructor(
@@ -1436,20 +1554,40 @@ const ConstructorDescription* disambiguate_constructor(
   Constructor::Filter filter = [](const Constructor::Candidates& c) {
     return Constructor::Filtered{true, c};
   };
-  return Constructor::disambiguate(filter, usage, lid, env, expected_type,
+  return Constructor::disambiguate(Constructor::Warn(location::prerr_warning), filter, usage, lid, env, expected_type,
                                    cstr_scope(candidates_in_scope));
 }
 
-// Only issue warnings once per record constructor/pattern (warnings are not
-// ported; the labels are resolved as typecore.ml does).
+// Only issue warnings once per record constructor/pattern
 std::vector<const LabelDescription*> disambiguate_lid_list(
-    const Location&, bool closed, env::t env, env::LabelUsage usage,
+    const Location& loc, bool closed, env::t env, env::LabelUsage usage,
     const std::optional<ExpectedTypePath>& expected_type, const std::vector<pt::LidLoc>& lids) {
   std::vector<std::string_view> ids;
   for (auto& lid : lids) ids.push_back(longident::last(lid.txt));
+  bool w_pr = false;
+  struct Amb {
+    std::string s;
+    std::vector<std::string> l;
+    std::string ex;
+  };
+  std::vector<Amb> w_amb;             // head first
+  std::vector<std::string> w_scope;  // head first
+  std::string w_scope_ty;
+  LabelWarn warn = [&](const Location& l, const warnings::Warning& msg) {
+    if (msg.k == WK::Not_principal) {
+      w_pr = true;
+    } else if (msg.k == WK::Ambiguous_name && msg.l.size() == 1) {
+      w_amb.insert(w_amb.begin(), Amb{msg.l[0], msg.l2, msg.s});
+    } else if (msg.k == WK::Name_out_of_scope && msg.l.size() == 1) {
+      w_scope.insert(w_scope.begin(), msg.l[0]);
+      w_scope_ty = msg.s;
+    } else {
+      location::prerr_warning(l, msg);
+    }
+  };
   auto process_label = [&](const pt::LidLoc& lid) {
     env::LookupAllLabels scope = env::lookup_all_labels(true, lid.loc, usage, lid.txt, env);
-    return disambiguate_label(usage, lid, env, expected_type, scope, &ids, closed);
+    return disambiguate_label(usage, lid, env, expected_type, scope, &ids, closed, warn);
   };
   // If one label is qualified [{ foo = ...; M.bar = ... }], we will
   // disambiguate all labels using one of the qualifying modules (see
@@ -1479,13 +1617,48 @@ std::vector<const LabelDescription*> disambiguate_lid_list(
     }
     out.push_back(process_label(qual_lid));
   }
+  if (w_pr) {
+    location::prerr_warning(loc, not_principal("this type-based record disambiguation"));
+  } else if (!w_amb.empty()) {
+    std::vector<Amb> amb(w_amb.rbegin(), w_amb.rend());  // List.rev !w_amb
+    std::vector<Path::t> paths;
+    for (const LabelDescription* l : out) paths.push_back(get_constr_type_path(l->lbl_res));
+    Path::t path = paths[0];
+    bool all_same = true;
+    for (std::size_t i = 1; i < paths.size(); ++i)
+      if (!compare_type_path(env, path, paths[i])) all_same = false;
+    if (all_same) {
+      warnings::Warning w = warnings::Warning::make(WK::Ambiguous_name);
+      for (auto& a : amb) w.l.push_back(a.s);
+      w.l2 = amb[0].l;
+      w.b = true;
+      w.s = amb[0].ex;
+      location::prerr_warning(loc, w);
+    } else {
+      for (auto& a : amb) {
+        warnings::Warning w = warnings::Warning::make(WK::Ambiguous_name);
+        w.l = {a.s};
+        w.l2 = a.l;
+        w.b = false;
+        w.s = a.ex;
+        location::prerr_warning(loc, w);
+      }
+    }
+  }
+  if (!w_scope.empty()) {
+    warnings::Warning w = warnings::Warning::make(WK::Name_out_of_scope);
+    w.s = w_scope_ty;
+    w.l.assign(w_scope.rbegin(), w_scope.rend());
+    w.b = true;
+    location::prerr_warning(loc, w);
+  }
   return out;
 }
 
 // Checks over the labels mentioned in a record pattern: no duplicate
-// definitions (error); properly closed (warning, not emitted)
+// definitions (error); properly closed (warning)
 void check_recordpat_labels(const Location& loc,
-                            const std::vector<tt::RecordPatField>& lbl_pat_list, ClosedFlag) {
+                            const std::vector<tt::RecordPatField>& lbl_pat_list, ClosedFlag closed) {
   if (lbl_pat_list.empty()) return;  // should not happen
   const LabelDescription* label1 = lbl_pat_list[0].label;
   std::vector<bool> defined(label1->lbl_all.size(), false);
@@ -1496,6 +1669,19 @@ void check_recordpat_labels(const Location& loc,
       raise_error(e);  // log_or_raise
     }
     defined[static_cast<std::size_t>(f.label->lbl_pos)] = true;
+  }
+  if (closed == ClosedFlag::Closed && warnings::is_active(9)) {
+    std::vector<std::string> undefined;  // head first
+    for (std::size_t i = 0; i < label1->lbl_all.size(); ++i)
+      if (!defined[i]) undefined.insert(undefined.begin(), std::string(label1->lbl_all[i]->lbl_name));
+    if (!undefined.empty()) {
+      std::string u;
+      for (std::size_t i = undefined.size(); i-- > 0;) {
+        u += undefined[i];
+        if (i > 0) u += ", ";
+      }
+      prerr_warning(loc, WK::Missing_record_field_pattern, u);
+    }
   }
 }
 

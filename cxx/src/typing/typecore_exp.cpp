@@ -131,8 +131,11 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
         Path::t fmt6_path =
             Path::pdot(Path::pident(Ident::create_persistent(OCAML_LIT("CamlinternalFormatBasics"))), "format6");
         bool is_format = false;
-        if (auto* tc = as<Tconstr>(get_desc(ty_exp)); tc && path::same(tc->path, fmt6_path))
-          is_format = true;  // (the -principal warning is not emitted)
+        if (auto* tc = as<Tconstr>(get_desc(ty_exp)); tc && path::same(tc->path, fmt6_path)) {
+          if (clflags::principal && get_level(ty_exp) != generic_level)
+            prerr_warning(loc, not_principal("this coercion to format6"));
+          is_format = true;
+        }
         if (is_format) {
           const pt::Expression* fp = type_format(loc, c.pconst_desc.s, env);
           pt::Expression* format_parsetree = make<pt::Expression>(*fp);
@@ -518,7 +521,8 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
         e2->exp_type = ty_exp;
         ext = e2;
       }
-      // (the Useless_record_with warning is not emitted)
+      std::size_t num_fields = lbl_exp_list.at(0).label->lbl_all.size();
+      if (opt_sexp && lid_sexp_list.size() == num_fields) prerr_warning(loc, WK::Useless_record_with);
       std::vector<tt::RecordField> fields;
       for (std::size_t k = 0; k < lbl->lbl_all.size(); ++k) fields.push_back({lbl->lbl_all[k], label_definitions[k]});
       return mk(mkd(tt::Texp_record{{XK::Texp_record}, slice(fields), lbl->lbl_repres, ext}), loc,
@@ -616,7 +620,9 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
         Uid uid = uid::mk(env::get_current_unit());
         TypeExpr* ty = ctype::instance(predef::type_int());
         auto* vd = make<ValueDescription>(ty, ValueKind{}, loc, Attributes{}, uid);
-        std::tie(id, new_env) = env::enter_value(v->name.txt, vd, env);
+        std::tie(id, new_env) = env::enter_value(v->name.txt, vd, env, [](std::string s) {
+          return warnings::Warning::with_s(WK::Unused_for_index, s);
+        });
       } else {
         raise_error(err(param->ppat_loc, env, EK::Invalid_for_loop_index));
       }
@@ -653,7 +659,11 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
       const TypeDesc* td = get_desc(sr.typ);
       if (auto* p = as<Tpoly>(td)) {
         if (p->vars.empty()) typ = ctype::instance(p->body);
-        else typ = ctype::instance_poly(p->vars, p->body);  // (the -principal warning is not emitted)
+        else {
+          if (clflags::principal && get_level(sr.typ) != generic_level)
+            prerr_warning(loc, not_principal("this use of a polymorphic method"));
+          typ = ctype::instance_poly(p->vars, p->body);
+        }
       } else if (td->kind == DescKind::Tvar) {
         TypeExpr* ty2 = ctype::newvar();
         TypeExpr* poly = ctype::newty(tpoly(ty2, {}));
@@ -849,8 +859,9 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
       const Package* pack;
       const TypeDesc* td = get_desc(ctype::expand_head(env, ctype::instance(ty_expected)));
       if (auto* tp = as<Tpackage>(td)) {
-        // (the -principal warning's check still expands)
-        if (clflags::principal) ctype::expand_head(env, protect_expansion(env, ty_expected));
+        if (clflags::principal &&
+            get_level(ctype::expand_head(env, protect_expansion(env, ty_expected))) < generic_level)
+          prerr_warning(loc, not_principal("this module packing"));
         pack = tp->pack;
       } else if (td->kind == DescKind::Tvar) {
         raise_error(err(loc, env, EK::Cannot_infer_signature));
@@ -939,7 +950,7 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
         auto* f = inner ? as<pt::Pexp_field>(inner->pexp_desc) : nullptr;
         if (!f) raise_error(err(loc, env, EK::Invalid_atomic_loc_payload));
         SolvedField sf = solve_Pexp_field(env::LabelUsage::Mutation, env, inner, f->exp, f->lid);
-        // (Env.mark_label_used Projection: usage marking only feeds warnings)
+        env::mark_label_used(env::LabelUsage::Projection, sf.label->lbl_uid);
         if (sf.label->lbl_atomic == AtomicFlag::Nonatomic) {
           Error e = err(loc, env, EK::Label_not_atomic);
           e.lid = f->lid.txt;
@@ -1044,7 +1055,7 @@ Constrained<Ret> type_coerce(const ConstraintArg<Ret>& c, env::t env, const Loca
           std::function<void()> force2 = ctype::subtype(env, a.arg_type, gi);
           dl2.force();
           force2();
-          // (the -principal warning is not emitted)
+          if (!a.gen && clflags::principal) prerr_warning(loc, not_principal("this ground coercion"));
         } catch (const ctype::Subtype& s) {
           Error e = err(loc, env, EK::Not_subtype);
           e.subtype = s.err;
@@ -1210,9 +1221,9 @@ SplitFunctionTy split_function_ty(env::t env, TypeExpr* ty_expected, const ArgLa
     if (!r.ok) raise_error(error_of_filter_arrow_failure(loc, env, explanation, first, ty_fun, r.error));
     return r.value;
   });
-  // (the -principal warning's check)
-  if (clflags::principal && !has_poly && !tpoly_is_mono(fa.ty_param) && get_level(fa.ty_param) < generic_level)
-    ctype::is_really_poly(env, fa.ty_param);
+  if (clflags::principal && !has_poly && !tpoly_is_mono(fa.ty_param) && get_level(fa.ty_param) < generic_level &&
+      ctype::is_really_poly(env, fa.ty_param))
+    prerr_warning(loc, not_principal("this higher-rank function"));
   TypeExpr* ty_param = fa.ty_param;
   if (!has_poly) {
     auto [ty, vars] = tpoly_get_poly(fa.ty_param);

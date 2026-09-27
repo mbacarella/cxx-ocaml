@@ -120,8 +120,10 @@ TypeFunctionResult type_function(env::t env, Slice<const pt::FunctionParam*> par
       unify_exp_types(loc, env, exp_type, ie);
     });
     if (is_optional(arg_label)) {
-      // (the Unerasable_optional_argument warning is not emitted; its
-      // arrow_spine expansions and delayed check are kept)
+      Location pat_loc = r.pat->pat_loc;
+      auto raise_unerasable_optional_argument = [pat_loc] {
+        prerr_warning(pat_loc, WK::Unerasable_optional_argument);
+      };
       auto only_labels_function_ret_tvar = [env](TypeExpr* ty) -> std::optional<TypeExpr*> {
         ctype::ArrowSpine sp = ctype::arrow_spine(env, ty);
         for (auto& a : sp.args)
@@ -132,7 +134,13 @@ TypeFunctionResult type_function(env::t env, Slice<const pt::FunctionParam*> par
       std::optional<TypeExpr*> o = only_labels_function_ret_tvar(ty_ret);
       if (o && *o) {
         TypeExpr* ret_tvar = *o;
-        add_delayed_check([only_labels_function_ret_tvar, ret_tvar] { only_labels_function_ret_tvar(ret_tvar); });
+        // We don't necessarily know [ty] is a function with only labelled
+        // args since unification may change this. So we add a delayed check.
+        add_delayed_check([only_labels_function_ret_tvar, ret_tvar, raise_unerasable_optional_argument] {
+          if (only_labels_function_ret_tvar(ret_tvar)) raise_unerasable_optional_argument();
+        });
+      } else if (o) {
+        raise_unerasable_optional_argument();
       }
     }
     tt::FunctionParamKind fp_kind{tt::FunctionParamKind::Kind::Tparam_pat, r.pat};
@@ -613,7 +621,7 @@ const tt::Expression* type_argument(env::t env, const pt::Expression* sexp, Type
   return type_argument_x(std::nullopt, Recarg::Rejected, env, sexp, t1, t2);
 }
 
-static UntypedArg type_apply_arg(env::t env, const UntypedArg& a) {
+static UntypedArg type_apply_arg(env::t env, const Location& app_loc, const UntypedArg& a) {
   if (a.omitted) return a;
   using UK = UntypedApplyArg::Kind;
   auto typed = [&](const tt::Expression* e) {
@@ -641,8 +649,8 @@ static UntypedArg type_apply_arg(env::t env, const UntypedArg& a) {
         }
         return typed(type_argument(env, arg.sarg, ty_arg2, ty_arg02));
       }
-      // (the -principal warning's check)
-      if (clflags::principal && get_level(arg.ty_arg) < generic_level) ctype::is_really_poly(env, arg.ty_arg);
+      if (clflags::principal && get_level(arg.ty_arg) < generic_level && ctype::is_really_poly(env, arg.ty_arg))
+        prerr_warning(app_loc, not_principal("applying a higher-rank function here"));
       struct R {
         const tt::Expression* arg;
         std::vector<TypeExpr*> vars;
@@ -673,7 +681,7 @@ static UntypedArg type_apply_arg(env::t env, const UntypedArg& a) {
 }
 
 std::pair<Slice<tt::LabeledArg>, TypeExpr*> type_application(
-    env::t env, const Location&, const tt::Expression* funct,
+    env::t env, const Location& app_loc, const tt::Expression* funct,
     const std::vector<std::pair<ArgLabel, const pt::Expression*>>& sargs) {
   struct FilterArrowMonoFailed {};
   auto filter_arrow_mono = [&](TypeExpr* t, const ArgLabel& l) {
@@ -715,14 +723,19 @@ std::pair<Slice<tt::LabeledArg>, TypeExpr*> type_application(
       bool any_label = false;
       for (auto& l : labels)
         if (l.kind != ArgLabel::Kind::Nolabel) any_label = true;
-      // (the Labels_omitted warning is not emitted)
       ignore_labels = labels.size() == sargs.size() && all_nolabel && any_label;
+      if (ignore_labels) {
+        std::vector<std::string> ls2;
+        for (auto& l : labels)
+          if (l.kind != ArgLabel::Kind::Nolabel) ls2.push_back(std::string(l.name));  // Asttypes.string_of_label
+        prerr_warning(funct->exp_loc, warnings::Warning::with_l(WK::Labels_omitted, ls2));
+      }
     }
   }
   TypeExpr* ity = ctype::instance(ty);
   CollectedArgs ca = collect_apply_args(env, funct, ignore_labels, ty, ity, sargs);
   std::vector<UntypedArg> args;
-  for (auto& a : ca.args) args.push_back(type_apply_arg(env, a));
+  for (auto& a : ca.args) args.push_back(type_apply_arg(env, app_loc, a));
   auto [ty_ret, args2] = type_omitted_parameters_and_build_result_type(ca.ty_ret, args);
   std::vector<tt::LabeledArg> out;
   for (auto& a : args2) out.push_back({a.label, a.omitted ? tt::ApplyArg{true, nullptr} : tt::ApplyArg{false, a.arg.targ}});

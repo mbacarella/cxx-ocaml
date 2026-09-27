@@ -17,6 +17,52 @@ using PK = tt::PatternDesc::Kind;
 using SK = pt::PatternDesc::Kind;
 using PC = tt::PatternCategory;
 
+bool has_literal_pattern(const pt::Pattern* p) {
+  switch (p->ppat_desc->kind) {
+    case SK::Ppat_constant:
+    case SK::Ppat_interval: return true;
+    case SK::Ppat_any:
+    case SK::Ppat_type:
+    case SK::Ppat_var:
+    case SK::Ppat_unpack:
+    case SK::Ppat_extension: return false;
+    case SK::Ppat_variant: {
+      auto* v = as<pt::Ppat_variant>(p->ppat_desc);
+      return v->arg && has_literal_pattern(v->arg);
+    }
+    case SK::Ppat_construct: {
+      auto* c = as<pt::Ppat_construct>(p->ppat_desc);
+      return c->arg && has_literal_pattern(c->arg->pat);
+    }
+    case SK::Ppat_exception: return has_literal_pattern(as<pt::Ppat_exception>(p->ppat_desc)->pat);
+    case SK::Ppat_constraint: return has_literal_pattern(as<pt::Ppat_constraint>(p->ppat_desc)->pat);
+    case SK::Ppat_alias: return has_literal_pattern(as<pt::Ppat_alias>(p->ppat_desc)->pat);
+    case SK::Ppat_lazy: return has_literal_pattern(as<pt::Ppat_lazy>(p->ppat_desc)->pat);
+    case SK::Ppat_open: return has_literal_pattern(as<pt::Ppat_open>(p->ppat_desc)->pat);
+    case SK::Ppat_array:
+      for (const pt::Pattern* q : as<pt::Ppat_array>(p->ppat_desc)->pats)
+        if (has_literal_pattern(q)) return true;
+      return false;
+    case SK::Ppat_tuple:
+      for (const pt::LabeledPattern& q : as<pt::Ppat_tuple>(p->ppat_desc)->pl)
+        if (has_literal_pattern(q.pat)) return true;
+      return false;
+    case SK::Ppat_record:
+      for (auto& [l, q] : as<pt::Ppat_record>(p->ppat_desc)->fields)
+        if (has_literal_pattern(q)) return true;
+      return false;
+    case SK::Ppat_effect: {
+      auto* e = as<pt::Ppat_effect>(p->ppat_desc);
+      return has_literal_pattern(e->eff) || has_literal_pattern(e->cont);
+    }
+    case SK::Ppat_or: {
+      auto* o = as<pt::Ppat_or>(p->ppat_desc);
+      return has_literal_pattern(o->p1) || has_literal_pattern(o->p2);
+    }
+  }
+  return false;
+}
+
 // pure / only_impure / as_comp_pattern (the value / computation tags)
 static const tt::Pattern* pure(PC category, const tt::Pattern* pat) {
   return category == PC::Value ? pat : tt::as_computation_pattern(pat);
@@ -279,14 +325,19 @@ static const tt::Pattern* type_pat_aux(TypePatState& tps, PC category,
           }
         } else if (sarg2->ppat_desc->kind == SK::Ppat_any && constr->cstr_arity == 0 &&
                    !existential_styp) {
-          // (Wildcard_arg_to_constant_constr warning not emitted)
+          prerr_warning(sarg2->ppat_loc, WK::Wildcard_arg_to_constant_constr);
         } else if (sarg2->ppat_desc->kind == SK::Ppat_any && constr->cstr_arity > 1) {
           sargs.assign(static_cast<std::size_t>(constr->cstr_arity), sarg2);
         } else {
           sargs.push_back(sarg2);
         }
       }
-      // (Fragile_literal_pattern warning not emitted)
+      if (builtin_attributes::warn_on_literal_pattern(constr->cstr_attributes))
+        for (const pt::Pattern* sp1 : sargs)
+          if (has_literal_pattern(sp1)) {
+            prerr_warning(sp1->ppat_loc, WK::Fragile_literal_pattern);
+            break;
+          }
       if (static_cast<long>(sargs.size()) != constr->cstr_arity) {
         Error e = err(loc, penv->env, EK::Constructor_arity_mismatch);
         e.lid = lid.txt;
@@ -503,14 +554,15 @@ static const tt::Pattern* type_pat_aux(TypePatState& tps, PC category,
 }
 
 // ---- entering pattern variables -----------------------------------------------------------
-env::t add_pattern_variables(env::t env, const std::vector<PatternVariable>& pv) {
-  // List.fold_right (the unused-variable checks are warnings, not ported)
+env::t add_pattern_variables(env::t env, const std::vector<PatternVariable>& pv, const env::CheckFn& check,
+                             const env::CheckFn& check_as) {
+  // List.fold_right
   for (auto it = pv.rbegin(); it != pv.rend(); ++it)
     env = env::add_value(it->pv_id,
                          make<ValueDescription>(ValueDescription{it->pv_type, ValueKind{}, it->pv_loc,
                                                                  pt::types_attributes(it->pv_attributes),
                                                                  it->pv_uid}),
-                         env);
+                         env, it->pv_kind == PatternVariableKind::As_var ? check_as : check);
   return env;
 }
 
