@@ -169,6 +169,10 @@ target_link_libraries(c++link PRIVATE cppcaml_core)
 
 add_executable(c++ocamlc src/tools/cppocamlc_main.cpp)
 target_link_libraries(c++ocamlc PRIVATE cppcaml_core)
+# A compiler process is short-lived and started once per unit: linking the
+# C++ runtime in saves the dynamic loader's symbol resolution (~0.3 ms of a
+# ~3 ms small-unit compile) and makes the binary self-contained.
+target_link_options(c++ocamlc PRIVATE -static-libstdc++ -static-libgcc)
 
 # Stage-1 oracle for the typing/ port: dump a cmi's decoded Types graph
 # (compared against cxx/harness/typing_cmidump.ml).

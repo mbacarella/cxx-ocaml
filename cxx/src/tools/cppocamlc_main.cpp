@@ -16,7 +16,7 @@
 // effect c++ocamlc does not implement is refused, when that effect would
 // take place, with "option -X is not supported yet" (TYPECHECKER.md,
 // "Driver options").
-#include <pthread.h>
+#include <ucontext.h>
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -983,7 +983,7 @@ static int run_main(int argc, char** argv) {
   }
 }
 
-// The compiler runs on a thread with a large stack.  OCaml's native frames
+// The compiler runs on a large stack.  OCaml's native frames
 // are several times smaller than the port's, so a recursion ocamlc.opt
 // takes in its 8 MiB system stack (a deep type graph in Ctype, a long
 // expression) needs more here; the reservation is virtual, pages are
@@ -1020,22 +1020,21 @@ struct MainArgs {
   char** argv;
   int rc;
 };
+MainArgs g_args;
+// The main thread switches to the big stack (ucontext) rather than handing
+// the work to a second thread: a thread's creation and join cost two trips
+// through the scheduler, measurable on a small unit's compile.
+ucontext_t g_main_ctx, g_big_ctx;
 
-void* main_thread(void* p) {
-  auto* a = static_cast<MainArgs*>(p);
-  static char altstack[64 * 1024];
-  stack_t ss{};
-  ss.ss_sp = altstack;
-  ss.ss_size = sizeof altstack;
-  ::sigaltstack(&ss, nullptr);
-  a->rc = run_main(a->argc, a->argv);
-  return nullptr;
+void big_stack_entry() {
+  g_args.rc = run_main(g_args.argc, g_args.argv);
+  // returning resumes g_main_ctx (uc_link)
 }
 
-// run_main on a kStackSize stack; falls back to the calling thread when the
+// run_main on a kStackSize stack; falls back to the normal stack when the
 // reservation fails (e.g. a tight ulimit -v)
 int run_main_big_stack(int argc, char** argv) {
-  MainArgs args{argc, argv, 0};
+  g_args = MainArgs{argc, argv, 0};
   void* mem = ::mmap(nullptr, kGuardSize + kStackSize, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
   if (mem == MAP_FAILED) return run_main(argc, argv);
@@ -1047,17 +1046,19 @@ int run_main_big_stack(int argc, char** argv) {
   sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
   ::sigemptyset(&sa.sa_mask);
   ::sigaction(SIGSEGV, &sa, nullptr);
-  pthread_attr_t attr;
-  ::pthread_attr_init(&attr);
-  ::pthread_attr_setstack(&attr, g_guard_hi, kStackSize);
-  pthread_t th;
-  if (::pthread_create(&th, &attr, main_thread, &args) != 0) {
-    ::pthread_attr_destroy(&attr);
-    return run_main(argc, argv);
-  }
-  ::pthread_join(th, nullptr);
-  ::pthread_attr_destroy(&attr);
-  return args.rc;
+  // the SIGSEGV handler runs on an alternate stack (the big one is full)
+  static char altstack[64 * 1024];
+  stack_t ss{};
+  ss.ss_sp = altstack;
+  ss.ss_size = sizeof altstack;
+  ::sigaltstack(&ss, nullptr);
+  if (::getcontext(&g_big_ctx) != 0) return run_main(argc, argv);
+  g_big_ctx.uc_stack.ss_sp = g_guard_hi;
+  g_big_ctx.uc_stack.ss_size = kStackSize;
+  g_big_ctx.uc_link = &g_main_ctx;
+  ::makecontext(&g_big_ctx, big_stack_entry, 0);
+  if (::swapcontext(&g_main_ctx, &g_big_ctx) != 0) return run_main(argc, argv);
+  return g_args.rc;
 }
 }  // namespace
 

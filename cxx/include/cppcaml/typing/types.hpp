@@ -519,7 +519,12 @@ const TypeDesc* tvar(OptStr name);
 // one object per unit (ocamlopt merges a unit's equal constants), which
 // every node made from it shares (the -g debug events marshal the sharing)
 const TypeDesc* tvar_none_literal(const char* unit);
-#define TVAR_NONE_LIT() ::cppcaml::typing::types::tvar_none_literal(__FILE__)
+#define TVAR_NONE_LIT()                                                                          \
+  ([]() -> const ::cppcaml::typing::TypeDesc* {                                                  \
+    static const ::cppcaml::typing::TypeDesc* const tvar_lit_ =                                  \
+        ::cppcaml::typing::types::tvar_none_literal(__FILE__);                                   \
+    return tvar_lit_;                                                                            \
+  }())
 const TypeDesc* tarrow(ArgLabel l, TypeExpr* a, TypeExpr* b, Commutable* c);
 const TypeDesc* ttuple(Slice<LabeledTy> l);
 const TypeDesc* tconstr(Path::t p, Slice<TypeExpr*> args, MemoRef* memo);

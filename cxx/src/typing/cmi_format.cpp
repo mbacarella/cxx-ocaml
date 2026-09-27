@@ -1825,10 +1825,26 @@ std::string output_cmi(const std::string& filename, const CmiInfos& cmi) {
 }
 
 CmiInfos read_cmi(const std::string& filename) {
-  std::ifstream in(filename, std::ios::binary);
-  if (!in) throw std::runtime_error("Cannot open " + filename);
-  std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)),
-                                  std::istreambuf_iterator<char>());
+  // the whole file in one read (a .cmi is read on every unit's startup)
+  std::vector<std::uint8_t> bytes;
+  {
+    std::FILE* f = std::fopen(filename.c_str(), "rb");
+    if (!f) throw std::runtime_error("Cannot open " + filename);
+    struct Close {
+      std::FILE* f;
+      ~Close() { std::fclose(f); }
+    } close{f};
+    if (std::fseek(f, 0, SEEK_END) == 0) {
+      long n = std::ftell(f);
+      if (n > 0) bytes.resize(static_cast<std::size_t>(n));
+      std::rewind(f);
+    }
+    std::size_t got = bytes.empty() ? 0 : std::fread(bytes.data(), 1, bytes.size(), f);
+    bytes.resize(got);
+    // a file that grew (or could not be sized): read the rest
+    std::uint8_t chunk[65536];
+    for (std::size_t k; (k = std::fread(chunk, 1, sizeof chunk, f)) > 0;) bytes.insert(bytes.end(), chunk, chunk + k);
+  }
   const std::string magic = cmi_magic_number;
   if (bytes.size() < magic.size())
     throw Error(Error::Kind::Corrupted_interface, filename);

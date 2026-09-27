@@ -1,5 +1,6 @@
 // Ports of utils/load_path.ml, utils/consistbl.ml and typing/persistent_env.ml.
 // See persistent_env.hpp.
+#include <dirent.h>
 #include "cppcaml/typing/persistent_env.hpp"
 
 #include <algorithm>
@@ -27,10 +28,16 @@ struct Dir {
 
 static Dir dir_create(bool hidden, const std::string& path) {
   // readdir_compat: a missing directory has no files; "" is the current one
+  // (readdir's order, without "." and "..", as Sys.readdir)
   Dir d{path, {}, hidden};
-  std::error_code ec;
-  for (auto& e : fs::directory_iterator(path.empty() ? "." : path, ec))
-    d.files.push_back(e.path().filename().string());
+  if (DIR* dp = ::opendir(path.empty() ? "." : path.c_str())) {
+    while (const struct dirent* e = ::readdir(dp)) {
+      const char* n = e->d_name;
+      if (n[0] == '.' && (n[1] == 0 || (n[1] == '.' && n[2] == 0))) continue;
+      d.files.emplace_back(n);
+    }
+    ::closedir(dp);
+  }
   return d;
 }
 
@@ -116,7 +123,8 @@ std::vector<std::string> get_path_list() {
   return v;
 }
 
-static bool is_basename(const std::string& fn) { return fs::path(fn).filename().string() == fn; }
+// Filename.basename fn = fn (Unix: a non-empty name without a '/')
+static bool is_basename(const std::string& fn) { return !fn.empty() && fn.find('/') == std::string::npos; }
 
 std::string find(const std::string& fn) {
   if (is_basename(fn)) {
