@@ -498,8 +498,7 @@ std::string char_escaped(char ch) {
 }
 
 // ---- fprintf ----------------------------------------------------------------------
-namespace {
-// open_box_of_string
+// open_box_of_string (CamlinternalFormat)
 std::pair<long, BoxType> open_box_of_string(std::string_view str) {
   if (str.empty()) return {0, BoxType::Pp_box};
   std::size_t len = str.size();
@@ -546,6 +545,7 @@ std::pair<long, BoxType> open_box_of_string(std::string_view str) {
   return {indent, box_type};
 }
 
+namespace {
 bool is_digit_or_minus(char c) { return (c >= '0' && c <= '9') || c == '-'; }
 
 // parse_integer: an optional '-' then digits

@@ -507,6 +507,14 @@ void fold_labels(const std::function<void(const LabelDescription*)>& f, Longiden
 // ---- misc -------------------------------------------------------------------------
 const Summary* summary(t env);
 std::vector<Ident::t> diff(t env1, t env2);
+// find_*_index id env: the ident's position among the bindings of its name
+// (0 = the most recent), None when it is not bound
+std::optional<long> find_value_index(Ident::t id, t env);
+std::optional<long> find_type_index(Ident::t id, t env);
+std::optional<long> find_module_index(Ident::t id, t env);
+std::optional<long> find_modtype_index(Ident::t id, t env);
+std::optional<long> find_class_index(Ident::t id, t env);
+std::optional<long> find_cltype_index(Ident::t id, t env);
 bool same_types(t env1, t env2);
 bool same_type_declarations(t env1, t env2);
 std::function<t(t)> make_copy_of_types(t env0);

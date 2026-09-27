@@ -44,6 +44,8 @@ bool exists_free(const std::vector<Ident::t>& ids, t p);
 int scope(t p);
 t subst(const std::vector<std::pair<Ident::t, t>>& id_map, t p);
 bool contains_unscoped_ident(t p);
+// Lexer.is_keyword (the default keyword set)
+bool is_keyword(std::string_view s);
 // path.ml `name` without ~paren (Lexer.is_keyword escaping included).
 std::string name(t p);
 Ident::t head(t p);

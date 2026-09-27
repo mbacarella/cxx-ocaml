@@ -72,6 +72,12 @@ add_library(cppcaml_core
   src/typing/lambda.cpp
   src/typing/format.cpp
   src/typing/printlambda.cpp
+  src/typing/format_doc.cpp
+  src/typing/oprint.cpp
+  src/typing/pprintast.cpp
+  src/typing/out_type.cpp
+  src/typing/printtyp.cpp
+  src/typing/printpat.cpp
   src/typing/simplif.cpp
   src/typing/tmc.cpp
   src/typing/translobj.cpp

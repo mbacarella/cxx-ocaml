@@ -45,6 +45,7 @@
 #include "cppcaml/typing/typecore.hpp"
 #include "cppcaml/typing/typemod.hpp"
 #include "cppcaml/typing/printlambda.hpp"
+#include "cppcaml/typing/printtyp.hpp"
 #include "cppcaml/typing/bytegen.hpp"
 #include "cppcaml/typing/bytepackager.hpp"
 #include "cppcaml/typing/emitcode.hpp"
@@ -168,7 +169,7 @@ static const std::set<std::string> kBoolIgnore = {
     "-typing-recovery", "-dno-unique-ids", "-dunique-ids", "-dno-locations", "-dlocations"};
 // Flags that would silently change the output if dropped -> reported unsupported.
 static const std::set<std::string> kUnsupportedArg = {"-ppx"};
-static const std::set<std::string> kUnsupportedBool = {"-i", "-output-obj"};
+static const std::set<std::string> kUnsupportedBool = {"-output-obj"};
 // -labels/-nolabels affect typing but not our (untyped-after-infer) output.
 static const std::set<std::string> kBoolIgnore2 = {"-labels", "-nolabels"};
 
@@ -278,6 +279,7 @@ static void install_typing() {
   static bool installed = false;
   if (!installed) {
     cppcaml::typing::typemod::install_forward_refs();
+    cppcaml::typing::printtyp::install_hooks();
     installed = true;
   }
 }
@@ -404,7 +406,8 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
                                      });
     if (port != PortResult::Typed) return 2;
     lap("typecheck", tp);
-    if (g_stop_after == StopAfter::Typing) return 0;
+    // Clflags.should_stop_after Typing (-i prints the signature, writes nothing)
+    if (g_stop_after == StopAfter::Typing || ty::clflags::print_types) return 0;
     // Compile.to_bytecode: Translmod.transl_implementation, -drawlambda,
     // Simplif.simplify_lambda, -dlambda, Bytegen.compile_implementation,
     // -dinstr (the dumps on stderr, as ocamlc's ppf_dump)
@@ -463,9 +466,20 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
           ty::parsetree::Signature sg = ty::parsetree::of_ast_signature(sig, in_path, {});
           // Compile_common.typecheck_intf
           const ty::typedtree::Signature* tsg = ty::typemod::type_interface(target, env0, sg);
+          if (ty::clflags::print_types) {
+            ty::printtyp::wrap_printing_env(false, env0, [&] {
+              ty::format_doc::Formatter d;
+              ty::printtyp::printed_signature(in_path, d, tsg->sig_type);
+              ty::format::Formatter out;
+              ty::format_doc::format(out, d.doc);
+              out.print_newline();
+              std::fwrite(out.contents().data(), 1, out.contents().size(), stdout);
+              std::fflush(stdout);
+            });
+          }
           (void)ty::includemod::signatures(env0, true, tsg->sig_type, tsg->sig_type);
           ty::typecore::force_delayed_checks();
-          if (g_stop_after == StopAfter::Typing) return;
+          if (g_stop_after == StopAfter::Typing || ty::clflags::print_types) return;
           // Compile_common.emit_signature
           ty::env::save_signature(ty::builtin_attributes::alerts_of_sig(sg), tsg->sig_type, target.modname,
                                   target.prefix + ".cmi");
@@ -565,6 +579,8 @@ static int run_main(int argc, char** argv) {
       else if (pass == "lambda") g_stop_after = StopAfter::Lambda;
     }
     else if (a == "-open") g_open_modules.push_back(need_arg("-open"));
+    else if (a == "-i") cppcaml::typing::clflags::print_types = true;
+    else if (a == "-i-variance") cppcaml::typing::clflags::print_variance = true;
     else if (a == "-pp") g_preprocessor = need_arg("-pp");
     else if (a == "-for-pack") cppcaml::typing::clflags::for_package = std::string(need_arg("-for-pack"));
     else if (kArgIgnore.count(a)) {
@@ -679,7 +695,8 @@ static int run_main(int argc, char** argv) {
     }
   }
 
-  if (compile_only) return 0;       // -c : no link
+  // Compenv.stop_early: -c, -i
+  if (compile_only || cppcaml::typing::clflags::print_types) return 0;
 
   if (make_lib) {  // -a : bundle the .cmo objects into a .cma
     if (out_path.empty()) out_path = "a.cma";

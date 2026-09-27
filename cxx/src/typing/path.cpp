@@ -205,7 +205,7 @@ bool contains_unscoped_ident(t p) {
 }
 
 // lexer.mll all_keywords (Lexer.is_keyword with the default keyword set).
-static bool is_keyword(std::string_view s) {
+bool is_keyword(std::string_view s) {
   static const std::unordered_set<std::string_view> kw = {
       "and", "as", "assert", "begin", "class", "constraint", "do", "done",
       "downto", "effect", "else", "end", "exception", "external", "false",

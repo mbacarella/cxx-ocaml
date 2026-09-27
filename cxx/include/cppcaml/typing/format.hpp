@@ -193,6 +193,9 @@ auto pr(P printer, V value) {
   return [printer, value](Formatter& ppf) { printer(ppf, value); };
 }
 
+// CamlinternalFormat.open_box_of_string: "hov 2" -> (2, Pp_hovbox)
+std::pair<long, BoxType> open_box_of_string(std::string_view str);
+
 // String.escaped / Char.escaped (the %S and %C conversions)
 std::string string_escaped(std::string_view s);
 std::string char_escaped(char c);

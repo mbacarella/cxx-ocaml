@@ -1063,6 +1063,34 @@ std::function<t(t)> make_copy_of_types(t env0) {
   };
 }
 
+// IdTbl.find_all_idents name tbl: the idents bound to the name, most
+// recent first, None for an opened module's component
+template <class A, class B>
+static void idtbl_find_all_idents(std::string_view name, const IdTbl<A, B>& tbl, std::vector<Ident::t>& out) {
+  for (auto& [id, d] : tbl.current.find_all(name)) out.push_back(id);
+  if (!tbl.layer) return;
+  const auto* L = tbl.layer;
+  if (L->is_open && L->components.find_opt(name)) out.push_back(nullptr);
+  idtbl_find_all_idents(name, L->next, out);
+}
+
+// find_index_tbl ident tbl: the ident's position among the bindings of its name
+template <class A, class B>
+static std::optional<long> find_index_tbl(Ident::t id, const IdTbl<A, B>& tbl) {
+  std::vector<Ident::t> lbs;
+  idtbl_find_all_idents(ident::name(id), tbl, lbs);
+  for (std::size_t i = 0; i < lbs.size(); ++i)
+    if (lbs[i] && ident::same(id, lbs[i])) return static_cast<long>(i);
+  return std::nullopt;
+}
+
+std::optional<long> find_value_index(Ident::t id, t env) { return find_index_tbl(id, env->values); }
+std::optional<long> find_type_index(Ident::t id, t env) { return find_index_tbl(id, env->types); }
+std::optional<long> find_module_index(Ident::t id, t env) { return find_index_tbl(id, env->modules); }
+std::optional<long> find_modtype_index(Ident::t id, t env) { return find_index_tbl(id, env->modtypes); }
+std::optional<long> find_class_index(Ident::t id, t env) { return find_index_tbl(id, env->classes); }
+std::optional<long> find_cltype_index(Ident::t id, t env) { return find_index_tbl(id, env->cltypes); }
+
 bool same_types(t e1, t e2) {
   return e1->types.current.same_as(e2->types.current) && e1->types.layer == e2->types.layer &&
          e1->modules.current.same_as(e2->modules.current) &&

@@ -6,10 +6,13 @@
 // ported; writing the cmi is the driver's (env::save_signature is not
 // ported yet).
 #include <algorithm>
+#include <cstdio>
 #include <filesystem>
 #include <set>
 
 #include "cppcaml/typing/parmatch.hpp"
+#include "cppcaml/typing/printtyp.hpp"
+#include "cppcaml/typing/warnings.hpp"
 #include "cppcaml/typing/persistent_env.hpp"
 #include "cppcaml/typing/shape.hpp"
 #include "typecore_internal.hpp"
@@ -226,10 +229,27 @@ tt::Implementation type_implementation(const UnitInfo& target, env::t initial_en
   // (Cmt_format.clear / save_cmt and the typing recovery are not ported)
   typecore::reset_delayed_checks();
   env::reset_required_globals();
+  if (clflags::print_types)  // #7656
+    warnings::parse_options(false, "-32-34-37-38-60");
   TypeStructureResult r = type_structure(initial_env, ast);
   shape::t shape0 = shape::set_uid_if_none(
       r.shape, uid::of_compilation_unit_id(ident::name(Ident::create_persistent(target.modname))));
   Signature simple_sg = simplify(r.env, r.names, r.sg);
+  if (clflags::print_types) {
+    typecore::force_delayed_checks();
+    // Format.fprintf std_formatter "%a@." (Printtyp.printed_signature sourcefile) simple_sg
+    printtyp::wrap_printing_env(false, initial_env, [&] {
+      format_doc::Formatter d;
+      printtyp::printed_signature(target.source_file, d, simple_sg);
+      format::Formatter out;
+      format_doc::format(out, d.doc);
+      out.print_newline();
+      std::fwrite(out.contents().data(), 1, out.contents().size(), stdout);
+      std::fflush(stdout);
+    });
+    // (the result is ignored by Compile.implementation)
+    return {r.str, tt::tcoerce_none(), simple_sg};
+  }
   if (target.has_mli) {
     Signature dclsig = env::read_signature(target.modname, target.cmi_file);
     auto [coercion, shape] = includemod::compunit(initial_env, true, target.source_file, r.sg,
