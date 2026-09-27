@@ -260,12 +260,12 @@ std::vector<Ident::t> heads(t p) {
   return acc;
 }
 
-std::string last(t p) {
+std::string_view last(t p) {
   switch (p->kind) {
-    case K::Pident: return std::string(ident::name(p->id));
-    case K::Pdot: return std::string(p->s);
+    case K::Pident: return ident::name(p->id);
+    case K::Pdot: return p->s;
     case K::Pextra_ty:
-      if (p->extra == Path::Extra::Pcstr_ty) return std::string(p->s);
+      if (p->extra == Path::Extra::Pcstr_ty) return p->s;
       return last(p->p1);
     case K::Papply: return last(p->p2);
   }

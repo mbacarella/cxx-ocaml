@@ -369,7 +369,11 @@ const TypeKind* internal::map_kind(const std::function<TypeExpr*(TypeExpr*)>& f,
       r->labels = slice(fl);
       return r;
     }
-    default:
+    case TypeKind::Kind::Type_abstract:
+    case TypeKind::Kind::Type_external:
+      // `Type_abstract r -> Type_abstract r` / `Type_external name -> ..`: a new block
+      return make<TypeKind>(*k);
+    default:  // Type_open: an immediate
       return k;
   }
 }

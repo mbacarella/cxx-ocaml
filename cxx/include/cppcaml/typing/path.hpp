@@ -50,7 +50,8 @@ bool is_keyword(std::string_view s);
 std::string name(t p);
 Ident::t head(t p);
 std::vector<Ident::t> heads(t p);
-std::string last(t p);
+// the string itself (an ident's name, a Pdot's component)
+std::string_view last(t p);
 t scrape_extra_ty(t p);
 bool is_constructor_typath(t p);
 // Ident.Unscoped.Set (ordered by stamp)

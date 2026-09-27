@@ -14,7 +14,15 @@
 
 namespace cppcaml::typing::parsetree {
 
+namespace {
+std::map<std::pair<const void*, std::size_t>, typing::Attributes> g_types_attributes;
+}
+void reset_types_attributes() { g_types_attributes.clear(); }
+
 typing::Attributes types_attributes(const Attributes& l) {
+  if (l.empty()) return {};
+  auto key = std::make_pair(static_cast<const void*>(l.p), l.n);
+  if (auto it = g_types_attributes.find(key); it != g_types_attributes.end()) return it->second;
   std::vector<const typing::Attribute*> out;
   for (const Attribute* a : l) {
     // a docstring's attribute (Docstrings builds it, with a Location.none
@@ -29,7 +37,9 @@ typing::Attributes types_attributes(const Attributes& l) {
     if (doc) ta->name_obj = name.data();
     out.push_back(ta);
   }
-  return slice(out);
+  typing::Attributes r = slice(out);
+  g_types_attributes.emplace(key, r);
+  return r;
 }
 
 Location gap_loc() {
@@ -570,7 +580,28 @@ struct Conv {
           } else if constexpr (std::is_same_v<T, ast::Pexp_lazy>) {
             d = make<Pexp_lazy>(Pexp_lazy{{K::Pexp_lazy}, expression(*v.e)});
           } else if constexpr (std::is_same_v<T, ast::Pexp_poly>) {
-            d = make<Pexp_poly>(Pexp_poly{{K::Pexp_poly}, expression(*v.e), v.t ? core_type(**v.t) : nullptr});
+            const Expression* pe = expression(*v.e);
+            const CoreType* pt = v.t ? core_type(**v.t) : nullptr;
+            // wrap_type_annotation: Ptyp_poly (newtypes, _) and the
+            // Pexp_newtype chain share the newtypes' strings
+            if (auto* ap = v.t ? std::get_if<ast::Ptyp_poly>(&(*v.t)->desc) : nullptr; ap && ap->from_newtypes) {
+              std::vector<StrLoc> vars;
+              for (const Expression* x = pe; x && x->pexp_desc->kind == K::Pexp_newtype;
+                   x = as<Pexp_newtype>(x->pexp_desc)->body)
+                vars.push_back(as<Pexp_newtype>(x->pexp_desc)->name);
+              auto* poly = as<Ptyp_poly>(pt->ptyp_desc);
+              if (vars.size() == poly->vars.size()) {
+                std::vector<StrLoc> nv(poly->vars.begin(), poly->vars.end());
+                for (std::size_t k = 0; k < nv.size(); ++k)
+                  if (nv[k].txt == vars[k].txt) nv[k].txt = vars[k].txt;
+                auto* np = make<Ptyp_poly>(*poly);
+                np->vars = slice(nv);
+                auto* nt = make<CoreType>(*pt);
+                nt->ptyp_desc = np;
+                pt = nt;
+              }
+            }
+            d = make<Pexp_poly>(Pexp_poly{{K::Pexp_poly}, pe, pt});
           } else if constexpr (std::is_same_v<T, ast::Pexp_object>) {
             d = make<Pexp_object>(Pexp_object{{K::Pexp_object}, class_structure(*v.cs)});
           } else if constexpr (std::is_same_v<T, ast::Pexp_newtype>) {

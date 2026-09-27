@@ -326,6 +326,7 @@ static cppcaml::typing::env::t initial_env() {
   ty::uid::reinit();
   ty::types::reset();
   ty::ctype::reset();
+  ty::parsetree::reset_types_attributes();
   ty::Location cmdline = ty::location::none();
   cmdline.loc_start.pos_fname = cmdline.loc_end.pos_fname = "command line";
   return ty::typemod::initial_env(

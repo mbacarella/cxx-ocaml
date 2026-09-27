@@ -4485,7 +4485,7 @@ class Parser {
         for (auto& n : newtypes) { nameset.insert(n.txt); varlist.push_back(n.txt); }
         varify(*Tv, nameset);
         Location polyTloc = innerLoc; polyTloc.ghost = true;
-        CoreTypeBox polyT = box(CoreType{Ptyp_poly{std::move(varlist), std::move(Tv)}, polyTloc});
+        CoreTypeBox polyT = box(CoreType{Ptyp_poly{std::move(varlist), std::move(Tv), /*from_newtypes=*/true}, polyTloc});
         Location pl = span(newtypeStart, bodyEnd, /*ghost=*/true);  // poly_exp_loc
         kind = Cfk_concrete{ovr, E({Pexp_poly{std::move(wrapped), std::move(polyT)}, pl})};
       } else if (cur().kind == Kind::COLON) {

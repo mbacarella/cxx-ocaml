@@ -144,7 +144,12 @@ struct Ptyp_package {  // (module S [with type t = u and …])
 };
 struct Ptyp_class { LongidentLoc id; std::vector<CoreTypeBox> args; };  // [args] #class
 struct Ptyp_alias { CoreTypeBox type; std::string name; Location name_loc{}; };  // (t as 'a); name_loc spans 'a
-struct Ptyp_poly { std::vector<std::string> vars; CoreTypeBox type; };  // 'a 'b. t
+struct Ptyp_poly {  // 'a 'b. t
+  std::vector<std::string> vars;
+  CoreTypeBox type;
+  // wrap_type_annotation's: the vars are the Pexp_newtype chain's own names
+  bool from_newtypes = false;
+};
 struct Ptyp_open { LongidentLoc mod_; CoreTypeBox type; };  // M.(t)
 struct Ptyp_functor { ArgLabel label; StringLoc name; Ptyp_package pkg; CoreTypeBox body; };  // (module M : T) -> t
 struct Ptyp_extension { ExtName name; ExtPayload payload; };  // [%id]

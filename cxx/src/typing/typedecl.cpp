@@ -596,7 +596,7 @@ void check_coherence(env::t env, const Location& loc, Path::t dpath, const TypeD
       if (eq) {
         subst::t s = subst::unsafe::add_type_path(dpath, tc->path, subst::identity());
         const TypeDeclaration* d = subst::type_declaration(s, decl);
-        err = includecore::type_declarations(true, loc, env, true, path::last(tc->path), decl2, dpath, d);
+        err = includecore::type_declarations(true, loc, env, true, std::string(path::last(tc->path)), decl2, dpath, d);
       }
     }
   } catch (const env::NotFound&) {
