@@ -106,14 +106,35 @@ static Slice<const tt::ValueBinding*> value_bindings_of_pat_exp_lists(const PatL
   return slice(l);
 }
 
-// (the unused-variable bookkeeping of type_let_def_wrap_warnings only feeds
-// warnings; what remains is the ghost bindings that give the missing-"rec"
-// hint of unbound-value errors)
 static ExpList type_let_def_wrap_warnings(
-    bool is_recursive, env::t exp_env, Slice<const pt::ValueBinding*> spat_sexp_list, const PatList& pat_list,
-    const std::vector<PatternVariable>& pvs,
+    env::CheckFn check, env::CheckFn check_strict, bool is_recursive, env::t exp_env, env::t new_env,
+    Slice<const pt::ValueBinding*> spat_sexp_list, const std::vector<pt::Attributes>& attrs_list,
+    const PatList& pat_list, const std::vector<PatternVariable>& pvs,
     const std::function<std::pair<const tt::Expression*, std::optional<std::vector<TypeExpr*>>>(
         env::t, const pt::ValueBinding*, TypeExpr*)>& type_def) {
+  if (!check) check = [](std::string s) { return warnings::Warning::with_s(WK::Unused_var, s); };
+  if (!check_strict) check_strict = [](std::string s) { return warnings::Warning::with_s(WK::Unused_var_strict, s); };
+  // the fake let-declaration introduced by fun ?(x = e) -> ...
+  bool is_fake_let = false;
+  if (spat_sexp_list.size() == 1)
+    if (auto* m = as<pt::Pexp_match>(spat_sexp_list[0]->pvb_expr->pexp_desc))
+      if (auto* id = as<pt::Pexp_ident>(m->exp->pexp_desc))
+        if (id->lid.txt->kind == Longident::Kind::Lident && id->lid.txt->s == "*opt*") is_fake_let = true;
+  if (is_fake_let) check = check_strict;
+  bool warn_about_unused_bindings = false;
+  for (auto& attrs : attrs_list) {
+    bool b = builtin_attributes::warning_scope(
+        attrs,
+        [&] {
+          return warnings::is_active(check("")) || warnings::is_active(check_strict("")) ||
+                 (is_recursive && warnings::is_active(39));
+        },
+        false);
+    if (b) {
+      warn_about_unused_bindings = true;
+      break;
+    }
+  }
   bool all_fun = true;
   for (auto* vb : spat_sexp_list)
     if (vb->pvb_expr->pexp_desc->kind != SXK::Pexp_function) all_fun = false;
@@ -122,14 +143,71 @@ static ExpList type_let_def_wrap_warnings(
     if (spat_sexp_list.empty()) throw std::logic_error("type_let_def_wrap_warnings");
     exp_env = maybe_add_pattern_variables_ghost(spat_sexp_list[0]->pvb_loc, exp_env, pvs);
   }
+  // Algorithm to detect unused declarations in recursive bindings (see
+  // typecore.ml): value_used events during the definitions are recorded in
+  // the current definition's slot, and replayed when one of its identifiers
+  // is used afterwards.
+  using Slot = std::shared_ptr<std::vector<Uid>>;
+  auto current_slot = std::make_shared<Slot>();
+  auto rec_needed = std::make_shared<bool>(false);
+  if (attrs_list.size() != pat_list.size()) throw std::invalid_argument("List.map2");
+  std::vector<Slot> slots;
+  for (std::size_t k = 0; k < pat_list.size(); ++k) {
+    Slot slot = builtin_attributes::warning_scope(
+        attrs_list[k],
+        [&]() -> Slot {
+          if (!warn_about_unused_bindings) return nullptr;
+          auto some_used = std::make_shared<bool>(false);
+          Slot sl = std::make_shared<std::vector<Uid>>();
+          for (Ident::t id : tt::pat_bound_idents(pat_list[k].first)) {
+            const ValueDescription* vd = env::find_value(Path::pident(id), new_env);
+            std::string name(ident::name(id));
+            auto used = std::make_shared<bool>(false);
+            if (!(name.empty() || name[0] == '_' || name[0] == '#')) {
+              Location vloc = vd->val_loc;
+              add_delayed_check([used, some_used, vloc, name, check, check_strict] {
+                if (!*used) location::prerr_warning(vloc, (*some_used ? check_strict : check)(name));
+              });
+            }
+            Uid vuid = vd->val_uid;
+            env::set_value_used_callback(vd, [current_slot, rec_needed, sl, used, some_used, vuid] {
+              if (*current_slot) {
+                (*current_slot)->insert((*current_slot)->begin(), vuid);
+                *rec_needed = true;
+              } else {
+                std::vector<Uid> l = *sl;  // get_ref slot
+                sl->clear();
+                for (const Uid& u : l) env::mark_value_used(u);
+                *used = true;
+                *some_used = true;
+              }
+            });
+          }
+          return sl;
+        },
+        false);
+    slots.push_back(slot);
+  }
   if (spat_sexp_list.size() != pat_list.size()) throw std::invalid_argument("List.map2");
   ExpList exp_list;
-  for (std::size_t k = 0; k < spat_sexp_list.size(); ++k)
+  for (std::size_t k = 0; k < spat_sexp_list.size(); ++k) {
+    if (is_recursive) *current_slot = slots[k];
     exp_list.push_back(type_def(exp_env, spat_sexp_list[k], pat_list[k].second));
+  }
+  *current_slot = nullptr;
+  if (is_recursive && !*rec_needed) {
+    const pt::ValueBinding* vb = spat_sexp_list[0];
+    // See PR#6677
+    builtin_attributes::warning_scope(
+        vb->pvb_attributes, [&] { prerr_warning(vb->pvb_pat->ppat_loc, WK::Unused_rec_flag); }, false);
+  }
   return exp_list;
 }
 
-static std::pair<PatList, ExpList> type_let_exps(bool is_recursive, env::t exp_env, const std::vector<const tt::Pattern*>& pats,
+static std::pair<PatList, ExpList> type_let_exps(const env::CheckFn& check, const env::CheckFn& check_strict,
+                                                 bool is_recursive, env::t exp_env, env::t new_env,
+                                                 const std::vector<pt::Attributes>& attrs_list,
+                                                 const std::vector<const tt::Pattern*>& pats,
                                                  const std::vector<PatternVariable>& pvs,
                                                  Slice<const pt::ValueBinding*> spat_sexp_list) {
   // Instantiate the pattern types: the instantiated type is the pattern
@@ -141,7 +219,7 @@ static std::pair<PatList, ExpList> type_let_exps(bool is_recursive, env::t exp_e
     pat_list.push_back({p2, pat->pat_type});
   }
   ExpList exp_list = type_let_def_wrap_warnings(
-      is_recursive, exp_env, spat_sexp_list, pat_list, pvs,
+      check, check_strict, is_recursive, exp_env, new_env, spat_sexp_list, attrs_list, pat_list, pvs,
       [](env::t exp_env2, const pt::ValueBinding* vb, TypeExpr* expected_ty)
           -> std::pair<const tt::Expression*, std::optional<std::vector<TypeExpr*>>> {
         const pt::Expression* sexp = vb_exp_constraint(vb);
@@ -163,9 +241,13 @@ static std::pair<PatList, ExpList> type_let_exps(bool is_recursive, env::t exp_e
 }
 
 std::pair<Slice<const tt::ValueBinding*>, env::t> type_let_rec(bool reset_tyvarenv, env::t env,
-                                                               Slice<const pt::ValueBinding*> spat_sexp_list) {
+                                                               Slice<const pt::ValueBinding*> spat_sexp_list,
+                                                               const env::CheckFn& check,
+                                                               const env::CheckFn& check_strict) {
   std::vector<std::pair<pt::Attributes, const pt::Pattern*>> spatl;
   for (auto* vb : spat_sexp_list) spatl.push_back(vb_pat_constraint(vb));
+  std::vector<pt::Attributes> attrs_list;
+  for (auto& x : spatl) attrs_list.push_back(x.first);
   // Recursive patterns can only consist of (possibly annotated) variables.
   for (auto* vb : spat_sexp_list)
     if (!is_var_pat(vb->pvb_pat)) raise_error(err(vb->pvb_pat->ppat_loc, env, EK::Illegal_letrec_pat));
@@ -205,7 +287,8 @@ std::pair<Slice<const tt::ValueBinding*>, env::t> type_let_rec(bool reset_tyvare
           return P{tp.patl, tp.env, tp.pattern_forces, tp.pvs};
         });
         env::t new_env = add_let_pattern_vars(p.new_env, p.pvs, p.force);
-        auto [pat_list, exp_list] = type_let_exps(true, new_env, p.pat_list, p.pvs, spat_sexp_list);
+        auto [pat_list, exp_list] =
+            type_let_exps(check, check_strict, true, new_env, new_env, attrs_list, p.pat_list, p.pvs, spat_sexp_list);
         return R{pat_list, exp_list, new_env};
       },
       [&](const R& r) { do_relaxed_value_restriction(env, r.pat_list, r.exp_list); });
@@ -215,9 +298,12 @@ std::pair<Slice<const tt::ValueBinding*>, env::t> type_let_rec(bool reset_tyvare
 
 std::pair<Slice<const tt::ValueBinding*>, env::t> type_let_nonrec(
     bool reset_tyvarenv, std::optional<ExistentialRestriction> existential_context,
-    const ModulePatternsRestriction& allow_modules, env::t env, Slice<const pt::ValueBinding*> spat_sexp_list) {
+    const ModulePatternsRestriction& allow_modules, env::t env, Slice<const pt::ValueBinding*> spat_sexp_list,
+    const env::CheckFn& check, const env::CheckFn& check_strict) {
   std::vector<std::pair<pt::Attributes, const pt::Pattern*>> spatl;
   for (auto* vb : spat_sexp_list) spatl.push_back(vb_pat_constraint(vb));
+  std::vector<pt::Attributes> attrs_list;
+  for (auto& x : spatl) attrs_list.push_back(x.first);
   struct R {
     PatList pat_list;
     ExpList exp_list;
@@ -245,7 +331,8 @@ std::pair<Slice<const tt::ValueBinding*>, env::t> type_let_nonrec(
         // Note [add_module_variables after checking expressions]: the
         // module variables are added after the expressions are typed.
         env::t new_env = add_let_pattern_vars(tp.env, tp.pvs, tp.pattern_forces);
-        auto [pat_list, exp_list] = type_let_exps(false, env, tp.patl, tp.pvs, spat_sexp_list);
+        auto [pat_list, exp_list] =
+            type_let_exps(check, check_strict, false, env, new_env, attrs_list, tp.patl, tp.pvs, spat_sexp_list);
         // Do exhaustiveness checks on patterns
         if (pat_list.size() != spatl.size() || exp_list.size() != spatl.size())
           throw std::invalid_argument("List.map2");
@@ -422,13 +509,15 @@ SendResult type_send(env::t env, const Location&, Explanation explanation, const
 
 // Typing of toplevel bindings
 TypeBindingResult type_binding(env::t env, RecFlag rec_flag, Slice<const pt::ValueBinding*> spat_sexp_list) {
+  env::CheckFn check = [](std::string s) { return warnings::Warning::with_s(WK::Unused_value_declaration, s); };
+  env::CheckFn check_strict = check;
   if (rec_flag == RecFlag::Recursive) {
-    auto [vbs, e] = type_let_rec(true, env, spat_sexp_list);
+    auto [vbs, e] = type_let_rec(true, env, spat_sexp_list, check, check_strict);
     return {vbs, e};
   }
   auto [vbs, e] = type_let_nonrec(true, ExistentialRestriction::At_toplevel,
                                   ModulePatternsRestriction{ModulePatternsRestriction::Kind::Modules_rejected}, env,
-                                  spat_sexp_list);
+                                  spat_sexp_list, check, check_strict);
   return {vbs, e};
 }
 

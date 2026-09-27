@@ -424,8 +424,27 @@ void pp_footnote(format::Formatter& ppf, const Report& report) {
 
 }  // namespace
 
+// num_loc_lines: the lines printed by the reports of the current batch;
+// a follow-up report is separated from the previous one by a blank line
+static long num_loc_lines = 0;
+
+static void print_report_(format::Formatter& ppf, const Report& report);
+
 void print_report(format::Formatter& ppf, const Report& report) {
-  // separate_new_message: not the toplevel, num_loc_lines unused
+  // separate_new_message
+  if (num_loc_lines != 0) {
+    ppf.print_newline();
+    ++num_loc_lines;
+  }
+  // print_updating_num_loc_lines: count the newlines the report outputs
+  std::size_t before = ppf.contents().size();
+  print_report_(ppf, report);
+  const std::string& out = ppf.contents();
+  for (std::size_t i = before; i < out.size(); ++i)
+    if (out[i] == '\n') ++num_loc_lines;
+}
+
+static void print_report_(format::Formatter& ppf, const Report& report) {
   if (report.kind == ReportKind::Report_error) {
     // "@[<v>%a%a%a: %a@[%a@]%a%a%a@]@."
     ppf.open_vbox(0);

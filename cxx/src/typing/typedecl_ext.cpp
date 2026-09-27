@@ -392,7 +392,7 @@ std::pair<const tt::TValueDescription*, env::t> transl_value_decl(env::t env, co
     auto* v = make<ValueDescription>(cty->ctyp_type, ValueKind{}, loc,
                                      parsetree::types_attributes(valdecl->pval_attributes),
                                      uid::mk(env::get_current_unit()));
-    auto [id, newenv] = env::enter_value(valdecl->pval_name.txt, v, env);
+    auto [id, newenv] = env::enter_value(valdecl->pval_name.txt, v, env, [](std::string s) { return warnings::Warning::with_s(warnings::Warning::K::Unused_value_declaration, s); });
     auto* desc = make<tt::TValueDescription>(id, valdecl->pval_name, cty, v, valdecl->pval_loc, valdecl->pval_attributes);
     return std::make_pair(static_cast<const tt::TValueDescription*>(desc), newenv);
   });
@@ -422,7 +422,7 @@ std::pair<const tt::TPrimitiveDescription*, env::t> transl_prim_desc(env::t env,
       vk.prim = prim;
       auto* v = make<ValueDescription>(ty, vk, loc, parsetree::types_attributes(primdesc->pprim_attributes),
                                        uid::mk(env::get_current_unit()));
-      auto [id, newenv] = env::enter_value(primdesc->pprim_name.txt, v, env);
+      auto [id, newenv] = env::enter_value(primdesc->pprim_name.txt, v, env, [](std::string s) { return warnings::Warning::with_s(warnings::Warning::K::Unused_value_declaration, s); });
       tt::PrimitiveKind tk{tt::PrimitiveKind::Kind::Tprim_decl, cty, pk.prims};
       return {make<tt::TPrimitiveDescription>(id, primdesc->pprim_name, tk, v, primdesc->pprim_loc,
                                               primdesc->pprim_attributes),
@@ -454,7 +454,7 @@ std::pair<const tt::TPrimitiveDescription*, env::t> transl_prim_desc(env::t env,
       v2->val_loc = loc;
       v = v2;
     }
-    auto [id, newenv] = env::enter_value(primdesc->pprim_name.txt, v, env);
+    auto [id, newenv] = env::enter_value(primdesc->pprim_name.txt, v, env, [](std::string s) { return warnings::Warning::with_s(warnings::Warning::K::Unused_value_declaration, s); });
     tt::PrimitiveKind tk{tt::PrimitiveKind::Kind::Tprim_alias, cty, {}, path, pprim_ident};
     return {make<tt::TPrimitiveDescription>(id, primdesc->pprim_name, tk, v, primdesc->pprim_loc,
                                             primdesc->pprim_attributes),

@@ -9,6 +9,7 @@
 #include "cppcaml/typing/includeclass.hpp"
 #include "cppcaml/typing/subst.hpp"
 #include "cppcaml/typing/typeclass.hpp"
+#include "cppcaml/typing/location.hpp"
 #include "cppcaml/typing/printtyp.hpp"
 #include "cppcaml/typing/typedecl.hpp"
 #include "cppcaml/typing/typedecl_variance.hpp"
@@ -111,9 +112,13 @@ Constraints extract_constraints(const ClassType* cty) {
   return {slice(v), slice(m), slice(std::vector<std::string_view>(c.begin(), c.end()))};
 }
 
-void update_class_signature(const Location& loc, env::t env, VirtualFlag virt, Kind kind, ClassSignature* sign) {
-  // (the Implicit_public_methods warning is not emitted)
-  ctype::update_implicitly_public_methods(sign);
+void update_class_signature(const Location& loc, env::t env, VirtualFlag virt, Kind kind, ClassSignature* sign,
+                            bool warn_implicit_public = false) {
+  std::vector<std::string_view> implicitly_public = ctype::update_implicitly_public_methods(sign);
+  if (warn_implicit_public && !implicitly_public.empty()) {
+    std::vector<std::string> l(implicitly_public.begin(), implicitly_public.end());
+    location::prerr_warning(loc, warnings::Warning::with_l(warnings::Warning::K::Implicit_public_methods, l));
+  }
   std::vector<std::string_view> implicitly_declared = ctype::update_implicitly_declared_methods(env, sign);
   if (!implicitly_declared.empty() && virt == VirtualFlag::Concrete) {
     Error e = err(loc, env, EK::Undeclared_methods);
@@ -503,12 +508,15 @@ std::pair<Ident::t, env::t> enter_ancestor_met(const Location& loc, std::string_
   kind.meths = meths;
   kind.cl_num = cl_num;
   auto* desc = make<ValueDescription>(ty, kind, loc, attrs, uid::mk(env::get_current_unit()));
-  return env::enter_value(name, desc, met_env);
+  return env::enter_value(name, desc, met_env, [](std::string s) {
+    return warnings::Warning::with_s(warnings::Warning::K::Unused_ancestor, s);
+  });
 }
 
 env::t add_self_met(const Location& loc, Ident::t id, ClassSignature* sign, bool self_virtual,
-                    StrMap<Ident::t>* meths, const StrMap<Ident::t>& vars, std::string_view cl_num, TypeExpr* ty,
-                    Attributes attrs, env::t met_env) {
+                    StrMap<Ident::t>* meths, const StrMap<Ident::t>& vars, std::string_view cl_num, bool as_var,
+                    TypeExpr* ty, Attributes attrs, env::t met_env) {
+  warnings::Warning::K wk = as_var ? warnings::Warning::K::Unused_var : warnings::Warning::K::Unused_var_strict;
   ValueKind kind{ValueKind::Kind::Val_self};
   kind.sign = sign;
   kind.self_virtual = self_virtual;
@@ -516,7 +524,7 @@ env::t add_self_met(const Location& loc, Ident::t id, ClassSignature* sign, bool
   kind.vars = vars;
   kind.cl_num = cl_num;
   auto* desc = make<ValueDescription>(ty, kind, loc, attrs, uid::mk(env::get_current_unit()));
-  return env::add_value(id, desc, met_env);
+  return env::add_value(id, desc, met_env, [wk](std::string s) { return warnings::Warning::with_s(wk, s); });
 }
 
 env::t add_instance_var_met(const Location& loc, std::string_view label, Ident::t id, const ClassSignature* sign,
@@ -560,6 +568,7 @@ struct IntermediateClassField {
   const pt::Attribute* attribute = nullptr;                 // Attribute
   Location loc;
   pt::Attributes attributes;
+  warnings::State warning_state;  // Concrete_method / Initializer
 };
 
 struct FirstPassAcc {
@@ -619,8 +628,21 @@ void class_field_first_pass(const Location& self_loc, std::string_view cl_num, F
         MethSet new_concrete_vals = concrete_instance_vars(parent_sign);
         MethSet over_meths = set_inter(new_concrete_meths, acc.concrete_meths);
         MethSet over_vals = set_inter(new_concrete_vals, acc.concrete_vals);
-        // (Fresh: the Method_override / Instance_variable_override warnings
-        // are not emitted)
+        if (in->ovr == OverrideFlag::Fresh) {
+          std::string cname = "inherited";
+          if (parent->cl_type->kind == ClassType::Kind::Cty_constr) cname = path::name(parent->cl_type->path);
+          if (!over_meths.empty()) {
+            std::vector<std::string> l{cname};
+            for (auto m : over_meths) l.push_back(std::string(m));
+            location::prerr_warning(loc, warnings::Warning::with_l(warnings::Warning::K::Method_override, l));
+          }
+          if (!over_vals.empty()) {
+            std::vector<std::string> l{cname};
+            for (auto m : over_vals) l.push_back(std::string(m));
+            location::prerr_warning(loc,
+                                    warnings::Warning::with_l(warnings::Warning::K::Instance_variable_override, l));
+          }
+        }
         if (in->ovr == OverrideFlag::Override && over_meths.empty() && over_vals.empty()) {
           Error e = err(loc, acc.val_env, EK::No_overriding);
           raise_error(e);
@@ -699,7 +721,11 @@ void class_field_first_pass(const Location& self_loc, std::string_view cl_num, F
           e.name2 = std::string(label.txt);
           raise_error(e);
         }
-        if (!acc.concrete_vals.count(label.txt) && v->kind_.ovr == OverrideFlag::Override) {
+        if (acc.concrete_vals.count(label.txt)) {
+          if (v->kind_.ovr == OverrideFlag::Fresh)
+            location::prerr_warning(label.loc, warnings::Warning::with_l(warnings::Warning::K::Instance_variable_override,
+                                                                         {std::string(label.txt)}));
+        } else if (v->kind_.ovr == OverrideFlag::Override) {
           Error e = err(loc, acc.val_env, EK::No_overriding);
           e.name = "instance variable";
           e.name2 = std::string(label.txt);
@@ -756,7 +782,11 @@ void class_field_first_pass(const Location& self_loc, std::string_view cl_num, F
           e.name2 = std::string(label.txt);
           raise_error(e);
         }
-        if (!acc.concrete_meths.count(label.txt) && m->kind_.ovr == OverrideFlag::Override) {
+        if (acc.concrete_meths.count(label.txt)) {
+          if (m->kind_.ovr == OverrideFlag::Fresh)
+            location::prerr_warning(loc, warnings::Warning::with_l(warnings::Warning::K::Method_override,
+                                                                   {std::string(label.txt)}));
+        } else if (m->kind_.ovr == OverrideFlag::Override) {
           Error e = err(loc, acc.val_env, EK::No_overriding);
           e.name = "method";
           e.name2 = std::string(label.txt);
@@ -800,6 +830,7 @@ void class_field_first_pass(const Location& self_loc, std::string_view cl_num, F
         field.priv = m->priv;
         field.override_ = m->kind_.ovr;
         field.sdefinition = sdefinition;
+        field.warning_state = warnings::backup();
         field.loc = loc;
         field.attributes = attributes;
         acc.rev_fields.push_back(field);
@@ -828,6 +859,7 @@ void class_field_first_pass(const Location& self_loc, std::string_view cl_num, F
         const pt::Expression* sexpr = make_method(self_loc, cl_num, as<pt::Pcf_initializer>(d)->exp);
         IntermediateClassField field{IK::Initializer};
         field.sdefinition = sexpr;
+        field.warning_state = warnings::backup();
         field.loc = loc;
         field.attributes = attributes;
         acc.rev_fields.push_back(field);
@@ -891,8 +923,7 @@ std::pair<env::t, const tt::ClassField*> class_field_second_pass(std::string_vie
       auto* desc = mkd(tt::Tcf_method{{CFK::Tcf_method}, field.label, field.priv, tt::ClassFieldKind{true, field.cty}});
       return {met_env, mkcf(desc, field.loc, field.attributes)};
     }
-    case IK::Concrete_method: {
-      // (Warnings.with_state: warnings are not ported)
+    case IK::Concrete_method: return warnings::with_state(field.warning_state, [&]() -> std::pair<env::t, const tt::ClassField*> {
       TypeExpr* ty = method_type(field.label.txt, sign);
       TypeExpr* self_param_type = newgenmono(sign->csig_self);
       tc::TypeExpected meth_type =
@@ -902,11 +933,11 @@ std::pair<env::t, const tt::ClassField*> class_field_second_pass(std::string_vie
       auto* desc = mkd(tt::Tcf_method{{CFK::Tcf_method}, field.label, field.priv,
                                       tt::ClassFieldKind{false, nullptr, field.override_, texp}});
       return {met_env, mkcf(desc, field.loc, field.attributes)};
-    }
+    });
     case IK::Constraint:
       return {met_env, mkcf(mkd(tt::Tcf_constraint{{CFK::Tcf_constraint}, field.cty1, field.cty2}), field.loc,
                             field.attributes)};
-    case IK::Initializer: {
+    case IK::Initializer: return warnings::with_state(field.warning_state, [&]() -> std::pair<env::t, const tt::ClassField*> {
       TypeExpr* unit_type = ctype::instance(predef::type_unit());
       TypeExpr* self_param_type = ctype::newmono(sign->csig_self);
       tc::TypeExpected meth_type =
@@ -914,7 +945,7 @@ std::pair<env::t, const tt::ClassField*> class_field_second_pass(std::string_vie
       const tt::Expression* texp =
           ctype::with_raised_nongen_level([&] { return tc::type_expect(met_env, field.sdefinition, meth_type); });
       return {met_env, mkcf(mkd(tt::Tcf_initializer{{CFK::Tcf_initializer}, texp}), field.loc, field.attributes)};
-    }
+    });
     case IK::Attribute:
       return {met_env, mkcf(mkd(tt::Tcf_attribute{{CFK::Tcf_attribute}, field.attribute}), field.loc,
                             field.attributes)};
@@ -988,12 +1019,13 @@ const tt::ClassStructure* class_structure(std::string_view cl_num, VirtualFlag v
   auto* meths_ref = make<StrMap<Ident::t>>(meths);  // Self_virtual (ref meths) | Self_concrete meths
   for (std::size_t k = self_pat_vars.size(); k-- > 0;) {  // List.fold_right
     const tc::PatternVariable& pv = self_pat_vars[k];
-    met_env = add_self_met(pv.pv_loc, pv.pv_id, sign, self_virtual, meths_ref, vars, cl_num, pv.pv_type,
+    met_env = add_self_met(pv.pv_loc, pv.pv_id, sign, self_virtual, meths_ref, vars, cl_num,
+                           pv.pv_kind == tc::PatternVariableKind::As_var, pv.pv_type,
                            pt::types_attributes(pv.pv_attributes), met_env);
   }
   std::vector<const tt::ClassField*> tfields = class_fields_second_pass(cl_num, sign, met_env, fields);
   // Update the class signature and warn about private methods made public
-  update_class_signature(loc, val_env, virt, kind, sign);
+  update_class_signature(loc, val_env, virt, kind, sign, true);
   return make<tt::ClassStructure>(self_pat, slice(tfields), sign, *meths_ref);
 }
 
@@ -1122,7 +1154,13 @@ const tt::ClassExpr* class_expr_aux(std::string_view cl_num, Final final, env::t
       }
       const tt::ClassExpr* cl = ctype::with_raised_nongen_level(
           [&] { return class_expr(cl_num, final, val_env2, r.met_env, virt, self_scope, f->body); });
-      // (the Unerasable_optional_argument warning is not emitted)
+      auto not_nolabel_function = [](const ClassType* t) {
+        for (; t->kind == ClassType::Kind::Cty_arrow; t = t->cty)
+          if (t->label.kind == ArgLabel::Kind::Nolabel) return false;
+        return true;
+      };
+      if (is_optional(f->label) && not_nolabel_function(cl->cl_type))
+        location::prerr_warning(pat->pat_loc, warnings::Warning::make(warnings::Warning::K::Unerasable_optional_argument));
       TypeExpr* ity = ctype::instance(pat->pat_type);
       return mk_cl(mkd(tt::Tcl_fun{{TK::Tcl_fun}, f->label, pat, slice(pv), cl, partial}), scl->pcl_loc,
                    cty_arrow(f->label, ity, cl->cl_type), val_env, scl->pcl_attributes);
@@ -1145,8 +1183,13 @@ const tt::ClassExpr* class_expr_aux(std::string_view cl_num, Final final, env::t
         bool any_label = false;
         for (auto& l : labels)
           if (l.kind != ArgLabel::Kind::Nolabel) any_label = true;
-        // (the Labels_omitted warning is not emitted)
         ignore_labels = labels.size() == sargs0.size() && all_nolabel && any_label;
+        if (ignore_labels) {
+          std::vector<std::string> ls;
+          for (auto& l : labels)
+            if (l.kind != ArgLabel::Kind::Nolabel) ls.push_back(std::string(l.name));
+          location::prerr_warning(cl->cl_loc, warnings::Warning::with_l(warnings::Warning::K::Labels_omitted, ls));
+        }
       }
       std::vector<tt::LabeledArg> args;
       std::vector<std::pair<ArgLabel, TypeExpr*>> omitted;  // head first
@@ -1190,7 +1233,10 @@ const tt::ClassExpr* class_expr_aux(std::string_view cl_num, Final final, env::t
             }
           } else if (auto x = extract_label(name, sargs)) {
             auto& [l2, sarg, commuted, rem] = *x;
-            (void)commuted;  // (the Nonoptional_label warning is not emitted)
+            (void)commuted;
+            if (!optional && is_optional(l2))
+              location::prerr_warning(sarg->pexp_loc, warnings::Warning::with_s(warnings::Warning::K::Nonoptional_label,
+                                                                                std::string(label_name(l))));
             arg = tt::ApplyArg{false, use_arg(sarg, l2)};
             remaining_sargs = rem;
           } else {
