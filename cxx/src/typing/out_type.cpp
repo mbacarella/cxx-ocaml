@@ -495,9 +495,54 @@ void add(Path::t p) {
   }
 }
 std::vector<std::pair<std::vector<Path::t>, Explanation>> explain(env::t e) {
-  // (needed by the error reports: stage 9b)
-  (void)e;
-  return {};
+  // fold_type_origin f acc: over the recorded names, in Ident.Set order
+  auto fold_type_origin = [&](const std::function<void(Path::t, const TypeOrigin&)>& f) {
+    for (Ident::t id : names) {
+      Path::t p = Path::pident(id);
+      const TypeDeclaration* decl;
+      try {
+        decl = env::find_type(p, e);
+      } catch (const env::NotFound&) {
+        continue;
+      }
+      f(p, bt::type_origin(decl));
+    }
+  };
+  // constrs: String.Map.add_to_list constr p (the list most recent first)
+  std::map<std::string, std::vector<Path::t>> constrs;
+  fold_type_origin([&](Path::t p, const TypeOrigin& o) {
+    if (o.kind == TypeOrigin::Kind::Existential) {
+      auto& l = constrs[std::string(o.existential)];
+      l.insert(l.begin(), p);
+    }
+  });
+  std::vector<std::pair<std::vector<Path::t>, Explanation>> out;
+  for (auto& [constructor, ids] : constrs)
+    if (!ids.empty()) out.push_back({ids, Explanation{Explanation::K::Existential, constructor}});
+  // eqns: TypeMap (by id) of lhs to TypeMap of rhs to paths
+  std::map<long, std::pair<TypeExpr*, std::map<long, std::pair<TypeExpr*, std::vector<Path::t>>>>> eqns;
+  fold_type_origin([&](Path::t p, const TypeOrigin& o) {
+    if (o.kind != TypeOrigin::Kind::Equation) return;
+    TypeExpr *t1 = o.eq1, *t2 = o.eq2;
+    if (types::get_id(t1) >= types::get_id(t2)) std::swap(t1, t2);
+    auto& inner = eqns[types::get_id(t1)];
+    inner.first = t1;
+    auto& ps = inner.second[types::get_id(t2)];
+    ps.first = t2;
+    ps.second.insert(ps.second.begin(), p);
+  });
+  // from_eqns: consed while folding in increasing order -- the last first
+  std::vector<std::pair<std::vector<Path::t>, Explanation>> from_eqns;
+  for (auto& [_, lhs] : eqns)
+    for (auto& [__, rhs] : lhs.second) {
+      std::vector<Path::t> ids(rhs.second.rbegin(), rhs.second.rend());
+      Explanation x{Explanation::K::Equation, "", lhs.first, rhs.first};
+      from_eqns.insert(from_eqns.begin(), {ids, x});
+    }
+  out.insert(out.end(), from_eqns.begin(), from_eqns.end());
+  for (auto& [ids, _] : out)
+    std::stable_sort(ids.begin(), ids.end(), [](Path::t a, Path::t b) { return path::compare(a, b) < 0; });
+  return out;
 }
 }  // namespace internal_names
 

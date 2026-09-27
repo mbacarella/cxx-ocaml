@@ -286,12 +286,29 @@ from the port.  The two must be identical on every .cmi in the tree
    own writer's view of the unit's .mli, until stage 10 removed it.  Type
    checking is on by default; DDC 139/139 .cmo + 216 .cmi and effid
    139/139 with it.
-9. **Messages:** `Printtyp` (+ `Out_type`, `Oprint`, `Errortrace_report`),
-   the `report_error` functions and `Location`'s reporting; then the
+9. **Messages.**  9a **done (2026-09-26): the type printers.**
+   `Format_doc` (documents built by printers and by a format-string
+   interpreter -- tags, magic sizes -- laid out by the Format engine
+   port), `Outcometree`, `Oprint`, `Out_type` (type-variable naming,
+   alias marking, `t/2` disambiguation in the printing environment),
+   `Printtyp`, `Printpat`, `Pprintast.Doc`'s longidents; the driver's `-i`
+   / `-i-variance`.  `intf_parity.sh` (-i stdout + exit code vs
+   ocamlc.opt): stamp probes 6531/6531, compiler sources 296/296, stdlib
+   144/144, testsuite 858/858 (+2 false accepts = warnings-as-errors).
+   Not ported: -short-paths' shortest-path search (`Clflags.real_paths`
+   = false throws), Warning 63's report (Ident_conflicts collects, the
+   explanation needs `Location.Doc.loc`).  Printpat is untested until
+   Parmatch's warnings print.
+   9b **next:** `Errortrace_report`, the `report_error` functions and
+   `Location`'s reporting (source excerpts, `Location.Doc.loc`), the
    warnings themselves (their state is ported: `-w` / `-warn-error` /
    `-alert` and `[@warning]` scopes drive `Warnings.is_active`) and the
    checks that emit them.  Oracle: ocamlc's stderr, byte for byte
-   (the testsuite's expect outputs are a second oracle).
+   (`ERR=1 intf_parity.sh`, the testsuite's expect outputs).  Error
+   reporters print with `format_doc::fprintf` (Arg: `%a` takes a callable
+   `void(Formatter&)`, `pr(printer, value)`) and `printtyp::` (type_expr,
+   type_scheme, path, type_expansion, modtype, signature ...); a document
+   lays out with `format_doc::format(format::Formatter&, doc)`.
 10. **Done (2026-09-26): code generation from the port.**  `lambda/`
    (Translcore, Translprim, Translattribute, Matching, Switch, Translmod,
    Translobj, Translclass, Value_rec_compiler, Simplif, Tmc, Printlambda
