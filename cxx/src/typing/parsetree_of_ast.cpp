@@ -1031,12 +1031,12 @@ struct Conv {
                                             attrs(v.attrs), l)});
           } else if constexpr (std::is_same_v<T, ast::Psig_modtypesubst>) {
             d = make<Psig_modtypesubst>(Psig_modtypesubst{{K::Psig_modtypesubst},
-                make<ModuleTypeDeclaration>(str(v.name), module_type(v.type), Attributes{}, l)});
+                make<ModuleTypeDeclaration>(str(v.name), module_type(v.type), attrs(v.attrs), l)});
           } else if constexpr (std::is_same_v<T, ast::Psig_modsubst>) {
             // pms_name is a string loc (not an option)
             d = make<Psig_modsubst>(Psig_modsubst{{K::Psig_modsubst},
                 make<ModuleSubstitution>(StrLoc{zborrow(v.name.txt.value_or("_")), loc(v.name.loc)},
-                                         lidloc(v.manifest), Attributes{}, l)});
+                                         lidloc(v.manifest), attrs(v.attrs), l)});
           } else if constexpr (std::is_same_v<T, ast::Psig_open>) {
             d = make<Psig_open>(Psig_open{{K::Psig_open}, open_description(v.ovr, v.id, l, attrs(v.attrs))});
           } else if constexpr (std::is_same_v<T, ast::Psig_include>) {

@@ -422,8 +422,8 @@ struct ModuleDeclaration { StrOptLoc name; ModuleTypeBox type; Attributes attrs;
 struct Psig_module { ModuleDeclaration md; };
 struct Psig_recmodule { std::vector<ModuleDeclaration> decls; };  // module rec M : … and N : …
 struct Psig_modtype { StringLoc name; std::optional<ModuleType> type; Attributes attrs; };  // module type S [= mty]
-struct Psig_modtypesubst { StringLoc name; ModuleType type; };  // module type S := mty
-struct Psig_modsubst { StrOptLoc name; LongidentLoc manifest; };  // module M := X.Y
+struct Psig_modtypesubst { StringLoc name; ModuleType type; Attributes attrs; };  // module type S := mty
+struct Psig_modsubst { StrOptLoc name; LongidentLoc manifest; Attributes attrs; };  // module M := X.Y
 struct Psig_open { OverrideFlag ovr; LongidentLoc id; Attributes attrs; };
 struct Psig_include { ModuleType mt; Attributes attrs; };
 struct Psig_class { std::vector<ClassTypeDeclaration> decls; };  // class c : ct  (class_description)

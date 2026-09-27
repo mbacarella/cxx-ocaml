@@ -4114,7 +4114,12 @@ class Parser {
       if (cur().kind == Kind::COLONEQUAL) {  // module type S := mty
         advance();
         ModuleType mt = parse_module_type();
-        return wrap_sig_ext(SignatureItem{Psig_modtypesubst{StringLoc{nm.text, tokloc(nm)}, std::move(mt)}, here()}, std::move(mt_ext));
+        // module_type_subst: attrs1 @ attrs2 (post_item_attributes), symbol_docs $sloc
+        while (cur().kind == Kind::LBRACKETATAT) { advance(); mtattrs.push_back(parse_attribute_body()); }
+        Location l = here();
+        attach_docs(mtattrs, l.start.cnum, l.end.cnum);
+        return wrap_sig_ext(SignatureItem{Psig_modtypesubst{StringLoc{nm.text, tokloc(nm)}, std::move(mt),
+                                                            std::move(mtattrs)}, l}, std::move(mt_ext));
       }
       std::optional<ModuleType> mty;
       if (cur().kind == Kind::EQUAL) { advance(); mty = parse_module_type(); }
@@ -4155,9 +4160,13 @@ class Parser {
         // MODULE ext attributes mkrhs(UIDENT) COLONEQUAL error: expecting $loc($6) "module path"
         if (cur().kind != Kind::UIDENT) expecting(cur().start, cur().end, "module path");
         LongidentLoc id = parse_type_path();
-        Attributes docs;  // module_subst's symbol_docs (Psig_modsubst keeps no attributes)
-        attach_docs(docs, t.start, tokens_[idx_ - 1].end);
-        return wrap_sig_ext(SignatureItem{Psig_modsubst{std::move(name), std::move(id)}, here()}, std::move(mod_ext));
+        // module_subst: attrs1 @ attrs2 (post_item_attributes), symbol_docs $sloc
+        Attributes msattrs = std::move(prefixattrs);
+        while (cur().kind == Kind::LBRACKETATAT) { advance(); msattrs.push_back(parse_attribute_body()); }
+        Location l = here();
+        attach_docs(msattrs, l.start.cnum, l.end.cnum);
+        return wrap_sig_ext(SignatureItem{Psig_modsubst{std::move(name), std::move(id), std::move(msattrs)}, l},
+                            std::move(mod_ext));
       }
       if (cur().kind == Kind::EQUAL) {  // module B = A.C  (module alias)
         advance();
