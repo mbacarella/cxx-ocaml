@@ -314,9 +314,9 @@ static ctype::PackageSubtypeResult package_subtype(env::t env, const Package* pa
   };
   const ModuleType *mty1, *mty2;
   try {
-    // (mkmty pack1, mkmty pack2): right to left
-    mty2 = mkmty(pack2);
+    // (mkmty pack1, mkmty pack2): a `match` scrutinee tuple, evaluated left to right (Translcore binds its components in order)
     mty1 = mkmty(pack1);
+    mty2 = mkmty(pack2);
   } catch (const Error& e) {
     if (e.kind != EK::Cannot_scrape_package_type) throw;
     et::FirstClassModule f{et::FirstClassModule::Kind::Package_cannot_scrape};

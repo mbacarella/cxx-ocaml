@@ -124,9 +124,9 @@ void update_class_signature(const Location& loc, env::t env, VirtualFlag virt, K
 
 void check_virtual(const Location& loc, env::t env, VirtualFlag virt, Kind kind, const ClassSignature* sign) {
   if (virt == VirtualFlag::Virtual) return;
-  // (Btype.virtual_methods sign, Btype.virtual_instance_vars sign): right to left
-  std::vector<std::string_view> vars = virtual_instance_vars(sign);
+  // (Btype.virtual_methods sign, Btype.virtual_instance_vars sign): a `match` scrutinee tuple, evaluated left to right (Translcore binds its components in order)
   std::vector<std::string_view> meths = virtual_methods(sign);
+  std::vector<std::string_view> vars = virtual_instance_vars(sign);
   if (meths.empty() && vars.empty()) return;
   Error e = err(loc, env, EK::Virtual_class);
   e.class_kind = kind;

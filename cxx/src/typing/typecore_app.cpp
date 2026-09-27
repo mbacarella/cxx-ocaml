@@ -382,9 +382,9 @@ CollectedArgs collect_apply_args(env::t env, const tt::Expression* funct, bool i
       fa = collect_functor_module_arg(env, arg_opt->first, rev_args, funct, packing->me, packing->pack, tfun,
                                       tfun0, l);
     } else {
-      // (filter_arrow .. ty_fun', filter_arrow .. ty_fun0): right to left
-      auto r0 = ctype::filter_arrow(env, true, ty_fun0, l, false);
+      // (filter_arrow .. ty_fun', filter_arrow .. ty_fun0): a `match` scrutinee tuple, evaluated left to right (Translcore binds its components in order)
       auto r = ctype::filter_arrow(env, true, ty_fun2, l, false);
+      auto r0 = ctype::filter_arrow(env, true, ty_fun0, l, false);
       if (r.ok && r0.ok) {
         UntypedArg arg = collect_arrow_arg(l, funct, optional, sargs, r.value.ty_param, r0.value.ty_param, lv,
                                            arg_opt);

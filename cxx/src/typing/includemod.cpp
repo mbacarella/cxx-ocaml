@@ -440,9 +440,9 @@ MtySymResult try_modtypes(const CoreRelation& core, Direction direction, const L
     Path::t p1 = env::normalize_modtype_path(env, mty1->path);
     Path::t p2 = env::normalize_modtype_path(env, subst::modtype_path(s, mty2->path));
     if (path::same(p1, p2)) return ok_none();
-    // (expand_modtype_path env p1, expand_modtype_path env p2): right to left
-    const ModuleType* e2 = expand_modtype_path(env, p2);
+    // (expand_modtype_path env p1, expand_modtype_path env p2): a `match` scrutinee tuple, evaluated left to right (Translcore binds its components in order)
     const ModuleType* e1 = expand_modtype_path(env, p1);
+    const ModuleType* e2 = expand_modtype_path(env, p2);
     if (e1 && e2) return try_modtypes(core, direction, loc, env, s, e1, e2, orig_shape);
     return MtySymResult::Err(mt_core(CMK::Abstract_module_type));
   }

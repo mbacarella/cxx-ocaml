@@ -334,9 +334,9 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
       TypeExpr* ty_expected0 = ctype::instance(ty_expected);
       if (v->arg) {
         // (sarg, get_desc (expand_head env ty_expected1), get_desc (expand_head env ty_expected0)):
-        // right to left
-        TypeExpr* e0 = ctype::expand_head(env, ty_expected0);
+        // a `match` scrutinee tuple, evaluated left to right (Translcore binds its components in order)
         TypeExpr* e1 = ctype::expand_head(env, ty_expected1);
+        TypeExpr* e0 = ctype::expand_head(env, ty_expected0);
         auto* tv = as<Tvariant>(get_desc(e1));
         auto* tv0 = as<Tvariant>(get_desc(e0));
         if (tv && tv0) {
@@ -350,8 +350,8 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
           }
         }
       } else {
-        ctype::expand_head(env, ty_expected0);
         ctype::expand_head(env, ty_expected1);
+        ctype::expand_head(env, ty_expected0);
       }
       // with Exit
       const tt::Expression* arg = v->arg ? type_exp(env, v->arg) : nullptr;
