@@ -498,28 +498,41 @@ diffing::ChangeKind classify_k(int k) {
 
 Ident::t param_id(const Named<FunctorParameter>& x) { return x.item.is_unit ? nullptr : x.item.id; }
 
+// Diffing.classify
+template <class Kind>
+diffing::ChangeKind classify(Kind k) {
+  switch (k) {
+    case Kind::Delete: return diffing::ChangeKind::Deletion;
+    case Kind::Insert: return diffing::ChangeKind::Insertion;
+    case Kind::Change: return diffing::ChangeKind::Modification;
+    case Kind::Keep: return diffing::ChangeKind::Preservation;
+  }
+  return diffing::ChangeKind::Preservation;
+}
+
 // pretty_params sep proj printer patch
 template <class T>
-Printer pretty_params(const std::vector<std::pair<Ident::t, T>>& params, const std::function<Printer(const T&)>& printer,
-                      std::size_t i = 0) {
+Printer pretty_params(const std::vector<std::tuple<Ident::t, T, diffing::ChangeKind>>& params,
+                      const std::function<Printer(const T&)>& printer, std::size_t i = 0) {
   if (i >= params.size()) return ignore_p();
-  auto pp_param = [&](const T& p) -> Printer {
+  // the style of Diffing.classify x
+  auto pp_param = [&](const T& p, diffing::ChangeKind k) -> Printer {
     Printer pr = printer(p);
-    return [pr](Formatter& ppf) {
-      fd::pp_open_stag(ppf, diffing::style_tag);
+    return [pr, k](Formatter& ppf) {
+      fd::pp_open_stag(ppf, diffing::style_tag(k));
       pr(ppf);
       fd::pp_close_stag(ppf);
     };
   };
-  if (i + 1 == params.size()) return pp_param(params[i].second);
+  if (i + 1 == params.size()) return pp_param(std::get<1>(params[i]), std::get<2>(params[i]));
   // dprintf "%t%a%t" (pp_param param) sep () (hide_id id q): right to left
-  Ident::t id = params[i].first;
+  Ident::t id = std::get<0>(params[i]);
   Printer rest;
   if (!id)
     rest = pretty_params(params, printer, i + 1);
   else
     out_type::ident_names::with_fuzzy(id, [&] { rest = pretty_params(params, printer, i + 1); });
-  Printer head = pp_param(params[i].second);
+  Printer head = pp_param(std::get<1>(params[i]), std::get<2>(params[i]));
   return [head, rest](Formatter& ppf) {
     head(ppf);
     space(ppf);
@@ -530,17 +543,17 @@ Printer pretty_params(const std::vector<std::pair<Ident::t, T>>& params, const s
 template <class L>
 Printer expected_p(const NPatch<L>& d) {
   using K = typename NChange<L>::K;
-  std::vector<std::pair<Ident::t, Named<FunctorParameter>>> ps;
+  std::vector<std::tuple<Ident::t, Named<FunctorParameter>, diffing::ChangeKind>> ps;
   for (const auto& [_, x] : d)
-    if (x.k != K::Delete) ps.push_back({param_id(x.right), x.right});
+    if (x.k != K::Delete) ps.push_back({param_id(x.right), x.right, classify(x.k)});
   return pretty_params<Named<FunctorParameter>>(ps, qualified_param);
 }
 
 Printer inclusion_got(const NPatch<FunctorParameter>& d) {
   using K = NChange<FunctorParameter>::K;
-  std::vector<std::pair<Ident::t, Named<FunctorParameter>>> ps;
+  std::vector<std::tuple<Ident::t, Named<FunctorParameter>, diffing::ChangeKind>> ps;
   for (const auto& [_, x] : d)
-    if (x.k != K::Insert) ps.push_back({param_id(x.left), x.left});
+    if (x.k != K::Insert) ps.push_back({param_id(x.left), x.left, classify(x.k)});
   return pretty_params<Named<FunctorParameter>>(ps, qualified_param);
 }
 Printer inclusion_insert(const Named<FunctorParameter>& mty) {
@@ -572,9 +585,9 @@ Printer inclusion_incompatible(const FunctorParameter& p) {
 
 Printer app_got(const NPatch<includemod::AppArg>& d) {
   using K = NChange<includemod::AppArg>::K;
-  std::vector<std::pair<Ident::t, Named<includemod::AppArg>>> ps;
+  std::vector<std::tuple<Ident::t, Named<includemod::AppArg>, diffing::ChangeKind>> ps;
   for (const auto& [_, x] : d)
-    if (x.k != K::Insert) ps.push_back({nullptr, x.left});
+    if (x.k != K::Insert) ps.push_back({nullptr, x.left, classify(x.k)});
   return pretty_params<Named<includemod::AppArg>>(ps, arg_p);
 }
 Printer app_delete(const Named<includemod::AppArg>& mty) {

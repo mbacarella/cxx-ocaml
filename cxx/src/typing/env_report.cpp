@@ -418,7 +418,7 @@ Report report_typetexp_error(const Location& loc, env::t env, const typetexp::Er
       return location::aligned_error_hint(
           loc, {},
           doc_printf("@{<ralign>The type @}%a@ does not expand to a polymorphic variant type",
-                     fd::pr(printtyp::type_expr, e.ty1)),
+                     misc::style::code(printtyp::type_expr, e.ty1)),
           hint);
     }
     case K::Variant_tags:
@@ -435,7 +435,7 @@ Report report_typetexp_error(const Location& loc, env::t env, const typetexp::Er
         else if (k == DescKind::Tunivar)
           fprintf(ppf, "it is already bound to another variable.");
         else
-          fprintf(ppf, "it is bound to@ %a.", fd::pr(printtyp::type_expr, v));
+          fprintf(ppf, "it is bound to@ %a.", misc::style::code(printtyp::type_expr, v));
       };
       return location::errorf(loc, "The universal type variable %a cannot be generalized:@ %a",
                               misc::style::code(pprintast::tyvar, e.name), explanation);
@@ -446,7 +446,7 @@ Report report_typetexp_error(const Location& loc, env::t env, const typetexp::Er
       Report r;
       printtyp::wrap_printing_env(true, env, [&] {
         r = location::errorf(loc, "Method %a has type %a,@ which should be %a", code_str(e.name),
-                             fd::pr(printtyp::type_expr, e.ty1), fd::pr(printtyp::type_expr, e.ty2));
+                             misc::style::code(printtyp::type_expr, e.ty1), misc::style::code(printtyp::type_expr, e.ty2));
       });
       return r;
     }
@@ -460,7 +460,7 @@ Report report_typetexp_error(const Location& loc, env::t env, const typetexp::Er
       });
     }
     case K::Not_an_object:
-      return location::errorf(loc, "@[The type %a@ is not an object type@]", fd::pr(printtyp::type_expr, e.ty1));
+      return location::errorf(loc, "@[The type %a@ is not an object type@]", misc::style::code(printtyp::type_expr, e.ty1));
     case K::Repeated_tuple_label:
       return location::errorf(loc, "@[This tuple type has two labels named %a@]", code_str(e.name));
     case K::Polymorphic_optional_param:

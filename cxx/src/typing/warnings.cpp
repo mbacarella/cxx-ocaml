@@ -1,4 +1,5 @@
 // See warnings.hpp: utils/warnings.ml's state, option parsing and scopes.
+#include <cstdio>
 #include "cppcaml/typing/warnings.hpp"
 
 #include "cppcaml/typing/format.hpp"
@@ -412,6 +413,56 @@ void parse_alert_option(std::string_view s) {
     }
     i = j;
   }
+}
+
+
+// help_warnings (-warn-help): the descriptions (warning_descriptions.inc,
+// generated from ocamlc's Warnings.descriptions), then the letters; the
+// caller exits 0
+namespace {
+struct Description {
+  int number;
+  std::vector<const char*> names;
+  const char* description;
+  std::optional<std::pair<int, int>> since;
+};
+const std::vector<Description>& descriptions() {
+  static const std::vector<Description> d = {
+#include "warning_descriptions.inc"
+  };
+  return d;
+}
+}  // namespace
+
+void help_warnings() {
+  for (const Description& d : descriptions()) {
+    std::string name = d.names.empty() ? "" : std::string(" [") + d.names[0] + "]";
+    char num[16];
+    std::snprintf(num, sizeof num, "%3i", d.number);
+    std::string line = std::string(num) + name + " " + d.description;
+    if (d.since) {
+      // pp_since: " (since %d.%0*d)", minor padded to 2 digits before 5.0
+      char buf[32];
+      if (d.since->first >= 5) std::snprintf(buf, sizeof buf, " (since %d.%d)", d.since->first, d.since->second);
+      else std::snprintf(buf, sizeof buf, " (since %d.%02d)", d.since->first, d.since->second);
+      line += buf;
+    }
+    std::fputs((line + "\n").c_str(), stdout);
+  }
+  std::fputs("  A all warnings\n", stdout);
+  for (char c = 'b'; c <= 'z'; ++c) {
+    std::vector<int> l = letter(c);
+    char up = static_cast<char>(c - 'a' + 'A');
+    if (l.empty()) continue;
+    if (l.size() == 1) {
+      std::printf("  %c Alias for warning %i.\n", up, l[0]);
+    } else {
+      std::string nums;
+      for (std::size_t i = 0; i < l.size(); ++i) nums += (i ? ", " : "") + std::to_string(l[i]);
+      std::printf("  %c warnings %s.\n", up, nums.c_str());
+    }
+  }
+  std::fflush(stdout);
 }
 
 }  // namespace cppcaml::typing::warnings

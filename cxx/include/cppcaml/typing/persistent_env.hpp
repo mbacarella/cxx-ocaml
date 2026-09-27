@@ -36,6 +36,9 @@ void reset();
 void init(const std::vector<std::string>& visible, const std::vector<std::string>& hidden);
 void add_dir(bool hidden, const std::string& dir);
 std::vector<std::string> get_path_list();
+// Load_path.get_visible () |> List.map Dir.files: each visible directory's
+// file names ("" read as the current directory), in the path's order
+std::vector<std::vector<std::string>> visible_dir_files();
 // raise NotFound
 std::string find(const std::string& fn);
 std::pair<std::string, Visibility> find_normalized_with_visibility(const std::string& fn);

@@ -76,6 +76,60 @@ for files where ocamlc prints a warning or alert first (counted before
   `c++cmi`, `modsig.hpp` / `c++modsig-test` and `link::pack`: **deleted**
   once `-pack` was ported (Bytepackager, `Typemod.package_units`).
 
+## Driver options
+
+c++ocamlc's command line is ocamlc's: `driver/main_args.ml`'s bytecode
+option table (keys, Arg kinds, Symbol choices and docs generated from
+ocamlc's own `Make_bytecomp_options (Default.Main).list` by
+`cxx/harness/gen_driver_tables.sh`, with `Config.print_config`'s variables
+and `Warnings.descriptions`; the actions ported in `typing/main_args.cpp`),
+stdlib Arg's parser and messages (`typing/arg.cpp`), Compenv's deferred
+actions, output prefixes, OCAMLPARAM and configuration file
+(`typing/compenv.cpp`), and Maindriver's sequence (`cppocamlc_main.cpp`).
+`cxx/harness/cli_parity.sh` runs a battery of command lines through both
+compilers (invoked as `ocamlc`, in the same directory): stdout, stderr,
+exit code and the files left behind, byte for byte -- 130/132, the two
+KNOWN being `-config`'s `standard_library_default` (c++ocamlc is not
+installed: its default is the stdlib next to it; `$OCAMLLIB` works as in
+ocamlc) and `-bin-annot`'s .cmt (Cmt_format is not ported yet; the flag
+sets `Clflags.binary_annotations` for it).
+
+- **Implemented** (their effects as ocamlc's): everything the typer,
+  translators, Emitcode, Bytepackager and the librarian read, and `-a`
+  `-alert` `-absname` `-c` `-cmi-file` `-color` (`Misc.Style`'s marks, ANSI
+  colours; OCAML_COLOR, NO_COLOR) `-error-style` (OCAML_ERROR_STYLE)
+  `-config` `-config-var` `-dlambda` `-drawlambda` `-dinstr` `-dparsetree`
+  (implementations) `-dump-into-file` `-dump-dir` `-for-pack` `-g` `-H`
+  (hidden) `-i` `-i-variance` `-I` `-impl` `-intf` `-intf-suffix`
+  `-keywords` (the lexer's keyword editions) `-linkall` (link and -a)
+  `-noautolink` `-o` `-open` `-pack` `-pp` (with `-verbose`'s echo)
+  `-plugin` `-safer-matching` `-match-context-rows` `-stop-after`
+  (`lambda` still writes the .cmo, as ocamlc does)
+  `-thread` `-use-runtime` `-runtime-variant` `-with-runtime`
+  `-without-runtime` `-v` `-version` `-vnum` `-where` `-vmthread` `-w`
+  `-warn-error` `-warn-help` `-args` `-args0` `-` `--`, the typing flags,
+  and OCAMLPARAM (all of `read_one_param`; the native-only settings parsed
+  and checked, then unused).  `-a` copies each unit's debug and hint
+  sections and keeps what the unit descriptor shared (byte-identical .cma).
+- **Accepted, no effect to reproduce**: `-bin-annot`,
+  `-bin-annot-occurrences` (flags set for the .cmt writer to come),
+  `-cc` (no C compilation takes place otherwise), `-dcamlprimc` (only with
+  `-custom`), `-dno-canonical-ids`, `-dparsetree-loc-ghost-invariants`,
+  `-no-check-prims` / `-use-prims` (c++ocamlc's linker checks no
+  primitives), `-safe-string`.
+- **Refused where their effect would take place** (`option -X is not
+  supported yet`, exit 2): when compiling a unit, `-annot` / `-dtypes`,
+  `-ppx`, `-dsource`, `-dtypedtree`, `-dshape`, `-dmatchcomp`,
+  `-dcanonical-ids`, `-compat-32`, `-dtimings` / `-dprofile`; when linking,
+  `-custom`, `-output-obj`, `-output-complete-obj`, `-output-complete-exe`,
+  `-make-runtime`, `-dllib` / `-dllib-suffixed`, `-dllpath`, `-cclib` / C
+  object inputs, `-bytecode-hints`, `-launch-method`, `-runtime-search`,
+  `-set-runtime-default`; when building a library, `-custom`, `-cclib`,
+  `-ccopt`, `-dllib`; `.c` inputs; `-depend`.  (`cli_parity.sh` checks the
+  refusals too.)
+- c++ocamlc's own: `-stdlib <dir>` (Config.standard_library, undocumented:
+  the bootstrap harnesses build against a stdlib being built).
+
 ## What counts as progress
 
 Parity with ocamlc, stage by stage, each with an oracle:

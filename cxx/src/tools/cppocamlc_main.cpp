@@ -10,10 +10,12 @@
 // the result is directly executable.  No ocamlc involved; only ocamlrun (the C
 // VM) and the prebuilt stdlib objects are reused.
 //
-// CLI policy: flags whose ARGUMENT we must consume (else they would be mistaken
-// for a source file) and meaning-preserving toggles are accepted and ignored;
-// flags that would silently change the meaning of the output if ignored (-pp,
-// -ppx, -pack, -a, -open, ...) are reported as unsupported rather than dropped.
+// The command line is ocamlc's: driver/main_args.ml's option table,
+// stdlib Arg's parser and messages, Compenv's deferred actions and
+// Maindriver's sequence (typing/{main_args,arg,compenv}).  An option whose
+// effect c++ocamlc does not implement is refused, when that effect would
+// take place, with "option -X is not supported yet" (TYPECHECKER.md,
+// "Driver options").
 #include <pthread.h>
 #include <signal.h>
 #include <sys/mman.h>
@@ -65,74 +67,14 @@
 #include "cppcaml/typing/simplif.hpp"
 #include "cppcaml/typing/translmod.hpp"
 #include "cppcaml/typing/warnings.hpp"
+#include "cppcaml/typing/arg.hpp"
+#include "cppcaml/typing/compenv.hpp"
+#include "cppcaml/typing/config.hpp"
+#include "cppcaml/typing/main_args.hpp"
 
 namespace fs = std::filesystem;
 
-static const char* kVersion = "5.6.0+dev0-2026-01-26";
 
-// Locate the stdlib directory (containing stdlib.cmi / stdlib.cma): an explicit
-// -I, else $OCAMLLIB/$CAMLLIB, else "stdlib" relative to the CWD, else relative
-// to this executable (<repo>/cxx/build/c++ocamlc -> <repo>/stdlib).
-static std::string discover_stdlib(const std::string& flag) {
-  if (!flag.empty()) return flag;
-  if (const char* e = std::getenv("OCAMLLIB"); e && *e) return e;
-  if (const char* e = std::getenv("CAMLLIB"); e && *e) return e;
-  if (fs::exists("stdlib/stdlib.cmi")) return "stdlib";
-  std::error_code ec;
-  fs::path exe = fs::read_symlink("/proc/self/exe", ec);
-  if (!ec) {
-    fs::path cand = exe.parent_path().parent_path().parent_path() / "stdlib";
-    if (fs::exists(cand / "stdlib.cmi")) return cand.string();
-  }
-  return "stdlib";
-}
-
-// Print the full command-line help.  Mirrors `ocamlc -help` in spirit but only
-// documents what c++ocamlc actually implements; the large remainder of ocamlc's
-// vocabulary is accepted-and-ignored (or rejected, see -strict-flags) for
-// drop-in compatibility rather than honoured.
-static void print_help(std::ostream& os) {
-  os <<
-      "Usage: c++ocamlc [options] <files>\n"
-      "\n"
-      "A drop-in bytecode compiler: parses, type-checks, and compiles OCaml\n"
-      "source to .cmo/.cmi, and links .cmo/.cma objects into a runnable\n"
-      "#!ocamlrun bytecode executable.  Accepts ocamlc's flag vocabulary.\n"
-      "\n"
-      "  c++ocamlc -c foo.ml              # foo.ml -> foo.cmo (+ foo.cmi)\n"
-      "  c++ocamlc a.cmo b.cmo -o prog    # link objects into an executable\n"
-      "\n"
-      "Options:\n"
-      "  -a              Build a .cma library from the given .cmo files\n"
-      "  -c              Compile only (do not link); stop at .cmo/.cmi\n"
-      "  -I <dir>        Add <dir> to the list of include directories\n"
-      "                  (a `+dir' is taken relative to the stdlib directory)\n"
-      "  -impl <file>    Compile <file> as a .ml regardless of its extension\n"
-      "  -intf <file>    Compile <file> as a .mli regardless of its extension\n"
-      "  -nocwd          Do not implicitly search the current directory for\n"
-      "                  compiled interfaces\n"
-      "  -nostdlib       Do not add the stdlib directory to the include path,\n"
-      "                  (stdlib.cma is still linked unless -nopervasives)\n"
-      "  -o <file>       Set the output file name\n"
-      "  -pack           Package the given .cmo files into one unit (needs -o)\n"
-      "  -runtime <file> Use <file> as the ocamlrun launched by the output exe\n"
-      "  -strict-flags   Turn accepted-but-ignored and unknown options into\n"
-      "                  errors instead of silently dropping them\n"
-      "  -dparsetree     Dump the parsed AST to stdout, then keep compiling\n"
-      "  -drawlambda     Dump the Lambda IR before Simplif to stderr\n"
-      "  -dlambda        Dump the Lambda IR to stderr, then keep compiling\n"
-      "  -dinstr         Dump the bytecode instructions to stderr, then keep going\n"
-      "  -config         Print the compiler configuration and exit\n"
-      "  -version        Print the compiler version and exit\n"
-      "  -vnum           Print the compiler version number and exit\n"
-      "  -where          Print the standard library directory and exit\n"
-      "  -help, --help   Print this help and exit\n"
-      "\n"
-      "Many other ocamlc options (-w, -g, -bin-annot, ...) are accepted for\n"
-      "compatibility and ignored; a few that would silently change the output\n"
-      "(-pp, -ppx, -open, -for-pack, -i, -output-obj) are rejected.  Use\n"
-      "-strict-flags to also reject the ignored ones.\n";
-}
 
 static std::string module_name(const std::string& path) {
   std::string base = fs::path(path).filename().string();
@@ -162,36 +104,23 @@ static std::string resolve_incdir(const std::string& d, const std::string& stdli
   return inst.string();
 }
 
+// Filename.remove_extension (Unix)
+static std::string remove_extension(const std::string& name) {
+  std::size_t slash = name.rfind('/');
+  std::size_t dot = name.rfind('.');
+  if (dot == std::string::npos || (slash != std::string::npos && dot < slash)) return name;
+  std::size_t base = slash == std::string::npos ? 0 : slash + 1;
+  bool only_dots = true;  // a basename of leading dots only has no extension
+  for (std::size_t k = base; k < dot; ++k) only_dots = only_dots && name[k] == '.';
+  if (only_dots) return name;
+  return name.substr(0, dot);
+}
+
 static bool ends_with(const std::string& s, const char* suf) {
   size_t n = std::string(suf).size();
   return s.size() >= n && s.compare(s.size() - n, n, suf) == 0;
 }
 
-// Flags taking ONE argument that we accept and ignore (must consume the arg so
-// it is not mistaken for a source file).
-static const std::set<std::string> kArgIgnore = {
-    "-color", "-error-style", "-cclib", "-ccopt",
-    "-dllib", "-dllpath", "-intf-suffix", "-intf_suffix",
-    "-cmi-file", "-dump-dir", "-inline", "-afl-inst-ratio", "-function-sections",
-    "-match-context-rows", "-runtime-variant"};
-// Boolean flags we accept and ignore (meaning-preserving for our bytecode output).
-static const std::set<std::string> kBoolIgnore = {
-    "-safe-string", "-unsafe-string", "-strict-sequence", "-no-strict-sequence",
-    "-strict-formats", "-no-strict-formats", "-bin-annot", "-bin-annot-occurrences",
-    "-annot", "-g", "-no-g", "-opaque", "-principal", "-no-principal", "-rectypes",
-    "-no-rectypes", "-short-paths", "-keep-locs", "-no-keep-locs", "-keep-docs",
-    "-no-keep-docs", "-absname", "-no-absname", "-noassert", "-unsafe",
-    "-no-alias-deps", "-alias-deps", "-app-funct", "-no-app-funct", "-compat-32",
-    "-noautolink", "-linkall", "-custom", "-no-check-prims", "-bytecode",
-    "-make-runtime", "-make_runtime", "-with-runtime", "-without-runtime",
-    "-warn-help", "-warn-error-help",
-    // typing/dump switches with no effect on our .cmo/.cmi output
-    "-typing-recovery", "-dno-unique-ids", "-dunique-ids", "-dno-locations", "-dlocations"};
-// Flags that would silently change the output if dropped -> reported unsupported.
-static const std::set<std::string> kUnsupportedArg = {"-ppx"};
-static const std::set<std::string> kUnsupportedBool = {"-output-obj"};
-// -labels/-nolabels affect typing but not our (untyped-after-infer) output.
-static const std::set<std::string> kBoolIgnore2 = {"-labels", "-nolabels"};
 
 
 // Compile a single .ml -> .cmo (+ .cmi unless a hand-written .mli exists).
@@ -200,51 +129,9 @@ static const std::set<std::string> kBoolIgnore2 = {"-labels", "-nolabels"};
 // stdout during compilation and keep going.  Byte-comparable (after the usual
 // label/stamp normalization) with the matching `ocamlc -d*` and with the
 // standalone c++parse / c++lambda / c++instr tools.
-struct DumpFlags { bool parsetree = false, lambda = false, instr = false, rawlambda = false; };
-static DumpFlags g_dump;
-static bool g_nopervasives = false;  // -nopervasives: no implicit Stdlib import
 
-// Clflags the ported type checker reads (the code generator ignores them)
-static void set_typing_flag(const std::string& a) {
-  namespace cf = cppcaml::typing::clflags;
-  if (a == "-principal") cf::principal = true;
-  else if (a == "-no-principal") cf::principal = false;
-  else if (a == "-rectypes") cf::recursive_types = true;
-  else if (a == "-no-rectypes") cf::recursive_types = false;
-  else if (a == "-strict-sequence") cf::strict_sequence = true;
-  else if (a == "-no-strict-sequence") cf::strict_sequence = false;
-  else if (a == "-strict-formats") cf::strict_formats = true;
-  else if (a == "-no-strict-formats") cf::strict_formats = false;
-  else if (a == "-app-funct") cf::applicative_functors = true;
-  else if (a == "-no-app-funct") cf::applicative_functors = false;
-  else if (a == "-no-alias-deps") cf::no_alias_deps = true;
-  else if (a == "-alias-deps") cf::no_alias_deps = false;
-  else if (a == "-nolabels") cf::classic = true;
-  else if (a == "-labels") cf::classic = false;
-  else if (a == "-unsafe") cf::unsafe = true;
-  else if (a == "-noassert") cf::noassert = true;
-  else if (a == "-g") cf::debug = true;
-  else if (a == "-no-g") cf::debug = false;
-  else if (a == "-keep-locs") cf::keep_locs = true;
-  else if (a == "-no-keep-locs") cf::keep_locs = false;
-  else if (a == "-keep-docs") cf::keep_docs = true;
-  else if (a == "-no-keep-docs") cf::keep_docs = false;
-  else if (a == "-opaque") cf::opaque = true;
-  else if (a == "-short-paths") cf::real_paths = false;
-  else if (a == "-absname") cf::absname = true;
-  else if (a == "-no-absname") cf::absname = false;
-}
 
-// -stop-after parsing / typing
-enum class StopAfter { None, Parsing, Typing, Lambda };
-static StopAfter g_stop_after = StopAfter::None;
 
-// -I directories (resolved) and -nostdlib, for the ported type checker
-static std::vector<std::string> g_incdirs;
-// -open M (Clflags.open_modules, in command-line order)
-static std::vector<std::string> g_open_modules;
-// -pp command (Clflags.preprocessor)
-static std::optional<std::string> g_preprocessor;
 
 // Filename.quote (Unix): the string in single quotes, each ' as '\''
 static std::string filename_quote(const std::string& s) {
@@ -263,7 +150,8 @@ static std::string filename_quote(const std::string& s) {
 static bool read_source(const std::string& path, std::string& text) {
   std::string input = path;
   std::string tmp;
-  if (g_preprocessor) {
+  namespace cf = cppcaml::typing::clflags;
+  if (cf::preprocessor) {
     char tmpl[] = "/tmp/ocamlppXXXXXX";
     int fd = ::mkstemp(tmpl);
     if (fd < 0) {
@@ -272,11 +160,25 @@ static bool read_source(const std::string& path, std::string& text) {
     }
     ::close(fd);
     tmp = tmpl;
-    std::string comm = *g_preprocessor + " " + filename_quote(path) + " > " + tmp;
+    std::string comm = *cf::preprocessor + " " + filename_quote(path) + " > " + tmp;
+    // Ccomp.command: -verbose echoes the command line
+    if (cf::verbose) {
+      std::cout.flush();
+      std::cerr << "+ " << comm << '\n';
+      std::cerr.flush();
+    }
     if (std::system(comm.c_str()) != 0) {
       std::remove(tmp.c_str());
-      std::cerr << "File \"" << path << "\", line 1:\nError: Error while running external preprocessor\n"
-                << "Command line: " << comm << '\n';
+      // Pparse.Error (CannotRun comm): Location.error_of_printer_file
+      namespace ty = cppcaml::typing;
+      ty::location::input_name = path;
+      ty::location::input_source.reset();
+      ty::location::print_report(
+          ty::location::err_formatter(),
+          ty::location::error_of_printer_file([&](ty::format_doc::Formatter& f) {
+            ty::format_doc::fprintf(f, "Error while running external preprocessor@.Command line: %s@.", comm);
+          }));
+      ty::location::err_flush();
       return false;
     }
     input = tmp;
@@ -301,8 +203,6 @@ static bool read_source(const std::string& path, std::string& text) {
   if (!tmp.empty()) std::remove(tmp.c_str());  // remove_preprocessed
   return true;
 }
-static std::string g_stdlib_dir;
-static bool g_nostdlib = false;
 
 // The typing port's forward references and module-init state (the idents
 // its modules create at startup, in link order), once per process
@@ -315,22 +215,37 @@ static void install_typing() {
   }
 }
 
-// Compmisc.init_path: the cwd, the -I directories in command-line order,
-// then the stdlib
-static void init_path(const std::string& stdlib_dir) {
+// Compmisc.init_path: [dir] (the cwd) unless -nocwd, the -I directories
+// in command-line order (with OCAMLPARAM's first / last ones, and +threads
+// under -thread), the standard library unless -nostdlib; the -H ones hidden
+static void init_path() {
   namespace ty = cppcaml::typing;
-  std::vector<std::string> visible{""};
-  for (auto& d : g_incdirs) visible.push_back(d);
-  // c++ocamlc finds its stdlib through -I when given one (ocamlc has
-  // Config.standard_library); that directory is not added twice, as the
-  // units of a later duplicate would shadow the opened Stdlib's
+  namespace cf = ty::clflags;
+  namespace ce = ty::compenv;
+  const std::string& stdlib = ty::config::standard_library;
+  std::vector<std::string> visible = cf::include_dirs;
+  if (cf::use_threads) visible.insert(visible.begin(), "+threads");
+  // last_include_dirs @ visible @ first_include_dirs (flexdll_dirs is [])
+  std::vector<std::string> l = ce::last_include_dirs;
+  l.insert(l.end(), visible.begin(), visible.end());
+  l.insert(l.end(), ce::first_include_dirs.begin(), ce::first_include_dirs.end());
+  for (std::string& d : l) d = resolve_incdir(d, stdlib);  // Misc.expand_directory
+  // (if no_cwd then [] else [dir]) @ List.rev_append visible std_include
+  std::vector<std::string> path;
+  if (!cf::no_cwd) path.push_back("");
+  path.insert(path.end(), l.rbegin(), l.rend());
+  // c++ocamlc finds its stdlib through -I when given one; that directory
+  // is not added twice (Load_path would ignore the duplicate's units)
   bool listed = false;
-  for (auto& d : g_incdirs) {
+  for (auto& d : l) {
     std::error_code ec;
-    if (fs::equivalent(d, stdlib_dir, ec)) listed = true;
+    if (fs::equivalent(d, stdlib, ec)) listed = true;
   }
-  if (!g_nostdlib && !listed) visible.push_back(stdlib_dir);
-  ty::load_path::init(visible, {});
+  if (!cf::no_std_include && !listed) path.push_back(stdlib);
+  std::vector<std::string> hidden;
+  for (auto it = cf::hidden_include_dirs.rbegin(); it != cf::hidden_include_dirs.rend(); ++it)
+    hidden.push_back(resolve_incdir(*it, stdlib));
+  ty::load_path::init(path, hidden);
   ty::env::reset_cache();
 }
 
@@ -345,8 +260,10 @@ static cppcaml::typing::env::t initial_env() {
   ty::out_type::reset_short_paths_cache();
   ty::Location cmdline = ty::location::none();
   cmdline.loc_start.pos_fname = cmdline.loc_end.pos_fname = "command line";
+  // ~open_implicit_modules:(List.rev !Clflags.open_modules)
+  std::vector<std::string> opens(ty::clflags::open_modules.rbegin(), ty::clflags::open_modules.rend());
   return ty::typemod::initial_env(
-      cmdline, ty::clflags::nopervasives ? std::nullopt : std::optional<std::string>("Stdlib"), g_open_modules);
+      cmdline, ty::clflags::nopervasives ? std::nullopt : std::optional<std::string>("Stdlib"), opens);
 }
 
 // The type checker (the typing/ port, TYPECHECKER.md): Compmisc.init_path +
@@ -360,13 +277,13 @@ using PortBody = std::function<void(cppcaml::typing::env::t, const cppcaml::typi
 // .cmi); Failed: an internal failure (reported); Rejected: a type error was
 // reported.
 enum class PortResult { Typed, Failed, Rejected };
-static PortResult port_typecheck(const std::string& in_path, const std::string& mod, const std::string& stdlib_dir,
-                           const std::string& out, bool intf, const PortBody& body) {
+static PortResult port_typecheck(const std::string& in_path, const std::string& mod, const std::string& out, bool intf,
+                                 const PortBody& body) {
   namespace ty = cppcaml::typing;
   install_typing();
   const bool debug = cppcaml::dbg_env("CPPCAML_TYPECHECK_DEBUG");
   try {
-    init_path(stdlib_dir);
+    init_path();
     // Compile_common: Env.set_current_unit; Compmisc.initial_env
     ty::env::set_current_unit(ty::UnitInfo{mod, intf ? ty::Uid::From::Intf : ty::Uid::From::Impl});
     ty::env::t env0 = initial_env();
@@ -374,7 +291,8 @@ static PortResult port_typecheck(const std::string& in_path, const std::string& 
     target.source_file = in_path;
     target.modname = mod;
     target.prefix = fs::path(out).replace_extension("").string();
-    target.has_mli = !intf && fs::exists(fs::path(in_path).replace_extension(".mli"));
+    // Unit_info.mli_from_source: the source's prefix and -intf-suffix
+    target.has_mli = !intf && fs::exists(remove_extension(in_path) + ty::config::interface_suffix);
     target.cmi_file = target.prefix + ".cmi";
     body(env0, target);
     return PortResult::Typed;
@@ -539,20 +457,100 @@ static void report_lexer_error(const std::string& path, const std::string& src, 
       emit_report(ty::location::errorf(
           loc, "%a cannot be used as a raw identifier, it must start with a lowercase letter", code_str(e.arg)));
       return;
+    case K::Unknown_keyword:
+      emit_report(ty::location::errorf(
+          loc, "%a has been defined as an additional keyword.@ This version of OCaml does not support this keyword.",
+          code_str(e.arg)));
+      return;
     case K::Other: break;
   }
   std::cerr << "c++ocamlc: " << path << ": " << e.what() << '\n';
 }
 
-static int compile_ml_(const std::string& in_path, const std::string& cmo_out, const std::string& stdlib_dir,
-                       bool prof);
-static int compile_ml(const std::string& in_path, const std::string& cmo_out, const std::string& stdlib_dir,
-                      bool prof) {
-  check_unit_name(in_path, module_name(cmo_out));
-  return compile_ml_(in_path, cmo_out, stdlib_dir, prof);
+// Compmisc.with_ppf_dump ~file_prefix: where the -d* dumps go -- stderr,
+// or <file_prefix>.dump under -dump-into-file, or a fresh file in -dump-dir
+struct PpfDump {
+  std::ofstream file;
+  bool to_file = false;
+  std::ostream& out() { return to_file ? static_cast<std::ostream&>(file) : std::cerr; }
+};
+static void open_ppf_dump(PpfDump& d, const std::string& file_prefix) {
+  namespace cf = cppcaml::typing::clflags;
+  if (cf::dump_dir) {
+    std::error_code ec;
+    fs::create_directories(fs::path(*cf::dump_dir + "/" + file_prefix).parent_path(), ec);
+    std::string tmpl = *cf::dump_dir + "/" + file_prefix + ".XXXXXX.dump";
+    std::vector<char> buf(tmpl.begin(), tmpl.end());
+    buf.push_back('\0');
+    int fd = ::mkstemps(buf.data(), 5);
+    if (fd >= 0) {
+      ::close(fd);
+      d.file.open(buf.data(), std::ios::binary | std::ios::trunc);
+      d.to_file = true;
+    }
+  } else if (cf::dump_into_file) {
+    d.file.open(file_prefix + ".dump", std::ios::binary | std::ios::trunc);
+    d.to_file = true;
+  }
 }
-static int compile_ml_(const std::string& in_path, const std::string& cmo_out,
-                      const std::string& stdlib_dir, bool prof) {
+
+// the options whose effect the compilers here lack, when a unit is compiled
+static bool refuse_unsupported_compile_option() {
+  std::string o = cppcaml::typing::main_args::unsupported_compile_option();
+  if (o.empty()) return false;
+  std::cout.flush();
+  std::cerr << "c++ocamlc: option " << o << " is not supported yet\n";
+  return true;
+}
+
+// Parse.wrap: Lexer.init ~keyword_edition (Clflags.parse_keyword_edition
+// of -keywords, whose Arg.Bad reaches Maindriver)
+static void init_lexer() {
+  namespace cf = cppcaml::typing::clflags;
+  if (!cf::keyword_edition) {
+    cppcaml::set_keyword_edition(std::nullopt, {});
+    return;
+  }
+  auto bad_version = [] {
+    throw cppcaml::typing::arg::Bad(
+        "Ill-formed version in keywords flag,\nthe supported format is <major>.<minor>, for example 5.2 .");
+  };
+  auto parse_version = [&](const std::string& v) -> std::optional<std::pair<int, int>> {
+    if (v.empty()) return std::nullopt;
+    std::size_t dot = v.find('.');
+    if (dot == std::string::npos || v.find('.', dot + 1) != std::string::npos) bad_version();
+    long major, minor;
+    if (!cppcaml::typing::arg::int_of_string_opt(v.substr(0, dot), major) ||
+        !cppcaml::typing::arg::int_of_string_opt(v.substr(dot + 1), minor))
+      bad_version();
+    return std::pair<int, int>{static_cast<int>(major), static_cast<int>(minor)};
+  };
+  // String.split_on_char '+'
+  std::vector<std::string> parts;
+  std::string cur;
+  for (char c : *cf::keyword_edition) {
+    if (c == '+') {
+      parts.push_back(cur);
+      cur.clear();
+    } else {
+      cur += c;
+    }
+  }
+  parts.push_back(cur);
+  std::optional<std::pair<int, int>> version = parse_version(parts[0]);
+  cppcaml::set_keyword_edition(version, std::vector<std::string>(parts.begin() + 1, parts.end()));
+}
+
+static int compile_ml_(const std::string& in_path, const std::string& cmo_out, bool prof);
+static int compile_ml(const std::string& in_path, const std::string& cmo_out, bool prof) {
+  if (refuse_unsupported_compile_option()) return 2;
+  check_unit_name(in_path, module_name(cmo_out));
+  return compile_ml_(in_path, cmo_out, prof);
+}
+static int compile_ml_(const std::string& in_path, const std::string& cmo_out, bool prof) {
+  namespace cf = cppcaml::typing::clflags;
+  PpfDump ppf_dump;
+  open_ppf_dump(ppf_dump, remove_extension(cmo_out) + ".cmo");
   namespace ty = cppcaml::typing;
   std::string src;  // Pparse.parse_file: the (preprocessed) source text
   if (!read_source(in_path, src)) return 2;
@@ -586,15 +584,15 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out,
   try {
     auto tp = t0;
     std::vector<std::string> dirfiles;
+    init_lexer();
     auto structure = cppcaml::parse_structure(src, dirfiles);
     emit_lex_warnings(in_path, src, static_cast<size_t>(-1));
     lap("parse", tp);
-    if (g_dump.parsetree)
-      cppcaml::ast::print_dparsetree(structure, in_path, std::cout, dirfiles);
-    if (g_stop_after == StopAfter::Parsing) return finish();
+    if (cf::dump_parsetree) cppcaml::ast::print_dparsetree(structure, in_path, ppf_dump.out(), dirfiles);
+    if (cf::should_stop_after(cf::Pass::Parsing)) return finish();
     // Compile_common.implementation: typecheck_impl
     std::optional<ty::typedtree::Implementation> impl;
-    PortResult port = port_typecheck(in_path, mod, stdlib_dir, cmo_out, /*intf=*/false,
+    PortResult port = port_typecheck(in_path, mod, cmo_out, /*intf=*/false,
                                      [&](ty::env::t env0, const ty::typemod::UnitInfo& target) {
                                        ty::parsetree::Structure st = ty::parsetree::of_ast(structure, in_path, dirfiles);
                                        // an .ml without .mli: its .cmi is written here (Typemod)
@@ -603,7 +601,7 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out,
     if (port != PortResult::Typed) return 2;
     lap("typecheck", tp);
     // Clflags.should_stop_after Typing (-i prints the signature, writes nothing)
-    if (g_stop_after == StopAfter::Typing || ty::clflags::print_types) return finish();
+    if (cf::should_stop_after(cf::Pass::Typing)) return finish();
     // Compile.to_bytecode: Translmod.transl_implementation, -drawlambda,
     // Simplif.simplify_lambda, -dlambda, Bytegen.compile_implementation,
     // -dinstr (the dumps on stderr, as ocamlc's ppf_dump)
@@ -612,13 +610,13 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out,
     // Bytegen's events and Emitcode's cu_name all share
     std::string_view modname = ty::zborrow(mod);
     ty::lambda::Program prog = ty::translmod::transl_implementation(modname, impl->structure, impl->coercion);
-    if (g_dump.rawlambda) std::cerr << ty::printlambda::dump(prog.code);
+    if (cf::dump_rawlambda) ppf_dump.out() << ty::printlambda::dump(prog.code);
     ty::lambda::lambda lam = ty::simplif::simplify_lambda(prog.code);
-    if (g_dump.lambda) std::cerr << ty::printlambda::dump(lam);
+    if (cf::dump_lambda) ppf_dump.out() << ty::printlambda::dump(lam);
     lap("lambda", tp);
-    if (g_stop_after == StopAfter::Lambda) return finish();
     ty::instruct::code bytecode = ty::bytegen::compile_implementation(modname, lam);
-    if (g_dump.instr) std::cerr << ty::printinstr::dump(bytecode);
+    if (cf::dump_instr) ppf_dump.out() << ty::printinstr::dump(bytecode);
+    ppf_dump.out().flush();
     lap("bytegen", tp);
     // Compile.emit_bytecode: Emitcode.to_file, the .cmo removed on failure
     std::FILE* oc = std::fopen(cmo_out.c_str(), "wb");
@@ -639,6 +637,8 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out,
       std::cerr << "  TOTAL compile " << in_path << ": "
                 << std::chrono::duration<double, std::milli>(clk::now() - t0).count() << " ms\n";
     return finish();
+  } catch (const cppcaml::typing::arg::Bad&) {
+    throw;  // (Arg.Bad escapes to Maindriver: -keywords' version)
   } catch (const cppcaml::ParseError& e) {
     emit_lex_warnings(in_path, src, e.pos);
     report_syntax_error(in_path, src, e);
@@ -674,6 +674,8 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out,
 
 // Compile a .mli -> .cmi.
 static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
+  namespace cf = cppcaml::typing::clflags;
+  if (refuse_unsupported_compile_option()) return 2;
   check_unit_name(in_path, module_name(cmi_out));
   std::string src;  // Pparse.parse_file: the (preprocessed) source text
   if (!read_source(in_path, src)) return 2;
@@ -681,11 +683,12 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
   cppcaml::typing::location::input_name = in_path;
   cppcaml::typing::location::input_source = src;
   try {
+    init_lexer();
     auto sig = cppcaml::parse_signature(src);
     emit_lex_warnings(in_path, src, static_cast<size_t>(-1));
-    if (g_stop_after == StopAfter::Parsing) return 0;
+    if (cf::should_stop_after(cf::Pass::Parsing)) return 0;
     PortResult port = port_typecheck(
-        in_path, module_name(cmi_out), g_stdlib_dir, cmi_out, /*intf=*/true,
+        in_path, module_name(cmi_out), cmi_out, /*intf=*/true,
         [&](cppcaml::typing::env::t env0, const cppcaml::typing::typemod::UnitInfo& target) {
           namespace ty = cppcaml::typing;
           ty::parsetree::Signature sg = ty::parsetree::of_ast_signature(sig, in_path, {});
@@ -707,11 +710,14 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
           ty::typecore::force_delayed_checks();
           ty::builtin_attributes::warn_unused();
           ty::warnings::check_fatal();
-          if (g_stop_after == StopAfter::Typing || ty::clflags::print_types) return;
+          // Compile_common.interface: the .cmi unless -i
+          if (ty::clflags::print_types) return;
           // Compile_common.emit_signature
           ty::env::save_signature(alerts, tsg->sig_type, target.modname, target.prefix + ".cmi");
         });
     if (port != PortResult::Typed) return 2;
+  } catch (const cppcaml::typing::arg::Bad&) {
+    throw;  // (Arg.Bad escapes to Maindriver: -keywords' version)
   } catch (const cppcaml::ParseError& e) {
     emit_lex_warnings(in_path, src, e.pos);
     report_syntax_error(in_path, src, e);
@@ -727,270 +733,257 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
   return 0;
 }
 
-static int run_main(int argc, char** argv) {
-  std::string out_path, stdlib_flag, runtime;
-  std::vector<std::string> incdirs_raw;  // -I dirs (may be `+unix`), in order
-  std::vector<std::string> inputs;       // positional files (.ml/.mli/.cmo/.cma)
-  bool compile_only = false;             // -c : stop at the .cmo / .cmi
-  bool make_lib = false;                 // -a : build a .cma archive
-  std::string pack_name;                 // -pack : build a packed unit (name from -o)
-  bool nostdlib = false;                 // -nostdlib : no default stdlib search dir
-  bool nocwd = false;                    // -nocwd : no implicit cwd cmi search
-  bool nopervasives = false;             // -nopervasives : Stdlib not implicitly opened
-  bool prof = std::getenv("CPPCAML_PROFILE") != nullptr;
+// The default standard library: next to the executable (<repo>/cxx/build/
+// c++ocamlc -> <repo>/stdlib), as c++ocamlc is not installed
+static std::string default_standard_library() {
+  std::error_code ec;
+  fs::path exe = fs::read_symlink("/proc/self/exe", ec);
+  if (!ec) {
+    fs::path cand = exe.parent_path().parent_path().parent_path() / "stdlib";
+    if (fs::exists(cand / "stdlib.cmi")) return cand.string();
+  }
+  return "/usr/local/lib/ocaml";
+}
 
-  // -strict-flags makes accepted-but-ignored / unknown options hard errors.
-  // Detect it up front so it governs options appearing before it on the line.
-  bool strict_flags = false;
-  for (int i = 1; i < argc; ++i)
-    if (std::string(argv[i]) == "-strict-flags") strict_flags = true;
-  auto reject_ignored = [&](const std::string& a) {
-    std::cerr << "c++ocamlc: option " << a
-              << " is accepted-but-ignored and -strict-flags is set\n";
-    std::exit(2);
-  };
+// Location.report_exception on Format.err_formatter; false when no reporter
+// knows the exception
+static bool report_exception(std::exception_ptr ep) {
+  namespace ty = cppcaml::typing;
+  ty::reporters::install();
+  bool reported = false;
+  try {
+    reported = ty::location::report_exception(ty::location::err_formatter(), ep);
+  } catch (...) {
+  }
+  ty::location::err_flush();
+  return reported;
+}
 
-  for (int i = 1; i < argc; ++i) {
-    std::string a = argv[i];
-    auto need_arg = [&](const char* what) -> const char* {
-      if (i + 1 >= argc) {
-        std::cerr << "c++ocamlc: option " << what << " needs an argument\n";
-        std::exit(2);
-      }
-      return argv[++i];
-    };
-    if (a == "-help" || a == "--help" || a == "-h") { print_help(std::cout); return 0; }
-    else if (a == "-strict-flags") { /* handled in the pre-scan above */ }
-    else if (a == "-o") out_path = need_arg("-o");
-    else if (a == "-I") incdirs_raw.push_back(need_arg("-I"));
-    // -H <dir>: APPROXIMATION -- searched like -I.  ocamlc lets a hidden dir
-    // satisfy dependencies only, never a direct reference; the hidden_includes
-    // tests that expect "Unbound module" therefore wrongly pass here.
-    else if (a == "-H") incdirs_raw.push_back(need_arg("-H"));
-    else if (a == "-runtime") runtime = need_arg("-runtime");
-    else if (a == "-use-runtime" || a == "-use_runtime")  // ocamlc's spelling of -runtime
-      runtime = need_arg(a.c_str());
-    else if (a == "-c") compile_only = true;
-    else if (a == "-dparsetree") g_dump.parsetree = true;   // dump AST, keep going
-    else if (a == "-dlambda") g_dump.lambda = cppcaml::typing::clflags::dump_lambda = true;         // dump Lambda IR
-    else if (a == "-drawlambda") g_dump.rawlambda = true;   // dump Lambda before Simplif (new path)
-    else if (a == "-dinstr") g_dump.instr = true;           // dump bytecode instrs
-    else if (a == "-a") make_lib = true;
-    else if (a == "-pack") pack_name = "?";  // resolved from -o once known
-    else if (a == "-nostdlib") nostdlib = true;
-    else if (a == "-nocwd") nocwd = true;
-    else if (a == "-nopervasives") nopervasives = true;
-    else if (a == "-stdlib") stdlib_flag = need_arg("-stdlib");
-    else if (a == "-version") { std::cout << kVersion << '\n'; return 0; }
-    else if (a == "-vnum") { std::cout << kVersion << '\n'; return 0; }
-    else if (a == "-where") { std::cout << discover_stdlib(stdlib_flag) << '\n'; return 0; }
-    else if (a == "-config") {
-      std::cout << "version: " << kVersion << "\nstandard_library: "
-                << fs::absolute(discover_stdlib(stdlib_flag)).string()
-                << "\next_obj: .o\next_lib: .a\next_dll: .so\nos_type: Unix\n";
-      return 0;
-    } else if (a == "-impl") inputs.push_back(need_arg("-impl"));   // force .ml kind
-    else if (a == "-intf") inputs.push_back(need_arg("-intf"));     // force .mli kind
-    else if (a == "-w" || a == "-warn-error" || a == "-alert") {
-      // Warnings.parse_options / parse_alert_option, in command-line order
-      std::string v = need_arg(a.c_str());
-      namespace w = cppcaml::typing::warnings;
-      try {
-        if (a == "-alert") w::parse_alert_option(v);
-        else if (std::optional<w::Alert> al = w::parse_options(a == "-warn-error", v))
-          cppcaml::typing::location::prerr_alert(cppcaml::typing::location::none(), *al);
-      } catch (const w::Bad& e) {
-        std::cerr << "c++ocamlc: bad argument '" << v << "' to option '" << a << "': " << e.what() << '\n';
-        return 2;
-      }
-    }
-    else if (a == "-stop-after") {
-      // `typing`: type-check with the ported checker, write nothing
-      std::string pass = need_arg("-stop-after");
-      if (pass == "parsing") g_stop_after = StopAfter::Parsing;
-      else if (pass == "typing") g_stop_after = StopAfter::Typing;
-      else if (pass == "lambda") g_stop_after = StopAfter::Lambda;
-      cppcaml::typing::builtin_attributes::stops_before_lambda =
-          g_stop_after == StopAfter::Parsing || g_stop_after == StopAfter::Typing;
-    }
-    else if (a == "-open") g_open_modules.push_back(need_arg("-open"));
-    else if (a == "-i") cppcaml::typing::clflags::print_types = true;
-    else if (a == "-i-variance") cppcaml::typing::clflags::print_variance = true;
-    else if (a == "-pp") g_preprocessor = need_arg("-pp");
-    else if (a == "-for-pack") cppcaml::typing::clflags::for_package = std::string(need_arg("-for-pack"));
-    else if (kArgIgnore.count(a)) {
-      if (strict_flags) reject_ignored(a);
-      (void)need_arg(a.c_str());
-    }
-    else if (kBoolIgnore.count(a) || kBoolIgnore2.count(a)) {
-      if (strict_flags) reject_ignored(a);
-      /* else accept; only the ported type checker reads these */
-      set_typing_flag(a);
-    }
-    else if (kUnsupportedArg.count(a)) {
-      std::cerr << "c++ocamlc: " << a << " is not supported yet\n";
-      (void)need_arg(a.c_str());
+static mode_t current_umask() {
+  mode_t m = ::umask(0);
+  ::umask(m);
+  return m;
+}
+
+// Bytelink.link objfiles output_name, as c++ocamlc's linker does it: the
+// objects found on the load path, the stdlib's around them
+static int link(const std::vector<std::string>& objfiles0, const std::string& output_name) {
+  namespace ty = cppcaml::typing;
+  namespace cf = ty::clflags;
+  std::vector<std::string> objfiles;
+  if (!cf::nopervasives) objfiles.push_back("stdlib.cma");
+  objfiles.insert(objfiles.end(), objfiles0.begin(), objfiles0.end());
+  if (!cf::nopervasives) objfiles.push_back("std_exit.cmo");
+  std::vector<std::string> paths;
+  for (const std::string& o : objfiles) {
+    try {
+      paths.push_back(ty::load_path::find(o));
+    } catch (const ty::load_path::NotFound&) {
+      // Bytelink.Error (File_not_found)
+      ty::location::print_report(ty::location::err_formatter(),
+                                 ty::location::errorf(ty::location::in_file(ty::location::input_name),
+                                                      "Cannot find file %a",
+                                                      [&](ty::format_doc::Formatter& f) {
+                                                        ty::location::doc::quoted_filename(f, o);
+                                                      }));
+      ty::location::err_flush();
       return 2;
-    } else if (kUnsupportedBool.count(a)) {
-      std::cerr << "c++ocamlc: " << a << " is not supported yet\n";
-      return 2;
-    } else if (!a.empty() && a[0] == '-') {
-      // An unrecognised flag: error under -strict-flags, else warn and keep
-      // going (be lenient for drop-in use).
-      if (strict_flags) {
-        std::cerr << "c++ocamlc: unknown option " << a << " (-strict-flags)\n";
-        return 2;
-      }
-      std::cerr << "c++ocamlc: warning: ignoring unknown option " << a << '\n';
-    } else {
-      inputs.push_back(a);  // a source/object file
     }
   }
-
-  if (inputs.empty()) {
-    std::cerr << "usage: c++ocamlc [-c] [-I <dir>]... <files...> [-o <out>]\n"
-                 "       c++ocamlc -help   for the full list of options\n";
+  // the launcher: -use-runtime's interpreter, else the tree's ocamlrun
+  // (+ -runtime-variant); none under -without-runtime
+  std::string runtime;
+  if (cf::with_runtime) {
+    if (!cf::use_runtime.empty()) {
+      runtime = fs::path(cf::use_runtime).is_relative() ? (fs::current_path() / cf::use_runtime).string()
+                                                         : cf::use_runtime;
+    } else {
+      fs::path r = fs::absolute(fs::path(ty::config::standard_library)).parent_path() / "runtime" /
+                   ("ocamlrun" + cf::runtime_variant);
+      if (fs::exists(r)) runtime = r.string();
+    }
+  }
+  try {
+    // (the .linkmap sidecar only on request: ocamlc writes no such file)
+    cppcaml::link::link_executable(paths, output_name, runtime, cf::link_everything, cf::no_auto_link,
+                                   std::getenv("CPPCAML_LINKMAP") != nullptr);
+  } catch (const std::exception& e) {
+    std::cout.flush();
+    std::cerr << "c++ocamlc: link error: " << e.what() << '\n';
     return 2;
   }
-
-  // stdlib_dir: an explicit -stdlib wins (pins every unit to one stdlib so their
-  // interface CRCs stay consistent -- vital when bootstrapping against a stdlib
-  // that is still being built and whose stdlib.cmi may not exist yet); else the
-  // -I dir that actually holds stdlib.cmi; else discovery.
-  std::string stdlib_dir = stdlib_flag;
-  if (stdlib_dir.empty())
-    for (const std::string& d : incdirs_raw)
-      if (d.empty() || d[0] != '+')
-        if (fs::exists(fs::path(d) / "stdlib.cmi")) { stdlib_dir = d; break; }
-  stdlib_dir = discover_stdlib(stdlib_dir);
-
-  std::vector<std::string> incdirs;  // resolved (+unix -> <stdlib>/unix)
-  for (const std::string& d : incdirs_raw) incdirs.push_back(resolve_incdir(d, stdlib_dir));
-  // ocamlc searches the current directory FIRST (before the -I dirs) unless
-  // -nocwd is given, so a sibling unit's .cmi is found without an explicit -I.
-  static const bool no_cwd_search = cppcaml::dbg_env("NOCWDSEARCH") != nullptr;
-  if (!nocwd && !no_cwd_search) incdirs.insert(incdirs.begin(), ".");
-  g_nopervasives = nopervasives;
-  g_incdirs = incdirs;
-  g_stdlib_dir = stdlib_dir;
-  g_nostdlib = nostdlib;
-  cppcaml::typing::clflags::nopervasives = nopervasives;
-  cppcaml::typing::clflags::no_std_include = nostdlib;
-
-  if (runtime.empty()) {
-    fs::path r = fs::absolute(fs::path(stdlib_dir)).parent_path() / "runtime" / "ocamlrun";
-    if (fs::exists(r)) runtime = r.string();
-  }
-
-  // Compile every source input; collect the resulting (and pre-built) objects
-  // for a possible link step.
-  std::vector<std::string> link_objs;
-  std::vector<std::string> objfiles;  // Compenv's objfiles, as named (-pack)
-  // A bare object name (`unix.cma`) on the link line is resolved against the
-  // -I include path, like ocamlc -- otherwise only a cwd-relative path works.
-  auto resolve_obj = [&](const std::string& f) -> std::string {
-    if (fs::exists(f)) return f;
-    for (const std::string& d : incdirs) {
-      fs::path cand = fs::path(d) / f;
-      if (fs::exists(cand)) return cand.string();
-    }
-    return f;  // leave as-is; the linker reports the open failure
-  };
-  // Compenv.output_prefix: under -c, -o gives the first unit's output prefix
-  // (whatever its extension) and is then forgotten; else the source's own
-  auto remove_extension = [](const std::string& n) {
-    fs::path p(n);
-    return p.has_extension() ? (p.parent_path() / p.stem()).string() : n;
-  };
-  bool out_used = false;
-  auto output_prefix = [&](const std::string& f) {
-    if (compile_only && !out_path.empty() && !out_used) {
-      out_used = true;
-      return remove_extension(out_path);
-    }
-    return remove_extension(f);
-  };
-  for (const std::string& f : inputs) {
-    if (ends_with(f, ".mli")) {
-      std::string cmi_out = output_prefix(f) + ".cmi";
-      if (int rc = compile_mli(f, cmi_out)) return rc;
-    } else if (ends_with(f, ".ml")) {
-      std::string cmo_out = output_prefix(f) + ".cmo";
-      if (int rc = compile_ml(f, cmo_out, stdlib_dir, prof)) return rc;
-      link_objs.push_back(cmo_out);
-      objfiles.push_back(cmo_out);
-    } else if (ends_with(f, ".cmo") || ends_with(f, ".cma")) {
-      link_objs.push_back(resolve_obj(f));  // a pre-compiled object/library to link
-      objfiles.push_back(f);
-    } else if (ends_with(f, ".cmi") && !pack_name.empty()) {
-      objfiles.push_back(f);  // an interface-only member of a pack
-    } else {
-      std::cerr << "c++ocamlc: don't know what to do with " << f << '\n';
-      return 2;
-    }
-  }
-
-  // Compenv.stop_early: -c, -i
-  if (compile_only || cppcaml::typing::clflags::print_types) return 0;
-
-  if (make_lib) {  // -a : bundle the .cmo objects into a .cma
-    if (out_path.empty()) out_path = "a.cma";
-    try {
-      cppcaml::link::archive(link_objs, out_path);
-    } catch (const std::exception& e) {
-      std::cerr << "c++ocamlc: -a: " << e.what() << '\n';
-      return 1;
-    }
-    return 0;
-  }
-  if (!pack_name.empty()) {  // -pack -o Pack.cmo : Bytepackager.package_files
-    if (out_path.empty()) { std::cerr << "c++ocamlc: -pack needs -o <Pack>.cmo\n"; return 2; }
-    namespace ty = cppcaml::typing;
-    try {
-      install_typing();
-      init_path(stdlib_dir);
-      ty::bytepackager::package_files(initial_env(), objfiles, out_path);
-    } catch (...) {
-      // Location.report_exception (Maindriver: exit 2)
-      ty::reporters::install();
-      std::exception_ptr ep = std::current_exception();
-      bool reported = false;
-      try {
-        reported = ty::location::report_exception(ty::location::err_formatter(), ep);
-      } catch (...) {
-        ep = std::current_exception();
-      }
-      ty::location::err_flush();
-      if (reported) return 2;
-      try {
-        std::rethrow_exception(ep);
-      } catch (const std::exception& e) {
-        std::cerr << "c++ocamlc: -pack: " << e.what() << '\n';
-      }
-      return 2;
-    }
-    return 0;
-  }
-
-  if (link_objs.empty()) return 0;  // only .mli inputs
-
-  // Link: [stdlib.cma] + objects + [std_exit.cmo] -> runnable bytecode launcher.
-  // Like Bytelink.link, only -nopervasives drops the implicit stdlib.cma /
-  // std_exit.cmo; -nostdlib merely removes the default dir from the search
-  // path, and stdlib_dir above was already resolved from -I in that case.
-  if (out_path.empty()) out_path = "a.out";
-  std::vector<std::string> linkin;
-  if (!nopervasives) linkin.push_back(stdlib_dir + "/stdlib.cma");
-  for (const std::string& o : link_objs) linkin.push_back(o);
-  if (!nopervasives) linkin.push_back(stdlib_dir + "/std_exit.cmo");
-  try {
-    cppcaml::link::link_executable(linkin, out_path, runtime);
-  } catch (const std::exception& e) {
-    std::cerr << "c++ocamlc: link error: " << e.what() << '\n';
-    return 1;
-  }
-  chmod(out_path.c_str(), 0755);
+  chmod(output_name.c_str(), cf::with_runtime ? 0777 & ~current_umask() : 0666 & ~current_umask());
   return 0;
+}
+
+// Maindriver.main's last step: Compmisc.with_ppf_dump ~file_prefix:"profile"
+// (fun ppf -> Profile.print ppf !profile_columns) -- nothing to print (no
+// -dtimings / -dprofile), but -dump-into-file / -dump-dir make the file
+static void profile_dump() {
+  PpfDump d;
+  open_ppf_dump(d, "profile");
+}
+
+// Maindriver.main
+static int run_main(int argc, char** argv) {
+  namespace ty = cppcaml::typing;
+  namespace cf = ty::clflags;
+  namespace ce = ty::compenv;
+  const std::string program = "ocamlc";
+  const bool prof = std::getenv("CPPCAML_PROFILE") != nullptr;
+  std::vector<std::string> args(argv, argv + argc);
+  ce::add_arguments(ty::main_args::bytecomp_options());
+  {
+    ty::arg::Option depend;
+    depend.key = "-depend";
+    depend.spec.k = ty::arg::Spec::K::Unit;
+    depend.spec.unit = [] { ce::fatal("c++ocamlc: option -depend is not supported yet"); };
+    depend.doc = "<options> Compute dependencies (use 'ocamlc -depend -help' for details)";
+    ce::add_arguments({depend});
+  }
+  ce::add_arguments(ty::main_args::cppcaml_extensions());
+  // Config.standard_library: $OCAMLLIB, else $CAMLLIB, else the default
+  ty::config::standard_library_default = default_standard_library();
+  if (const char* e = std::getenv("OCAMLLIB")) ty::config::standard_library = e;
+  else if (const char* e2 = std::getenv("CAMLLIB")) ty::config::standard_library = e2;
+  else ty::config::standard_library = ty::config::standard_library_default;
+  try {
+    ce::readenv(ce::Position::Before_args);
+    ce::parse_arguments(args, ce::anonymous, program);
+    // Compmisc.read_clflags_from_env
+    auto from_env = [](const char* var, auto parse, auto& flag, const char* usage) {
+      const char* v = std::getenv(var);
+      if (!v) return;
+      auto x = parse(std::string(v));
+      if (!x) {
+        ty::warnings::Warning w = ty::warnings::Warning::make(ty::warnings::Warning::K::Bad_env_variable);
+        w.s = var;
+        w.s2 = usage;
+        ty::location::prerr_warning(ty::location::none(), w);
+      } else if (!flag) {
+        flag = *x;
+      }
+    };
+    from_env("OCAML_COLOR",
+             [](const std::string& s) -> std::optional<cf::Color> {
+               if (s == "auto") return cf::Color::Auto;
+               if (s == "always") return cf::Color::Always;
+               if (s == "never") return cf::Color::Never;
+               return std::nullopt;
+             },
+             cf::color, "expected \"auto\", \"always\" or \"never\"");
+    if (!cf::color) {
+      const char* nc = std::getenv("NO_COLOR");
+      if (nc && *nc) cf::color = cf::Color::Never;
+    }
+    from_env("OCAML_ERROR_STYLE",
+             [](const std::string& s) -> std::optional<cf::ErrorStyle> {
+               if (s == "contextual") return cf::ErrorStyle::Contextual;
+               if (s == "short") return cf::ErrorStyle::Short;
+               return std::nullopt;
+             },
+             cf::error_style, "expected \"contextual\" or \"short\"");
+    if (cf::plugin) ce::fatal("-plugin is only supported up to OCaml 4.08.0");
+    try {
+      ce::ActionContext ctx;
+      ctx.compile_implementation = [&](cf::Pass start_from, const std::string& source_file,
+                                       const std::string& output_prefix) -> int {
+        (void)start_from;  // (only Parsing reaches here: .cmir-linear is refused)
+        return compile_ml(source_file, output_prefix + ".cmo", prof);
+      };
+      ctx.compile_interface = [](const std::string& source_file, const std::string& output_prefix) {
+        return compile_mli(source_file, output_prefix + ".cmi");
+      };
+      ctx.ocaml_mod_ext = ".cmo";
+      ctx.ocaml_lib_ext = ".cma";
+      ce::process_deferred_actions(ctx);
+    } catch (const ty::arg::Bad& b) {
+      std::cout.flush();
+      std::cerr << b.msg << '\n';
+      std::cerr.flush();
+      ce::print_arguments(program);
+      return 2;
+    }
+    if (cf::should_stop_after(cf::Pass::Lambda)) {  // Continue
+      profile_dump();
+      return 0;
+    }
+    ce::readenv(ce::Position::Before_link);
+    if ((cf::make_archive ? 1 : 0) + (cf::make_package ? 1 : 0) + (ce::stop_early ? 1 : 0) +
+            (cf::output_c_object ? 1 : 0) >
+        1) {
+      if (!cf::stop_after) ce::fatal("Please specify at most one of -pack, -a, -c, -output-obj");
+      ce::fatal("Options -i and -stop-after (parsing|typing|lambda) are  incompatible with -pack, -a, -output-obj");
+    }
+    if (cf::make_archive) {
+      init_path();
+      std::string out = ce::extract_output(cf::output_name);
+      std::string o = ty::main_args::unsupported_archive_option();
+      if (!o.empty()) ce::fatal("c++ocamlc: option " + o + " is not supported yet");
+      std::vector<std::string> objs;
+      for (const std::string& f : ce::get_objfiles(false)) {
+        try {
+          objs.push_back(ty::load_path::find(f));
+        } catch (const ty::load_path::NotFound&) {
+          objs.push_back(f);  // (the librarian reports the open failure)
+        }
+      }
+      try {
+        cppcaml::link::archive(objs, out, cf::link_everything);
+      } catch (const std::exception& e) {
+        std::cout.flush();
+        std::cerr << "c++ocamlc: -a: " << e.what() << '\n';
+        return 2;
+      }
+      ty::warnings::check_fatal();
+    } else if (cf::make_package) {
+      init_path();
+      std::string extracted_output = ce::extract_output(cf::output_name);
+      std::vector<std::string> revd = ce::get_objfiles(false);
+      install_typing();
+      ty::bytepackager::package_files(initial_env(), revd, extracted_output);
+      ty::warnings::check_fatal();
+    } else if (!ce::stop_early && !cf::objfiles.empty()) {
+      std::string target;
+      if (cf::output_c_object && !cf::output_complete_executable) {
+        std::string s = ce::extract_output(cf::output_name);
+        if (!(ends_with(s, ty::config::ext_obj) || ends_with(s, ty::config::ext_dll) || ends_with(s, ".c")))
+          ce::fatal(std::string("The extension of the output file must be .c, ") + ty::config::ext_obj + " or " +
+                    ty::config::ext_dll);
+        target = s;
+      } else {
+        target = ce::default_output(cf::output_name);
+      }
+      init_path();
+      std::string o = ty::main_args::unsupported_link_option();
+      if (!o.empty()) ce::fatal("c++ocamlc: option " + o + " is not supported yet");
+      if (int rc = link(ce::get_objfiles(true), target)) return rc;
+      ty::warnings::check_fatal();
+    }
+    profile_dump();
+    return 0;
+  } catch (const ce::ExitWithStatus& e) {
+    return e.status;
+  } catch (const ty::arg::SysError& e) {
+    // Sys_error (from -args): Location's "I/O error" report
+    ty::location::print_report(ty::location::err_formatter(),
+                               ty::location::errorf(ty::location::in_file(ty::location::input_name),
+                                                    "I/O error: %s", std::string(e.what())));
+    ty::location::err_flush();
+    return 2;
+  } catch (...) {
+    std::exception_ptr ep = std::current_exception();
+    if (report_exception(ep)) return 2;
+    try {
+      std::rethrow_exception(ep);
+    } catch (const std::exception& e) {
+      std::cout.flush();
+      std::cerr << "c++ocamlc: " << e.what() << '\n';
+    } catch (...) {
+      std::cerr << "c++ocamlc: internal error\n";
+    }
+    return 2;
+  }
 }
 
 // The compiler runs on a thread with a large stack.  OCaml's native frames

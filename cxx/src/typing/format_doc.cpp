@@ -1,5 +1,6 @@
 // Port of utils/format_doc.ml (TYPECHECKER.md stage 9).
 #include "cppcaml/typing/format_doc.hpp"
+#include "cppcaml/typing/misc.hpp"
 
 #include <algorithm>
 #include <optional>
@@ -25,13 +26,6 @@ BoxType box_type(format::BoxType b) {
     case format::BoxType::Pp_box: return BoxType::B;
   }
   return BoxType::B;
-}
-
-// Misc.Style.style_of_tag: the tags whose markup is "" with colours off;
-// any other tag gets Format's default markers "<t>" / "</t>"
-bool known_style_tag(const std::string& t) {
-  return t == "error" || t == "warning" || t == "loc" || t == "hint" || t == "inline_code" || t == "ralign" ||
-         t == "@style";  // Misc.Style.Style (diffing.hpp)
 }
 
 }  // namespace
@@ -63,14 +57,21 @@ void format(format::Formatter& ppf, const Doc& doc) {
         break;
       case Element::K::Close_box: ppf.close_box(); break;
       case Element::K::Open_tag:
+        // Format's mark tags, on once Misc.Style.setup has run
         tag_stack.push_back(e.text);
-        if (!known_style_tag(e.text)) ppf.print_as(0, "<" + e.text + ">");
+        if (ppf.mark_tags && misc::style::marks_enabled()) {
+          std::string m = misc::style::mark_open_tag(e.text);
+          if (!m.empty()) ppf.print_as(0, m);
+        }
         break;
       case Element::K::Close_tag:
         if (!tag_stack.empty()) {
           std::string t = std::move(tag_stack.back());
           tag_stack.pop_back();
-          if (!known_style_tag(t)) ppf.print_as(0, "</" + t + ">");
+          if (ppf.mark_tags && misc::style::marks_enabled()) {
+            std::string m = misc::style::mark_close_tag(t);
+            if (!m.empty()) ppf.print_as(0, m);
+          }
         }
         break;
       case Element::K::Open_tbox: ppf.open_tbox(); break;

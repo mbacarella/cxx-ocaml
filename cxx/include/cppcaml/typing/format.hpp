@@ -32,6 +32,10 @@ class Formatter {
   Formatter(const Formatter&) = delete;
   Formatter& operator=(const Formatter&) = delete;
 
+  // pp_set_mark_tags: Misc.Style.setup gives std_formatter, err_formatter
+  // and str_formatter tag handling; a fresh formatter (asprintf's) has none
+  bool mark_tags = false;
+
   // the text output so far (flushed tokens only)
   const std::string& contents() const { return out_; }
   std::string take() { return std::move(out_); }

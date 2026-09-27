@@ -20,12 +20,20 @@ namespace cppcaml::typing::diffing {
 
 enum class ChangeKind { Deletion, Insertion, Modification, Preservation };
 
-// the semantic tag of Misc.Style.Style (markup "" with colours off)
-inline constexpr std::string_view style_tag = "@style";
+// the semantic tag of Misc.Style.Style (style k): "@style:<ANSI codes>"
+// (misc::style::mark_open_tag; no markup with colours off)
+inline std::string style_tag(ChangeKind k) {
+  switch (k) {
+    case ChangeKind::Preservation: return "@style:32";                // [FG Green]
+    case ChangeKind::Deletion: case ChangeKind::Insertion: return "@style:31;1";  // [FG Red; Bold]
+    case ChangeKind::Modification: return "@style:35;1";              // [FG Magenta; Bold]
+  }
+  return "@style:0";
+}
 
 // Diffing.prefix ppf (pos, p)
-inline void prefix(format_doc::Formatter& ppf, long pos, ChangeKind) {
-  format_doc::pp_open_stag(ppf, style_tag);
+inline void prefix(format_doc::Formatter& ppf, long pos, ChangeKind p) {
+  format_doc::pp_open_stag(ppf, style_tag(p));
   format_doc::fprintf(ppf, "%i. ", pos);
   format_doc::pp_close_stag(ppf);
 }
@@ -356,7 +364,10 @@ struct KeyedChange {
 template <class L, class R, class D>
 void prefix(format_doc::Formatter& ppf, const KeyedChange<L, R, D>& x) {
   using K = typename KeyedChange<L, R, D>::K;
-  format_doc::pp_open_stag(ppf, style_tag);
+  ChangeKind kind = x.k == K::Insert ? ChangeKind::Insertion
+                  : x.k == K::Delete ? ChangeKind::Deletion
+                                     : ChangeKind::Modification;
+  format_doc::pp_open_stag(ppf, style_tag(kind));
   switch (x.k) {
     case K::Change: format_doc::fprintf(ppf, "%i. ", x.change.pos); break;
     case K::Insert:

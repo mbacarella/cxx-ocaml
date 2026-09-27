@@ -12,10 +12,13 @@
 
 #include "cppcaml/typing/parmatch.hpp"
 #include "cppcaml/typing/printtyp.hpp"
+#include "cppcaml/typing/oprint.hpp"
 #include "cppcaml/typing/warnings.hpp"
 #include "cppcaml/typing/persistent_env.hpp"
 #include "cppcaml/typing/shape.hpp"
 #include "cppcaml/typing/location.hpp"
+#include "cppcaml/typing/config.hpp"
+#include "cppcaml/typing/clflags.hpp"
 #include "typecore_internal.hpp"
 #include "typemod_internal.hpp"
 
@@ -227,6 +230,27 @@ void install_forward_refs() {
 }
 
 // ---- typecheck an implementation file -------------------------------------------------------
+// Filename.remove_extension
+static std::string remove_extension(const std::string& name) {
+  std::size_t slash = name.rfind('/');
+  std::size_t dot = name.rfind('.');
+  if (dot == std::string::npos || (slash != std::string::npos && dot < slash)) return name;
+  std::size_t base = slash == std::string::npos ? 0 : slash + 1;
+  // a basename made of leading dots only has no extension
+  bool only_dots = true;
+  for (std::size_t k = base; k < dot; ++k) only_dots = only_dots && name[k] == '.';
+  if (only_dots) return name;
+  return name.substr(0, dot);
+}
+// Unit_info.modname_from_source: the basename up to its first '.', capitalized
+static std::string modname_of_filename(const std::string& file) {
+  std::size_t slash = file.rfind('/');
+  std::string base = slash == std::string::npos ? file : file.substr(slash + 1);
+  std::size_t dot = base.find('.');
+  if (dot != std::string::npos) base = base.substr(0, dot);
+  if (!base.empty() && base[0] >= 'a' && base[0] <= 'z') base[0] = static_cast<char>(base[0] - 'a' + 'A');
+  return base;
+}
 tt::Implementation type_implementation(const UnitInfo& target, env::t initial_env, pt::Structure ast) {
   // (Cmt_format.clear / save_cmt and the typing recovery are not ported)
   typecore::reset_delayed_checks();
@@ -252,21 +276,27 @@ tt::Implementation type_implementation(const UnitInfo& target, env::t initial_en
     // (the result is ignored by Compile.implementation)
     return {r.str, tt::tcoerce_none(), simple_sg};
   }
-  if (target.has_mli) {
-    // Unit_info.find_normalized_cmi: the unit's .cmi in the load path
-    std::string source_intf = target.source_file.substr(0, target.source_file.size() - 3) + ".mli";
-    std::string compiled_intf_file;
-    try {
-      compiled_intf_file = load_path::find_normalized(target.modname + ".cmi");
-    } catch (const load_path::NotFound&) {
-      Error e(location::in_file(target.source_file), env::empty(), EK::Interface_not_compiled);
-      e.name = source_intf;
-      typing_recovery::log_and_raise(e);
+  // Unit_info.mli_from_source: the source's prefix and Config.interface_suffix
+  std::string source_intf = remove_extension(target.source_file) + config::interface_suffix;
+  if (clflags::cmi_file || target.has_mli) {
+    std::string compiled_intf_file, intf_modname = target.modname;
+    if (clflags::cmi_file) {
+      // Unit_info.Artifact.from_filename: the unit named after the file
+      compiled_intf_file = *clflags::cmi_file;
+      intf_modname = modname_of_filename(compiled_intf_file);
+    } else {
+      // Unit_info.find_normalized_cmi: the unit's .cmi in the load path
+      try {
+        compiled_intf_file = load_path::find_normalized(target.modname + ".cmi");
+      } catch (const load_path::NotFound&) {
+        Error e(location::in_file(target.source_file), env::empty(), EK::Interface_not_compiled);
+        e.name = source_intf;
+        typing_recovery::log_and_raise(e);
+      }
     }
-    Signature dclsig = env::read_signature(target.modname, compiled_intf_file);
-    auto [coercion, shape] = includemod::compunit(initial_env, true, target.source_file, r.sg,
-                                                  target.source_file.substr(0, target.source_file.size() - 3) + ".mli",
-                                                  dclsig, shape0);
+    Signature dclsig = env::read_signature(intf_modname, compiled_intf_file);
+    auto [coercion, shape] =
+        includemod::compunit(initial_env, true, target.source_file, r.sg, source_intf, dclsig, shape0);
     (void)shape;
     typecore::force_delayed_checks();
     return {r.str, coercion, dclsig};
@@ -289,18 +319,23 @@ const tt::Signature* type_interface(const UnitInfo&, env::t env, pt::Signature a
   return transl_signature(env, ast);
 }
 
-// Env.persistent_structures_of_dir: the unit names of the dir's .cmi files
-static std::set<std::string> persistent_structures_of_dir(const std::string& dir) {
+// Env.unit_name_of_filename: a .cmi's unit (Unit_info.strict_modname_from_
+// source: the basename up to its first '.', capitalized), if a valid name
+static std::optional<std::string> unit_name_of_filename(const std::string& fn) {
+  std::size_t dot = fn.rfind('.');
+  if (dot == std::string::npos || fn.substr(dot) != ".cmi") return std::nullopt;  // Filename.extension
+  std::string stem = fn.substr(0, fn.find('.'));
+  if (!stem.empty() && stem[0] >= 'a' && stem[0] <= 'z') stem[0] = static_cast<char>(stem[0] - 'a' + 'A');
+  if (!oprint::is_valid_identifier(stem)) return std::nullopt;  // Unit_info.is_unit_name
+  return stem;
+}
+
+// Env.persistent_structures_of_dir: the units of a load-path directory's
+// file list (Load_path.Dir.files)
+static std::set<std::string> persistent_structures_of_dir(const std::vector<std::string>& files) {
   std::set<std::string> out;
-  std::error_code ec;
-  for (auto& e : std::filesystem::directory_iterator(dir, ec)) {
-    std::string name = e.path().filename().string();
-    if (name.size() > 4 && name.substr(name.size() - 4) == ".cmi") {
-      std::string base = name.substr(0, name.size() - 4);
-      if (!base.empty() && base[0] >= 'a' && base[0] <= 'z') base[0] = static_cast<char>(base[0] - 'a' + 'A');
-      out.insert(base);
-    }
-  }
+  for (const std::string& f : files)
+    if (std::optional<std::string> u = unit_name_of_filename(f)) out.insert(*u);
   return out;
 }
 
@@ -325,7 +360,8 @@ env::t initial_env(const Location& loc, const std::optional<std::string>& initia
     return e;
   };
   std::vector<std::set<std::string>> units;
-  for (auto& dir : load_path::get_path_list()) units.push_back(persistent_structures_of_dir(dir));
+  // List.map Env.persistent_structures_of_dir (Load_path.get_visible ())
+  for (auto& files : load_path::visible_dir_files()) units.push_back(persistent_structures_of_dir(files));
   if (initially_opened_module) {
     // Locate the directory that contains [m], add the units it contains to
     // the environment and open [m] in the resulting environment.

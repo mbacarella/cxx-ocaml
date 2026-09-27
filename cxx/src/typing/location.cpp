@@ -82,6 +82,7 @@ void filename(fd::Formatter& ppf, std::string_view file) {
 }
 
 void loc(fd::Formatter& ppf, const Location& loc) {
+  misc::style::setup();  // Location.setup_tags
   auto file_valid = [](const std::string& f) {
     if (f == "_none_") return true;  // printed anyway, to please editors
     return !(f.empty() || f == "//toplevel//");
@@ -376,21 +377,52 @@ void pp_loc(format::Formatter& ppf, const Report& report, const Location& l) {
   print_loc(ppf, l);
   ppf.print_string(":");
   ppf.print_space();
-  // (Fmt.compat highlight) loc: Misc.Error_style.Contextual
+  // (Fmt.compat highlight) loc: the excerpt under Misc.Error_style.Contextual
+  // (the default), nothing under Short
   fd::Formatter f;
-  if (is_quotable_loc(l)) highlight_quote(f, tag, {l});
+  bool contextual = !clflags::error_style || *clflags::error_style == clflags::ErrorStyle::Contextual;
+  if (contextual && is_quotable_loc(l)) highlight_quote(f, tag, {l});
   fd::format(ppf, f.doc);
 }
 
 void pp_txt(format::Formatter& ppf, const fd::Doc& txt) { fd::format(ppf, txt); }
 
+// Format's @{<tag>...@}: the tag's marks once Misc.Style.setup has run
+static void mark_open(format::Formatter& ppf, const std::string& tag) {
+  if (!ppf.mark_tags || !misc::style::marks_enabled()) return;
+  std::string m = misc::style::mark_open_tag(tag);
+  if (!m.empty()) ppf.print_as(0, m);
+}
+static void mark_close(format::Formatter& ppf, const std::string& tag) {
+  if (!ppf.mark_tags || !misc::style::marks_enabled()) return;
+  std::string m = misc::style::mark_close_tag(tag);
+  if (!m.empty()) ppf.print_as(0, m);
+}
+
 void pp_report_kind(format::Formatter& ppf, const Report& r) {
+  auto tagged = [&](const char* tag, const char* text) {
+    mark_open(ppf, tag);
+    ppf.print_string(text);
+    mark_close(ppf, tag);
+  };
   switch (r.kind) {
-    case ReportKind::Report_error: ppf.print_string("Error"); break;
-    case ReportKind::Report_warning: format::fprintf(ppf, "Warning %s", r.kind_arg); break;
-    case ReportKind::Report_warning_as_error: format::fprintf(ppf, "Error (warning %s)", r.kind_arg); break;
-    case ReportKind::Report_alert: format::fprintf(ppf, "Alert %s", r.kind_arg); break;
-    case ReportKind::Report_alert_as_error: format::fprintf(ppf, "Error (alert %s)", r.kind_arg); break;
+    case ReportKind::Report_error: tagged("error", "Error"); break;
+    case ReportKind::Report_warning:
+      tagged("warning", "Warning");
+      format::fprintf(ppf, " %s", r.kind_arg);
+      break;
+    case ReportKind::Report_warning_as_error:
+      tagged("error", "Error");
+      format::fprintf(ppf, " (warning %s)", r.kind_arg);
+      break;
+    case ReportKind::Report_alert:
+      tagged("warning", "Alert");
+      format::fprintf(ppf, " %s", r.kind_arg);
+      break;
+    case ReportKind::Report_alert_as_error:
+      tagged("error", "Error");
+      format::fprintf(ppf, " (alert %s)", r.kind_arg);
+      break;
   }
 }
 
@@ -431,6 +463,7 @@ static long num_loc_lines = 0;
 static void print_report_(format::Formatter& ppf, const Report& report);
 
 void print_report(format::Formatter& ppf, const Report& report) {
+  misc::style::setup();  // batch_mode_printer.pp: setup_tags
   // separate_new_message
   if (num_loc_lines != 0) {
     ppf.print_newline();
@@ -569,6 +602,7 @@ bool report_exception(format::Formatter& ppf, std::exception_ptr ep) {
 
 format::Formatter& err_formatter() {
   static format::Formatter f;
+  f.mark_tags = true;  // (marks only once Misc.Style.setup has run)
   return f;
 }
 

@@ -138,8 +138,6 @@ StrMap<std::string_view> fold_alerts(const std::vector<std::pair<std::string, st
 
 }  // namespace
 
-bool stops_before_lambda = false;
-
 bool is_builtin_attr(std::string_view s) { return builtin_attrs().count(drop_ocaml_attr_prefix(s)) != 0; }
 
 void register_attr(std::string_view txt, const Location& loc) {
@@ -160,6 +158,8 @@ void warn_unused() {
   std::vector<Entry> keys;
   for (auto& [k, e] : unused_attrs()) keys.push_back(e);
   unused_attrs().clear();
+  // compiler_stops_before_attributes_consumed ()
+  bool stops_before_lambda = clflags::stop_after && *clflags::stop_after < clflags::Pass::Lambda;
   if (stops_before_lambda || clflags::print_types) return;
   std::sort(keys.begin(), keys.end(), [](const Entry& a, const Entry& b) { return a.seq < b.seq; });
   std::stable_sort(keys.begin(), keys.end(), [](const Entry& a, const Entry& b) {

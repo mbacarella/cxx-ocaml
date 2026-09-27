@@ -102,6 +102,13 @@ static std::vector<std::string> rev_paths(const std::vector<Dir>& ds) {
   return v;
 }
 
+std::vector<std::vector<std::string>> visible_dir_files() {
+  // visible_dirs is kept latest-first: List.rev gives the path's order
+  std::vector<std::vector<std::string>> r;
+  for (auto it = g_visible_dirs.rbegin(); it != g_visible_dirs.rend(); ++it) r.push_back(it->files);
+  return r;
+}
+
 std::vector<std::string> get_path_list() {
   auto v = rev_paths(g_visible_dirs);
   auto h = rev_paths(g_hidden_dirs);

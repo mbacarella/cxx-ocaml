@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "cppcaml/token.hpp"
@@ -38,7 +39,7 @@ struct LexError : std::runtime_error {
     Illegal_character, Illegal_escape, Reserved_sequence, Unterminated_comment, Unterminated_string,
     Unterminated_string_in_comment,
     Empty_character_literal, Invalid_literal, Invalid_directive, Invalid_encoding, Invalid_char_in_ident,
-    Non_lowercase_delimiter, Capitalized_raw_identifier, Other
+    Non_lowercase_delimiter, Capitalized_raw_identifier, Unknown_keyword, Other
   };
   Kind kind = Kind::Other;
   size_t pos;                        // the location: [pos, end)
@@ -125,5 +126,8 @@ class Lexer {
 // True if `s` is an OCaml keyword (matches Lexer.is_keyword); used by the printer
 // to escape type variables named like keywords (`'\#let`).
 bool is_ocaml_keyword(std::string_view s);
+// Lexer.init ~keyword_edition (populate_keywords): (None, []) is the
+// default edition, every keyword
+void set_keyword_edition(std::optional<std::pair<int, int>> version, const std::vector<std::string>& keywords);
 
 }  // namespace cppcaml

@@ -172,6 +172,9 @@ void reset_fatal();
 // warning-as-error was reported
 void check_fatal();
 
+// help_warnings (-warn-help), on stdout
+void help_warnings();
+
 // parse_options errflag s: the deprecated-letters alert it may return;
 // raises Bad
 std::optional<Alert> parse_options(bool errflag, std::string_view s);

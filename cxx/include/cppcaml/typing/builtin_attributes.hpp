@@ -29,9 +29,6 @@ inline void mark_used(const parsetree::StrLoc& name) { mark_used(name.txt, name.
 // warn_unused (): Misplaced_attribute for each attribute still unused, in
 // the order of the source; the table is cleared
 void warn_unused();
-// Clflags.stop_after < Lambda || print_types (compiler_stops_before_
-// attributes_consumed): the driver sets it
-extern bool stops_before_lambda;
 bool is_builtin_attr(std::string_view s);
 
 // attr_equals_builtin: `s` or `ocaml.s`

@@ -19,6 +19,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <unordered_map>
 
 #include "cppcaml/marshal.hpp"
 #include "cppcaml/omarshal.hpp"
@@ -89,24 +90,31 @@ struct InputFile {
 };
 
 // Convert a decoded Marshal value (the literal Obj.t) to an omarshal value.
-ValPtr conv(const m::Arena& a, std::size_t id) {
+ValPtr conv(const m::Arena& a, std::size_t id, std::unordered_map<std::size_t, ValPtr>* memo = nullptr) {
   const m::Value& v = a[id];
+  // input_value then output_value keeps what the marshaled value shared:
+  // with a memo, one ValPtr per arena block / string
+  if (memo && v.kind != m::Value::Kind::Int)
+    if (auto it = memo->find(id); it != memo->end()) return it->second;
+  ValPtr r;
   switch (v.kind) {
     case m::Value::Kind::Int:
       if (!v.custom_raw().empty())  // a boxed int32/int64/nativeint literal
         return omarshal::vcustom(v.custom_raw(), v.custom_bsize());
       return omarshal::vint(v.i);
-    case m::Value::Kind::String: return omarshal::vstr(v.str());
-    case m::Value::Kind::Double: return omarshal::vdbl(v.d());
+    case m::Value::Kind::String: r = omarshal::vstr(v.str()); break;
+    case m::Value::Kind::Double: r = omarshal::vdbl(v.d()); break;
     case m::Value::Kind::Block: {
       std::vector<ValPtr> fs;
-      for (auto f : v.fields) fs.push_back(conv(a, f));
-      return omarshal::vblock((int)v.tag, std::move(fs));
+      for (auto f : v.fields) fs.push_back(conv(a, f, memo));
+      r = omarshal::vblock((int)v.tag, std::move(fs));
+      break;
     }
-    case m::Value::Kind::DoubleArray:
-      return omarshal::vdblarr(v.darr());
+    case m::Value::Kind::DoubleArray: r = omarshal::vdblarr(v.darr()); break;
   }
-  return omarshal::vint(0);
+  if (!r) return omarshal::vint(0);
+  if (memo) (*memo)[id] = r;
+  return r;
 }
 
 // Walk an OCaml list value (cons blocks / 0) collecting element arena ids.
@@ -253,7 +261,8 @@ void put_be32(std::vector<std::uint8_t>& v, std::uint32_t n) {
 }  // namespace
 
 void link_executable(const std::vector<std::string>& inputs,
-                     const std::string& out_path, const std::string& runtime_path) {
+                     const std::string& out_path, const std::string& runtime_path,
+                     bool link_everything, bool no_auto_link, bool write_linkmap) {
   Symtable st;
   st.init_prims();
   st.init_predef();
@@ -275,7 +284,7 @@ void link_executable(const std::vector<std::string>& inputs,
   };
   for (auto fi = files.rbegin(); fi != files.rend(); ++fi)
     for (auto ui = fi->units.rbegin(); ui != fi->units.rend(); ++ui)
-      if (!fi->archive || ui->force_link || missing.count(ui->name)) take(*ui);
+      if (!fi->archive || ui->force_link || link_everything || missing.count(ui->name)) take(*ui);
 
   // Interface-consistency check (bytelink's Consistbl / check_consistency): every
   // unit records the CRC of each .cmi it was compiled against (cu_imports).  Two
@@ -462,7 +471,7 @@ void link_executable(const std::vector<std::string>& inputs,
   {
     std::vector<std::pair<bool, std::string>> seen;
     for (const InputFile& fi : files)
-      for (const auto& [suffixed, name] : fi.dllibs) {
+      for (const auto& [suffixed, name] : no_auto_link ? decltype(fi.dllibs){} : fi.dllibs) {
         bool out_suffixed = suffixed;
         std::string out_name = name;
         if (suffixed && name.rfind("-l", 0) == 0) out_name = "dll" + name.substr(2);
@@ -507,14 +516,16 @@ void link_executable(const std::vector<std::string>& inputs,
   f.write(reinterpret_cast<const char*>(out.data()), (std::streamsize)out.size());
 
   // The module map sidecar (best-effort; a failure to write it is non-fatal).
-  std::ofstream lm(out_path + ".linkmap");
-  if (lm) lm << linkmap;
+  if (write_linkmap) {
+    std::ofstream lm(out_path + ".linkmap");
+    if (lm) lm << linkmap;
+  }
 }
 
 // ---- `ocamlc -a`: build a .cma library ------------------------------------
 // A .cma is `magic(12) + be32(toc_offset) + <concatenated unit code> + marshaled
 // library`; each unit's cu_pos is rewritten to its code offset within the file.
-void archive(const std::vector<std::string>& cmos, const std::string& out_path) {
+void archive(const std::vector<std::string>& cmos, const std::string& out_path, bool link_everything) {
   std::vector<std::uint8_t> out;
   const char* magic = "Caml1999A038";
   out.insert(out.end(), magic, magic + 12);
@@ -529,11 +540,26 @@ void archive(const std::vector<std::string>& cmos, const std::string& out_path) 
     m::Arena arena;
     std::size_t root = m::read_value(file.data(), file.size(), off, arena);
     arena.finalize();
-    int cu_pos = (int)arena[arena[root].fields[1]].i;
-    int codesize = (int)arena[arena[root].fields[2]].i;
-    ValPtr cu = conv(arena, root);
-    cu->fields[1] = omarshal::vint((long long)out.size());  // rewrite cu_pos
+    auto field = [&](int i) { return (long long)arena[arena[root].fields[i]].i; };
+    long long cu_pos = field(1), codesize = field(2);
+    std::unordered_map<std::size_t, ValPtr> memo;
+    ValPtr cu = conv(arena, root, &memo);
+    // Bytelibrarian.copy_compunit: the code, then the debug and hint
+    // sections, each at its new position
+    cu->fields[1] = omarshal::vint((long long)out.size());  // cu_pos
+    if (link_everything) cu->fields[7] = omarshal::vint(1);  // cu_force_link
     out.insert(out.end(), file.begin() + cu_pos, file.begin() + cu_pos + codesize);
+    if (arena[root].fields.size() > 11) {
+      long long debug = field(8), debugsize = field(9), hint = field(10), hintsize = field(11);
+      if (debug > 0) {
+        cu->fields[8] = omarshal::vint((long long)out.size());
+        out.insert(out.end(), file.begin() + debug, file.begin() + debug + debugsize);
+      }
+      if (hint > 0) {
+        cu->fields[10] = omarshal::vint((long long)out.size());
+        out.insert(out.end(), file.begin() + hint, file.begin() + hint + hintsize);
+      }
+    }
     units.push_back(cu);
   }
   // library = { lib_units; lib_custom=false; lib_ccobjs=[]; lib_ccopts=[]; lib_dllibs=[] }

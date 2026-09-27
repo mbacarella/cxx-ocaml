@@ -1,6 +1,12 @@
 // See misc.hpp.
 #include "cppcaml/typing/misc.hpp"
 
+#include <unistd.h>
+
+#include <cstdlib>
+
+#include "cppcaml/typing/clflags.hpp"
+
 #include <algorithm>
 #include <cstdlib>
 
@@ -13,6 +19,50 @@ void inline_code(fd::Formatter& ppf, std::string_view s) {
   fd::pp_close_stag(ppf);
 }
 void hint(fd::Formatter& ppf) { fd::fprintf(ppf, "@{<hint>Hint@}"); }
+
+namespace {
+bool g_setup_done = false;
+bool g_color_enabled = false;
+// style_of_tag: the ANSI codes of the known tags (Style.default_styles);
+// "ralign" has no style (ansi_of_style_l [] is the Reset code)
+std::optional<std::string> style_codes(const std::string& tag) {
+  if (tag == "error") return "1;31";
+  if (tag == "warning") return "1;35";
+  if (tag == "loc") return "1";
+  if (tag == "hint") return "1;34";
+  if (tag == "inline_code") return "1";
+  if (tag == "ralign") return "0";
+  if (tag.rfind("@style:", 0) == 0) return tag.substr(7);
+  return std::nullopt;
+}
+}  // namespace
+
+void setup() {
+  if (g_setup_done) return;
+  g_setup_done = true;
+  namespace cf = clflags;
+  cf::Color c = cf::color ? *cf::color : cf::Color::Auto;
+  if (c == cf::Color::Always) g_color_enabled = true;
+  else if (c == cf::Color::Never) g_color_enabled = false;
+  else {
+    const char* term = std::getenv("TERM");
+    std::string t = term ? term : "";
+    g_color_enabled = t != "dumb" && !t.empty() && ::isatty(2);
+  }
+}
+
+bool marks_enabled() { return g_setup_done; }
+
+std::string mark_open_tag(const std::string& tag) {
+  if (std::optional<std::string> codes = style_codes(tag)) return g_color_enabled ? "\x1b[" + *codes + "m" : "";
+  return "<" + tag + ">";
+}
+
+std::string mark_close_tag(const std::string& tag) {
+  if (style_codes(tag)) return g_color_enabled ? "\x1b[0m" : "";
+  return "</" + tag + ">";
+}
+
 }  // namespace style
 
 std::optional<long> edit_distance(std::string_view a, std::string_view b, long cutoff) {

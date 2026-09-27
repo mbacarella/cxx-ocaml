@@ -300,9 +300,44 @@ const std::vector<std::pair<std::string_view, Kind>>& dedicated_symbols() {
   return v;
 }
 
+// The keywords' "since" versions (lexer.mll all_keywords; absent: always)
+std::optional<std::pair<int, int>> keyword_since(std::string_view s) {
+  if (s == "effect") return std::pair{5, 3};
+  if (s == "class" || s == "constraint" || s == "inherit" || s == "initializer" || s == "method" || s == "new" ||
+      s == "object" || s == "private" || s == "virtual")
+    return std::pair{1, 0};
+  if (s == "assert" || s == "lazy") return std::pair{1, 6};
+  if (s == "nonrec") return std::pair{4, 2};
+  return std::nullopt;
+}
+
+// lexer.mll's keyword_table as populate_keywords leaves it: None when the
+// default edition is in force (every keyword); an entry without a token is
+// an additional keyword this version does not know (Unknown_keyword)
+std::optional<std::unordered_map<std::string, std::optional<KwEntry>>> g_active_keywords;
+
 }  // namespace
 
+void set_keyword_edition(std::optional<std::pair<int, int>> version, const std::vector<std::string>& keywords) {
+  if (!version && keywords.empty()) {
+    g_active_keywords.reset();
+    return;
+  }
+  std::unordered_map<std::string, std::optional<KwEntry>> tbl;
+  for (auto& [name, entry] : keyword_table()) {
+    std::optional<std::pair<int, int>> since = keyword_since(name);
+    if (!version || !since || *version >= *since) tbl[std::string(name)] = entry;
+  }
+  for (const std::string& name : keywords) {
+    auto it = keyword_table().find(name);
+    if (it != keyword_table().end()) tbl[name] = it->second;
+    else tbl[name] = std::nullopt;
+  }
+  g_active_keywords = std::move(tbl);
+}
+
 bool is_ocaml_keyword(std::string_view s) {
+  if (g_active_keywords) return g_active_keywords->count(std::string(s)) != 0;
   auto it = keyword_table().find(s);
   return it != keyword_table().end();
 }
@@ -573,10 +608,27 @@ Token Lexer::scan_ident(size_t start) {
       t.text = std::string(src_.substr(start, pos_ - start));
       return t;
     }
-    auto it = keyword_table().find(name);
-    if (it != keyword_table().end()) {
-      Token t = Token::make(it->second.kind, start, pos_);
-      if (it->second.text) t.text = it->second.text;  // INFIXOP keyword (mod, lsl, ...)
+    // find_keyword: the keyword's token, Unknown_keyword for an additional
+    // keyword this version lacks, else LIDENT
+    std::optional<KwEntry> kw;
+    if (g_active_keywords) {
+      auto it = g_active_keywords->find(name);
+      if (it != g_active_keywords->end()) {
+        if (!it->second) {
+          LexError e("Unknown_keyword", start);
+          e.kind = LexError::Kind::Unknown_keyword;
+          e.end = pos_;
+          e.arg = name;
+          throw e;
+        }
+        kw = *it->second;
+      }
+    } else if (auto it = keyword_table().find(name); it != keyword_table().end()) {
+      kw = it->second;
+    }
+    if (kw) {
+      Token t = Token::make(kw->kind, start, pos_);
+      if (kw->text) t.text = kw->text;  // INFIXOP keyword (mod, lsl, ...)
       return t;
     }
     Token t = Token::make(Kind::LIDENT, start, pos_);
