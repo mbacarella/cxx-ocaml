@@ -70,6 +70,7 @@ struct Token {
   std::string ext_id;                // QUOTED_STRING_EXPR/ITEM extension identifier
   size_t content_start = 0;          // QUOTED_STRING_*: byte offset of the content (after `|`)
   int char_code = -1;                // CHAR: byte value 0..255
+  bool lex_error = false;            // TEOF standing for a lexer error (Lexer::pending_error)
 
   static Token make(Kind k, size_t s, size_t e) { return Token{k, s, e}; }
 };

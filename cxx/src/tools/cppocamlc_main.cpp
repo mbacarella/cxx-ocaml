@@ -36,6 +36,8 @@
 #include "cppcaml/dbgenv.hpp"
 #include "cppcaml/link.hpp"
 #include "cppcaml/parser.hpp"
+#include "cppcaml/lexer.hpp"
+#include "cppcaml/typing/misc.hpp"
 #include "cppcaml/typing/builtin_attributes.hpp"
 #include "cppcaml/typing/clflags.hpp"
 #include "cppcaml/typing/ctype.hpp"
@@ -397,6 +399,118 @@ static PortResult port_typecheck(const std::string& in_path, const std::string& 
   }
 }
 
+// The location of a byte span of the source (Location.curr lexbuf; the
+// `# N "file"` directives are not taken into account here)
+static cppcaml::typing::Location span_loc(const std::string& path, const std::string& src, size_t a, size_t b) {
+  namespace ty = cppcaml::typing;
+  auto pos = [&](size_t off) {
+    long lnum = 1, bol = 0;
+    for (size_t i = 0; i < off && i < src.size(); ++i)
+      if (src[i] == '\n') {
+        ++lnum;
+        bol = static_cast<long>(i + 1);
+      }
+    return ty::Position{ty::zborrow(path), lnum, bol, static_cast<long>(off)};
+  };
+  return ty::Location{pos(a), pos(b), false};
+}
+
+static void emit_report(const cppcaml::typing::location::Report& r) {
+  namespace ty = cppcaml::typing;
+  ty::location::print_report(ty::location::err_formatter(), r);
+  ty::location::err_flush();
+}
+
+// Syntaxerr.prepare_error (parse.ml)
+static void report_syntax_error(const std::string& path, const std::string& src, const cppcaml::ParseError& e) {
+  namespace ty = cppcaml::typing;
+  namespace fd = ty::format_doc;
+  using ty::misc::style::code_str;
+  ty::Location loc = span_loc(path, src, e.pos, e.end);
+  switch (e.kind) {
+    case cppcaml::ParseError::Kind::Unclosed: {
+      ty::Location oloc = span_loc(path, src, e.open_pos, e.open_end);
+      emit_report(ty::location::errorf_sub(
+          loc, {ty::location::msg(oloc, "This %a might be unmatched", code_str(e.opening))},
+          "Syntax error: %a expected", code_str(e.what_)));
+      return;
+    }
+    case cppcaml::ParseError::Kind::Expecting:
+      emit_report(ty::location::errorf(loc, "Syntax error: %a expected.", code_str(e.what_)));
+      return;
+    case cppcaml::ParseError::Kind::Not_expecting:
+      emit_report(ty::location::errorf(loc, "Syntax error: %a not expected.", code_str(e.what_)));
+      return;
+    case cppcaml::ParseError::Kind::Other: emit_report(ty::location::errorf(loc, "Syntax error")); return;
+  }
+}
+
+// Lexer.prepare_error (lexer.mll)
+static void report_lexer_error(const std::string& path, const std::string& src, const cppcaml::LexError& e) {
+  namespace ty = cppcaml::typing;
+  namespace fd = ty::format_doc;
+  using ty::misc::style::code_str;
+  using K = cppcaml::LexError::Kind;
+  ty::Location loc = span_loc(path, src, e.pos, e.end);
+  std::string expl = e.expl ? *e.expl : std::string();
+  bool has_expl = e.expl.has_value();
+  switch (e.kind) {
+    case K::Illegal_character:
+      emit_report(ty::location::errorf(loc, "Illegal character (%s)", ty::format::char_escaped(e.arg[0])));
+      return;
+    case K::Illegal_escape:
+      emit_report(ty::location::errorf(loc, "Illegal backslash escape in string or character (%s)%t", e.arg,
+                                       [&](fd::Formatter& f) {
+                                         if (has_expl) fd::fprintf(f, ": %s", expl);
+                                       }));
+      return;
+    case K::Reserved_sequence:
+      emit_report(ty::location::errorf(loc, "Reserved character sequence: %s%t", e.arg, [&](fd::Formatter& f) {
+        if (has_expl) fd::fprintf(f, " %s", expl);
+      }));
+      return;
+    case K::Unterminated_comment: emit_report(ty::location::errorf(loc, "Comment not terminated")); return;
+    case K::Unterminated_string: emit_report(ty::location::errorf(loc, "String literal not terminated")); return;
+    case K::Unterminated_string_in_comment:
+      emit_report(ty::location::errorf_sub(
+          loc, {ty::location::msg(span_loc(path, src, e.pos2, e.pos2 + 1), "String literal begins here")},
+          "This comment contains an unterminated string literal"));
+      return;
+    case K::Empty_character_literal:
+      emit_report(ty::location::error(
+          loc, "Illegal empty character literal ''",
+          {ty::location::msg_noloc("@{<hint>Hint@}: Did you mean %a or a type variable %a?", code_str("' '"),
+                                   code_str("'a"))}));
+      return;
+    case K::Invalid_literal: emit_report(ty::location::errorf(loc, "Invalid literal %s", e.arg)); return;
+    case K::Invalid_directive:
+      emit_report(ty::location::errorf(loc, "Invalid lexer directive %S%t", e.arg, [&](fd::Formatter& f) {
+        if (has_expl) fd::fprintf(f, ": %s", expl);
+      }));
+      return;
+    case K::Invalid_encoding:
+      emit_report(ty::location::errorf(loc, "Invalid encoding of identifier %s.", e.arg));
+      return;
+    case K::Invalid_char_in_ident: {
+      char b[32];
+      std::snprintf(b, sizeof b, "%04lX", std::stol(e.arg));
+      emit_report(ty::location::errorf(loc, "Invalid character U+%s in identifier", std::string(b)));
+      return;
+    }
+    case K::Non_lowercase_delimiter:
+      emit_report(ty::location::errorf(
+          loc, "%a cannot be used as a quoted string delimiter,@ it must contain only lowercase letters.",
+          code_str(e.arg)));
+      return;
+    case K::Capitalized_raw_identifier:
+      emit_report(ty::location::errorf(
+          loc, "%a cannot be used as a raw identifier, it must start with a lowercase letter", code_str(e.arg)));
+      return;
+    case K::Other: break;
+  }
+  std::cerr << "c++ocamlc: " << path << ": " << e.what() << '\n';
+}
+
 static int compile_ml(const std::string& in_path, const std::string& cmo_out,
                       const std::string& stdlib_dir, bool prof) {
   namespace ty = cppcaml::typing;
@@ -471,10 +585,31 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
       std::cerr << "  TOTAL compile " << in_path << ": "
                 << std::chrono::duration<double, std::milli>(clk::now() - t0).count() << " ms\n";
   } catch (const cppcaml::ParseError& e) {
-    std::cerr << "c++ocamlc: " << in_path << ": parse error at " << e.pos << ": " << e.what() << '\n';
-    return 1;
-  } catch (const std::exception& e) {
-    std::cerr << "c++ocamlc: " << in_path << ": " << e.what() << '\n';
+    report_syntax_error(in_path, src, e);
+    return 2;
+  } catch (const cppcaml::LexError& e) {
+    report_lexer_error(in_path, src, e);
+    return 2;
+  } catch (...) {
+    // Location.report_exception (Maindriver: exit 2): the translators' errors
+    namespace ty = cppcaml::typing;
+    ty::reporters::install();
+    std::exception_ptr ep = std::current_exception();
+    bool reported = false;
+    try {
+      reported = ty::location::report_exception(ty::location::err_formatter(), ep);
+    } catch (...) {
+      ep = std::current_exception();
+    }
+    ty::location::err_flush();
+    if (reported) return 2;
+    try {
+      std::rethrow_exception(ep);
+    } catch (const std::exception& e) {
+      std::cerr << "c++ocamlc: " << in_path << ": " << e.what() << '\n';
+    } catch (...) {
+      std::cerr << "c++ocamlc: " << in_path << ": internal error\n";
+    }
     return 1;
   }
   return 0;
@@ -517,8 +652,11 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
         });
     if (port != PortResult::Typed) return 2;
   } catch (const cppcaml::ParseError& e) {
-    std::cerr << "c++ocamlc: " << in_path << ": parse error at " << e.pos << ": " << e.what() << '\n';
-    return 1;
+    report_syntax_error(in_path, src, e);
+    return 2;
+  } catch (const cppcaml::LexError& e) {
+    report_lexer_error(in_path, src, e);
+    return 2;
   } catch (const std::exception& e) {
     std::cerr << "c++ocamlc: " << in_path << ": " << e.what() << '\n';
     return 1;

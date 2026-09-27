@@ -392,7 +392,7 @@ Token Lexer::raw_token() {
 
   if (is_symbolchar(c)) return scan_symbol(start);
 
-  throw LexError("Illegal character", start);
+  throw LexError(LexError::Kind::Illegal_character, start, start + 1, std::string(1, c));
 }
 
 Token Lexer::next() {
@@ -435,7 +435,16 @@ std::vector<Token> Lexer::tokenize() {
     DS docs;
     Token tok;
     for (;;) {
-      Token rt = raw_token();
+      Token rt;
+      try {
+        rt = raw_token();
+      } catch (const LexError& e) {
+        pending_error_ = e;
+        Token t = Token::make(Kind::TEOF, e.pos, e.pos);
+        t.lex_error = true;
+        out.push_back(std::move(t));
+        return out;
+      }
       if (rt.kind == Kind::COMMENT) {
         if (lines == NewLine) lines = NoLine;  // NoLine/BlankLine unchanged
         continue;
@@ -531,7 +540,7 @@ Token Lexer::scan_ident(size_t start) {
     char c0 = name[0];
     bool capitalized = (c0 >= 'A' && c0 <= 'Z');
     if (raw_escape) {
-      if (capitalized) throw LexError("Capitalized raw identifier", start);
+      if (capitalized) throw LexError(LexError::Kind::Capitalized_raw_identifier, start, pos_, name);
       Token t = Token::make(Kind::LIDENT, start, pos_);
       t.text = std::move(name);
       return t;
@@ -564,18 +573,18 @@ Token Lexer::scan_ident(size_t start) {
   // Extended (contains Latin-9 / utf8): normalize to NFC, validate, classify by
   // capitalization of the first scalar.
   auto [nfc, enc_ok] = utf8_normalize(name);
-  if (!enc_ok) throw LexError("Invalid encoding of identifier", name_start);
+  if (!enc_ok) throw LexError(LexError::Kind::Invalid_encoding, start, pos_, name);
   for (size_t i = 0; i < nfc.size();) {
     UDec d = utf8_decode(nfc, i);
     if (!uchar_valid_in_identifier(d.cp))
-      throw LexError("Invalid char in identifier", name_start);
+      throw LexError(LexError::Kind::Invalid_char_in_ident, start, pos_, std::to_string(d.cp));
     if (i == 0 && uchar_not_identifier_start(d.cp))
-      throw LexError("Invalid ident start", name_start);
+      throw LexError(LexError::Kind::Invalid_char_in_ident, start, pos_, std::to_string(d.cp));  // (excluded by the regexps)
     i += d.len;
   }
   UDec first = utf8_decode(nfc, 0);
   bool capitalized = uchar_is_uppercase(first.cp);
-  if (raw_escape && capitalized) throw LexError("Capitalized raw identifier", start);
+  if (raw_escape && capitalized) throw LexError(LexError::Kind::Capitalized_raw_identifier, start, pos_, nfc);
   Kind k = (!raw_escape && capitalized) ? Kind::UIDENT : Kind::LIDENT;
   Token t = Token::make(k, start, pos_);
   t.text = std::move(nfc);
@@ -619,7 +628,7 @@ Token Lexer::scan_number(size_t start) {
   // Invalid literal: a number immediately glued to identifier chars.
   if (!modifier && !eof() && is_identchar(cur())) {
     while (!eof() && is_identchar(cur())) pos_++;
-    throw LexError("Invalid literal", start);
+    throw LexError(LexError::Kind::Invalid_literal, start, pos_, std::string(src_.substr(start, pos_ - start)));
   }
   Token t = Token::make(is_float ? Kind::FLOAT : Kind::INT, start, pos_);
   // Literal text excludes the modifier (matches lexer.mll's `lit`).
@@ -686,7 +695,7 @@ Token Lexer::scan_char_or_quote(size_t start) {
     return t;
   }
   // '' is an empty character literal error in OCaml.
-  if (c0 == '\'') throw LexError("Empty character literal", start);
+  if (c0 == '\'') throw LexError(LexError::Kind::Empty_character_literal, start, start + 2);
 
   // Bare quote.
   pos_++;
@@ -697,7 +706,7 @@ Token Lexer::scan_string(size_t start) {
   pos_++;  // opening "
   strbuf_.clear();
   for (;;) {
-    if (eof()) throw LexError("Unterminated string", start);
+    if (eof()) throw LexError(LexError::Kind::Unterminated_string, start, start + 1);
     char c = cur();
     if (c == '"') { pos_++; break; }
     if (c == '\\') {
@@ -718,7 +727,9 @@ Token Lexer::scan_string(size_t start) {
       }
       if (is_digit(e) && is_digit(at(pos_ + 2)) && is_digit(at(pos_ + 3))) {
         int v = 100 * (e - '0') + 10 * (at(pos_ + 2) - '0') + (at(pos_ + 3) - '0');
-        if (v > 255) throw LexError("Illegal decimal escape", pos_);  // out of 0-255
+        if (v > 255)
+          throw LexError(LexError::Kind::Illegal_escape, pos_, pos_ + 4, std::string(src_.substr(pos_, 4)),
+                         std::to_string(v) + " is outside the range of legal characters (0-255).");
         store(static_cast<char>(v));
         pos_ += 4;
         continue;
@@ -727,7 +738,12 @@ Token Lexer::scan_string(size_t start) {
           at(pos_ + 3) >= '0' && at(pos_ + 3) <= '7' && at(pos_ + 4) >= '0' &&
           at(pos_ + 4) <= '7') {
         int v = 64 * (at(pos_ + 2) - '0') + 8 * (at(pos_ + 3) - '0') + (at(pos_ + 4) - '0');
-        if (v > 255) throw LexError("Illegal octal escape", pos_);  // out of 0-255
+        if (v > 255) {
+          char o[16];
+          std::snprintf(o, sizeof o, "o%o", static_cast<unsigned>(v));
+          throw LexError(LexError::Kind::Illegal_escape, pos_, pos_ + 5, std::string(src_.substr(pos_, 5)),
+                         std::string(o) + " (=" + std::to_string(v) + ") is outside the range of legal characters (0-255).");
+        }
         store(static_cast<char>(v));
         pos_ += 5;
         continue;
@@ -742,7 +758,15 @@ Token Lexer::scan_string(size_t start) {
         size_t q = pos_ + 3;
         int cp = 0, ndig = 0;
         while (is_hex(at(q))) { cp = cp * 16 + digit_value(at(q)); q++; ndig++; }
-        if (ndig > 6 || !is_scalar_value(cp)) throw LexError("Illegal \\u escape", pos_);
+        if (at(q) == '}' && (ndig > 6 || !is_scalar_value(cp))) {
+          std::string lexeme(src_.substr(pos_, q + 1 - pos_));
+          if (ndig > 6)
+            throw LexError(LexError::Kind::Illegal_escape, pos_, q + 1, lexeme,
+                           std::string("too many digits, expected 1 to 6 hexadecimal digits"));
+          char hx[32];
+          std::snprintf(hx, sizeof hx, "%X", static_cast<unsigned>(cp));
+          throw LexError(LexError::Kind::Illegal_escape, pos_, q + 1, lexeme, std::string(hx) + " is not a Unicode scalar value");
+        }
         if (at(q) == '}') q++;
         append_utf8(strbuf_, cp);
         pos_ = q;
@@ -783,7 +807,7 @@ Token Lexer::scan_quoted_string(size_t start, const std::string& delim) {
   strbuf_.clear();
   std::string closer = "|" + delim + "}";
   for (;;) {
-    if (eof()) throw LexError("Unterminated string", start);
+    if (eof()) throw LexError(LexError::Kind::Unterminated_string, start, start + 1);
     if (looking_at(closer)) {
       pos_ += closer.size();
       break;
@@ -810,12 +834,14 @@ Token Lexer::scan_quoted_string(size_t start, const std::string& delim) {
 
 void Lexer::scan_comment() {
   // pos_ at "(*". Consume balanced, string-aware, through matching "*)".
+  // comment_start_loc: the stack of the open comments' starts, innermost last
+  std::vector<size_t> starts{pos_};
   pos_ += 2;
   int depth = 1;
   while (depth > 0) {
-    if (eof()) throw LexError("Unterminated comment", 0);
-    if (looking_at("(*")) { depth++; pos_ += 2; continue; }
-    if (looking_at("*)")) { depth--; pos_ += 2; continue; }
+    if (eof()) throw LexError(LexError::Kind::Unterminated_comment, starts.back(), starts.back() + 2);
+    if (looking_at("(*")) { starts.push_back(pos_); depth++; pos_ += 2; continue; }
+    if (looking_at("*)")) { starts.pop_back(); depth--; pos_ += 2; continue; }
     if (cur() == '\'') {
       // A quote immediately after an identifier character is an identifier prime
       // (`f'`), not a char-literal opener -- so `(* f' '"' *)` is not mis-lexed
@@ -854,12 +880,19 @@ void Lexer::scan_comment() {
     }
     if (cur() == '"') {
       // skip a string literal so that "*)" inside it doesn't end the comment
+      size_t str_start = pos_;
       pos_++;
       while (!eof() && cur() != '"') {
         if (cur() == '\\' && !eof()) { pos_ += 2; continue; }
         pos_++;
       }
-      if (!eof()) pos_++;  // closing "
+      if (eof()) {
+        // Unterminated_string_in_comment (start, str_start), at the comment
+        LexError e(LexError::Kind::Unterminated_string_in_comment, starts.back(), starts.back() + 2);
+        e.pos2 = str_start;
+        throw e;
+      }
+      pos_++;  // closing "
       continue;
     }
     if (cur() == '{') {
@@ -993,8 +1026,8 @@ Token Lexer::scan_brace(size_t start) {
   while (p < src_.size() && is_delim_byte(src_[p])) p++;
   if (p < src_.size() && src_[p] == '|') {
     auto [delim, enc_ok] = utf8_normalize(src_.substr(pos_ + 1, p - (pos_ + 1)));
-    if (!enc_ok) throw LexError("Invalid encoding of delimiter", start);
-    if (!ident_is_lowercase(delim)) throw LexError("Non-lowercase delimiter", start);
+    if (!enc_ok) throw LexError(LexError::Kind::Invalid_encoding, start, p + 1, std::string(src_.substr(pos_ + 1, p - (pos_ + 1))));
+    if (!ident_is_lowercase(delim)) throw LexError(LexError::Kind::Non_lowercase_delimiter, start, p + 1, delim);
     pos_ = p + 1;  // past '|'
     return scan_quoted_string(start, delim);
   }
@@ -1030,7 +1063,9 @@ Token Lexer::scan_hash(size_t start) {
           static constexpr std::string_view kMaxInt = "4611686018427387903";  // 2^62-1
           bool overflow = sig.size() > kMaxInt.size() ||
                           (sig.size() == kMaxInt.size() && sig > kMaxInt);
-          if (overflow) throw LexError("Invalid directive: line number out of range", num_start);
+          if (overflow)
+            throw LexError(LexError::Kind::Invalid_directive, start + 1, r, "#" + std::string(src_.substr(num_start, q + 1 - num_start)),
+                           std::string("line number out of range"));
           // record the directive: subsequent lines are renumbered from <num> and
           // attributed to "<file>".  Anchor at the start of the next line.
           size_t anchor = (r < src_.size()) ? r + 1 : r;  // skip the trailing newline
@@ -1060,7 +1095,8 @@ Token Lexer::scan_symbol(size_t start) {
   char c = cur();
 
   // ".~" is a reserved sequence (MetaOCaml).
-  if (c == '.' && at(pos_ + 1) == '~') throw LexError("Reserved sequence .~", start);
+  if (c == '.' && at(pos_ + 1) == '~')
+    throw LexError(LexError::Kind::Reserved_sequence, start, start + 2, ".~", std::string("is reserved for use in MetaOCaml"));
 
   // --- longest dedicated spelling ---
   size_t ded_len = 0;
@@ -1155,7 +1191,7 @@ Token Lexer::scan_symbol(size_t start) {
     pos_ += ded_len;
     return t;
   }
-  throw LexError("Illegal character", start);
+  throw LexError(LexError::Kind::Illegal_character, start, start + 1, std::string(1, c));
 }
 
 }  // namespace cppcaml

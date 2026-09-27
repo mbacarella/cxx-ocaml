@@ -96,6 +96,8 @@ class Parser {
   explicit Parser(std::string_view src) : src_(src) {
     Lexer lex(src);
     tokens_ = lex.tokenize();
+    pending_lex_error_ = lex.pending_error();
+    if (tokens_[0].lex_error) throw *pending_lex_error_;
     docs_ = lex.doc_attach();
     line_starts_.push_back(0);
     for (size_t i = 0; i < src.size(); ++i)
@@ -107,6 +109,16 @@ class Parser {
     }
   }
   const std::vector<std::string>& directive_files() const { return filenames_; }
+  // the span of the token starting at a ParseError's offset (Location.curr
+  // lexbuf: the offending lookahead token)
+  void locate(ParseError& e) const {
+    if (e.end != e.pos) return;
+    for (const Token& t : tokens_)
+      if (t.start == e.pos) {
+        e.end = t.end;
+        return;
+      }
+  }
 
   // --- docstrings (ocaml.doc / ocaml.text) ---
   Structure doc_payload(const Docstring& d) {
@@ -210,10 +222,40 @@ class Parser {
     size_t k = idx_ + n;
     return tokens_[k < tokens_.size() ? k : tokens_.size() - 1];
   }
-  void advance() { if (idx_ + 1 < tokens_.size()) idx_++; }
+  // (a lexer error arises when the parser reads that token)
+  void advance() {
+    if (idx_ + 1 < tokens_.size()) idx_++;
+    if (tokens_[idx_].lex_error) throw *pending_lex_error_;
+  }
+  std::optional<LexError> pending_lex_error_;
   void expect(Kind k, const char* what) {
     if (cur().kind != k) throw ParseError(std::string("expected ") + what, cur().start);
     advance();
+  }
+  // parser.mly's `... error { unclosed opening $loc(open) closing $loc(error) }`
+  // productions: the enclosed phrase is complete but the closing token is not
+  // there -- the offending token is the error's location.
+  [[noreturn]] void unclosed(const char* opening, const Token& open, const char* closing, size_t at, size_t at_end) {
+    ParseError e(std::string("expected ") + closing, at);
+    e.kind = ParseError::Kind::Unclosed;
+    e.end = at_end;
+    e.what_ = closing;
+    e.open_pos = open.start;
+    e.open_end = open.end;
+    e.opening = opening;
+    throw e;
+  }
+  void expect_closing(Kind k, const char* closing, const Token& open, const char* opening) {
+    if (cur().kind != k) unclosed(opening, open, closing, cur().start, cur().end);
+    advance();
+  }
+  // `... error { expecting $loc nonterm }`
+  [[noreturn]] void expecting(size_t at, size_t at_end, const char* nonterm) {
+    ParseError e(std::string("expected ") + nonterm, at);
+    e.kind = ParseError::Kind::Expecting;
+    e.end = at_end;
+    e.what_ = nonterm;
+    throw e;
   }
 
   int phys_line_index(size_t cnum) const {
@@ -393,7 +435,7 @@ class Parser {
       } else {
         inner = parse_expr();
       }
-      const Token& c = cur(); expect(Kind::RPAREN, ")");
+      const Token& c = cur(); expect_closing(Kind::RPAREN, ")", lp, "(");
       return make_local_open(pr.lid, std::move(inner), span(openStart, position(c.end)));
     }
     ExprBox inner = parse_atom();  // M.[…] / M.{…} / M.[|…|]
@@ -530,21 +572,24 @@ class Parser {
         Location l = span(e->loc.start, field.loc.end);
         e = E({Pexp_field{std::move(e), std::move(field)}, l});
       } else if (cur().kind == Kind::DOT && peek(1).kind == Kind::LPAREN) {
+        const Token& lp = peek(1);
         advance(); advance();  // . (
         ExprBox idx = parse_expr();
-        const Token& c = cur(); expect(Kind::RPAREN, ")");
+        const Token& c = cur(); expect_closing(Kind::RPAREN, ")", lp, "(");
         e = indexed_get(std::move(e), std::move(idx), position(c.end), "Array");
       } else if (cur().kind == Kind::DOT && peek(1).kind == Kind::LBRACKET) {
+        const Token& lb = peek(1);
         advance(); advance();  // . [
         ExprBox idx = parse_expr();
-        const Token& c = cur(); expect(Kind::RBRACKET, "]");
+        const Token& c = cur(); expect_closing(Kind::RBRACKET, "]", lb, "[");
         e = indexed_get(std::move(e), std::move(idx), position(c.end), "String");
       } else if (cur().kind == Kind::DOT && peek(1).kind == Kind::LBRACE) {
+        const Token& lb = peek(1);
         advance(); advance();  // . {   (bigarray indexing; commas separate indices)
         std::vector<ExprBox> idxs;
         idxs.push_back(parse_binop(0));
         while (cur().kind == Kind::COMMA) { advance(); idxs.push_back(parse_binop(0)); }
-        const Token& c = cur(); expect(Kind::RBRACE, "}");
+        const Token& c = cur(); expect_closing(Kind::RBRACE, "}", lb, "{");
         e = bigarray_get(std::move(e), std::move(idxs), position(c.end));
       } else if (cur().kind == Kind::DOTOP) {  // e.op(i) / e.op[i] / e.op{i;j} index-op get
         e = parse_dotop_index(std::move(e), {});
@@ -640,7 +685,7 @@ class Parser {
           return E({Pexp_coerce{std::move(inner), std::nullopt, std::move(ty2)},
                     span(position(t.start), position(c.end))});
         }
-        const Token& c = cur(); expect(Kind::RPAREN, ")");
+        const Token& c = cur(); expect_closing(Kind::RPAREN, ")", t, "(");
         inner->loc = span(position(t.start), position(c.end));  // reloc to parens
         return inner;
       }
@@ -664,7 +709,7 @@ class Parser {
           if (cur().kind == Kind::RBRACKET) break;  // trailing ';'
           elems.push_back(parse_expr_no_seq());
         }
-        const Token& c = cur(); expect(Kind::RBRACKET, "]");
+        const Token& c = cur(); expect_closing(Kind::RBRACKET, "]", t, "[");
         return build_expr_list(elems, position(t.start), position(c.start), position(c.end));
       }
       case Kind::LBRACE: {
@@ -707,7 +752,7 @@ class Parser {
           }
           if (cur().kind == Kind::SEMI) advance(); else break;
         }
-        const Token& c = cur(); expect(Kind::RBRACE, "}");
+        const Token& c = cur(); expect_closing(Kind::RBRACE, "}", t, "{");
         return E({Pexp_record{std::move(fields), std::move(base)},
                   span(position(t.start), position(c.end))});
       }
@@ -725,7 +770,7 @@ class Parser {
         }
         ExprBox inner = parse_expr();
         if (cur().kind == Kind::SEMI) advance();  // optional trailing ';' before end
-        const Token& c = cur(); expect(Kind::END, "end");
+        const Token& c = cur(); expect_closing(Kind::END, "end", t, "begin");
         inner->loc = span(position(t.start), position(c.end));
         // parser.mly rebuilds the node (mkexp_attrs ~loc:$sloc): its
         // pexp_loc_stack is empty, so an `assert`'s innermost location --
@@ -751,7 +796,7 @@ class Parser {
         advance();
         std::optional<ExtName> ext = take_ext(); Attributes attrs = take_attrs();  // object%ext[@attr]
         ClassStructure cs = parse_class_structure_body();
-        const Token& c = cur(); expect(Kind::END, "end");
+        const Token& c = cur(); expect_closing(Kind::END, "end", t, "object");
         return wrap_ext(E({Pexp_object{box(std::move(cs))}, span(position(t.start), position(c.end))}),
                         std::move(ext), std::move(attrs));
       }
@@ -774,7 +819,7 @@ class Parser {
           }
           if (cur().kind == Kind::SEMI) advance(); else break;
         }
-        const Token& c = cur(); expect(Kind::GREATERRBRACE, ">}");
+        const Token& c = cur(); expect_closing(Kind::GREATERRBRACE, ">}", t, "{<");
         return E({Pexp_override{std::move(fields)}, span(position(t.start), position(c.end))});
       }
       case Kind::LBRACKETBAR: {
@@ -788,7 +833,7 @@ class Parser {
             elems.push_back(parse_expr_no_seq());
           }
         }
-        const Token& c = cur(); expect(Kind::BARRBRACKET, "|]");
+        const Token& c = cur(); expect_closing(Kind::BARRBRACKET, "|]", t, "[|");
         return E({Pexp_array{std::move(elems)}, span(position(t.start), position(c.end))});
       }
       default:
@@ -1377,9 +1422,12 @@ class Parser {
         std::optional<ExtName> ext = take_ext();  // `while%ext …`
         Attributes attrs = take_attrs();
         ExprBox cond = parse_expr();
+        const Token& dot = cur();
         expect(Kind::DO, "do");
         ExprBox body = parse_expr();
         if (cur().kind == Kind::SEMI) advance();  // optional trailing ';' before done
+        if (cur().kind != Kind::DONE)  // DO seq_expr error: unclosed "do" $loc($1) "done" $loc($2)
+          unclosed("do", dot, "done", static_cast<size_t>(body->loc.start.cnum), static_cast<size_t>(body->loc.end.cnum));
         const Token& c = cur(); expect(Kind::DONE, "done");
         return wrap_ext(E({Pexp_while{std::move(cond), std::move(body)},
                   span(position(t.start), position(c.end))}), std::move(ext), std::move(attrs));
@@ -1396,9 +1444,12 @@ class Parser {
         else if (cur().kind == Kind::DOWNTO) { dir = DirectionFlag::Downto; advance(); }
         else throw ParseError("expected 'to' or 'downto'", cur().start);
         ExprBox hi = parse_expr();
+        const Token& dot = cur();
         expect(Kind::DO, "do");
         ExprBox body = parse_expr();
         if (cur().kind == Kind::SEMI) advance();  // optional trailing ';' before done
+        if (cur().kind != Kind::DONE)  // DO seq_expr error: unclosed "do" $loc($1) "done" $loc($2)
+          unclosed("do", dot, "done", static_cast<size_t>(body->loc.start.cnum), static_cast<size_t>(body->loc.end.cnum));
         const Token& c = cur(); expect(Kind::DONE, "done");
         return wrap_ext(E({Pexp_for{std::move(var), std::move(lo), std::move(hi), dir, std::move(body)},
                   span(position(t.start), position(c.end))}), std::move(ext), std::move(attrs));
@@ -1967,6 +2018,8 @@ class Parser {
     Pattern p = parse_pat_or();
     while (cur().kind == Kind::AS) {
       advance();
+      // self AS error: expecting $loc($3) "identifier" (val_ident: LIDENT | ( operator ))
+      if (cur().kind != Kind::LIDENT && cur().kind != Kind::LPAREN) expecting(cur().start, cur().end, "identifier");
       StringLoc nm = parse_alias_name();
       Location l = span(p.loc.start, nm.loc.end);
       p = Pattern{Ppat_alias{box(std::move(p)), nm}, l};
@@ -2178,7 +2231,7 @@ class Parser {
                             ? ppat_unit_open(span(cl.loc.start, position(cur().end)),
                                              span(position(lp.start), position(cur().end)))
                             : parse_pattern();
-        const Token& c = cur(); expect(Kind::RPAREN, ")");
+        const Token& c = cur(); expect_closing(Kind::RPAREN, ")", lp, "(");
         return Pattern{Ppat_open{cl, box(std::move(inner))}, span(cl.loc.start, position(c.end))};
       }
       if (cur().kind == Kind::DOT &&
@@ -2280,7 +2333,7 @@ class Parser {
                               ? ppat_unit_open(span(cl.loc.start, position(cur().end)),
                                                span(position(lp.start), position(cur().end)))
                               : parse_pattern();
-          const Token& c = cur(); expect(Kind::RPAREN, ")");
+          const Token& c = cur(); expect_closing(Kind::RPAREN, ")", lp, "(");
           return {Ppat_open{cl, box(std::move(inner))}, span(cl.loc.start, position(c.end))};
         }
         if (cur().kind == Kind::DOT &&
@@ -2306,11 +2359,13 @@ class Parser {
           else if (cur().kind == Kind::UNDERSCORE) { const Token& nm = cur(); advance(); name = StrOptLoc{std::nullopt, tokloc(nm)}; }
           else throw ParseError("expected module name", cur().start);
           std::optional<Ptyp_package> pkg;
-          if (cur().kind == Kind::COLON) {  // (module M : S [with type …] / (S [@a]))
+          bool colon = cur().kind == Kind::COLON;
+          if (colon) {  // (module M : S [with type …] / (S [@a]))
             advance();
             pkg = parse_package_type_maybe_paren();
           }
-          const Token& c = cur(); expect(Kind::RPAREN, ")");
+          const Token& c = cur();
+          if (colon) expect_closing(Kind::RPAREN, ")", t, "("); else expect(Kind::RPAREN, ")");
           return {Ppat_unpack{std::move(name), std::move(pkg)}, span(position(t.start), position(c.end))};
         }
         if (peek(1).kind == Kind::RPAREN) {
@@ -2325,7 +2380,7 @@ class Parser {
         if (cur().kind == Kind::COLON) {
           advance();
           CoreTypeBox ty = parse_poly_type(/*ghost=*/false);  // (pat : 'a. t) poly constraint
-          const Token& c = cur(); expect(Kind::RPAREN, ")");
+          const Token& c = cur(); expect_closing(Kind::RPAREN, ")", t, "(");
           // a poly-type constraint takes the inner pat..type span; a plain type
           // takes the parenthesised span.
           Location l = std::holds_alternative<Ptyp_poly>(ty->desc)
@@ -2333,7 +2388,7 @@ class Parser {
                            : span(position(t.start), position(c.end));
           return {Ppat_constraint{box(std::move(p)), std::move(ty)}, l};
         }
-        const Token& c = cur(); expect(Kind::RPAREN, ")");
+        const Token& c = cur(); expect_closing(Kind::RPAREN, ")", t, "(");
         p.loc = span(position(t.start), position(c.end));  // reloc to parens
         return p;
       }
@@ -2350,7 +2405,7 @@ class Parser {
           if (cur().kind == Kind::RBRACKET) break;
           elems.push_back(parse_pattern());
         }
-        const Token& c = cur(); expect(Kind::RBRACKET, "]");
+        const Token& c = cur(); expect_closing(Kind::RBRACKET, "]", t, "[");
         return build_pat_list(elems, position(t.start), position(c.start), position(c.end));
       }
       case Kind::LBRACKETBAR: {  // [| p; … |]
@@ -2364,7 +2419,7 @@ class Parser {
             elems.push_back(box(parse_pattern()));
           }
         }
-        const Token& c = cur(); expect(Kind::BARRBRACKET, "|]");
+        const Token& c = cur(); expect_closing(Kind::BARRBRACKET, "|]", t, "[|");
         return {Ppat_array{std::move(elems)}, span(position(t.start), position(c.end))};
       }
       case Kind::LBRACKETPERCENT: {  // [%id payload]
@@ -2417,7 +2472,7 @@ class Parser {
           }
           if (cur().kind == Kind::SEMI) advance(); else break;
         }
-        const Token& c = cur(); expect(Kind::RBRACE, "}");
+        const Token& c = cur(); expect_closing(Kind::RBRACE, "}", t, "{");
         return {Ppat_record{std::move(fields), closed}, span(position(t.start), position(c.end))};
       }
       default: throw ParseError("unsupported pattern", t.start);
@@ -3682,6 +3737,7 @@ class Parser {
   }
   ModuleType parse_module_type_base() {
     const Token& t = cur();
+    if (t.kind == Kind::STRUCT) expecting(t.start, t.end, "sig");  // STRUCT error
     if (t.kind == Kind::LBRACKETPERCENT) {  // [%id payload]  -> Pmty_extension
       advance();
       auto [name, payload] = parse_ext_body();
@@ -3692,7 +3748,7 @@ class Parser {
       advance();
       Attributes attrs = take_attrs();  // `sig[@attr] … end` -> pmty_attributes
       Signature items = parse_signature_until(Kind::END);
-      const Token& c = cur(); expect(Kind::END, "end");
+      const Token& c = cur(); expect_closing(Kind::END, "end", t, "sig");
       ModuleType m{Pmty_signature{std::move(items)}, span(position(t.start), position(c.end)), {}};
       m.attrs = std::move(attrs);
       return m;
@@ -3729,7 +3785,7 @@ class Parser {
     if (t.kind == Kind::LPAREN) {  // ( module_type )  -> inner unchanged (no paren reloc)
       advance();
       ModuleType mt = parse_module_type();
-      expect(Kind::RPAREN, ")");
+      expect_closing(Kind::RPAREN, ")", t, "(");
       return mt;
     }
     if (t.kind == Kind::UIDENT) {
@@ -3975,6 +4031,8 @@ class Parser {
       StrOptLoc name = parse_module_name();
       if (cur().kind == Kind::COLONEQUAL) {  // module M := X.Y  (module subst)
         advance();
+        // MODULE ext attributes mkrhs(UIDENT) COLONEQUAL error: expecting $loc($6) "module path"
+        if (cur().kind != Kind::UIDENT) expecting(cur().start, cur().end, "module path");
         LongidentLoc id = parse_type_path();
         return wrap_sig_ext(SignatureItem{Psig_modsubst{std::move(name), std::move(id)}, here()}, std::move(mod_ext));
       }
@@ -4104,18 +4162,33 @@ class Parser {
   // `(val e [: pkg])` first-class module unpack; the `(` (at `lparenStart`) and
   // the `val` keyword are already consumed-pending: cur() is `val`. Consumes the
   // closing `)` and returns the Pmod_unpack spanning the parens.
-  ModuleExpr parse_unpack_after_lparen(Position lparenStart) {
+  ModuleExpr parse_unpack_after_lparen(const Token& lp) {
+    Position lparenStart = position(lp.start);
     advance();  // val
     Attributes vattrs = take_attrs();  // `(val[@attr] e)` -> on the Pmod_unpack
     ExprBox e = parse_expr();
+    auto starts_package_type = [&] {
+      Kind k = cur().kind;
+      return k == Kind::UIDENT || k == Kind::LIDENT || k == Kind::LPAREN;
+    };
     if (cur().kind == Kind::COLON) {
       advance();
+      // LPAREN VAL attributes expr COLON error
+      if (!starts_package_type()) unclosed("(", lp, ")", cur().start, cur().end);
       Position pkgStart = position(cur().start);
       Ptyp_package body = parse_package_type_body();  // path [with type t = u and …]
       Location pkgloc = span(pkgStart, position(tokens_[idx_ - 1].end));
       auto pkg = box(CoreType{std::move(body), pkgloc});
       Location cl = span(e->loc.start, pkg->loc.end);
       e = E({Pexp_constraint{std::move(e), std::move(pkg)}, cl});
+    } else if (cur().kind == Kind::COLONGREATER) {
+      advance();
+      // LPAREN VAL attributes expr COLONGREATER error
+      if (!starts_package_type()) unclosed("(", lp, ")", cur().start, cur().end);
+      throw ParseError("unsupported (val e :> S)", cur().start);
+    } else if (cur().kind != Kind::RPAREN) {
+      // LPAREN VAL attributes expr error
+      unclosed("(", lp, ")", cur().start, cur().end);
     }
     const Token& c = cur(); expect(Kind::RPAREN, ")");
     ModuleExpr m{Pmod_unpack{std::move(e)}, span(lparenStart, position(c.end))};
@@ -4136,7 +4209,7 @@ class Parser {
           continue;
         }
         if (cur().kind == Kind::VAL) {  // F(val e [: pkg])  unpack argument
-          ModuleExpr arg = parse_unpack_after_lparen(position(lp.start));
+          ModuleExpr arg = parse_unpack_after_lparen(lp);
           Position ae = arg.loc.end;
           me = ModuleExpr{Pmod_apply{box(std::move(me)), box(std::move(arg))}, span(symstart, ae)};
           continue;
@@ -4156,6 +4229,7 @@ class Parser {
   }
   ModuleExpr parse_module_expr_head() {
     const Token& t = cur();
+    if (t.kind == Kind::SIG) expecting(t.start, t.end, "struct");  // SIG error
     if (t.kind == Kind::LBRACKETPERCENT) {  // [%id payload]  -> Pmod_extension
       advance();
       auto [name, payload] = parse_ext_body();
@@ -4166,7 +4240,7 @@ class Parser {
       advance();
       Attributes sattrs = take_attrs();  // `struct[@attr] … end` -> on the Pmod_structure
       Structure items = parse_structure_until(Kind::END);
-      const Token& c = cur(); expect(Kind::END, "end");
+      const Token& c = cur(); expect_closing(Kind::END, "end", t, "struct");
       ModuleExpr m{Pmod_structure{std::move(items)}, span(position(t.start), position(c.end))};
       for (auto& a : sattrs) m.attrs.push_back(std::move(a));
       return m;
@@ -4194,16 +4268,16 @@ class Parser {
     if (t.kind == Kind::LPAREN) {
       advance();
       if (cur().kind == Kind::VAL)  // (val e [: pkg])  first-class module unpack
-        return parse_unpack_after_lparen(position(t.start));
+        return parse_unpack_after_lparen(t);
       ModuleExpr me = parse_module_expr();
       if (cur().kind == Kind::COLON) {  // (me : mt)
         advance();
         ModuleType mt = parse_module_type();
-        const Token& c = cur(); expect(Kind::RPAREN, ")");
+        const Token& c = cur(); expect_closing(Kind::RPAREN, ")", t, "(");
         return ModuleExpr{Pmod_constraint{box(std::move(me)), box(std::move(mt))},
                           span(position(t.start), position(c.end))};
       }
-      const Token& c = cur(); expect(Kind::RPAREN, ")");
+      const Token& c = cur(); expect_closing(Kind::RPAREN, ")", t, "(");
       return me;  // grouping keeps inner loc
     }
     if (t.kind == Kind::UIDENT) {
@@ -4570,7 +4644,7 @@ class Parser {
       Attributes oattrs;  // `object[@attr] …` -> attrs on the Pcl_structure
       while (cur().kind == Kind::LBRACKETAT) { advance(); oattrs.push_back(parse_attribute_body()); }
       ClassStructure cs = parse_class_structure_body();
-      const Token& c = cur(); expect(Kind::END, "end");
+      const Token& c = cur(); expect_closing(Kind::END, "end", t, "object");
       return ClassExpr{Pcl_structure{std::move(cs)}, span(position(t.start), position(c.end)), std::move(oattrs)};
     }
     if (t.kind == Kind::LPAREN) {
@@ -4579,11 +4653,11 @@ class Parser {
       if (cur().kind == Kind::COLON) {
         advance();
         ClassType ct = parse_class_type();
-        const Token& c = cur(); expect(Kind::RPAREN, ")");
+        const Token& c = cur(); expect_closing(Kind::RPAREN, ")", t, "(");
         return ClassExpr{Pcl_constraint{box(std::move(ce)), box(std::move(ct))},
                          span(position(t.start), position(c.end)), {}};
       }
-      const Token& c = cur(); expect(Kind::RPAREN, ")");
+      const Token& c = cur(); expect_closing(Kind::RPAREN, ")", t, "(");
       return ce;  // parenthesized class expr keeps inner loc
     }
     // actual_class_parameters class_longident -> Pcl_constr
@@ -4652,7 +4726,7 @@ class Parser {
       Attributes oattrs;  // `object[@attr] …` -> attrs on the Pcty_signature
       while (cur().kind == Kind::LBRACKETAT) { advance(); oattrs.push_back(parse_attribute_body()); }
       ClassSignature cs = parse_class_sig_body();
-      const Token& c = cur(); expect(Kind::END, "end");
+      const Token& c = cur(); expect_closing(Kind::END, "end", t, "object");
       return ClassType{Pcty_signature{std::move(cs)}, span(position(t.start), position(c.end)), std::move(oattrs)};
     }
     if (t.kind == Kind::LBRACKET) {  // [tys] clty_longident
@@ -4872,11 +4946,33 @@ class Parser {
 
 }  // namespace
 
-Structure parse_structure(std::string_view src) { return Parser(src).parse_structure(); }
-Signature parse_signature(std::string_view src) { return Parser(src).parse_signature(); }
+Structure parse_structure(std::string_view src) {
+  Parser p(src);
+  try {
+    return p.parse_structure();
+  } catch (ParseError& e) {
+    p.locate(e);
+    throw;
+  }
+}
+Signature parse_signature(std::string_view src) {
+  Parser p(src);
+  try {
+    return p.parse_signature();
+  } catch (ParseError& e) {
+    p.locate(e);
+    throw;
+  }
+}
 Structure parse_structure(std::string_view src, std::vector<std::string>& directive_files) {
   Parser p(src);
-  Structure s = p.parse_structure();
+  Structure s;
+  try {
+    s = p.parse_structure();
+  } catch (ParseError& e) {
+    p.locate(e);
+    throw;
+  }
   directive_files = p.directive_files();
   return s;
 }

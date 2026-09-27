@@ -24,6 +24,7 @@ void register_typedecl();
 void register_typemod();
 void register_typeclass();
 void register_includemod();
+void register_translate();  // Translmod, Translprim, Translcore, Translclass, Tmc
 void register_misc();  // Primitive, Attr_helper, Syntaxerr, Persistent_env, Cmi_format, Translcore, ...
 
 }  // namespace cppcaml::typing::reporters

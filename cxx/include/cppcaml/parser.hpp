@@ -10,9 +10,18 @@
 
 namespace cppcaml {
 
+// Syntaxerr.Error: Other (a plain "Syntax error" at the offending token),
+// Unclosed (an opening delimiter never closed) or Expecting (a nonterminal
+// expected).  pos / end: the location (the offending token's span).
 struct ParseError : std::runtime_error {
+  enum class Kind { Other, Unclosed, Expecting, Not_expecting };
+  Kind kind = Kind::Other;
   size_t pos;
-  ParseError(std::string m, size_t p) : std::runtime_error(std::move(m)), pos(p) {}
+  size_t end;
+  std::string what_;                        // Unclosed: closing; Expecting / Not_expecting: nonterminal
+  size_t open_pos = 0, open_end = 0;        // Unclosed: the opening delimiter
+  std::string opening;                      // Unclosed
+  ParseError(std::string m, size_t p) : std::runtime_error(std::move(m)), pos(p), end(p) {}
 };
 
 // Parse a compilation unit (.ml structure). `src` must outlive the call.

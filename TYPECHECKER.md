@@ -299,16 +299,45 @@ from the port.  The two must be identical on every .cmi in the tree
    = false throws), Warning 63's report (Ident_conflicts collects, the
    explanation needs `Location.Doc.loc`).  Printpat is untested until
    Parmatch's warnings print.
-   9b **next:** `Errortrace_report`, the `report_error` functions and
-   `Location`'s reporting (source excerpts, `Location.Doc.loc`), the
-   warnings themselves (their state is ported: `-w` / `-warn-error` /
-   `-alert` and `[@warning]` scopes drive `Warnings.is_active`) and the
-   checks that emit them.  Oracle: ocamlc's stderr, byte for byte
-   (`ERR=1 intf_parity.sh`, the testsuite's expect outputs).  Error
-   reporters print with `format_doc::fprintf` (Arg: `%a` takes a callable
-   `void(Formatter&)`, `pr(printer, value)`) and `printtyp::` (type_expr,
-   type_scheme, path, type_expansion, modtype, signature ...); a document
-   lays out with `format_doc::format(format::Formatter&, doc)`.
+   9b **done (2026-09-26): the error reports.**  `Location`'s reporting
+   (`location.hpp`: `Report` / `Msg`, `errorf`, `error_of_printer`,
+   `print_report` with the source excerpt -- highlight_quote,
+   Format's tabulation boxes -- `register_error_of_exn`,
+   `report_exception` (exit 2), `Doc.loc` / `Doc.locs`), `Misc.Style` and
+   the spellchecker, `Errortrace_report`, and every `report_error`: Env
+   (lookup errors with did-you-mean), Typetexp, Typecore, Typedecl,
+   Includecore (Diffing_with_keys record/variant diffs), Includemod and
+   Includemod_errorprinter (Diffing, Signature_matching's suggestions
+   via Stable_matching, functor-application diffs, `-error-size`),
+   Includeclass, Typemod, Typeclass, Persistent_env, Cmi_format,
+   Primitive, Attr_helper, Bytepackager, Translmod / Translprim /
+   Translcore / Translclass / Tmc, and the driver's Sys_error.  Syntax
+   errors: the C++ lexer's errors are structured (`LexError::Kind`,
+   Lexer.report_error's texts) and raised lazily, when the parser reaches
+   the token, as ocamlc lexes on demand; the parser reports the offending
+   token's span and Syntaxerr's `Unclosed` / `Expecting` at the
+   menhir error productions' points (parens, brackets, records, arrays,
+   begin/end, sig/struct/object, do/done, module/class parens).
+   `error_parity.sh` (stderr + exit code vs ocamlc.opt, `-w -a`):
+   false-accept probes + `error_probes/` (167, one per error
+   constructor reached) 304/304; `error_parity_multi.sh`'s 9 multi-file
+   scenarios (missing / stale .cmi, inconsistent assumptions, -pack,
+   circular recursive modules) 9/9; the testsuite's 1853 .ml, compiled
+   in full (`STOP=`), 1066 SAME / 7 DIFF / 1 FACCEPT (779 accepted by
+   both): the 7 = 3 warning or alert lines (9c), 3 syntax errors menhir
+   detects elsewhere (generated-parse-errors, a singleton labeled tuple
+   type, arrow_ambiguity), conjunctive_types (ocamlc runs past the
+   timeout, c++ocamlc overflows the stack);
+   the FACCEPT is a warning-as-error.
+   Left: warnings and alerts (9c); syntax errors where menhir's LALR
+   automaton detects the error elsewhere than the recursive-descent
+   parser (full parity needs the automaton's error states; the
+   generated-parse-errors test is its catalogue); Includemod's rarer
+   paths no corpus reaches.  9c's API: a warning is a `location::Report`
+   of kind `Report_warning` / `Report_warning_as_error` printed by
+   `location::print_report(location::err_formatter(), r)`;
+   `misc::style` for inline code; Warning 63 uses
+   `out_type::ident_conflicts::err_msg` (it prints `Doc.loc`).
 10. **Done (2026-09-26): code generation from the port.**  `lambda/`
    (Translcore, Translprim, Translattribute, Matching, Switch, Translmod,
    Translobj, Translclass, Value_rec_compiler, Simplif, Tmc, Printlambda

@@ -15,6 +15,7 @@
 #include "cppcaml/typing/warnings.hpp"
 #include "cppcaml/typing/persistent_env.hpp"
 #include "cppcaml/typing/shape.hpp"
+#include "cppcaml/typing/location.hpp"
 #include "typecore_internal.hpp"
 #include "typemod_internal.hpp"
 
@@ -251,7 +252,17 @@ tt::Implementation type_implementation(const UnitInfo& target, env::t initial_en
     return {r.str, tt::tcoerce_none(), simple_sg};
   }
   if (target.has_mli) {
-    Signature dclsig = env::read_signature(target.modname, target.cmi_file);
+    // Unit_info.find_normalized_cmi: the unit's .cmi in the load path
+    std::string source_intf = target.source_file.substr(0, target.source_file.size() - 3) + ".mli";
+    std::string compiled_intf_file;
+    try {
+      compiled_intf_file = load_path::find_normalized(target.modname + ".cmi");
+    } catch (const load_path::NotFound&) {
+      Error e(location::in_file(target.source_file), env::empty(), EK::Interface_not_compiled);
+      e.name = source_intf;
+      typing_recovery::log_and_raise(e);
+    }
+    Signature dclsig = env::read_signature(target.modname, compiled_intf_file);
     auto [coercion, shape] = includemod::compunit(initial_env, true, target.source_file, r.sg,
                                                   target.source_file.substr(0, target.source_file.size() - 3) + ".mli",
                                                   dclsig, shape0);

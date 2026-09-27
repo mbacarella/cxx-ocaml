@@ -4,6 +4,7 @@
 // and DOCSTRING are recognised but dropped by next(), exactly as the OCaml
 // `Lexer.token` wrapper does. raw_token() exposes the unfiltered stream.
 #pragma once
+#include <optional>
 #include <cstddef>
 #include <stdexcept>
 #include <string>
@@ -27,12 +28,25 @@ struct DocAttach {
   std::unordered_map<size_t, std::vector<Docstring>> pre, post, floating, pre_extra, post_extra;
 };
 
-// Lexing error, mirrors lexer.mll's `Error of error * Location.t`. For now we
-// carry a message and the byte offset; structured error variants come later.
+// Lexing error, mirrors lexer.mll's `Error of error * Location.t`: the
+// error (kind, its string payload and optional explanation) and the byte
+// span of its location.
 struct LexError : std::runtime_error {
-  size_t pos;
-  LexError(std::string msg, size_t p)
-      : std::runtime_error(std::move(msg)), pos(p) {}
+  enum class Kind {
+    Illegal_character, Illegal_escape, Reserved_sequence, Unterminated_comment, Unterminated_string,
+    Unterminated_string_in_comment,
+    Empty_character_literal, Invalid_literal, Invalid_directive, Invalid_encoding, Invalid_char_in_ident,
+    Non_lowercase_delimiter, Capitalized_raw_identifier, Other
+  };
+  Kind kind = Kind::Other;
+  size_t pos;                        // the location: [pos, end)
+  size_t end;
+  std::string arg;                   // the error's string (or char / code point) payload
+  std::optional<std::string> expl;   // Illegal_escape / Reserved_sequence / Invalid_directive
+  size_t pos2 = 0;                   // Unterminated_string_in_comment: the literal's start
+  LexError(std::string msg, size_t p) : std::runtime_error(std::move(msg)), pos(p), end(p) {}
+  LexError(Kind k, size_t p, size_t e, std::string a = {}, std::optional<std::string> x = std::nullopt)
+      : std::runtime_error("Lexer.Error"), kind(k), pos(p), end(e), arg(std::move(a)), expl(std::move(x)) {}
 };
 
 class Lexer {
@@ -49,7 +63,11 @@ class Lexer {
 
   // Convenience: lex the whole buffer into the filtered token vector,
   // terminated by an EOF token. Also populates the docstring attachment tables.
+  // The tokens, up to the first lexer error: that error ends the stream with
+  // a TEOF marked lex_error, and is kept in pending_error() -- ocamlc lexes on
+  // demand, so the error only arises when the parser reaches it.
   std::vector<Token> tokenize();
+  const std::optional<LexError>& pending_error() const { return pending_error_; }
 
   const DocAttach& doc_attach() const { return docs_; }
 
@@ -89,6 +107,7 @@ class Lexer {
   std::string strbuf_;
   void store(char c) { strbuf_.push_back(c); }
   void store(std::string_view s) { strbuf_.append(s); }
+  std::optional<LexError> pending_error_;
 };
 
 // True if `s` is an OCaml keyword (matches Lexer.is_keyword); used by the printer
