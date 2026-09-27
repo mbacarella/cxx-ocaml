@@ -70,6 +70,8 @@ Ident::t for_unnamed_functor_param();
 t var(const Uid& uid, Ident::t id);
 t abs(const Uid* uid, Ident::t var, t body);
 t str(const Uid* uid, ItemMap map);
+// `str ?uid:src.uid map`: the uid option is src's own block
+t str_uid_of(t src, ItemMap map);
 t alias(const Uid* uid, t s);
 t leaf(const Uid& uid);
 t approx(t s);

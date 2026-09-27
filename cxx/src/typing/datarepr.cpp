@@ -109,7 +109,7 @@ std::pair<std::vector<TypeExpr*>, std::vector<TypeExpr*>> constructor_existentia
 
 struct ConstrArgs {
   std::vector<TypeExpr*> existentials;
-  std::vector<TypeExpr*> args;
+  Slice<TypeExpr*> args;  // a Cstr_tuple's own list
   const TypeDeclaration* inlined;
 };
 
@@ -118,7 +118,7 @@ static ConstrArgs constructor_args(const UnitInfo* current_unit, PrivateFlag pri
                                    Path::t path, RecordRepresentation rep) {
   auto [tyl, existentials] = constructor_existentials(cd_args, cd_res);
   if (cd_args.kind == ConstructorArguments::Kind::Cstr_tuple)
-    return {existentials, {cd_args.tuple.begin(), cd_args.tuple.end()}, nullptr};
+    return {existentials, cd_args.tuple, nullptr};
   auto type_params = free_vars(tuple_of(tyl), /*param=*/true);
   long arity = static_cast<long>(type_params.size());
   auto* kind = make<TypeKind>();
@@ -131,7 +131,7 @@ static ConstrArgs constructor_args(const UnitInfo* current_unit, PrivateFlag pri
       slice(type_params), arity, kind, priv, nullptr,
       slice(variance::unknown_signature(true, arity)), slice(sep), false, lowest_level,
       location::none(), Attributes{}, TypeImmediacy::Unknown, false, uid::mk(current_unit));
-  return {existentials, {newgenconstr(path, slice(type_params))}, tdecl};
+  return {existentials, slice(std::vector<TypeExpr*>{newgenconstr(path, slice(type_params))}), tdecl};
 }
 
 static std::vector<std::pair<Ident::t, const ConstructorDescription*>> constructor_descrs(
@@ -179,7 +179,7 @@ static std::vector<std::pair<Ident::t, const ConstructorDescription*>> construct
             current_unit, decl->type_private, cd->cd_args, cd->cd_res,
             Path::pextra_ty(ty_path, Path::Extra::Pcstr_ty, cstr_name), representation);
         auto* cstr = make<ConstructorDescription>(
-            cstr_name, ty_res, slice(ca.existentials), slice(ca.args),
+            cstr_name, ty_res, slice(ca.existentials), ca.args,
             static_cast<long>(ca.args.size()), tag, num_consts, num_nonconsts,
             cd->cd_res != nullptr, decl->type_private, cd->cd_loc, cd->cd_attributes,
             ca.inlined, cd->cd_uid);
@@ -205,7 +205,7 @@ const ConstructorDescription* extension_descr(const UnitInfo* current_unit, Path
   tag.ext_path = path_ext;
   tag.ext_constant = ca.args.empty();
   return make<ConstructorDescription>(
-      zborrow(path::last(path_ext)), ty_res, slice(ca.existentials), slice(ca.args),
+      zborrow(path::last(path_ext)), ty_res, slice(ca.existentials), ca.args,
       static_cast<long>(ca.args.size()), tag, -1L, -1L, ext->ext_ret_type != nullptr,
       ext->ext_private, ext->ext_loc, ext->ext_attributes, ca.inlined, ext->ext_uid);
 }

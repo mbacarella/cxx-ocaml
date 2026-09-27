@@ -91,6 +91,14 @@ t str(const Uid* uid, ItemMap m) {
   s->map = m;
   return s;
 }
+t str_uid_of(t src, ItemMap m) {
+  Shape* s = mk(nullptr, Shape::Kind::Struct);
+  s->has_uid = src->has_uid;
+  s->uid = src->uid;
+  s->uid_obj = src->uid_obj;
+  s->map = m;
+  return s;
+}
 t alias(const Uid* uid, t a) {
   Shape* s = mk(uid, Shape::Kind::Alias);
   s->t1 = a;

@@ -684,7 +684,7 @@ Result<CoercionShape, E::SignatureSymptom> signatures_(const CoreRelation& core,
   if (unpaired.empty() && d.errors.empty() && d.untypables.empty()) {
     shape::t sh = (!d.deep_modifications && exported_len1 == exported_len2)
                       ? mod_shape
-                      : shape::str(mod_shape->has_uid ? &mod_shape->uid : nullptr, d.shape_map);
+                      : shape::str_uid_of(mod_shape, d.shape_map);  // Shape.str ?uid:mod_shape.uid
     if (runtime_len1 == runtime_len2)  // see PR#5098
       return R::Ok({simplify_structure_coercion(d.runtime_coercions, id_pos_list), sh});
     auto* c = make<tt::ModuleCoercion>(tt::ModuleCoercion{CK::Tcoerce_structure});
