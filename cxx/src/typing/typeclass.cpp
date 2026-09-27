@@ -1187,7 +1187,7 @@ const tt::ClassExpr* class_expr_aux(std::string_view cl_num, Final final, env::t
         if (ignore_labels) {
           std::vector<std::string> ls;
           for (auto& l : labels)
-            if (l.kind != ArgLabel::Kind::Nolabel) ls.push_back(std::string(l.name));
+            if (l.kind != ArgLabel::Kind::Nolabel) ls.push_back(string_of_label(l));
           location::prerr_warning(cl->cl_loc, warnings::Warning::with_l(warnings::Warning::K::Labels_omitted, ls));
         }
       }
@@ -1236,7 +1236,7 @@ const tt::ClassExpr* class_expr_aux(std::string_view cl_num, Final final, env::t
             (void)commuted;
             if (!optional && is_optional(l2))
               location::prerr_warning(sarg->pexp_loc, warnings::Warning::with_s(warnings::Warning::K::Nonoptional_label,
-                                                                                std::string(label_name(l))));
+                                                                                string_of_label(l)));
             arg = tt::ApplyArg{false, use_arg(sarg, l2)};
             remaining_sargs = rem;
           } else {

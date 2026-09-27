@@ -298,14 +298,7 @@ Doc explain_incompatible_fields(std::string_view name, const et::Diff<TypeExpr*>
                     misc::style::code(out_type::type_expr_with_reserved_names, diff.expected));
 }
 
-std::string string_of_label(const ArgLabel& l) {
-  switch (l.kind) {
-    case ArgLabel::Kind::Nolabel: return "";
-    case ArgLabel::Kind::Labelled: return std::string(l.name);
-    case ArgLabel::Kind::Optional: return "?" + std::string(l.name);
-  }
-  return "";
-}
+
 
 Doc explain_label_mismatch(std::string_view missing_label_msg, const et::Diff<ArgLabel>& d) {
   using K = ArgLabel::Kind;

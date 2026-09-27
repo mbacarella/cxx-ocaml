@@ -570,7 +570,7 @@ const tt::Expression* type_argument_x(Explanation explanation, Recarg recarg, en
     unify_exp(sarg, env, texp, ty_expected);
     return texp;
   }
-  // (the -principal warning is not emitted)
+  bool warn = clflags::principal && (may_coerce->lv != generic_level || get_level(ty_fun2) != generic_level);
   TypeExpr* ty_fun = ctype::instance(ty_fun2);
   auto* ea = as<Tarrow>(get_desc(ctype::expand_head(env, ty_expected)));
   if (!(ea && ea->label.kind == ArgLabel::Kind::Nolabel)) throw std::logic_error("type_argument_");
@@ -605,7 +605,13 @@ const tt::Expression* type_argument_x(Explanation explanation, Recarg recarg, en
     f->exp_desc = make<tt::Texp_function>(tt::Texp_function{{XK::Texp_function}, {}, fb});
     return f;
   };
-  // (the Eliminated_optional_arguments warning is not emitted)
+  {
+    std::vector<std::string> ls;
+    for (auto& a : args) ls.push_back(string_of_label(a.label));
+    prerr_warning(texp->exp_loc, warnings::Warning::with_l(WK::Eliminated_optional_arguments, ls));
+  }
+  if (warn)
+    prerr_warning(texp->exp_loc, warnings::Warning::with_s(WK::Non_principal_labels, "eliminated optional argument"));
   // let-expand to have side effects
   auto [let_pat, let_var] = var_pair(env, OCAML_LIT("arg"), texp->exp_type);
   auto* vb = make<tt::ValueBinding>(let_pat, texp, tt::RecursiveBindingKind::Dynamic, tt::Attributes{},
@@ -727,7 +733,7 @@ std::pair<Slice<tt::LabeledArg>, TypeExpr*> type_application(
       if (ignore_labels) {
         std::vector<std::string> ls2;
         for (auto& l : labels)
-          if (l.kind != ArgLabel::Kind::Nolabel) ls2.push_back(std::string(l.name));  // Asttypes.string_of_label
+          if (l.kind != ArgLabel::Kind::Nolabel) ls2.push_back(string_of_label(l));
         prerr_warning(funct->exp_loc, warnings::Warning::with_l(WK::Labels_omitted, ls2));
       }
     }

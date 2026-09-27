@@ -468,7 +468,7 @@ std::pair<const tt::TPrimitiveDescription*, env::t> transl_prim_desc(env::t env,
 const tt::TTypeDeclaration* transl_with_constraint(Ident::t id, Path::t fixed_row_path, env::t sig_env,
                                                    const TypeDeclaration* sig_decl0, env::t outer_env,
                                                    const pt::TypeDeclaration* sdecl) {
-  // (Env.mark_type_used: usage marking only feeds warnings)
+  env::mark_type_used(sig_decl0->type_uid);
   return ctype::with_local_level_generalize([&]() -> const tt::TTypeDeclaration* {
     typetexp::ty_var_env::reset();
     // In the first part, we typecheck the syntactic declaration in the

@@ -366,7 +366,7 @@ CollectedArgs collect_apply_args(env::t env, const tt::Expression* funct, bool i
         auto& [l2, sarg, commuted, rem] = *x;
         if (commuted) may_warn(sarg->pexp_loc, not_principal("commuting this argument"));
         if (!optional && is_optional(l2))
-          prerr_warning(sarg->pexp_loc, WK::Nonoptional_label, std::string(label_name(l)));
+          prerr_warning(sarg->pexp_loc, WK::Nonoptional_label, string_of_label(l));
         remaining_sargs = rem;
         arg_opt = std::make_pair(sarg, l2);
       } else {

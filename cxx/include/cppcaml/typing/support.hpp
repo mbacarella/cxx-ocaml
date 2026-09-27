@@ -66,6 +66,16 @@ struct ArgLabel {
   bool operator!=(const ArgLabel& o) const { return !(*this == o); }
 };
 
+// Asttypes.string_of_label
+inline std::string string_of_label(const ArgLabel& l) {
+  switch (l.kind) {
+    case ArgLabel::Kind::Nolabel: return "";
+    case ArgLabel::Kind::Labelled: return std::string(l.name);
+    case ArgLabel::Kind::Optional: return "?" + std::string(l.name);
+  }
+  return "";
+}
+
 // An optional string (`string option`), trivially copyable for Slices.
 // A fresh identity token (a zone byte): an OCaml allocation's identity where
 // the port keeps a value (the .cmi writer shares by it, as Marshal does).

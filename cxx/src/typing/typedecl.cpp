@@ -3,6 +3,7 @@
 // (constraints, coherence, well-foundedness, regularity).  Shapes (cmt-only,
 // and pure here) are not computed.  Warnings are not emitted.
 #include "typedecl_internal.hpp"
+#include "cppcaml/typing/location.hpp"
 
 #include <map>
 #include <set>
@@ -907,8 +908,45 @@ static env::t add_types_to_env(const std::vector<std::pair<Ident::t, const TypeD
 }
 
 // Translate a set of type declarations, mutually recursive or not
+// Warn on definitions of type "type foo = ()" which redefine a different
+// unit type and are likely a mistake.
+static void check_redefined_unit(const pt::TypeDeclaration* td) {
+  if (!td->ptype_manifest && td->ptype_kind.kind == pt::TypeKind::Kind::Ptype_variant &&
+      td->ptype_kind.constructors.size() == 1 && td->ptype_kind.constructors[0]->pcd_name.txt == "()")
+    location::prerr_warning(td->ptype_loc, warnings::Warning::with_s(warnings::Warning::K::Redefining_unit,
+                                                                      std::string(td->ptype_name.txt)));
+}
+
+static void check_duplicates(const std::vector<const pt::TypeDeclaration*>& sdecl_list) {
+  std::map<std::string_view, std::string_view> labels, constrs;
+  auto warn = [](const Location& loc, const char* kind, std::string_view name, std::string_view n1,
+                 std::string_view n2) {
+    warnings::Warning w = warnings::Warning::make(warnings::Warning::K::Duplicate_definitions);
+    w.s = kind;
+    w.s2 = std::string(name);
+    w.s3 = std::string(n1);
+    w.s4 = std::string(n2);
+    location::prerr_warning(loc, w);
+  };
+  for (auto* sdecl : sdecl_list) {
+    if (sdecl->ptype_kind.kind == pt::TypeKind::Kind::Ptype_variant) {
+      for (auto* pcd : sdecl->ptype_kind.constructors) {
+        auto it = constrs.find(pcd->pcd_name.txt);
+        if (it != constrs.end()) warn(pcd->pcd_loc, "constructor", pcd->pcd_name.txt, it->second, sdecl->ptype_name.txt);
+        else constrs[pcd->pcd_name.txt] = sdecl->ptype_name.txt;
+      }
+    } else if (sdecl->ptype_kind.kind == pt::TypeKind::Kind::Ptype_record) {
+      for (auto* ld : sdecl->ptype_kind.labels) {
+        auto it = labels.find(ld->pld_name.txt);
+        if (it != labels.end()) warn(ld->pld_loc, "label", ld->pld_name.txt, it->second, sdecl->ptype_name.txt);
+        else labels[ld->pld_name.txt] = sdecl->ptype_name.txt;
+      }
+    }
+  }
+}
+
 TranslTypeDeclResult transl_type_decl(env::t env, RecFlag rec_flag, Slice<const pt::TypeDeclaration*> sdecl_list0) {
-  // (the Redefining_unit warning is not emitted)
+  for (auto* sd : sdecl_list0) check_redefined_unit(sd);
   // Add dummy types for fixed rows
   std::vector<const pt::TypeDeclaration*> sdecl_list;
   for (auto* sdecl : sdecl_list0) {
@@ -942,14 +980,42 @@ TranslTypeDeclResult transl_type_decl(env::t env, RecFlag rec_flag, Slice<const 
     env::t temp_env = env;
     for (std::size_t k = 0; k < sdecl_list.size(); ++k)
       temp_env = enter_type(std::nullopt, rec_flag, temp_env, sdecl_list[k], ids_list[k].first, ids_list[k].second);
-    // Translate each declaration.  (The unused-declaration slots only feed
-    // warning 34, off by default.)
+    // Translate each declaration.
+    using Slot = std::shared_ptr<std::vector<Uid>>;
+    auto current_slot = std::make_shared<Slot>();
+    bool warn_unused = warnings::is_active(34);
+    std::vector<Slot> slots;
+    for (std::size_t k = 0; k < sdecl_list.size(); ++k) {
+      Slot slot;
+      if (rec_flag == RecFlag::Recursive && warn_unused) {
+        // See typecore.ml for a description of the algorithm used to
+        // detect unused declarations in a set of recursive definitions.
+        slot = std::make_shared<std::vector<Uid>>();
+        const TypeDeclaration* td = env::find_type(Path::pident(ids_list[k].first), temp_env);
+        Uid tuid = td->type_uid;
+        env::set_type_used_callback(td, [current_slot, slot, tuid](std::function<void()> old_callback) {
+          if (*current_slot) {
+            (*current_slot)->insert((*current_slot)->begin(), tuid);
+          } else {
+            std::vector<Uid> l = *slot;  // get_ref slot
+            slot->clear();
+            for (const Uid& u : l) env::mark_type_used(u);
+            old_callback();
+          }
+        });
+      }
+      slots.push_back(slot);
+    }
     std::vector<const tt::TTypeDeclaration*> tdecls;
-    for (std::size_t k = 0; k < sdecl_list.size(); ++k)
+    for (std::size_t k = 0; k < sdecl_list.size(); ++k) {
+      *current_slot = slots[k];
       tdecls.push_back(builtin_attributes::warning_scope(sdecl_list[k]->ptype_attributes, [&] {
         return transl_declaration(temp_env, sdecl_list[k], ids_list[k].first, ids_list[k].second);
       }));
-    // (check_duplicates only warns)
+    }
+    *current_slot = nullptr;
+    // Check for duplicates
+    check_duplicates(sdecl_list);
     return R{tdecls, temp_env};
   });
   // Copy the type declarations to remove spurious expansions
