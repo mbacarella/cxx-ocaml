@@ -913,11 +913,16 @@ class Writer {
     }
     auto key = std::make_pair(static_cast<const void*>(l.p), l.n);
     if (auto it = lists_.find(key); it != lists_.end()) return it->second;
-    std::vector<V> xs;
-    for (auto& x : l) xs.push_back(elt(x));
-    V v = o::vlist(xs);
-    lists_[key] = v;
-    return v;
+    // the cells registered before the elements are written: an element may
+    // reach its own list again (a Texpand's args through the expansion)
+    std::vector<V> cells;
+    for (std::size_t k = 0; k < l.size(); ++k) cells.push_back(o::vblock(0, {}));
+    lists_[key] = cells[0];
+    for (std::size_t k = 0; k < l.size(); ++k) {
+      V h = elt(l[k]);
+      cells[k]->fields = {h, k + 1 < l.size() ? cells[k + 1] : i(0)};
+    }
+    return cells[0];
   }
   V opt_str(const OptStr& x) {
     if (!x.some) return none();
@@ -1154,9 +1159,10 @@ class Writer {
     if (pa->tail.empty()) return tys(pa->args);
     auto key = std::make_pair(static_cast<const void*>(pa->args.p), pa->args.n);
     if (auto it = lists_.find(key); it != lists_.end()) return it->second;
-    V hd = ty(pa->args[0]);
-    V v = o::vblock(0, {hd, tys(pa->tail)});
+    V v = o::vblock(0, {});
     lists_[key] = v;
+    V hd = ty(pa->args[0]);
+    v->fields = {hd, tys(pa->tail)};
     return v;
   }
   V name_ref(const NameRef* r) {

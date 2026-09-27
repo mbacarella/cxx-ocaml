@@ -1048,7 +1048,18 @@ SolvedConstruct solve_Ppat_construct(TypePatState& tps, ctype::PatternEnv* penv,
       ctype::lower_variables_only(penv->env, penv->equations_scope, ty_res);
     return R{ty_args, equated_types, existential_ctyp};
   });
-  // (the -principal warning about equated types is not emitted)
+  if (clflags::principal && !penv->in_counterexample) {
+    // Do not warn for counter-examples.  The check (fully_generic's marks
+    // and repr compressions) runs as ocamlc's; the Not_principal warning
+    // itself is not emitted yet (stage 9).
+    struct WarnOnlyOnce {};
+    try {
+      r.equated_types->iter([&](TypeExpr* t1, TypeExpr* t2) {
+        if (!(ctype::fully_generic(t1) && ctype::fully_generic(t2))) throw WarnOnlyOnce{};
+      });
+    } catch (const WarnOnlyOnce&) {
+    }
+  }
   return SolvedConstruct{r.ty_args, r.existential_ctyp};
 }
 
