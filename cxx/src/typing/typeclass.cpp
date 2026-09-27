@@ -270,7 +270,7 @@ std::pair<const tt::CoreType*, const tt::CoreType*> type_constraint(env::t val_e
 // fun (self-* as self-<cl_num>) -> expr
 const pt::Expression* make_method(const Location& loc, std::string_view cl_num, const pt::Expression* expr) {
   const pt::Pattern* var = ah::pat_mk(
-      mkd(pt::Ppat_var{{pt::PatternDesc::Kind::Ppat_var}, pt::StrLoc{"self-*", loc}}), loc);
+      mkd(pt::Ppat_var{{pt::PatternDesc::Kind::Ppat_var}, pt::StrLoc{OCAML_LIT("self-*"), loc}}), loc);
   const pt::Pattern* pat = ah::pat_mk(
       mkd(pt::Ppat_alias{{pt::PatternDesc::Kind::Ppat_alias}, var,
                          pt::StrLoc{zborrow(std::string("self-") + std::string(cl_num)), loc}}),

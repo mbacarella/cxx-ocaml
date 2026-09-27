@@ -50,7 +50,7 @@ std::pair<const tt::Pattern*, std::vector<PatternVariable>> type_self_pattern(en
   // Pat.mk (Ppat_alias (spat, mknoloc "selfpat-*"))
   const pt::Pattern* spat = ast_helper::pat_mk(
       make<pt::Ppat_alias>(pt::Ppat_alias{{pt::PatternDesc::Kind::Ppat_alias}, spat0,
-                                          pt::StrLoc{"selfpat-*", location::none()}}),
+                                          pt::StrLoc{OCAML_LIT("selfpat-*"), location::none()}}),
       location::none());
   std::shared_ptr<TypePatState> tps =
       create_type_pat_state(std::nullopt, ModulePatternsRestriction{ModulePatternsRestriction::Kind::Modules_rejected});

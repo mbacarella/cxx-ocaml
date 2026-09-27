@@ -706,8 +706,8 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
       std::pair<Path::t, const ValueDescription*> self, selfpat;
       try {
         // (find_value_by_name "selfpat-*", find_value_by_name "self-*"): right to left
-        self = env::find_value_by_name(Longident::lident("self-*"), env);
-        selfpat = env::find_value_by_name(Longident::lident("selfpat-*"), env);
+        self = env::find_value_by_name(Longident::lident(OCAML_LIT("self-*")), env);
+        selfpat = env::find_value_by_name(Longident::lident(OCAML_LIT("selfpat-*")), env);
       } catch (const env::NotFound&) {
         raise_error(err(loc, env, EK::Outside_class));
       }
