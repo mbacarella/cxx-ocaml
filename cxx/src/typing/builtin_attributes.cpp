@@ -341,6 +341,13 @@ void check_deprecated_mutable_inclusion(const Location& def, const Location& use
   if (t1 && !t2) location::deprecated(loc, "mutating field " + cat(s, *t1), def, use);
 }
 
+parsetree::Attributes ast_attributes(const Attributes& l) {
+  std::vector<const parsetree::Attribute*> out;
+  for (const Attribute* a : l)
+    if (a->ast) out.push_back(a->ast);
+  return slice(out);
+}
+
 // ---- warning attributes ----
 namespace {
 void warn_payload(const Location& loc, std::string_view txt, std::string msg) {
@@ -359,7 +366,7 @@ void warning_attribute(const parsetree::Attribute* a, bool ppwarning) {
     mark_used(name);
     if (std::optional<std::string_view> s = string_of_payload(a->attr_payload)) {
       try {
-        warnings::parse_options(errflag, *s);  // (the letters alert is not reported yet)
+        if (std::optional<warnings::Alert> a = warnings::parse_options(errflag, *s)) location::prerr_alert(loc, *a);
       } catch (const warnings::Bad& e) {
         warn_payload(loc, name.txt, e.what());
       }

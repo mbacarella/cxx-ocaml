@@ -49,6 +49,15 @@ struct LexError : std::runtime_error {
       : std::runtime_error("Lexer.Error"), kind(k), pos(p), end(e), arg(std::move(a)), expl(std::move(x)) {}
 };
 
+// Warnings the lexer reports (lexer.mll's Location.prerr_warning): recorded
+// in source order by the last tokenize(), for the driver to print with the
+// parse (Comment_start = 1, Comment_not_end = 2, Illegal_backslash = 14).
+struct LexWarning {
+  int number;
+  size_t start, end;
+};
+std::vector<LexWarning>& lex_warnings();
+
 class Lexer {
  public:
   // `src` must outlive the lexer (we hold a view into it).

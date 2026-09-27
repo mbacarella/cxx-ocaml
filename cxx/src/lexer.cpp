@@ -350,6 +350,8 @@ Token Lexer::raw_token() {
   if (c == '\'') return scan_char_or_quote(start);
   if (c == '(') {
     if (at(pos_ + 1) == '*') {
+      // "(*)": Comment_start
+      if (at(pos_ + 2) == ')') lex_warnings().push_back(LexWarning{1, start, start + 3});
       scan_comment();
       if (is_doc_comment(start, pos_)) {
         Token t = Token::make(Kind::DOCSTRING, start, pos_);
@@ -419,6 +421,7 @@ std::string Lexer::doc_body(size_t s, size_t e) const {
 }
 
 std::vector<Token> Lexer::tokenize() {
+  lex_warnings().clear();
   // Ports lexer.mll's `token`/`attach` state machine: between consecutive real
   // tokens, accumulate comments/EOLs/docstrings and route the docstrings into the
   // pre/post/floating/extra tables (see DocAttach).
@@ -702,6 +705,11 @@ Token Lexer::scan_char_or_quote(size_t start) {
   return Token::make(Kind::QUOTE, start, pos_);
 }
 
+std::vector<LexWarning>& lex_warnings() {
+  static std::vector<LexWarning> w;
+  return w;
+}
+
 Token Lexer::scan_string(size_t start) {
   pos_++;  // opening "
   strbuf_.clear();
@@ -772,7 +780,9 @@ Token Lexer::scan_string(size_t start) {
         pos_ = q;
         continue;
       }
-      // '\\' followed by anything else: lax, store the backslash + char raw.
+      // '\\' followed by anything else: lax, store the backslash + char raw
+      // (the Illegal_backslash warning: strings in comments are not lexed here)
+      lex_warnings().push_back(LexWarning{14, pos_, pos_ + 2});
       store('\\');
       store(e);
       pos_ += 2;
@@ -1144,6 +1154,11 @@ Token Lexer::scan_symbol(size_t start) {
       break;
     }
     case '*': {  // "**" -> INFIXOP4 ; else INFIXOP3
+      if (at(pos_ + 1) == ')') {
+        // "*)" outside a comment: Comment_not_end, then STAR (the ')' is
+        // lexed again)
+        lex_warnings().push_back(LexWarning{2, pos_, pos_ + 2});
+      }
       if (at(pos_ + 1) == '*') {
         size_t q = run_symbolchar(pos_ + 2);
         open_len = q - pos_; open_kind = Kind::INFIXOP4;

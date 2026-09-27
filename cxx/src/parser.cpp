@@ -3541,10 +3541,12 @@ class Parser {
     }
     if (t.kind == Kind::LBRACKETATATAT) {  // [@@@ name payload ]  (floating attribute)
       advance();
+      size_t name_start = cur().start;
       std::string name = parse_attr_name();
+      Location name_loc = span(position(name_start), position(tokens_[idx_ - 1].end));
       Structure payload = parse_structure_until(Kind::RBRACKET);
       const Token& c = cur(); expect(Kind::RBRACKET, "]");
-      return StructureItem{Pstr_attribute{std::move(name), std::move(payload)},
+      return StructureItem{Pstr_attribute{std::move(name), std::move(payload), name_loc},
                            span(position(t.start), position(c.end))};
     }
     if (t.kind == Kind::LBRACKETPERCENTPERCENT) {  // [%% name payload ] [@@attr]  (item extension)
@@ -4099,10 +4101,12 @@ class Parser {
     }
     if (t.kind == Kind::LBRACKETATATAT) {  // [@@@ …]
       advance();
+      size_t name_start = cur().start;
       std::string name = parse_attr_name();
+      Location name_loc = span(position(name_start), position(tokens_[idx_ - 1].end));
       Structure payload = parse_structure_until(Kind::RBRACKET);
       const Token& c = cur(); expect(Kind::RBRACKET, "]");
-      return SignatureItem{Psig_attribute{std::move(name), std::move(payload)},
+      return SignatureItem{Psig_attribute{std::move(name), std::move(payload), name_loc},
                            span(position(t.start), position(c.end))};
     }
     if (t.kind == Kind::LBRACKETPERCENTPERCENT) {  // [%% …] [@@attr]
@@ -4376,10 +4380,12 @@ class Parser {
     Position fs = position(t.start);
     if (t.kind == Kind::LBRACKETATATAT) {  // [@@@attr]  -> Pcf_attribute (floating)
       advance();
+      size_t name_start = cur().start;
       std::string name = parse_attr_name();
+      Location name_loc = span(position(name_start), position(tokens_[idx_ - 1].end));
       Structure payload = parse_structure_until(Kind::RBRACKET);
       const Token& c = cur(); expect(Kind::RBRACKET, "]");
-      return ClassField{Pcf_attribute{std::move(name), std::move(payload)},
+      return ClassField{Pcf_attribute{std::move(name), std::move(payload), name_loc},
                         span(fs, position(c.end)), {}};
     }
     if (t.kind == Kind::LBRACKETPERCENTPERCENT) {  // [%%id]  -> Pcf_extension
@@ -4804,10 +4810,12 @@ class Parser {
     Position fs = position(t.start);
     if (t.kind == Kind::LBRACKETATATAT) {  // [@@@attr]  -> Pctf_attribute (floating)
       advance();
+      size_t name_start = cur().start;
       std::string name = parse_attr_name();
+      Location name_loc = span(position(name_start), position(tokens_[idx_ - 1].end));
       Structure payload = parse_structure_until(Kind::RBRACKET);
       const Token& c = cur(); expect(Kind::RBRACKET, "]");
-      return ClassTypeField{Pctf_attribute{std::move(name), std::move(payload)},
+      return ClassTypeField{Pctf_attribute{std::move(name), std::move(payload), name_loc},
                             span(fs, position(c.end)), {}};
     }
     if (t.kind == Kind::LBRACKETPERCENTPERCENT) {  // [%%id]  -> Pctf_extension

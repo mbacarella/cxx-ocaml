@@ -5,11 +5,8 @@
 // the components are evaluated as OCaml does: right to left, a record's
 // fields right to left in definition order, `let ... and ...` and List.map
 // left to right.
-//
-// Not reported (TYPECHECKER.md stage 9): the warnings of check_static
-// (Inlining_impossible) and emit_tail_infos (Wrong_tailcall_expectation),
-// which only warn; emit_tail_infos is therefore not run.
 #include "cppcaml/typing/simplif.hpp"
+#include "cppcaml/typing/location.hpp"
 
 #include <deque>
 #include <map>
@@ -1024,8 +1021,12 @@ struct SimplifyLocalFunctions {
     return false;
   }
 
-  // check_static: only warns (Inlining_impossible), not reported
-  void check_static(const LFunction*) {}
+  void check_static(const LFunction* lf) {
+    if (lf->attr.local == LocalAttribute::Always_local)
+      location::prerr_warning(to_location(lf->loc),
+                              warnings::Warning::with_s(warnings::Warning::K::Inlining_impossible,
+                                                        "This function cannot be compiled into a static continuation"));
+  }
 
   void tail(Lam lam) {
     if (auto* x = as<Llet>(lam)) {
@@ -1226,11 +1227,138 @@ Slice<RecBinding> split_default_wrapper(Ident::t fun_id, FunctionKind kind, Slic
 
 // The entry point: simplification + rewriting of tail-modulo-cons calls.
 // (+ emission of tailcall annotations: warnings only, not run.)
+// Tail call info in annotation files (and the Wrong_tailcall_expectation
+// warning)
+static void emit_tail_infos(bool is_tail, Lam lambda) {
+  auto list = [](bool t, Slice<Lam> l) {
+    for (Lam x : l) emit_tail_infos(t, x);
+  };
+  // emit_tail_infos_lfunction: entering a function resets [is_tail]
+  auto lfunction = [](const LFunction* lf) { emit_tail_infos(true, lf->body); };
+  switch (lambda->kind) {
+    case LK::Lvar:
+    case LK::Lmutvar:
+    case LK::Lconst: return;
+    case LK::Lapply: {
+      const LambdaApply& ap = as<Lapply>(lambda)->ap;
+      // Note: is_tail may over-approximate tail-callness (see simplif.ml)
+      if (ap.ap_tailcall != TailcallAttribute::Default_tailcall) {
+        bool expect_tail = ap.ap_tailcall == TailcallAttribute::Tailcall_expectation_true;
+        if (is_tail != expect_tail) {
+          warnings::Warning w = warnings::Warning::make(warnings::Warning::K::Wrong_tailcall_expectation);
+          w.b = expect_tail;
+          location::prerr_warning(to_location(ap.ap_loc), w);
+        }
+      }
+      emit_tail_infos(false, ap.ap_func);
+      list(false, ap.ap_args);
+      return;
+    }
+    case LK::Lfunction: lfunction(as<Lfunction>(lambda)->f); return;
+    case LK::Llet: {
+      auto* x = as<Llet>(lambda);
+      emit_tail_infos(false, x->arg);
+      emit_tail_infos(is_tail, x->body);
+      return;
+    }
+    case LK::Lmutlet: {
+      auto* x = as<Lmutlet>(lambda);
+      emit_tail_infos(false, x->arg);
+      emit_tail_infos(is_tail, x->body);
+      return;
+    }
+    case LK::Lletrec: {
+      auto* x = as<Lletrec>(lambda);
+      for (auto& b : x->decl) lfunction(b.def);
+      emit_tail_infos(is_tail, x->body);
+      return;
+    }
+    case LK::Lprim: {
+      auto* x = as<Lprim>(lambda);
+      using PK_ = Primitive::K;
+      if ((x->p.kind == PK_::Pbytes_to_string || x->p.kind == PK_::Pbytes_of_string) && x->args.size() == 1) {
+        emit_tail_infos(is_tail, x->args[0]);
+      } else if ((x->p.kind == PK_::Psequand || x->p.kind == PK_::Psequor) && x->args.size() == 2) {
+        emit_tail_infos(false, x->args[0]);
+        emit_tail_infos(is_tail, x->args[1]);
+      } else {
+        list(false, x->args);
+      }
+      return;
+    }
+    case LK::Lswitch: {
+      auto* x = as<Lswitch>(lambda);
+      emit_tail_infos(false, x->arg);
+      for (auto& c : x->sw.sw_consts) emit_tail_infos(is_tail, c.action);
+      for (auto& c : x->sw.sw_blocks) emit_tail_infos(is_tail, c.action);
+      if (x->sw.sw_failaction) emit_tail_infos(is_tail, x->sw.sw_failaction);
+      return;
+    }
+    case LK::Lstringswitch: {
+      auto* x = as<Lstringswitch>(lambda);
+      emit_tail_infos(false, x->arg);
+      for (auto& c : x->cases) emit_tail_infos(is_tail, c.action);
+      if (x->def) emit_tail_infos(is_tail, x->def);
+      return;
+    }
+    case LK::Lstaticraise: list(false, as<Lstaticraise>(lambda)->args); return;
+    case LK::Lstaticcatch: {
+      auto* x = as<Lstaticcatch>(lambda);
+      emit_tail_infos(is_tail, x->body);
+      emit_tail_infos(is_tail, x->handler);
+      return;
+    }
+    case LK::Ltrywith: {
+      auto* x = as<Ltrywith>(lambda);
+      emit_tail_infos(false, x->body);
+      emit_tail_infos(is_tail, x->handler);
+      return;
+    }
+    case LK::Lifthenelse: {
+      auto* x = as<Lifthenelse>(lambda);
+      emit_tail_infos(false, x->cond);
+      emit_tail_infos(is_tail, x->ifso);
+      emit_tail_infos(is_tail, x->ifnot);
+      return;
+    }
+    case LK::Lsequence: {
+      auto* x = as<Lsequence>(lambda);
+      emit_tail_infos(false, x->l1);
+      emit_tail_infos(is_tail, x->l2);
+      return;
+    }
+    case LK::Lwhile: {
+      auto* x = as<Lwhile>(lambda);
+      emit_tail_infos(false, x->cond);
+      emit_tail_infos(false, x->body);
+      return;
+    }
+    case LK::Lfor: {
+      auto* x = as<Lfor>(lambda);
+      emit_tail_infos(false, x->lo);
+      emit_tail_infos(false, x->hi);
+      emit_tail_infos(false, x->body);
+      return;
+    }
+    case LK::Lassign: emit_tail_infos(false, as<Lassign>(lambda)->e); return;
+    case LK::Lsend: {
+      auto* x = as<Lsend>(lambda);
+      emit_tail_infos(false, x->met);
+      emit_tail_infos(false, x->obj);
+      list(false, x->args);
+      return;
+    }
+    case LK::Levent: emit_tail_infos(is_tail, as<Levent>(lambda)->l); return;
+    case LK::Lifused: emit_tail_infos(is_tail, as<Lifused>(lambda)->l); return;
+  }
+}
+
 Lam simplify_lambda(Lam lam) {
   if (clflags::native_code || !clflags::debug) lam = simplify_local_functions(lam);
   lam = simplify_exits(lam);
   lam = simplify_lets(lam);
   lam = tmc::rewrite(lam);
+  if (clflags::annotations || warnings::is_active(51)) emit_tail_infos(true, lam);
   return lam;
 }
 

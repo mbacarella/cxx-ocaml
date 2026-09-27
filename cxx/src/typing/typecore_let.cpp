@@ -343,7 +343,7 @@ std::pair<Slice<const tt::ValueBinding*>, env::t> type_let_nonrec(
             std::vector<parmatch::TypedCase> cases{parmatch::typed_case(c)};
             check_partial(ctype::get_current_level(), env, pat->pat_type, pat->pat_loc, cases);
             return 0;
-          });
+          }, false);
         }
         return R{pat_list, exp_list, new_env, tp.mvs};
       },
@@ -416,7 +416,7 @@ std::pair<const tt::Expression*, Slice<const tt::BindingOp*>> type_andops(
 }
 
 // Typing of method call
-SendResult type_send(env::t env, const Location&, Explanation explanation, const pt::Expression* e,
+SendResult type_send(env::t env, const Location& loc, Explanation explanation, const pt::Expression* e,
                      std::string_view met) {
   const tt::Expression* obj = type_exp(env, e);
   auto undefined_self_method = [&](const StrMap<Ident::t>& meths) {
@@ -446,7 +446,7 @@ SendResult type_send(env::t env, const Location&, Explanation explanation, const
       typ = ctype::newvar();
       *vk.meths = vk.meths->add(zborrow(met), id);
       ctype::add_method(env, met, PrivateFlag::Private, VirtualFlag::Virtual, typ, vk.sign);
-      // (the Undeclared_virtual_method warning is not emitted)
+      prerr_warning(loc, WK::Undeclared_virtual_method, std::string(met));
     }
     tt::Meth m{tt::Meth::Kind::Tmeth_val};
     m.id = id;

@@ -40,6 +40,8 @@
 #include "cppcaml/typing/misc.hpp"
 #include "cppcaml/typing/builtin_attributes.hpp"
 #include "cppcaml/typing/clflags.hpp"
+#include "cppcaml/typing/oprint.hpp"
+#include "cppcaml/typing/location.hpp"
 #include "cppcaml/typing/ctype.hpp"
 #include "cppcaml/typing/env.hpp"
 #include "cppcaml/typing/error_report.hpp"
@@ -134,6 +136,14 @@ static std::string module_name(const std::string& path) {
   if (dot != std::string::npos) base = base.substr(0, dot);
   if (!base.empty()) base[0] = (char)std::toupper((unsigned char)base[0]);
   return base;
+}
+
+// Unit_info.make's check_unit_name: Bad_module_name on the source file
+static void check_unit_name(const std::string& source_file, const std::string& modname) {
+  namespace ty = cppcaml::typing;
+  if (!ty::oprint::is_valid_identifier(modname))
+    ty::location::prerr_warning(ty::location::in_file(source_file),
+                                ty::warnings::Warning::with_s(ty::warnings::Warning::K::Bad_module_name, modname));
 }
 
 // ocamlc spells a stdlib-relative include dir as `+unix` (= <stdlib>/unix in an
@@ -423,6 +433,19 @@ static void emit_report(const cppcaml::typing::location::Report& r) {
 }
 
 // Syntaxerr.prepare_error (parse.ml)
+// The lexer's warnings (lexer.mll prints them as the parser pulls tokens):
+// those before [limit], in source order
+static void emit_lex_warnings(const std::string& path, const std::string& src, size_t limit) {
+  namespace ty = cppcaml::typing;
+  using WK = ty::warnings::Warning::K;
+  for (const cppcaml::LexWarning& w : cppcaml::lex_warnings()) {
+    if (w.start >= limit) continue;
+    WK k = w.number == 1 ? WK::Comment_start : w.number == 2 ? WK::Comment_not_end : WK::Illegal_backslash;
+    ty::location::prerr_warning(span_loc(path, src, w.start, w.end), ty::warnings::Warning::make(k));
+  }
+  cppcaml::lex_warnings().clear();
+}
+
 static void report_syntax_error(const std::string& path, const std::string& src, const cppcaml::ParseError& e) {
   namespace ty = cppcaml::typing;
   namespace fd = ty::format_doc;
@@ -512,7 +535,14 @@ static void report_lexer_error(const std::string& path, const std::string& src, 
   std::cerr << "c++ocamlc: " << path << ": " << e.what() << '\n';
 }
 
-static int compile_ml(const std::string& in_path, const std::string& cmo_out,
+static int compile_ml_(const std::string& in_path, const std::string& cmo_out, const std::string& stdlib_dir,
+                       bool prof);
+static int compile_ml(const std::string& in_path, const std::string& cmo_out, const std::string& stdlib_dir,
+                      bool prof) {
+  check_unit_name(in_path, module_name(cmo_out));
+  return compile_ml_(in_path, cmo_out, stdlib_dir, prof);
+}
+static int compile_ml_(const std::string& in_path, const std::string& cmo_out,
                       const std::string& stdlib_dir, bool prof) {
   namespace ty = cppcaml::typing;
   std::string src;  // Pparse.parse_file: the (preprocessed) source text
@@ -548,6 +578,7 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
     auto tp = t0;
     std::vector<std::string> dirfiles;
     auto structure = cppcaml::parse_structure(src, dirfiles);
+    emit_lex_warnings(in_path, src, static_cast<size_t>(-1));
     lap("parse", tp);
     if (g_dump.parsetree)
       cppcaml::ast::print_dparsetree(structure, in_path, std::cout, dirfiles);
@@ -600,9 +631,11 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
                 << std::chrono::duration<double, std::milli>(clk::now() - t0).count() << " ms\n";
     return finish();
   } catch (const cppcaml::ParseError& e) {
+    emit_lex_warnings(in_path, src, e.pos);
     report_syntax_error(in_path, src, e);
     return 2;
   } catch (const cppcaml::LexError& e) {
+    emit_lex_warnings(in_path, src, e.pos);
     report_lexer_error(in_path, src, e);
     return 2;
   } catch (...) {
@@ -632,6 +665,7 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
 
 // Compile a .mli -> .cmi.
 static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
+  check_unit_name(in_path, module_name(cmi_out));
   std::string src;  // Pparse.parse_file: the (preprocessed) source text
   if (!read_source(in_path, src)) return 2;
   // Pparse: Location.input_name, the lexbuf holding the whole source
@@ -639,6 +673,7 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
   cppcaml::typing::location::input_source = src;
   try {
     auto sig = cppcaml::parse_signature(src);
+    emit_lex_warnings(in_path, src, static_cast<size_t>(-1));
     if (g_stop_after == StopAfter::Parsing) return 0;
     PortResult port = port_typecheck(
         in_path, module_name(cmi_out), g_stdlib_dir, cmi_out, /*intf=*/true,
@@ -669,9 +704,11 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
         });
     if (port != PortResult::Typed) return 2;
   } catch (const cppcaml::ParseError& e) {
+    emit_lex_warnings(in_path, src, e.pos);
     report_syntax_error(in_path, src, e);
     return 2;
   } catch (const cppcaml::LexError& e) {
+    emit_lex_warnings(in_path, src, e.pos);
     report_lexer_error(in_path, src, e);
     return 2;
   } catch (const std::exception& e) {
@@ -751,7 +788,8 @@ static int run_main(int argc, char** argv) {
       namespace w = cppcaml::typing::warnings;
       try {
         if (a == "-alert") w::parse_alert_option(v);
-        else w::parse_options(a == "-warn-error", v);
+        else if (std::optional<w::Alert> al = w::parse_options(a == "-warn-error", v))
+          cppcaml::typing::location::prerr_alert(cppcaml::typing::location::none(), *al);
       } catch (const w::Bad& e) {
         std::cerr << "c++ocamlc: bad argument '" << v << "' to option '" << a << "': " << e.what() << '\n';
         return 2;

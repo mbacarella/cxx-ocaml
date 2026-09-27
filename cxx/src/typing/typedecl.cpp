@@ -25,9 +25,10 @@ std::optional<bool> get_unboxed_from_attributes(const pt::TypeDeclaration* sdecl
   return std::nullopt;
 }
 
-// (Builtin_attributes.warning_scope ~ppwarning:false decl.type_attributes)
 env::t add_type_attrs(bool check, Ident::t id, const TypeDeclaration* decl, env::t env) {
-  return env::add_type(check, id, decl, env);
+  return builtin_attributes::warning_scope(
+      builtin_attributes::ast_attributes(decl->type_attributes), [&] { return env::add_type(check, id, decl, env); },
+      false);
 }
 
 // Add a dummy type declaration to the environment, with the given arity.

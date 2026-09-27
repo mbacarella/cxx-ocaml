@@ -106,7 +106,7 @@ static const tt::ModuleType* transl_modtype_aux(env::t env, const pt::ModuleType
       return mkmty(mkd(tt::Tmty_alias{{TK::Tmty_alias}, path, lid}), mty_alias(path), env, loc, smty->pmty_attributes);
     }
     case K::Pmty_signature: {
-      const tt::Signature* sg = transl_signature_(env, as<pt::Pmty_signature>(d)->sg);
+      const tt::Signature* sg = transl_signature(env, as<pt::Pmty_signature>(d)->sg);
       return mkmty(mkd(tt::Tmty_signature{{TK::Tmty_signature}, sg}), mty_signature(sg->sig_type), env, loc,
                    smty->pmty_attributes);
     }
@@ -466,6 +466,8 @@ const tt::Signature* transl_signature_(env::t env0, pt::Signature ssg) {
   return make<tt::Signature>(slice(trem), rem2, env);
 }
 
-const tt::Signature* transl_signature(env::t env, pt::Signature ssg) { return transl_signature_(env, ssg); }
+const tt::Signature* transl_signature(env::t env, pt::Signature ssg) {
+  return builtin_attributes::warning_scope(pt::Attributes{}, [&] { return transl_signature_(env, ssg); });
+}
 
 }  // namespace cppcaml::typing::typemod

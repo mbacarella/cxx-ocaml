@@ -969,13 +969,18 @@ static StructureTyped type_structure_s(bool toplevel, bool funct_body, Path::t a
   std::vector<const tt::StructureItem*> items;
   std::vector<const SignatureItem*> sg;
   // (Cmt_format saved types and typing recovery are not ported)
-  for (auto* item : sstr) {
-    ItemTyped r = type_str_item(names, toplevel, funct_body, anchor, env, shape_map, item);
-    items.push_back(r.item);
-    sg.insert(sg.end(), r.sg.begin(), r.sg.end());
-    shape_map = r.shape_map;
-    env = r.env;
-  }
+  auto delayed = [&] {
+    for (auto* item : sstr) {
+      ItemTyped r = type_str_item(names, toplevel, funct_body, anchor, env, shape_map, item);
+      items.push_back(r.item);
+      sg.insert(sg.end(), r.sg.begin(), r.sg.end());
+      shape_map = r.shape_map;
+      env = r.env;
+    }
+    return 0;
+  };
+  if (toplevel) delayed();
+  else builtin_attributes::warning_scope(pt::Attributes{}, delayed);
   auto* str = make<tt::Structure>(slice(items), slice(sg), env);
   return {str, slice(sg), names, shape::str(nullptr, shape_map), env};
 }

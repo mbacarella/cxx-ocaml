@@ -3,6 +3,7 @@
 // recursive type declarations.
 #pragma once
 
+#include "cppcaml/typing/builtin_attributes.hpp"
 #include <functional>
 #include <vector>
 
@@ -23,8 +24,11 @@ struct Property {
   std::function<void(env::t, Ident::t, Decl, const Req&)> check;
 };
 
-// (Builtin_attributes.warning_scope ~ppwarning:false decl.type_attributes)
-inline env::t add_type(bool check, Ident::t id, Decl decl, env::t env) { return env::add_type(check, id, decl, env); }
+inline env::t add_type(bool check, Ident::t id, Decl decl, env::t env) {
+  return builtin_attributes::warning_scope(
+      builtin_attributes::ast_attributes(decl->type_attributes), [&] { return env::add_type(check, id, decl, env); },
+      false);
+}
 inline env::t add_types_to_env(const Decls& decls, env::t env) {
   // List.fold_right
   for (std::size_t k = decls.size(); k-- > 0;)

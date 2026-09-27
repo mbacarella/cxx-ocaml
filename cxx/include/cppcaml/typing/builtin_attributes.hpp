@@ -82,6 +82,11 @@ void check_deprecated_mutable(const Location& loc, const Attributes& attrs, std:
 void check_deprecated_mutable_inclusion(const Location& def, const Location& use, const Location& loc,
                                         const Attributes& attrs1, const Attributes& attrs2, std::string_view s);
 
+// A Types attribute list as the parsetree attributes warning_scope reads
+// (in OCaml they are one type; a .cmi's attributes have no parsetree here,
+// and their [@warning] settings only matter inside the scope)
+parsetree::Attributes ast_attributes(const Attributes& l);
+
 // ---- warning attributes ----
 // warning_attribute ?ppwarning attr: [@warning "..."] / [@warnerror "..."]
 // / [@alert ...] update the warning state; [@ppwarning] reports; bad

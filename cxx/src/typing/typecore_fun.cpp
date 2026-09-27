@@ -859,8 +859,12 @@ const tt::Expression* type_statement(Explanation explanation, env::t env, const 
   return ctype::with_local_level_generalize(
       [&] { return type_exp(env, sexp); },
       [&](const tt::Expression* exp) {
+        const tt::Expression* subexp = final_subexpression(exp);
         TypeExpr* ty = ctype::expand_head(env, exp->exp_type);
-        // (the Nonreturning_statement warning is not emitted)
+        // (-typing-recovery is never on in batch ocamlc: has_recovery_errors is false)
+        if (is_Tvar(ty) && get_level(ty) > ctype::get_current_level() &&
+            subexp->exp_desc->kind != XK::Texp_while)
+          prerr_warning(subexp->exp_loc, WK::Nonreturning_statement);
         if (clflags::strict_sequence) {
           TypeExpr* expected_ty = ctype::instance(predef::type_unit());
           with_explanation(explanation, [&] { unify_exp(sexp, env, exp, expected_ty); });

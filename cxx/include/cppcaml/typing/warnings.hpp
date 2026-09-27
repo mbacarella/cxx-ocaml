@@ -172,9 +172,9 @@ void reset_fatal();
 // warning-as-error was reported
 void check_fatal();
 
-// parse_options errflag s (the deprecated-letters alert it may return is
-// not reported yet); raises Bad
-void parse_options(bool errflag, std::string_view s);
+// parse_options errflag s: the deprecated-letters alert it may return;
+// raises Bad
+std::optional<Alert> parse_options(bool errflag, std::string_view s);
 void parse_alert_option(std::string_view s);
 
 }  // namespace cppcaml::typing::warnings

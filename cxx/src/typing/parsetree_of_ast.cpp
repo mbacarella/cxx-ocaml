@@ -219,13 +219,15 @@ struct Conv {
     return map_slice<const Attribute*>(l, [&](const ast::Attribute& a) { return attribute(a); });
   }
   // Pstr_attribute / Psig_attribute / Pctf_attribute / Pcf_attribute: the
-  // ast keeps only the name and the payload; the attribute spans the item.
-  const Attribute* item_attribute(const std::string& name, const ast::Structure& payload,
-                                  const Location& item_loc) const {
+  // attribute spans the item; its name has its own location (a docstring's
+  // ocaml.text has none: the parser leaves it unset)
+  const Attribute* item_attribute(const std::string& name, const ast::Structure& payload, const Location& item_loc,
+                                  const ast::Location& name_loc) const {
     ++attr_payload_depth;
     Payload p = payload_str(payload);
     --attr_payload_depth;
-    return registered(make<Attribute>(StrLoc{zborrow(name), gap_loc()}, p, item_loc));
+    bool unset = name_loc.start.cnum == 0 && name_loc.end.cnum == 0;
+    return registered(make<Attribute>(StrLoc{zborrow(name), unset ? gap_loc() : loc(name_loc)}, p, item_loc));
   }
   const Extension* extension(const ast::ExtName& name, const ast::ExtPayload& p) const {
     return make<Extension>(StrLoc{zborrow(name), name.has_loc ? loc(name.loc) : gap_loc()}, ext_payload(p));
@@ -807,7 +809,7 @@ struct Conv {
             } else if constexpr (std::is_same_v<T, ast::Pctf_constraint>) {
               d = make<Pctf_constraint>(Pctf_constraint{{K::Pctf_constraint}, core_type(*v.t1), core_type(*v.t2)});
             } else if constexpr (std::is_same_v<T, ast::Pctf_attribute>) {
-              d = make<Pctf_attribute>(Pctf_attribute{{K::Pctf_attribute}, item_attribute(v.name, v.payload, l)});
+              d = make<Pctf_attribute>(Pctf_attribute{{K::Pctf_attribute}, item_attribute(v.name, v.payload, l, v.name_loc)});
             } else if constexpr (std::is_same_v<T, ast::Pctf_extension>) {
               d = make<Pctf_extension>(Pctf_extension{{K::Pctf_extension}, extension(v.name, v.payload)});
             }
@@ -881,7 +883,7 @@ struct Conv {
             } else if constexpr (std::is_same_v<T, ast::Pcf_initializer>) {
               d = make<Pcf_initializer>(Pcf_initializer{{K::Pcf_initializer}, expression(*v.e)});
             } else if constexpr (std::is_same_v<T, ast::Pcf_attribute>) {
-              d = make<Pcf_attribute>(Pcf_attribute{{K::Pcf_attribute}, item_attribute(v.name, v.payload, l)});
+              d = make<Pcf_attribute>(Pcf_attribute{{K::Pcf_attribute}, item_attribute(v.name, v.payload, l, v.name_loc)});
             } else if constexpr (std::is_same_v<T, ast::Pcf_extension>) {
               d = make<Pcf_extension>(Pcf_extension{{K::Pcf_extension}, extension(v.name, v.payload)});
             }
@@ -1051,7 +1053,7 @@ struct Conv {
             });
             d = make<Psig_class_type>(Psig_class_type{{K::Psig_class_type}, ds});
           } else if constexpr (std::is_same_v<T, ast::Psig_attribute>) {
-            d = make<Psig_attribute>(Psig_attribute{{K::Psig_attribute}, item_attribute(v.name, v.payload, l)});
+            d = make<Psig_attribute>(Psig_attribute{{K::Psig_attribute}, item_attribute(v.name, v.payload, l, v.name_loc)});
           } else if constexpr (std::is_same_v<T, ast::Psig_extension>) {
             d = make<Psig_extension>(Psig_extension{{K::Psig_extension}, extension(v.name, v.payload),
                                                     attrs(v.attrs)});
@@ -1121,7 +1123,7 @@ struct Conv {
             d = make<Pstr_include>(Pstr_include{{K::Pstr_include},
                 make<IncludeDeclaration>(module_expr(v.expr), l, attrs(v.attrs))});
           } else if constexpr (std::is_same_v<T, ast::Pstr_attribute>) {
-            d = make<Pstr_attribute>(Pstr_attribute{{K::Pstr_attribute}, item_attribute(v.name, v.payload, l)});
+            d = make<Pstr_attribute>(Pstr_attribute{{K::Pstr_attribute}, item_attribute(v.name, v.payload, l, v.name_loc)});
           } else if constexpr (std::is_same_v<T, ast::Pstr_extension>) {
             d = make<Pstr_extension>(Pstr_extension{{K::Pstr_extension}, extension(v.name, v.payload),
                                                     attrs(v.attrs)});

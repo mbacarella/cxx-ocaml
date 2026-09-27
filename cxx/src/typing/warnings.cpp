@@ -1,6 +1,8 @@
 // See warnings.hpp: utils/warnings.ml's state, option parsing and scopes.
 #include "cppcaml/typing/warnings.hpp"
 
+#include "cppcaml/typing/format.hpp"
+
 #include <algorithm>
 #include <optional>
 #include <unordered_map>
@@ -209,8 +211,69 @@ std::vector<Token> parse_warnings(std::string_view s) {
   return tokens;
 }
 
-void parse_opt(std::array<bool, last_warning_number + 1>& error, std::array<bool, last_warning_number + 1>& active,
-               bool errflag, std::string_view s) {
+// letter_alert tokens: the deprecated-letters alert
+std::optional<Alert> letter_alert(const std::vector<Token>& tokens) {
+  // sequences of 2 or more consecutive unsigned letters, most recent first
+  std::vector<std::vector<char>> consecutive_letters;
+  std::vector<char> current;
+  auto commit_chunk = [&] {
+    if (current.size() >= 2) consecutive_letters.insert(consecutive_letters.begin(), current);
+  };
+  for (const Token& t : tokens) {
+    if (t.is_letter && !t.has_modifier) {
+      current.push_back(t.c);
+    } else {
+      commit_chunk();
+      current.clear();
+    }
+  }
+  commit_chunk();
+  if (consecutive_letters.empty()) return std::nullopt;
+  const std::vector<char>& example = consecutive_letters[0];
+  std::size_t max_seq_len = 0;
+  for (auto& x : consecutive_letters) max_seq_len = std::max(max_seq_len, x.size());
+  auto print_modifier = [](format::Formatter& ppf, Modifier m) {
+    ppf.print_string(m == Modifier::Set_all ? "@" : m == Modifier::Clear ? "-" : "+");
+  };
+  auto print_token = [&](format::Formatter& ppf, const Token& t) {
+    if (!t.is_letter) {
+      print_modifier(ppf, t.m);
+      ppf.print_string(t.n1 == t.n2 ? std::to_string(t.n1) : std::to_string(t.n1) + ".." + std::to_string(t.n2));
+    } else if (t.has_modifier) {
+      print_modifier(ppf, t.m);
+      ppf.print_char(t.c);
+    } else {
+      bool lowercase = !(t.c >= 'A' && t.c <= 'Z');
+      ppf.print_char(lowercase ? '-' : '+');
+      ppf.print_char(t.c);
+    }
+  };
+  format::Formatter f;
+  format::fprintf(
+      f,
+      "@[<v>@[Setting a warning with a sequence of lowercase or uppercase letters,@ like '%a',@ is deprecated.@]@ "
+      "@[Use the equivalent signed form:@ %t.@]@ @[Hint: Enabling or disabling a warning by its mnemonic name "
+      "requires a + or - prefix.@]%t@?@]",
+      [&](format::Formatter& ppf) {
+        for (char c : example) ppf.print_char(c);
+      },
+      [&](format::Formatter& ppf) {
+        for (const Token& t : tokens) print_token(ppf, t);
+      },
+      [&](format::Formatter& ppf) {
+        if (max_seq_len >= 5)
+          format::fprintf(ppf, "@ @[Hint: Did you make a spelling mistake when using a mnemonic name?@]");
+      });
+  f.print_flush();
+  Location nowhere;  // ghost_loc_in_file "_none_"
+  nowhere.loc_start = Position{"_none_", 0, 0, -1};
+  nowhere.loc_end = nowhere.loc_start;
+  nowhere.loc_ghost = true;
+  return Alert{"ocaml_deprecated_cli", f.take(), nowhere, nowhere};
+}
+
+std::optional<Alert> parse_opt(std::array<bool, last_warning_number + 1>& error,
+                               std::array<bool, last_warning_number + 1>& active, bool errflag, std::string_view s) {
   auto& flags = errflag ? error : active;
   auto action = [&](Modifier m, int i) {
     switch (m) {
@@ -242,31 +305,31 @@ void parse_opt(std::array<bool, last_warning_number + 1>& error, std::array<bool
       for (int n = t.n1; n <= std::min(t.n2, last_warning_number); ++n) action(t.m, n);
     }
   };
-  auto parse_and_eval = [&] {
-    for (const Token& t : parse_warnings(s)) eval(t);
-    // (letter_alert: the ocaml_deprecated_cli alert is not reported yet)
+  auto parse_and_eval = [&]() -> std::optional<Alert> {
+    std::vector<Token> tokens = parse_warnings(s);
+    for (const Token& t : tokens) eval(t);
+    return letter_alert(tokens);
   };
   if (std::optional<int> n = name_to_number(s)) {
     action(Modifier::Set, *n);
-    return;
+    return std::nullopt;
   }
-  if (s.empty()) {
-    parse_and_eval();
-    return;
-  }
+  if (s.empty()) return parse_and_eval();
   std::optional<int> n = name_to_number(s.substr(1));
   if (s[0] == '+' && n) action(Modifier::Set, *n);
   else if (s[0] == '-' && n) action(Modifier::Clear, *n);
   else if (s[0] == '@' && n) action(Modifier::Set_all, *n);
-  else parse_and_eval();
+  else return parse_and_eval();
+  return std::nullopt;
 }
 
-void parse_options_(bool errflag, std::string_view s) {
+std::optional<Alert> parse_options_(bool errflag, std::string_view s) {
   auto error = current().error;
   auto active = current().active;
-  parse_opt(error, active, errflag, s);
+  std::optional<Alert> alrt = parse_opt(error, active, errflag, s);
   current().error = error;
   current().active = active;
+  return alrt;
 }
 
 // warnings.ml's module initialization: the defaults
@@ -313,9 +376,9 @@ bool alert_is_error(std::string_view kind) {
   return !disabled && (a.set.count(std::string(kind)) != 0) == a.pos;
 }
 
-void parse_options(bool errflag, std::string_view s) {
+std::optional<Alert> parse_options(bool errflag, std::string_view s) {
   ensure_defaults();
-  parse_options_(errflag, s);
+  return parse_options_(errflag, s);
 }
 
 void parse_alert_option(std::string_view s) {

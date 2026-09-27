@@ -1322,15 +1322,6 @@ void reset_declaration_caches() {
 
 // ---- insertion of bindings by identifier + path ----------------------------------
 
-// A Types attribute list as the parsetree attributes warning_scope reads
-// (in OCaml they are one type; a .cmi's attributes have no parsetree here,
-// and their [@warning] settings only matter inside the scope)
-static parsetree::Attributes ast_attributes(const Attributes& l) {
-  std::vector<const parsetree::Attribute*> out;
-  for (const Attribute* a : l)
-    if (a->ast) out.push_back(a->ast);
-  return slice(out);
-}
 
 // check_usage loc id uid warn tbl
 static void check_usage(const Location& loc, Ident::t id, const Uid& uid, const CheckFn& warn,
@@ -1378,7 +1369,7 @@ static t store_value(const CheckFn& check, Ident::t id, AddressLazy* addr, const
 
 static t store_constructor(bool check, const TypeDeclaration* type_decl, Ident::t type_id, Ident::t cstr_id,
                            const ConstructorDescription* cstr, t env) {
-  builtin_attributes::warning_scope(ast_attributes(cstr->cstr_attributes), [&] {
+  builtin_attributes::warning_scope(builtin_attributes::ast_attributes(cstr->cstr_attributes), [&] {
     if (check && !type_decl->type_loc.loc_ghost && warnings::is_active(37)) {
       std::string ty_name(ident::name(type_id));
       std::string name(cstr->cstr_name);
@@ -1411,7 +1402,7 @@ static t store_constructor(bool check, const TypeDeclaration* type_decl, Ident::
 
 static t store_label(bool check, const TypeDeclaration* type_decl, Ident::t type_id, Ident::t lbl_id,
                      const LabelDescription* lbl, t env) {
-  builtin_attributes::warning_scope(ast_attributes(lbl->lbl_attributes), [&] {
+  builtin_attributes::warning_scope(builtin_attributes::ast_attributes(lbl->lbl_attributes), [&] {
     if (check && !type_decl->type_loc.loc_ghost && warnings::is_active(69)) {
       std::string ty_name(ident::name(type_id));
       PrivateFlag priv = type_decl->type_private;
@@ -1508,7 +1499,7 @@ static t store_extension(bool check, bool rebind, Ident::t id, AddressLazy* addr
   auto* cda = make<ConstructorData>(cstr, addr);
   builtin_attributes::mark_alerts_used(ext->ext_attributes);
   builtin_attributes::mark_warn_on_literal_pattern_used(ext->ext_attributes);
-  builtin_attributes::warning_scope(ast_attributes(ext->ext_attributes), [&] {
+  builtin_attributes::warning_scope(builtin_attributes::ast_attributes(ext->ext_attributes), [&] {
     if (check && !loc.loc_ghost && warnings::is_active(38)) {
       PrivateFlag priv = ext->ext_private;
       bool is_exception = path::same(ext->ext_type_path, predef::paths().exn);

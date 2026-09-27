@@ -428,7 +428,7 @@ struct Psig_open { OverrideFlag ovr; LongidentLoc id; Attributes attrs; };
 struct Psig_include { ModuleType mt; Attributes attrs; };
 struct Psig_class { std::vector<ClassTypeDeclaration> decls; };  // class c : ct  (class_description)
 struct Psig_class_type { std::vector<ClassTypeDeclaration> decls; };
-struct Psig_attribute { std::string name; Structure payload; };
+struct Psig_attribute { std::string name; Structure payload; Location name_loc{}; };
 struct Psig_extension { ExtName name; ExtPayload payload; Attributes attrs; };
 struct SignatureItem {
   std::variant<Psig_value, Psig_primitive, Psig_type, Psig_typesubst, Psig_typext,
@@ -486,7 +486,7 @@ struct Pctf_inherit { ClassTypeBox ct; };
 struct Pctf_val { StringLoc name; MutableFlag mut; VirtualFlag virt; CoreTypeBox type; };
 struct Pctf_method { StringLoc name; PrivateFlag priv; VirtualFlag virt; CoreTypeBox type; };
 struct Pctf_constraint { CoreTypeBox t1; CoreTypeBox t2; };
-struct Pctf_attribute { std::string name; Structure payload; };  // `[@@@attr]` in a class type
+struct Pctf_attribute { std::string name; Structure payload; Location name_loc{}; };  // `[@@@attr]` in a class type
 struct Pctf_extension { ExtName name; ExtPayload payload; };  // `[%%id]` in a class type
 struct ClassTypeField {
   std::variant<Pctf_inherit, Pctf_val, Pctf_method, Pctf_constraint, Pctf_attribute,
@@ -521,7 +521,7 @@ struct Pcf_val { StringLoc name; MutableFlag mut; ClassFieldKind kind; };
 struct Pcf_method { StringLoc name; PrivateFlag priv; ClassFieldKind kind; };
 struct Pcf_constraint { CoreTypeBox t1; CoreTypeBox t2; };
 struct Pcf_initializer { ExprBox e; };
-struct Pcf_attribute { std::string name; Structure payload; };  // `[@@@attr]` in a class body
+struct Pcf_attribute { std::string name; Structure payload; Location name_loc{}; };  // `[@@@attr]` in a class body
 struct Pcf_extension { ExtName name; ExtPayload payload; };  // `[%%id]` in a class body
 struct ClassField {
   std::variant<Pcf_inherit, Pcf_val, Pcf_method, Pcf_constraint, Pcf_initializer,
@@ -551,7 +551,7 @@ struct Pstr_primitive { PrimitiveDescription prim; };
 struct Pstr_val { ValueDescription vd; };  // `val x : t` in a structure (fork feature)
 struct Pstr_module { ModuleBinding binding; };
 struct Pstr_recmodule { std::vector<ModuleBinding> bindings; };  // module rec A = … and B = …
-struct Pstr_attribute { std::string name; Structure payload; };  // [@@@attr …]
+struct Pstr_attribute { std::string name; Structure payload; Location name_loc{}; };  // [@@@attr …]
 struct Pstr_extension { ExtName name; ExtPayload payload; Attributes attrs; };  // [%%ext …]
 struct Pstr_include { ModuleExpr expr; Attributes attrs; };
 struct Pstr_modtype { StringLoc name; std::optional<ModuleType> type; Attributes attrs; };  // module type S = mty

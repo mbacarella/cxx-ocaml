@@ -12,10 +12,8 @@
 // component choices.  Pair evaluates its second component first, so a nest
 // produces its components' code last to first, sums their delayed use
 // counts and concatenates their tmc_calls in order, as `combine` does.
-//
-// Not reported (TYPECHECKER.md stage 9): the warnings Tmc_breaks_tailcall and
-// Unused_tmc_attribute.
 #include "cppcaml/typing/tmc.hpp"
+#include "cppcaml/typing/location.hpp"
 
 #include <functional>
 #include <memory>
@@ -283,8 +281,12 @@ ChoiceP choice_apply(const Context& ctx, bool tail, const Lapply* node) {
     auto* f = as<Lvar>(apply.ap_func);
     if (!f) throw NoTmc{};
     auto it = ctx.find(f->id);
-    // (if tail: warning Tmc_breaks_tailcall, not reported)
-    if (it == ctx.end()) throw NoTmc{};
+    if (it == ctx.end()) {
+      if (tail)
+        location::prerr_warning(to_location(apply.ap_loc),
+                                warnings::Warning::make(warnings::Warning::K::Tmc_breaks_tailcall));
+      throw NoTmc{};
+    }
     Specialized specialized = it->second;
     // Support of tupled functions: the [function_kind] of the direct-style
     // function is identical to the one of the input function, which may be
@@ -558,7 +560,8 @@ std::vector<std::pair<Ident::t, const LFunction*>> make_dps_variant(Ident::t var
                                                                    const Context& outer_ctx, const LFunction* lfun) {
   Specialized special = inner_ctx.at(var);
   ChoiceP fun_choice = choice(outer_ctx, true, lfun->body);
-  // (if fun_choice.tmc_calls = []: warning Unused_tmc_attribute, not reported)
+  if (fun_choice->tmc_calls.empty())
+    location::prerr_warning(to_location(lfun->loc), warnings::Warning::make(warnings::Warning::K::Unused_tmc_attribute));
   const LFunction* direct =
       lfunction_(lfun->kind, lfun->params, lfun->return_, choice_direct(fun_choice), lfun->attr, lfun->loc);
   // { var = create_local "dst"; offset = create_local "offset"; loc }: a

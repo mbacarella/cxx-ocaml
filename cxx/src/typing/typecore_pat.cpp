@@ -619,9 +619,10 @@ TypePatternListResult type_pattern_list(PC category, std::optional<ExistentialRe
   if (spatl.size() != expected_tys.size()) throw std::invalid_argument("List.map2");
   std::vector<const tt::Pattern*> patl;
   for (std::size_t k = 0; k < spatl.size(); ++k)
-    patl.push_back(builtin_attributes::warning_scope(spatl[k].first, [&] {
-      return type_pat(*tps, category, no_existentials, new_penv, spatl[k].second, expected_tys[k]);
-    }));
+    patl.push_back(builtin_attributes::warning_scope(
+        spatl[k].first,
+        [&] { return type_pat(*tps, category, no_existentials, new_penv, spatl[k].second, expected_tys[k]); },
+        false));
   return {patl, new_penv->env, tps->tps_pattern_force, tps->tps_pattern_variables, tps->tps_module_variables};
 }
 
