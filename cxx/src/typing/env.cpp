@@ -2252,6 +2252,13 @@ t remove_last_open(Path::t root, t env0) {
 }
 
 // Read a signature from a file (Persistent_env.read)
+Signature read_signature_named(std::string_view modname, const std::string& filename) {
+  const ModuleData* mda = g_persistent_env.read(read_sign_of_cmi, std::string(modname), filename, modname);
+  const ModuleDeclaration* d = lz::force_module_decl(mda->mda_declaration);
+  if (d->md_type->kind != ModuleType::Kind::Mty_signature)
+    throw std::logic_error("Env.read_signature");
+  return d->md_type->sign;
+}
 Signature read_signature(const std::string& modname, const std::string& filename) {
   const ModuleData* mda = g_persistent_env.read(read_sign_of_cmi, modname, filename);  // read_pers_mod
   const ModuleDeclaration* d = lz::force_module_decl(mda->mda_declaration);

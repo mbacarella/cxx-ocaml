@@ -566,6 +566,8 @@ bool path_equiv(t env, Path::t p1, Path::t p2);
 
 // persistent structures
 Signature read_signature(const std::string& modname, const std::string& filename);
+// the same, [modname] being the caller's string object (a zone string)
+Signature read_signature_named(std::string_view modname, const std::string& filename);
 // save_signature ~alerts sg modname filename (Env.save_signature): substitute
 // the signature for saving, write the .cmi and enter it in the persistent
 // table; returns the cmi written.

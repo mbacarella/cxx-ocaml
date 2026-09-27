@@ -226,8 +226,10 @@ class PersistentEnv {
 
   // read penv f cmi: read_pers_struct ~check:true
   PM read(const std::function<PM(const PersistentSignature&)>& f, const std::string& modname,
-          const std::string& filename) {
-    add_import(modname);
+          const std::string& filename, std::string_view modname_obj = {}) {
+    // [modname_obj]: the caller's string object for the name (the one the
+    // import set keeps when it is the first added)
+    add_import(modname_obj.data() ? modname_obj : std::string_view(modname));
     PersistentSignature pers_sig{filename, cmi_format::read_cmi(filename), load_path::Visibility::Visible};
     PM pm = f(pers_sig);
     return acknowledge_pers_struct(true, modname, pers_sig, pm).pm;

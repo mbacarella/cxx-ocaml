@@ -6,7 +6,9 @@
 # compiles the members with ocamlc.opt for both and packs with each
 # compiler, isolating Bytepackager / Typemod.package_units.
 #
-# Usage: pack_parity.sh [scenario ...]   (G=-g adds -g everywhere)
+# Usage: pack_parity.sh [scenario ...]   (G=-g adds -g everywhere;
+#   BIN_ANNOT=1 adds -bin-annot and compares the .cmt / .cmti too -- the
+#   compilers then run through same-named symlinks, as argv is recorded)
 #   SAME / DIFF / CFAIL (c++ocamlc failed) / OFAIL (ocamlc.opt failed)
 #   per scenario and pass; outputs are kept in /tmp/pack_parity/<scenario>.
 set -u
@@ -17,6 +19,8 @@ OCAMLC="$ROOT/ocamlc.opt"
 OUT=/tmp/pack_parity
 G="${G:-}"
 FL="-nostdlib -I $ROOT/stdlib -w -a $G"
+BIN_ANNOT="${BIN_ANNOT:-}"
+[ -n "$BIN_ANNOT" ] && FL="$FL -bin-annot"
 
 # ---- scenarios: files, then the build (in terms of $C, the member compiler,
 # and $P, the packer); the pack's artifacts are p.cmo / p.cmi unless PACK=
@@ -173,7 +177,13 @@ run_one() {  # scenario pass dir member-compiler packer
   # recorded in a .cmo name it), then moved to [dir]
   local sc="$1" dir="$3" w="$OUT/$1/$2/w"
   mkdir -p "$w"
-  ( cd "$w" && C="$4 $FL" P="$5 $FL" PACK=p && "sc_$sc" >build.log 2>&1; echo $? > rc
+  local cm="$4" pk="$5"
+  if [ -n "$BIN_ANNOT" ]; then  # same argv[0] for both compilers
+    mkdir -p "$OUT/bin_m" "$OUT/bin_p"
+    ln -sfn "$4" "$OUT/bin_m/ocamlc"; ln -sfn "$5" "$OUT/bin_p/ocamlc"
+    cm="$OUT/bin_m/ocamlc"; pk="$OUT/bin_p/ocamlc"
+  fi
+  ( cd "$w" && C="$cm $FL" P="$pk $FL" PACK=p && "sc_$sc" >build.log 2>&1; echo $? > rc
     [ -f prog ] && "$ROOT/runtime/ocamlrun" ./prog > run.out 2>&1 )
   mv "$w" "$dir"
 }
@@ -194,7 +204,7 @@ for sc in $ALL; do
     if [ "$(cat "$o/rc")" != 0 ] && [ "$sc" != errors ]; then res=OFAIL
     elif [ "$(cat "$c/rc")" != 0 ] && [ "$sc" != errors ]; then res=CFAIL
     else
-      for f in $stem.cmo $stem.cmi q.cmo q.cmi; do
+      for f in $stem.cmo $stem.cmi q.cmo q.cmi $( [ -n "$BIN_ANNOT" ] && cd "$o" && ls *.cmt *.cmti 2>/dev/null); do
         if [ -f "$o/$f" ] || [ -f "$c/$f" ]; then
           cmp -s "$o/$f" "$c/$f" || { res=DIFF; why="$why $f"; }
         fi

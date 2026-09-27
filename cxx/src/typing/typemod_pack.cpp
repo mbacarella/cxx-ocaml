@@ -1,8 +1,9 @@
 // Port of typing/typemod.ml, part 5: the signature of a packed unit
-// (package_signatures, package_units) for -pack.  The cmt is not written
-// (c++ocamlc writes no .cmt).
+// (package_signatures, package_units) for -pack, and its .cmt (Packed).
 #include <algorithm>
 #include <filesystem>
+
+#include "cppcaml/typing/cmt_format.hpp"
 
 #include "cppcaml/typing/mtype.hpp"
 #include "cppcaml/typing/shape.hpp"
@@ -83,16 +84,17 @@ const tt::ModuleCoercion* package_units(env::t initial_env, const std::vector<st
   // Read the signatures of the units
   std::vector<PackUnit> units;
   for (const std::string& f : objfiles) {
-    std::string modname = modname_from_source(f);
+    // Unit_info.Artifact.modname: one string, the import set's if first
+    std::string_view modname = zstr(modname_from_source(f));
     std::string cmi = chop_extensions(f) + ".cmi";  // Unit_info.companion_cmi
-    Signature sg = env::read_signature(modname, cmi);
+    Signature sg = env::read_signature_named(modname, cmi);
     bool is_cmi = f.size() >= 4 && f.compare(f.size() - 4, 4, ".cmi") == 0;
     if (is_cmi && !mtype::no_code_needed_sig(env::initial(), sg)) {
       Error e(location::none(), env::empty(), Error::Kind::Implementation_is_required);
       e.name = f;
       throw e;
     }
-    units.push_back({zborrow(modname), sg});
+    units.push_back({modname, sg});
   }
   // Compute signature of packaged unit
   ident::reinit();
@@ -115,6 +117,10 @@ const tt::ModuleCoercion* package_units(env::t initial_env, const std::vector<st
     Signature dclsig = env::read_signature(target_modname, target_cmi);
     auto [cc, shape_] = includemod::compunit(initial_env, true, "(obtained by packing)", sg, mli, dclsig, shape);
     (void)shape_;
+    cmt_format::BinaryAnnots annots{cmt_format::BinaryAnnots::Kind::Packed};
+    annots.packed_sg = sg;
+    annots.packed_files = objfiles;
+    cmt_format::save_cmt(prefix + ".cmt", target_modname, std::nullopt, annots, initial_env, nullptr, shape);
     return cc;
   }
   // Determine imports
@@ -123,8 +129,14 @@ const tt::ModuleCoercion* package_units(env::t initial_env, const std::vector<st
     if (std::none_of(units.begin(), units.end(), [&](const PackUnit& u) { return u.name == imp.first; }))
       imports.push_back(imp);
   // Write packaged signature
-  if (!clflags::dont_write_files)
-    env::save_signature_with_imports(StrMap<std::string_view>{}, sg, target_modname, target_cmi, imports);
+  if (!clflags::dont_write_files) {
+    cmi_format::CmiInfos cmi =
+        env::save_signature_with_imports(StrMap<std::string_view>{}, sg, target_modname, target_cmi, imports);
+    cmt_format::BinaryAnnots annots{cmt_format::BinaryAnnots::Kind::Packed};
+    annots.packed_sg = cmi.cmi_sign;
+    annots.packed_files = objfiles;
+    cmt_format::save_cmt(prefix + ".cmt", target_modname, std::nullopt, annots, initial_env, &cmi, shape);
+  }
   return tt::tcoerce_none();
 }
 
