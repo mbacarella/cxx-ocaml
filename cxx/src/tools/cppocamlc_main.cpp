@@ -38,7 +38,6 @@
 #include <string>
 #include <vector>
 
-#include "cppcaml/link.hpp"
 #include "cppcaml/parser.hpp"
 #include "cppcaml/lexer.hpp"
 #include "cppcaml/typing/misc.hpp"
@@ -59,6 +58,8 @@
 #include "cppcaml/typing/out_type.hpp"
 #include "cppcaml/typing/printtyp.hpp"
 #include "cppcaml/typing/bytegen.hpp"
+#include "cppcaml/typing/bytelibrarian.hpp"
+#include "cppcaml/typing/bytelink.hpp"
 #include "cppcaml/typing/bytepackager.hpp"
 #include "cppcaml/typing/emitcode.hpp"
 #include "cppcaml/typing/cmt_format.hpp"
@@ -791,60 +792,9 @@ static bool report_exception(std::exception_ptr ep) {
   return reported;
 }
 
-static mode_t current_umask() {
-  mode_t m = ::umask(0);
-  ::umask(m);
-  return m;
-}
-
-// Bytelink.link objfiles output_name, as c++ocamlc's linker does it: the
-// objects found on the load path, the stdlib's around them
-static int link(const std::vector<std::string>& objfiles0, const std::string& output_name) {
-  namespace ty = cppcaml::typing;
-  namespace cf = ty::clflags;
-  std::vector<std::string> objfiles;
-  if (!cf::nopervasives) objfiles.push_back("stdlib.cma");
-  objfiles.insert(objfiles.end(), objfiles0.begin(), objfiles0.end());
-  if (!cf::nopervasives) objfiles.push_back("std_exit.cmo");
-  std::vector<std::string> paths;
-  for (const std::string& o : objfiles) {
-    try {
-      paths.push_back(ty::load_path::find(o));
-    } catch (const ty::load_path::NotFound&) {
-      // Bytelink.Error (File_not_found)
-      ty::location::print_report(ty::location::err_formatter(),
-                                 ty::location::errorf(ty::location::in_file(ty::location::input_name),
-                                                      "Cannot find file %a",
-                                                      [&](ty::format_doc::Formatter& f) {
-                                                        ty::location::doc::quoted_filename(f, o);
-                                                      }));
-      ty::location::err_flush();
-      return 2;
-    }
-  }
-  // the launcher: -use-runtime's interpreter, else the tree's ocamlrun
-  // (+ -runtime-variant); none under -without-runtime
-  std::string runtime;
-  if (cf::with_runtime) {
-    if (!cf::use_runtime.empty()) {
-      runtime = fs::path(cf::use_runtime).is_relative() ? (fs::current_path() / cf::use_runtime).string()
-                                                         : cf::use_runtime;
-    } else {
-      fs::path r = fs::absolute(fs::path(ty::config::standard_library)).parent_path() / "runtime" /
-                   ("ocamlrun" + cf::runtime_variant);
-      if (fs::exists(r)) runtime = r.string();
-    }
-  }
-  try {
-    // (the .linkmap sidecar only on request: ocamlc writes no such file)
-    cppcaml::link::link_executable(paths, output_name, runtime, cf::link_everything, cf::no_auto_link,
-                                   std::getenv("CPPCAML_LINKMAP") != nullptr);
-  } catch (const std::exception& e) {
-    std::cout.flush();
-    std::cerr << "c++ocamlc: link error: " << e.what() << '\n';
-    return 2;
-  }
-  chmod(output_name.c_str(), cf::with_runtime ? 0777 & ~current_umask() : 0666 & ~current_umask());
+// Bytelink.link objfiles output_name (its errors reach Location's report)
+static int link(const std::vector<std::string>& objfiles, const std::string& output_name) {
+  cppcaml::typing::bytelink::link(objfiles, output_name);
   return 0;
 }
 
@@ -953,21 +903,7 @@ static int run_main(int argc, char** argv) {
       std::string out = ce::extract_output(cf::output_name);
       std::string o = ty::main_args::unsupported_archive_option();
       if (!o.empty()) ce::fatal("c++ocamlc: option " + o + " is not supported yet");
-      std::vector<std::string> objs;
-      for (const std::string& f : ce::get_objfiles(false)) {
-        try {
-          objs.push_back(ty::load_path::find(f));
-        } catch (const ty::load_path::NotFound&) {
-          objs.push_back(f);  // (the librarian reports the open failure)
-        }
-      }
-      try {
-        cppcaml::link::archive(objs, out, cf::link_everything);
-      } catch (const std::exception& e) {
-        std::cout.flush();
-        std::cerr << "c++ocamlc: -a: " << e.what() << '\n';
-        return 2;
-      }
+      ty::bytelibrarian::create_archive(ce::get_objfiles(false), out);
       ty::warnings::check_fatal();
     } else if (cf::make_package) {
       init_path();

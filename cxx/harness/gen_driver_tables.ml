@@ -61,4 +61,61 @@ let () =
            | None -> "{}"
            | Some r -> Printf.sprintf "{{%d, %d}}" r.Sys.major r.Sys.minor))
         Warnings.descriptions
-  | _ -> prerr_endline "usage: gen_driver_tables (options|config|warnings)"; exit 2
+  | [| _; "linkconfig" |] ->
+      (* the Config / Sys values Bytelink, Symtable, Dll, Ccomp and
+         Misc.RuntimeID read, as C++ definitions (config.hpp includes them) *)
+      let str n v = Printf.printf "inline const std::string %s = \"%s\";\n" n (esc v)
+      and bool n v = Printf.printf "inline constexpr bool %s = %b;\n" n v
+      and int n v = Printf.printf "inline constexpr long %s = %d;\n" n v in
+      str "bindir" Config.bindir;
+      (* (config.common.ml's "." rule is applied by config.hpp) *)
+      str "target_bindir_raw" Config.target_bindir;
+      str "ccomp_type" Config.ccomp_type;
+      str "c_compiler" Config.c_compiler;
+      str "c_output_obj" Config.c_output_obj;
+      bool "c_has_debug_prefix_map" Config.c_has_debug_prefix_map;
+      str "bytecode_cflags" Config.bytecode_cflags;
+      str "bytecode_cppflags" Config.bytecode_cppflags;
+      str "native_cflags" Config.native_cflags;
+      str "native_cppflags" Config.native_cppflags;
+      str "bytecomp_c_libraries" Config.bytecomp_c_libraries;
+      str "native_pack_linker" Config.native_pack_linker;
+      str "ar" Config.ar;
+      bool "ar_supports_response_files" Config.ar_supports_response_files;
+      str "mkdll" Config.mkdll;
+      str "mkexe" Config.mkexe;
+      str "mkmaindll" Config.mkmaindll;
+      str "system" Config.system;
+      str "host" Config.host;
+      str "target" Config.target;
+      bool "target_win32" Config.target_win32;
+      bool "windows_unicode" Config.windows_unicode;
+      bool "supports_shared_libraries" Config.supports_shared_libraries;
+      str "compression_c_libraries" Config.compression_c_libraries;
+      bool "suffixing" Config.suffixing;
+      bool "shebangscripts" Config.shebangscripts;
+      bool "flat_float_array" Config.flat_float_array;
+      bool "with_frame_pointers" Config.with_frame_pointers;
+      bool "tsan" Config.tsan;
+      bool "is_official_release" Config.is_official_release;
+      int "release_number" Config.release_number;
+      int "reserved_header_bits" Config.reserved_header_bits;
+      int "int_size" Sys.int_size;
+      int "ocaml_release_major" Sys.ocaml_release.Sys.major;
+      int "ocaml_release_minor" Sys.ocaml_release.Sys.minor;
+      str "exec_magic_number" Config.exec_magic_number;
+      str "cmo_magic_number" Config.cmo_magic_number;
+      str "cma_magic_number" Config.cma_magic_number;
+      (match Config.launch_method with
+       | Config.Executable -> str "launch_method_raw" "exe"
+       | Config.Shebang None -> str "launch_method_raw" "sh"
+       | Config.Shebang (Some s) -> str "launch_method_raw" s);
+      str "search_method_raw"
+        (match Config.search_method with
+         | Config.Disable -> "disable"
+         | Config.Fallback -> "fallback"
+         | Config.Enable -> "enable");
+      Printf.printf "inline const std::vector<std::string> flexdll_dirs = {%s};\n"
+        (String.concat ", "
+           (List.map (fun d -> "\"" ^ esc d ^ "\"") Config.flexdll_dirs))
+  | _ -> prerr_endline "usage: gen_driver_tables (options|config|warnings|linkconfig)"; exit 2

@@ -9,6 +9,12 @@
 
 #include "cppcaml/typing/clflags.hpp"
 
+#include "cppcaml/typing/config.hpp"
+#include "cppcaml/typing/filename.hpp"
+
+#include <filesystem>
+#include <stdexcept>
+
 namespace cppcaml::typing::misc {
 
 namespace style {
@@ -189,6 +195,144 @@ std::vector<std::string> invert_build_path_prefix_map(const std::string& path) {
   std::vector<std::string> matches = build_path_prefix_map::invert_all(*prefix_map, path);
   if (matches.empty()) return {path};
   return matches;
+}
+
+// ---- files and paths ----
+
+std::string find_in_path(const std::vector<std::string>& path, const std::string& name) {
+  std::error_code ec;
+  if (!filename::is_implicit(name)) {
+    if (std::filesystem::exists(name, ec)) return name;
+    throw NotFound{};
+  }
+  for (const std::string& dir : path) {
+    std::string fullname = filename::concat(dir, name);
+    if (std::filesystem::exists(fullname, ec)) return fullname;
+  }
+  throw NotFound{};
+}
+
+void remove_file(const std::string& f) {
+  std::error_code ec;
+  if (std::filesystem::is_regular_file(f, ec)) std::filesystem::remove(f, ec);
+}
+
+std::vector<std::string> split_path_contents(const std::string& s, char sep) {
+  std::vector<std::string> r;
+  if (s.empty()) return r;
+  std::size_t b = 0;
+  for (;;) {
+    std::size_t e = s.find(sep, b);
+    r.push_back(s.substr(b, e == std::string::npos ? std::string::npos : e - b));
+    if (e == std::string::npos) return r;
+    b = e + 1;
+  }
+}
+
+std::string concat_null_terminated(const std::vector<std::string>& l) {
+  std::string r;
+  for (const std::string& x : l) {
+    r += x;
+    r += '\0';
+  }
+  return r;
+}
+
+std::string replace_substring(const std::string& before, const std::string& after, const std::string& str) {
+  std::string r;
+  std::size_t curr = 0;
+  for (;;) {
+    std::size_t next = before.empty() ? std::string::npos : str.find(before, curr);
+    if (next == std::string::npos) return r + str.substr(curr);
+    r += str.substr(curr, next - curr) + after;
+    curr = next + before.size();
+  }
+}
+
+// ---- Misc.RuntimeID ----
+
+namespace {
+// make fn ?(dev = not Config.is_official_release) ... ()
+RuntimeID make_default() {
+  RuntimeID t;
+  t.dev = !config::is_official_release;
+  t.release = static_cast<int>(config::release_number);
+  t.reserved = static_cast<int>(config::reserved_header_bits);
+  t.no_flat_float_array = !config::flat_float_array;
+  t.fp = config::with_frame_pointers;
+  t.tsan = config::tsan;
+  t.int31 = config::int_size == 31;
+  t.is_static = !config::supports_shared_libraries;
+  t.no_compression = config::compression_c_libraries.empty();
+  t.ansi = config::target_win32 && !config::windows_unicode;
+  return t;
+}
+}  // namespace
+
+RuntimeID RuntimeID::make_zinc() {
+  RuntimeID t = make_default();
+  t.reserved = 0;
+  t.fp = false;
+  t.tsan = false;
+  t.ansi = false;
+  return t;
+}
+
+RuntimeID RuntimeID::make_bytecode() {
+  RuntimeID t = make_default();
+  t.fp = false;
+  t.tsan = false;
+  return t;
+}
+
+bool RuntimeID::is_zinc() const { return reserved == 0 && !fp && !tsan && !ansi; }
+bool RuntimeID::is_bytecode() const { return !fp && !tsan; }
+
+std::string RuntimeID::to_string() const {
+  static const char alpha[] = "0123456789abcdefghijklmnopqrstuv";
+  auto bit = [](int b, bool cond) { return cond ? 1 << b : 0; };
+  int q0 = bit(0, dev) | ((release << 1) & 0b11110);
+  int q1 = (release >> 4) | ((reserved << 2) & 0b11100);
+  int q2 = (reserved >> 3) | bit(2, no_flat_float_array) | bit(3, fp) | bit(4, tsan);
+  int q3 = bit(0, int31) | bit(1, is_static) | bit(2, no_compression) | bit(3, ansi);
+  return {alpha[q0], alpha[q1], alpha[q2], alpha[q3]};
+}
+
+std::optional<RuntimeID> RuntimeID::of_string(const std::string& s) {
+  if (s.size() != 4) return std::nullopt;
+  auto convert = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'v') return c - 'a' + 10;
+    return -1000;  // min_int: the sum stays negative
+  };
+  int q0 = convert(s[0]), q1 = convert(s[1]), q2 = convert(s[2]), q3 = convert(s[3]);
+  if (q0 + q1 + q2 + q3 < 0) return std::nullopt;
+  auto set = [](int b, int q) { return (q & (1 << b)) != 0; };
+  RuntimeID t;
+  t.dev = set(0, q0);
+  t.release = ((q1 & 0b11) << 4) | (q0 >> 1);
+  t.reserved = ((q2 & 0b11) << 2) | (q1 >> 2);
+  t.no_flat_float_array = set(2, q2);
+  t.fp = set(3, q2);
+  t.tsan = set(4, q2);
+  t.int31 = set(0, q3);
+  t.is_static = set(1, q3);
+  t.no_compression = set(2, q3);
+  t.ansi = set(3, q3);
+  return t;
+}
+
+std::string RuntimeID::ocamlrun(const std::string& variant) const {
+  if (!is_zinc()) throw std::invalid_argument("Misc.RuntimeID.ocamlrun");
+  return "ocamlrun" + variant + "-" + to_string();
+}
+
+std::string shared_runtime_bytecode() {
+  return "-lcamlrun-" + config::target + "-" + RuntimeID::make_bytecode().to_string();
+}
+
+std::string stubslib(const std::string& name) {
+  return name + "-" + config::target + "-" + RuntimeID::make_bytecode().to_string();
 }
 
 }  // namespace cppcaml::typing::misc

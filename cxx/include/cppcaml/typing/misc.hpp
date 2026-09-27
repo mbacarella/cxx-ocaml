@@ -81,4 +81,45 @@ const build_path_prefix_map::Map* get_build_path_prefix_map();
 // invert_build_path_prefix_map path
 std::vector<std::string> invert_build_path_prefix_map(const std::string& path);
 
+// ---- files and paths (the linker's) ----
+// find_in_path path name: raises NotFound
+struct NotFound {};
+std::string find_in_path(const std::vector<std::string>& path, const std::string& name);
+// remove_file: when it is a regular file, ignoring errors
+void remove_file(const std::string& filename);
+// split_path_contents ?(sep = ':') s
+std::vector<std::string> split_path_contents(const std::string& s, char sep = ':');
+// concat_null_terminated l
+std::string concat_null_terminated(const std::vector<std::string>& l);
+// replace_substring ~before ~after str
+std::string replace_substring(const std::string& before, const std::string& after, const std::string& str);
+
+// ---- Misc.RuntimeID ----
+struct RuntimeID {
+  bool dev = false;
+  int release = 0;
+  int reserved = 0;
+  bool no_flat_float_array = false;
+  bool fp = false;
+  bool tsan = false;
+  bool int31 = false;
+  bool is_static = false;  // static
+  bool no_compression = false;
+  bool ansi = false;
+
+  // make_zinc () / make_bytecode (), with the Config / Sys defaults
+  static RuntimeID make_zinc();
+  static RuntimeID make_bytecode();
+  bool is_zinc() const;
+  bool is_bytecode() const;
+  std::string to_string() const;
+  static std::optional<RuntimeID> of_string(const std::string& s);
+  // ocamlrun variant t (raises std::invalid_argument unless is_zinc)
+  std::string ocamlrun(const std::string& variant) const;
+};
+// RuntimeID.shared_runtime Sys.Bytecode (~prefix:"-l", ~host:Config.target)
+std::string shared_runtime_bytecode();
+// RuntimeID.stubslib name (~runtime_id:(make_bytecode ()), ~host:Config.target)
+std::string stubslib(const std::string& name);
+
 }  // namespace cppcaml::typing::misc

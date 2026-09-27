@@ -15,7 +15,7 @@
 #   bin-annot -bin-annot's .cmt (Cmt_format is not ported yet)
 set -u
 SELF="$(readlink -f "$0")"
-ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
+ROOT="${ROOT:-$(cd "$(dirname "$SELF")/../.." && pwd)}"
 CPP="${CPP:-$ROOT/cxx/build-release/c++ocamlc}"
 T=$(mktemp -d)
 trap 'rm -rf "${T:?}"' EXIT
@@ -58,6 +58,7 @@ EOF
   cat > z.ml <<'EOF'
 let z = ZZZ
 EOF
+  echo 'int cppcaml_x(int n) { return n + 1; }' > x.c
   echo 'module X = Stdlib' > opened.ml
   echo 'let y = List.length []' > useopen.ml
   cat > sfx.mlx <<'EOF'
@@ -278,20 +279,32 @@ refuse dmatchcomp -dmatchcomp -c a.ml
 refuse dcanonical-ids -dcanonical-ids -c a.ml
 refuse compat-32 -compat-32 -c a.ml
 refuse dtimings -dtimings -c a.ml
-refuse custom -custom a.ml b.ml -o prog
-refuse output-obj -output-obj a.ml b.ml -o prog.o
-refuse output-complete-exe -output-complete-exe a.ml b.ml -o prog
-refuse make-runtime -make-runtime a.ml -o rt
-refuse dllib-link -dllib -lfoo a.ml b.ml -o prog
-refuse dllpath -dllpath /x a.ml b.ml -o prog
-refuse cclib-link -cclib -lfoo a.ml b.ml -o prog
-refuse bytecode-hints -bytecode-hints a.ml b.ml -o prog
-refuse runtime-search -runtime-search enable a.ml b.ml -o prog
-refuse launch-method -launch-method sh a.ml b.ml -o prog
-refuse cclib-archive -cclib -lfoo a.ml -a -o lib.cma
-refuse custom-archive -custom a.ml -a -o lib.cma
-refuse c-file -c x.c
 refuse depend -depend a.ml
+# the linker's (Bytelink / Bytelibrarian / Dll / Ccomp ports)
+run dllib-link -dllib -lfoo a.ml b.ml -o prog
+run dllpath -dllpath /x a.ml b.ml -o prog
+run cclib-link -cclib -lfoo a.ml b.ml -o prog
+run bytecode-hints -bytecode-hints a.ml b.ml -o prog
+run runtime-search -runtime-search enable a.ml b.ml -o prog
+run launch-method -launch-method sh a.ml b.ml -o prog
+run launch-method-exe -launch-method exe a.ml b.ml -o prog
+run set-runtime-default -set-runtime-default standard_library_default=/x a.ml b.ml -o prog
+run cclib-archive -cclib -lfoo a.ml -a -o lib.cma
+run custom-archive -custom a.ml -a -o lib.cma
+run ccopt-dllib-archive -ccopt -O2 -dllib -lbar a.ml -a -o lib.cma
+run c-file -c x.c
+run c-file-o -c x.c -o y.o
+# the C-toolchain links need an installed stdlib (caml/*.h, libcamlrun.a)
+INST="${INST:-/tmp/cxxsw/usr/local/lib/ocaml}"
+if [ -f "$INST/caml/mlvalues.h" ]; then
+  RUN_ENV="OCAMLLIB=$INST" run custom -custom a.ml b.ml -o prog
+  RUN_ENV="OCAMLLIB=$INST" run output-obj -output-obj a.ml b.ml -o prog.o
+  RUN_ENV="OCAMLLIB=$INST" run output-obj-c -output-obj a.ml b.ml -o prog.c
+  RUN_ENV="OCAMLLIB=$INST" run output-complete-exe -output-complete-exe a.ml b.ml -o prog
+  RUN_ENV="OCAMLLIB=$INST" run make-runtime -make-runtime a.ml -o rt
+else
+  echo "(the C-toolchain cases skipped: no installed stdlib at INST=$INST)"
+fi
 
 echo "cases $N: SAME $SAME  DIFF $DIFF  KNOWN $KNOWN"
 echo "refused $NREF: as expected $REFOK"

@@ -5,7 +5,10 @@
 
 #include "cppcaml/typing/misc.hpp"
 #include "cppcaml/typing/pprintast.hpp"
+#include "cppcaml/typing/bytelibrarian.hpp"
+#include "cppcaml/typing/bytelink.hpp"
 #include "cppcaml/typing/bytepackager.hpp"
+#include "cppcaml/typing/symtable.hpp"
 #include "cppcaml/typing/cmi_format.hpp"
 #include "cppcaml/typing/persistent_env.hpp"
 #include "cppcaml/typing/primitive.hpp"
@@ -121,6 +124,15 @@ void register_misc() {
             break;
         }
       });
+    } catch (const bytelink::Error& e) {
+      bytelink::Error err = e;
+      return location::error_of_printer_file([err](Formatter& ppf) { bytelink::report_error_doc(ppf, err); });
+    } catch (const bytelibrarian::Error& e) {
+      bytelibrarian::Error err = e;
+      return location::error_of_printer_file([err](Formatter& ppf) { bytelibrarian::report_error_doc(ppf, err); });
+    } catch (const symtable::Error& e) {
+      symtable::Error err = e;
+      return location::error_of_printer_file([err](Formatter& ppf) { symtable::report_error_doc(ppf, err); });
     } catch (const typemod::ErrorForward& e) {
       return error_of_extension(e.ext);
     } catch (const typeclass::ErrorForward& e) {

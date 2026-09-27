@@ -2,6 +2,8 @@
 // defaults.  The c++ocamlc driver sets them from the command line.
 #pragma once
 
+#include "cppcaml/typing/config.hpp"
+#include "cppcaml/typing/filename.hpp"
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -92,8 +94,10 @@ inline bool no_check_prims = false;        // -no-check-prims
 inline bool output_c_object = false;       // -output-obj
 inline bool output_complete_object = false;   // -output-complete-obj
 inline bool output_complete_executable = false;  // -output-complete-exe
-inline bool launch_method_set = false;     // -launch-method
-inline bool search_method_set = false;     // -runtime-search (not "disable")
+// target_bindir / launch_method / search_method: unset = the Config default
+inline std::optional<std::string> target_bindir;                 // -launch-method "<m> <bindir>"
+inline std::optional<config::LaunchMethod> launch_method;        // -launch-method
+inline std::optional<config::SearchMethod> search_method;        // -runtime-search
 inline std::string runtime_variant;        // -runtime-variant
 inline std::string use_prims;              // -use-prims
 inline std::string use_runtime;            // -use-runtime
@@ -108,5 +112,10 @@ inline std::optional<Pass> stop_after;
 inline bool should_stop_after(Pass pass) {
   if (Pass::Typing <= pass && print_types) return true;
   return stop_after && *stop_after <= pass;
+}
+// std_include_flag prefix
+inline std::string std_include_flag(const std::string& prefix) {
+  if (no_std_include) return "";
+  return prefix + filename::quote(config::standard_library);
 }
 }  // namespace cppcaml::typing::clflags

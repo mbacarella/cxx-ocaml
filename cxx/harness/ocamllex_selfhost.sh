@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # THE SELF-HOSTING FIXPOINT: build the real ocamllex (lex/*.{mli,ml}) with
-# c++ocamlc against our ENTIRE self-built (all-ours) stdlib, link with c++link,
+# c++ocamlc against our ENTIRE self-built (all-ours) stdlib, link with c++ocamlc,
 # and use the resulting bytecode ocamllex to regenerate ocamllex's OWN lexer
 # (lex/lexer.mll) -- then check the output is byte-identical (modulo the output
 # filename in `# line` directives) to the reference lex/ocamllex.opt.
@@ -14,7 +14,6 @@ SELF="$(readlink -f "$0")"
 cd "$(dirname "$SELF")/../.." || exit 1
 ROOT=$PWD
 CPP=$ROOT/cxx/build/c++ocamlc
-LINK=$ROOT/cxx/build/c++link
 RUN=$ROOT/runtime/ocamlrun
 STD=$ROOT/stdlib
 ORACLE=$ROOT/lex/ocamllex.opt   # reference (native) ocamllex
@@ -69,7 +68,7 @@ done
 # Link: all stdlib objs + lex objs + std_exit.
 objs=""; for m in $STDORDER; do f="$WD/$(gname "$m").cmo"; [ -f "$f" ] && objs="$objs $f"; done
 for m in $LEXORDER; do objs="$objs $WD/$m.cmo"; done
-if ! "$LINK" -nostdlib -runtime "$RUN" $objs "$WD/std_exit.cmo" -o "$WD/ocamllex" 2>"$WD/err"; then
+if ! "$CPP" -nopervasives -use-runtime "$RUN" -I "$STD" $objs "$WD/std_exit.cmo" -o "$WD/ocamllex" 2>"$WD/err"; then
   echo "FAIL: link"; sed 's/^/  /' "$WD/err"; exit 1
 fi
 

@@ -2,7 +2,7 @@
 # THE COMPILER BOOTSTRAP: build the reference OCaml compiler's own OCaml sources
 # (ocamlcommon + ocamlbytecomp = the whole bytecode compiler front+back end) with
 # c++ocamlc against our ENTIRE self-built (all-ours) stdlib, link the result with
-# c++link + the runtime into a working bytecode `ocamlc`, then use THAT ocamlc to
+# c++ocamlc as the linker + the runtime into a working bytecode `ocamlc`, then use THAT ocamlc to
 # compile a program -- proving the c++-compiled compiler runs.
 #
 # c++ocamlc is a C++ program and cannot literally compile itself; the achievable
@@ -11,9 +11,8 @@ set -u
 SELF="$(readlink -f "$0")"
 cd "$(dirname "$SELF")/../.." || exit 1
 ROOT=$PWD
-source cxx/harness/_require_fresh.sh; require_fresh c++ocamlc c++link
+source cxx/harness/_require_fresh.sh; require_fresh c++ocamlc
 CPP=$ROOT/cxx/build/c++ocamlc
-LINK=$ROOT/cxx/build/c++link
 RUN=$ROOT/runtime/ocamlrun
 STD=$ROOT/stdlib
 
@@ -292,7 +291,7 @@ echo "=== compiler: ok=$ok fail=$fail ==="
 # ---- 3. link the bytecode ocamlc -------------------------------------------
 stdobjs=""; for m in $STDORDER; do f="$WD/$(gname "$m").cmo"; [ -f "$f" ] && stdobjs="$stdobjs $f"; done
 clobjs=""; for n in $order; do clobjs="$clobjs $WD/$n.cmo"; done
-if ! "$LINK" -nostdlib -runtime "$RUN" $stdobjs $clobjs "$WD/std_exit.cmo" -o "$WD/ocamlc" 2>"$WD/lerr"; then
+if ! "$CPP" -nopervasives -use-runtime "$RUN" -I "$STD" $stdobjs $clobjs "$WD/std_exit.cmo" -o "$WD/ocamlc" 2>"$WD/lerr"; then
   echo "FAIL: link"; sed 's/^/  /' "$WD/lerr"; exit 1
 fi
 echo "linked: $WD/ocamlc"
