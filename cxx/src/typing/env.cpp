@@ -1858,13 +1858,40 @@ static std::pair<Path::t, A> lookup_ident_generic(bool errors, bool use, const L
   }
 }
 
+// ---- use_label / use_constructor (env.ml) ----
+// The usage marks themselves (Uid tables of the unused-declaration
+// warnings) and the alerts are stage 9; what matters here is
+// mark_type_path_used's lookup, which forces the type's descriptions (an
+// inlined record's labels allocate a type: Datarepr.labels_of_type).
+static void mark_type_path_used(t env, Path::t path) {
+  try {
+    (void)find_type(path, env);
+  } catch (const NotFound&) {
+  }
+}
+static Path::t tconstr_path(TypeExpr* ty) {
+  auto* c = as<Tconstr>(get_desc(ty));
+  if (!c) throw std::logic_error("Env: not a Tconstr");
+  return c->path;
+}
+static void use_label(bool use, t env, const LabelDescription* lbl) {
+  if (use) mark_type_path_used(env, tconstr_path(lbl->lbl_res));  // mark_label_description_used
+}
+static void use_constructor_desc(bool use, t env, const ConstructorDescription* cstr) {
+  if (use) mark_type_path_used(env, tconstr_path(cstr->cstr_res));  // mark_constructor_description_used
+}
+
 static std::vector<std::pair<const LabelDescription*, std::function<void()>>>
 lookup_all_ident_labels(bool errors, bool use, const Location& loc, std::string_view s, t env) {
   auto lbls = tycomp_find_all(use, s, env->labels);
   if (lbls.empty())
     may_lookup_error(errors, loc, env, lerr(LookupError::Kind::Unbound_label, Longident::lident(s)));
   std::vector<std::pair<const LabelDescription*, std::function<void()>>> out;
-  for (auto& [l, fn] : lbls) out.emplace_back(l, fn);
+  for (auto& [l, fn] : lbls)
+    out.emplace_back(l, [use, env, l = l, fn = fn] {
+      use_label(use, env, l);
+      fn();
+    });
   return out;
 }
 
@@ -1876,7 +1903,11 @@ lookup_all_ident_constructors(bool errors, bool use, const Location& loc, std::s
     may_lookup_error(errors, loc, env,
                      lerr(LookupError::Kind::Unbound_constructor, Longident::lident(s)));
   std::vector<std::pair<const ConstructorDescription*, std::function<void()>>> out;
-  for (auto& [cda, fn] : cstrs) out.emplace_back(cda->cda_description, fn);
+  for (auto& [cda, fn] : cstrs)
+    out.emplace_back(cda->cda_description, [use, env, c = cda->cda_description, fn = fn] {
+      use_constructor_desc(use, env, c);
+      fn();
+    });
   return out;
 }
 
@@ -2137,7 +2168,7 @@ static std::vector<std::pair<const LabelDescription*, std::function<void()>>> lo
     if (!lbls || lbls->empty())
       may_lookup_error(errors, loc, env, lerr(LookupError::Kind::Unbound_label, lid));
     std::vector<std::pair<const LabelDescription*, std::function<void()>>> out;
-    for (auto* l : *lbls) out.emplace_back(l, [] {});
+    for (auto* l : *lbls) out.emplace_back(l, [use, env, l] { use_label(use, env, l); });
     return out;
   }
   throw std::logic_error("Env.lookup_all_labels: Lapply");
@@ -2156,7 +2187,9 @@ lookup_all_constructors_(bool errors, bool use, const Location& loc, Longident::
     if (!cstrs || cstrs->empty())
       may_lookup_error(errors, loc, env, lerr(LookupError::Kind::Unbound_constructor, lid));
     std::vector<std::pair<const ConstructorDescription*, std::function<void()>>> out;
-    for (auto* cda : *cstrs) out.emplace_back(cda->cda_description, [] {});
+    for (auto* cda : *cstrs)
+      out.emplace_back(cda->cda_description,
+                       [use, env, c = cda->cda_description] { use_constructor_desc(use, env, c); });
     return out;
   }
   throw std::logic_error("Env.lookup_all_constructors: Lapply");
@@ -2221,7 +2254,7 @@ const ConstructorDescription* lookup_constructor(bool use, const Location& loc, 
 }
 
 std::vector<std::pair<const ConstructorDescription*, std::function<void()>>>
-lookup_all_constructors_from_type(bool, const Location&, ConstructorUsage, Path::t ty_path, t env) {
+lookup_all_constructors_from_type(bool use, const Location&, ConstructorUsage, Path::t ty_path, t env) {
   std::vector<std::pair<const ConstructorDescription*, std::function<void()>>> out;
   const TypeDescriptions* d;
   try {
@@ -2230,7 +2263,7 @@ lookup_all_constructors_from_type(bool, const Location&, ConstructorUsage, Path:
     return out;
   }
   if (d->kind != TypeKind::Kind::Type_variant) return out;
-  for (auto* c : d->constructors) out.emplace_back(c, [] {});
+  for (auto* c : d->constructors) out.emplace_back(c, [use, env, c] { use_constructor_desc(use, env, c); });
   return out;
 }
 
@@ -2257,7 +2290,7 @@ const LabelDescription* lookup_label(bool use, const Location& loc, LabelUsage, 
 }
 
 std::vector<std::pair<const LabelDescription*, std::function<void()>>> lookup_all_labels_from_type(
-    bool, const Location&, LabelUsage, Path::t ty_path, t env) {
+    bool use, const Location&, LabelUsage, Path::t ty_path, t env) {
   std::vector<std::pair<const LabelDescription*, std::function<void()>>> out;
   const TypeDescriptions* d;
   try {
@@ -2266,7 +2299,7 @@ std::vector<std::pair<const LabelDescription*, std::function<void()>>> lookup_al
     return out;
   }
   if (d->kind != TypeKind::Kind::Type_record) return out;
-  for (auto* l : d->labels) out.emplace_back(l, [] {});
+  for (auto* l : d->labels) out.emplace_back(l, [use, env, l] { use_label(use, env, l); });
   return out;
 }
 
