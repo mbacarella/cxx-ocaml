@@ -14,6 +14,9 @@
 // for a source file) and meaning-preserving toggles are accepted and ignored;
 // flags that would silently change the meaning of the output if ignored (-pp,
 // -ppx, -pack, -a, -open, ...) are reported as unsupported rather than dropped.
+#include <pthread.h>
+#include <signal.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -987,6 +990,84 @@ static int run_main(int argc, char** argv) {
   return 0;
 }
 
+// The compiler runs on a thread with a large stack.  OCaml's native frames
+// are several times smaller than the port's, so a recursion ocamlc.opt
+// takes in its 8 MiB system stack (a deep type graph in Ctype, a long
+// expression) needs more here; the reservation is virtual, pages are
+// committed as the recursion touches them.  Where the port does run out,
+// it does what ocamlc does when OCaml raises Stack_overflow past
+// Location.report_exception: the uncaught exception handler's "Fatal
+// error: exception Stack overflow" (Printexc's spelling), exit 2 (a guard
+// region below the stack, caught on an alternate signal stack).  ocamlc.opt
+// reaches it once its fiber stack hits OCAMLRUNPARAM's l (1 GiB by default,
+// typing-misc/conjunctive_types.ml's unbounded update_level_abbrev
+// recursion): the port's larger frames get there sooner, with the same
+// result.
+namespace {
+constexpr std::size_t kStackSize = std::size_t{1} << 30;   // 1 GiB
+constexpr std::size_t kGuardSize = std::size_t{1} << 20;   // 1 MiB
+char* g_guard_lo = nullptr;
+char* g_guard_hi = nullptr;
+
+void on_segv(int sig, siginfo_t* info, void*) {
+  char* a = static_cast<char*>(info->si_addr);
+  if (a >= g_guard_lo && a < g_guard_hi) {
+    static const char msg[] = "Fatal error: exception Stack overflow\n";
+    std::fflush(nullptr);
+    (void)!::write(2, msg, sizeof msg - 1);
+    ::_exit(2);
+  }
+  // any other fault: the default action (a core dump)
+  ::signal(sig, SIG_DFL);
+  ::raise(sig);
+}
+
+struct MainArgs {
+  int argc;
+  char** argv;
+  int rc;
+};
+
+void* main_thread(void* p) {
+  auto* a = static_cast<MainArgs*>(p);
+  static char altstack[64 * 1024];
+  stack_t ss{};
+  ss.ss_sp = altstack;
+  ss.ss_size = sizeof altstack;
+  ::sigaltstack(&ss, nullptr);
+  a->rc = run_main(a->argc, a->argv);
+  return nullptr;
+}
+
+// run_main on a kStackSize stack; falls back to the calling thread when the
+// reservation fails (e.g. a tight ulimit -v)
+int run_main_big_stack(int argc, char** argv) {
+  MainArgs args{argc, argv, 0};
+  void* mem = ::mmap(nullptr, kGuardSize + kStackSize, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  if (mem == MAP_FAILED) return run_main(argc, argv);
+  g_guard_lo = static_cast<char*>(mem);
+  g_guard_hi = g_guard_lo + kGuardSize;
+  ::mprotect(mem, kGuardSize, PROT_NONE);  // the stack grows down into it
+  struct sigaction sa{};
+  sa.sa_sigaction = on_segv;
+  sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+  ::sigemptyset(&sa.sa_mask);
+  ::sigaction(SIGSEGV, &sa, nullptr);
+  pthread_attr_t attr;
+  ::pthread_attr_init(&attr);
+  ::pthread_attr_setstack(&attr, g_guard_hi, kStackSize);
+  pthread_t th;
+  if (::pthread_create(&th, &attr, main_thread, &args) != 0) {
+    ::pthread_attr_destroy(&attr);
+    return run_main(argc, argv);
+  }
+  ::pthread_join(th, nullptr);
+  ::pthread_attr_destroy(&attr);
+  return args.rc;
+}
+}  // namespace
+
 int main(int argc, char** argv) {
   // Every .cmo/.cmi/executable is written through a local, RAII std::ofstream
   // that has already flushed and closed by the time run_main returns; the only
@@ -998,7 +1079,7 @@ int main(int argc, char** argv) {
   // of a warm compile).  Skip all static destructors and atexit handlers with
   // _Exit; the output bytes are identical, we just stop paying to unbuild the
   // in-memory graphs on the way out.
-  int rc = run_main(argc, argv);
+  int rc = run_main_big_stack(argc, argv);
   std::cout.flush();
   std::cerr.flush();
   std::fflush(nullptr);
