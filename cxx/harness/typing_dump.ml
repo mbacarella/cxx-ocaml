@@ -655,7 +655,7 @@ module P = struct
     s " "; loc c.pconst_loc; s "}"
 
   let rec attribute ?(gap_name = false) (a : attribute) =
-    s "{attr "; if gap_name then str_gloc a.attr_name else str_loc a.attr_name;
+    s "{attr "; ignore gap_name; str_loc a.attr_name;
     s " "; payload a.attr_payload; s " "; loc a.attr_loc; s "}"
   and attrs l = list (fun a -> attribute a) l
   and payload = function

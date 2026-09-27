@@ -595,9 +595,12 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
                                        // the source's name: one string object (cmt_format.hpp)
                                        std::string_view src_name = ty::zborrow(in_path);
                                        ty::cmt_format::set_source_name(src_name);
-                                       ty::parsetree::Structure st = ty::parsetree::of_ast(structure, src_name, dirfiles);
+                                       // with -pp the lexer's positions name the file through a
+                                       // string of their own (Pparse's preprocessed input)
+                                       std::string_view pos_name = cf::preprocessor ? ty::zstr(in_path) : src_name;
+                                       ty::parsetree::Structure st = ty::parsetree::of_ast(structure, pos_name, dirfiles);
                                        ty::cmt_format::set_comments(
-                                           ty::parsetree::comments_of_ast(cppcaml::ast::last_comments(), src_name, dirfiles));
+                                           ty::parsetree::comments_of_ast(cppcaml::ast::last_comments(), pos_name, dirfiles));
                                        // an .ml without .mli: its .cmi is written here (Typemod)
                                        impl = ty::typemod::type_implementation(target, env0, st);
                                      });
@@ -696,8 +699,9 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
           namespace ty = cppcaml::typing;
           std::string_view src_name = ty::zborrow(in_path);  // the source's name: one string object
           ty::cmt_format::set_source_name(src_name);
-          ty::parsetree::Signature sg = ty::parsetree::of_ast_signature(sig, src_name, {});
-          ty::cmt_format::set_comments(ty::parsetree::comments_of_ast(cppcaml::ast::last_comments(), src_name, {}));
+          std::string_view pos_name = cf::preprocessor ? ty::zstr(in_path) : src_name;  // as compile_ml's
+          ty::parsetree::Signature sg = ty::parsetree::of_ast_signature(sig, pos_name, {});
+          ty::cmt_format::set_comments(ty::parsetree::comments_of_ast(cppcaml::ast::last_comments(), pos_name, {}));
           // Compile_common.typecheck_intf
           const ty::typedtree::Signature* tsg = ty::typemod::type_interface(target, env0, sg);
           ty::StrMap<std::string_view> alerts = ty::builtin_attributes::alerts_of_sig(true, sg);

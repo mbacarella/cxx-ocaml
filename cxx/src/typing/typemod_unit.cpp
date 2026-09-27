@@ -284,8 +284,9 @@ static tt::Implementation type_implementation_(const UnitInfo& target, env::t in
   if (clflags::print_types)  // #7656
     warnings::parse_options(false, "-32-34-37-38-60");
   TypeStructureResult r = type_structure(initial_env, ast);
-  shape::t shape0 = shape::set_uid_if_none(
-      r.shape, uid::of_compilation_unit_id(ident::name(Ident::create_persistent(target.modname))));
+  // Ident.create_persistent modname: the unit's one name string
+  Ident::t unit_id = Ident::create_persistent(uid::unit_name_string(target.modname));
+  shape::t shape0 = shape::set_uid_if_none(r.shape, uid::of_compilation_unit_id(ident::name(unit_id)));
   Signature simple_sg = simplify(r.env, r.names, r.sg);
   if (clflags::print_types) {
     typecore::force_delayed_checks();

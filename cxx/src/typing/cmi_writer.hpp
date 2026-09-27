@@ -208,8 +208,19 @@ class Writer {
     current_unit_name_ = str(n);
   }
   V unit_name(std::string_view n) {
+    if (current_unit_by_identity_) {
+      if (n.data() == current_unit_view_.data() && n.size() == current_unit_view_.size()) return current_unit_name_;
+      return str(n);
+    }
     if (current_unit_name_ && n == current_unit_) return current_unit_name_;
     return str(n);
+  }
+  // the .cmt's: the unit's name is the one string [n] (uid::unit_name_
+  // string); a uid read from a .cmi carries that file's own string
+  void set_current_unit_identity(std::string_view n) {
+    set_current_unit_shared(n);
+    current_unit_by_identity_ = true;
+    current_unit_view_ = n;
   }
  public:
   template <class F>
@@ -260,6 +271,12 @@ class Writer {
             x->fields[2]->kind == OValue::Kind::Int && x->fields[3]->kind == OValue::Kind::Int)
           return x->pos ? position(*x->pos)
                         : position(Position{x->fields[0]->s, x->fields[1]->i, x->fields[2]->i, x->fields[3]->i});
+        // a parsetree location record: that record's one value (loc())
+        if (x->loc_rec) {
+          Location l = *x->loc_rec;
+          l.obj = x->loc_rec;
+          return loc(l);
+        }
         return shared(memo_, x, static_cast<int>(x->tag), [&]() -> std::vector<V> {
           std::vector<V> fs;
           for (const OValue* f : x->fields) fs.push_back(ovalue(f));
@@ -758,6 +775,8 @@ class Writer {
   std::map<std::string, V> fnames_;
   std::string current_unit_;
   V current_unit_name_;
+  bool current_unit_by_identity_ = false;
+  std::string_view current_unit_view_;
   std::map<std::pair<const char*, std::size_t>, V> strs_;
   std::map<std::pair<const void*, std::size_t>, V> lists_;
   std::unordered_map<const void*, V> mprivate_;

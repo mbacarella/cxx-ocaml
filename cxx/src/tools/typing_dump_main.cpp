@@ -902,8 +902,8 @@ void payload(const Payload& p) {
 }
 void attribute(const Attribute* a, bool gap_name = false) {
   s("{attr ");
-  if (gap_name) str_gloc(a->attr_name);
-  else str_loc(a->attr_name);
+  (void)gap_name;
+  str_loc(a->attr_name);
   s(" "); payload(a->attr_payload); s(" "); loc(a->attr_loc); s("}");
 }
 void attrs(const Attributes& l) { list(l, [](const Attribute* a) { attribute(a); }); }

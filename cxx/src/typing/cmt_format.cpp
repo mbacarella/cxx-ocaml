@@ -244,9 +244,11 @@ class TreeWriter {
   V payload(const OValue* x) {
     if (x->kind != OValue::Kind::Block) return w_.ovalue(x);
     if (is_position(x)) return w_.ovalue(x);
+    // a location: the parsetree's record, which Types' copy of the
+    // attribute (the same parsetree value) writes too
     if (x->tag == 0 && x->fields.size() == 3 && is_position(x->fields[0]) && is_position(x->fields[1]) &&
         x->fields[2]->kind == OValue::Kind::Int)
-      return loc(Location{position_of(x->fields[0]), position_of(x->fields[1]), x->fields[2]->i != 0});
+      return w_.ovalue(x);
     std::vector<V> fs;
     for (const OValue* f : x->fields) fs.push_back(payload(f));
     return o::vblock(static_cast<int>(x->tag), fs);
@@ -254,8 +256,22 @@ class TreeWriter {
   // Tast_mapper.attribute: { attr_name = map_loc; attr_payload; attr_loc }
   // (the payload as Types holds it: parsetree_ovalue)
   V attribute_(const Attribute* a) {
-    return o::vblock(0, {o::vblock(0, {w_.str(a->attr_name), loc(a->attr_name_loc)}), payload(a->attr_payload),
-                         loc(a->attr_loc)});
+    V name = o::vblock(0, {w_.str(a->attr_name), loc(a->attr_name_loc)});
+    V p = payload(a->attr_payload);
+    // a doc attribute (Docstrings): its attr_loc is its payload item's loc
+    // record, PStr [{pstr_desc; pstr_loc}] (as the .cmi writer's)
+    if (a->name_obj) {
+      const OValue* x = a->attr_payload;
+      if (x && x->kind == OValue::Kind::Block && x->tag == 0 && x->fields.size() == 1) {
+        const OValue* cons = x->fields[0];
+        if (cons->kind == OValue::Kind::Block && cons->fields.size() == 2) {
+          const OValue* item = cons->fields[0];
+          if (item->kind == OValue::Kind::Block && item->fields.size() == 2)
+            return o::vblock(0, {name, p, w_.ovalue(item->fields[1])});
+        }
+      }
+    }
+    return o::vblock(0, {name, p, loc(a->attr_loc)});
   }
   V attribute(const pt::Attribute* a) { return attribute_(pt::types_attributes(slice({a}))[0]); }
   V attributes(const pt::Attributes& as) {
@@ -2247,8 +2263,9 @@ void save_cmt(const std::string& filename, std::string_view modname, const std::
     out += bytes;
     this_crc = crc;
   }
+  modname = uid::unit_name_string(modname);  // Unit_info.modname: the one string
   Writer w;
-  w.set_current_unit_shared(modname);
+  w.set_current_unit_identity(modname);
   EventWriter ew(w);
   TreeWriter tw(w, ew);
   // cmt_ident_occurrences: -bin-annot-occurrences is not ported (the list is [])

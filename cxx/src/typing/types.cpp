@@ -90,11 +90,24 @@ static std::string_view no_unit_name() {
   return s;
 }
 
+// Unit_info.modname: the unit's one name string, which every uid of the
+// unit carries (and Cmt_format's cmt_modname)
+std::string_view unit_name_string(std::string_view modname) {
+  static std::string last;
+  static std::string_view z;
+  if (!z.data() || last != modname) {
+    last = std::string(modname);
+    ZoneScope perm(permanent_zone());
+    z = zone().str(modname);
+  }
+  return z;
+}
+
 Uid mk(const UnitInfo* current_unit) {
   Uid u;
   u.kind = Uid::Kind::Item;
   if (current_unit) {
-    u.comp_unit = zstr(current_unit->modname);
+    u.comp_unit = unit_name_string(current_unit->modname);
     u.from = current_unit->kind;
   } else {
     u.comp_unit = no_unit_name();
@@ -107,7 +120,7 @@ Uid mk(const UnitInfo* current_unit) {
 Uid mk_local_opaque(const UnitInfo* current_unit) {
   Uid u;
   u.kind = Uid::Kind::Local_opaque_item;
-  u.comp_unit = current_unit ? zstr(current_unit->modname) : no_unit_name();
+  u.comp_unit = current_unit ? unit_name_string(current_unit->modname) : no_unit_name();
   u.id = ++g_id_param;
   u.obj = fresh_obj();
   return u;

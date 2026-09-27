@@ -117,6 +117,7 @@ struct UnitInfo {
 // Shape.Uid functions (shape.ml).
 namespace uid {
 Uid mk(const UnitInfo* current_unit);
+std::string_view unit_name_string(std::string_view modname);
 Uid mk_local_opaque(const UnitInfo* current_unit);
 Uid of_compilation_unit_id(std::string_view name);
 Uid of_predef_id(std::string_view name);
@@ -163,6 +164,9 @@ struct OValue {
   // a Lexing.position block read from a .cmi: the Reader's record for the
   // same marshaled block (one object, whichever way it is decoded)
   const Position* pos = nullptr;
+  // a Location.t block converted from a parsetree location record (its
+  // identity, Location::obj): the writers make it that record's one value
+  const Location* loc_rec = nullptr;
 };
 
 // ---- Parsetree.attribute ------------------------------------------------

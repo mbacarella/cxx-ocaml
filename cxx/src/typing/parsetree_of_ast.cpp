@@ -17,6 +17,12 @@ namespace cppcaml::typing::parsetree {
 
 namespace {
 std::map<std::pair<const void*, std::size_t>, typing::Attributes> g_types_attributes;
+// the docstrings' ds_loc records by span: Lexer.comments () lists each
+// docstring's comment with that same location record
+std::map<std::pair<long, long>, Location> g_docstring_locs;
+// a line directive's file name: one string per directive file for the unit
+// (the parsetree's positions and Lexer.comments () share the lexbuf's)
+std::vector<std::string_view> g_zdirfiles;
 }
 void reset_types_attributes() { g_types_attributes.clear(); }
 
@@ -31,7 +37,8 @@ typing::Attributes types_attributes(const Attributes& l) {
     bool doc = (a->attr_name.txt == "ocaml.doc" || a->attr_name.txt == "ocaml.text") &&
                a->attr_name.loc.loc_start.pos_cnum == -1;
     // Docstrings's doc_loc / text_loc: one {txt; loc} record each
-    static const std::string_view doc_name = OCAML_LIT("ocaml.doc"), text_name = OCAML_LIT("ocaml.text");
+    static const std::string_view doc_name = ocaml_literal("parsing/docstrings.ml", "ocaml.doc"),
+                                  text_name = ocaml_literal("parsing/docstrings.ml", "ocaml.text");
     std::string_view name = !doc ? a->attr_name.txt : a->attr_name.txt == "ocaml.doc" ? doc_name : text_name;
     auto* ta = make<typing::Attribute>(
         typing::Attribute{name, a->attr_name.loc, ovalue_of_payload(a->attr_payload, doc), a->attr_loc, a});
@@ -70,7 +77,7 @@ struct Conv {
   // pos_fname string of their lexbuf (Location.init), which the .cmo's
   // Assert_failure / Match_failure literals share.
   mutable std::string_view zfname;
-  mutable std::vector<std::string_view> zdirfiles;
+  std::vector<std::string_view>& zdirfiles = g_zdirfiles;
   Position pos(const ast::Position& p) const {
     std::string_view f;
     if (p.cnum == -1) {
@@ -123,11 +130,24 @@ struct Conv {
   // "()", "[]", "::", "false", "true"; infix_operator's and BANG's fixed
   // tokens): string literals, one object each (ocamlopt merges a unit's
   // equal constants)
+  // parser.mly's array_function: `Ldot (Lident "Array" | "String", "get" |
+  // "set")`, the names its literals (a ghost ident: only the desugaring)
+  static Longident::t array_function(Longident::t l) {
+    if (l->kind != Longident::Kind::Ldot || l->l1->kind != Longident::Kind::Lident) return l;
+    std::string_view m = l->l1->s;
+    if (m != "Array" && m != "String") return l;
+    std::string_view f = l->s == "get" || l->s == "set" ? ocaml_literal("parsing/parser.mly", l->s) : l->s;
+    return Longident::ldot(Longident::lident(ocaml_literal("parsing/parser.mly", m)), l->l1_loc, f, l->s_loc);
+  }
   static std::string_view name(std::string_view s) {
     static const std::string_view lits[] = {"()", "[]", "::", "false", "true", "+", "+.", "+=", "-", "-.", "*",
                                             "%",  "=",  "<",  ">",     "or",   "||", "&",  "&&", ":=", "!"};
     for (std::string_view l : lits)
       if (s == l) return ocaml_literal("parsing/parser.mly", s);
+    // lexer.mll's keyword_table: the infix keywords' INFIXOP3 / INFIXOP4 text
+    static const std::string_view kws[] = {"lor", "lxor", "mod", "land", "lsl", "lsr", "asr", "!="};
+    for (std::string_view k : kws)
+      if (s == k) return ocaml_literal("parsing/lexer.mll", s);
     return s;
   }
   Longident::t lid(const ast::Longident& l) const {
@@ -182,6 +202,23 @@ struct Conv {
     p.str = structure(s);
     return p;
   }
+  // Docstrings.docs_attr / text_attr: the payload `Pstr_eval (Pexp_constant
+  // (Const.string ~loc body))`, every location of which is ds_loc, the one
+  // record (the item's pstr_loc here)
+  static void docstring_locations(const Payload& p) {
+    if (p.kind != Payload::Kind::PStr || p.str.size() != 1) return;
+    auto* item = p.str[0];
+    auto* ev = as<Pstr_eval>(item->pstr_desc);
+    if (!ev) return;
+    auto* e = const_cast<Expression*>(ev->exp);
+    auto* c = as<Pexp_constant>(e->pexp_desc);
+    if (!c || c->c.pconst_desc.kind != ConstantDesc::Kind::Pconst_string) return;
+    e->pexp_loc = item->pstr_loc;
+    auto* cm = const_cast<Pexp_constant*>(c);
+    cm->c.pconst_loc = item->pstr_loc;
+    cm->c.pconst_desc.str_loc = item->pstr_loc;
+    g_docstring_locs.try_emplace({item->pstr_loc.loc_start.pos_cnum, item->pstr_loc.loc_end.pos_cnum}, item->pstr_loc);
+  }
   Payload ext_payload(const ast::ExtPayload& e) const {
     Payload p{};
     if (e.typ) {
@@ -229,6 +266,7 @@ struct Conv {
     // docstrings.ml builds its ocaml.doc / ocaml.text attributes with a
     // Location.none name; the ast leaves that name location unset (zero).
     bool unset = a.name_loc.start.cnum == 0 && a.name_loc.end.cnum == 0;
+    if (unset) docstring_locations(p);
     // ... and its attr_loc is the docstring's, which is its payload item's.
     Location al = loc(a.loc);
     if (a.loc.start.cnum == 0 && a.loc.end.cnum == 0 && p.kind == Payload::Kind::PStr &&
@@ -236,7 +274,9 @@ struct Conv {
       al = p.str[0]->pstr_loc;
     --attr_payload_depth;
     const Attribute* r =
-        registered(make<Attribute>(StrLoc{zborrow(a.name), unset ? location::none() : loc(a.name_loc)}, p, al));
+        registered(make<Attribute>(StrLoc{unset ? ocaml_literal("parsing/docstrings.ml", a.name) : zborrow(a.name),
+                                          unset ? location::none() : loc(a.name_loc)},
+                                   p, al));
     ++attr_payload_depth;
     return r;
   }
@@ -247,11 +287,21 @@ struct Conv {
   // attribute spans the item; its name has its own location (a docstring's
   // ocaml.text has none: the parser leaves it unset)
   const Attribute* item_attribute(const std::string& name, const ast::Structure& payload, const Location& item_loc,
-                                  const ast::Location& name_loc) const {
+                                  const ast::Location& name_loc, Location* docstring_item_loc = nullptr) const {
     ++attr_payload_depth;
     Payload p = payload_str(payload);
     --attr_payload_depth;
     bool unset = name_loc.start.cnum == 0 && name_loc.end.cnum == 0;
+    if (unset && p.kind == Payload::Kind::PStr && !p.str.empty()) {
+      docstring_locations(p);
+      // Docstrings.text_attr: {attr_name = text_loc (a static {txt; loc =
+      // Location.none}); attr_loc = ds_loc}, the payload item's and (Sig.text
+      // / Str.text) the item's own location record
+      Location al = p.str[0]->pstr_loc;
+      if (docstring_item_loc) *docstring_item_loc = al;
+      return registered(
+          make<Attribute>(StrLoc{ocaml_literal("parsing/docstrings.ml", name), location::none()}, p, al));
+    }
     return registered(make<Attribute>(StrLoc{zborrow(name), unset ? gap_loc() : loc(name_loc)}, p, item_loc));
   }
   const Extension* extension(const ast::ExtName& name, const ast::ExtPayload& p) const {
@@ -427,7 +477,16 @@ struct Conv {
                                                 v.arg ? pattern(**v.arg) : nullptr});
           } else if constexpr (std::is_same_v<T, ast::Ppat_record>) {
             auto fs = map_slice<std::pair<LidLoc, const Pattern*>>(v.fields, [&](auto& f) {
-              return std::make_pair(lidloc(f.first), pattern(*f.second));
+              LidLoc id = lidloc(f.first);
+              const Pattern* p = pattern(*f.second);
+              // a pun (pat_of_label): the variable is Longident.last of the label
+              if (id.loc.loc_ghost) {
+                const Pattern* q = p;
+                if (auto* c = as<Ppat_constraint>(q->ppat_desc)) q = c->pat;
+                if (auto* var = as<Ppat_var>(q->ppat_desc); var && var->name.txt == id.txt->s)
+                  const_cast<Ppat_var*>(var)->name.txt = id.txt->s;
+              }
+              return std::make_pair(id, p);
             });
             d = make<Ppat_record>(Ppat_record{{K::Ppat_record}, fs, closed(v.closed)});
           } else if constexpr (std::is_same_v<T, ast::Ppat_array>) {
@@ -516,7 +575,9 @@ struct Conv {
         [&](auto& v) {
           using T = std::decay_t<decltype(v)>;
           if constexpr (std::is_same_v<T, ast::Pexp_ident>) {
-            d = make<Pexp_ident>(Pexp_ident{{K::Pexp_ident}, lidloc(v.id)});
+            LidLoc id = lidloc(v.id);
+            if (l.loc_ghost) id.txt = array_function(id.txt);
+            d = make<Pexp_ident>(Pexp_ident{{K::Pexp_ident}, id});
           } else if constexpr (std::is_same_v<T, ast::Pexp_constant>) {
             d = make<Pexp_constant>(Pexp_constant{{K::Pexp_constant}, constant(v.c)});
           } else if constexpr (std::is_same_v<T, ast::Pexp_let>) {
@@ -570,7 +631,17 @@ struct Conv {
                                                 v.arg ? expression(**v.arg) : nullptr});
           } else if constexpr (std::is_same_v<T, ast::Pexp_record>) {
             auto fs = map_slice<std::pair<LidLoc, const Expression*>>(v.fields, [&](auto& f) {
-              return std::make_pair(lidloc(f.first), expression(*f.second));
+              LidLoc id = lidloc(f.first);
+              const Expression* e = expression(*f.second);
+              // a pun (exp_of_longident): Lident (Longident.last label)
+              if (id.loc.loc_ghost) {
+                const Expression* x = e;
+                if (auto* c = as<Pexp_constraint>(x->pexp_desc)) x = c->exp;
+                if (auto* i = as<Pexp_ident>(x->pexp_desc);
+                    i && i->lid.txt->kind == Longident::Kind::Lident && i->lid.txt->s == id.txt->s)
+                  const_cast<Pexp_ident*>(i)->lid.txt = Longident::lident(id.txt->s);
+              }
+              return std::make_pair(id, e);
             });
             d = make<Pexp_record>(Pexp_record{{K::Pexp_record}, fs,
                                               v.base ? expression(**v.base) : nullptr});
@@ -1085,7 +1156,8 @@ struct Conv {
             });
             d = make<Psig_class_type>(Psig_class_type{{K::Psig_class_type}, ds});
           } else if constexpr (std::is_same_v<T, ast::Psig_attribute>) {
-            d = make<Psig_attribute>(Psig_attribute{{K::Psig_attribute}, item_attribute(v.name, v.payload, l, v.name_loc)});
+            d = make<Psig_attribute>(
+                Psig_attribute{{K::Psig_attribute}, item_attribute(v.name, v.payload, l, v.name_loc, &item_loc)});
           } else if constexpr (std::is_same_v<T, ast::Psig_extension>) {
             d = make<Psig_extension>(Psig_extension{{K::Psig_extension}, extension(v.name, v.payload),
                                                     attrs(v.attrs)});
@@ -1158,7 +1230,8 @@ struct Conv {
             d = make<Pstr_include>(Pstr_include{{K::Pstr_include},
                 make<IncludeDeclaration>(module_expr(v.expr), l, attrs(v.attrs))});
           } else if constexpr (std::is_same_v<T, ast::Pstr_attribute>) {
-            d = make<Pstr_attribute>(Pstr_attribute{{K::Pstr_attribute}, item_attribute(v.name, v.payload, l, v.name_loc)});
+            d = make<Pstr_attribute>(
+                Pstr_attribute{{K::Pstr_attribute}, item_attribute(v.name, v.payload, l, v.name_loc, &item_loc)});
           } else if constexpr (std::is_same_v<T, ast::Pstr_extension>) {
             d = make<Pstr_extension>(Pstr_extension{{K::Pstr_extension}, extension(v.name, v.payload),
                                                     attrs(v.attrs)});
@@ -1176,12 +1249,16 @@ struct Conv {
 
 Structure of_ast(const ast::Structure& s, std::string_view fname,
                  const std::vector<std::string>& dirfiles) {
+  g_docstring_locs.clear();
+  g_zdirfiles.clear();
   Conv c{zborrow(fname), dirfiles};
   return c.structure(s);
 }
 
 Signature of_ast_signature(const ast::Signature& s, std::string_view fname,
                            const std::vector<std::string>& dirfiles) {
+  g_docstring_locs.clear();
+  g_zdirfiles.clear();
   Conv c{zborrow(fname), dirfiles};
   return c.signature(s);
 }
@@ -1191,7 +1268,11 @@ std::vector<std::pair<std::string_view, Location>> comments_of_ast(const std::ve
                                                                    const std::vector<std::string>& dirfiles) {
   Conv c{zborrow(fname), dirfiles};
   std::vector<std::pair<std::string_view, Location>> out;
-  for (const ast::Comment& x : cs) out.emplace_back(zone().str(x.text), c.loc(x.loc));
+  for (const ast::Comment& x : cs) {
+    auto it = g_docstring_locs.find({x.loc.start.cnum, x.loc.end.cnum});
+    out.emplace_back(zone().str(x.text), it != g_docstring_locs.end() ? it->second : c.loc(x.loc));
+  }
+  g_docstring_locs.clear();
   return out;
 }
 

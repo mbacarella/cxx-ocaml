@@ -71,13 +71,18 @@ bool same_loc(const Location& a, const Location& b) {
   return pos_key(a.loc_start) == pos_key(b.loc_start) && pos_key(a.loc_end) == pos_key(b.loc_end) &&
          a.loc_ghost == b.loc_ghost;
 }
+V loc_block(const Location& l, V a, V b) {
+  V r = B(0, {a, b, boolean(l.loc_ghost)});
+  if (same_record(l)) const_cast<OValue*>(r)->loc_rec = l.obj;
+  return r;
+}
 V loc(const Location& l) {
-  if (!loc_memo) return B(0, {position(l.loc_start), position(l.loc_end), boolean(l.loc_ghost)});
+  if (!loc_memo) return loc_block(l, position(l.loc_start), position(l.loc_end));
   auto [it, fresh] = loc_memo->try_emplace({pos_key(l.loc_start), pos_key(l.loc_end), l.loc_ghost}, nullptr);
   if (fresh) {
     V a = position(l.loc_start);
     V b = position(l.loc_end);
-    it->second = B(0, {a, b, boolean(l.loc_ghost)});
+    it->second = loc_block(l, a, b);
   }
   return it->second;
 }
