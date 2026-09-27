@@ -31,6 +31,8 @@ ast::Structure parse_structure(std::string_view src);
 ast::Structure parse_structure(std::string_view src, std::vector<std::string>& directive_files);
 // Parse an interface (.mli signature). `src` must outlive the call.
 ast::Signature parse_signature(std::string_view src);
+// ... and the filenames named by its `# N "file"` directives (as above)
+ast::Signature parse_signature(std::string_view src, std::vector<std::string>& directive_files);
 
 namespace ast {
 // Lexer.comments () of the last parse (ast::Comment: text and location)

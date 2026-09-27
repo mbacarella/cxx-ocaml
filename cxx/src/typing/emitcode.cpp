@@ -9,10 +9,10 @@
 // structured constant's boxed integer one per constant, blocks otherwise
 // fresh.
 //
-// Deviations: Clflags.bytecode_compatible_32 (-compat-32) and
-// BUILD_PATH_PREFIX_MAP (Location.rewrite_absolute_path) are not ported;
-// to_memory / to_packed_file (the toplevel's, -pack's) are not ported.
+// Deviations: Clflags.bytecode_compatible_32 (-compat-32) and to_memory
+// (the toplevel's) are not ported.
 #include "cppcaml/typing/emitcode.hpp"
+#include "cppcaml/typing/location.hpp"
 
 #include <unistd.h>
 
@@ -123,7 +123,7 @@ std::string getcwd_() {
 
 std::string absolute_path(const std::string& s0) {
   std::string s = is_relative(s0) ? concat(getcwd_(), s0) : s0;
-  // rewrite_absolute_path: the identity without BUILD_PATH_PREFIX_MAP
+  s = location::rewrite_absolute_path(s);
   std::function<std::string(const std::string&)> aux = [&](const std::string& s) -> std::string {
     std::string base = basename(s);
     std::string dir = generic_dirname(s);
@@ -475,7 +475,7 @@ class Emitter {
     std::string path(ev->ev_loc.loc_start.pos_fname);
     std::string abspath = absolute_path(path);
     debug_dirs.insert(generic_dirname(abspath));
-    if (is_relative(path)) debug_dirs.insert(getcwd_());  // rewrite_absolute_path: identity
+    if (is_relative(path)) debug_dirs.insert(location::rewrite_absolute_path(getcwd_()));
     ev->ev_pos = out_position;
     events.push_back(ev);
   }
@@ -905,7 +905,9 @@ void to_file(std::FILE* outchan, std::string_view filename, std::string_view mod
     // Env.imports's strings: the first one Persistent_env.add_import saw for
     // each name (often a persistent ident's name, shared with a required
     // global); the unit's own name is the one Unit_info carries into cu_name
-    V n = name == modname ? cu_name : w.str(env::import_name(name));
+    // -- unless -cmi-file named the interface (Unit_info.Artifact.
+    // from_filename makes a fresh modname, which Env.read_signature added)
+    V n = name == modname && !clflags::cmi_file ? cu_name : w.str(env::import_name(name));
     imports.push_back(o::vblock(0, {n, crc ? w.some(w.fresh_str(*crc)) : w.none()}));
   }
   std::vector<V> prims;

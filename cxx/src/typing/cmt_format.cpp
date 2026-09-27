@@ -14,6 +14,7 @@
 // declarations does (Tast_iterator's order, into a Uid.Tbl whose bucket
 // layout comes from Hashtbl.hash, ported: caml_hash).
 #include "cppcaml/typing/cmt_format.hpp"
+#include "cppcaml/typing/location.hpp"
 
 #include <unistd.h>
 
@@ -2265,8 +2266,7 @@ class ShapeWriter {
   std::unordered_map<shape::t, V> memo_;
 };
 
-// Location.rewrite_absolute_path (no BUILD_PATH_PREFIX_MAP support: the path)
-std::string rewrite_absolute_path(const std::string& p) { return p; }
+using location::rewrite_absolute_path;
 
 std::string file_digest(const std::string& path) {
   std::ifstream in(path, std::ios::binary);

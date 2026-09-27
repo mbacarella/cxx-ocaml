@@ -3,12 +3,11 @@
 
 #include <unistd.h>
 
-#include <cstdlib>
-
-#include "cppcaml/typing/clflags.hpp"
-
 #include <algorithm>
 #include <cstdlib>
+#include <iostream>
+
+#include "cppcaml/typing/clflags.hpp"
 
 namespace cppcaml::typing::misc {
 
@@ -161,6 +160,35 @@ void print_see_manual(fd::Formatter& ppf, const std::vector<long>& section) {
 void print_manual_hint(fd::Formatter& ppf, const std::vector<long>& section) {
   fd::fprintf(ppf, "%t (%a):", [](fd::Formatter& f) { style::hint(f); },
               [&](fd::Formatter& f) { print_manual_section(f, section); });
+}
+
+void fatal_error(const std::string& msg) {
+  // Format.kfprintf ... Format.err_formatter ("@?>> Fatal error: " ^^ fmt ^^ "@.")
+  std::cout.flush();
+  std::cerr << ">> Fatal error: " << msg << std::endl;
+  throw FatalError{};
+}
+
+const build_path_prefix_map::Map* get_build_path_prefix_map() {
+  static bool init = false;
+  static std::optional<build_path_prefix_map::Map> map_cache;
+  if (!init) {
+    init = true;
+    if (const char* encoded_map = std::getenv("BUILD_PATH_PREFIX_MAP")) {
+      build_path_prefix_map::Result<build_path_prefix_map::Map> r = build_path_prefix_map::decode_map(encoded_map);
+      if (!r.ok) fatal_error("Invalid value for the environment variable BUILD_PATH_PREFIX_MAP: " + r.error);
+      map_cache = std::move(*r.ok);
+    }
+  }
+  return map_cache ? &*map_cache : nullptr;
+}
+
+std::vector<std::string> invert_build_path_prefix_map(const std::string& path) {
+  const build_path_prefix_map::Map* prefix_map = get_build_path_prefix_map();
+  if (!prefix_map) return {path};
+  std::vector<std::string> matches = build_path_prefix_map::invert_all(*prefix_map, path);
+  if (matches.empty()) return {path};
+  return matches;
 }
 
 }  // namespace cppcaml::typing::misc

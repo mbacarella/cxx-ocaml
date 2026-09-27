@@ -9,6 +9,7 @@
 #include <string_view>
 #include <vector>
 
+#include "cppcaml/typing/build_path_prefix_map.hpp"
 #include "cppcaml/typing/format_doc.hpp"
 
 namespace cppcaml::typing::misc {
@@ -67,5 +68,17 @@ const char* ordinal_suffix(long n);
 void print_manual_section(fd::Formatter& ppf, const std::vector<long>& section);
 void print_see_manual(fd::Formatter& ppf, const std::vector<long>& section);
 void print_manual_hint(fd::Formatter& ppf, const std::vector<long>& section);
+
+// exception Fatal_error: fatal_errorf prints ">> Fatal error: <msg>" on
+// stderr and raises it; nothing reports it, so it reaches the uncaught
+// exception handler ("Fatal error: exception Misc.Fatal_error", exit 2)
+struct FatalError {};
+[[noreturn]] void fatal_error(const std::string& msg);
+
+// get_build_path_prefix_map (): BUILD_PATH_PREFIX_MAP, decoded once (an
+// invalid value is a fatal error)
+const build_path_prefix_map::Map* get_build_path_prefix_map();
+// invert_build_path_prefix_map path
+std::vector<std::string> invert_build_path_prefix_map(const std::string& path);
 
 }  // namespace cppcaml::typing::misc

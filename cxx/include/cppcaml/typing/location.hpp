@@ -33,6 +33,10 @@ extern std::optional<std::string> input_source;
 Location in_file(std::string_view name);
 // get_pos_info pos = (pos_fname, pos_lnum, pos_cnum - pos_bol)
 std::tuple<std::string_view, long, long> get_pos_info(const Position& pos);
+// rewrite_absolute_path: BUILD_PATH_PREFIX_MAP's rewriting (the path
+// itself without it).  (rewrite_find_first_existing /
+// rewrite_find_all_existing_dirs serve the toplevel only: not ported.)
+std::string rewrite_absolute_path(const std::string& path);
 std::string absolute_path(const std::string& s);
 std::string show_filename(const std::string& file);
 

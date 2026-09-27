@@ -81,6 +81,7 @@ add_library(cppcaml_core
   src/typing/printtyp.cpp
   src/typing/printpat.cpp
   src/typing/misc.cpp
+  src/typing/build_path_prefix_map.cpp
   src/typing/location.cpp
   src/typing/errortrace_report.cpp
   src/typing/reporters.cpp

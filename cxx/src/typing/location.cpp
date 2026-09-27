@@ -52,6 +52,12 @@ std::string concat_(const std::string& dirname, const std::string& filename) {
 
 }  // namespace
 
+std::string rewrite_absolute_path(const std::string& path) {
+  const build_path_prefix_map::Map* map = misc::get_build_path_prefix_map();
+  if (!map) return path;
+  return build_path_prefix_map::rewrite(*map, path);
+}
+
 std::string absolute_path(const std::string& s0) {
   std::string s = s0;
   if (s.empty() || s[0] != '/') {
@@ -59,7 +65,7 @@ std::string absolute_path(const std::string& s0) {
     std::string cwd = ::getcwd(buf, sizeof buf) ? buf : "";
     s = concat_(cwd, s);
   }
-  // (rewrite_absolute_path: BUILD_PATH_PREFIX_MAP is not ported)
+  s = rewrite_absolute_path(s);
   std::function<std::string(const std::string&)> aux = [&](const std::string& s) -> std::string {
     std::string base = basename_(s);
     std::string dir = dirname_(s);

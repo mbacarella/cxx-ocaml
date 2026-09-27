@@ -1,11 +1,10 @@
 // Port of lambda/translprim.ml (TYPECHECKER.md stage 10).
 //
-// Deviations: Location.rewrite_absolute_path is the identity (the
-// BUILD_PATH_PREFIX_MAP rewriting is not ported); Config.with_frame_pointers
-// is read only in native code, where it is false; the error printers belong
-// to the error-report stage.
+// Deviations: Config.with_frame_pointers is read only in native code, where
+// it is false; the error printers belong to the error-report stage.
 
 #include "cppcaml/typing/translprim.hpp"
+#include "cppcaml/typing/location.hpp"
 
 #include <cstdio>
 #include <string>
@@ -726,18 +725,22 @@ lam_t lambda_of_loc(LocKind kind, const ScopedLocation& sloc) {
   Location loc = to_location(sloc);
   const Position& loc_start = loc.loc_start;
   // Location.get_pos_info
-  std::string file(loc_start.pos_fname);
+  std::string_view file = loc_start.pos_fname;
   long lnum = loc_start.pos_lnum;
   long cnum = loc_start.pos_cnum - loc_start.pos_bol;
-  // (not Filename.is_relative: Location.rewrite_absolute_path, the identity
-  // without BUILD_PATH_PREFIX_MAP)
+  // an absolute file: Location.rewrite_absolute_path (BUILD_PATH_PREFIX_MAP;
+  // the string itself when no prefix matches)
+  if (!file.empty() && file[0] == '/') {
+    std::string r = location::rewrite_absolute_path(std::string(file));
+    if (r != file) file = zstr(r);
+  }
   long enum_ = loc.loc_end.pos_cnum - loc_start.pos_cnum + cnum;
   switch (kind) {
     case LocKind::Loc_POS:
       return lconst(const_block(0, {const_immstring(file), const_int(lnum), const_int(cnum), const_int(enum_)}));
     case LocKind::Loc_FILE: return lconst(const_immstring(file));
     case LocKind::Loc_MODULE: {
-      std::string filename = filename_basename(file);
+      std::string filename = filename_basename(std::string(file));
       std::string name = env::get_current_unit_name();
       std::string module_name = name.empty() ? "//" + filename + "//" : name;
       return lconst(const_immstring(module_name));

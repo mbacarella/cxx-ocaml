@@ -55,7 +55,6 @@
 #include "cppcaml/typing/typecore.hpp"
 #include "cppcaml/typing/typemod.hpp"
 #include "cppcaml/typing/printlambda.hpp"
-#include "cppcaml/typing/location.hpp"
 #include "cppcaml/typing/reporters.hpp"
 #include "cppcaml/typing/out_type.hpp"
 #include "cppcaml/typing/printtyp.hpp"
@@ -275,6 +274,22 @@ using PortBody = std::function<void(cppcaml::typing::env::t, const cppcaml::typi
 // .cmi); Failed: an internal failure (reported); Rejected: a type error was
 // reported.
 enum class PortResult { Typed, Failed, Rejected };
+
+// Misc.Fatal_error: fatal_errorf has printed ">> Fatal error: ..."; nothing
+// reports the exception, so OCaml's uncaught exception handler prints it
+// (exit 2).  True when [ep] is one.
+static bool uncaught_fatal_error(std::exception_ptr ep) {
+  try {
+    std::rethrow_exception(ep);
+  } catch (const cppcaml::typing::misc::FatalError&) {
+    std::cout.flush();
+    std::cerr << "Fatal error: exception Misc.Fatal_error\n";
+    std::cerr.flush();
+    return true;
+  } catch (...) {
+  }
+  return false;
+}
 static PortResult port_typecheck(const std::string& in_path, const std::string& mod, const std::string& out, bool intf,
                                  const PortBody& body) {
   namespace ty = cppcaml::typing;
@@ -301,6 +316,7 @@ static PortResult port_typecheck(const std::string& in_path, const std::string& 
     // Location.report_exception Format.err_formatter exn (Maindriver: exit 2)
     ty::reporters::install();
     std::exception_ptr ep = std::current_exception();
+    if (uncaught_fatal_error(ep)) return PortResult::Failed;
     bool reported = false;
     try {
       reported = ty::location::report_exception(ty::location::err_formatter(), ep);
@@ -658,6 +674,7 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
     namespace ty = cppcaml::typing;
     ty::reporters::install();
     std::exception_ptr ep = std::current_exception();
+    if (uncaught_fatal_error(ep)) return 2;
     bool reported = false;
     try {
       reported = ty::location::report_exception(ty::location::err_formatter(), ep);
@@ -690,7 +707,8 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
   cppcaml::typing::location::input_source = src;
   try {
     init_lexer();
-    auto sig = cppcaml::parse_signature(src);
+    std::vector<std::string> dirfiles;  // the `# N "file"` directives' names
+    auto sig = cppcaml::parse_signature(src, dirfiles);
     emit_lex_warnings(in_path, src, static_cast<size_t>(-1));
     if (cf::should_stop_after(cf::Pass::Parsing)) return 0;
     PortResult port = port_typecheck(
@@ -700,8 +718,8 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
           std::string_view src_name = ty::zborrow(in_path);  // the source's name: one string object
           ty::cmt_format::set_source_name(src_name);
           std::string_view pos_name = cf::preprocessor ? ty::zstr(in_path) : src_name;  // as compile_ml's
-          ty::parsetree::Signature sg = ty::parsetree::of_ast_signature(sig, pos_name, {});
-          ty::cmt_format::set_comments(ty::parsetree::comments_of_ast(cppcaml::ast::last_comments(), pos_name, {}));
+          ty::parsetree::Signature sg = ty::parsetree::of_ast_signature(sig, pos_name, dirfiles);
+          ty::cmt_format::set_comments(ty::parsetree::comments_of_ast(cppcaml::ast::last_comments(), pos_name, dirfiles));
           // Compile_common.typecheck_intf
           const ty::typedtree::Signature* tsg = ty::typemod::type_interface(target, env0, sg);
           ty::StrMap<std::string_view> alerts = ty::builtin_attributes::alerts_of_sig(true, sg);
@@ -988,6 +1006,7 @@ static int run_main(int argc, char** argv) {
     return 2;
   } catch (...) {
     std::exception_ptr ep = std::current_exception();
+    if (uncaught_fatal_error(ep)) return 2;
     if (report_exception(ep)) return 2;
     try {
       std::rethrow_exception(ep);

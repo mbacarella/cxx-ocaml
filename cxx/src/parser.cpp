@@ -5136,6 +5136,19 @@ Signature parse_signature(std::string_view src) {
     throw;
   }
 }
+Signature parse_signature(std::string_view src, std::vector<std::string>& directive_files) {
+  Parser p(src);
+  Signature s;
+  try {
+    s = p.parse_signature();
+    p.warn_bad_docstrings();
+  } catch (ParseError& e) {
+    p.locate(e);
+    throw;
+  }
+  directive_files = p.directive_files();
+  return s;
+}
 Structure parse_structure(std::string_view src, std::vector<std::string>& directive_files) {
   Parser p(src);
   Structure s;
