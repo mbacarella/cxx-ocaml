@@ -14,6 +14,8 @@
 //  - OCaml `option` of a pointer is a nullable pointer; lists are Slices.
 #pragma once
 
+#include "cppcaml/typing/fn_ref.hpp"
+
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -517,7 +519,12 @@ const TypeDesc* tvar(OptStr name);
 // one object per unit (ocamlopt merges a unit's equal constants), which
 // every node made from it shares (the -g debug events marshal the sharing)
 const TypeDesc* tvar_none_literal(const char* unit);
-#define TVAR_NONE_LIT() ::cppcaml::typing::types::tvar_none_literal(__FILE__)
+#define TVAR_NONE_LIT()                                                                          \
+  ([]() -> const ::cppcaml::typing::TypeDesc* {                                                  \
+    static const ::cppcaml::typing::TypeDesc* const tvar_lit_ =                                  \
+        ::cppcaml::typing::types::tvar_none_literal(__FILE__);                                   \
+    return tvar_lit_;                                                                            \
+  }())
 const TypeDesc* tarrow(ArgLabel l, TypeExpr* a, TypeExpr* b, Commutable* c);
 const TypeDesc* ttuple(Slice<LabeledTy> l);
 const TypeDesc* tconstr(Path::t p, Slice<TypeExpr*> args, MemoRef* memo);
@@ -556,13 +563,13 @@ long get_id(TypeExpr* t);
 inline constexpr long scope_mask = (1L << 27) - 1;
 inline constexpr long marks_mask = ~scope_mask;
 struct TypeMark;
-void with_type_mark(const std::function<void(TypeMark&)>& f);
+void with_type_mark(FnRef<void(TypeMark&)> f);
 bool not_marked_node(TypeMark& mark, TypeExpr* t);
 bool try_mark_node(TypeMark& mark, TypeExpr* t);
 
 // kept abbreviations
 const PathArgs* get_abbrev(TypeExpr* t);  // (path, args) option
-void iter_abbrev(const std::function<void(Path::t, Slice<TypeExpr*>)>& f, TypeExpr* t);
+void iter_abbrev(FnRef<void(Path::t, Slice<TypeExpr*>)> f, TypeExpr* t);
 TypeExpr* ignore_abbrev(TypeExpr* t);
 void forget_abbrev(TypeExpr* t);
 
@@ -632,7 +639,7 @@ const RowField* rf_either(const RowField* use_ext_of, bool no_arg,
 const RowField* rf_either_of(TypeExpr* oty);
 bool eq_row_field_ext(const RowField* a, const RowField* b);
 bool changed_row_field_exts(const std::vector<const RowField*>& l,
-                            const std::function<void()>& f);
+                            FnRef<void()> f);
 
 // signature helpers
 Visibility item_visibility(const SignatureItem* it);
@@ -650,7 +657,7 @@ struct Snapshot {
   long old;
 };
 Snapshot snapshot();
-void backtrack(const std::function<void()>& cleanup, Snapshot s);
+void backtrack(FnRef<void()> cleanup, Snapshot s);
 void undo_first_change_after(Snapshot s);
 void undo_compress(Snapshot s);
 

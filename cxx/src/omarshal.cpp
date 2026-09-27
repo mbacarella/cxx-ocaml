@@ -12,9 +12,25 @@ namespace cppcaml::omarshal {
 // = 0x300 (shared_heap.h:75).  Writing 0 there is read back identically -- the
 // intern side masks the colour off -- but it is not the same BYTES, which is
 // what a linked executable is compared on.
-inline std::uint32_t hdr_color() { return 3u << 8; }
+constexpr std::uint32_t hdr_color() { return 3u << 8; }
 
-ValPtr vint(long long n) { auto v = std::make_shared<Value>(); v->k = Value::Int; v->i = n; return v; }
+// An int is an immediate, never shared: the small ones are allocated once.
+ValPtr vint(long long n) {
+  constexpr long long lo = -256, hi = 4096;
+  static const std::vector<ValPtr> small = [] {
+    std::vector<ValPtr> v;
+    v.reserve(hi - lo);
+    for (long long k = lo; k < hi; ++k) {
+      auto x = std::make_shared<Value>();
+      x->k = Value::Int;
+      x->i = k;
+      v.push_back(std::move(x));
+    }
+    return v;
+  }();
+  if (n >= lo && n < hi) return small[static_cast<std::size_t>(n - lo)];
+  auto v = std::make_shared<Value>(); v->k = Value::Int; v->i = n; return v;
+}
 ValPtr vstr(std::string s) { auto v = std::make_shared<Value>(); v->k = Value::Str; v->s = std::move(s); return v; }
 ValPtr vdbl(double d) { auto v = std::make_shared<Value>(); v->k = Value::Dbl; v->d = d; return v; }
 ValPtr vblock(int tag, std::vector<ValPtr> f) {
@@ -49,6 +65,7 @@ struct Marshaler {
   // field may point back at the block itself (cycles).
   std::unordered_map<const Value*, long long> seen;
   void byte(int b) { body.push_back((std::uint8_t)b); }
+  void bytes(const std::string& s) { body.insert(body.end(), s.begin(), s.end()); }
   void be32(std::uint32_t n) { byte(n >> 24); byte(n >> 16); byte(n >> 8); byte(n); }
   void emit_shared(long long dist) {  // back-distance to the target object
     if (dist < 0x100) { byte(0x4); byte((int)dist); }                  // CODE_SHARED8
@@ -68,7 +85,7 @@ struct Marshaler {
     if (len < 0x20) byte(0x20 | (int)len);
     else if (len < 256) { byte(0x9); byte((int)len); }
     else { byte(0xA); be32((std::uint32_t)len); }
-    for (char c : s) byte((std::uint8_t)c);
+    bytes(s);
     nobjs++; w64 += 1 + (len / 8 + 1); w32 += 1 + (len / 4 + 1);
   }
   void emit(const ValPtr& v) {
@@ -121,7 +138,7 @@ struct Marshaler {
         return;
       }
       case Value::Custom: {  // verbatim on-disk custom bytes (incl. its code byte)
-        for (char c : v->s) byte((std::uint8_t)c);
+        bytes(v->s);
         nobjs++;                                  // extern.c:858 (header + ops)
         w32 += 2 + (((v->custom_bytes32 >= 0 ? v->custom_bytes32 : v->custom_bytes) + 3) >> 2);
         w64 += 2 + ((v->custom_bytes + 7) >> 3);

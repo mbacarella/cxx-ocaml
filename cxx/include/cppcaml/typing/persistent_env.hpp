@@ -206,7 +206,7 @@ class PersistentEnv {
                                const std::function<PM(const PersistentSignature&)>& val_of_pers_sig,
                                bool check, std::string_view name) {
     if (name == "*predef*") throw load_path::NotFound{};
-    auto it = persistent_structures_.find(std::string(name));
+    auto it = persistent_structures_.find(name);
     if (it != persistent_structures_.end()) {
       if (!it->second.found) throw load_path::NotFound{};
       if (allow_hidden || it->second.ps.ps_visibility == load_path::Visibility::Visible)
@@ -241,7 +241,7 @@ class PersistentEnv {
   // `check`: record the weak dependency (the No_cmi_file warning check is
   // not ported yet).
   void check(std::string_view name) {
-    if (!persistent_structures_.count(std::string(name))) add_import(name);
+    if (!persistent_structures_.count(name)) add_import(name);
   }
 
   std::string crc_of_unit(const std::function<PM(const PersistentSignature&)>& f,
@@ -320,7 +320,7 @@ class PersistentEnv {
     return it->second;
   }
 
-  std::map<std::string, Info> persistent_structures_;
+  std::map<std::string, Info, std::less<>> persistent_structures_;
   std::map<std::string, std::string_view, std::less<>> imported_units_;
   std::set<std::string> imported_opaque_units_;
   Consistbl crc_units_;

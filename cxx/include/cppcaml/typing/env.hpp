@@ -335,6 +335,10 @@ struct TypeExpansion {
 };
 TypeExpansion find_type_expansion(Path::t p, t env);
 TypeExpansion find_type_expansion_opt(Path::t p, t env);
+// find_type_expansion(_opt) without the exception: false where they raise
+// Not_found for a type without a (visible) manifest; an unknown path still
+// raises NotFound (find_type).  `opt`: find_type_expansion_opt.
+bool find_type_expansion_into(Path::t p, t env, bool opt, TypeExpansion& out);
 const ModuleType* find_modtype_expansion(Path::t p, t env);
 const subst::lazy::Modtype* find_modtype_expansion_lazy(Path::t p, t env);
 

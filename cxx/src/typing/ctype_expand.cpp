@@ -14,12 +14,6 @@ static et::Elt<TypeExpr*> escape_elt_(const et::Escape<TypeExpr*>& e) {
   x.escape = e;
   return x;
 }
-[[noreturn]] static void raise_scope_escape_exn_(TypeExpr* ty) {
-  et::Escape<TypeExpr*> e;
-  e.kind = et::Escape<TypeExpr*>::Kind::Equation;
-  e.equation = ty;
-  throw Escape(e);
-}
 
 // If the environment has changed, memorized expansions might not be correct
 // anymore, and so we flush the cache.
@@ -36,10 +30,16 @@ static void check_abbrev_env(env::t env) {
   }
 }
 
+// How expand_abbrev_gen finds the expansion: Env.find_type_expansion,
+// Env.find_type_expansion_opt, or a given function.  The first two go
+// through Env.find_type_expansion_into, without the exception.
+enum class FteKind { Std, Opt, Fn };
+
 // Expand an abbreviation.  The expansion is memorized.  (See ctype.ml for
-// the four failure cases.)
-TypeExpr* expand_abbrev_gen(bool link, PrivateFlag kind, const FindTypeExpansion& find_type_expansion,
-                            env::t env, TypeExpr* ty) {
+// the four failure cases.)  nullptr where ctype.ml raises Cannot_expand
+// (C++ exceptions are too costly for this hot, often-failing path).
+static TypeExpr* expand_abbrev_gen_(bool link, PrivateFlag kind, FteKind fk, const FindTypeExpansion* fte,
+                                    env::t env, TypeExpr* ty) {
   auto* c = as<Tconstr>(get_desc(ty));
   if (!c) throw std::logic_error("Ctype.expand_abbrev_gen");
   Path::t path = c->path;
@@ -54,10 +54,13 @@ TypeExpr* expand_abbrev_gen(bool link, PrivateFlag kind, const FindTypeExpansion
   if (TypeExpr* ty2 = find_expans(kind, path, lookup_abbrev->contents)) {
     try {
       if (level != generic_level) update_level(env, level, ty2);
+      bool stale = false;
       if (!clflags::principal) update_scope(scope, ty2);
-      // In principal mode, force re-expansion if scope increased
-      else if (get_scope(ty2) < scope) raise_scope_escape_exn_(ty);
-      expansion = ty2;
+      // In principal mode, force re-expansion if scope increased (ctype.ml
+      // raises an Escape that the handler below catches at once)
+      else if (get_scope(ty2) < scope) stale = true;
+      if (stale) forget_abbrev_memo(lookup_abbrev, path);
+      else expansion = ty2;
     } catch (const Escape&) {
       // in case of Escape, discard the stale expansion and re-expand
       forget_abbrev_memo(lookup_abbrev, path);
@@ -69,14 +72,15 @@ TypeExpr* expand_abbrev_gen(bool link, PrivateFlag kind, const FindTypeExpansion
     env::TypeExpansion x;
     bool found = true;
     try {
-      x = find_type_expansion(path, env);
+      if (fk == FteKind::Fn) x = (*fte)(path, env);
+      else found = env::find_type_expansion_into(path, env, fk == FteKind::Opt, x);
     } catch (const env::NotFound&) {
       found = false;
     }
     if (!found) {
       // another way to expand is to normalize the path itself
       Path::t path2 = env::try_normalize_type_path(nullptr, env, path);
-      if (!path2) throw CannotExpand{};
+      if (!path2) return nullptr;
       ty2 = newty3(level, scope, tconstr(path2, args, abbrev));
     } else {
       long scope2 = std::max(x.expansion_scope, get_scope(ty));
@@ -101,9 +105,19 @@ TypeExpr* expand_abbrev_gen(bool link, PrivateFlag kind, const FindTypeExpansion
   return ty2;
 }
 
+TypeExpr* expand_abbrev_gen(bool link, PrivateFlag kind, const FindTypeExpansion& fte, env::t env,
+                            TypeExpr* ty) {
+  if (TypeExpr* r = expand_abbrev_gen_(link, kind, FteKind::Fn, &fte, env, ty)) return r;
+  throw CannotExpand{};
+}
+
 // Expand respecting privacy
+static TypeExpr* expand_abbrev_(bool link, env::t env, TypeExpr* ty) {
+  return expand_abbrev_gen_(link, PrivateFlag::Public, FteKind::Std, nullptr, env, ty);
+}
 TypeExpr* expand_abbrev(bool link, env::t env, TypeExpr* ty) {
-  return expand_abbrev_gen(link, PrivateFlag::Public, env::find_type_expansion, env, ty);
+  if (TypeExpr* r = expand_abbrev_(link, env, ty)) return r;
+  throw CannotExpand{};
 }
 
 // Expand once the head of a type
@@ -135,25 +149,34 @@ bool safe_abbrev(env::t env, TypeExpr* ty) {
 
 // Expand the head of a type once.  Raise CannotExpand if the type cannot be
 // expanded.  May raise Escape, if a recursion was hidden in the type.
+// (The *_nt functions return nullptr where ctype.ml raises Cannot_expand.)
+static TypeExpr* try_expand_once_nt(bool link, env::t env, TypeExpr* ty) {
+  if (get_desc(ty)->kind == DescKind::Tconstr) return expand_abbrev_(link, env, ty);
+  return nullptr;
+}
 TypeExpr* try_expand_once(bool link, env::t env, TypeExpr* ty) {
-  if (get_desc(ty)->kind == DescKind::Tconstr) return expand_abbrev(link, env, ty);
+  if (TypeExpr* r = try_expand_once_nt(link, env, ty)) return r;
   throw CannotExpand{};
 }
 
 // This one only raises CannotExpand
-static TypeExpr* try_expand_safe_(bool link, env::t env, TypeExpr* ty) {
+static TypeExpr* try_expand_safe_nt(bool link, env::t env, TypeExpr* ty) {
   Snapshot snap = btype::snapshot();
   try {
-    return try_expand_once(link, env, ty);
+    return try_expand_once_nt(link, env, ty);
   } catch (const Escape&) {
     btype::backtrack(snap);
     cleanup_abbrev_memo();
-    throw CannotExpand{};
+    return nullptr;
   }
 }
-TypeExpr* try_expand_safe(env::t env, TypeExpr* ty) { return try_expand_safe_(true, env, ty); }
+TypeExpr* try_expand_safe(env::t env, TypeExpr* ty) {
+  if (TypeExpr* r = try_expand_safe_nt(true, env, ty)) return r;
+  throw CannotExpand{};
+}
 TypeExpr* try_expand_safe_no_link(env::t env, TypeExpr* ty) {
-  return try_expand_safe_(false, env, ty);
+  if (TypeExpr* r = try_expand_safe_nt(false, env, ty)) return r;
+  throw CannotExpand{};
 }
 
 // Fully expand the head of a type.
@@ -169,13 +192,24 @@ TypeExpr* try_expand_head(const std::function<TypeExpr*(env::t, TypeExpr*)>& try
   }
 }
 
+// try_expand_head with a non-raising try_once; nullptr for Cannot_expand
+template <class F>
+static TypeExpr* try_expand_head_nt(F&& try_once, env::t env, TypeExpr* ty) {
+  TypeExpr* ty2 = try_once(env, ty);
+  if (!ty2) return nullptr;
+  for (;;) {
+    TypeExpr* ty3 = try_once(env, ty2);
+    if (!ty3) return ty2;
+    ty2 = ty3;
+  }
+}
+
 // Unsafe full expansion, may raise [Unify [Escape _]].
 TypeExpr* expand_head_unif(env::t env, TypeExpr* ty) {
   try {
-    return try_expand_head([](env::t e, TypeExpr* t) { return try_expand_once(true, e, t); }, env,
-                           ty);
-  } catch (const CannotExpand&) {
-    return ty;
+    TypeExpr* r =
+        try_expand_head_nt([](env::t e, TypeExpr* t) { return try_expand_once_nt(true, e, t); }, env, ty);
+    return r ? r : ty;
   } catch (const Escape& e) {
     raise_for(TraceExn::Unify, escape_elt_(e.esc));
   }
@@ -183,18 +217,14 @@ TypeExpr* expand_head_unif(env::t env, TypeExpr* ty) {
 
 // Safe version of expand_head, never fails
 TypeExpr* expand_head(env::t env, TypeExpr* ty) {
-  try {
-    return try_expand_head(try_expand_safe, env, ty);
-  } catch (const CannotExpand&) {
-    return ty;
-  }
+  TypeExpr* r =
+      try_expand_head_nt([](env::t e, TypeExpr* t) { return try_expand_safe_nt(true, e, t); }, env, ty);
+  return r ? r : ty;
 }
 TypeExpr* expand_head_nolink(env::t env, TypeExpr* ty) {
-  try {
-    return try_expand_head(try_expand_safe_no_link, env, ty);
-  } catch (const CannotExpand&) {
-    return ty;
-  }
+  TypeExpr* r =
+      try_expand_head_nt([](env::t e, TypeExpr* t) { return try_expand_safe_nt(false, e, t); }, env, ty);
+  return r ? r : ty;
 }
 
 // Expand until we find a non-abstract type declaration
@@ -239,8 +269,12 @@ TypedeclExtraction extract_concrete_typedecl(env::t env, TypeExpr* ty) {
 
 // expand_head_opt: the compiler's own expand_head for type-based
 // optimisations (sees private abbreviations' manifests)
+static TypeExpr* expand_abbrev_opt_(env::t env, TypeExpr* ty) {
+  return expand_abbrev_gen_(false, PrivateFlag::Private, FteKind::Opt, nullptr, env, ty);
+}
 TypeExpr* expand_abbrev_opt(env::t env, TypeExpr* ty) {
-  return expand_abbrev_gen(false, PrivateFlag::Private, env::find_type_expansion_opt, env, ty);
+  if (TypeExpr* r = expand_abbrev_opt_(env, ty)) return r;
+  throw CannotExpand{};
 }
 
 bool safe_abbrev_opt(env::t env, TypeExpr* ty) {
@@ -255,8 +289,12 @@ bool safe_abbrev_opt(env::t env, TypeExpr* ty) {
   return false;
 }
 
+static TypeExpr* try_expand_once_opt_nt(env::t env, TypeExpr* ty) {
+  if (get_desc(ty)->kind == DescKind::Tconstr) return expand_abbrev_opt_(env, ty);
+  return nullptr;
+}
 TypeExpr* try_expand_once_opt(env::t env, TypeExpr* ty) {
-  if (get_desc(ty)->kind == DescKind::Tconstr) return expand_abbrev_opt(env, ty);
+  if (TypeExpr* r = try_expand_once_opt_nt(env, ty)) return r;
   throw CannotExpand{};
 }
 
@@ -266,22 +304,23 @@ TypeExpr* try_expand_once_gen_nolink(const FindTypeExpansion& fte, env::t env, T
   throw CannotExpand{};
 }
 
-TypeExpr* try_expand_safe_opt(env::t env, TypeExpr* ty) {
+static TypeExpr* try_expand_safe_opt_nt(env::t env, TypeExpr* ty) {
   Snapshot snap = btype::snapshot();
   try {
-    return try_expand_once_opt(env, ty);
+    return try_expand_once_opt_nt(env, ty);
   } catch (const Escape&) {
     btype::backtrack(snap);
-    throw CannotExpand{};
+    return nullptr;
   }
+}
+TypeExpr* try_expand_safe_opt(env::t env, TypeExpr* ty) {
+  if (TypeExpr* r = try_expand_safe_opt_nt(env, ty)) return r;
+  throw CannotExpand{};
 }
 
 TypeExpr* expand_head_opt(env::t env, TypeExpr* ty) {
-  try {
-    return try_expand_head(try_expand_safe_opt, env, ty);
-  } catch (const CannotExpand&) {
-    return ty;
-  }
+  TypeExpr* r = try_expand_head_nt(try_expand_safe_opt_nt, env, ty);
+  return r ? r : ty;
 }
 
 // Recursively expand the head of a type.  Also expand #-types.  Error
@@ -296,11 +335,9 @@ TypeExpr* full_expand(bool may_forget_scope, env::t env, TypeExpr* ty) {
       ty = with_level(get_level(ty), [&]() -> TypeExpr* {
         // The same as expand_head, except in the failing case we return the
         // *original* type, not [duplicate_type ty].
-        try {
-          return try_expand_head(try_expand_safe, env, duplicate_type(ty));
-        } catch (const CannotExpand&) {
-          return ty;
-        }
+        TypeExpr* r = try_expand_head_nt(
+            [](env::t e, TypeExpr* t) { return try_expand_safe_nt(true, e, t); }, env, duplicate_type(ty));
+        return r ? r : ty;
       });
     }
   } else {
@@ -359,7 +396,24 @@ bool is_contractive(env::t env, Path::t p) {
 }
 
 // ---- occur check ---------------------------------------------------------------------
-static void occur_rec(env::t env, TypeMark& visited, bool allow_recursive, const TypeSet& parents,
+// occur_rec's `parents` (a TypeSet of the ancestors in ctype.ml): only ever
+// extended by one node for the recursive calls, so a chain on the stack --
+// membership by the representative's identity, as TypeSet's compare by id.
+namespace {
+struct Parents {
+  TypeExpr* ty;  // repr'd when added (TypeSet.add)
+  const Parents* next;
+  bool mem(TypeExpr* t) const {
+    TypeExpr* r = repr(t);
+    for (const Parents* p = this; p; p = p->next)
+      if (p->ty == r) return true;
+    return false;
+  }
+};
+bool parents_mem(const Parents* p, TypeExpr* t) { return p && p->mem(t); }
+}  // namespace
+
+static void occur_rec(env::t env, TypeMark& visited, bool allow_recursive, const Parents* parents,
                       TypeExpr* ty0, TypeExpr* ty) {
   if (!not_marked_node(visited, ty)) return;
   if (eq_type(ty, ty0)) throw Occur{};
@@ -367,11 +421,10 @@ static void occur_rec(env::t env, TypeMark& visited, bool allow_recursive, const
   if (auto* c = as<Tconstr>(d)) {
     if (!(allow_recursive && is_contractive(env, c->path))) {
       try {
-        if (parents.mem(ty)) throw Occur{};
-        TypeSet parents2 = parents;
-        parents2.add(ty);
+        if (parents_mem(parents, ty)) throw Occur{};
+        Parents parents2{repr(ty), parents};
         iter_type_expr(
-            [&](TypeExpr* t) { occur_rec(env, visited, allow_recursive, parents2, ty0, t); }, ty);
+            [&](TypeExpr* t) { occur_rec(env, visited, allow_recursive, &parents2, ty0, t); }, ty);
       } catch (const Occur&) {
         TypeExpr* ty2;
         try {
@@ -383,11 +436,10 @@ static void occur_rec(env::t env, TypeMark& visited, bool allow_recursive, const
       }
     }
   } else if (d->kind == DescKind::Tobject || d->kind == DescKind::Tvariant) {
-  } else if (!(allow_recursive || parents.mem(ty))) {
-    TypeSet parents2 = parents;
-    parents2.add(ty);
+  } else if (!(allow_recursive || parents_mem(parents, ty))) {
+    Parents parents2{repr(ty), parents};
     iter_type_expr(
-        [&](TypeExpr* t) { occur_rec(env, visited, allow_recursive, parents2, ty0, t); }, ty);
+        [&](TypeExpr* t) { occur_rec(env, visited, allow_recursive, &parents2, ty0, t); }, ty);
   }
   try_mark_node(visited, ty);
 }
@@ -407,7 +459,7 @@ void occur(const Uenv& uenv, TypeExpr* ty0, TypeExpr* ty) {
       type_changed = false;
       if (!eq_type(ty0, ty))
         with_type_mark(
-            [&](TypeMark& mark) { occur_rec(env, mark, allow_recursive, TypeSet{}, ty0, ty); });
+            [&](TypeMark& mark) { occur_rec(env, mark, allow_recursive, nullptr, ty0, ty); });
     } while (type_changed);
     if (old) type_changed = true;
   } catch (...) {

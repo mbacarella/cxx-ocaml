@@ -104,11 +104,7 @@ static A idtbl_find_same(Ident::t id, const IdTbl<A, B>& tbl) {
 template <class A, class B, class W>
 static std::pair<Path::t, A> idtbl_find_name(W&& wrap, bool mark, std::string_view name,
                                              const IdTbl<A, B>& tbl) {
-  try {
-    auto [id, desc] = tbl.current.find_name(name);
-    return {Path::pident(id), *desc};
-  } catch (const typename ident::Tbl<A>::NotFound&) {
-  }
+  if (auto [id, desc] = tbl.current.find_name_opt(name); desc) return {Path::pident(id), *desc};
   if (!tbl.layer) throw NotFound{};
   const auto* L = tbl.layer;
   if (L->is_open) {
@@ -1040,22 +1036,29 @@ const lz::ModuleDecl* find_module_lazy(Path::t p, t env) {
 }
 
 // ---- type / modtype expansion ---------------------------------------------------------
-TypeExpansion find_type_expansion(Path::t p, t env) {
+bool find_type_expansion_into(Path::t p, t env, bool opt, TypeExpansion& out) {
   const TypeDeclaration* decl = find_type(p, env);
   if (decl->type_manifest &&
-      (decl->type_private == PrivateFlag::Public || !type_kind_is_abstract(decl) ||
-       has_constr_row(decl->type_manifest)))
-    return {decl->type_params, decl->type_manifest, decl->type_expansion_scope};
+      (opt || decl->type_private == PrivateFlag::Public || !type_kind_is_abstract(decl) ||
+       has_constr_row(decl->type_manifest))) {
+    out = {decl->type_params, decl->type_manifest, decl->type_expansion_scope};
+    return true;
+  }
   // The manifest type of Private abstract data types without private row
   // are still considered unknown to the type system.
-  throw NotFound{};
+  return false;
+}
+
+TypeExpansion find_type_expansion(Path::t p, t env) {
+  TypeExpansion x;
+  if (!find_type_expansion_into(p, env, false, x)) throw NotFound{};
+  return x;
 }
 
 TypeExpansion find_type_expansion_opt(Path::t p, t env) {
-  const TypeDeclaration* decl = find_type(p, env);
-  if (decl->type_manifest)
-    return {decl->type_params, decl->type_manifest, decl->type_expansion_scope};
-  throw NotFound{};
+  TypeExpansion x;
+  if (!find_type_expansion_into(p, env, true, x)) throw NotFound{};
+  return x;
 }
 
 const lz::Modtype* find_modtype_expansion_lazy(Path::t p, t env) {

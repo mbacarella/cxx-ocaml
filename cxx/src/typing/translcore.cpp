@@ -219,6 +219,13 @@ const StructuredConstant* extract_constant(lam_t l) {
   if (auto* c = as<L::Lconst>(l)) return c->c;
   throw NotConstant{};
 }
+// whether List.map extract_constant ll would not raise Not_constant (it has
+// no other effect: the translations below test first instead of catching)
+static bool all_constant(const std::vector<lam_t>& ll) {
+  for (lam_t l : ll)
+    if (!as<L::Lconst>(l)) return false;
+  return true;
+}
 
 std::string_view extract_float(const StructuredConstant* c) {
   if (c->kind == StructuredConstant::Kind::Const_float) return c->s;
@@ -462,13 +469,12 @@ lam_t transl_exp0(bool in_new_scope, scopes sc, const tt::Expression* e) {
       std::vector<const tt::Expression*> el;
       for (const tt::LabeledExpression& le : x->el) el.push_back(le.exp);
       auto [ll, shape] = transl_list_with_shape(sc, slice(el));
-      try {
+      if (all_constant(ll)) {
         std::vector<const StructuredConstant*> cl;
         for (lam_t l : ll) cl.push_back(extract_constant(l));
         return L::lconst(const_block(0, cl));
-      } catch (const NotConstant&) {
-        return L::lprim(pmakeblock(0, MutableFlag::Immutable, &shape), slice(ll), of_location(sc, e->exp_loc));
       }
+      return L::lprim(pmakeblock(0, MutableFlag::Immutable, &shape), slice(ll), of_location(sc, e->exp_loc));
     }
     case EK::Texp_construct: {
       auto* x = static_cast<const tt::Texp_construct*>(d);
@@ -484,14 +490,13 @@ lam_t transl_exp0(bool in_new_scope, scopes sc, const tt::Expression* e) {
           if (ll.size() != 1) fatal_error("Translcore: unboxed constructor");
           return ll[0];
         case ConstructorTag::Kind::Cstr_block:
-          try {
+          if (all_constant(ll)) {
             std::vector<const StructuredConstant*> cl;
             for (lam_t l : ll) cl.push_back(extract_constant(l));
             return L::lconst(const_block(cstr->cstr_tag.n, cl));
-          } catch (const NotConstant&) {
-            return L::lprim(pmakeblock(cstr->cstr_tag.n, MutableFlag::Immutable, &shape), slice(ll),
-                            of_location(sc, e->exp_loc));
           }
+          return L::lprim(pmakeblock(cstr->cstr_tag.n, MutableFlag::Immutable, &shape), slice(ll),
+                          of_location(sc, e->exp_loc));
         case ConstructorTag::Kind::Cstr_extension: {
           lam_t lam = L::transl_extension_path(of_location(sc, e->exp_loc), e->exp_env, cstr->cstr_tag.ext_path);
           if (cstr->cstr_tag.ext_constant) return lam;
@@ -513,12 +518,9 @@ lam_t transl_exp0(bool in_new_scope, scopes sc, const tt::Expression* e) {
       long tag = btype::hash_variant(x->label);
       if (!x->arg) return L::lconst(L::const_int(tag));
       lam_t lam = transl_exp_(sc, x->arg);
-      try {
-        return L::lconst(const_block(0, {L::const_int(tag), extract_constant(lam)}));
-      } catch (const NotConstant&) {
-        return L::lprim(pmakeblock(0, MutableFlag::Immutable, nullptr), slice({L::lconst(L::const_int(tag)), lam}),
-                        of_location(sc, e->exp_loc));
-      }
+      if (as<L::Lconst>(lam)) return L::lconst(const_block(0, {L::const_int(tag), extract_constant(lam)}));
+      return L::lprim(pmakeblock(0, MutableFlag::Immutable, nullptr), slice({L::lconst(L::const_int(tag)), lam}),
+                      of_location(sc, e->exp_loc));
     }
     case EK::Texp_record: {
       auto* x = static_cast<const tt::Texp_record*>(d);
@@ -1048,8 +1050,9 @@ lam_t transl_record(scopes sc, const Location& loc, env::t env, Slice<tt::Record
     for (const tt::RecordField& f : fields)
       if (f.label->lbl_mut == MutableFlag::Mutable) mut = MutableFlag::Mutable;
     lam_t lam;
-    try {
-      if (mut == MutableFlag::Mutable) throw NotConstant{};
+    // translcore.ml raises Not_constant for a mutable record, a field that
+    // is not a constant, an extension record (tested first here)
+    if (mut != MutableFlag::Mutable && repres.kind != RK::Record_extension && all_constant(ll)) {
       std::vector<const StructuredConstant*> cl;
       for (lam_t l : ll) cl.push_back(extract_constant(l));
       switch (repres.kind) {
@@ -1068,9 +1071,9 @@ lam_t transl_record(scopes sc, const Location& loc, env::t env, Slice<tt::Record
           lam = L::lconst(c);
           break;
         }
-        case RK::Record_extension: throw NotConstant{};
+        case RK::Record_extension: break;
       }
-    } catch (const NotConstant&) {
+    } else {
       ScopedLocation sloc = of_location(sc, loc);
       switch (repres.kind) {
         case RK::Record_regular: lam = L::lprim(pmakeblock(0, mut, &shape), slice(ll), sloc); break;

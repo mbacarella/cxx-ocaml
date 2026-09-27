@@ -126,33 +126,36 @@ class Tbl {
 
   // find_same: raises NotFound
   const A& find_same(Ident::t id) const {
+    if (const A* x = find_same_opt(id)) return *x;
+    throw NotFound{};
+  }
+  const A* find_same_opt(Ident::t id) const {
     std::string_view n = name(id);
     for (const Node* x = t_; x;) {
       int c = n.compare(x->d->name);
       if (c == 0) {
         for (const TblData<A>* k = x->d; k; k = k->previous)
-          if (same(id, k->ident)) return get_data(k);
-        throw NotFound{};
+          if (same(id, k->ident)) return &get_data(k);
+        return nullptr;
       }
       x = c < 0 ? x->l : x->r;
     }
-    throw NotFound{};
-  }
-  const A* find_same_opt(Ident::t id) const {
-    try {
-      return &find_same(id);
-    } catch (const NotFound&) {
-      return nullptr;
-    }
+    return nullptr;
   }
   // find_name: the most recent binding of the name
   std::pair<Ident::t, const A*> find_name(std::string_view n) const {
+    auto r = find_name_opt(n);
+    if (!r.second) throw NotFound{};
+    return r;
+  }
+  // find_name, {nullptr, nullptr} when the name is unbound
+  std::pair<Ident::t, const A*> find_name_opt(std::string_view n) const {
     for (const Node* x = t_; x;) {
       int c = n.compare(x->d->name);
       if (c == 0) return {x->d->ident, &get_data(x->d)};
       x = c < 0 ? x->l : x->r;
     }
-    throw NotFound{};
+    return {nullptr, nullptr};
   }
   // find_all: every binding of the name, most recent first
   std::vector<std::pair<Ident::t, const A*>> find_all(std::string_view n) const {

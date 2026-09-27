@@ -143,7 +143,12 @@ std::string_view zborrow(std::string_view s);
 // reaches marshaled output (ident names in the -g debug events), its sharing
 // is Marshal's.
 std::string_view ocaml_literal(const char* unit, std::string_view s);
-#define OCAML_LIT(s) ::cppcaml::typing::ocaml_literal(__FILE__, s)
+// (each use site looks its literal up once: the interned object is permanent)
+#define OCAML_LIT(s)                                                                  \
+  ([]() -> std::string_view {                                                         \
+    static const std::string_view ocaml_lit_ = ::cppcaml::typing::ocaml_literal(__FILE__, s); \
+    return ocaml_lit_;                                                                \
+  }())
 
 // ---------------------------------------------------------------------------
 // A persistent balanced map: stdlib map.ml's AVL, ported.  `Cmp` is a

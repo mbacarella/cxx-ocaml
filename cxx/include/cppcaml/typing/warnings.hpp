@@ -6,6 +6,7 @@
 #pragma once
 
 #include <array>
+#include <memory>
 #include <optional>
 #include <set>
 #include <vector>
@@ -32,11 +33,14 @@ struct AlertSet {
   bool pos = false;
 };
 
+// warnings.ml's state is an immutable record that backup / restore pass
+// around; the alert sets are shared here, and replaced (never mutated) by
+// set_alert, so that saving a state (warning scopes, delayed checks) is cheap.
 struct State {
   std::array<bool, last_warning_number + 1> active{};
   std::array<bool, last_warning_number + 1> error{};
-  AlertSet alerts;
-  AlertSet alert_errors;
+  std::shared_ptr<const AlertSet> alerts;
+  std::shared_ptr<const AlertSet> alert_errors;
 };
 
 // Arg.Bad of the option parsers
