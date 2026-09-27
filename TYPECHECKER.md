@@ -33,8 +33,10 @@ and Emitcode from the typed tree, as `driver/compile.ml` sequences them.
 The .cmo is byte-identical to ocamlc.opt's on the compiler's sources
 (145/145), the stdlib built as its Makefile builds it (72/72, the `-pp`
 units included) and the stamp probes (6525/6527: the two .cmi leftovers
-below reach the .cmo through the crc); without `-g` so far -- the debug
-events section is being brought up.
+below reach the .cmo through the crc).  With `-g` (the debug events
+section): compiler sources 145/145, packs 24/24, stdlib 68/72, stamp
+probes 6436/6527 (the rest: class/object/record typing's object identity,
+e.g. `set_object_name`'s `rv :: params` sharing its tail).
 
 Accept/reject parity with ocamlc (`-stop-after typing`, same flags):
 
@@ -314,5 +316,10 @@ from the port.  The two must be identical on every .cmi in the tree
    c++ocamlc or by ocamlc.opt, give byte-identical packed .cmo and .cmi
    and identical program output (24/24); a .cmi's filenames are one value
    per string object, as the members' signatures come from several .cmi.
-   Left: the `-g` debug events (live type ids, summary sharing, the
-   `"??"` defname), which the `-g` packs wait on too.
+   The `-g` debug events expose the typing environments' type ids and
+   object sharing: Env.initial built once at module init, a unit's equal
+   string literals one object (`OCAML_LIT`), Env's use_label /
+   use_constructor callbacks and Parmatch's fragile check (they allocate
+   types), and a `match (a, b, c)` scrutinee's components evaluating left
+   to right (only a tuple value is right to left).  Left: the `-g` tail
+   above.
