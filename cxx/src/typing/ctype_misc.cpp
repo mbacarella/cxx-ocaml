@@ -1362,7 +1362,7 @@ const TypeDeclaration* nondep_type_decl(env::t env, const std::vector<Ident::t>&
                   decl->type_kind);
   } catch (const NondepCannotErase&) {
     if (!is_covariant) throw;
-    tk = make<TypeKind>(TypeKind::Kind::Type_abstract, TypeOrigin{});
+    tk = TYPE_ABSTRACT_LIT(Definition);
   }
   TypeExpr* tm = nullptr;
   PrivateFlag priv = decl->type_private;

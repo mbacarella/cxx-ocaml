@@ -583,6 +583,17 @@ static RowFieldCell* row_field_ext(const RowField* fi) {
 const RowField* rf_present(TypeExpr* oty) {
   return make<RowField>(RowField::Kind::RFpresent, oty);
 }
+const TypeKind* type_abstract_literal(const char* unit, TypeOrigin::Kind origin) {
+  static std::map<std::pair<std::string, int>, const TypeKind*> lits;
+  auto key = std::make_pair(ocaml_unit_of_file(unit), static_cast<int>(origin));
+  auto it = lits.find(key);
+  if (it != lits.end()) return it->second;
+  ZoneScope perm(permanent_zone());
+  auto* k = make<TypeKind>();
+  k->kind = TypeKind::Kind::Type_abstract;
+  k->origin.kind = origin;
+  return lits[key] = k;
+}
 const RowField* rf_present_none_literal(const char* unit) {
   static std::map<std::string, const RowField*> lits;
   std::string u = ocaml_unit_of_file(unit);

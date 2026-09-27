@@ -1347,12 +1347,8 @@ TypeExpr* approx_description(const pt::ClassType* ct) {
 }
 
 // ---- class declarations -----------------------------------------------------------------------
-const TypeKind* abstract_definition_kind() {
-  auto* k = make<TypeKind>();
-  k->kind = TypeKind::Kind::Type_abstract;
-  k->origin = TypeOrigin{};
-  return k;
-}
+// typeclass.ml's `Type_abstract Definition` literal
+const TypeKind* abstract_definition_kind() { return TYPE_ABSTRACT_LIT(Definition); }
 Slice<Separability> default_separability(long arity) {
   // Types.Separability.default_signature (Config.flat_float_array)
   return slice(std::vector<Separability>(static_cast<std::size_t>(arity), Separability::Deepsep));
@@ -1553,12 +1549,12 @@ env::t class_infos_(bool define_class, const KindFn<S, T>& kind, const Pending<S
   }
   // Class and class type temporary definitions
   Slice<variance::t> cty_variance = slice(variance::unknown_signature(false, static_cast<long>(params.size())));
-  Path::t obj_path = Path::pident(p.obj_id);
+  // each `Path.Pident obj_id` of typeclass.ml is its own block
   TypeExpr* cty_new = cl->pci_virt == VirtualFlag::Virtual ? nullptr : p.constr_type;
-  auto* cltydef0 = make<ClassTypeDeclaration>(slice(params), class_body(typ), obj_path, p.cl_td, cty_variance,
+  auto* cltydef0 = make<ClassTypeDeclaration>(slice(params), class_body(typ), Path::pident(p.obj_id), p.cl_td, cty_variance,
                                               cl->pci_loc, pt::types_attributes(cl->pci_attributes),
                                               p.dummy_class->cty_uid);
-  auto* clty0 = make<ClassDeclaration>(slice(params), typ, obj_path, cty_new, cty_variance, cl->pci_loc,
+  auto* clty0 = make<ClassDeclaration>(slice(params), typ, Path::pident(p.obj_id), cty_new, cty_variance, cl->pci_loc,
                                        pt::types_attributes(cl->pci_attributes), p.dummy_class->cty_uid);
   p.dummy_class->cty_type = typ;
   if (define_class) env = env::add_class(p.id, clty0, env);
@@ -1569,7 +1565,7 @@ env::t class_infos_(bool define_class, const KindFn<S, T>& kind, const Pending<S
   // Final definitions
   auto [params2, typ2] = ctype::instance_class(slice(params), typ);
   TypeExpr* cty_new2 = cl->pci_virt == VirtualFlag::Virtual ? nullptr : ctype::instance(p.constr_type);
-  auto* clty = make<ClassDeclaration>(slice(params2), typ2, obj_path, cty_new2, cty_variance, cl->pci_loc,
+  auto* clty = make<ClassDeclaration>(slice(params2), typ2, Path::pident(p.obj_id), cty_new2, cty_variance, cl->pci_loc,
                                       pt::types_attributes(cl->pci_attributes), p.dummy_class->cty_uid);
   long oarity = static_cast<long>(p.obj_params.size());
   auto* obj_abbr = make<TypeDeclaration>(slice(p.obj_params), oarity, abstract_definition_kind(), PrivateFlag::Public,
@@ -1577,11 +1573,11 @@ env::t class_infos_(bool define_class, const KindFn<S, T>& kind, const Pending<S
                                          default_separability(oarity), false, lowest_level, cl->pci_loc, Attributes{},
                                          TypeImmediacy::Unknown, false, p.dummy_class->cty_uid);
   auto [cl_params, cl_ty] = ctype::instance_parameterized_type(slice(params), self_type(typ));
-  ctype::set_object_name(obj_path, slice(cl_params), cl_ty);
+  ctype::set_object_name(Path::pident(p.obj_id), slice(cl_params), cl_ty);
   auto* cl_abbr = make<TypeDeclaration>(*p.cl_td);
   cl_abbr->type_params = slice(cl_params);
   cl_abbr->type_manifest = cl_ty;
-  auto* cltydef = make<ClassTypeDeclaration>(slice(params2), class_body(typ2), obj_path, cl_abbr, cty_variance,
+  auto* cltydef = make<ClassTypeDeclaration>(slice(params2), class_body(typ2), Path::pident(p.obj_id), cl_abbr, cty_variance,
                                              cl->pci_loc, pt::types_attributes(cl->pci_attributes),
                                              p.dummy_class->cty_uid);
   // List.rev !coercion_locs (the head of the OCaml list is the vector's front)

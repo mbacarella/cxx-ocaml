@@ -341,10 +341,11 @@ static const tt::TTypeDeclaration* transl_declaration(env::t env, const pt::Type
   }
   tt::TTypeKind tkind{};
   auto* kind = make<TypeKind>();
+  const TypeKind* abstract_kind = nullptr;  // typedecl.ml's `Type_abstract Definition` literal
   switch (sk.kind) {
     case PK::Ptype_abstract:
       tkind.kind = tt::TTypeKind::Kind::Ttype_abstract;
-      kind->kind = TypeKind::Kind::Type_abstract;
+      abstract_kind = TYPE_ABSTRACT_LIT(Definition);
       break;
     case PK::Ptype_external:
       tkind.kind = tt::TTypeKind::Kind::Ttype_external;
@@ -426,7 +427,7 @@ static const tt::TTypeDeclaration* transl_declaration(env::t env, const pt::Type
   auto* decl = make<TypeDeclaration>();
   decl->type_params = slice(params);
   decl->type_arity = arity;
-  decl->type_kind = kind;
+  decl->type_kind = abstract_kind ? abstract_kind : kind;
   decl->type_private = sdecl->ptype_private;
   decl->type_manifest = man;
   decl->type_variance = slice(variance::unknown_signature(false, arity));

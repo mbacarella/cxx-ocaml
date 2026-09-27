@@ -183,9 +183,7 @@ static const TypeDeclaration* abstractify_type(const TypeDeclaration* ty) {
   std::vector<TypeExpr*> params;
   for (std::size_t k = 0; k < ty->type_params.size(); ++k) params.push_back(btype::newgenvar());
   d->type_params = slice(params);
-  auto* kind = make<TypeKind>();
-  kind->origin = TypeOrigin{TypeOrigin::Kind::Rec_check_regularity};
-  d->type_kind = kind;
+  d->type_kind = TYPE_ABSTRACT_LIT(Rec_check_regularity);
   d->type_manifest = nullptr;
   d->type_variance = slice(variance::unknown_signature(false, arity));
   d->type_separability =
@@ -690,7 +688,7 @@ TypeResult merge_type(bool destructive, env::t env, const Location& loc, Signatu
       auto* decl_row = make<TypeDeclaration>();
       decl_row->type_params = slice(params);
       decl_row->type_arity = arity;
-      decl_row->type_kind = make<TypeKind>();
+      decl_row->type_kind = TYPE_ABSTRACT_LIT(Definition);
       decl_row->type_private = PrivateFlag::Private;
       decl_row->type_manifest = nullptr;
       decl_row->type_variance = slice(vars);

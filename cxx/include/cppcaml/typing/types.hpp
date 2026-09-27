@@ -615,6 +615,12 @@ const RowField* rf_present(TypeExpr* oty);
 // ocamlc.opt) inlines rf_present, and `RFpresent None` becomes a static
 // structured constant -- one per unit, shared by every row field built so
 const RowField* rf_present_none_literal(const char* unit);
+// `Type_abstract <constant origin>` written in an OCaml unit: a static
+// structured constant, one per (unit, origin) -- shared by every
+// declaration built from it
+const TypeKind* type_abstract_literal(const char* unit, TypeOrigin::Kind origin);
+#define TYPE_ABSTRACT_LIT(origin) \
+  ::cppcaml::typing::types::type_abstract_literal(__FILE__, ::cppcaml::typing::TypeOrigin::Kind::origin)
 #define RF_PRESENT_NONE_LIT() ::cppcaml::typing::types::rf_present_none_literal(__FILE__)
 const RowField* rf_absent();
 const RowField* rf_either(const RowField* use_ext_of, bool no_arg,

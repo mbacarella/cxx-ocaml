@@ -527,7 +527,7 @@ const tt::TTypeDeclaration* transl_with_constraint(Ident::t id, Path::t fixed_ro
       type_kind = sig_decl->type_kind;
       type_unboxed_default = sig_decl->type_unboxed_default;
     } else {
-      type_kind = make<TypeKind>();
+      type_kind = TYPE_ABSTRACT_LIT(Definition);
       type_unboxed_default = false;
     }
     auto* new_sig_decl = make<TypeDeclaration>();
@@ -587,7 +587,7 @@ const tt::TTypeDeclaration* transl_with_constraint(Ident::t id, Path::t fixed_ro
 const TypeDeclaration* transl_package_constraint(const Location& loc, env::t env, TypeExpr* ty) {
   auto* d = make<TypeDeclaration>();
   d->type_arity = 0;
-  d->type_kind = make<TypeKind>();
+  d->type_kind = TYPE_ABSTRACT_LIT(Definition);
   d->type_private = PrivateFlag::Public;
   d->type_manifest = ty;
   d->type_is_newtype = false;
