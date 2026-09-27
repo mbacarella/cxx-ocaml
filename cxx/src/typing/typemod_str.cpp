@@ -8,6 +8,7 @@
 // stands for Env's: idents are unique).
 #include <unordered_map>
 
+#include "cppcaml/typing/includemod_errorprinter.hpp"
 #include "cppcaml/typing/typedecl_unboxed.hpp"
 #include "typecore_app.hpp"
 #include "typemod_internal.hpp"
@@ -326,10 +327,13 @@ static ctype::PackageSubtypeResult package_subtype(env::t env, const Package* pa
   try {
     const tt::ModuleCoercion* c = includemod::modtypes(location::none(), env, true, mty1, mty2);
     if (c->kind == tt::ModuleCoercion::Kind::Tcoerce_none) return {true, {}};
-    // (the message is Includemod_errorprinter's, not ported)
-    return {false, et::FirstClassModule{et::FirstClassModule::Kind::Package_coercion}};
-  } catch (const includemod::Error&) {
-    return {false, et::FirstClassModule{et::FirstClassModule::Kind::Package_inclusion}};
+    et::FirstClassModule f{et::FirstClassModule::Kind::Package_coercion};
+    f.doc = includemod_errorprinter::coercion_in_package_subtype(env, mty1, c);
+    return {false, f};
+  } catch (const includemod::Error& e) {
+    et::FirstClassModule f{et::FirstClassModule::Kind::Package_inclusion};
+    f.doc = format_doc::doc_printf("%a", [&](format_doc::Formatter& ff) { includemod_errorprinter::err_msgs(ff, e.expl); });
+    return {false, f};
   }
 }
 

@@ -52,6 +52,11 @@ CmiInfos read_cmi(const std::string& filename);
 // substituted for saving (Env.save_signature does it).
 std::string output_cmi(const std::string& filename, const CmiInfos& cmi);
 
+// the size of Marshal.to_buffer's output for (got, expected) (the Includemod
+// error printer's is_big: the -error-size threshold)
+std::size_t marshaled_size(const ModuleType* a, const ModuleType* b);
+std::size_t marshaled_size(const ModtypeDeclaration* a, const ModtypeDeclaration* b);
+
 // The debugging events of a .cmo (Emitcode.to_file with -g): the marshaled
 // `debug_event list`, whose typing values (types, Env summaries, Subst.t)
 // go through the .cmi Writer.  (Not in cmi_format.mli.)

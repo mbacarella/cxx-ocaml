@@ -73,10 +73,10 @@ void format(format::Formatter& ppf, const Doc& doc) {
           if (!known_style_tag(t)) ppf.print_as(0, "</" + t + ">");
         }
         break;
-      case Element::K::Open_tbox:
-      case Element::K::Tab_break:
-      case Element::K::Set_tab:
-      case Element::K::Close_tbox: break;  // tabulation boxes: not ported
+      case Element::K::Open_tbox: ppf.open_tbox(); break;
+      case Element::K::Tab_break: ppf.print_tbreak(e.a, e.b); break;
+      case Element::K::Set_tab: ppf.set_tab(); break;
+      case Element::K::Close_tbox: ppf.close_tbox(); break;
       case Element::K::Simple_break: ppf.print_break(e.a, e.b); break;
       case Element::K::Break:
         ppf.print_custom_break(e.text, e.a, e.fits_after, e.breaks_before, e.b, e.breaks_after);
@@ -195,6 +195,17 @@ void pp_print_newline(Formatter& ppf) {
   e.newline = true;
   ppf.add(std::move(e));
 }
+void pp_open_tbox(Formatter& ppf) { ppf.add(el(Element::K::Open_tbox)); }
+void pp_close_tbox(Formatter& ppf) { ppf.add(el(Element::K::Close_tbox)); }
+void pp_set_tab(Formatter& ppf) { ppf.add(el(Element::K::Set_tab)); }
+void pp_print_tbreak(Formatter& ppf, long width, long offset) {
+  Element e = el(Element::K::Tab_break);
+  e.a = width;
+  e.b = offset;
+  ppf.add(std::move(e));
+}
+void pp_print_tab(Formatter& ppf) { pp_print_tbreak(ppf, 0, 0); }
+
 void pp_print_if_newline(Formatter& ppf) { ppf.add(el(Element::K::If_newline)); }
 void pp_doc(Formatter& ppf, const Doc& doc) {
   ppf.doc.els.insert(ppf.doc.els.end(), doc.els.begin(), doc.els.end());

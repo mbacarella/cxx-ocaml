@@ -89,6 +89,11 @@ void pp_print_flush(Formatter& ppf);
 void pp_force_newline(Formatter& ppf);
 void pp_print_newline(Formatter& ppf);
 void pp_print_if_newline(Formatter& ppf);
+void pp_open_tbox(Formatter& ppf);
+void pp_close_tbox(Formatter& ppf);
+void pp_set_tab(Formatter& ppf);
+void pp_print_tbreak(Formatter& ppf, long width, long offset);
+void pp_print_tab(Formatter& ppf);
 void pp_doc(Formatter& ppf, const Doc& doc);
 void deprecated_printer(Formatter& ppf, std::function<void(format::Formatter&)> pr);
 

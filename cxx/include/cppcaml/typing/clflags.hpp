@@ -37,5 +37,6 @@ inline bool unique_ids = true;            // -dno-unique-ids
 inline bool annotations = false;          // -annot
 inline bool afl_instrument = false;       // -afl-instrument (native)
 inline long match_context_rows = 32;      // -match-context-rows
+inline long error_size = 500;              // -error-size
 inline bool safer_matching = false;       // -safer-matching
 }  // namespace cppcaml::typing::clflags

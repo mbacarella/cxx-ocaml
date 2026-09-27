@@ -87,6 +87,9 @@ add_library(cppcaml_core
   src/typing/includecore_report.cpp
   src/typing/typedecl_report.cpp
   src/typing/includeclass_report.cpp
+  src/typing/signature_matching.cpp
+  src/typing/includemod_errorprinter.cpp
+  src/typing/typemod_report.cpp
   src/typing/simplif.cpp
   src/typing/tmc.cpp
   src/typing/translobj.cpp

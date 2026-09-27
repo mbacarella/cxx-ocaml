@@ -1739,6 +1739,22 @@ std::vector<std::uint8_t> marshal_debug_events(const std::vector<const instruct:
   return o::marshal(o::vlist(evs));
 }
 
+std::size_t marshaled_size(const ModuleType* a, const ModuleType* b) {
+  Writer w;
+  w.set_current_unit(env::get_current_unit_name());
+  // (got, expected): a tuple, fields evaluated right to left
+  o::ValPtr vb = w.module_type(b);
+  o::ValPtr va = w.module_type(a);
+  return o::marshal(o::vblock(0, {va, vb})).size();
+}
+std::size_t marshaled_size(const ModtypeDeclaration* a, const ModtypeDeclaration* b) {
+  Writer w;
+  w.set_current_unit(env::get_current_unit_name());
+  o::ValPtr vb = w.modtype_decl(b);
+  o::ValPtr va = w.modtype_decl(a);
+  return o::marshal(o::vblock(0, {va, vb})).size();
+}
+
 std::string output_cmi(const std::string& filename, const CmiInfos& cmi) {
   // (the provided signature must have been substituted for saving)
   Writer w;

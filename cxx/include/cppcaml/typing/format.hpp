@@ -5,8 +5,7 @@
 // text.  A Formatter accumulates its output into a string (the engine's
 // out_string / out_newline / out_spaces / out_indent all append to it).
 //
-// Not ported: tabulation boxes, semantic tags, and the ellipsis/max_boxes
-// setters (max_boxes stays max_int, as ocamlc never changes it).
+// Not ported: semantic tags and the ellipsis/max_boxes setters (max_boxes stays max_int, as ocamlc never changes it).
 #pragma once
 
 #include <cstdint>
@@ -59,6 +58,12 @@ class Formatter {
   void print_if_newline();
   void print_newline();
   void print_flush();
+  // tabulation boxes
+  void open_tbox();
+  void close_tbox();
+  void print_tbreak(long width, long offset);
+  void print_tab() { print_tbreak(0, 0); }
+  void set_tab();
   void set_margin(long n);
   long get_margin() const { return margin_; }
   void set_max_indent(long n);
@@ -66,7 +71,9 @@ class Formatter {
   void set_min_space_left(long n);
 
  private:
-  enum class Tok : std::uint8_t { Pp_text, Pp_break, Pp_begin, Pp_end, Pp_newline, Pp_if_newline };
+  enum class Tok : std::uint8_t {
+    Pp_text, Pp_break, Pp_begin, Pp_end, Pp_newline, Pp_if_newline, Pp_tbreak, Pp_stab, Pp_tbegin, Pp_tend
+  };
   struct QueueElem {
     long size;  // Size.t: known when >= 0
     Tok token;
@@ -77,6 +84,8 @@ class Formatter {
     long fw = 0, bo = 0;
     long indent = 0;  // Pp_begin
     BoxType box = BoxType::Pp_box;
+    std::shared_ptr<std::vector<long>> tabs;  // Pp_tbegin: the tabulation box
+    long tw = 0, toff = 0;                    // Pp_tbreak (width, offset)
   };
   struct ScanElem {
     long left_total;
@@ -118,6 +127,7 @@ class Formatter {
   std::vector<std::unique_ptr<QueueElem>> pool_;  // owns every queue element
   std::vector<ScanElem> scan_stack_;
   std::vector<FormatElem> format_stack_;
+  std::vector<std::shared_ptr<std::vector<long>>> tbox_stack_;
   long margin_;
   long min_space_left_;
   long max_indent_;

@@ -427,16 +427,19 @@ void pp_footnote(format::Formatter& ppf, const Report& report) {
 void print_report(format::Formatter& ppf, const Report& report) {
   // separate_new_message: not the toplevel, num_loc_lines unused
   if (report.kind == ReportKind::Report_error) {
-    // "@[<v>%a%a%a: %a@[%a@]%a%a%a@]@." (the tabulation box prints nothing)
+    // "@[<v>%a%a%a: %a@[%a@]%a%a%a@]@."
     ppf.open_vbox(0);
+    ppf.open_tbox();
     pp_loc(ppf, report, report.main.loc);  // pp_main_loc
     pp_report_kind(ppf, report);
     ppf.print_string(": ");
+    ppf.set_tab();
     ppf.open_box(0);
     pp_txt(ppf, report.main.txt);
     ppf.close_box();
     pp_submsgs(ppf, report);
     pp_footnote(ppf, report);
+    ppf.close_tbox();
     ppf.close_box();
     ppf.print_newline();
   } else {

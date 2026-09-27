@@ -467,6 +467,8 @@ Report report_error(const Location& loc, const typedecl::Error& err) {
 
 }  // namespace
 
+Report typedecl_report_error(const Location& loc, const typedecl::Error& err) { return report_error(loc, err); }
+
 void register_typedecl() {
   location::register_error_of_exn([](std::exception_ptr ep) -> std::optional<Report> {
     try {

@@ -7,10 +7,14 @@
 #include <optional>
 
 #include "cppcaml/typing/location.hpp"
+#include "cppcaml/typing/typedecl.hpp"
 
 namespace cppcaml::typing::reporters {
 
 void install();
+
+// Typedecl.report_error ~loc err (Typemod's Badly_formed_signature reuses it)
+location::Report typedecl_report_error(const Location& loc, const typedecl::Error& err);
 
 // per module (called by install)
 void register_env();

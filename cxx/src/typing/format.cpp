@@ -202,6 +202,42 @@ void Formatter::format_pp_token(long size, QueueElem* e) {
     case Tok::Pp_if_newline:
       if (current_indent_ != margin_ - space_left_) skip_token();
       return;
+    case Tok::Pp_tbegin: tbox_stack_.push_back(e->tabs); return;
+    case Tok::Pp_tend:
+      if (!tbox_stack_.empty()) tbox_stack_.pop_back();
+      return;
+    case Tok::Pp_stab: {
+      if (tbox_stack_.empty()) return;  // No open tabulation box.
+      std::vector<long>& tabs = *tbox_stack_.back();
+      long n = margin_ - space_left_;
+      // add_tab n: insert before the first larger element
+      auto it = tabs.begin();
+      while (it != tabs.end() && !(n < *it)) ++it;
+      tabs.insert(it, n);
+      return;
+    }
+    case Tok::Pp_tbreak: {
+      long insertion_point = margin_ - space_left_;
+      if (tbox_stack_.empty()) return;  // No open tabulation box.
+      const std::vector<long>& tabs = *tbox_stack_.back();
+      long tab;
+      if (tabs.empty()) {
+        tab = insertion_point;
+      } else {
+        tab = tabs.front();
+        for (long h : tabs)
+          if (h >= insertion_point) {
+            tab = h;
+            break;
+          }
+      }
+      long offset = tab - insertion_point;
+      if (offset >= 0)
+        break_same_line("", offset + e->tw, "");
+      else
+        break_new_line("", tab + e->toff, "", margin_);
+      return;
+    }
     case Tok::Pp_break: {
       if (format_stack_.empty()) return;  // No open box.
       FormatElem top = format_stack_.back();
@@ -294,6 +330,7 @@ void Formatter::set_size(bool break_hint) {
   }
   switch (top.queue_elem->token) {
     case Tok::Pp_break:
+    case Tok::Pp_tbreak:
       if (break_hint) {
         top.queue_elem->size = right_total_ + size;
         scan_stack_.pop_back();
@@ -362,6 +399,7 @@ void Formatter::rinit() {
   pool_.clear();
   initialize_scan_stack();
   format_stack_.clear();
+  tbox_stack_.clear();
   current_indent_ = 0;
   curr_depth_ = 0;
   space_left_ = margin_;
@@ -416,6 +454,38 @@ void Formatter::print_custom_break(std::string_view fits_before, long fits_width
 }
 
 void Formatter::print_break(long width, long offset) { print_custom_break("", width, "", "", offset, ""); }
+
+// Tabulation boxes.
+void Formatter::open_tbox() {
+  curr_depth_ = curr_depth_ + 1;
+  if (curr_depth_ < max_boxes_) {
+    QueueElem* e = new_elem(0, Tok::Pp_tbegin, 0);
+    e->tabs = std::make_shared<std::vector<long>>();
+    enqueue_advance(e);
+  }
+}
+
+void Formatter::close_tbox() {
+  if (curr_depth_ > 1) {
+    if (curr_depth_ < max_boxes_) {
+      enqueue_advance(new_elem(0, Tok::Pp_tend, 0));
+      curr_depth_ = curr_depth_ - 1;
+    }
+  }
+}
+
+void Formatter::print_tbreak(long width, long offset) {
+  if (curr_depth_ < max_boxes_) {
+    QueueElem* e = new_elem(-right_total_, Tok::Pp_tbreak, width);
+    e->tw = width;
+    e->toff = offset;
+    scan_push(true, e);
+  }
+}
+
+void Formatter::set_tab() {
+  if (curr_depth_ < max_boxes_) enqueue_advance(new_elem(0, Tok::Pp_stab, 0));
+}
 
 // To set the margin of pretty-printer.
 static long pp_limit(long n) { return n < pp_infinity ? n : pp_infinity - 1; }
