@@ -296,10 +296,14 @@ from the port.  The two must be identical on every .cmi in the tree
    / `-i-variance`.  `intf_parity.sh` (-i stdout + exit code vs
    ocamlc.opt): stamp probes 6531/6531, compiler sources 296/296, stdlib
    144/144, testsuite 858/858 (+2 false accepts = warnings-as-errors).
-   Not ported: -short-paths' shortest-path search (`Clflags.real_paths`
-   = false throws), Warning 63's report (Ident_conflicts collects, the
-   explanation needs `Location.Doc.loc`).  Printpat is untested until
-   Parmatch's warnings print.
+   `-short-paths` (ported later: Out_type's one-slot short-paths cache,
+   normalize_type_path / path_size / is_unambiguous / get_best_path, the
+   snapshot in wrap_env, `hide` in with_hidden_items; Env's iter_types /
+   run_iter_cont / used_persistent / find_shadowed_types): `-i` stamp
+   probes 6531/6531 (1648 of them print differently under
+   -short-paths), compiler sources 296/296, testsuite 784/784; errors
+   304/304 and the testsuite's rejections as without it; warnings (`-w
+   +a`) 6531 + 66.
    9b **done (2026-09-26): the error reports.**  `Location`'s reporting
    (`location.hpp`: `Report` / `Msg`, `errorf`, `error_of_printer`,
    `print_report` with the source excerpt -- highlight_quote,
@@ -327,8 +331,12 @@ from the port.  The two must be identical on every .cmi in the tree
    in full (`STOP=`), 1066 SAME / 7 DIFF / 1 FACCEPT (779 accepted by
    both): the 7 = 3 warning or alert lines (9c), 3 syntax errors menhir
    detects elsewhere (generated-parse-errors, a singleton labeled tuple
-   type, arrow_ambiguity), conjunctive_types (ocamlc runs past the
-   timeout, c++ocamlc overflows the stack);
+   type, arrow_ambiguity), conjunctive_types (an unbounded
+   update_level_abbrev recursion in ocamlc too: ocamlc.opt reaches
+   "Fatal error: exception Stack overflow" when its fiber stack hits
+   OCAMLRUNPARAM's l, 1 GiB by default, which takes minutes and passes
+   the harness timeout; c++ocamlc, which runs on a 1 GiB stack with a
+   guard, prints the same in a second);
    the FACCEPT is a warning-as-error.
    Left: warnings and alerts (9c); syntax errors where menhir's LALR
    automaton detects the error elsewhere than the recursive-descent
@@ -368,7 +376,9 @@ from the port.  The two must be identical on every .cmi in the tree
    compiler sources (the Makefile's flags, and `-w +a`) 0 DIFF;
    `error_probes/` 179/179 both ways; testsuite/tests (1940 .ml/.mli)
    4 DIFF both ways, none a warning: the 3 syntax errors above and
-   conjunctive_types (timeout / stack overflow).
+   conjunctive_types (ocamlc.opt's timeout, see above).  `module M := P`
+   and `module type S := mty` carry their attributes and docstrings
+   (they were dropped).
    `stdlib_cmo_parity.sh` with W= (the Makefile's flags, `-w +a`):
    72/72 on the .cmo and on stderr.  `error_parity.sh` now runs with the
    default warnings (W=, `-w -a` still the default).

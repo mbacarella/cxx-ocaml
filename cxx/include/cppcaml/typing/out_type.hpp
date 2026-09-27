@@ -29,6 +29,9 @@ std::string_view namespace_to_string(Namespace n);
 // the printing environment
 env::t printing_env();
 void set_printing_env(env::t env);
+// Forget the short-paths cache (its key is an environment of the unit
+// being compiled; the driver resets it with the unit's other state)
+void reset_short_paths_cache();
 // wrap_printing_env ~error env f
 void wrap_printing_env(bool error, env::t env, const std::function<void()>& f);
 

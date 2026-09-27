@@ -56,6 +56,7 @@
 #include "cppcaml/typing/printlambda.hpp"
 #include "cppcaml/typing/location.hpp"
 #include "cppcaml/typing/reporters.hpp"
+#include "cppcaml/typing/out_type.hpp"
 #include "cppcaml/typing/printtyp.hpp"
 #include "cppcaml/typing/bytegen.hpp"
 #include "cppcaml/typing/bytepackager.hpp"
@@ -229,6 +230,7 @@ static void set_typing_flag(const std::string& a) {
   else if (a == "-keep-docs") cf::keep_docs = true;
   else if (a == "-no-keep-docs") cf::keep_docs = false;
   else if (a == "-opaque") cf::opaque = true;
+  else if (a == "-short-paths") cf::real_paths = false;
   else if (a == "-absname") cf::absname = true;
   else if (a == "-no-absname") cf::absname = false;
 }
@@ -340,6 +342,7 @@ static cppcaml::typing::env::t initial_env() {
   ty::types::reset();
   ty::ctype::reset();
   ty::parsetree::reset_types_attributes();
+  ty::out_type::reset_short_paths_cache();
   ty::Location cmdline = ty::location::none();
   cmdline.loc_start.pos_fname = cmdline.loc_end.pos_fname = "command line";
   return ty::typemod::initial_env(

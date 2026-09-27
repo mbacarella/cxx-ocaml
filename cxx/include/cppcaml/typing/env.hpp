@@ -1,13 +1,12 @@
 // Port of typing/env.ml (TYPECHECKER.md): typing environments.
 //
 // Deviations, each marked at its site in env.cpp:
-//  - no shapes (Shape.t only feeds .cmt / project-index output);
-//  - save_signature and the short-path iterators (iter_env, run_iter_cont)
-//    come with the cmi-writing and printing stages.
+//  - no shapes (Shape.t only feeds .cmt / project-index output).
 #pragma once
 
 #include <functional>
 #include <map>
+#include <set>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -546,6 +545,15 @@ std::optional<long> find_modtype_index(Ident::t id, t env);
 std::optional<long> find_class_index(Ident::t id, t env);
 std::optional<long> find_cltype_index(Ident::t id, t env);
 bool same_types(t env1, t env2);
+// Iterating on an environment, for Out_type's short paths: iter_types f env
+// returns the first level (Env.iter_cont = unit -> unit); running a level
+// (run_iter_cont) returns the next level's continuations, with the module
+// path each explores.  f p1 (p2, decl)
+using IterCont = std::function<void()>;
+IterCont iter_types(const std::function<void(Path::t, Path::t, const TypeDeclaration*)>& f, t env);
+std::vector<std::pair<Path::t, IterCont>> run_iter_cont(const std::vector<IterCont>& l);
+std::set<std::string> used_persistent();
+std::vector<Path::t> find_shadowed_types(Path::t path, t env);
 bool same_type_declarations(t env1, t env2);
 std::function<t(t)> make_copy_of_types(t env0);
 t with_pairs(Slice<std::pair<ident::Unscoped*, ident::Unscoped*>> id_pairs, t env);

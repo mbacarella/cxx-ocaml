@@ -1137,6 +1137,163 @@ bool same_types(t e1, t e2) {
          e1->modules.layer == e2->modules.layer;
 }
 
+// ---- iterating on an environment (ignoring the body of functors and not yet
+// evaluated structures): the short-paths search of Out_type ----------------
+
+// iter_env_cont: the continuations the current level's iteration queued, as
+// (path, cont), consed (run_iter_cont reverses them)
+static std::vector<std::pair<Path::t, IterCont>> g_iter_env_cont;
+
+static bool scrape_alias_for_visit(t env, const lz::Modtype* mty) {
+  for (;;) {
+    if (mty->kind != lz::Modtype::Kind::MtyL_alias) return true;
+    Path::t path = mty->path;
+    if (path->kind == Path::Kind::Pident && ident::persistent(path->id) &&
+        !g_persistent_env.looked_up(std::string(ident::name(path->id))))
+      return false;
+    // PR#6600: find_module may raise Not_found
+    try {
+      mty = find_module_lazy(path, env)->mdl_type;
+    } catch (const NotFound&) {
+      return false;
+    }
+  }
+}
+
+// IdTbl.iter wrap f tbl
+template <class A, class B, class W>
+static void idtbl_iter(W&& wrap, const std::function<void(Ident::t, Path::t, const A&)>& f,
+                       const IdTbl<A, B>& tbl) {
+  tbl.current.iter([&](Ident::t id, const A& desc) { f(id, Path::pident(id), desc); });
+  if (!tbl.layer) return;
+  const auto* L = tbl.layer;
+  if (L->is_open) {
+    L->components.iter([&](std::string_view s, const B& x) {
+      long root_scope = path::scope(L->root);
+      f(Ident::create_scoped(static_cast<int>(root_scope), s), Path::pdot(L->root, s), wrap(x));
+    });
+    idtbl_iter(wrap, f, L->next);
+    return;
+  }
+  idtbl_iter<A, B>(wrap,
+                   std::function<void(Ident::t, Path::t, const A&)>(
+                       [&](Ident::t id, Path::t p, const A& desc) { f(id, p, L->f(desc)); }),
+                   L->next);
+}
+
+using TypeIterFn = std::function<void(Path::t, Path::t, const TypeDeclaration*)>;
+
+// iter_env's iter_components path path' mcomps: queue the continuation that
+// visits one module's components (and queues its submodules')
+static void queue_components(const TypeIterFn& f, t env, Path::t path, Path::t path2,
+                             ModuleComponents* mcomps) {
+  IterCont cont = [f, env, path, path2, mcomps] {
+    bool visit = true;
+    if (const ComponentsMaker* cm = mcomps->comps->get_arg()) visit = scrape_alias_for_visit(env, cm->cm_mty);
+    if (!visit) return;
+    const ModuleComponentsRepr* r = get_components(mcomps);
+    if (!r->is_structure) return;  // Functor_comps
+    const StructureComponents* comps = r->structure;
+    comps->comp_types.iter([&](std::string_view s, const TypeData* d) {
+      f(Path::pdot(path, s), Path::pdot(path2, s), d->tda_declaration);
+    });
+    comps->comp_modules.iter([&](std::string_view s, const ModuleData* mda) {
+      queue_components(f, env, Path::pdot(path, s), Path::pdot(path2, s), mda->mda_components);
+    });
+  };
+  g_iter_env_cont.emplace_back(path, std::move(cont));
+}
+
+// iter_types f env: iter_env wrap_identity (fun env -> env.types)
+// (fun sc -> sc.comp_types) ... env, the unit -> unit closure
+IterCont iter_types(const TypeIterFn& f, t env) {
+  return [f, env] {
+    idtbl_iter<const TypeData*, const TypeData*>(
+        wrap_identity<const TypeData*>,
+        [&](Ident::t id, Path::t p2, const TypeData* const& tda) { f(Path::pident(id), p2, tda->tda_declaration); },
+        env->types);
+    idtbl_iter<const ModuleEntry*, const ModuleData*>(
+        wrap_module,
+               [&](Ident::t id, Path::t path, const ModuleEntry* const& entry) {
+                 switch (entry->kind) {
+                   case ModuleEntry::Kind::Mod_unbound: return;
+                   case ModuleEntry::Kind::Mod_local:
+                     queue_components(f, env, Path::pident(id), path, entry->data->mda_components);
+                     return;
+                   case ModuleEntry::Kind::Mod_persistent: {
+                     const ModuleData* const* data =
+                         g_persistent_env.find_in_cache(std::string(ident::name(id)));
+                     if (!data) return;
+                     queue_components(f, env, Path::pident(id), path, (*data)->mda_components);
+                     return;
+                   }
+                 }
+               },
+               env->modules);
+  };
+}
+
+std::vector<std::pair<Path::t, IterCont>> run_iter_cont(const std::vector<IterCont>& l) {
+  g_iter_env_cont.clear();
+  for (const IterCont& c : l) c();
+  std::vector<std::pair<Path::t, IterCont>> cont = std::move(g_iter_env_cont);  // List.rev of the consed list
+  g_iter_env_cont.clear();
+  return cont;
+}
+
+std::set<std::string> used_persistent() {
+  std::set<std::string> r;
+  g_persistent_env.fold([&](const std::string& s, const ModuleData* const&) { r.insert(s); });
+  return r;
+}
+
+// find_all_comps wrap proj s (p, mda)
+template <class A, class Proj>
+static std::vector<std::pair<Path::t, A>> find_all_comps(Proj&& proj, std::string_view s, Path::t p,
+                                                        const ModuleData* mda) {
+  const ModuleComponentsRepr* r = get_components(mda->mda_components);
+  if (!r->is_structure) return {};
+  if (const A* c = proj(r->structure).find_opt(s)) return {{Path::pdot(p, s), *c}};
+  return {};
+}
+
+static std::vector<std::pair<Path::t, const ModuleData*>> find_shadowed_comps(Path::t path, t env) {
+  switch (path->kind) {
+    case Path::Kind::Pident: {
+      std::vector<std::pair<Path::t, const ModuleData*>> out;
+      for (auto& [p, data] : idtbl_find_all(wrap_module, ident::name(path->id), env->modules))
+        if (data->kind == ModuleEntry::Kind::Mod_local) out.emplace_back(p, data->data);
+      return out;
+    }
+    case Path::Kind::Pdot: {
+      std::vector<std::pair<Path::t, const ModuleData*>> out;
+      for (auto& [p, mda] : find_shadowed_comps(path->p1, env))
+        for (auto& x : find_all_comps<const ModuleData*>(
+                 [](const StructureComponents* c) -> const auto& { return c->comp_modules; }, path->s, p, mda))
+          out.push_back(x);
+      return out;
+    }
+    default: return {};
+  }
+}
+
+std::vector<Path::t> find_shadowed_types(Path::t path, t env) {
+  std::vector<Path::t> out;
+  switch (path->kind) {
+    case Path::Kind::Pident:
+      for (auto& [p, d] : idtbl_find_all(wrap_identity<const TypeData*>, ident::name(path->id), env->types))
+        out.push_back(p);
+      return out;
+    case Path::Kind::Pdot:
+      for (auto& [p, mda] : find_shadowed_comps(path->p1, env))
+        for (auto& x : find_all_comps<const TypeData*>(
+                 [](const StructureComponents* c) -> const auto& { return c->comp_types; }, path->s, p, mda))
+          out.push_back(x.first);
+      return out;
+    default: return out;
+  }
+}
+
 // ============================================================================
 // Expand manifest module type names at the top of the given module type
 

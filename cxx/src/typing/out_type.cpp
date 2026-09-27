@@ -423,12 +423,206 @@ std::vector<TypeExpr*> apply_subst(const ParamSubst& s1, const std::vector<TypeE
   return tyl;
 }
 
-// best_type_path p: (p, Id) -- Clflags.real_paths (the short-paths search
-// is not ported)
+const TypeDesc* printer_get_desc(TypeExpr* ty) { return bt::get_folded_desc(true, ty); }
+
+ParamSubst compose(const std::vector<long>& l1, const ParamSubst& s) {
+  ParamSubst r;
+  switch (s.k) {
+    case ParamSubst::K::Id:
+      r.k = ParamSubst::K::Map;
+      r.map = l1;
+      return r;
+    case ParamSubst::K::Map:
+      r.k = ParamSubst::K::Map;
+      for (long i : s.map) r.map.push_back(l1.at(static_cast<std::size_t>(i)));
+      return r;
+    case ParamSubst::K::Nth:
+      r.k = ParamSubst::K::Nth;
+      r.n = l1.at(static_cast<std::size_t>(s.n));
+      return r;
+  }
+  return r;
+}
+
+// ---- the short-paths cache (-short-paths: Clflags.real_paths off) ----
+// A one-slot cache keyed by printing_old / printing_pers; printing_map is
+// evaluated lazily, one module depth at a time (printing_depth), through
+// Env's iteration continuations (printing_cont).
+struct BestPath {  // Paths of Path.t list | Best of Path.t
+  bool best = false;
+  Path::t p = nullptr;
+  std::vector<Path::t> paths;  // in list order
+};
+env::t g_printing_old = nullptr;  // Env.empty until first set
+std::set<std::string> g_printing_pers;
+long g_printing_depth = 0;
+std::vector<env::IterCont> g_printing_cont;
+PathMap<BestPath*> g_printing_map;
+
+env::t printing_old() {
+  if (!g_printing_old) g_printing_old = env::empty();
+  return g_printing_old;
+}
+
+struct NotFoundIndex {};
+long index_of(const Slice<TypeExpr*>& l, TypeExpr* x) {
+  long i = 0;
+  for (TypeExpr* a : l) {
+    if (types::eq_type(x, a)) return i;
+    ++i;
+  }
+  throw env::NotFound{};
+}
+
+bool uniq(const std::vector<long>& l) {
+  for (std::size_t i = 0; i < l.size(); ++i)
+    for (std::size_t j = i + 1; j < l.size(); ++j)
+      if (l[i] == l[j]) return false;
+  return true;
+}
+
+std::pair<Path::t, ParamSubst> normalize_type_path(bool cache, env::t e, Path::t p) {
+  try {
+    env::TypeExpansion x = env::find_type_expansion(p, e);
+    const TypeDesc* d = printer_get_desc(x.body);
+    if (auto* c = as<Tconstr>(d)) {
+      bool same_params = x.params.size() == c->args.size();
+      if (same_params)
+        for (std::size_t i = 0; i < x.params.size(); ++i)
+          if (!types::eq_type(x.params[i], c->args[i])) {
+            same_params = false;
+            break;
+          }
+      if (same_params) return normalize_type_path(cache, e, c->path);
+      std::vector<long> ids;
+      for (TypeExpr* t : c->args) ids.push_back(types::get_id(t));
+      if (cache || x.params.size() <= c->args.size() || !uniq(ids)) return {p, ParamSubst{}};
+      std::vector<long> l1;
+      for (TypeExpr* t : c->args) l1.push_back(index_of(x.params, t));
+      auto [p2, s2] = normalize_type_path(cache, e, c->path);
+      return {p2, compose(l1, s2)};
+    }
+    ParamSubst s;
+    s.k = ParamSubst::K::Nth;
+    s.n = index_of(x.params, x.body);
+    return {p, s};
+  } catch (const env::NotFound&) {
+    return {env::normalize_type_path(nullptr, e, p), ParamSubst{}};
+  }
+}
+
+long penalty(std::string_view s) {
+  if (!s.empty() && s[0] == '_') return 10;
+  return find_double_underscore(s) ? 10 : 1;
+}
+
+std::pair<long, long> path_size(Path::t p) {
+  switch (p->kind) {
+    case Path::Kind::Pident: return {penalty(ident::name(p->id)), -static_cast<long>(ident::scope(p->id))};
+    case Path::Kind::Pdot: {
+      auto [l, b] = path_size(p->p1);
+      return {1 + l, b};
+    }
+    case Path::Kind::Papply: {
+      auto [l, b] = path_size(p->p1);
+      return {l + path_size(p->p2).first, b};
+    }
+    case Path::Kind::Pextra_ty:
+      if (p->extra == Path::Extra::Pcstr_ty) {
+        auto [l, b] = path_size(p->p1);
+        return {1 + l, b};
+      }
+      return path_size(p->p1);
+  }
+  return {0, 0};
+}
+
+bool is_id(const ParamSubst& s) { return s.k == ParamSubst::K::Id; }
+
+Longident::t lid_of_path(Path::t p) {
+  switch (p->kind) {
+    case Path::Kind::Pident: return Longident::lident(ident::name(p->id));
+    case Path::Kind::Pdot: return Longident::ldot(lid_of_path(p->p1), location::none(), p->s, location::none());
+    case Path::Kind::Papply:
+      return Longident::lapply(lid_of_path(p->p1), location::none(), lid_of_path(p->p2), location::none());
+    case Path::Kind::Pextra_ty:
+      if (p->extra == Path::Extra::Pcstr_ty)
+        return Longident::ldot(lid_of_path(p->p1), location::none(), p->s, location::none());
+      return lid_of_path(p->p1);
+  }
+  return nullptr;
+}
+
+bool is_unambiguous(Path::t path, env::t e) {
+  std::vector<Path::t> l = env::find_shadowed_types(path, e);
+  for (Path::t q : l)
+    if (path::same(path, q)) return true;  // concrete paths are ok
+  if (l.empty()) return true;
+  // allow also coherent paths:
+  auto normalize = [&](Path::t q) { return normalize_type_path(true, e, q).first; };
+  Path::t p0 = l[0];
+  Path::t p1 = normalize(p0);
+  bool coherent = true;
+  for (std::size_t i = 1; i < l.size(); ++i)
+    if (!path::same(normalize(l[i]), p1)) {
+      coherent = false;
+      break;
+    }
+  if (coherent) return true;
+  // also allow repeatedly defining and opening (for toplevel)
+  Longident::t id = lid_of_path(p0);
+  for (std::size_t i = 1; i < l.size(); ++i)
+    if (!longident::same(lid_of_path(l[i]), id)) return false;
+  return path::same(p0, env::find_type_by_name(id, e).first);
+}
+
+Path::t get_best_path(BestPath* r) {
+  for (;;) {
+    if (r->best) return r->p;
+    if (r->paths.empty()) throw env::NotFound{};
+    std::vector<Path::t> l = std::move(r->paths);
+    r->paths.clear();  // r := Paths []
+    for (Path::t p : l) {
+      if (r->best && path_size(p) >= path_size(r->p)) continue;
+      if (is_unambiguous(p, cur_env())) {
+        r->best = true;
+        r->p = p;
+      }
+    }
+  }
+}
+
+// best_type_path p
 std::pair<Path::t, ParamSubst> best_type_path(Path::t p) {
-  if (!clflags::real_paths && cur_env() != env::empty())
-    throw std::logic_error("Out_type.best_type_path: -short-paths is not ported");
-  return {p, ParamSubst{}};
+  if (cur_env() == env::empty()) return {p, ParamSubst{}};
+  if (clflags::real_paths) return {p, ParamSubst{}};
+  auto [p1, s] = normalize_type_path(false, cur_env(), p);
+  auto get_path = [&, p1 = p1]() -> Path::t {
+    BestPath* const* r = g_printing_map.find_opt(p1);
+    if (!r) throw env::NotFound{};
+    return get_best_path(*r);
+  };
+  for (;;) {
+    if (g_printing_cont.empty()) break;
+    bool deeper;
+    try {
+      deeper = path_size(get_path()).first > g_printing_depth;
+    } catch (const env::NotFound&) {
+      deeper = true;
+    }
+    if (!deeper) break;
+    std::vector<env::IterCont> next;
+    for (auto& [q, c] : env::run_iter_cont(g_printing_cont)) next.push_back(std::move(c));
+    g_printing_cont = std::move(next);
+    ++g_printing_depth;
+  }
+  Path::t p2;
+  try {
+    p2 = get_path();
+  } catch (const env::NotFound&) {
+    p2 = p1;
+  }
+  return {p2, s};
 }
 
 const ot::OutIdent* tree_of_best_type_path(Path::t p, Path::t p2) {
@@ -436,7 +630,6 @@ const ot::OutIdent* tree_of_best_type_path(Path::t p, Path::t p2) {
   return tree_of_path_ns(std::nullopt, p2, false);
 }
 
-const TypeDesc* printer_get_desc(TypeExpr* ty) { return bt::get_folded_desc(true, ty); }
 
 // proxy ty = Transient_expr.repr (proxy ty)
 TypeExpr* proxy(TypeExpr* ty) { return types::repr(bt::proxy(ty)); }
@@ -894,9 +1087,50 @@ std::string name_of_type_named(TypeExpr* t) {
   return variable_names::name_of_type([] { return variable_names::new_name(); }, t);
 }
 
+namespace {
+bool same_printing_env(env::t e) {
+  std::set<std::string> used_pers = env::used_persistent();
+  return env::same_types(printing_old(), e) && g_printing_pers == used_pers;
+}
+}  // namespace
+
 void set_printing_env(env::t e) {
   g_printing_env = e;
-  // (Clflags.real_paths: the short-paths cache is not computed)
+  if (clflags::real_paths || cur_env() == env::empty() || same_printing_env(e)) return;
+  g_printing_old = e;
+  g_printing_pers = env::used_persistent();
+  g_printing_map = PathMap<BestPath*>{};
+  g_printing_depth = 0;
+  env::IterCont cont = env::iter_types(
+      [e](Path::t p, Path::t p2, const TypeDeclaration*) {
+        auto [p1, s1] = normalize_type_path(true, e, p2);
+        if (!is_id(s1)) return;
+        if (BestPath* const* r = g_printing_map.find_opt(p1)) {
+          if ((*r)->best) {  // Best p' -> r := Paths [p; p']
+            Path::t p3 = (*r)->p;
+            (*r)->best = false;
+            (*r)->p = nullptr;
+            (*r)->paths = {p, p3};
+          } else {
+            (*r)->paths.insert((*r)->paths.begin(), p);
+          }
+          return;
+        }
+        BestPath* r = make<BestPath>();
+        r->paths = {p};
+        g_printing_map = g_printing_map.add(p1, r);
+      },
+      e);
+  g_printing_cont = {cont};
+}
+
+void reset_short_paths_cache() {
+  g_printing_env = nullptr;
+  g_printing_old = nullptr;
+  g_printing_pers.clear();
+  g_printing_depth = 0;
+  g_printing_cont.clear();
+  g_printing_map = PathMap<BestPath*>{};
 }
 
 void wrap_printing_env(bool error, env::t e, const std::function<void()>& f) {
@@ -921,14 +1155,76 @@ namespace {
 // wrap_env ?keep_short_paths fenv ftree arg
 template <class R>
 R wrap_env(bool keep_short_paths, const std::function<env::t(env::t)>& fenv, const std::function<R()>& ftree) {
+  // We save the current value of the short-path cache: from keys ...
   env::t e = cur_env();
+  std::set<std::string> old_pers = g_printing_pers;
+  // ... to data
+  PathMap<BestPath*> old_map = g_printing_map;
+  long old_depth = g_printing_depth;
+  std::vector<env::IterCont> old_cont = g_printing_cont;
   if (keep_short_paths)
     g_printing_env = fenv(e);
   else
     set_printing_env(fenv(e));
   R tree = ftree();
+  if (clflags::real_paths || same_printing_env(e)) {
+    // our cached key is still live in the cache, and we want to keep all
+    // progress made on the computation of the printing_map
+  } else {
+    // we restore the snapshotted cache before calling set_printing_env
+    g_printing_old = e;
+    g_printing_pers = std::move(old_pers);
+    g_printing_depth = old_depth;
+    g_printing_cont = std::move(old_cont);
+    g_printing_map = old_map;
+  }
   set_printing_env(e);
   return tree;
+}
+
+// we hide items being defined from short-path to avoid shortening
+// [type t = Path.To.t] into [type t = t].
+struct BoundIdent {
+  bool hide;
+  Ident::t ident;
+};
+
+const TypeDeclaration* dummy_decl() {
+  auto* d = make<TypeDeclaration>();
+  d->type_params = {};
+  d->type_arity = 0;
+  d->type_kind = TYPE_ABSTRACT_LIT(Definition);
+  d->type_private = PrivateFlag::Public;
+  d->type_manifest = nullptr;
+  d->type_is_newtype = false;
+  d->type_expansion_scope = bt::lowest_level;
+  d->type_loc = location::none();
+  d->type_immediate = TypeImmediacy::Unknown;
+  d->type_unboxed_default = false;
+  d->type_uid = uid::internal_not_actually_unique();
+  return d;
+}
+
+// hide ids env: List.fold_right hide_id ids env
+env::t hide(const std::vector<BoundIdent>& ids, env::t e) {
+  for (auto it = ids.rbegin(); it != ids.rend(); ++it)
+    // Global idents cannot be renamed
+    if (it->hide && !ident::global(it->ident)) e = env::add_type(false, ident::rename(it->ident), dummy_decl(), e);
+  return e;
+}
+
+template <class R>
+R with_hidden_items(const std::vector<BoundIdent>& ids, const std::function<R()>& f) {
+  std::vector<Ident::t> l;
+  for (auto& b : ids) l.push_back(b.ident);
+  auto hidden = [&]() -> R {  // Ident_names.with_hidden ids f
+    std::optional<R> r;
+    ident_names::with_hidden(l, [&] { r.emplace(f()); });
+    return std::move(*r);
+  };
+  if (!clflags::real_paths)
+    return wrap_env<R>(false, [&](env::t e) { return hide(ids, e); }, hidden);
+  return hidden();
 }
 
 }  // namespace
@@ -1550,10 +1846,8 @@ void prepared_constructor(Formatter& ppf, const ConstructorDeclaration* c) {
 }
 
 const ot::OutSigItem* tree_of_type_declaration(Ident::t id, const TypeDeclaration* decl, RecStatus rs) {
-  // with_hidden_items [{hide=true; ident}] (Clflags.real_paths: Ident_names.with_hidden)
-  const ot::OutSigItem* r = nullptr;
-  ident_names::with_hidden({id}, [&] { r = tree_of_type_declaration_(id, decl, rs); });
-  return r;
+  return with_hidden_items<const ot::OutSigItem*>(
+      {BoundIdent{true, id}}, [&] { return tree_of_type_declaration_(id, decl, rs); });
 }
 
 const ot::OutSigItem* tree_of_prepared_type_declaration(Ident::t id, const TypeDeclaration* decl, RecStatus rs) {
@@ -1931,24 +2225,10 @@ const ot::OutSigItem* tree_of_cltype_declaration(Ident::t id, const ClassTypeDec
 // ---- module types and signatures ----
 namespace {
 
-struct BoundIdent {
-  bool hide;
-  Ident::t ident;
-};
-
 BoundIdent ident_sigitem(const SignatureItem* it) {
   return {it->kind == SignatureItem::Kind::Sig_type, it->id};
 }
 
-template <class R>
-R with_hidden_items(const std::vector<BoundIdent>& ids, const std::function<R()>& f) {
-  // Clflags.real_paths: Ident_names.with_hidden ids f
-  std::vector<Ident::t> l;
-  for (auto& b : ids) l.push_back(b.ident);
-  std::optional<R> r;
-  ident_names::with_hidden(l, [&] { r.emplace(f()); });
-  return std::move(*r);
-}
 
 env::t add_sigitem(env::t e, const signature_group::SigItem& x) {
   auto items = signature_group::flatten(x);
