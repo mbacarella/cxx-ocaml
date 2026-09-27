@@ -99,6 +99,8 @@ class Parser {
     pending_lex_error_ = lex.pending_error();
     if (tokens_[0].lex_error) throw *pending_lex_error_;
     docs_ = lex.doc_attach();
+    ds_attached_.assign(docs_.all.size(), Unattached);
+    ds_associated_.assign(docs_.all.size(), 0);
     line_starts_.push_back(0);
     for (size_t i = 0; i < src.size(); ++i)
       if (src[i] == '\n') line_starts_.push_back(static_cast<int>(i + 1));
@@ -129,41 +131,138 @@ class Parser {
     return s;
   }
   Attribute doc_attr(const Docstring& d) { return Attribute{"ocaml.doc", doc_payload(d)}; }
-  // get_pre_docs / get_post_docs: the first docstring of the list, prepended/appended.
-  // symbol_info: a doc comment following a field/constructor (`x : t (** doc *)`)
-  // is appended as an `ocaml.doc` attribute.
-  std::unordered_map<size_t, size_t> consumed_post_;  // # post-docs already taken at a key
-  std::unordered_set<size_t> text_emitted_;  // docstrings already emitted as ocaml.text (keyed by
-                                             // start cnum) — a doc reachable from two tables emits once
+  // Docstrings' bookkeeping (docstrings.ml): each registered docstring is
+  // attached (Unattached | Info | Docs) and associated (Zero | One | Many);
+  // warn_bad_docstrings reads both after the parse.
+  enum : uint8_t { Unattached = 0, Info = 1, Docs = 2 };
+  std::vector<uint8_t> ds_attached_, ds_associated_;
+  // An undo log of the bookkeeping, so that a backtracking parse (idx_ = save)
+  // leaves it as the one real parse would: {id, attached, associated} before a
+  // change, or a text_emitted_ key (text = true) inserted.
+  struct DocUndo { size_t id; uint8_t attached, associated; bool text; };
+  std::vector<DocUndo> ds_journal_;
+  void set_attached(size_t id, uint8_t a) {
+    ds_journal_.push_back({id, ds_attached_[id], ds_associated_[id], false});
+    ds_attached_[id] = a;
+  }
+  bool emit_once(size_t start) {
+    if (!text_emitted_.insert(start).second) return false;
+    ds_journal_.push_back({start, 0, 0, true});
+    return true;
+  }
+  void undo_docs(size_t mark) {
+    while (ds_journal_.size() > mark) {
+      const DocUndo& u = ds_journal_.back();
+      if (u.text) text_emitted_.erase(u.id);
+      else { ds_attached_[u.id] = u.attached; ds_associated_[u.id] = u.associated; }
+      ds_journal_.pop_back();
+    }
+  }
+  using DocTable = std::unordered_map<size_t, std::vector<Docstring>>;
+  static const std::vector<Docstring>* doc_list(const DocTable& m, size_t key) {
+    auto it = m.find(key);
+    return it == m.end() ? nullptr : &it->second;
+  }
+  // get_docstring ~info: the first non-Info docstring, attached
+  const Docstring* get_docstring(bool info, const std::vector<Docstring>* dsl) {
+    if (!dsl) return nullptr;
+    for (const Docstring& d : *dsl)
+      if (ds_attached_[d.id] != Info) {
+        set_attached(d.id, info ? Info : Docs);
+        return &d;
+      }
+    return nullptr;
+  }
+  // get_docstrings: all the non-Info docstrings, attached
+  std::vector<const Docstring*> get_docstrings(const std::vector<Docstring>* dsl) {
+    std::vector<const Docstring*> r;
+    if (!dsl) return r;
+    for (const Docstring& d : *dsl)
+      if (ds_attached_[d.id] != Info) {
+        set_attached(d.id, Docs);
+        r.push_back(&d);
+      }
+    return r;
+  }
+  void associate_docstrings(const std::vector<Docstring>* dsl) {
+    if (!dsl) return;
+    for (const Docstring& d : *dsl) {
+      ds_journal_.push_back({d.id, ds_attached_[d.id], ds_associated_[d.id], false});
+      ds_associated_[d.id] = ds_associated_[d.id] == 0 ? 1 : 2;
+    }
+  }
+  const Docstring* get_pre_docs(size_t pos) {
+    const std::vector<Docstring>* dsl = doc_list(docs_.pre, pos);
+    associate_docstrings(dsl);
+    return get_docstring(false, dsl);
+  }
+  const Docstring* get_post_docs(size_t pos) {
+    const std::vector<Docstring>* dsl = doc_list(docs_.post, pos);
+    associate_docstrings(dsl);
+    return get_docstring(false, dsl);
+  }
+  void mark_pre_docs(size_t pos) { associate_docstrings(doc_list(docs_.pre, pos)); }
+  void mark_post_docs(size_t pos) { associate_docstrings(doc_list(docs_.post, pos)); }
+  // mark_symbol_docs / mark_rhs_docs
+  void mark_docs(size_t startCnum, size_t endCnum) {
+    mark_pre_docs(startCnum);
+    mark_post_docs(endCnum);
+  }
+  // warn_bad_docstrings, in source order
+  void warn_bad_docstrings() const {
+    for (const Docstring& d : docs_.all) {
+      if (ds_attached_[d.id] == Info) continue;
+      if (ds_attached_[d.id] == Unattached)
+        lex_warnings().push_back(LexWarning{50, d.start, d.end, true});
+      else if (ds_associated_[d.id] == 2)
+        lex_warnings().push_back(LexWarning{50, d.start, d.end, false});
+    }
+  }
   // An empty-body docstring (`(**)`) is still consumed but generates no attribute
   // (docstrings.ml add_docs_attrs/add_info_attrs/add_text_attrs filter `ds_body=""`).
+  // symbol_info: a doc comment following a field/constructor (`x : t (** doc *)`)
+  // is appended as an `ocaml.doc` attribute.
   bool append_info_doc(Attributes& attrs, size_t endCnum) {
-    auto it = docs_.post.find(endCnum);
-    size_t n = consumed_post_[endCnum];
-    if (it != docs_.post.end() && n < it->second.size()) {
-      if (!it->second[n].body.empty()) attrs.push_back(doc_attr(it->second[n]));
-      consumed_post_[endCnum] = n + 1;  // the enclosing decl must not reuse it
-      return true;
-    }
-    return false;
+    const Docstring* d = get_docstring(true, doc_list(docs_.post, endCnum));
+    if (d && !d->body.empty()) attrs.push_back(doc_attr(*d));
+    return d != nullptr;
   }
+  // symbol_docs: the pre docstring is prepended, the post one appended
   void attach_docs(Attributes& attrs, size_t startCnum, size_t endCnum) {
-    auto pit = docs_.pre.find(startCnum);
-    if (pit != docs_.pre.end() && !pit->second.empty() && !pit->second.front().body.empty())
-      attrs.insert(attrs.begin(), doc_attr(pit->second.front()));
-    auto qit = docs_.post.find(endCnum);
-    size_t n = consumed_post_[endCnum];
-    if (qit != docs_.post.end() && n < qit->second.size()) {
-      if (!qit->second[n].body.empty()) attrs.push_back(doc_attr(qit->second[n]));
-      consumed_post_[endCnum] = n + 1;
+    const Docstring* pre = get_pre_docs(startCnum);
+    const Docstring* post = get_post_docs(endCnum);
+    if (pre && !pre->body.empty()) attrs.insert(attrs.begin(), doc_attr(*pre));
+    if (post && !post->body.empty()) attrs.push_back(doc_attr(*post));
+  }
+  // symbol_text $symbolstartpos of an `and` item: its floating docstrings, as
+  // ocaml.text attributes before all the others (Ast_helper's add_text_attrs)
+  void add_and_text(Attributes& attrs, size_t andCnum) {
+    Attributes text;
+    for (const Docstring* d : text_docs(docs_.floating, andCnum))
+      if (!d->body.empty()) text.push_back(Attribute{"ocaml.text", doc_payload(*d)});
+    attrs.insert(attrs.begin(), std::make_move_iterator(text.begin()),
+                 std::make_move_iterator(text.end()));
+  }
+  // symbol_docs + symbol_text of the items of an `and` group, each spanning
+  // from its keyword
+  template <class Item>
+  void attach_group_docs(std::vector<Item>& items) {
+    for (size_t i = 0; i < items.size(); ++i) {
+      attach_docs(items[i].attrs, items[i].loc.start.cnum, items[i].loc.end.cnum);
+      if (i > 0) add_and_text(items[i].attrs, items[i].loc.start.cnum);
     }
   }
+  // get_text / get_post_text / get_pre_extra_text / get_post_extra_text
+  std::vector<const Docstring*> text_docs(const DocTable& m, size_t key) {
+    return get_docstrings(doc_list(m, key));
+  }
+  std::unordered_set<size_t> text_emitted_;  // docstrings already emitted as ocaml.text (keyed by
+                                             // start cnum) — a doc reachable from two tables emits once
   void emit_text(Structure& items, const std::unordered_map<size_t, std::vector<Docstring>>& m,
                  size_t key) {
-    auto it = m.find(key);
-    if (it == m.end()) return;
-    for (auto& d : it->second) {
-      if (d.body.empty() || !text_emitted_.insert(d.start).second) continue;
+    for (const Docstring* dp : text_docs(m, key)) {
+      const Docstring& d = *dp;
+      if (d.body.empty() || !emit_once(d.start)) continue;
       Location l = span(position(d.start), position(d.end));
       items.push_back(StructureItem{Pstr_attribute{"ocaml.text", doc_payload(d)}, l});
     }
@@ -655,13 +754,13 @@ class Parser {
                     span(position(t.start), position(c.end))}), std::move(ext), std::move(attrs));
         }
         {  // (+), (>>=), (!), (.%[]), …  -> Pexp_ident spanning the parens
-          size_t save = idx_;
+          size_t save = idx_, dsave = ds_journal_.size();
           if (auto op = parse_operator_name_tokens(); op && cur().kind == Kind::RPAREN) {
             const Token& c = cur(); advance();  // RPAREN
             Location l = span(position(t.start), position(c.end));
             return E({Pexp_ident{lid0(*op, l)}, l});
           }
-          idx_ = save;
+          idx_ = save; undo_docs(dsave);
         }
         ExprBox inner = parse_expr();
         if (cur().kind == Kind::COLON) {
@@ -716,10 +815,10 @@ class Parser {
         advance();
         std::optional<ExprBox> base;
         if (is_atom_start(cur().kind) && cur().kind != Kind::RBRACE) {
-          size_t save = idx_;
+          size_t save = idx_, dsave = ds_journal_.size();
           ExprBox e = parse_app();  // the `{ e with … }` base may be an application (`f ()`)
           if (cur().kind == Kind::WITH) { advance(); base = std::move(e); }
-          else idx_ = save;  // it was the first field label, not a base
+          else idx_ = save; undo_docs(dsave);  // it was the first field label, not a base
         }
         std::vector<std::pair<LongidentLoc, ExprBox>> fields;
         while (cur().kind != Kind::RBRACE) {
@@ -1549,7 +1648,7 @@ class Parser {
   // an explicit universal quantifier is allowed (let/val/method/field annotations).
   CoreTypeBox parse_poly_type(bool ghost) {
     if (cur().kind == Kind::QUOTE && peek(1).kind == Kind::LIDENT) {
-      size_t save = idx_;
+      size_t save = idx_, dsave = ds_journal_.size();
       Position start = position(cur().start);
       std::vector<std::string> vars;
       while (cur().kind == Kind::QUOTE && peek(1).kind == Kind::LIDENT) {
@@ -1563,7 +1662,7 @@ class Parser {
         Location l{start, position(tokens_[idx_ - 1].end), ghost};
         return box(CoreType{Ptyp_poly{std::move(vars), std::move(inner)}, l});
       }
-      idx_ = save;  // not `'a. …` — a plain type starting with a type variable
+      idx_ = save; undo_docs(dsave);  // not `'a. …` — a plain type starting with a type variable
     }
     return parse_core_type();
   }
@@ -1668,7 +1767,7 @@ class Parser {
     Position symstart = position(cur().start);
     // modular explicit: `[label:](module M : pkg) -> codomain`  -> Ptyp_functor
     {
-      size_t save = idx_;
+      size_t save = idx_, dsave = ds_journal_.size();
       ArgLabel flabel = Nolabel{};
       if (cur().kind == Kind::LABEL) { flabel = Labelled{cur().text}; advance(); }
       else if (cur().kind == Kind::LIDENT && peek(1).kind == Kind::COLON) {
@@ -1687,7 +1786,7 @@ class Parser {
         return box(CoreType{Ptyp_functor{std::move(flabel), StringLoc{nm.text, tokloc(nm)},
                                          std::move(pkg), std::move(cod)}, l});
       }
-      idx_ = save;  // not a modular-explicit arrow
+      idx_ = save; undo_docs(dsave);  // not a modular-explicit arrow
     }
     // Leading label: `~x:`/`?x:` are unambiguously arrow labels; a bare `x:` is the
     // first tuple element's label *unless* an arrow follows (then it moves to the arrow).
@@ -2004,13 +2103,13 @@ class Parser {
     const Token& t = cur();
     if (t.kind == Kind::LIDENT) { advance(); return StringLoc{t.text, tokloc(t)}; }
     if (t.kind == Kind::LPAREN) {
-      size_t save = idx_;
+      size_t save = idx_, dsave = ds_journal_.size();
       advance();
       if (auto op = parse_operator_name_tokens(); op && cur().kind == Kind::RPAREN) {
         const Token& c = cur(); advance();
         return StringLoc{*op, span(position(t.start), position(c.end))};
       }
-      idx_ = save;
+      idx_ = save; undo_docs(dsave);
     }
     throw ParseError("expected name after 'as'", t.start);
   }
@@ -2150,12 +2249,12 @@ class Parser {
     // (`a [@x] :: b`); a trailing one (`a :: b [@x]`) belongs to the whole cons,
     // so leave it for parse_pat_cons. Tentatively consume, roll back if no `::`.
     if (cur().kind == Kind::LBRACKETAT) {
-      size_t save = idx_;
+      size_t save = idx_, dsave = ds_journal_.size();
       Attributes opattrs;
       while (cur().kind == Kind::LBRACKETAT) { advance(); opattrs.push_back(parse_attribute_body()); }
       if (cur().kind == Kind::COLONCOLON)
         for (auto& a : opattrs) p.attrs.push_back(std::move(a));
-      else idx_ = save;
+      else idx_ = save; undo_docs(dsave);
     }
     // `(p) as x :: rest`: OCaml's `::` has higher precedence than `as`, so the LR
     // parser shifts the `::` -- the alias binds to this cons OPERAND. We mirror
@@ -2551,12 +2650,12 @@ class Parser {
     if (cur().kind == Kind::COLON) {  // GADT:  A : ['a 'b.] t1 * … -> tres
       advance();
       if (cur().kind == Kind::QUOTE && peek(1).kind == Kind::LIDENT) {  // pcd_vars: 'a 'b.
-        size_t save = idx_;
+        size_t save = idx_, dsave = ds_journal_.size();
         while (cur().kind == Kind::QUOTE && peek(1).kind == Kind::LIDENT) {
           advance(); gvars.push_back(cur().text); advance();
         }
         if (cur().kind == Kind::DOT) advance();
-        else { idx_ = save; gvars.clear(); }
+        else { idx_ = save; undo_docs(dsave); gvars.clear(); }
       }
       if (cur().kind == Kind::LBRACE) {  // A : { fields } -> tres  (inline record)
         args = Pcstr_record{parse_label_decls()};
@@ -2659,7 +2758,9 @@ class Parser {
     }
     return params;
   }
-  ExtensionConstructor parse_ext_ctor(Position start) {
+  // [info]: symbol_info $endpos of a type extension's constructor (an
+  // exception declaration takes symbol_docs instead)
+  ExtensionConstructor parse_ext_ctor(Position start, bool info = true) {
     const Token& nm = cur();
     if (nm.kind != Kind::UIDENT) throw ParseError("expected constructor name", nm.start);
     advance();
@@ -2677,12 +2778,12 @@ class Parser {
       if (cur().kind == Kind::COLON) {  // GADT-style
         advance();
         if (cur().kind == Kind::QUOTE && peek(1).kind == Kind::LIDENT) {  // 'a 'b.
-          size_t save = idx_;
+          size_t save = idx_, dsave = ds_journal_.size();
           while (cur().kind == Kind::QUOTE && peek(1).kind == Kind::LIDENT) {
             advance(); gvars.push_back(cur().text); advance();
           }
           if (cur().kind == Kind::DOT) advance();
-          else { idx_ = save; gvars.clear(); }
+          else { idx_ = save; undo_docs(dsave); gvars.clear(); }
         }
         if (cur().kind == Kind::LBRACE) {  // C : { fields } -> tres
           args = Pcstr_record{parse_label_decls()};
@@ -2712,7 +2813,7 @@ class Parser {
     Attributes attrs;  // pext_attributes: `A [@deprecated]`
     while (cur().kind == Kind::LBRACKETAT) { advance(); attrs.push_back(parse_attribute_body()); }
     if (!attrs.empty()) endp = position(tokens_[idx_ - 1].end);
-    append_info_doc(attrs, tokens_[idx_ - 1].end);  // `type e += A (** doc *)`
+    if (info) append_info_doc(attrs, tokens_[idx_ - 1].end);  // `type e += A (** doc *)`
     return ExtensionConstructor{StringLoc{nm.text, tokloc(nm)}, std::move(kind),
                                 span(start, endp), std::move(attrs)};
   }
@@ -2951,10 +3052,10 @@ class Parser {
   // consumes it, otherwise leaves the position unchanged.
   std::optional<StringLoc> try_paren_operator() {
     if (cur().kind != Kind::LPAREN) return std::nullopt;
-    size_t save = idx_;
+    size_t save = idx_, dsave = ds_journal_.size();
     const Token& lp = cur(); advance();
     auto nm = parse_operator_name_tokens();
-    if (!nm || cur().kind != Kind::RPAREN) { idx_ = save; return std::nullopt; }
+    if (!nm || cur().kind != Kind::RPAREN) { idx_ = save; undo_docs(dsave); return std::nullopt; }
     const Token& c = cur(); advance();
     return StringLoc{*nm, span(position(lp.start), position(c.end))};
   }
@@ -3211,7 +3312,9 @@ class Parser {
     const Token& t = cur();
     if (t.kind == Kind::QUOTED_STRING_ITEM) {  // {%%ext|…|} -> Pstr_extension(ext, [string])
       advance();
-      return StructureItem{Pstr_extension{quoted_ext_name(t, 3), quoted_payload(t)},
+      Attributes attrs;
+      attach_docs(attrs, t.start, t.end);  // symbol_docs $sloc
+      return StructureItem{Pstr_extension{quoted_ext_name(t, 3), quoted_payload(t), std::move(attrs)},
                            span(position(t.start), position(t.end))};
     }
     if (t.kind == Kind::LET) {
@@ -3219,20 +3322,26 @@ class Parser {
         // let open/module … in …  is an expression statement
         ExprBox e = parse_expr();
         Location l = e->loc;
+        mark_docs(t.start, tokens_[idx_ - 1].end);  // mark_rhs_docs(text_str(str_exp))
         return StructureItem{Pstr_eval{std::move(e)}, l};
       }
-      size_t save = idx_;
+      size_t save = idx_, dsave = ds_journal_.size();
       auto [rf, binds] = parse_value_bindings();
       if (cur().kind == Kind::IN) {  // it's actually a let-expression statement
-        idx_ = save;
+        idx_ = save; undo_docs(dsave);
         ExprBox e = parse_expr();
         Location l = e->loc;
+        mark_docs(t.start, tokens_[idx_ - 1].end);  // mark_rhs_docs(text_str(str_exp))
         return StructureItem{Pstr_eval{std::move(e)}, l};
       }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
-      if (!binds.empty())  // docs attach to the first binding (post only if single)
-        attach_docs(binds[0].attrs, l.start.cnum,
-                    binds.size() == 1 ? l.end.cnum : static_cast<size_t>(-1));
+      // val_of_let_bindings forces each binding's lb_docs and lb_text (the
+      // bindings reversed, as addlb accumulates them)
+      for (size_t i = binds.size(); i-- > 0;) {
+        if (!binds[i].loc) continue;
+        attach_docs(binds[i].attrs, binds[i].loc->start.cnum, binds[i].loc->end.cnum);
+        if (i > 0) add_and_text(binds[i].attrs, binds[i].loc->start.cnum);
+      }
       if (let_ext_) {  // `let%ext …`  -> Pstr_extension over the (ghost-wrapped) let item
         ExtName ext = std::move(*let_ext_);
         let_ext_ = std::nullopt;
@@ -3268,7 +3377,7 @@ class Parser {
       if (cur().kind == Kind::NONREC) { advance(); rf = RecFlag::Nonrecursive; }
       Position d0 = position(t.start);
       // disambiguate `type [params] path += …` (extension) from declarations
-      size_t save = idx_;
+      size_t save = idx_, dsave = ds_journal_.size();
       std::vector<CoreTypeBox> params = parse_type_params();
       if (cur().kind == Kind::LIDENT || cur().kind == Kind::UIDENT) {
         LongidentLoc path = parse_longident_path();
@@ -3300,7 +3409,7 @@ class Parser {
                                                          std::move(ctors), priv, std::move(extattrs)}}, l};
         }
       }
-      idx_ = save;  // not an extension: parse type declaration(s)
+      idx_ = save; undo_docs(dsave);  // not an extension: parse type declaration(s)
       std::vector<TypeDeclaration> decls;
       decls.push_back(parse_type_declaration(d0));
       while (cur().kind == Kind::AND) {
@@ -3310,8 +3419,9 @@ class Parser {
         TypeDeclaration d = parse_type_declaration(ds);
         d.attrs.insert(d.attrs.begin(), std::make_move_iterator(andattrs.begin()),
                        std::make_move_iterator(andattrs.end()));
-        // and_type_declaration's symbol_docs $sloc: its own pre/post docs
+        // and_type_declaration's symbol_docs $sloc and symbol_text: its own docs
         attach_docs(d.attrs, ds.cnum, d.loc.end.cnum);
+        add_and_text(d.attrs, ds.cnum);
         decls.push_back(std::move(d));
       }
       Location l = span(d0, position(tokens_[idx_ - 1].end));
@@ -3338,6 +3448,7 @@ class Parser {
       ModuleExpr me = parse_module_expr();
       while (cur().kind == Kind::LBRACKETATAT) { advance(); oattrs.push_back(parse_attribute_body()); }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
+      attach_docs(oattrs, l.start.cnum, l.end.cnum);
       StructureItem item{Pstr_open{ovr, std::move(me), std::move(oattrs)}, l};
       if (open_ext) {  // `open%ext …` wraps the (ghost) Pstr_open in a Pstr_extension
         item.loc.ghost = true;
@@ -3351,7 +3462,7 @@ class Parser {
       std::optional<ExtName> exc_ext = take_ext();  // `exception%ext …`
       Attributes prefixattrs = take_attrs();  // `exception%ext[@attr] X` -> on the constructor
       // extension_constructor loc spans the `exception` keyword
-      ExtensionConstructor ctor = parse_ext_ctor(position(t.start));
+      ExtensionConstructor ctor = parse_ext_ctor(position(t.start), /*info=*/false);
       ctor.attrs.insert(ctor.attrs.begin(), std::make_move_iterator(prefixattrs.begin()),
                         std::make_move_iterator(prefixattrs.end()));
       Attributes exnattrs;  // ptyexn_attributes: `exception E [@@attr]`
@@ -3504,6 +3615,7 @@ class Parser {
         Position akw = position(cur().start); advance();
         decls.push_back(parse_one_class_type_decl(akw));
         attach_docs(decls.back().attrs, akw.cnum, decls.back().loc.end.cnum);  // symbol_docs of the `and`
+        add_and_text(decls.back().attrs, akw.cnum);
       }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
       attach_docs(decls[0].attrs, l.start.cnum, decls[0].loc.end.cnum);  // docs on 1st decl
@@ -3528,6 +3640,7 @@ class Parser {
         Position akw = position(cur().start); advance();
         decls.push_back(parse_one_class_decl(akw));
         attach_docs(decls.back().attrs, akw.cnum, decls.back().loc.end.cnum);  // symbol_docs of the `and`
+        add_and_text(decls.back().attrs, akw.cnum);
       }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
       attach_docs(decls[0].attrs, l.start.cnum, decls[0].loc.end.cnum);  // docs on 1st decl
@@ -3546,6 +3659,7 @@ class Parser {
       Location name_loc = span(position(name_start), position(tokens_[idx_ - 1].end));
       Structure payload = parse_structure_until(Kind::RBRACKET);
       const Token& c = cur(); expect(Kind::RBRACKET, "]");
+      mark_docs(t.start, c.end);  // floating_attribute: mark_symbol_docs $sloc
       return StructureItem{Pstr_attribute{std::move(name), std::move(payload), name_loc},
                            span(position(t.start), position(c.end))};
     }
@@ -3554,6 +3668,7 @@ class Parser {
       auto [name, payload] = parse_ext_body();
       Attributes attrs;
       while (cur().kind == Kind::LBRACKETATAT) { advance(); attrs.push_back(parse_attribute_body()); }
+      attach_docs(attrs, t.start, tokens_[idx_ - 1].end);  // symbol_docs $sloc
       return StructureItem{Pstr_extension{std::move(name), std::move(payload), std::move(attrs)},
                            span(position(t.start), position(tokens_[idx_ - 1].end))};
     }
@@ -3561,6 +3676,7 @@ class Parser {
     Location l = e->loc;
     Attributes attrs;  // `e [@@attr]` -> Pstr_eval attributes (do not extend the item loc)
     while (cur().kind == Kind::LBRACKETATAT) { advance(); attrs.push_back(parse_attribute_body()); }
+    mark_docs(t.start, tokens_[idx_ - 1].end);  // mark_rhs_docs(text_str(str_exp))
     return StructureItem{Pstr_eval{std::move(e), std::move(attrs)}, l};
   }
 
@@ -3804,10 +3920,9 @@ class Parser {
 
   void emit_text_sig(Signature& items, const std::unordered_map<size_t, std::vector<Docstring>>& m,
                      size_t key) {
-    auto it = m.find(key);
-    if (it == m.end()) return;
-    for (auto& d : it->second) {
-      if (d.body.empty() || !text_emitted_.insert(d.start).second) continue;
+    for (const Docstring* dp : text_docs(m, key)) {
+      const Docstring& d = *dp;
+      if (d.body.empty() || !emit_once(d.start)) continue;
       Location l = span(position(d.start), position(d.end));
       items.push_back(SignatureItem{Psig_attribute{"ocaml.text", doc_payload(d)}, l});
     }
@@ -3847,7 +3962,9 @@ class Parser {
     auto here = [&] { return span(position(t.start), position(tokens_[idx_ - 1].end)); };
     if (t.kind == Kind::QUOTED_STRING_ITEM) {  // {%%ext|…|} -> Psig_extension
       advance();
-      return SignatureItem{Psig_extension{quoted_ext_name(t, 3), quoted_payload(t)},
+      Attributes attrs;
+      attach_docs(attrs, t.start, t.end);  // symbol_docs $sloc
+      return SignatureItem{Psig_extension{quoted_ext_name(t, 3), quoted_payload(t), std::move(attrs)},
                            span(position(t.start), position(t.end))};
     }
     if (t.kind == Kind::VAL) {
@@ -3898,7 +4015,7 @@ class Parser {
       RecFlag rf = RecFlag::Recursive;
       if (cur().kind == Kind::NONREC) { advance(); rf = RecFlag::Nonrecursive; }
       Position d0 = position(t.start);
-      size_t save = idx_;
+      size_t save = idx_, dsave = ds_journal_.size();
       std::vector<CoreTypeBox> params = parse_type_params();
       if (cur().kind == Kind::LIDENT || cur().kind == Kind::UIDENT) {  // type [params] path += …
         LongidentLoc path = parse_longident_path();
@@ -3929,7 +4046,7 @@ class Parser {
                                                          std::move(ctors), priv, std::move(extattrs)}}, l};
         }
       }
-      idx_ = save;
+      idx_ = save; undo_docs(dsave);
       std::vector<TypeDeclaration> decls;
       decls.push_back(parse_type_declaration(d0));
       decls[0].attrs.insert(decls[0].attrs.begin(), std::make_move_iterator(typeprefix.begin()),
@@ -3941,8 +4058,9 @@ class Parser {
         TypeDeclaration d = parse_type_declaration(ds);
         d.attrs.insert(d.attrs.begin(), std::make_move_iterator(andattrs.begin()),
                        std::make_move_iterator(andattrs.end()));
-        // and_type_declaration's symbol_docs $sloc: its own pre/post docs
+        // and_type_declaration's symbol_docs $sloc and symbol_text: its own docs
         attach_docs(d.attrs, ds.cnum, d.loc.end.cnum);
+        add_and_text(d.attrs, ds.cnum);
         decls.push_back(std::move(d));
       }
       attach_docs(decls[0].attrs, d0.cnum, decls[0].loc.end.cnum);
@@ -3954,7 +4072,7 @@ class Parser {
       advance();
       std::optional<ExtName> ext = take_ext();  // `exception%ext …`
       Attributes prefixattrs = take_attrs();  // `exception%ext[@attr] X` -> on the constructor
-      ExtensionConstructor ctor = parse_ext_ctor(position(t.start));
+      ExtensionConstructor ctor = parse_ext_ctor(position(t.start), /*info=*/false);
       ctor.attrs.insert(ctor.attrs.begin(), std::make_move_iterator(prefixattrs.begin()),
                         std::make_move_iterator(prefixattrs.end()));
       Attributes exnattrs;  // ptyexn_attributes: `exception E [@@attr]`
@@ -4028,6 +4146,7 @@ class Parser {
           if (cur().kind == Kind::AND) { kw = cur().start; advance(); continue; }
           break;
         }
+        attach_group_docs(decls);
         return wrap_sig_ext(SignatureItem{Psig_recmodule{std::move(decls)}, here()}, std::move(mod_ext));
       }
       StrOptLoc name = parse_module_name();
@@ -4036,6 +4155,8 @@ class Parser {
         // MODULE ext attributes mkrhs(UIDENT) COLONEQUAL error: expecting $loc($6) "module path"
         if (cur().kind != Kind::UIDENT) expecting(cur().start, cur().end, "module path");
         LongidentLoc id = parse_type_path();
+        Attributes docs;  // module_subst's symbol_docs (Psig_modsubst keeps no attributes)
+        attach_docs(docs, t.start, tokens_[idx_ - 1].end);
         return wrap_sig_ext(SignatureItem{Psig_modsubst{std::move(name), std::move(id)}, here()}, std::move(mod_ext));
       }
       if (cur().kind == Kind::EQUAL) {  // module B = A.C  (module alias)
@@ -4044,6 +4165,7 @@ class Parser {
         ModuleType mt{Pmty_alias{id}, id.loc, {}};
         Attributes mdattrs = std::move(prefixattrs);  // trailing `[@@attr]` (e.g. [@@alert])
         while (cur().kind == Kind::LBRACKETATAT) { advance(); mdattrs.push_back(parse_attribute_body()); }
+        attach_docs(mdattrs, t.start, tokens_[idx_ - 1].end);  // module_alias's symbol_docs $sloc
         return wrap_sig_ext(SignatureItem{Psig_module{ModuleDeclaration{std::move(name), box(std::move(mt)),
                             std::move(mdattrs)}}, here()}, std::move(mod_ext));
       }
@@ -4079,6 +4201,7 @@ class Parser {
         Position akw = position(cur().start); advance();
         decls.push_back(parse_one_class_type_decl(akw));
         attach_docs(decls.back().attrs, akw.cnum, decls.back().loc.end.cnum);  // symbol_docs of the `and`
+        add_and_text(decls.back().attrs, akw.cnum);
       }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
       attach_docs(decls[0].attrs, l.start.cnum, decls[0].loc.end.cnum);  // docs on 1st decl
@@ -4096,6 +4219,7 @@ class Parser {
       while (cur().kind == Kind::AND) {
         Position akw = position(cur().start); advance();
         decls.push_back(parse_one_class_description(akw));
+        add_and_text(decls.back().attrs, akw.cnum);
       }
       return wrap_sig_ext(SignatureItem{Psig_class{std::move(decls)}, here()}, std::move(ext));
     }
@@ -4106,6 +4230,7 @@ class Parser {
       Location name_loc = span(position(name_start), position(tokens_[idx_ - 1].end));
       Structure payload = parse_structure_until(Kind::RBRACKET);
       const Token& c = cur(); expect(Kind::RBRACKET, "]");
+      mark_docs(t.start, c.end);  // floating_attribute: mark_symbol_docs $sloc
       return SignatureItem{Psig_attribute{std::move(name), std::move(payload), name_loc},
                            span(position(t.start), position(c.end))};
     }
@@ -4114,6 +4239,7 @@ class Parser {
       auto [name, payload] = parse_ext_body();
       Attributes attrs;
       while (cur().kind == Kind::LBRACKETATAT) { advance(); attrs.push_back(parse_attribute_body()); }
+      attach_docs(attrs, t.start, tokens_[idx_ - 1].end);  // symbol_docs $sloc
       return SignatureItem{Psig_extension{std::move(name), std::move(payload), std::move(attrs)},
                            span(position(t.start), position(tokens_[idx_ - 1].end))};
     }
@@ -4134,6 +4260,7 @@ class Parser {
       binds.push_back(parse_module_binding_def());
       binds.back().loc = span(position(kw), position(tokens_[idx_ - 1].end));
     }
+    attach_group_docs(binds);
     return binds;
   }
   ModuleBinding parse_module_binding_def() {
@@ -4322,10 +4449,9 @@ class Parser {
 
   void emit_class_text(std::vector<ClassField>& fields,
                        const std::unordered_map<size_t, std::vector<Docstring>>& m, size_t key) {
-    auto it = m.find(key);
-    if (it == m.end()) return;
-    for (auto& d : it->second) {
-      if (d.body.empty() || !text_emitted_.insert(d.start).second) continue;
+    for (const Docstring* dp : text_docs(m, key)) {
+      const Docstring& d = *dp;
+      if (d.body.empty() || !emit_once(d.start)) continue;
       Location l = span(position(d.start), position(d.end));
       fields.push_back(ClassField{Pcf_attribute{"ocaml.text", doc_payload(d)}, l, {}});
     }
@@ -4372,7 +4498,10 @@ class Parser {
     ClassField f = parse_class_field_core();
     for (auto& a : last_post_attrs_) f.attrs.push_back(std::move(a));  // `field [@@attr]`
     last_post_attrs_.clear();
-    attach_docs(f.attrs, f.loc.start.cnum, f.loc.end.cnum);  // (** doc *) on the field
+    if (std::holds_alternative<Pcf_attribute>(f.desc))
+      mark_docs(f.loc.start.cnum, f.loc.end.cnum);  // floating_attribute: mark_symbol_docs
+    else
+      attach_docs(f.attrs, f.loc.start.cnum, f.loc.end.cnum);  // (** doc *) on the field
     return f;
   }
   ClassField parse_class_field_core() {
@@ -4475,9 +4604,9 @@ class Parser {
           advance();
         }
         expect(Kind::DOT, ".");
-        size_t tsave = idx_;
+        size_t tsave = idx_, dsave = ds_journal_.size();
         CoreTypeBox T = parse_core_type();   // for the constraint (non-varified)
-        idx_ = tsave;
+        idx_ = tsave; undo_docs(dsave);
         CoreTypeBox Tv = parse_core_type();  // re-parsed copy for the poly type
         expect(Kind::EQUAL, "=");
         ExprBox e = parse_expr();
@@ -4736,7 +4865,7 @@ class Parser {
       return ClassType{Pcty_signature{std::move(cs)}, span(position(t.start), position(c.end)), std::move(oattrs)};
     }
     if (t.kind == Kind::LBRACKET) {  // [tys] clty_longident
-      size_t save = idx_;
+      size_t save = idx_, dsave = ds_journal_.size();
       try {
         advance();
         std::vector<CoreTypeBox> tys;
@@ -4745,7 +4874,7 @@ class Parser {
         expect(Kind::RBRACKET, "]");
         LongidentLoc id = parse_type_path();  // clty_longident: F(X).t allowed
         return ClassType{Pcty_constr{id, std::move(tys)}, span(position(t.start), id.loc.end), {}};
-      } catch (const ParseError&) { idx_ = save; }
+      } catch (const ParseError&) { idx_ = save; undo_docs(dsave); }
     }
     CoreTypeBox dom = parse_type_tuple();
     if (cur().kind == Kind::MINUSGREATER) {
@@ -4788,10 +4917,9 @@ class Parser {
   }
   void emit_class_type_text(std::vector<ClassTypeField>& fields,
                             const std::unordered_map<size_t, std::vector<Docstring>>& m, size_t key) {
-    auto it = m.find(key);
-    if (it == m.end()) return;
-    for (auto& d : it->second) {
-      if (d.body.empty() || !text_emitted_.insert(d.start).second) continue;
+    for (const Docstring* dp : text_docs(m, key)) {
+      const Docstring& d = *dp;
+      if (d.body.empty() || !emit_once(d.start)) continue;
       Location l = span(position(d.start), position(d.end));
       fields.push_back(ClassTypeField{Pctf_attribute{"ocaml.text", doc_payload(d)}, l, {}});
     }
@@ -4802,7 +4930,10 @@ class Parser {
     ClassTypeField f = parse_class_sig_field_core();
     for (auto& a : last_post_attrs_) f.attrs.push_back(std::move(a));  // `field [@@attr]`
     last_post_attrs_.clear();
-    attach_docs(f.attrs, f.loc.start.cnum, f.loc.end.cnum);  // (** doc *) on the field
+    if (std::holds_alternative<Pctf_attribute>(f.desc))
+      mark_docs(f.loc.start.cnum, f.loc.end.cnum);  // floating_attribute: mark_symbol_docs
+    else
+      attach_docs(f.attrs, f.loc.start.cnum, f.loc.end.cnum);  // (** doc *) on the field
     return f;
   }
   ClassTypeField parse_class_sig_field_core() {
@@ -4957,7 +5088,9 @@ class Parser {
 Structure parse_structure(std::string_view src) {
   Parser p(src);
   try {
-    return p.parse_structure();
+    Structure s = p.parse_structure();
+    p.warn_bad_docstrings();
+    return s;
   } catch (ParseError& e) {
     p.locate(e);
     throw;
@@ -4966,7 +5099,9 @@ Structure parse_structure(std::string_view src) {
 Signature parse_signature(std::string_view src) {
   Parser p(src);
   try {
-    return p.parse_signature();
+    Signature s = p.parse_signature();
+    p.warn_bad_docstrings();
+    return s;
   } catch (ParseError& e) {
     p.locate(e);
     throw;
@@ -4977,6 +5112,7 @@ Structure parse_structure(std::string_view src, std::vector<std::string>& direct
   Structure s;
   try {
     s = p.parse_structure();
+    p.warn_bad_docstrings();
   } catch (ParseError& e) {
     p.locate(e);
     throw;

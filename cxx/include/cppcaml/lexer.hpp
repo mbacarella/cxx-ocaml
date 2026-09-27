@@ -16,7 +16,8 @@
 namespace cppcaml {
 
 // A `(** … *)` doc comment: body (delimiters stripped) and the comment's span.
-struct Docstring { std::string body; size_t start = 0; size_t end = 0; };
+// [id] is the registration index (Docstrings.register order) into DocAttach::all.
+struct Docstring { std::string body; size_t start = 0; size_t end = 0; size_t id = 0; };
 
 // Docstring attachment tables, keyed by byte offset (cnum), built by the lexer's
 // token/EOL/docstring state machine (ports parsing/docstrings.ml + lexer.mll).
@@ -26,6 +27,7 @@ struct Docstring { std::string body; size_t start = 0; size_t end = 0; };
 //   pre_extra[s] / post_extra[e] -> ocaml.text threaded at structure boundaries
 struct DocAttach {
   std::unordered_map<size_t, std::vector<Docstring>> pre, post, floating, pre_extra, post_extra;
+  std::vector<Docstring> all;  // Docstrings.docstrings: every docstring, in source order
 };
 
 // Lexing error, mirrors lexer.mll's `Error of error * Location.t`: the
@@ -55,6 +57,7 @@ struct LexError : std::runtime_error {
 struct LexWarning {
   int number;
   size_t start, end;
+  bool flag = true;  // Unexpected_docstring's payload (50: unattached, not ambiguous)
 };
 std::vector<LexWarning>& lex_warnings();
 

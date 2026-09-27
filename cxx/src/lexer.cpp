@@ -457,9 +457,20 @@ std::vector<Token> Lexer::tokenize() {
         continue;
       }
       if (rt.kind == Kind::DOCSTRING) {
-        Docstring d{rt.text, rt.start, rt.end};
+        Docstring d{rt.text, rt.start, rt.end, docs_.all.size()};
+        docs_.all.push_back(d);  // Docstrings.register
         bool blank = lines == BlankLine;
-        if (docs.tag == 0) {                       // Initial
+        if (d.body == "/*") {  // `(**/**)`: a stop comment is always floating
+          if (docs.tag == 0) { docs.tag = 2; docs.f = {d}; }
+          else if (docs.tag == 1) { docs.tag = 2; docs.f = {d}; }  // Before(a, [doc], [])
+          else {  // Before(a, doc :: b @ f, [])
+            std::vector<Docstring> nf{d};
+            nf.insert(nf.end(), docs.b.begin(), docs.b.end());
+            nf.insert(nf.end(), docs.f.begin(), docs.f.end());
+            docs.f = std::move(nf);
+            docs.b.clear();
+          }
+        } else if (docs.tag == 0) {                       // Initial
           if (!blank) { docs.tag = 1; docs.a = {d}; }
           else { docs.tag = 2; docs.b = {d}; }
         } else if (docs.tag == 1) {                // After(a)

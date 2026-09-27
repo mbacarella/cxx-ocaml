@@ -50,10 +50,11 @@ Accept/reject parity with ocamlc (`-stop-after typing`, same flags):
 The 2 false accepts: stdlib/camlinternalFormatBasics.ml (ocamlc dies with a
 Consistbl inconsistency between the tree's cmis, not a type error) and
 typing-objects-bugs/pr7284_bad.ml (a warning made an error by
-`[@@warnerror "+8"]`; warnings are not ported).  Of the identical rejections, the
+`[@@warnerror "+8"]`, counted before 9c ported the warnings: c++ocamlc
+now rejects it with ocamlc's report).  Of the identical rejections, the
 error line differs for 60 syntax errors (the C++ parser's messages) and
-for files where ocamlc prints a warning or alert first (warnings are not
-ported).  `port_check.sh` adapts
+for files where ocamlc prints a warning or alert first (counted before
+9c ported the warnings; see stage 9).  `port_check.sh` adapts
 `false_accept.sh` / `valid_reject.sh` (`CPP=cxx/harness/port_check.sh`).
 
 ## Legacy code, and what is left of it
@@ -338,6 +339,39 @@ from the port.  The two must be identical on every .cmi in the tree
    `location::print_report(location::err_formatter(), r)`;
    `misc::style` for inline code; Warning 63 uses
    `out_type::ident_conflicts::err_msg` (it prints `Doc.loc`).
+   9c **done (2026-09-26): warnings and alerts.**  `Warnings.t` with
+   every message, `report` / `report_alert` / `check_fatal` (a fatal
+   warning: exit 2, the .cmo removed), `-w` / `-warn-error` / `-alert`
+   and the deprecated-letter alert; `Location`'s warning and alert
+   printers with the batch printer's blank-line separation;
+   `Builtin_attributes` (the unused-attribute table, warning 53; the
+   alert checks; `[@warning]` / `[@@@warning]` / `[@ppwarning]` scopes,
+   47); Env's usage tables and delayed checks (unused values, types,
+   constructors, labels, extensions, modules, opens, for-indices,
+   shadowing 44/45, 32-39, 60, 66, 67, 69); Includemod / Includecore
+   marking by `Directionality.mark_as_used`; Typecore (disambiguation
+   40-42/18, 5, 6, 9, 10, 16, 19-21, 23, 26-28, 35, 43, 48, 52, 75 and
+   the principality warnings), Typeclass (7, 13, 15, 36), Typedecl (30,
+   62, 65 and the recursive-type unused slots), Typemod (70, 73),
+   Parmatch (4, 8 with its counter-example, 11, 12, 56, 57), Matching
+   (74), Simplif (51, 55), Tmc (71, 72), Translattribute (47, 54, 55),
+   Primitive's deprecation alerts; the lexer's 1, 2, 14 and the
+   parser's docstring bookkeeping (Docstrings' getters and markers, an
+   undo log for the recursive-descent parser's backtracking), warning
+   50, which also closed parsetree gaps the testsuite never reached
+   (docstrings of `and` items, `module rec`, `open`, item extensions,
+   exceptions and signature module aliases -- stdlib.mli's `@canonical`
+   docs, whose .cmi is now byte-identical).  `warning_parity.sh` (stderr + exit code vs
+   ocamlc.opt, each file compiled alone; W= the warning flags):
+   `warning_probes/` (one probe per warning, 66 files) 66/66 with
+   default warnings and with `-w +a`; stamp probes 6531/6531 both ways;
+   compiler sources (the Makefile's flags, and `-w +a`) 0 DIFF;
+   `error_probes/` 179/179 both ways; testsuite/tests (1940 .ml/.mli)
+   4 DIFF both ways, none a warning: the 3 syntax errors above and
+   conjunctive_types (timeout / stack overflow).
+   `stdlib_cmo_parity.sh` with W= (the Makefile's flags, `-w +a`):
+   72/72 on the .cmo and on stderr.  `error_parity.sh` now runs with the
+   default warnings (W=, `-w -a` still the default).
 10. **Done (2026-09-26): code generation from the port.**  `lambda/`
    (Translcore, Translprim, Translattribute, Matching, Switch, Translmod,
    Translobj, Translclass, Value_rec_compiler, Simplif, Tmc, Printlambda

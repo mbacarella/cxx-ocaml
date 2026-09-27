@@ -440,8 +440,11 @@ static void emit_lex_warnings(const std::string& path, const std::string& src, s
   using WK = ty::warnings::Warning::K;
   for (const cppcaml::LexWarning& w : cppcaml::lex_warnings()) {
     if (w.start >= limit) continue;
-    WK k = w.number == 1 ? WK::Comment_start : w.number == 2 ? WK::Comment_not_end : WK::Illegal_backslash;
-    ty::location::prerr_warning(span_loc(path, src, w.start, w.end), ty::warnings::Warning::make(k));
+    WK k = w.number == 1 ? WK::Comment_start : w.number == 2 ? WK::Comment_not_end
+         : w.number == 50 ? WK::Unexpected_docstring : WK::Illegal_backslash;
+    ty::warnings::Warning wn = ty::warnings::Warning::make(k);
+    if (w.number == 50) wn.b = w.flag;
+    ty::location::prerr_warning(span_loc(path, src, w.start, w.end), wn);
   }
   cppcaml::lex_warnings().clear();
 }
