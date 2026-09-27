@@ -898,6 +898,7 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
           TypeExpr* ty = ctype::newvar();
           Location l2 = slet->pbop_op.loc;
           l2.loc_ghost = true;
+          l2 = location::distinct_record(l2);  // {... with loc_ghost = true}
           std::vector<pt::LabeledPattern> pl{{OptStr::none(), spat_acc}, {OptStr::none(), sand->pbop_pat}};
           spat_acc = ah::pat_mk(mkd(pt::Ppat_tuple{{SPK::Ppat_tuple}, slice(pl), ClosedFlag::Closed}), l2);
           std::vector<LabeledTy> tl{{OptStr::none(), ty_acc}, {OptStr::none(), ty}};

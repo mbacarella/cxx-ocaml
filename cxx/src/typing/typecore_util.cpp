@@ -276,7 +276,7 @@ tt::Expression* mkexp(const tt::ExpressionDesc* d, TypeExpr* ty, const Location&
 static pt::LidLoc mknoloc_lid(Longident::t l) { return pt::LidLoc{l, location::none()}; }
 
 const tt::Expression* option_none(env::t env, TypeExpr* ty, const Location& loc) {
-  Longident::t lid = Longident::lident("None");
+  Longident::t lid = Longident::lident(ocaml_literal("typing/typecore.ml", "None"));
   const ConstructorDescription* cnone = env::find_ident_constructor(predef::idents().none, env);
   return mkexp(make<tt::Texp_construct>(
                    tt::Texp_construct{{XK::Texp_construct}, mknoloc_lid(lid), cnone, {}}),
@@ -284,7 +284,7 @@ const tt::Expression* option_none(env::t env, TypeExpr* ty, const Location& loc)
 }
 
 const tt::Expression* option_some(env::t env, const tt::Expression* texp) {
-  Longident::t lid = Longident::lident("Some");
+  Longident::t lid = Longident::lident(ocaml_literal("typing/typecore.ml", "Some"));
   const ConstructorDescription* csome = env::find_ident_constructor(predef::idents().some, env);
   return mkexp(make<tt::Texp_construct>(
                    tt::Texp_construct{{XK::Texp_construct}, mknoloc_lid(lid), csome, slice({texp})}),
@@ -1181,6 +1181,7 @@ std::pair<Path::t, const tt::Pattern*> build_or_pat(env::t env, const Location& 
   TypeExpr* ty = ctype::newty(tvariant(make_row(ctype::newvar())));
   Location gloc = loc;
   gloc.loc_ghost = true;
+  gloc = location::distinct_record(gloc);  // {loc with loc_ghost = true}
   tt::RowDescRef* row2 = make<tt::RowDescRef>(tt::RowDescRef{make_row(ctype::newvar())});
   std::vector<const tt::Pattern*> ps;
   for (auto& [l, p] : pats)

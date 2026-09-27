@@ -960,10 +960,12 @@ TranslTypeDeclResult transl_type_decl(env::t env, RecFlag rec_flag, Slice<const 
     auto* d = make<pt::TypeDeclaration>(*sdecl);
     Location nloc = sdecl->ptype_name.loc;
     nloc.loc_ghost = true;
+    nloc = location::distinct_record(nloc);  // {... with loc_ghost = true}
     d->ptype_name = pt::StrLoc{zborrow(std::string(sdecl->ptype_name.txt) + "#row"), nloc};
     d->ptype_kind = pt::TypeKind{pt::TypeKind::Kind::Ptype_abstract};
     d->ptype_manifest = nullptr;
     d->ptype_loc.loc_ghost = true;
+    d->ptype_loc = location::distinct_record(d->ptype_loc);
     sdecl_list.push_back(d);
   }
   sdecl_list.insert(sdecl_list.end(), sdecl_list0.begin(), sdecl_list0.end());

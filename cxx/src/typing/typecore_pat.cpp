@@ -217,6 +217,7 @@ static const tt::Pattern* type_pat_aux(TypePatState& tps, PC category,
       char c2 = get_bound(iv->c2);
       Location gloc = loc;
       gloc.loc_ghost = true;
+      gloc = location::distinct_record(gloc);  // {loc with loc_ghost = true}
       std::function<const pt::Pattern*(unsigned char, unsigned char)> loop =
           [&](unsigned char a, unsigned char b) -> const pt::Pattern* {
         if (a == b) return ppat_char(static_cast<char>(a), gloc);

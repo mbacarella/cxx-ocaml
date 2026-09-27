@@ -618,7 +618,7 @@ Location loc_rest_of_function(const Location& loc_function, bool first,
                               Slice<const pt::FunctionParam*> params_suffix, const pt::FunctionBody* body) {
   if (!params_suffix.empty()) {
     if (first) return loc_function;
-    return Location{params_suffix[0]->pparam_loc.loc_start, loc_function.loc_end, true};
+    return location::distinct_record(Location{params_suffix[0]->pparam_loc.loc_start, loc_function.loc_end, true});
   }
   if (body->kind == pt::FunctionBody::Kind::Pfunction_body) return body->body->pexp_loc;
   return body->loc;
@@ -1273,17 +1273,20 @@ const pt::Expression* vb_exp_constraint(const pt::ValueBinding* vb) {
   if (ct->kind == pt::ValueConstraint::Kind::Pvc_coercion) {
     Location loc = expr->pexp_loc;
     loc.loc_ghost = true;
+    loc = location::distinct_record(loc);  // {expr.pexp_loc with loc_ghost = true}
     return ah::exp_coerce(loc, expr, ct->ground, ct->coercion);
   }
   if (ct->locally_abstract_univars.empty()) {
     if (ct->typ->ptyp_desc->kind == pt::CoreTypeDesc::Kind::Ptyp_poly) return expr;
     Location loc = expr->pexp_loc;
     loc.loc_ghost = true;
+    loc = location::distinct_record(loc);  // {expr.pexp_loc with loc_ghost = true}
     return ah::exp_constraint(loc, expr, ct->typ);
   }
   Location loc = expr->pexp_loc;
   loc.loc_start = vb->pvb_pat->ppat_loc.loc_start;
   loc.loc_ghost = true;
+  loc = location::distinct_record(loc);
   const pt::Expression* e = ah::exp_constraint(loc, expr, ct->typ);
   // List.fold_right (Exp.newtype ~loc) vars expr
   for (std::size_t k = ct->locally_abstract_univars.size(); k-- > 0;)
@@ -1297,7 +1300,7 @@ std::pair<pt::Attributes, const pt::Pattern*> vb_pat_constraint(const pt::ValueB
   const pt::ValueConstraint* ct = vb->pvb_constraint;
   auto ghost = [](Location l) {
     l.loc_ghost = true;
-    return l;
+    return location::distinct_record(l);  // {... with loc_ghost = true}
   };
   if (ct) {
     if (ct->kind == pt::ValueConstraint::Kind::Pvc_coercion)
@@ -1309,6 +1312,7 @@ std::pair<pt::Attributes, const pt::Pattern*> vb_pat_constraint(const pt::ValueB
     Location loc = pat->ppat_loc;
     loc.loc_end = ct->typ->ptyp_loc.loc_end;
     loc.loc_ghost = true;
+    loc = location::distinct_record(loc);
     return {vb->pvb_attributes, ah::pat_constraint(loc, pat, t)};
   }
   SPK pk = pat->ppat_desc->kind;

@@ -961,6 +961,7 @@ std::pair<const tt::ModuleCoercion*, shape::t> compunit(env::t env, bool mark, s
   loc.loc_start.pos_bol = loc.loc_end.pos_bol = 0;
   loc.loc_start.pos_cnum = loc.loc_end.pos_cnum = -1;
   loc.loc_ghost = true;
+  loc = location::distinct_record(loc);  // Location.in_file: a record of its own
   Direction direction = strictly_positive(mark, false);
   auto r = signatures_(core_inclusion(), direction, loc, env, subst::identity(), impl_sig, intf_sig, unit_shape);
   if (!r.ok) {

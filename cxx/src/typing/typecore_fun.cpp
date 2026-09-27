@@ -88,6 +88,7 @@ TypeFunctionResult type_function(env::t env, Slice<const pt::FunctionParam*> par
       if (auto* c = as<pt::Ppat_constraint>(pat->ppat_desc)) {
         Location gloc = dflt->pexp_loc;
         gloc.loc_ghost = true;
+        gloc = location::distinct_record(gloc);  // {default.pexp_loc with loc_ghost = true}
         dflt = ah::exp_constraint(gloc, dflt, c->ty);
       }
       default_arg = type_expect(env, dflt, mk_expected(ty_default));
@@ -359,6 +360,7 @@ SolvedField solve_Pexp_field(env::LabelUsage label_usage, env::t env, const pt::
 const pt::Expression* type_format(const Location& loc0, std::string_view str, env::t env) {
   Location loc = loc0;
   loc.loc_ghost = true;
+  loc = location::distinct_record(loc);  // {loc with loc_ghost = true}
   namespace cf = camlinternal_format;
   auto mk_exp_loc = [&](const pt::ExpressionDesc* d) { return ah::exp_mk(d, loc); };
   auto mk_lid_loc = [&](Longident::t lid) { return pt::LidLoc{lid, loc}; };
@@ -371,8 +373,10 @@ const pt::Expression* type_format(const Location& loc0, std::string_view str, en
     return mk_exp_loc(make<pt::Pexp_tuple>(pt::Pexp_tuple{{SXK::Pexp_tuple}, slice(el)}));
   };
   auto mk_constr = [&](std::string_view name, const std::vector<const pt::Expression*>& args) {
-    Longident::t lid = Longident::ldot(Longident::lident(OCAML_LIT("CamlinternalFormatBasics")), location::none(), name,
-                                       location::none());
+    // the constructor names are typecore.ml's literals: one string each
+    Longident::t lid =
+        Longident::ldot(Longident::lident(ocaml_literal("typing/typecore.ml", "CamlinternalFormatBasics")),
+                        location::none(), ocaml_literal("typing/typecore.ml", name), location::none());
     const pt::Expression* arg = args.empty() ? nullptr : args.size() == 1 ? args[0] : tuple(args);
     return construct(lid, arg);
   };
@@ -407,8 +411,8 @@ const pt::Expression* type_format(const Location& loc0, std::string_view str, en
         for (auto* a : v->args) args.push_back(conv(a));
         return tuple(args);
       }
-      case cf::FmtValue::Kind::None: return construct(Longident::lident("None"), nullptr);
-      case cf::FmtValue::Kind::Some: return construct(Longident::lident("Some"), conv(v->args[0]));
+      case cf::FmtValue::Kind::None: return construct(Longident::lident(ocaml_literal("typing/typecore.ml", "None")), nullptr);
+      case cf::FmtValue::Kind::Some: return construct(Longident::lident(ocaml_literal("typing/typecore.ml", "Some")), conv(v->args[0]));
       case cf::FmtValue::Kind::Int: return mk_int(v->i);
       case cf::FmtValue::Kind::String: return mk_string(v->s);
       case cf::FmtValue::Kind::Char: return mk_char(v->c);
@@ -593,6 +597,7 @@ const tt::Expression* type_argument_x(Explanation explanation, Recarg recarg, en
     std::vector<const tt::Case*> cases{make<tt::Case>(eta_pat, nullptr, nullptr, e)};
     Location cases_loc = texp1->exp_loc;
     cases_loc.loc_ghost = true;
+    cases_loc = location::distinct_record(cases_loc);  // {texp.exp_loc with loc_ghost = true}
     Ident::t param = name_cases(OCAML_LIT("param"), slice(cases));
     tt::FunctionBody* fb = make<tt::FunctionBody>();
     fb->kind = tt::FunctionBody::Kind::Tfunction_cases;

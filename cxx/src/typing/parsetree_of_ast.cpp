@@ -109,17 +109,25 @@ struct Conv {
     return o ? OptStr::of(*o) : OptStr::none();
   }
 
+  static bool same_span(const Location& a, const Location& b) {
+    return a.loc_ghost == b.loc_ghost && a.loc_start.pos_cnum == b.loc_start.pos_cnum &&
+           a.loc_end.pos_cnum == b.loc_end.pos_cnum && a.loc_start.pos_fname == b.loc_start.pos_fname;
+  }
   // Longident inner locations: a component location the parser did not
   // record (zero-initialized) is a gap.
   Location inner(const ast::Location& l) const {
     bool unset = l.start.cnum == 0 && l.end.cnum == 0 && l.start.lnum <= 1 && !l.ghost;
     return unset ? gap_loc() : loc(l);
   }
-  // parser.mly's own names ("()", "[]", "::": constr_ident, the unit and
-  // list constructors): string literals, one object each (ocamlopt merges
-  // a unit's equal constants)
+  // parser.mly's own names (constr_extra_ident / constr_extra_nonprefix_ident:
+  // "()", "[]", "::", "false", "true"; infix_operator's and BANG's fixed
+  // tokens): string literals, one object each (ocamlopt merges a unit's
+  // equal constants)
   static std::string_view name(std::string_view s) {
-    if (s == "()" || s == "[]" || s == "::") return ocaml_literal("parsing/parser.mly", s);
+    static const std::string_view lits[] = {"()", "[]", "::", "false", "true", "+", "+.", "+=", "-", "-.", "*",
+                                            "%",  "=",  "<",  ">",     "or",   "||", "&",  "&&", ":=", "!"};
+    for (std::string_view l : lits)
+      if (s == l) return ocaml_literal("parsing/parser.mly", s);
     return s;
   }
   Longident::t lid(const ast::Longident& l) const {
@@ -1102,7 +1110,10 @@ struct Conv {
         [&](auto& v) {
           using T = std::decay_t<decltype(v)>;
           if constexpr (std::is_same_v<T, ast::Pstr_eval>) {
-            d = make<Pstr_eval>(Pstr_eval{{K::Pstr_eval}, expression(*v.e), attrs(v.attrs)});
+            const Expression* e = expression(*v.e);
+            d = make<Pstr_eval>(Pstr_eval{{K::Pstr_eval}, e, attrs(v.attrs)});
+            // mkstrexp: pstr_loc = e.pexp_loc, the one record
+            if (same_span(e->pexp_loc, item_loc)) item_loc = e->pexp_loc;
           } else if constexpr (std::is_same_v<T, ast::Pstr_value>) {
             d = make<Pstr_value>(Pstr_value{{K::Pstr_value}, rec(v.rf), value_bindings(v.bindings, &l)});
           } else if constexpr (std::is_same_v<T, ast::Pstr_val>) {
