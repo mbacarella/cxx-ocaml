@@ -1180,8 +1180,12 @@ class Writer {
   V row(const RowDesc* r) {
     return shared(memo_, r, 0, [&]() -> std::vector<V> {
       return {list(r->row_fields, [&](const RowFieldEntry& e) { return o::vblock(0, {str(e.label), row_field(e.field)}); }),
-              ty(r->row_more), b(r->row_closed), r->row_fixed ? some(fixed(r->row_fixed)) : none(),
-              r->row_name ? some(path_args(r->row_name)) : none()};
+              ty(r->row_more), b(r->row_closed),
+              // the options are passed on with the row's other fields
+              // (create_row ~fixed:(row_fixed row) ~name:(row_name row)):
+              // one `Some` per explanation / name record
+              r->row_fixed ? some_shared(r->row_fixed, [&] { return fixed(r->row_fixed); }) : none(),
+              r->row_name ? some_shared(r->row_name, [&] { return path_args(r->row_name); }) : none()};
     });
   }
   V package(const Package* p) {
@@ -1410,11 +1414,16 @@ class Writer {
     switch (k.kind) {
       case ValueKind::Kind::Val_reg: return i(0);
       case ValueKind::Kind::Val_prim: {
+        // one `Val_prim prim` block per declaration: copies of the value
+        // description (Subst, the signature's) keep its val_kind
         const PrimitiveDescription* p = k.prim;
-        return o::vblock(0, {o::vblock(0, {str(p->prim_name), i(p->prim_arity), b(p->prim_alloc),
-                                           str(p->prim_native_name),
-                                           list(p->prim_native_repr_args, [&](const NativeRepr& n) { return native_repr(n); }),
-                                           native_repr(p->prim_native_repr_res)})});
+        if (auto it = val_prims_.find(p); it != val_prims_.end()) return it->second;
+        V v = o::vblock(0, {o::vblock(0, {str(p->prim_name), i(p->prim_arity), b(p->prim_alloc),
+                                          str(p->prim_native_name),
+                                          list(p->prim_native_repr_args, [&](const NativeRepr& n) { return native_repr(n); }),
+                                          native_repr(p->prim_native_repr_res)})});
+        val_prims_[p] = v;
+        return v;
       }
       case ValueKind::Kind::Val_ivar: return o::vblock(1, {mutable_flag(k.ivar_mut), str(k.ivar_name)});
       // (never in a signature: a debug event's Env summary)
@@ -1531,6 +1540,7 @@ class Writer {
   std::map<std::tuple<const void*, const void*, bool>, V> locs_;
   std::unordered_map<const void*, V> pos_objs_, loc_objs_;
   std::unordered_map<const void*, V> somes_;
+  std::unordered_map<const void*, V> val_prims_;
   std::map<std::pair<const void*, const void*>, V> attr_names_;
 };
 

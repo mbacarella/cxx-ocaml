@@ -11,6 +11,7 @@
 #include "cppcaml/typing/btype.hpp"
 #include "cppcaml/typing/ctype.hpp"
 #include "cppcaml/typing/parmatch.hpp"
+#include "cppcaml/typing/predef.hpp"
 #include "cppcaml/typing/subst.hpp"
 #include "cppcaml/typing/warnings.hpp"
 
@@ -1943,11 +1944,74 @@ bool inactive(tt::Partial partial, const tt::Pattern* pat) {
 
 // ---- exported exhaustiveness check -------------------------------------------------------
 // (the fragile check runs for warning 4 only, which is off by default)
+// ---- the fragile check (warning 4) ----
+// Collect all data types in a pattern
+static std::vector<Path::t> add_path(Path::t path, std::vector<Path::t> paths) {
+  for (Path::t x : paths)
+    if (path::same(path, x)) return paths;
+  paths.push_back(path);
+  return paths;
+}
+static bool extendable_path(Path::t path) {
+  const predef::Paths& p = predef::paths();
+  return !(path::same(path, p.bool_) || path::same(path, p.list) || path::same(path, p.unit) ||
+           path::same(path, p.option));
+}
+static std::vector<Path::t> collect_paths_from_pat(std::vector<Path::t> r, const tt::Pattern* p) {
+  const tt::PatternDesc* d = p->pat_desc;
+  switch (d->kind) {
+    case PK::Tpat_construct: {
+      auto* c = as<tt::Tpat_construct>(d);
+      if (c->cstr->cstr_tag.kind != ConstructorTag::Kind::Cstr_extension) {
+        Path::t path = get_constructor_type_path(p->pat_type, p->pat_env);
+        if (extendable_path(path)) r = add_path(path, std::move(r));
+      }
+      for (const tt::Pattern* q : c->args) r = collect_paths_from_pat(std::move(r), q);
+      return r;
+    }
+    case PK::Tpat_any: case PK::Tpat_var: case PK::Tpat_constant: return r;
+    case PK::Tpat_variant: {
+      auto* v = as<tt::Tpat_variant>(d);
+      return v->arg ? collect_paths_from_pat(std::move(r), v->arg) : r;
+    }
+    case PK::Tpat_tuple:
+      for (const tt::LabeledPattern& lp : as<tt::Tpat_tuple>(d)->pats) r = collect_paths_from_pat(std::move(r), lp.pat);
+      return r;
+    case PK::Tpat_array:
+      for (const tt::Pattern* q : as<tt::Tpat_array>(d)->pats) r = collect_paths_from_pat(std::move(r), q);
+      return r;
+    case PK::Tpat_record:
+      for (const tt::RecordPatField& f : as<tt::Tpat_record>(d)->fields) r = collect_paths_from_pat(std::move(r), f.pat);
+      return r;
+    case PK::Tpat_alias: return collect_paths_from_pat(std::move(r), as<tt::Tpat_alias>(d)->pat);
+    case PK::Tpat_or: {
+      auto* o = as<tt::Tpat_or>(d);
+      return collect_paths_from_pat(collect_paths_from_pat(std::move(r), o->p1), o->p2);
+    }
+    case PK::Tpat_lazy: return collect_paths_from_pat(std::move(r), as<tt::Tpat_lazy>(d)->pat);
+    default: throw std::logic_error("Parmatch.collect_paths_from_pat");
+  }
+}
+// Actual fragile check: one exhaustivity check per collected datatype,
+// considering that the type is extended.  (The warning itself is stage 9;
+// the checks are run for their effects on the type graph -- clean_copy.)
+static void do_check_fragile(const std::vector<TypedCase>& casel, const std::vector<Pats>& pss) {
+  std::vector<Path::t> exts;
+  for (const TypedCase& c : casel) exts = collect_paths_from_pat(std::move(exts), c.pattern);
+  if (exts.empty() || pss.empty()) return;
+  for (Path::t ext : exts) {
+    Seq<const tt::Pattern*> witnesses = exhaust(ext, pss, static_cast<long>(pss[0].size()));
+    (void)witnesses();  // Seq.Nil: Fragile_match (Path.name ext)
+  }
+}
+
 tt::Partial check_partial(const std::function<const tt::Pattern*(const tt::Pattern*)>& pred, const Location&,
                           const std::vector<TypedCase>& casel) {
   std::vector<Pats> pss = initial_matrix(casel);
   pss = get_mins<Pats>([](const Pats& a, const Pats& b) { return le_pats(a, b); }, pss);
-  return do_check_partial(pred, pss);
+  tt::Partial total = do_check_partial(pred, pss);
+  if (total == tt::Partial::Total && warnings::is_active(warnings::Fragile_match)) do_check_fragile(casel, pss);
+  return total;
 }
 
 // Ambiguous variables in or-patterns under a guard: a warning-only check
