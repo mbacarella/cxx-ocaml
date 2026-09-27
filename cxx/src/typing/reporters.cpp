@@ -5,6 +5,9 @@
 
 #include "cppcaml/typing/misc.hpp"
 #include "cppcaml/typing/pprintast.hpp"
+#include "cppcaml/typing/bytepackager.hpp"
+#include "cppcaml/typing/cmi_format.hpp"
+#include "cppcaml/typing/persistent_env.hpp"
 #include "cppcaml/typing/primitive.hpp"
 #include "cppcaml/typing/typeclass.hpp"
 #include "cppcaml/typing/typecore.hpp"
@@ -56,6 +59,68 @@ void register_misc() {
     } catch (const typecore::VariableInScope& e) {
       return location::errorf(e.loc, "In this scoped type, variable %a is reserved for the local type %a.",
                               misc::style::code(pprintast::tyvar, e.name), code_str(e.name));
+    } catch (const persistent_env::Error& e) {
+      using K = persistent_env::Error::Kind;
+      K k = e.kind;
+      std::string a = e.a, b = e.b, c = e.c;
+      return location::error_of_printer_file([=](Formatter& ppf) {
+        auto qf = [](const std::string& f) { return [f](Formatter& ff) { location::doc::quoted_filename(ff, f); }; };
+        switch (k) {
+          case K::Illegal_renaming:
+            fprintf(ppf, "Wrong file naming: %a@ contains the compiled interface for@ %a when %a was expected", qf(c),
+                    code_str(b), code_str(a));
+            break;
+          case K::Inconsistent_import:
+            fprintf(ppf, "@[<hov>The files %a@ and %a@ make inconsistent assumptions@ over interface %a@]", qf(b),
+                    qf(c), code_str(a));
+            break;
+          case K::Need_recursive_types:
+            fprintf(ppf, "@[<hov>Invalid import of %a, which uses recursive types.@ The compilation flag %a is required@]",
+                    code_str(a), code_str("-rectypes"));
+            break;
+        }
+      });
+    } catch (const cmi_format::Error& e) {
+      using K = cmi_format::Error::Kind;
+      K k = e.kind;
+      std::string f = e.filename, on = e.older_newer;
+      return location::error_of_printer_file([=](Formatter& ppf) {
+        auto qf = [f](Formatter& ff) { location::doc::quoted_filename(ff, f); };
+        switch (k) {
+          case K::Not_an_interface: fprintf(ppf, "%a@ is not a compiled interface", qf); break;
+          case K::Wrong_version_interface:
+            fprintf(ppf,
+                    "%a@ is not a compiled interface for this version of OCaml.@.It seems to be for %s version of "
+                    "OCaml.",
+                    qf, on);
+            break;
+          case K::Corrupted_interface: fprintf(ppf, "Corrupted compiled interface@ %a", qf); break;
+        }
+      });
+    } catch (const bytepackager::Error& e) {
+      using K = bytepackager::Error::Kind;
+      K k = e.kind;
+      std::string file = e.file, name = e.name, id = e.id, auth = e.auth;
+      return location::error_of_printer_file([=](Formatter& ppf) {
+        auto qf = [](const std::string& f) { return [f](Formatter& ff) { location::doc::quoted_filename(ff, f); }; };
+        switch (k) {
+          case K::Forward_reference:
+            fprintf(ppf, "Forward reference to %a in file %a", code_str(name), qf(file));
+            break;
+          case K::Multiple_definition: fprintf(ppf, "File %a redefines %a", qf(file), code_str(name)); break;
+          case K::Not_an_object_file: fprintf(ppf, "%a is not a bytecode object file", qf(file)); break;
+          case K::Illegal_renaming:
+            fprintf(ppf, "Wrong file naming: %a@ contains the code for@ %a when %a was expected", qf(file),
+                    code_str(name), code_str(id));
+            break;
+          case K::File_not_found: fprintf(ppf, "File %a not found", code_str(file)); break;
+          case K::Inconsistent_import:
+            // Bytelink.report_error's
+            fprintf(ppf, "@[<hov>Files %a@ and %a@ make inconsistent assumptions over interface %a@]", qf(file),
+                    qf(auth), code_str(name));
+            break;
+        }
+      });
     } catch (const typemod::ErrorForward& e) {
       return error_of_extension(e.ext);
     } catch (const typeclass::ErrorForward& e) {

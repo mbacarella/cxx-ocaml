@@ -21,6 +21,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <cerrno>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -264,8 +266,16 @@ static bool read_source(const std::string& path, std::string& text) {
   }
   std::ifstream in(input, std::ios::binary);
   if (!in) {
-    std::cerr << "c++ocamlc: cannot open " << input << '\n';
+    // Sys_error, reported by Location: "I/O error: <file>: <strerror>"
+    int errnum = errno;
     if (!tmp.empty()) std::remove(tmp.c_str());
+    namespace ty = cppcaml::typing;
+    ty::location::input_name = path;
+    ty::location::input_source.reset();
+    std::string msg = input + ": " + std::strerror(errnum);
+    ty::location::print_report(ty::location::err_formatter(),
+                               ty::location::errorf(ty::location::in_file(path), "I/O error: %s", msg));
+    ty::location::err_flush();
     return false;
   }
   std::ostringstream ss;
@@ -736,17 +746,20 @@ static int run_main(int argc, char** argv) {
       install_typing();
       init_path(stdlib_dir);
       ty::bytepackager::package_files(initial_env(), objfiles, out_path);
-    } catch (const ty::bytepackager::Error& e) {
-      std::cerr << "Error: " << ty::bytepackager::report_error(e) << '\n';
-      return 2;
     } catch (...) {
-      std::optional<ty::error_report::Report> r = ty::error_report::classify(std::current_exception());
-      if (r) {
-        std::cerr << "Error: " << r->name << '\n';
-        return 2;
-      }
+      // Location.report_exception (Maindriver: exit 2)
+      ty::reporters::install();
+      std::exception_ptr ep = std::current_exception();
+      bool reported = false;
       try {
-        throw;
+        reported = ty::location::report_exception(ty::location::err_formatter(), ep);
+      } catch (...) {
+        ep = std::current_exception();
+      }
+      ty::location::err_flush();
+      if (reported) return 2;
+      try {
+        std::rethrow_exception(ep);
       } catch (const std::exception& e) {
         std::cerr << "c++ocamlc: -pack: " << e.what() << '\n';
       }

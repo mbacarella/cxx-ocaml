@@ -50,7 +50,7 @@ fi
 
 rm -rf "$OUT"; mkdir -p "$OUT"
 if [ $# -gt 0 ]; then files=("$@")
-else mapfile -t files < <(ls cxx/harness/false_accept/*.ml cxx/harness/error_probes/*.ml* 2>/dev/null); fi
+else mapfile -t files < <(ls cxx/harness/false_accept/*.ml cxx/harness/error_probes/*.ml 2>/dev/null); fi
 ulimit -v 8000000
 res=$(printf '%s\n' "${files[@]}" | xargs -P "$JOBS" -I{} bash "$SELF" --worker {} | sort -k2)
 printf '%s\n' "$res" > /tmp/.error_parity_results
