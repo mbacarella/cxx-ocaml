@@ -90,6 +90,7 @@ add_library(cppcaml_core
   src/typing/signature_matching.cpp
   src/typing/includemod_errorprinter.cpp
   src/typing/typemod_report.cpp
+  src/typing/typeclass_report.cpp
   src/typing/simplif.cpp
   src/typing/tmc.cpp
   src/typing/translobj.cpp

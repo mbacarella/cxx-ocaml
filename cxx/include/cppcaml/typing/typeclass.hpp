@@ -5,6 +5,8 @@
 // Printtyp.
 #pragma once
 
+#include "cppcaml/typing/format_doc.hpp"
+
 #include <functional>
 #include <optional>
 #include <string>
@@ -86,6 +88,7 @@ struct Error : std::runtime_error {
   const ClassDeclaration* clty = nullptr;
   MutableFlag mut = MutableFlag::Immutable;
   const ClassSignature* sign = nullptr;       // Closing_self_type
+  format_doc::Doc decl_doc;                   // Unbound_type_var: the printed declaration
   Error(const Location& l, env::t e, K k) : std::runtime_error("Typeclass.Error"), loc(l), env(e), kind(k) {}
 };
 // Error_forward of Location.error (an uninterpreted extension node)

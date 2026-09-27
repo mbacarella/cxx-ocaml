@@ -9,6 +9,7 @@
 #include "cppcaml/typing/includeclass.hpp"
 #include "cppcaml/typing/subst.hpp"
 #include "cppcaml/typing/typeclass.hpp"
+#include "cppcaml/typing/printtyp.hpp"
 #include "cppcaml/typing/typedecl.hpp"
 #include "cppcaml/typing/typedecl_variance.hpp"
 #include "typecore_class.hpp"
@@ -1608,7 +1609,7 @@ void collapse_conj_class_params(env::t env, const Infos<S, T>& i) {
 }
 
 template <class S, class T>
-FullClass<T> final_decl(env::t env, const Infos<S, T>& i) {
+FullClass<T> final_decl(env::t env, bool define_class, const Infos<S, T>& i) {
   if (std::optional<TypeSet> vars = ctype::nongen_vars_in_class_declaration(i.clty)) {
     Error e = err(i.cl->pci_loc, env, EK::Non_generalizable_class);
     e.id = i.id;
@@ -1617,8 +1618,14 @@ FullClass<T> final_decl(env::t env, const Infos<S, T>& i) {
     raise_error(e);
   }
   if (auto reason = ctype::closed_class(i.clty->cty_params, signature_of_class_type(i.clty->cty_type))) {
-    // (the printed declaration is part of the error message only)
     Error e = err(i.cl->pci_loc, env, EK::Unbound_type_var);
+    // the declaration, printed when the error is raised
+    if (define_class)
+      e.decl_doc = format_doc::doc_printf(
+          "%a", [&](format_doc::Formatter& f) { printtyp::class_declaration(i.id, f, i.clty); });
+    else
+      e.decl_doc = format_doc::doc_printf(
+          "%a", [&](format_doc::Formatter& f) { printtyp::cltype_declaration(i.id, f, i.cltydef); });
     e.closed_failure = reason;
     e.clty = i.clty;
     raise_error(e);
@@ -1709,7 +1716,7 @@ std::pair<std::vector<ClassInfo<const tt::ClassInfos<T>*>>, env::t> type_classes
   env = env2;
   // List.rev_map (final_decl env define_class) res: applied in list order
   std::vector<FullClass<T>> res;
-  for (auto& i : infos) res.insert(res.begin(), final_decl(env, i));
+  for (auto& i : infos) res.insert(res.begin(), final_decl(env, define_class, i));
   std::vector<typedecl_variance::ClassDeclInput> decls;
   for (auto& c : res)
     decls.push_back({c.obj_id, c.obj_abbr, c.clty, c.cltydef, c.req->ci_params, c.req->ci_loc});

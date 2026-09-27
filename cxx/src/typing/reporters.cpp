@@ -77,6 +77,7 @@ void install() {
   register_typedecl();
   register_typemod();
   register_includemod();
+  register_typeclass();
 }
 
 }  // namespace cppcaml::typing::reporters
