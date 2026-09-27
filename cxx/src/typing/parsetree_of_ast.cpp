@@ -69,13 +69,17 @@ struct Conv {
   // One zone string per file name: the lexer's positions all carry the one
   // pos_fname string of their lexbuf (Location.init), which the .cmo's
   // Assert_failure / Match_failure literals share.
-  mutable std::string_view zfname, znone;
+  mutable std::string_view zfname;
   mutable std::vector<std::string_view> zdirfiles;
   Position pos(const ast::Position& p) const {
     std::string_view f;
     if (p.cnum == -1) {
-      if (!znone.data()) znone = zborrow("_none_");
-      f = znone;
+      // Location.none's (Lexing.dummy_pos with "_none_"): its one string
+      Position n = location::none().loc_start;
+      n.pos_lnum = p.lnum;
+      n.pos_bol = p.bol;
+      n.pos_cnum = p.cnum;
+      return n;
     } else if (p.file_id > 0 && p.file_id <= static_cast<int>(dirfiles.size())) {
       if (zdirfiles.empty()) zdirfiles.resize(dirfiles.size());
       std::string_view& z = zdirfiles[p.file_id - 1];
@@ -91,6 +95,8 @@ struct Conv {
   // its identity (obj) goes with every copy the typer makes
   Location loc(const ast::Location& l) const {
     Location r{pos(l.start), pos(l.end), l.ghost};
+    // Location.none (mknoloc) is one static record: no identity of its own
+    if (l.start.cnum == -1 && l.end.cnum == -1) return r;
     r.obj = make<Location>(r);
     return r;
   }
