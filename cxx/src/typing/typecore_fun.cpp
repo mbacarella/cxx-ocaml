@@ -625,7 +625,7 @@ const tt::Expression* type_argument_x(Explanation explanation, Recarg recarg, en
   tt::Expression* r = make<tt::Expression>(*texp);
   r->exp_type = ty_fun;
   r->exp_desc = make<tt::Texp_let>(tt::Texp_let{{XK::Texp_let}, RecFlag::Nonrecursive, slice(vbs), func(let_var)});
-  return r;
+  return re(r);
 }
 
 const tt::Expression* type_argument(env::t env, const pt::Expression* sexp, TypeExpr* t1, TypeExpr* t2) {
@@ -806,9 +806,9 @@ const tt::Expression* type_construct(env::t env, const pt::Expression* sexp, con
   R r = ctype::with_local_level_generalize_structure_if(separate, [&] {
     R r2 = ctype::with_local_level_generalize_structure_if(separate, [&] {
       ctype::InstancedConstructor ic = ctype::instance_constructor(ctype::ExistentialTreatment{}, constr);
-      tt::Expression* texp = make<tt::Expression>(
+      tt::Expression* texp = re(make<tt::Expression>(
           make<tt::Texp_construct>(tt::Texp_construct{{XK::Texp_construct}, lid, constr, {}}), sexp->pexp_loc,
-          Slice<tt::ExpExtraItem>{}, ic.res, env, sexp->pexp_attributes);
+          Slice<tt::ExpExtraItem>{}, ic.res, env, sexp->pexp_attributes));
       return R{ic.args, ic.res, texp};
     });
     with_explanation(explanation, [&] {

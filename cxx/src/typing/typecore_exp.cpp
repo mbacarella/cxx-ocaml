@@ -2,6 +2,7 @@
 // (every Pexp_* case), and the constraint, coercion, newtype, identifier and
 // function-splitting helpers that follow it ("type_exp" to
 // "split_function_mty").
+#include "cppcaml/typing/cmt_format.hpp"
 #include <unordered_set>
 
 #include "ast_helper.hpp"
@@ -49,11 +50,21 @@ const tt::Expression* type_expect(env::t env, const pt::Expression* sexp, const 
 
 static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::Expression* sexp,
                                           const TypeExpected& ty_expected_explained);
+static const tt::Expression* type_expect_w(Recarg recarg, env::t env, const pt::Expression* sexp,
+                                           const TypeExpected& ty_expected_explained);
 
 // Typing of an expression with an expected type.  (Typing_recovery_state
 // saves the partial typedtree for the cmt file; typing recovery is off.)
 const tt::Expression* type_expect_r(Recarg recarg, env::t env, const pt::Expression* sexp,
                                     const TypeExpected& ty_expected_explained) {
+  return cmt_format::with_saved_types([&] { return type_expect_w(recarg, env, sexp, ty_expected_explained); },
+                                      [](const tt::Expression* e) {
+                                        return cmt_format::BinaryPart{
+                                            cmt_format::BinaryPart::Kind::Partial_expression, false, e};
+                                      });
+}
+static const tt::Expression* type_expect_w(Recarg recarg, env::t env, const pt::Expression* sexp,
+                                           const TypeExpected& ty_expected_explained) {
   return builtin_attributes::warning_scope(sexp->pexp_attributes, [&] {
     return type_expect_(recarg, env, sexp, ty_expected_explained);
   });
@@ -96,7 +107,7 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
   auto rue = [&](tt::Expression* exp) -> const tt::Expression* {
     with_explanation(explanation, [&] {
       TypeExpr* ity = ctype::instance(ty_expected);
-      unify_exp(sexp, env, exp, ity);
+      unify_exp(sexp, env, re(exp), ity);
     });
     return exp;
   };
@@ -200,8 +211,8 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
         pat_exp_list = r.pel;
         body = r.body;
       }
-      return mk(mkd(tt::Texp_let{{XK::Texp_let}, l->rec, pat_exp_list, body}), loc, body->exp_type, env,
-                sexp->pexp_attributes);
+      return re(mk(mkd(tt::Texp_let{{XK::Texp_let}, l->rec, pat_exp_list, body}), loc, body->exp_type, env,
+                sexp->pexp_attributes));
     }
     case SXK::Pexp_function: {
       auto* f = as<pt::Pexp_function>(d);
@@ -220,7 +231,7 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
           mk(mkd(tt::Texp_function{{XK::Texp_function}, slice(params), r.body}), loc, r.exp_type, env,
              sexp->pexp_attributes);
       e->exp_extra = slice(extra);
-      return e;
+      return re(e);
     }
     case SXK::Pexp_apply: {
       auto* a = as<pt::Pexp_apply>(d);
@@ -273,8 +284,8 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
       for (auto* c : val_cases)
         if (!pattern_needs_partial_application_check(c->c_lhs)) all = false;
       if (all) check_partial_application(false, arg);
-      return mk(mkd(tt::Texp_match{{XK::Texp_match}, arg, val_cases, eff_cases, partial}), loc,
-                ctype::instance(ty_expected), env, sexp->pexp_attributes);
+      return re(mk(mkd(tt::Texp_match{{XK::Texp_match}, arg, val_cases, eff_cases, partial}), loc,
+                ctype::instance(ty_expected), env, sexp->pexp_attributes));
     }
     case SXK::Pexp_try: {
       auto* t = as<pt::Pexp_try>(d);
@@ -289,8 +300,8 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
       if (!eff_caselist.empty())
         eff_cases = type_effect_cases(tt::PatternCategory::Value, env, ty_expected_explained, loc,
                                       slice(eff_caselist), eff_conts);
-      return mk(mkd(tt::Texp_try{{XK::Texp_try}, body, exn_cases, eff_cases}), loc, body->exp_type, env,
-                sexp->pexp_attributes);
+      return re(mk(mkd(tt::Texp_try{{XK::Texp_try}, body, exn_cases, eff_cases}), loc, body->exp_type, env,
+                sexp->pexp_attributes));
     }
     case SXK::Pexp_tuple: {
       Slice<pt::LabeledExpression> sexpl = as<pt::Pexp_tuple>(d)->el;
@@ -322,8 +333,8 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
       }
       for (auto& x : expl) tys.push_back({x.label, x.exp->exp_type});
       // Keep sharing
-      return mk(mkd(tt::Texp_tuple{{XK::Texp_tuple}, slice(expl)}), loc, ctype::newty(ttuple(slice(tys))), env,
-                sexp->pexp_attributes);
+      return re(mk(mkd(tt::Texp_tuple{{XK::Texp_tuple}, slice(expl)}), loc, ctype::newty(ttuple(slice(tys))), env,
+                sexp->pexp_attributes));
     }
     case SXK::Pexp_construct: {
       auto* c = as<pt::Pexp_construct>(d);
@@ -348,8 +359,8 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
           if (f.kind == RowFieldView::Kind::Rpresent && f.present && f0.kind == RowFieldView::Kind::Rpresent &&
               f0.present) {
             const tt::Expression* arg = type_argument(env, v->arg, f.present, f0.present);
-            return mk(mkd(tt::Texp_variant{{XK::Texp_variant}, l, arg}), loc, ty_expected0, env,
-                      sexp->pexp_attributes);
+            return re(mk(mkd(tt::Texp_variant{{XK::Texp_variant}, l, arg}), loc, ty_expected0, env,
+                      sexp->pexp_attributes));
           }
         }
       } else {
@@ -525,8 +536,8 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
       if (opt_sexp && lid_sexp_list.size() == num_fields) prerr_warning(loc, WK::Useless_record_with);
       std::vector<tt::RecordField> fields;
       for (std::size_t k = 0; k < lbl->lbl_all.size(); ++k) fields.push_back({lbl->lbl_all[k], label_definitions[k]});
-      return mk(mkd(tt::Texp_record{{XK::Texp_record}, slice(fields), lbl->lbl_repres, ext}), loc,
-                ctype::instance(ty_expected), env, sexp->pexp_attributes);
+      return re(mk(mkd(tt::Texp_record{{XK::Texp_record}, slice(fields), lbl->lbl_repres, ext}), loc,
+                ctype::instance(ty_expected), env, sexp->pexp_attributes));
     }
     case SXK::Pexp_field: {
       auto* f = as<pt::Pexp_field>(d);
@@ -565,8 +576,8 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
       }
       std::vector<const tt::Expression*> argl;
       for (auto* sarg : as<pt::Pexp_array>(d)->el) argl.push_back(type_expect(env, sarg, mk_expected(ty_elt)));
-      return mk(mkd(tt::Texp_array{{XK::Texp_array}, mut, slice(argl)}), loc, ctype::instance(ty_expected), env,
-                sexp->pexp_attributes);
+      return re(mk(mkd(tt::Texp_array{{XK::Texp_array}, mut, slice(argl)}), loc, ctype::instance(ty_expected), env,
+                sexp->pexp_attributes));
     }
     case SXK::Pexp_ifthenelse: {
       auto* i = as<pt::Pexp_ifthenelse>(d);
@@ -582,15 +593,15 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
       const tt::Expression* ifnot = type_expect(env, i->else_, ty_expected_explained);
       // Keep sharing
       unify_exp(sexp, env, ifnot, ifso->exp_type);
-      return mk(mkd(tt::Texp_ifthenelse{{XK::Texp_ifthenelse}, cond, ifso, ifnot}), loc, ifso->exp_type, env,
-                sexp->pexp_attributes);
+      return re(mk(mkd(tt::Texp_ifthenelse{{XK::Texp_ifthenelse}, cond, ifso, ifnot}), loc, ifso->exp_type, env,
+                sexp->pexp_attributes));
     }
     case SXK::Pexp_sequence: {
       auto* s = as<pt::Pexp_sequence>(d);
       const tt::Expression* exp1 = type_statement(TypeForcingContext::Sequence_left_hand_side, env, s->e1);
       const tt::Expression* exp2 = type_expect(env, s->e2, ty_expected_explained);
-      return mk(mkd(tt::Texp_sequence{{XK::Texp_sequence}, exp1, exp2}), loc, exp2->exp_type, env,
-                sexp->pexp_attributes);
+      return re(mk(mkd(tt::Texp_sequence{{XK::Texp_sequence}, exp1, exp2}), loc, exp2->exp_type, env,
+                sexp->pexp_attributes));
     }
     case SXK::Pexp_while: {
       auto* w = as<pt::Pexp_while>(d);
@@ -762,8 +773,8 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
         unify_exp_types(loc, env, to_unify, gi);
       });
       const tt::Expression* arg = type_expect(env, as<pt::Pexp_lazy>(d)->exp, mk_expected(ty));
-      return mk(mkd(tt::Texp_lazy{{XK::Texp_lazy}, arg}), loc, ctype::instance(ty_expected), env,
-                sexp->pexp_attributes);
+      return re(mk(mkd(tt::Texp_lazy{{XK::Texp_lazy}, arg}), loc, ctype::instance(ty_expected), env,
+                sexp->pexp_attributes));
     }
     case SXK::Pexp_object: {
       auto [desc, meths] = type_object(env, loc, as<pt::Pexp_object>(d)->cs);
@@ -822,7 +833,7 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
       x.cty = cty;
       tt::Expression* r = make<tt::Expression>(*exp);
       r->exp_extra = cons_extra(x, loc, sexp->pexp_attributes, exp->exp_extra);
-      return r;
+      return re(r);
     }
     case SXK::Pexp_newtype: {
       auto* n = as<pt::Pexp_newtype>(d);
@@ -964,8 +975,8 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
       throw ErrorForward(ext);
     }
     case SXK::Pexp_unreachable:
-      return mk(make<tt::Texp_unreachable>(tt::Texp_unreachable{{XK::Texp_unreachable}}), loc,
-                ctype::instance(ty_expected), env, sexp->pexp_attributes);
+      return re(mk(make<tt::Texp_unreachable>(tt::Texp_unreachable{{XK::Texp_unreachable}}), loc,
+                ctype::instance(ty_expected), env, sexp->pexp_attributes));
     case SXK::Pexp_struct_item: {
       auto* s = as<pt::Pexp_struct_item>(d);
       TypeExpr* tv = ctype::newvar();
@@ -985,8 +996,8 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
             // implicit unpack)
             ctype::unify_var(r.newenv, tv, r.exp->exp_type);
           });
-      return mk(mkd(tt::Texp_struct_item{{XK::Texp_struct_item}, r.si, r.exp}), loc, r.exp->exp_type, env,
-                sexp->pexp_attributes);
+      return re(mk(mkd(tt::Texp_struct_item{{XK::Texp_struct_item}, r.si, r.exp}), loc, r.exp->exp_type, env,
+                sexp->pexp_attributes));
     }
   }
   throw std::logic_error("type_expect_");

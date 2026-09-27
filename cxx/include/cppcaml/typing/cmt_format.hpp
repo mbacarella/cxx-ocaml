@@ -16,8 +16,41 @@
 
 namespace cppcaml::typing::cmt_format {
 
-// binary_annots (the partial forms, which only a failed compilation saves,
-// are not built)
+// binary_part: a piece of typed tree the typer saved (add_saved_type)
+struct BinaryPart {
+  enum class Kind : std::uint8_t {
+    Partial_structure, Partial_structure_item, Partial_expression, Partial_pattern, Partial_class_expr,
+    Partial_signature, Partial_signature_item, Partial_module_type
+  };
+  Kind kind;
+  bool computation = false;  // Partial_pattern's category: Value | Computation
+  const void* node;
+};
+// the saved types, an immutable list as Cmt_format's (head: the latest)
+struct SavedTypes {
+  BinaryPart part;
+  const SavedTypes* next;
+};
+using saved_types_t = const SavedTypes*;
+saved_types_t get_saved_types();
+void set_saved_types(saved_types_t l);
+void add_saved_type(BinaryPart p);
+saved_types_t cons_saved_type(BinaryPart p, saved_types_t l);
+// Typing_recovery_state.with_saved_types ~save_part f (without
+// -typing-recovery): on success the parts [f] saved give way to the one
+// [save_part] makes of its result; an exception leaves [f]'s own list
+// (the outer one is lost)
+template <class F, class S>
+auto with_saved_types(F&& f, S&& save_part) {
+  saved_types_t saved = get_saved_types();
+  set_saved_types(nullptr);
+  auto result = f();
+  set_saved_types(cons_saved_type(save_part(result), saved));
+  return result;
+}
+
+// binary_annots (Partial_interface is never built: an interface's type
+// error writes no .cmti)
 struct BinaryAnnots {
   enum class Kind : std::uint8_t {
     Packed, Implementation, Interface, Partial_implementation, Partial_interface
@@ -27,6 +60,7 @@ struct BinaryAnnots {
   const typedtree::Signature* signature = nullptr;  // Interface
   Signature packed_sg;                              // Packed
   std::vector<std::string> packed_files;            // Packed
+  saved_types_t parts = nullptr;                    // Partial_implementation (Array.of_list)
 };
 
 // Lexer.comments (): the unit's comments, in source order (set by the

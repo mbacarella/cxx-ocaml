@@ -1200,7 +1200,7 @@ std::pair<Path::t, const tt::Pattern*> build_or_pat(env::t env, const Location& 
                           Slice<tt::PatExtraItem>{}, ty, env, tt::Attributes{});
   tt::Pattern* rr = make<tt::Pattern>(*r);
   rr->pat_loc = loc;
-  return {path, rr};
+  return {path, rp(rr)};
 }
 
 // ---- type paths ------------------------------------------------------------------------

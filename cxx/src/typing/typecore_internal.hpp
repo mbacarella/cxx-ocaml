@@ -7,6 +7,7 @@
 
 #include "cppcaml/typing/builtin_attributes.hpp"
 #include "cppcaml/typing/clflags.hpp"
+#include "cppcaml/typing/cmt_format.hpp"
 #include "cppcaml/typing/datarepr.hpp"
 #include "cppcaml/typing/location.hpp"
 #include "cppcaml/typing/misc.hpp"
@@ -18,6 +19,23 @@
 #include "cppcaml/typing/typing_recovery.hpp"
 
 namespace cppcaml::typing::typecore {
+
+// Saving the typed nodes for a partial .cmt (typecore.ml's re / rp / rcp)
+template <class E>
+inline E* re(E* node) {
+  cmt_format::add_saved_type({cmt_format::BinaryPart::Kind::Partial_expression, false, node});
+  return node;
+}
+template <class P>
+inline P* rp(P* node) {
+  cmt_format::add_saved_type({cmt_format::BinaryPart::Kind::Partial_pattern, false, node});
+  return node;
+}
+template <class P>
+inline P* rcp(P* node) {
+  cmt_format::add_saved_type({cmt_format::BinaryPart::Kind::Partial_pattern, true, node});
+  return node;
+}
 
 // ---- warnings ----
 using WK = warnings::Warning::K;

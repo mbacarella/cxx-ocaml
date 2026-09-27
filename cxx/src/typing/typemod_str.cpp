@@ -6,6 +6,7 @@
 // creates an ident when the shape of a module is not an abstraction, so the
 // shapes of modules are tracked here (a table of the module idents' shapes
 // stands for Env's: idents are unique).
+#include "cppcaml/typing/cmt_format.hpp"
 #include <unordered_map>
 
 #include "cppcaml/typing/includemod_errorprinter.hpp"
@@ -1010,10 +1011,16 @@ static StructureTyped type_structure_s(bool toplevel, bool funct_body, Path::t a
   shape::ItemMap shape_map = shape::map::empty();
   std::vector<const tt::StructureItem*> items;
   std::vector<const SignatureItem*> sg;
-  // (Cmt_format saved types and typing recovery are not ported)
+  // (typing recovery is not ported)
+  using cmt_format::BinaryPart;
+  cmt_format::saved_types_t saved = cmt_format::get_saved_types();  // with_saved_types ~save_part
+  cmt_format::set_saved_types(nullptr);
   auto delayed = [&] {
     for (auto* item : sstr) {
+      cmt_format::saved_types_t previous_saved_types = cmt_format::get_saved_types();
       ItemTyped r = type_str_item(names, toplevel, funct_body, anchor, env, shape_map, item);
+      cmt_format::set_saved_types(cmt_format::cons_saved_type(
+          BinaryPart{BinaryPart::Kind::Partial_structure_item, false, r.item}, previous_saved_types));
       items.push_back(r.item);
       sg.insert(sg.end(), r.sg.begin(), r.sg.end());
       shape_map = r.shape_map;
@@ -1025,6 +1032,8 @@ static StructureTyped type_structure_s(bool toplevel, bool funct_body, Path::t a
   else builtin_attributes::warning_scope(pt::Attributes{}, delayed);
   Signature sgs = slice(sg);  // one list: str_type and the module type's
   auto* str = make<tt::Structure>(slice(items), sgs, env);
+  cmt_format::set_saved_types(
+      cmt_format::cons_saved_type(BinaryPart{BinaryPart::Kind::Partial_structure, false, str}, saved));
   return {str, sgs, names, shape::str(nullptr, shape_map), env};
 }
 

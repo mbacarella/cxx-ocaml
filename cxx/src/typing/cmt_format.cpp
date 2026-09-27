@@ -1551,6 +1551,26 @@ class TreeWriter {
     return w_.i(0);
   }
 
+  // clear_part: the part's tree, mapped
+  V part(const BinaryPart& b) {
+    using K = BinaryPart::Kind;
+    switch (b.kind) {
+      case K::Partial_structure: return o::vblock(0, {structure(static_cast<const tt::Structure*>(b.node))});
+      case K::Partial_structure_item:
+        return o::vblock(1, {structure_item(static_cast<const tt::StructureItem*>(b.node))});
+      case K::Partial_expression: return o::vblock(2, {expr(static_cast<const tt::Expression*>(b.node))});
+      case K::Partial_pattern: {
+        V p = pat(static_cast<const tt::Pattern*>(b.node));
+        return o::vblock(3, {w_.i(b.computation ? 1 : 0), p});
+      }
+      case K::Partial_class_expr: return o::vblock(4, {class_expr(static_cast<const tt::ClassExpr*>(b.node))});
+      case K::Partial_signature: return o::vblock(5, {signature(static_cast<const tt::Signature*>(b.node))});
+      case K::Partial_signature_item:
+        return o::vblock(6, {signature_item(static_cast<const tt::SignatureItem*>(b.node))});
+      case K::Partial_module_type: return o::vblock(7, {module_type(static_cast<const tt::ModuleType*>(b.node))});
+    }
+    return w_.i(0);
+  }
   // the value written for an item declaration node
   V decl(const void* node) const {
     auto it = decls_.find(node);
@@ -1629,6 +1649,20 @@ class DeclIndexer {
   }
   void signature(const tt::Signature* s) {
     for (const tt::SignatureItem* it : s->sig_items) signature_item(it);
+  }
+  // iter_on_parts
+  void part(const BinaryPart& b) {
+    using K = BinaryPart::Kind;
+    switch (b.kind) {
+      case K::Partial_structure: structure(static_cast<const tt::Structure*>(b.node)); break;
+      case K::Partial_structure_item: structure_item(static_cast<const tt::StructureItem*>(b.node)); break;
+      case K::Partial_expression: expr(static_cast<const tt::Expression*>(b.node)); break;
+      case K::Partial_pattern: pat(static_cast<const tt::Pattern*>(b.node)); break;
+      case K::Partial_class_expr: class_expr(static_cast<const tt::ClassExpr*>(b.node)); break;
+      case K::Partial_signature: signature(static_cast<const tt::Signature*>(b.node)); break;
+      case K::Partial_signature_item: signature_item(static_cast<const tt::SignatureItem*>(b.node)); break;
+      case K::Partial_module_type: module_type(static_cast<const tt::ModuleType*>(b.node)); break;
+    }
   }
 
  private:
@@ -2248,7 +2282,20 @@ void record_declaration_dependency(DepKind k, const Uid& uid1, const Uid& uid2) 
   g_deps.push_back(Dep{k, uid1, uid2});
 }
 
-void clear() { g_deps.clear(); }
+// Cmt_format.saved_types (only kept for -bin-annot: nothing else reads it)
+static saved_types_t g_saved_types = nullptr;
+saved_types_t get_saved_types() { return g_saved_types; }
+void set_saved_types(saved_types_t l) { g_saved_types = l; }
+saved_types_t cons_saved_type(BinaryPart p, saved_types_t l) {
+  if (!clflags::binary_annotations) return nullptr;
+  return make<SavedTypes>(SavedTypes{p, l});
+}
+void add_saved_type(BinaryPart p) { g_saved_types = cons_saved_type(p, g_saved_types); }
+
+void clear() {
+  g_saved_types = nullptr;
+  g_deps.clear();
+}
 
 void save_cmt(const std::string& filename, std::string_view modname, const std::optional<std::string>& sourcefile,
               const BinaryAnnots& annots, env::t initial_env, const cmi_format::CmiInfos* cmi, shape::t shape) {
@@ -2277,12 +2324,25 @@ void save_cmt(const std::string& filename, std::string_view modname, const std::
       annots_v = o::vblock(0, {w.signature(annots.packed_sg),
                                w.list(annots.packed_files, [&](const std::string& f) { return w.str(zborrow(f)); })});
       break;
-    default: annots_v = o::vblock(3, {o::vblock(0, {})}); break;  // Partial_implementation [||]
+    default: break;
   }
   UidTbl tbl;
   DeclIndexer ix(w, tw, tbl);
   if (annots.kind == BinaryAnnots::Kind::Implementation) ix.structure(annots.structure);
   else if (annots.kind == BinaryAnnots::Kind::Interface) ix.signature(annots.signature);
+  else if (annots.kind == BinaryAnnots::Kind::Partial_implementation ||
+           annots.kind == BinaryAnnots::Kind::Partial_interface) {
+    // Array.map clear_part (Array.of_list parts), then index_declarations
+    // over each part: a node in two parts is two copies, each part's
+    // declarations are its own copy's (written, then indexed, part by part)
+    std::vector<V> parts;
+    for (saved_types_t l = annots.parts; l; l = l->next) {
+      parts.push_back(tw.part(l->part));
+      ix.part(l->part);
+    }
+    int tag = annots.kind == BinaryAnnots::Kind::Partial_implementation ? 3 : 4;
+    annots_v = o::vblock(tag, {o::vblock(0, parts)});
+  }
   // the record's fields, right to left
   V shape_v = shape ? w.some(ShapeWriter(w).shape(shape)) : w.none();
   V interface_digest = this_crc ? w.some(o::vstr(*this_crc)) : w.none();

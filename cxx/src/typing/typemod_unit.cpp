@@ -267,8 +267,9 @@ tt::Implementation type_implementation(const UnitInfo& target, env::t initial_en
   try {
     return type_implementation_(target, initial_env, ast);
   } catch (...) {
-    // ~exceptionally: the saved parts (not ported: none) as a partial .cmt
+    // ~exceptionally: the saved parts as a partial .cmt
     cmt_format::BinaryAnnots annots{cmt_format::BinaryAnnots::Kind::Partial_implementation};
+    annots.parts = cmt_format::get_saved_types();
     try {
       save_cmt(target, annots, initial_env, nullptr, nullptr);
     } catch (...) {

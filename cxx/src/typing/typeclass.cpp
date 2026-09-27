@@ -3,6 +3,7 @@
 // class type declarations, immediate objects, and the recursive-module
 // checks on class types.  Warnings are not emitted; the warning-only
 // computations are left out.  Cmt_format.add_saved_type (`rc`) is not ported.
+#include "cppcaml/typing/cmt_format.hpp"
 #include <set>
 
 #include "ast_helper.hpp"
@@ -1032,7 +1033,9 @@ const tt::ClassStructure* class_structure(std::string_view cl_num, VirtualFlag v
 
 tt::ClassExpr* mk_cl(const tt::ClassExprDesc* desc, const Location& loc, const ClassType* ty, env::t env,
                      const pt::Attributes& attrs) {
-  return make<tt::ClassExpr>(desc, loc, ty, env, attrs);
+  tt::ClassExpr* c = make<tt::ClassExpr>(desc, loc, ty, env, attrs);
+  cmt_format::add_saved_type({cmt_format::BinaryPart::Kind::Partial_class_expr, false, c});  // rc
+  return c;
 }
 
 const tt::ClassExpr* class_expr_aux(std::string_view cl_num, Final final, env::t val_env, env::t met_env,

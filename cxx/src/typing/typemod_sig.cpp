@@ -1,6 +1,7 @@
 // Port of typing/typemod.ml, part 2: module types and signatures
 // (transl_modtype, `with` constraints, transl_signature, module type
 // declarations, recursive module types).
+#include "cppcaml/typing/cmt_format.hpp"
 #include "typemod_internal.hpp"
 
 namespace cppcaml::typing::typemod {
@@ -17,13 +18,16 @@ static Path::t transl_module_alias(const Location& loc, env::t env, Longident::t
   return env::lookup_module_path(true, loc, false, lid, env);
 }
 
-// (Cmt_format.add_saved_type is not ported)
 static const tt::ModuleType* mkmty(const tt::ModuleTypeDesc* desc, const ModuleType* typ, env::t env,
                                    const Location& loc, pt::Attributes attrs) {
-  return make<tt::ModuleType>(desc, typ, env, loc, attrs);
+  const tt::ModuleType* mty = make<tt::ModuleType>(desc, typ, env, loc, attrs);
+  cmt_format::add_saved_type({cmt_format::BinaryPart::Kind::Partial_module_type, false, mty});
+  return mty;
 }
 static const tt::SignatureItem* mksig(const tt::SignatureItemDesc* desc, env::t env, const Location& loc) {
-  return make<tt::SignatureItem>(desc, env, loc);
+  const tt::SignatureItem* sg = make<tt::SignatureItem>(desc, env, loc);
+  cmt_format::add_saved_type({cmt_format::BinaryPart::Kind::Partial_signature_item, false, sg});
+  return sg;
 }
 template <class D>
 static const D* mkd(D d) {
@@ -472,7 +476,11 @@ const tt::Signature* transl_signature_(env::t env0, pt::Signature ssg) {
 }
 
 const tt::Signature* transl_signature(env::t env, pt::Signature ssg) {
-  return builtin_attributes::warning_scope(pt::Attributes{}, [&] { return transl_signature_(env, ssg); });
+  return cmt_format::with_saved_types(
+      [&] { return builtin_attributes::warning_scope(pt::Attributes{}, [&] { return transl_signature_(env, ssg); }); },
+      [](const tt::Signature* sg) {
+        return cmt_format::BinaryPart{cmt_format::BinaryPart::Kind::Partial_signature, false, sg};
+      });
 }
 
 }  // namespace cppcaml::typing::typemod

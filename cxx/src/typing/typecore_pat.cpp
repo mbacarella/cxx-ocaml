@@ -139,10 +139,12 @@ static const tt::Pattern* type_pat_aux(TypePatState& tps, PC category,
     unify_pat(penv->env, x, ctype::instance(expected_ty), sp->ppat_desc);
     return x;
   };
-  // record {general,value,computation} pattern (the cmt saved types are not
-  // kept)
-  auto rvp = [&](const tt::Pattern* x) { return pure(category, x); };
-  auto rcp = [&](const tt::Pattern* x) { return only_impure(category, x); };
+  // record {general,value,computation} pattern
+  auto crp = [&](const tt::Pattern* x) {
+    return category == PC::Value ? typecore::rp(x) : typecore::rcp(x);
+  };
+  auto rvp = [&](const tt::Pattern* x) { return crp(pure(category, x)); };
+  auto rcp = [&](const tt::Pattern* x) { return crp(only_impure(category, x)); };
   const pt::PatternDesc* d = sp->ppat_desc;
   switch (d->kind) {
     case SK::Ppat_any:
@@ -492,7 +494,7 @@ static const tt::Pattern* type_pat_aux(TypePatState& tps, PC category,
         const tt::Pattern* p2 = tt::alpha_pat(alpha_env, r.p2);
         return make<tt::Tpat_or>(tt::Tpat_or{{PK::Tpat_or}, r.p1, p2, nullptr});
       });
-      return mkpat(pat_desc, loc, ctype::instance(expected_ty), penv->env, sp->ppat_attributes);
+      return crp(mkpat(pat_desc, loc, ctype::instance(expected_ty), penv->env, sp->ppat_attributes));
     }
     case SK::Ppat_lazy: {
       TypeExpr* nv = solve_Ppat_lazy(loc, penv, expected_ty);
