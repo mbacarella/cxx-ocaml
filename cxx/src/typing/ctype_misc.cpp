@@ -1386,6 +1386,7 @@ const TypeDeclaration* nondep_type_decl(env::t env, const std::vector<Ident::t>&
   r->type_params = slice(params);
   r->type_kind = tk;
   r->type_manifest = tm;
+  r->manifest_obj.reset();  // a new Some block
   r->type_private = priv;
   r->type_is_newtype = false;
   r->type_expansion_scope = lowest_level;
@@ -1478,6 +1479,7 @@ const ClassDeclaration* nondep_class_declaration(env::t env, const std::vector<I
   r->cty_params = slice(params);
   r->cty_type = cty_type;
   r->cty_new = cty_new;
+  r->new_obj.reset();  // a new Some block
   return r;
 }
 

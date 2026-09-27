@@ -988,6 +988,7 @@ static std::pair<std::vector<TypeExpr*>, const tt::ConstructTypeAnnot*> solve_co
       }
       TypeDeclaration* d2 = make<TypeDeclaration>(*x.decl);
       d2->type_manifest = ctype::duplicate_type(tv2);
+      d2->manifest_obj.reset();  // a new Some block
       penv->set_env(env::add_type(false, x.id, d2, penv->env));
     }
     if (!rem.empty()) cleanup_abbrev_memo();

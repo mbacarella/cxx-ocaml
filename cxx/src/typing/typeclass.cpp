@@ -976,6 +976,7 @@ const tt::ClassStructure* class_structure(std::string_view cl_num, VirtualFlag v
   // Location of self. Used for locations of self arguments
   Location self_loc = spat->ppat_loc;
   self_loc.loc_ghost = true;
+  self_loc = location::distinct_record(self_loc);  // {spat.ppat_loc with ...}: a record of its own
   ClassSignature* sign = ctype::new_class_signature();
   // Adding a dummy method to the signature prevents it from being closed /
   // escaping.
@@ -1629,6 +1630,7 @@ env::t class_infos_(bool define_class, const KindFn<S, T>& kind, const Pending<S
   auto* cl_abbr = make<TypeDeclaration>(*p.cl_td);
   cl_abbr->type_params = cl_params_l;
   cl_abbr->type_manifest = cl_ty;
+  cl_abbr->manifest_obj.reset();  // a new Some block
   auto* cltydef = make<ClassTypeDeclaration>(params2, class_body(typ2), Path::pident(p.obj_id), cl_abbr, cty_variance,
                                              cl->pci_loc, pt::types_attributes(cl->pci_attributes),
                                              p.dummy_class->cty_uid);

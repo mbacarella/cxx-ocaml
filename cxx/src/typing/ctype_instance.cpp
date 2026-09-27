@@ -392,6 +392,7 @@ const TypeDeclaration* instance_declaration(const TypeDeclaration* decl) {
     auto* d = make<TypeDeclaration>(*decl);
     d->type_params = slice(params);
     d->type_manifest = manifest;
+    d->manifest_obj.reset();  // a new Some block
     d->type_kind = kind;
     r = d;
   });

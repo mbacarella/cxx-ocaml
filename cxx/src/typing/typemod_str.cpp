@@ -290,6 +290,7 @@ static Signature package_constraints_sig(env::t env, const Location& loc, Signat
       if (ty) {
         auto* td = make<TypeDeclaration>(*it->type);
         td->type_manifest = ty;
+        td->manifest_obj.reset();  // a new Some block
         td->type_immediate = typedecl_immediacy::compute_decl(env, td);
         out.push_back(sig_type(it->id, td, it->rec, it->vis));
         continue;

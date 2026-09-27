@@ -877,6 +877,7 @@ const TypeDeclaration* name_recursion(const pt::TypeDeclaration* sdecl, Ident::t
       link_type(ty, btype::newty2(get_level(ty), td));
       TypeDeclaration* d = make<TypeDeclaration>(*decl);
       d->type_manifest = ty2;
+      d->manifest_obj.reset();  // a new Some block
       return d;
     }
   }

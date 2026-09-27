@@ -63,6 +63,12 @@ Location location::distinct_record(Location l) {
   return l;
 }
 
+std::uint64_t SomeToken::get() const {
+  static std::uint64_t next = 0;
+  if (!v) v = ++next;
+  return v;
+}
+
 Location location::none() {
   Position p{"_none_", 0, 0, -1};  // Lexing.dummy_pos with pos_fname "_none_"
   return Location{p, p, true};

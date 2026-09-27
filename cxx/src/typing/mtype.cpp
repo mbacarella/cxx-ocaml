@@ -100,6 +100,7 @@ static std::vector<const lz::SignatureItem*> strengthen_lazy_sig2(
                                              decl->type_params, make<MemoRef>(mnil())));
           auto* d = make<TypeDeclaration>(*decl);
           d->type_manifest = manif;
+          d->manifest_obj.reset();  // a new Some block
           if (type_kind_is_abstract(decl)) d->type_private = PrivateFlag::Public;
           newdecl = d;
         }
@@ -371,6 +372,7 @@ const TypeDeclaration* enrich_typedecl(env::t env, Path::t p, Ident::t id, const
   TypeExpr* orig_ty2 = newgenty(tconstr(p, decl->type_params, make<MemoRef>(mnil())));
   auto* r = make<TypeDeclaration>(*decl);
   r->type_manifest = orig_ty2;
+  r->manifest_obj.reset();  // a new Some block
   return r;
 }
 

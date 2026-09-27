@@ -256,6 +256,23 @@ enum class Separability : std::uint8_t { Ind, Sep, Deepsep };
 enum class TypeImmediacy : std::uint8_t { Unknown, Always, Always_on_64bits };
 
 // ---- declarations -------------------------------------------------------
+// The identity of a declaration's `Some ty` block (type_manifest, cty_new),
+// which Marshal shares: OCaml's `{d with ...}` keeps d's block, a record
+// built afresh (or a `with` that sets the field) has a new one.  A C++ copy
+// of the declaration is such a `with` copy -- it takes the source's token,
+// minting one for it -- and a copy that sets the option anew resets it.
+struct SomeToken {
+  mutable std::uint64_t v = 0;
+  SomeToken() = default;
+  SomeToken(const SomeToken& o) : v(o.get()) {}
+  SomeToken& operator=(const SomeToken& o) {
+    v = o.get();
+    return *this;
+  }
+  std::uint64_t get() const;  // the token, minted on first use
+  void reset() { v = 0; }
+};
+
 struct LabelDeclaration {
   Ident::t ld_id;
   MutableFlag ld_mutable;
@@ -339,6 +356,7 @@ struct TypeDeclaration {
   TypeImmediacy type_immediate;
   bool type_unboxed_default;
   Uid type_uid;
+  SomeToken manifest_obj;  // type_manifest's block
 };
 
 struct ExtensionConstructor {
@@ -398,6 +416,7 @@ struct ClassDeclaration {
   Location cty_loc;
   Attributes cty_attributes;
   Uid cty_uid;
+  SomeToken new_obj;  // cty_new's block
 };
 
 struct ClassTypeDeclaration {

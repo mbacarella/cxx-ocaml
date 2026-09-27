@@ -37,6 +37,12 @@ class Writer {
     return it->second;
   }
   V some(V x) { return o::vblock(0, {std::move(x)}); }
+  // a declaration's `Some ty` block: one per token (types.hpp, SomeToken)
+  V some_tok(const SomeToken& t, V x) {
+    auto [it, fresh] = some_toks_.try_emplace(t.get(), nullptr);
+    if (fresh) it->second = some(std::move(x));
+    return it->second;
+  }
   // a value built by [make], one per identity token (nullptr: a fresh one)
   template <class F>
   V shared_by(const void* obj, F&& make) {
@@ -533,7 +539,7 @@ class Writer {
   V type_decl(const TypeDeclaration* d) {
     return shared(memo_, d, 0, [&]() -> std::vector<V> {
       return {tys(d->type_params), i(d->type_arity), type_kind(d->type_kind), private_flag(d->type_private),
-              d->type_manifest ? some(ty(d->type_manifest)) : none(),
+              d->type_manifest ? some_tok(d->manifest_obj, ty(d->type_manifest)) : none(),
               list(d->type_variance, [&](variance::t v) { return i(v); }),
               list(d->type_separability, [&](Separability x) { return i(static_cast<long>(x)); }),
               b(d->type_is_newtype), i(d->type_expansion_scope), loc(d->type_loc), attributes(d->type_attributes),
@@ -707,7 +713,7 @@ class Writer {
   V class_decl(const ClassDeclaration* cd) {
     return shared(memo_, cd, 0, [&]() -> std::vector<V> {
       return {tys(cd->cty_params), class_type(cd->cty_type), path(cd->cty_path),
-              cd->cty_new ? some(ty(cd->cty_new)) : none(), variances(cd->cty_variance), loc(cd->cty_loc),
+              cd->cty_new ? some_tok(cd->new_obj, ty(cd->cty_new)) : none(), variances(cd->cty_variance), loc(cd->cty_loc),
               attributes(cd->cty_attributes), uid(cd->cty_uid)};
     });
   }
@@ -761,6 +767,7 @@ class Writer {
   std::unordered_map<const void*, V> self_meths_;  // Val_self's self_meths blocks
   std::unordered_map<const void*, V> pos_objs_, loc_objs_;
   std::unordered_map<const void*, V> somes_;
+  std::unordered_map<std::uint64_t, V> some_toks_;
   std::unordered_map<const void*, V> val_prims_;
   std::unordered_map<const void*, V> prim_descs_;
   std::unordered_map<const void*, V> sig_items_;
