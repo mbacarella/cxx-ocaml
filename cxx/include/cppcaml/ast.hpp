@@ -128,16 +128,20 @@ struct Ptyp_arrow { ArgLabel label; CoreTypeBox dom; CoreTypeBox cod; };
 struct Ptyp_tuple { std::vector<CoreTypeBox> elems;
                     std::vector<std::optional<std::string>> labels; };  // empty = all None
 struct Ptyp_constr { LongidentLoc id; std::vector<CoreTypeBox> args; };
-struct Rtag { std::string name; bool constant; std::vector<CoreTypeBox> types; Attributes attrs; };
-struct Rinherit { CoreTypeBox ct; };
+struct Rtag {
+  std::string name; bool constant; std::vector<CoreTypeBox> types; Attributes attrs;
+  Location name_loc{};  // mkrhs(name_tag): the backquote through the tag
+  Location loc{};       // prf_loc: $sloc, through the trailing attributes
+};
+struct Rinherit { CoreTypeBox ct; Location loc{}; };  // prf_loc: $sloc
 using RowField = std::variant<Rtag, Rinherit>;
 struct Ptyp_variant {
   std::vector<RowField> rows;
   ClosedFlag closed = ClosedFlag::Closed;
   std::optional<std::vector<std::string>> labels;  // `[< … > l]` present tags
 };
-struct Otag { StringLoc name; CoreTypeBox type; Attributes attrs; };
-struct Oinherit { CoreTypeBox type; };
+struct Otag { StringLoc name; CoreTypeBox type; Attributes attrs; Location loc{}; };  // pof_loc: $sloc
+struct Oinherit { CoreTypeBox type; Location loc{}; };                              // pof_loc: $sloc
 using ObjectField = std::variant<Otag, Oinherit>;
 struct Ptyp_object { std::vector<ObjectField> fields; ClosedFlag closed = ClosedFlag::Closed; };  // < m:t; .. >
 struct Ptyp_package {  // (module S [with type t = u and …])

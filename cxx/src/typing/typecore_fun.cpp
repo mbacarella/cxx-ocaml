@@ -371,7 +371,7 @@ const pt::Expression* type_format(const Location& loc0, std::string_view str, en
     return mk_exp_loc(make<pt::Pexp_tuple>(pt::Pexp_tuple{{SXK::Pexp_tuple}, slice(el)}));
   };
   auto mk_constr = [&](std::string_view name, const std::vector<const pt::Expression*>& args) {
-    Longident::t lid = Longident::ldot(Longident::lident("CamlinternalFormatBasics"), location::none(), name,
+    Longident::t lid = Longident::ldot(Longident::lident(OCAML_LIT("CamlinternalFormatBasics")), location::none(), name,
                                        location::none());
     const pt::Expression* arg = args.empty() ? nullptr : args.size() == 1 ? args[0] : tuple(args);
     return construct(lid, arg);

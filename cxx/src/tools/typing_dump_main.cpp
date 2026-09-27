@@ -949,7 +949,7 @@ void core_type(const CoreType* t) {
         s("{");
         if (auto* ot = as<Otag>(f->pof_desc)) { s("Otag "); str_loc(ot->label); s(" "); core_type(ot->ty); }
         else { s("Oinherit "); core_type(as<Oinherit>(f->pof_desc)->ty); }
-        s(" "); gloc(f->pof_loc); s(" "); attrs(f->pof_attributes); s("}");
+        s(" "); loc(f->pof_loc); s(" "); attrs(f->pof_attributes); s("}");
       });
       s(" "); flag_closed(o->closed);
       break;
@@ -961,7 +961,7 @@ void core_type(const CoreType* t) {
     }
     case K::Ptyp_alias: {
       auto* a = as<Ptyp_alias>(d);
-      s("Ptyp_alias "); core_type(a->ty); s(" "); str_gloc(a->name);
+      s("Ptyp_alias "); core_type(a->ty); s(" "); str_loc(a->name);
       break;
     }
     case K::Ptyp_variant: {
@@ -970,11 +970,11 @@ void core_type(const CoreType* t) {
       list(v->fields, [](const RowField* f) {
         s("{");
         if (auto* rt = as<Rtag>(f->prf_desc)) {
-          s("Rtag "); str_gloc(rt->label); s(" "); bool_(rt->constant); s(" "); core_types(rt->types);
+          s("Rtag "); str_loc(rt->label); s(" "); bool_(rt->constant); s(" "); core_types(rt->types);
         } else {
           s("Rinherit "); core_type(as<Rinherit>(f->prf_desc)->ty);
         }
-        s(" "); gloc(f->prf_loc); s(" "); attrs(f->prf_attributes); s("}");
+        s(" "); loc(f->prf_loc); s(" "); attrs(f->prf_attributes); s("}");
       });
       s(" "); flag_closed(v->closed); s(" ");
       if (!v->has_labels) s("None");
@@ -1289,7 +1289,7 @@ void value_constraint(const ValueConstraint* vc) {
 void value_binding(const ValueBinding* vb) {
   s("{vb "); pattern(vb->pvb_pat); s(" "); expression(vb->pvb_expr); s(" ");
   popt(vb->pvb_constraint, value_constraint); s(" "); attrs(vb->pvb_attributes); s(" ");
-  gloc(vb->pvb_loc); s("}");
+  loc(vb->pvb_loc); s("}");
 }
 void value_description(const ValueDescription* v) {
   s("{val "); str_loc(v->pval_name); s(" "); core_type(v->pval_type); s(" ");

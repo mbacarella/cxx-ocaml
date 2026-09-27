@@ -342,13 +342,13 @@ struct Conv {
             std::vector<const RowField*> rows;
             for (auto& r : v.rows) {
               if (auto* rt = std::get_if<ast::Rtag>(&r)) {
-                auto* desc = make<Rtag>(Rtag{{RowFieldDesc::Kind::Rtag}, str_gap(rt->name),
+                auto* desc = make<Rtag>(Rtag{{RowFieldDesc::Kind::Rtag}, StrLoc{zborrow(rt->name), inner(rt->name_loc)},
                                              rt->constant, core_types(rt->types)});
-                rows.push_back(make<RowField>(desc, gap_loc(), attrs(rt->attrs)));
+                rows.push_back(make<RowField>(desc, inner(rt->loc), attrs(rt->attrs)));
               } else {
                 auto& ri = std::get<ast::Rinherit>(r);
                 auto* desc = make<Rinherit>(Rinherit{{RowFieldDesc::Kind::Rinherit}, core_type(*ri.ct)});
-                rows.push_back(make<RowField>(desc, gap_loc(), Attributes{}));
+                rows.push_back(make<RowField>(desc, inner(ri.loc), Attributes{}));
               }
             }
             Slice<std::string_view> labels;
@@ -362,11 +362,11 @@ struct Conv {
               if (auto* ot = std::get_if<ast::Otag>(&f)) {
                 auto* desc = make<Otag>(Otag{{ObjectFieldDesc::Kind::Otag}, str(ot->name),
                                              core_type(*ot->type)});
-                fs.push_back(make<ObjectField>(desc, gap_loc(), attrs(ot->attrs)));
+                fs.push_back(make<ObjectField>(desc, inner(ot->loc), attrs(ot->attrs)));
               } else {
                 auto& oi = std::get<ast::Oinherit>(f);
                 auto* desc = make<Oinherit>(Oinherit{{ObjectFieldDesc::Kind::Oinherit}, core_type(*oi.type)});
-                fs.push_back(make<ObjectField>(desc, gap_loc(), Attributes{}));
+                fs.push_back(make<ObjectField>(desc, inner(oi.loc), Attributes{}));
               }
             }
             d = make<Ptyp_object>(Ptyp_object{{K::Ptyp_object}, slice(fs), closed(v.closed)});

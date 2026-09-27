@@ -1299,7 +1299,7 @@ const tt::ClassExpr* class_expr_aux(std::string_view cl_num, Final final, env::t
       Slice<const tt::ValueBinding*> defs = tb.vbs;
       if (l->rec == RecFlag::Recursive) defs = tc::annotate_recursive_bindings(val_env2, defs);
       return mk_cl(mkd(tt::Tcl_let{{TK::Tcl_let}, l->rec, defs, slice(vals), cl}), scl->pcl_loc, cl->cl_type,
-                   val_env, scl->pcl_attributes);
+                   val_env2, scl->pcl_attributes);
     }
     case PK::Pcl_constraint: {
       auto* c = as<pt::Pcl_constraint>(d);

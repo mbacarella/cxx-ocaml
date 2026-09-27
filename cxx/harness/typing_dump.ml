@@ -684,17 +684,17 @@ module P = struct
              s "{"; (match f.pof_desc with
               | Otag (l, t) -> s "Otag "; str_loc l; s " "; core_type t
               | Oinherit t -> s "Oinherit "; core_type t);
-             s " "; gloc f.pof_loc; s " "; attrs f.pof_attributes; s "}") fl;
+             s " "; loc f.pof_loc; s " "; attrs f.pof_attributes; s "}") fl;
          s " "; flag_closed c
      | Ptyp_class (l, tl) -> s "Ptyp_class "; lid_loc l; s " "; list core_type tl
-     | Ptyp_alias (t, n) -> s "Ptyp_alias "; core_type t; s " "; str_gloc n
+     | Ptyp_alias (t, n) -> s "Ptyp_alias "; core_type t; s " "; str_loc n
      | Ptyp_variant (fl, c, ls) ->
          s "Ptyp_variant ";
          list (fun (f : row_field) ->
              s "{"; (match f.prf_desc with
-              | Rtag (l, b, tl) -> s "Rtag "; str_gloc l; s " "; bool b; s " "; list core_type tl
+              | Rtag (l, b, tl) -> s "Rtag "; str_loc l; s " "; bool b; s " "; list core_type tl
               | Rinherit t -> s "Rinherit "; core_type t);
-             s " "; gloc f.prf_loc; s " "; attrs f.prf_attributes; s "}") fl;
+             s " "; loc f.prf_loc; s " "; attrs f.prf_attributes; s "}") fl;
          s " "; flag_closed c; s " "; opt (list q) ls
      | Ptyp_poly (vs, t) -> s "Ptyp_poly "; list str_gloc vs; s " "; core_type t
      | Ptyp_package p -> s "Ptyp_package "; package_type ~gap:false p
@@ -821,7 +821,7 @@ module P = struct
   and value_binding (vb : value_binding) =
     s "{vb "; pattern vb.pvb_pat; s " "; expression vb.pvb_expr; s " ";
     opt value_constraint vb.pvb_constraint; s " "; attrs vb.pvb_attributes; s " ";
-    gloc vb.pvb_loc; s "}"
+    loc vb.pvb_loc; s "}"
 
   and value_description (v : value_description) =
     s "{val "; str_loc v.pval_name; s " "; core_type v.pval_type; s " ";

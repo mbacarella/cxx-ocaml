@@ -2039,14 +2039,18 @@ class Parser {
             advance();
             while (cur().kind == Kind::LBRACKETAT) { advance(); attrs.push_back(parse_attribute_body()); }  // $6
             if (!had) append_info_doc(attrs, tokens_[idx_ - 1].end);
-            fields.push_back(Otag{StringLoc{nm.text, tokloc(nm)}, std::move(ty), std::move(attrs)});
+            fields.push_back(Otag{StringLoc{nm.text, tokloc(nm)}, std::move(ty), std::move(attrs),
+                                  span(position(nm.start), position(tokens_[idx_ - 1].end))});
             continue;
           }
           append_info_doc(attrs, end4);  // field (last, no semi): symbol_info $endpos($4)
-          fields.push_back(Otag{StringLoc{nm.text, tokloc(nm)}, std::move(ty), std::move(attrs)});
+          fields.push_back(Otag{StringLoc{nm.text, tokloc(nm)}, std::move(ty), std::move(attrs),
+                                span(position(nm.start), position(end4))});
           break;
         } else {  // Oinherit: an inherited object type
-          fields.push_back(Oinherit{parse_core_type()});
+          size_t start = cur().start;
+          CoreTypeBox ty = parse_core_type();
+          fields.push_back(Oinherit{std::move(ty), span(position(start), position(tokens_[idx_ - 1].end))});
         }
         if (cur().kind == Kind::SEMI) advance(); else break;
       }
@@ -2059,9 +2063,11 @@ class Parser {
   CoreTypeBox parse_possibly_poly_type() { return parse_poly_type(/*ghost=*/false); }
   RowField parse_row_field() {
     if (cur().kind == Kind::BACKQUOTE) {
+      size_t start = cur().start;
       advance();
       const Token& tag = cur();
       advance();
+      Location name_loc = span(position(start), position(tag.end));
       std::vector<CoreTypeBox> types;
       bool amp = false;  // `\`A of & t` is still a "constant" tag (empty-conjunction prefix)
       if (cur().kind == Kind::OF) {
@@ -2077,9 +2083,12 @@ class Parser {
       Attributes attrs;  // prf_attributes: explicit `[@a]` then an info docstring
       while (cur().kind == Kind::LBRACKETAT) { advance(); attrs.push_back(parse_attribute_body()); }
       append_info_doc(attrs, tokens_[idx_ - 1].end);  // `\`Tag … (** info *)`
-      return Rtag{tag.text, constant, std::move(types), std::move(attrs)};
+      return Rtag{tag.text, constant, std::move(types), std::move(attrs), name_loc,
+                  span(position(start), position(tokens_[idx_ - 1].end))};
     }
-    return Rinherit{parse_core_type()};
+    size_t start = cur().start;
+    CoreTypeBox ty = parse_core_type();
+    return Rinherit{std::move(ty), span(position(start), position(tokens_[idx_ - 1].end))};
   }
 
   // ---- patterns ----
