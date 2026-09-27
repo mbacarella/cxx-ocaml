@@ -324,6 +324,8 @@ struct Conv {
       d.s = zborrow(s->s);
       d.str_loc = loc(s->strloc);
       d.delim = optstr_of(s->delim);
+      // Utf8_lexeme.normalize "": Misc's literal (lexer.mll's validate_delim)
+      if (s->delim && s->delim->empty()) d.delim = OptStr::of(ocaml_literal("utils/misc.ml", ""));
     } else {
       auto& f = std::get<ast::Pconst_float>(c.desc);
       d.kind = ConstantDesc::Kind::Pconst_float;
@@ -483,8 +485,11 @@ struct Conv {
               if (id.loc.loc_ghost) {
                 const Pattern* q = p;
                 if (auto* c = as<Ppat_constraint>(q->ppat_desc)) q = c->pat;
-                if (auto* var = as<Ppat_var>(q->ppat_desc); var && var->name.txt == id.txt->s)
+                if (auto* var = as<Ppat_var>(q->ppat_desc); var && var->name.txt == id.txt->s) {
+                  // Pat.mk ~loc:lbl.loc (Ppat_var (loc_last lbl)): one location record
                   const_cast<Ppat_var*>(var)->name.txt = id.txt->s;
+                  const_cast<Ppat_var*>(var)->name.loc = q->ppat_loc;
+                }
               }
               return std::make_pair(id, p);
             });
@@ -525,7 +530,18 @@ struct Conv {
   }
   Slice<ArgExpression> args(const std::vector<std::pair<ast::ArgLabel, ast::ExprBox>>& l) const {
     return map_slice<ArgExpression>(l, [&](auto& a) {
-      return ArgExpression{label(a.first), expression(*a.second)};
+      ArgExpression r{label(a.first), expression(*a.second)};
+      bool pun = std::visit([](auto& x) {
+        if constexpr (requires { x.pun; }) return x.pun;
+        else return false;
+      }, a.first);
+      if (pun) {
+        const Expression* x = r.exp;
+        if (auto* c = as<Pexp_constraint>(x->pexp_desc)) x = c->exp;
+        if (auto* i = as<Pexp_ident>(x->pexp_desc); i && i->lid.txt->kind == Longident::Kind::Lident)
+          r.label.name = i->lid.txt->s;  // mkexpvar label: one string
+      }
+      return r;
     });
   }
   const ValueConstraint* value_constraint(const ast::ValueConstraint& vc) const {
@@ -638,8 +654,11 @@ struct Conv {
                 const Expression* x = e;
                 if (auto* c = as<Pexp_constraint>(x->pexp_desc)) x = c->exp;
                 if (auto* i = as<Pexp_ident>(x->pexp_desc);
-                    i && i->lid.txt->kind == Longident::Kind::Lident && i->lid.txt->s == id.txt->s)
+                    i && i->lid.txt->kind == Longident::Kind::Lident && i->lid.txt->s == id.txt->s) {
+                  // Exp.mk ~loc:lid.loc (Pexp_ident lid): one location record
                   const_cast<Pexp_ident*>(i)->lid.txt = Longident::lident(id.txt->s);
+                  const_cast<Pexp_ident*>(i)->lid.loc = x->pexp_loc;
+                }
               }
               return std::make_pair(id, e);
             });

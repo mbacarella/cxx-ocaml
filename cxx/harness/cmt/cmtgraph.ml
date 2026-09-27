@@ -21,7 +21,7 @@ let rec dump b depth (o : Obj.t) =
         Printf.bprintf b "#%d[%d:" n t;
         for i = 0 to Obj.size o - 1 do
           if i > 0 then Buffer.add_char b ' ';
-          if depth > 400 then Buffer.add_string b "..." else dump b (depth + 1) (Obj.field o i)
+          if depth > 1_000_000 then Buffer.add_string b "..." else dump b (depth + 1) (Obj.field o i)
         done;
         Buffer.add_char b ']'
       end

@@ -976,7 +976,7 @@ class Parser {
         args.emplace_back(Optional{lt.text}, postfix_field(parse_atom()));
       } else if (k == Kind::TILDE && peek(1).kind == Kind::LIDENT) {  // ~x punning
         advance(); const Token& id = cur(); advance();
-        args.emplace_back(Labelled{id.text}, ident_expr(id.text, tokloc(id)));
+        args.emplace_back(Labelled{id.text, true}, ident_expr(id.text, tokloc(id)));
       } else if (k == Kind::TILDE && peek(1).kind == Kind::LPAREN &&
                  peek(2).kind == Kind::LIDENT && peek(3).kind == Kind::COLON) {  // ~(x : t)
         advance();  // ~
@@ -987,10 +987,10 @@ class Parser {
         const Token& rp = cur(); expect(Kind::RPAREN, ")");
         Location cl{position(lp.start), position(rp.end), false};
         ExprBox v = E({Pexp_constraint{ident_expr(id.text, tokloc(id)), std::move(ty)}, cl});
-        args.emplace_back(Labelled{id.text}, std::move(v));
+        args.emplace_back(Labelled{id.text, true}, std::move(v));
       } else if (k == Kind::QUESTION && peek(1).kind == Kind::LIDENT) {  // ?x punning
         advance(); const Token& id = cur(); advance();
-        args.emplace_back(Optional{id.text}, ident_expr(id.text, tokloc(id)));
+        args.emplace_back(Optional{id.text, true}, ident_expr(id.text, tokloc(id)));
       } else if (is_atom_start(k)) {
         args.emplace_back(Nolabel{}, postfix_field(parse_atom()));
       } else {
@@ -4760,8 +4760,8 @@ class Parser {
       Kind k = cur().kind;
       if (k == Kind::LABEL) { const Token& lt = cur(); advance(); args.emplace_back(Labelled{lt.text}, parse_atom_postfix()); }
       else if (k == Kind::OPTLABEL) { const Token& lt = cur(); advance(); args.emplace_back(Optional{lt.text}, parse_atom_postfix()); }
-      else if (k == Kind::TILDE && peek(1).kind == Kind::LIDENT) { advance(); const Token& id = cur(); advance(); args.emplace_back(Labelled{id.text}, ident_expr(id.text, tokloc(id))); }
-      else if (k == Kind::QUESTION && peek(1).kind == Kind::LIDENT) { advance(); const Token& id = cur(); advance(); args.emplace_back(Optional{id.text}, ident_expr(id.text, tokloc(id))); }
+      else if (k == Kind::TILDE && peek(1).kind == Kind::LIDENT) { advance(); const Token& id = cur(); advance(); args.emplace_back(Labelled{id.text, true}, ident_expr(id.text, tokloc(id))); }
+      else if (k == Kind::QUESTION && peek(1).kind == Kind::LIDENT) { advance(); const Token& id = cur(); advance(); args.emplace_back(Optional{id.text, true}, ident_expr(id.text, tokloc(id))); }
       else if (is_atom_start(k)) args.emplace_back(Nolabel{}, parse_atom_postfix());
       else break;
     }

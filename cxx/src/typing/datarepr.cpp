@@ -119,7 +119,9 @@ static ConstrArgs constructor_args(const UnitInfo* current_unit, PrivateFlag pri
   auto [tyl, existentials] = constructor_existentials(cd_args, cd_res);
   if (cd_args.kind == ConstructorArguments::Kind::Cstr_tuple)
     return {existentials, cd_args.tuple, nullptr};
-  auto type_params = free_vars(tuple_of(tyl), /*param=*/true);
+  // one list: the inlined declaration's type_params and the argument's
+  // Tconstr arguments (newgenconstr path type_params)
+  Slice<TypeExpr*> type_params = slice(free_vars(tuple_of(tyl), /*param=*/true));
   long arity = static_cast<long>(type_params.size());
   auto* kind = make<TypeKind>();
   kind->kind = TypeKind::Kind::Type_record;
@@ -128,10 +130,10 @@ static ConstrArgs constructor_args(const UnitInfo* current_unit, PrivateFlag pri
   // Separability.default_signature: Config.flat_float_array is true
   std::vector<Separability> sep(static_cast<std::size_t>(arity), Separability::Deepsep);
   auto* tdecl = make<TypeDeclaration>(
-      slice(type_params), arity, kind, priv, nullptr,
+      type_params, arity, kind, priv, nullptr,
       slice(variance::unknown_signature(true, arity)), slice(sep), false, lowest_level,
       location::none(), Attributes{}, TypeImmediacy::Unknown, false, uid::mk(current_unit));
-  return {existentials, slice(std::vector<TypeExpr*>{newgenconstr(path, slice(type_params))}), tdecl};
+  return {existentials, slice(std::vector<TypeExpr*>{newgenconstr(path, type_params)}), tdecl};
 }
 
 static std::vector<std::pair<Ident::t, const ConstructorDescription*>> constructor_descrs(
@@ -171,9 +173,12 @@ static std::vector<std::pair<Ident::t, const ConstructorDescription*>> construct
         if (rep == VariantRepresentation::Variant_unboxed) {
           representation.kind = RecordRepresentation::Kind::Record_unboxed;
           representation.unboxed_inlined = true;
+          static const void* unboxed_true = fresh_identity();  // a static constant
+          representation.obj = unboxed_true;
         } else {
           representation.kind = RecordRepresentation::Kind::Record_inlined;
           representation.inlined_tag = idx_nonconst;
+          representation.obj = fresh_identity();  // one block, shared by the labels
         }
         ConstrArgs ca = constructor_args(
             current_unit, decl->type_private, cd->cd_args, cd->cd_res,
@@ -197,6 +202,7 @@ const ConstructorDescription* extension_descr(const UnitInfo* current_unit, Path
   RecordRepresentation rep;
   rep.kind = RecordRepresentation::Kind::Record_extension;
   rep.extension = path_ext;
+  rep.obj = fresh_identity();
   ConstrArgs ca = constructor_args(current_unit, ext->ext_private, ext->ext_args,
                                    ext->ext_ret_type,
                                    Path::pextra_ty(path_ext, Path::Extra::Pext_ty), rep);

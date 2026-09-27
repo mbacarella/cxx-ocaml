@@ -113,8 +113,10 @@ enum class RecFlag { Nonrecursive, Recursive };
 
 // --- arg labels ---
 struct Nolabel {};
-struct Labelled { std::string name; };
-struct Optional { std::string name; };
+// pun: an application's `~x` / `~(x : t)` / `?x` (mkexpvar label): the
+// argument's identifier is the label's own string
+struct Labelled { std::string name; bool pun = false; };
+struct Optional { std::string name; bool pun = false; };
 using ArgLabel = std::variant<Nolabel, Labelled, Optional>;
 
 enum class ClosedFlag { Closed, Open };
