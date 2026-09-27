@@ -3255,6 +3255,8 @@ class Parser {
         TypeDeclaration d = parse_type_declaration(ds);
         d.attrs.insert(d.attrs.begin(), std::make_move_iterator(andattrs.begin()),
                        std::make_move_iterator(andattrs.end()));
+        // and_type_declaration's symbol_docs $sloc: its own pre/post docs
+        attach_docs(d.attrs, ds.cnum, d.loc.end.cnum);
         decls.push_back(std::move(d));
       }
       Location l = span(d0, position(tokens_[idx_ - 1].end));
@@ -3446,6 +3448,7 @@ class Parser {
       while (cur().kind == Kind::AND) {
         Position akw = position(cur().start); advance();
         decls.push_back(parse_one_class_type_decl(akw));
+        attach_docs(decls.back().attrs, akw.cnum, decls.back().loc.end.cnum);  // symbol_docs of the `and`
       }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
       attach_docs(decls[0].attrs, l.start.cnum, decls[0].loc.end.cnum);  // docs on 1st decl
@@ -3469,6 +3472,7 @@ class Parser {
       while (cur().kind == Kind::AND) {
         Position akw = position(cur().start); advance();
         decls.push_back(parse_one_class_decl(akw));
+        attach_docs(decls.back().attrs, akw.cnum, decls.back().loc.end.cnum);  // symbol_docs of the `and`
       }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
       attach_docs(decls[0].attrs, l.start.cnum, decls[0].loc.end.cnum);  // docs on 1st decl
@@ -3879,6 +3883,8 @@ class Parser {
         TypeDeclaration d = parse_type_declaration(ds);
         d.attrs.insert(d.attrs.begin(), std::make_move_iterator(andattrs.begin()),
                        std::make_move_iterator(andattrs.end()));
+        // and_type_declaration's symbol_docs $sloc: its own pre/post docs
+        attach_docs(d.attrs, ds.cnum, d.loc.end.cnum);
         decls.push_back(std::move(d));
       }
       attach_docs(decls[0].attrs, d0.cnum, decls[0].loc.end.cnum);
@@ -4012,6 +4018,7 @@ class Parser {
       while (cur().kind == Kind::AND) {
         Position akw = position(cur().start); advance();
         decls.push_back(parse_one_class_type_decl(akw));
+        attach_docs(decls.back().attrs, akw.cnum, decls.back().loc.end.cnum);  // symbol_docs of the `and`
       }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
       attach_docs(decls[0].attrs, l.start.cnum, decls[0].loc.end.cnum);  // docs on 1st decl
