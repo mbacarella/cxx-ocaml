@@ -962,17 +962,19 @@ void check_unused(long lev, env::t env, TypeExpr* expected_ty,
 }
 
 // ---- delayed checks, executed after typing the whole compilation unit ----------------------
-// (f, Warnings.backup ()) pairs, head first
+// (f, Warnings.backup ()) pairs, oldest first (typecore.ml conses them
+// and runs List.rev of the list)
 static std::vector<std::pair<std::function<void()>, warnings::State>> delayed_checks;
 void reset_delayed_checks() { delayed_checks.clear(); }
 void add_delayed_check(std::function<void()> f) {
-  delayed_checks.insert(delayed_checks.begin(), {std::move(f), warnings::backup()});
+  delayed_checks.emplace_back(std::move(f), warnings::backup());
 }
 void force_delayed_checks() {
   // checks may change type levels
   Snapshot snap = btype::snapshot();
   warnings::State w_old = warnings::backup();
-  std::vector<std::pair<std::function<void()>, warnings::State>> l(delayed_checks.rbegin(), delayed_checks.rend());
+  std::vector<std::pair<std::function<void()>, warnings::State>> l = std::move(delayed_checks);
+  delayed_checks.clear();
   for (auto& [f, w] : l) {
     warnings::restore(w);
     f();

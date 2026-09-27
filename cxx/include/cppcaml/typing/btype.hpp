@@ -1,6 +1,8 @@
 // Port of typing/btype.ml (TYPECHECKER.md): basic operations on core types.
 #pragma once
 
+#include "cppcaml/typing/fn_ref.hpp"
+
 #include <functional>
 #include <map>
 #include <optional>
@@ -63,7 +65,7 @@ class TypePairs {
   void add(TypeExpr* a, TypeExpr* b);
   bool mem(TypeExpr* a, TypeExpr* b) const;
   // iterate in insertion order
-  void iter(const std::function<void(TypeExpr*, TypeExpr*)>& f) const;
+  void iter(FnRef<void(TypeExpr*, TypeExpr*)> f) const;
 
  private:
   struct H {
@@ -82,7 +84,7 @@ inline constexpr long lowest_level = ident::lowest_scope;
 // ---- leveled type pool --------------------------------------------------
 // with_new_pool(level, f): run f with a fresh pool on top, return the nodes
 // added to it (most recent first, as the OCaml list).
-std::vector<TypeExpr*> with_new_pool(long level, const std::function<void()>& f);
+std::vector<TypeExpr*> with_new_pool(long level, FnRef<void()> f);
 void add_to_pool(long level, TypeExpr* ty);
 
 // ---- type creators ------------------------------------------------------
@@ -129,17 +131,17 @@ void set_static_row_name(const TypeDeclaration* decl, Path::t path);
 // fold_row / fold_type_desc / fold_type_expr: every OCaml fold here is a
 // sequence of calls in a fixed order, so the iter_ forms (same order) serve
 // with the accumulator captured by the callback.
-void iter_row(const std::function<void(TypeExpr*)>& f, const RowDesc* row);
-void iter_type_expr(const std::function<void(TypeExpr*)>& f, TypeExpr* ty);
-void iter_type_desc(const std::function<void(TypeExpr*)>& f, const TypeDesc* d);
-void iter_abbrev_memo(const std::function<void(TypeExpr*)>& f, const AbbrevMemo* m);
-void iter_type_expr_cstr_args(const std::function<void(TypeExpr*)>& f,
+void iter_row(FnRef<void(TypeExpr*)> f, const RowDesc* row);
+void iter_type_expr(FnRef<void(TypeExpr*)> f, TypeExpr* ty);
+void iter_type_desc(FnRef<void(TypeExpr*)> f, const TypeDesc* d);
+void iter_abbrev_memo(FnRef<void(TypeExpr*)> f, const AbbrevMemo* m);
+void iter_type_expr_cstr_args(FnRef<void(TypeExpr*)> f,
                               const ConstructorArguments& a);
-ConstructorArguments map_type_expr_cstr_args(const std::function<TypeExpr*(TypeExpr*)>& f,
+ConstructorArguments map_type_expr_cstr_args(FnRef<TypeExpr*(TypeExpr*)> f,
                                              const ConstructorArguments& a);
-void iter_type_expr_kind(const std::function<void(TypeExpr*)>& f, const TypeKind* k);
-const Package* map_pack(const std::function<Path::t(Path::t)>& map_path,
-                        const std::function<TypeExpr*(TypeExpr*)>& map_type,
+void iter_type_expr_kind(FnRef<void(TypeExpr*)> f, const TypeKind* k);
+const Package* map_pack(FnRef<Path::t(Path::t)> map_path,
+                        FnRef<TypeExpr*(TypeExpr*)> map_type,
                         const Package* p);
 
 // ---- marking --------------------------------------------------------------
@@ -172,10 +174,10 @@ TypeIterators type_iterators_without_type_expr();
 TypeIterators type_iterators(types::TypeMark& mark);
 
 // ---- copying --------------------------------------------------------------
-const RowDesc* copy_row(const std::function<TypeExpr*(TypeExpr*)>& f, bool fixed,
+const RowDesc* copy_row(FnRef<TypeExpr*(TypeExpr*)> f, bool fixed,
                         const RowDesc* row, bool keep, TypeExpr* more);
 Commutable* copy_commu(Commutable* c);
-const TypeDesc* copy_type_desc(const std::function<TypeExpr*(TypeExpr*)>& f,
+const TypeDesc* copy_type_desc(FnRef<TypeExpr*(TypeExpr*)> f,
                                const TypeDesc* d, bool keep_names = false);
 
 // For_copy (copy scopes)
@@ -183,7 +185,7 @@ struct CopyScope {
   std::vector<std::pair<TypeExpr*, const TypeDesc*>> saved_desc;
 };
 void redirect_desc(CopyScope& scope, TypeExpr* ty, const TypeDesc* desc);
-void with_copy_scope(const std::function<void(CopyScope&)>& f);
+void with_copy_scope(FnRef<void(CopyScope&)> f);
 
 // ---- memorization of abbreviation expansion --------------------------------
 TypeExpr* find_expans(PrivateFlag priv, Path::t p1, const AbbrevMemo* m);  // nullptr = None

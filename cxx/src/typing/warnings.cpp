@@ -125,8 +125,8 @@ State initial_state() {
   State s;
   s.active.fill(true);
   s.error.fill(false);
-  s.alerts = {{}, false};
-  s.alert_errors = {{}, true};  // all soft
+  s.alerts = std::make_shared<const AlertSet>(AlertSet{{}, false});
+  s.alert_errors = std::make_shared<const AlertSet>(AlertSet{{}, true});  // all soft
   return s;
 }
 
@@ -143,12 +143,13 @@ void set_alert(bool error, bool enable, std::string_view s) {
   if (s == "all") {
     upd = {{}, !enable};
   } else {
-    upd = error ? current().alert_errors : current().alerts;
+    upd = error ? *current().alert_errors : *current().alerts;
     if (enable == upd.pos) upd.set.insert(std::string(s));
     else upd.set.erase(std::string(s));
   }
-  if (error) current().alert_errors = upd;
-  else current().alerts = upd;
+  auto p = std::make_shared<const AlertSet>(std::move(upd));
+  if (error) current().alert_errors = p;
+  else current().alerts = p;
 }
 
 enum class Modifier { Set, Clear, Set_all };
@@ -368,12 +369,12 @@ bool is_error(int number) {
 }
 bool alert_is_active(std::string_view kind) {
   ensure_defaults();
-  const AlertSet& a = current().alerts;
+  const AlertSet& a = *current().alerts;
   return !disabled && (a.set.count(std::string(kind)) != 0) == a.pos;
 }
 bool alert_is_error(std::string_view kind) {
   ensure_defaults();
-  const AlertSet& a = current().alert_errors;
+  const AlertSet& a = *current().alert_errors;
   return !disabled && (a.set.count(std::string(kind)) != 0) == a.pos;
 }
 

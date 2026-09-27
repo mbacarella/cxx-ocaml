@@ -1,6 +1,7 @@
 // Port of typing/btype.ml.  See btype.hpp.
 #include "cppcaml/typing/btype.hpp"
 
+#include <algorithm>
 #include <climits>
 #include <stdexcept>
 
@@ -18,7 +19,7 @@ void TypePairs::add(TypeExpr* a, TypeExpr* b) {
 bool TypePairs::mem(TypeExpr* a, TypeExpr* b) const {
   return set_.count(std::make_pair(repr(a), repr(b))) != 0;
 }
-void TypePairs::iter(const std::function<void(TypeExpr*, TypeExpr*)>& f) const {
+void TypePairs::iter(FnRef<void(TypeExpr*, TypeExpr*)> f) const {
   for (auto& [a, b] : elems_) f(a, b);
 }
 
@@ -37,7 +38,7 @@ static Pool* pool_of_level(long level, Pool* pool) {
   return pool;
 }
 
-std::vector<TypeExpr*> with_new_pool(long level, const std::function<void()>& f) {
+std::vector<TypeExpr*> with_new_pool(long level, FnRef<void()> f) {
   Pool pool{level, {}, g_pool_stack};
   Pool* saved = g_pool_stack;
   g_pool_stack = &pool;
@@ -48,7 +49,9 @@ std::vector<TypeExpr*> with_new_pool(long level, const std::function<void()>& f)
   } restore{g_pool_stack, saved};
   f();
   // OCaml returns pool.pool, whose head is the most recently added node.
-  return std::vector<TypeExpr*>(pool.pool.rbegin(), pool.pool.rend());
+  std::vector<TypeExpr*> r = std::move(pool.pool);
+  std::reverse(r.begin(), r.end());
+  return r;
 }
 
 void add_to_pool(long level, TypeExpr* ty) {
@@ -225,7 +228,7 @@ void set_static_row_name(const TypeDeclaration* decl, Path::t path) {
 }
 
 // ---- traversal --------------------------------------------------------------
-void iter_row(const std::function<void(TypeExpr*)>& f, const RowDesc* row) {
+void iter_row(FnRef<void(TypeExpr*)> f, const RowDesc* row) {
   for (auto& e : row_fields(row)) {
     auto v = row_field_repr(e.field);
     if (v.kind == RowFieldView::Kind::Rpresent && v.present) f(v.present);
@@ -246,7 +249,7 @@ void iter_row(const std::function<void(TypeExpr*)>& f, const RowDesc* row) {
   }
 }
 
-void iter_type_desc(const std::function<void(TypeExpr*)>& f, const TypeDesc* d) {
+void iter_type_desc(FnRef<void(TypeExpr*)> f, const TypeDesc* d) {
   switch (d->kind) {
     case DescKind::Tvar: return;
     case DescKind::Tarrow: { auto* a = as<Tarrow>(d); f(a->t1); f(a->t2); return; }
@@ -292,11 +295,11 @@ void iter_type_desc(const std::function<void(TypeExpr*)>& f, const TypeDesc* d) 
   }
 }
 
-void iter_type_expr(const std::function<void(TypeExpr*)>& f, TypeExpr* ty) {
+void iter_type_expr(FnRef<void(TypeExpr*)> f, TypeExpr* ty) {
   iter_type_desc(f, get_desc(ty));
 }
 
-void iter_abbrev_memo(const std::function<void(TypeExpr*)>& f, const AbbrevMemo* m) {
+void iter_abbrev_memo(FnRef<void(TypeExpr*)> f, const AbbrevMemo* m) {
   for (;;) {
     switch (m->kind) {
       case AbbrevMemo::Kind::Mnil: return;
@@ -312,7 +315,7 @@ void iter_abbrev_memo(const std::function<void(TypeExpr*)>& f, const AbbrevMemo*
   }
 }
 
-void iter_type_expr_cstr_args(const std::function<void(TypeExpr*)>& f,
+void iter_type_expr_cstr_args(FnRef<void(TypeExpr*)> f,
                               const ConstructorArguments& a) {
   if (a.kind == ConstructorArguments::Kind::Cstr_tuple) {
     for (TypeExpr* t : a.tuple) f(t);
@@ -321,7 +324,7 @@ void iter_type_expr_cstr_args(const std::function<void(TypeExpr*)>& f,
   }
 }
 
-ConstructorArguments map_type_expr_cstr_args(const std::function<TypeExpr*(TypeExpr*)>& f,
+ConstructorArguments map_type_expr_cstr_args(FnRef<TypeExpr*(TypeExpr*)> f,
                                              const ConstructorArguments& a) {
   ConstructorArguments r;
   r.kind = a.kind;
@@ -341,7 +344,7 @@ ConstructorArguments map_type_expr_cstr_args(const std::function<TypeExpr*(TypeE
   return r;
 }
 
-void iter_type_expr_kind(const std::function<void(TypeExpr*)>& f, const TypeKind* k) {
+void iter_type_expr_kind(FnRef<void(TypeExpr*)> f, const TypeKind* k) {
   switch (k->kind) {
     case TypeKind::Kind::Type_variant:
       for (auto* cd : k->constructors) {
@@ -357,8 +360,8 @@ void iter_type_expr_kind(const std::function<void(TypeExpr*)>& f, const TypeKind
   }
 }
 
-const Package* map_pack(const std::function<Path::t(Path::t)>& map_path,
-                        const std::function<TypeExpr*(TypeExpr*)>& map_type,
+const Package* map_pack(FnRef<Path::t(Path::t)> map_path,
+                        FnRef<TypeExpr*(TypeExpr*)> map_type,
                         const Package* p) {
   Path::t np = map_path(p->pack_path);
   std::vector<PackConstraint> cs;
@@ -493,7 +496,7 @@ TypeIterators type_iterators(TypeMark& mark) {
 }
 
 // ---- copying --------------------------------------------------------------
-const RowDesc* copy_row(const std::function<TypeExpr*(TypeExpr*)>& f, bool fixed,
+const RowDesc* copy_row(FnRef<TypeExpr*(TypeExpr*)> f, bool fixed,
                         const RowDesc* row, bool keep, TypeExpr* more) {
   RowDescRepr r = row_repr(row);
   std::vector<RowFieldEntry> fields;
@@ -530,7 +533,7 @@ const RowDesc* copy_row(const std::function<TypeExpr*(TypeExpr*)>& f, bool fixed
 
 Commutable* copy_commu(Commutable* c) { return is_commu_ok(c) ? commu_ok() : commu_var(); }
 
-const TypeDesc* copy_type_desc(const std::function<TypeExpr*(TypeExpr*)>& f,
+const TypeDesc* copy_type_desc(FnRef<TypeExpr*(TypeExpr*)> f,
                                const TypeDesc* d, bool keep_names) {
   switch (d->kind) {
     case DescKind::Tvar:
@@ -602,14 +605,23 @@ void redirect_desc(CopyScope& scope, TypeExpr* ty, const TypeDesc* desc) {
   transient_expr::set_desc(ty, desc);
 }
 
-void with_copy_scope(const std::function<void(CopyScope&)>& f) {
+// saved_desc buffers of finished copy scopes, reused (the scopes nest)
+static std::vector<std::vector<std::pair<TypeExpr*, const TypeDesc*>>> g_saved_desc_free;
+
+void with_copy_scope(FnRef<void(CopyScope&)> f) {
   CopyScope scope;
+  if (!g_saved_desc_free.empty()) {
+    scope.saved_desc = std::move(g_saved_desc_free.back());
+    g_saved_desc_free.pop_back();
+  }
   struct Cleanup {
     CopyScope& s;
     ~Cleanup() {
       // List.iter over saved_desc, which conses: newest first
       for (auto it = s.saved_desc.rbegin(); it != s.saved_desc.rend(); ++it)
         transient_expr::set_desc(it->first, it->second);
+      s.saved_desc.clear();
+      g_saved_desc_free.push_back(std::move(s.saved_desc));
     }
   } cleanup{scope};
   f(scope);

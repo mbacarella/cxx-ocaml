@@ -396,7 +396,24 @@ bool is_contractive(env::t env, Path::t p) {
 }
 
 // ---- occur check ---------------------------------------------------------------------
-static void occur_rec(env::t env, TypeMark& visited, bool allow_recursive, const TypeSet& parents,
+// occur_rec's `parents` (a TypeSet of the ancestors in ctype.ml): only ever
+// extended by one node for the recursive calls, so a chain on the stack --
+// membership by the representative's identity, as TypeSet's compare by id.
+namespace {
+struct Parents {
+  TypeExpr* ty;  // repr'd when added (TypeSet.add)
+  const Parents* next;
+  bool mem(TypeExpr* t) const {
+    TypeExpr* r = repr(t);
+    for (const Parents* p = this; p; p = p->next)
+      if (p->ty == r) return true;
+    return false;
+  }
+};
+bool parents_mem(const Parents* p, TypeExpr* t) { return p && p->mem(t); }
+}  // namespace
+
+static void occur_rec(env::t env, TypeMark& visited, bool allow_recursive, const Parents* parents,
                       TypeExpr* ty0, TypeExpr* ty) {
   if (!not_marked_node(visited, ty)) return;
   if (eq_type(ty, ty0)) throw Occur{};
@@ -404,11 +421,10 @@ static void occur_rec(env::t env, TypeMark& visited, bool allow_recursive, const
   if (auto* c = as<Tconstr>(d)) {
     if (!(allow_recursive && is_contractive(env, c->path))) {
       try {
-        if (parents.mem(ty)) throw Occur{};
-        TypeSet parents2 = parents;
-        parents2.add(ty);
+        if (parents_mem(parents, ty)) throw Occur{};
+        Parents parents2{repr(ty), parents};
         iter_type_expr(
-            [&](TypeExpr* t) { occur_rec(env, visited, allow_recursive, parents2, ty0, t); }, ty);
+            [&](TypeExpr* t) { occur_rec(env, visited, allow_recursive, &parents2, ty0, t); }, ty);
       } catch (const Occur&) {
         TypeExpr* ty2;
         try {
@@ -420,11 +436,10 @@ static void occur_rec(env::t env, TypeMark& visited, bool allow_recursive, const
       }
     }
   } else if (d->kind == DescKind::Tobject || d->kind == DescKind::Tvariant) {
-  } else if (!(allow_recursive || parents.mem(ty))) {
-    TypeSet parents2 = parents;
-    parents2.add(ty);
+  } else if (!(allow_recursive || parents_mem(parents, ty))) {
+    Parents parents2{repr(ty), parents};
     iter_type_expr(
-        [&](TypeExpr* t) { occur_rec(env, visited, allow_recursive, parents2, ty0, t); }, ty);
+        [&](TypeExpr* t) { occur_rec(env, visited, allow_recursive, &parents2, ty0, t); }, ty);
   }
   try_mark_node(visited, ty);
 }
@@ -444,7 +459,7 @@ void occur(const Uenv& uenv, TypeExpr* ty0, TypeExpr* ty) {
       type_changed = false;
       if (!eq_type(ty0, ty))
         with_type_mark(
-            [&](TypeMark& mark) { occur_rec(env, mark, allow_recursive, TypeSet{}, ty0, ty); });
+            [&](TypeMark& mark) { occur_rec(env, mark, allow_recursive, nullptr, ty0, ty); });
     } while (type_changed);
     if (old) type_changed = true;
   } catch (...) {

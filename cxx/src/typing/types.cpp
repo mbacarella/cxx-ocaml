@@ -388,31 +388,37 @@ long get_id(TypeExpr* t) { return repr(t)->id; }
 struct TypeMark {
   bool is_hash;
   long mark = 0;
-  std::vector<TypeExpr*> marked;
+  std::vector<TypeExpr*>* marked = nullptr;  // the mark's list of marked nodes (reused)
   std::unordered_set<TypeExpr*> visited;
 };
 
-// type_marks = all the bits in marks_mask (Sys.int_size - 27 = 36 of them)
+// type_marks = all the bits in marks_mask (Sys.int_size - 27 = 36 of them),
+// kept as a stack: the head of types.ml's available_marks list is last.
+// with_type_mark takes the head and gives it back on exit, so the uses nest.
 static std::vector<long> g_available_marks = [] {
   std::vector<long> v;
-  for (int x = 0; x < 63 - 27; ++x) v.push_back(1L << (x + 27));
+  for (int x = 63 - 27 - 1; x >= 0; --x) v.push_back(1L << (x + 27));
   return v;
 }();
+// one list of marked nodes per mark bit, emptied on release (its buffer stays)
+static std::vector<TypeExpr*> g_marked[64];
 
-void with_type_mark(const std::function<void(TypeMark&)>& f) {
+void with_type_mark(FnRef<void(TypeMark&)> f) {
   if (!g_available_marks.empty()) {
-    auto old = g_available_marks;
-    TypeMark mk{false, g_available_marks.front()};
-    g_available_marks.erase(g_available_marks.begin());
+    long m = g_available_marks.back();
+    g_available_marks.pop_back();
+    std::vector<TypeExpr*>& lst = g_marked[__builtin_ctzl(static_cast<unsigned long>(m))];
+    lst.clear();
+    TypeMark mk{false, m, &lst};
     struct Restore {
-      std::vector<long>& avail;
-      std::vector<long> old;
-      TypeMark& mk;
+      long m;
+      std::vector<TypeExpr*>& lst;
       ~Restore() {
-        avail = std::move(old);
-        for (TypeExpr* ty : mk.marked) ty->scope &= ~mk.mark;
+        for (TypeExpr* ty : lst) ty->scope &= ~m;
+        lst.clear();
+        g_available_marks.push_back(m);
       }
-    } restore{g_available_marks, std::move(old), mk};
+    } restore{m, lst};
     f(mk);
   } else {
     TypeMark mk{true};
@@ -429,7 +435,7 @@ static bool try_mark_transient(TypeMark& mark, TypeExpr* ty) {
   if (!mark.is_hash) {
     if (ty->scope & mark.mark) return false;
     ty->scope |= mark.mark;
-    mark.marked.push_back(ty);
+    mark.marked->push_back(ty);
     return true;
   }
   return mark.visited.insert(ty).second;
@@ -442,7 +448,7 @@ const PathArgs* get_abbrev(TypeExpr* t) {
   if (auto* e = as<Texpand>(t->desc)) return make<PathArgs>(e->path, e->args);
   return nullptr;
 }
-void iter_abbrev(const std::function<void(Path::t, Slice<TypeExpr*>)>& f, TypeExpr* t) {
+void iter_abbrev(FnRef<void(Path::t, Slice<TypeExpr*>)> f, TypeExpr* t) {
   repr(t);
   if (auto* e = as<Texpand>(t->desc)) f(e->path, e->args);
 }
@@ -624,7 +630,7 @@ bool eq_row_field_ext(const RowField* a, const RowField* b) {
   return row_field_ext(a) == row_field_ext(b);
 }
 bool changed_row_field_exts(const std::vector<const RowField*>& l,
-                            const std::function<void()>& f) {
+                            FnRef<void()> f) {
   std::vector<RowFieldCell*> exts;
   for (auto* x : l) exts.push_back(row_field_ext(x));
   f();
@@ -883,7 +889,7 @@ Snapshot snapshot() {
   return {g_trail, old};
 }
 
-void backtrack(const std::function<void()>& cleanup, Snapshot s) {
+void backtrack(FnRef<void()> cleanup, Snapshot s) {
   const Changes* c = s.changes->contents;
   switch (c->kind) {
     case Changes::Kind::Unchanged:
