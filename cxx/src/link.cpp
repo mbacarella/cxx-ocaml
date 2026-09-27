@@ -233,9 +233,8 @@ struct Symtable {
   // which is num_of_prim's fallthrough.  Numbering only the used ones instead
   // gave every C_CALL a different operand AND a short PRIM section (55 names
   // where upstream writes all 482), which is why no linked program ever
-  // matched byte-for-byte.  NOBUILTINPRIMS reverts to the old numbering.
+  // matched byte-for-byte.
   void init_prims() {
-    if (std::getenv("NOBUILTINPRIMS")) return;
     for (const char* name : kBuiltinPrimitives) of_prim(name);
   }
   void init_predef() {
@@ -358,7 +357,7 @@ void link_executable(const std::vector<std::string>& inputs,
   // payloads `[@@unboxed]` (cmo_format.mli:22,26), so a key is a 1-field block
   // holding the name string, tag 0 for a unit and tag 1 for a predef -- and
   // the map's ordering is the POLYMORPHIC compare, which orders by tag first
-  // and then by the string.  NOSYMBSECT drops the section again.
+  // and then by the string.
   std::vector<std::pair<std::string, int>> gslots;   // (key, slot), slot order
   for (auto& [key, slot] : st.globals) gslots.push_back({key, slot});
   std::sort(gslots.begin(), gslots.end(),
@@ -429,16 +428,14 @@ void link_executable(const std::vector<std::string>& inputs,
                                 omarshal::vint(n->d), tval(n->r),
                                 omarshal::vint(n->h)});
   };
-  std::vector<std::uint8_t> symb;
-  if (!std::getenv("NOSYMBSECT"))
-    symb = omarshal::marshal(
-        omarshal::vblock(0, {omarshal::vint(st.cnt), tval(groot)}));
+  std::vector<std::uint8_t> symb =
+      omarshal::marshal(omarshal::vblock(0, {omarshal::vint(st.cnt), tval(groot)}));
 
   //   CRCS: `output_value outchan (extract_crc_interfaces())` (bytelink.ml:647)
   // -- a `(modname * Digest.t option) list` over every interface any linked
   // unit imported.  Consistbl.extract sort_uniq's the names and then folds
   // with `::`, so the list comes out in DESCENDING name order (consistbl.ml:61).
-  // A name recorded with no digest stays `None`.  NOCRCSSECT drops it again.
+  // A name recorded with no digest stays `None`.
   std::map<std::string, std::string> crcs;   // name -> digest ("" = None)
   for (const InputFile& fi : files)
     for (const Unit& u : fi.units) {
@@ -455,9 +452,7 @@ void link_executable(const std::vector<std::string>& inputs,
         0, {omarshal::vstr(it->first),
             it->second.empty() ? omarshal::vint(0)
                                : omarshal::vblock(0, {omarshal::vstr(it->second)})}));
-  std::vector<std::uint8_t> crcsec;
-  if (!std::getenv("NOCRCSSECT"))
-    crcsec = omarshal::marshal(omarshal::vlist(crcl));
+  std::vector<std::uint8_t> crcsec = omarshal::marshal(omarshal::vlist(crcl));
 
   // PRIM: required C-primitive names, NUL-terminated, in numbering order.
   std::vector<std::uint8_t> prim;

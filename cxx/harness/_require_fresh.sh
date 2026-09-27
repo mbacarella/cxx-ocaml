@@ -3,7 +3,7 @@
 # The parity/DDC/bootstrap harnesses run `cxx/build/c++*` binaries.  Those are a
 # SEPARATE build from `cxx/build-release/` (the one iterated on by hand), so a
 # `ninja -C cxx/build-release ...` + `cp` of one binary leaves the OTHERS stale:
-# on 2026-07-12/13 `cxx/build/c++type` and `c++lambda` sat 5 days behind source
+# on 2026-07-12/13 two of the `cxx/build/` tools sat 5 days behind source
 # while the gates reported green -- a two-day vacuous pass that hid live
 # segfaults.  This guard makes that impossible: before a harness uses a
 # `cxx/build` binary, it re-runs ninja (which does precise source-dependency
@@ -12,7 +12,7 @@
 #
 # Usage (source, then call with the ninja target(s) the harness needs):
 #     source "$(dirname "${BASH_SOURCE[0]}")/_require_fresh.sh"
-#     require_fresh c++type              # or: c++ocamlc c++link, etc.
+#     require_fresh c++ocamlc c++link
 #
 # Escape hatch: CPPCAML_SKIP_FRESH=1 skips the check (e.g. bisecting a
 # hand-built binary).  It prints a loud warning so a skip is never silent.

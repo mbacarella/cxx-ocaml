@@ -12,11 +12,7 @@ namespace cppcaml::omarshal {
 // = 0x300 (shared_heap.h:75).  Writing 0 there is read back identically -- the
 // intern side masks the colour off -- but it is not the same BYTES, which is
 // what a linked executable is compared on.
-// NOMARSHALHDR reverts both this and the custom-block word accounting below.
-inline std::uint32_t hdr_color() {
-  static const std::uint32_t c = std::getenv("NOMARSHALHDR") ? 0u : 3u << 8;
-  return c;
-}
+inline std::uint32_t hdr_color() { return 3u << 8; }
 
 ValPtr vint(long long n) { auto v = std::make_shared<Value>(); v->k = Value::Int; v->i = n; return v; }
 ValPtr vstr(std::string s) { auto v = std::make_shared<Value>(); v->k = Value::Str; v->s = std::move(s); return v; }
@@ -127,13 +123,8 @@ struct Marshaler {
       case Value::Custom: {  // verbatim on-disk custom bytes (incl. its code byte)
         for (char c : v->s) byte((std::uint8_t)c);
         nobjs++;                                  // extern.c:858 (header + ops)
-        if (std::getenv("NOMARSHALHDR")) {
-          long long words = 1 + (v->custom_bytes + 7) / 8;
-          w32 += 1 + words; w64 += 1 + words;
-        } else {
-          w32 += 2 + (((v->custom_bytes32 >= 0 ? v->custom_bytes32 : v->custom_bytes) + 3) >> 2);
-          w64 += 2 + ((v->custom_bytes + 7) >> 3);
-        }
+        w32 += 2 + (((v->custom_bytes32 >= 0 ? v->custom_bytes32 : v->custom_bytes) + 3) >> 2);
+        w64 += 2 + ((v->custom_bytes + 7) >> 3);
         return;
       }
     }

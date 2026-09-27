@@ -5,8 +5,9 @@
 // This is the bottom plumbing layer for loading .cmi files: a .cmi is just the
 // cmi magic string followed by three back-to-back Marshal values
 // ((name, signature), crcs, flags).  We decode the wire format into a generic
-// value arena that faithfully reconstructs sharing and cycles, then a higher
-// layer (cmi.cpp) interprets that arena as Types.signature.
+// value arena that faithfully reconstructs sharing and cycles, which
+// typing/cmi_format.cpp's Reader interprets (and link.cpp / Bytepackager read
+// .cmo descriptors with).
 //
 // Scope: small + big headers, uncompressed.  The cmi read path is always plain
 // Marshal (utils/compression.ml: input_value = Stdlib.input_value), and our

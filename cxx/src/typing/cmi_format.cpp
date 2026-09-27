@@ -906,7 +906,7 @@ class Writer {
   // type_variance / type_separability ...), so one value per storage.
   template <class T, class F>
   V list(const Slice<T>& l, F&& elt) {
-    if (l.empty() || getenv("CMIW_NOLISTSHARE")) {
+    if (l.empty()) {
       std::vector<V> xs;
       for (auto& x : l) xs.push_back(elt(x));
       return o::vlist(xs);

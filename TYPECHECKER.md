@@ -129,6 +129,13 @@ sets `Clflags.binary_annotations` for it).
   refusals too.)
 - c++ocamlc's own: `-stdlib <dir>` (Config.standard_library, undocumented:
   the bootstrap harnesses build against a stdlib being built).
+- Development switches (environment, not ocamlc's): `CPPCAML_PROFILE=1`
+  (phase timers on stderr; `cxx/harness/bench.sh PHASES=1` sums them),
+  `CPPCAML_TYPECHECK_DEBUG=1` / `CPPCAML_REPORT_DEBUG=1` (the details of an
+  internal failure / of an error reporter that raised),
+  `CPPCAML_LINKMAP=1` (a `.linkmap` sidecar next to a linked program),
+  `CPPCAML_NO_FASTEXIT=1` (tear the process down normally instead of
+  `_exit`, e.g. for leak checkers).
 
 ## What counts as progress
 

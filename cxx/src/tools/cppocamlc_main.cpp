@@ -38,7 +38,6 @@
 #include <string>
 #include <vector>
 
-#include "cppcaml/dbgenv.hpp"
 #include "cppcaml/link.hpp"
 #include "cppcaml/parser.hpp"
 #include "cppcaml/lexer.hpp"
@@ -125,10 +124,8 @@ static bool ends_with(const std::string& s, const char* suf) {
 
 // Compile a single .ml -> .cmo (+ .cmi unless a hand-written .mli exists).
 // Returns 0 on success.  `cmo_out` is where the .cmo is written.
-// -d* debug dumps (like ocamlc's): print an intermediate representation to
-// stdout during compilation and keep going.  Byte-comparable (after the usual
-// label/stamp normalization) with the matching `ocamlc -d*` and with the
-// standalone c++parse / c++lambda / c++instr tools.
+// -d* debug dumps: ocamlc's, on its ppf_dump (stderr, or a file with
+// -dump-into-file / -dump-dir), byte for byte.
 
 
 
@@ -281,7 +278,7 @@ static PortResult port_typecheck(const std::string& in_path, const std::string& 
                                  const PortBody& body) {
   namespace ty = cppcaml::typing;
   install_typing();
-  const bool debug = cppcaml::dbg_env("CPPCAML_TYPECHECK_DEBUG");
+  const bool debug = std::getenv("CPPCAML_TYPECHECK_DEBUG") != nullptr;
   try {
     init_path();
     // Compile_common: Env.set_current_unit; Compmisc.initial_env
