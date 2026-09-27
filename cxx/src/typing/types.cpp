@@ -902,16 +902,16 @@ void backtrack(FnRef<void()> cleanup, Snapshot s) {
       // rev_log accumulates oldest-first then the list is walked in that
       // order: `rev_log [] change` builds newest-first, and List.iter undoes
       // newest-first.
-      std::vector<const Change*> backlog;
+      std::vector<const Change*> backlog;  // oldest first
       for (const Changes* x = c;;) {
         if (x->kind == Changes::Kind::Unchanged) break;
         if (x->kind == Changes::Kind::Invalid) throw std::logic_error("Types.rev_log");
         const Changes* d = x->next->contents;
         x->next->contents = &g_invalid;
-        backlog.insert(backlog.begin(), x->ch);
+        backlog.push_back(x->ch);
         x = d;
       }
-      for (const Change* ch : backlog) undo_change(*ch);
+      for (auto it = backlog.rbegin(); it != backlog.rend(); ++it) undo_change(**it);
       s.changes->contents = &g_unchanged;
       g_last_snapshot = s.old;
       g_trail = s.changes;
