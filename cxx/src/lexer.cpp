@@ -484,6 +484,11 @@ std::vector<Token> Lexer::tokenize() {
         return out;
       }
       if (rt.kind == Kind::COMMENT) {
+        // add_comment: the text between the delimiters ("(*)" opens the
+        // comment with its ')')
+        size_t b = rt.start + (src_.substr(rt.start, 3) == "(*)" ? 3 : 2);
+        size_t e = rt.end >= rt.start + 4 ? rt.end - 2 : b;
+        comments_.push_back(Comment{e > b ? std::string(src_.substr(b, e - b)) : std::string(), rt.start, rt.end});
         if (lines == NewLine) lines = NoLine;  // NoLine/BlankLine unchanged
         continue;
       }
@@ -494,6 +499,7 @@ std::vector<Token> Lexer::tokenize() {
       if (rt.kind == Kind::DOCSTRING) {
         Docstring d{rt.text, rt.start, rt.end, docs_.all.size()};
         docs_.all.push_back(d);  // Docstrings.register
+        comments_.push_back(Comment{"*" + rt.text, rt.start, rt.end});  // add_docstring_comment
         bool blank = lines == BlankLine;
         if (d.body == "/*") {  // `(**/**)`: a stop comment is always floating
           if (docs.tag == 0) { docs.tag = 2; docs.f = {d}; }

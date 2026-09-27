@@ -87,12 +87,17 @@ class Lexer {
   // `# N "file"` line directives, in source order (anchor = next line's start).
   struct LineDirective { size_t anchor_cnum; int line; std::string file; };
   const std::vector<LineDirective>& directives() const { return directives_; }
+  // Lexer.comments (): every comment (a docstring as "*" ^ its body), with
+  // its span, in source order (tokenize fills it)
+  struct Comment { std::string text; size_t start = 0; size_t end = 0; };
+  const std::vector<Comment>& comments() const { return comments_; }
 
  private:
   std::string_view src_;
   size_t pos_ = 0;
   DocAttach docs_;
   std::vector<LineDirective> directives_;
+  std::vector<Comment> comments_;
 
   bool is_doc_comment(size_t s, size_t e) const;
   std::string doc_body(size_t s, size_t e) const;

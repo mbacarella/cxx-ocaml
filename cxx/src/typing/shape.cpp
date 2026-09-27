@@ -30,16 +30,16 @@ int ItemCmp::operator()(const Item& a, const Item& b) const {
 }
 
 namespace item {
-Item make(std::string_view str, SigComponentKind ns) { return {str, ns}; }
-Item value(Ident::t id) { return {ident::name(id), SigComponentKind::Value}; }
-Item type_(Ident::t id) { return {ident::name(id), SigComponentKind::Type}; }
-Item constr(Ident::t id) { return {ident::name(id), SigComponentKind::Constructor}; }
-Item label(Ident::t id) { return {ident::name(id), SigComponentKind::Label}; }
-Item module_(Ident::t id) { return {ident::name(id), SigComponentKind::Module}; }
-Item module_type(Ident::t id) { return {ident::name(id), SigComponentKind::Module_type}; }
-Item extension_constructor(Ident::t id) { return {ident::name(id), SigComponentKind::Extension_constructor}; }
-Item class_(Ident::t id) { return {ident::name(id), SigComponentKind::Class}; }
-Item class_type(Ident::t id) { return {ident::name(id), SigComponentKind::Class_type}; }
+Item make(std::string_view str, SigComponentKind ns) { return {str, ns, fresh_identity()}; }
+Item value(Ident::t id) { return make(ident::name(id), SigComponentKind::Value); }
+Item type_(Ident::t id) { return make(ident::name(id), SigComponentKind::Type); }
+Item constr(Ident::t id) { return make(ident::name(id), SigComponentKind::Constructor); }
+Item label(Ident::t id) { return make(ident::name(id), SigComponentKind::Label); }
+Item module_(Ident::t id) { return make(ident::name(id), SigComponentKind::Module); }
+Item module_type(Ident::t id) { return make(ident::name(id), SigComponentKind::Module_type); }
+Item extension_constructor(Ident::t id) { return make(ident::name(id), SigComponentKind::Extension_constructor); }
+Item class_(Ident::t id) { return make(ident::name(id), SigComponentKind::Class); }
+Item class_type(Ident::t id) { return make(ident::name(id), SigComponentKind::Class_type); }
 }  // namespace item
 
 static Shape* mk(const Uid* uid, Shape::Kind k) {
@@ -47,6 +47,7 @@ static Shape* mk(const Uid* uid, Shape::Kind k) {
   if (uid) {
     s->has_uid = true;
     s->uid = *uid;
+    s->uid_obj = fresh_identity();  // Some uid
   }
   s->kind = k;
   return s;
@@ -140,7 +141,7 @@ t of_path(const std::function<t(SigComponentKind, Ident::t)>& find_shape, SigCom
   std::function<t(SigComponentKind, Path::t)> aux = [&](SigComponentKind k, Path::t p) -> t {
     switch (p->kind) {
       case Path::Kind::Pident: return find_shape(k, p->id);
-      case Path::Kind::Pdot: return proj(nullptr, aux(SigComponentKind::Module, p->p1), Item{p->s, k});
+      case Path::Kind::Pdot: return proj(nullptr, aux(SigComponentKind::Module, p->p1), item::make(p->s, k));
       case Path::Kind::Papply: {
         // app (aux Module p1) ~arg:(aux Module p2): right to left
         t a = aux(SigComponentKind::Module, p->p2);
@@ -150,8 +151,8 @@ t of_path(const std::function<t(SigComponentKind, Ident::t)>& find_shape, SigCom
       case Path::Kind::Pextra_ty:
         if (p->extra == Path::Extra::Pcstr_ty) {
           if (k == SigComponentKind::Label && p->p1->kind == Path::Kind::Pextra_ty)
-            return proj(nullptr, aux(SigComponentKind::Constructor, p->p1), Item{p->s, k});
-          return proj(nullptr, aux(SigComponentKind::Type, p->p1), Item{p->s, k});
+            return proj(nullptr, aux(SigComponentKind::Constructor, p->p1), item::make(p->s, k));
+          return proj(nullptr, aux(SigComponentKind::Type, p->p1), item::make(p->s, k));
         }
         return aux(SigComponentKind::Extension_constructor, p->p1);
     }
@@ -161,9 +162,11 @@ t of_path(const std::function<t(SigComponentKind, Ident::t)>& find_shape, SigCom
 }
 
 t for_persistent_unit(std::string_view s) {
-  Uid u = uid::of_compilation_unit_id(ident::name(Ident::create_persistent(s)));
+  // Uid.of_compilation_unit_id (Ident.create_persistent s): its name is s,
+  // the string Comp_unit holds too
+  Uid u = uid::of_compilation_unit_id(s);
   Shape* r = mk(&u, Shape::Kind::Comp_unit);
-  r->str = zborrow(s);
+  r->str = s;
   return r;
 }
 t leaf_for_unpack() {
@@ -176,6 +179,7 @@ t set_uid_if_none(t s, const Uid& u) {
   Shape* r = make<Shape>(*s);
   r->has_uid = true;
   r->uid = u;
+  r->uid_obj = fresh_identity();  // { t with uid = Some uid }
   return r;
 }
 

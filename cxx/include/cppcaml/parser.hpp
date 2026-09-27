@@ -33,6 +33,8 @@ ast::Structure parse_structure(std::string_view src, std::vector<std::string>& d
 ast::Signature parse_signature(std::string_view src);
 
 namespace ast {
+// Lexer.comments () of the last parse (ast::Comment: text and location)
+const std::vector<Comment>& last_comments();
 // Render a structure in `ocamlc -dparsetree` format (see ast_print.cpp).
 // `dirfiles` supplies the directive filenames (file_id>0); fname is file_id 0.
 void print_dparsetree(const Structure& s, std::string_view fname, std::ostream& os,

@@ -795,5 +795,9 @@ Structure of_ast(const ast::Structure& s, std::string_view fname,
                  const std::vector<std::string>& dirfiles);
 Signature of_ast_signature(const ast::Signature& s, std::string_view fname,
                            const std::vector<std::string>& dirfiles);
+// Lexer.comments (), with the locations of_ast gives
+std::vector<std::pair<std::string_view, Location>> comments_of_ast(const std::vector<ast::Comment>& cs,
+                                                                   std::string_view fname,
+                                                                   const std::vector<std::string>& dirfiles);
 
 }  // namespace cppcaml::typing::parsetree

@@ -29,6 +29,13 @@ struct Location {
   bool ghost = false;
 };
 
+// A comment the lexer saw (Lexer.comments ()): its text -- a docstring's is
+// "*" ^ its body -- and its location
+struct Comment {
+  std::string text;
+  Location loc;
+};
+
 template <class T>
 using Box = std::unique_ptr<T>;
 

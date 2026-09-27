@@ -88,17 +88,17 @@ actions, output prefixes, OCAMLPARAM and configuration file
 (`typing/compenv.cpp`), and Maindriver's sequence (`cppocamlc_main.cpp`).
 `cxx/harness/cli_parity.sh` runs a battery of command lines through both
 compilers (invoked as `ocamlc`, in the same directory): stdout, stderr,
-exit code and the files left behind, byte for byte -- 130/132, the two
-KNOWN being `-config`'s `standard_library_default` (c++ocamlc is not
+exit code and the files left behind, byte for byte -- 131/132, the
+KNOWN one being `-config`'s `standard_library_default` (c++ocamlc is not
 installed: its default is the stdlib next to it; `$OCAMLLIB` works as in
-ocamlc) and `-bin-annot`'s .cmt (Cmt_format is not ported yet; the flag
-sets `Clflags.binary_annotations` for it).
+ocamlc).
 
 - **Implemented** (their effects as ocamlc's): everything the typer,
   translators, Emitcode, Bytepackager and the librarian read, and `-a`
   `-alert` `-absname` `-c` `-cmi-file` `-color` (`Misc.Style`'s marks, ANSI
   colours; OCAML_COLOR, NO_COLOR) `-error-style` (OCAML_ERROR_STYLE)
-  `-config` `-config-var` `-dlambda` `-drawlambda` `-dinstr` `-dparsetree`
+  `-bin-annot` (the .cmt / .cmti: Cmt_format, below) `-config`
+  `-config-var` `-dlambda` `-drawlambda` `-dinstr` `-dparsetree`
   (implementations) `-dump-into-file` `-dump-dir` `-for-pack` `-g` `-H`
   (hidden) `-i` `-i-variance` `-I` `-impl` `-intf` `-intf-suffix`
   `-keywords` (the lexer's keyword editions) `-linkall` (link and -a)
@@ -111,9 +111,9 @@ sets `Clflags.binary_annotations` for it).
   and OCAMLPARAM (all of `read_one_param`; the native-only settings parsed
   and checked, then unused).  `-a` copies each unit's debug and hint
   sections and keeps what the unit descriptor shared (byte-identical .cma).
-- **Accepted, no effect to reproduce**: `-bin-annot`,
-  `-bin-annot-occurrences` (flags set for the .cmt writer to come),
-  `-cc` (no C compilation takes place otherwise), `-dcamlprimc` (only with
+- **Accepted, no effect to reproduce**: `-bin-annot-occurrences` (the
+  .cmt's cmt_ident_occurrences stay [] -- Shape_reduce's occurrence
+  resolution is not ported), `-cc` (no C compilation takes place otherwise), `-dcamlprimc` (only with
   `-custom`), `-dno-canonical-ids`, `-dparsetree-loc-ghost-invariants`,
   `-no-check-prims` / `-use-prims` (c++ocamlc's linker checks no
   primitives), `-safe-string`.
@@ -136,6 +136,28 @@ sets `Clflags.binary_annotations` for it).
   `CPPCAML_LINKMAP=1` (a `.linkmap` sidecar next to a linked program),
   `CPPCAML_NO_FASTEXIT=1` (tear the process down normally instead of
   `_exit`, e.g. for leak checkers).
+
+### `-bin-annot`: the .cmt / .cmti (Cmt_format)
+
+`typing/cmt_format.cpp` ports `file_formats/cmt_format.ml`'s save_cmt:
+`clear_env`'s Tast_mapper rebuild of the typed tree (a fresh record per
+node, the leaves -- locations, types, paths, idents, descriptions, Types
+declarations -- by reference, every environment through
+`Env.keep_only_summary` and its one-entry memo, called in the mapper's
+evaluation order), `index_declarations` (Tast_iterator's order into a
+Uid.Tbl whose buckets come from a port of `caml_hash`), the lexer's
+comments, argv, load path, digests, imports, `Uid.Deps` (recorded by
+Includemod), and the shape Typemod reduces with `Shape_reduce.local_reduce`
+(`typing/shape_reduce.cpp`, structural memo tables as the .ml's).  The
+writer is the .cmi Writer and the -g EventWriter (`typing/cmi_writer.hpp`).
+Typedecl's type and extension shapes, recursive modules' `Shape.var`
+shapes, and location records' identity (one per parser location, kept by
+the typer's copies) came with it.  `cxx/harness/cmt_parity.sh` compares
+with ocamlc.opt (both invoked through one path, in one directory):
+contents identical (`cmt/cmtdump.ml`: every field, the typed tree through
+Printtyped) on the stamp probes but the two .cmi leftovers; bytes (Marshal's
+sharing) on a growing share.  Not ported: `-bin-annot-occurrences`' index,
+the partial .cmt of a failed compilation (written with no parts).
 
 ## What counts as progress
 

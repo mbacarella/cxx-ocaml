@@ -174,9 +174,11 @@ TranslModtypeDecl transl_modtype_decl(env::t env, const pt::ModuleTypeDeclaratio
   });
 }
 
+void record_module_shape(Ident::t id, shape::t s);  // typemod_str.cpp (Env's mda_shape)
+
 TranslRecmodule transl_recmodule_modtypes(env::t env, Slice<const pt::ModuleDeclaration*> sdecls) {
   struct Cur {
-    Ident::t id;  // id_shape: None when id is null (the shape is cmt-only)
+    Ident::t id;  // id_shape: None when id is null
     pt::OptStrLoc id_loc;
     const ModuleDeclaration* md;
     const tt::ModuleType* tmty;
@@ -220,7 +222,9 @@ TranslRecmodule transl_recmodule_modtypes(env::t env, Slice<const pt::ModuleDecl
     Uid md_uid = uid::mk(env::get_current_unit());
     auto* md = make<ModuleDeclaration>(approx_modtype(approx_env(pmd->pmd_name.txt), pmd->pmd_type),
                                        parsetree::types_attributes(pmd->pmd_attributes), pmd->pmd_loc, md_uid);
-    // (Shape.var md_uid id: pure)
+    // id_shape: Shape.var md_uid id, the shape make_env's environments
+    // give the module (Env.add_module_declaration ~shape)
+    if (ids[k]) record_module_shape(ids[k], shape::var(md_uid, ids[k]));
     init.push_back({ids[k], pmd->pmd_name, md, nullptr});
   }
   env::t abs_env = make_env(init);

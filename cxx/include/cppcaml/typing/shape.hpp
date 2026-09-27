@@ -23,6 +23,9 @@ bool can_appear_in_types(SigComponentKind k);
 struct Item {  // string * Sig_component_kind.t
   std::string_view name;
   SigComponentKind kind;
+  // the tuple's identity (one per Item.make / Item.value ... call; Map.map
+  // and the shape reducer keep the key objects): the .cmt shares them
+  const void* obj = nullptr;
 };
 struct ItemCmp {  // Stdlib.compare on the pair
   int operator()(const Item& a, const Item& b) const;
@@ -48,6 +51,9 @@ struct Shape {
   enum class Kind : std::uint8_t { Var, Abs, App, Struct, Pack, Alias, Leaf, Proj, Comp_unit, Error };
   bool has_uid = false;  // uid : Uid.t option
   Uid uid{};
+  // the `Some uid` block's identity: one per constructor call that builds
+  // it, kept by record copies ({t with ...}) and the shape reducer
+  const void* uid_obj = nullptr;
   Kind kind;
   Ident::t var = nullptr;   // Var / Abs / Pack
   t t1 = nullptr;           // Abs body / App fn / Alias / Proj

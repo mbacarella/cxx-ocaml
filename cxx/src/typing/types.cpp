@@ -109,7 +109,7 @@ Uid mk_local_opaque(const UnitInfo* current_unit) {
 Uid of_compilation_unit_id(std::string_view name) {
   Uid u;
   u.kind = Uid::Kind::Compilation_unit;
-  u.comp_unit = zstr(name);
+  u.comp_unit = zborrow(name);  // Compilation_unit (Ident.name id): the ident's own string
   u.obj = fresh_obj();
   return u;
 }

@@ -16,6 +16,8 @@
 #include "cppcaml/typing/warnings.hpp"
 #include "cppcaml/typing/persistent_env.hpp"
 #include "cppcaml/typing/shape.hpp"
+#include "cppcaml/typing/cmt_format.hpp"
+#include "cppcaml/typing/shape_reduce.hpp"
 #include "cppcaml/typing/location.hpp"
 #include "cppcaml/typing/config.hpp"
 #include "cppcaml/typing/clflags.hpp"
@@ -251,8 +253,32 @@ static std::string modname_of_filename(const std::string& file) {
   if (!base.empty() && base[0] >= 'a' && base[0] <= 'z') base[0] = static_cast<char>(base[0] - 'a' + 'A');
   return base;
 }
+static tt::Implementation type_implementation_(const UnitInfo& target, env::t initial_env, pt::Structure ast);
+
+// Typemod.type_implementation's save_cmt: the unit's .cmt (Unit_info.cmt)
+static void save_cmt(const UnitInfo& target, const cmt_format::BinaryAnnots& annots, env::t initial_env,
+                     const cmi_format::CmiInfos* cmi, shape::t shape) {
+  cmt_format::save_cmt(target.prefix + ".cmt", target.modname, target.source_file, annots, initial_env, cmi, shape);
+}
+
 tt::Implementation type_implementation(const UnitInfo& target, env::t initial_env, pt::Structure ast) {
-  // (Cmt_format.clear / save_cmt and the typing recovery are not ported)
+  cmt_format::clear();
+  shape_reduce::reset();
+  try {
+    return type_implementation_(target, initial_env, ast);
+  } catch (...) {
+    // ~exceptionally: the saved parts (not ported: none) as a partial .cmt
+    cmt_format::BinaryAnnots annots{cmt_format::BinaryAnnots::Kind::Partial_implementation};
+    try {
+      save_cmt(target, annots, initial_env, nullptr, nullptr);
+    } catch (...) {
+    }
+    throw;
+  }
+}
+
+static tt::Implementation type_implementation_(const UnitInfo& target, env::t initial_env, pt::Structure ast) {
+  // (the typing recovery is not ported)
   typecore::reset_delayed_checks();
   env::reset_required_globals();
   if (clflags::print_types)  // #7656
@@ -297,21 +323,31 @@ tt::Implementation type_implementation(const UnitInfo& target, env::t initial_en
     Signature dclsig = env::read_signature(intf_modname, compiled_intf_file);
     auto [coercion, shape] =
         includemod::compunit(initial_env, true, target.source_file, r.sg, source_intf, dclsig, shape0);
-    (void)shape;
     typecore::force_delayed_checks();
+    // It is important to run these checks after the inclusion test above,
+    // so that value declarations which are not used internally but
+    // exported are not reported as being unused.
+    shape::t reduced = shape_reduce::local_reduce_empty(shape);
+    cmt_format::BinaryAnnots annots{cmt_format::BinaryAnnots::Kind::Implementation};
+    annots.structure = r.str;
+    save_cmt(target, annots, initial_env, nullptr, reduced);
     return {r.str, coercion, dclsig};
   }
   location::prerr_warning(location::in_file(target.source_file),
                           warnings::Warning::make(warnings::Warning::K::Missing_mli));
   auto [coercion, shape] = includemod::compunit(initial_env, true, target.source_file, r.sg, "(inferred signature)",
                                                 simple_sg, shape0);
-  (void)shape;
   check_nongen_signature(r.env, simple_sg);
   normalize_signature(simple_sg);
   typecore::force_delayed_checks();
-  // (the shape's Shape_reduce.local_reduce is not ported: no cmt)
+  shape::t reduced = shape_reduce::local_reduce_empty(shape);
   StrMap<std::string_view> alerts = builtin_attributes::alerts_of_str(true, ast);
-  if (!clflags::dont_write_files) env::save_signature(alerts, simple_sg, target.modname, target.prefix + ".cmi");
+  if (!clflags::dont_write_files) {
+    cmi_format::CmiInfos cmi = env::save_signature(alerts, simple_sg, target.modname, target.prefix + ".cmi");
+    cmt_format::BinaryAnnots annots{cmt_format::BinaryAnnots::Kind::Implementation};
+    annots.structure = r.str;
+    save_cmt(target, annots, initial_env, &cmi, reduced);
+  }
   return {r.str, coercion, simple_sg};
 }
 

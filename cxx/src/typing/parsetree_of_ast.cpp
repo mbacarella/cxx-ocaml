@@ -87,10 +87,14 @@ struct Conv {
     }
     return Position{f, p.lnum, p.bol, p.cnum};
   }
+  // Each conversion is a location record of its own (the parser's make_loc):
+  // its identity (obj) goes with every copy the typer makes
   Location loc(const ast::Location& l) const {
-    return Location{pos(l.start), pos(l.end), l.ghost};
+    Location r{pos(l.start), pos(l.end), l.ghost};
+    r.obj = make<Location>(r);
+    return r;
   }
-  StrLoc str(const ast::StringLoc& s) const { return {zborrow(s.txt), loc(s.loc)}; }
+  StrLoc str(const ast::StringLoc& s) const { return {zborrow(name(s.txt)), loc(s.loc)}; }
   StrLoc str_gap(std::string_view s) const { return {zborrow(s), gap_loc()}; }
   OptStrLoc optstr(const ast::StrOptLoc& s) const {
     return {s.txt ? OptStr::of(*s.txt) : OptStr::none(), loc(s.loc)};
@@ -105,10 +109,17 @@ struct Conv {
     bool unset = l.start.cnum == 0 && l.end.cnum == 0 && l.start.lnum <= 1 && !l.ghost;
     return unset ? gap_loc() : loc(l);
   }
+  // parser.mly's own names ("()", "[]", "::": constr_ident, the unit and
+  // list constructors): string literals, one object each (ocamlopt merges
+  // a unit's equal constants)
+  static std::string_view name(std::string_view s) {
+    if (s == "()" || s == "[]" || s == "::") return ocaml_literal("parsing/parser.mly", s);
+    return s;
+  }
   Longident::t lid(const ast::Longident& l) const {
-    if (auto* i = std::get_if<ast::Lident>(&l.v)) return Longident::lident(i->name);
+    if (auto* i = std::get_if<ast::Lident>(&l.v)) return Longident::lident(name(i->name));
     if (auto* d = std::get_if<ast::Ldot>(&l.v))
-      return Longident::ldot(lid(*d->prefix), inner(d->prefix_loc), d->name, inner(d->name_loc));
+      return Longident::ldot(lid(*d->prefix), inner(d->prefix_loc), name(d->name), inner(d->name_loc));
     auto& a = std::get<ast::Lapply>(l.v);
     return Longident::lapply(lid(*a.f), inner(a.f_loc), lid(*a.x), inner(a.x_loc));
   }
@@ -1149,6 +1160,15 @@ Signature of_ast_signature(const ast::Signature& s, std::string_view fname,
                            const std::vector<std::string>& dirfiles) {
   Conv c{zborrow(fname), dirfiles};
   return c.signature(s);
+}
+
+std::vector<std::pair<std::string_view, Location>> comments_of_ast(const std::vector<ast::Comment>& cs,
+                                                                   std::string_view fname,
+                                                                   const std::vector<std::string>& dirfiles) {
+  Conv c{zborrow(fname), dirfiles};
+  std::vector<std::pair<std::string_view, Location>> out;
+  for (const ast::Comment& x : cs) out.emplace_back(zone().str(x.text), c.loc(x.loc));
+  return out;
 }
 
 }  // namespace cppcaml::typing::parsetree

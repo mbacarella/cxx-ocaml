@@ -107,6 +107,8 @@ add_library(cppcaml_core
   src/typing/bytegen.cpp
   src/typing/printinstr.cpp
   src/typing/emitcode.cpp
+  src/typing/cmt_format.cpp
+  src/typing/shape_reduce.cpp
   src/typing/arg.cpp
   src/typing/config.cpp
   src/typing/compenv.cpp

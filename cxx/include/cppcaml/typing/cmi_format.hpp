@@ -51,6 +51,8 @@ CmiInfos read_cmi(const std::string& filename);
 // returns its CRC, the raw BLAKE128 digest.  The signature must have been
 // substituted for saving (Env.save_signature does it).
 std::string output_cmi(const std::string& filename, const CmiInfos& cmi);
+// the bytes output_cmi writes (magic, header, crcs, flags) and the crc
+std::pair<std::string, std::string> output_cmi_bytes(const CmiInfos& cmi);
 
 // the size of Marshal.to_buffer's output for (got, expected) (the Includemod
 // error printer's is_big: the -error-size threshold)

@@ -109,6 +109,10 @@ std::vector<std::vector<std::string>> visible_dir_files() {
   return r;
 }
 
+std::pair<std::vector<std::string>, std::vector<std::string>> get_paths() {
+  return {rev_paths(g_visible_dirs), rev_paths(g_hidden_dirs)};
+}
+
 std::vector<std::string> get_path_list() {
   auto v = rev_paths(g_visible_dirs);
   auto h = rev_paths(g_hidden_dirs);

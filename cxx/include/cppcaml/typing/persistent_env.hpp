@@ -36,6 +36,8 @@ void reset();
 void init(const std::vector<std::string>& visible, const std::vector<std::string>& hidden);
 void add_dir(bool hidden, const std::string& dir);
 std::vector<std::string> get_path_list();
+// Load_path.get_paths (): { visible; hidden }
+std::pair<std::vector<std::string>, std::vector<std::string>> get_paths();
 // Load_path.get_visible () |> List.map Dir.files: each visible directory's
 // file names ("" read as the current directory), in the path's order
 std::vector<std::vector<std::string>> visible_dir_files();

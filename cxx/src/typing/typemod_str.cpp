@@ -41,6 +41,37 @@ static shape::t find_shape(SigComponentKind ns, Ident::t id) {
 }
 shape::t shape_of_path(Path::t path) { return shape::of_path(find_shape, SigComponentKind::Module, path); }
 
+// Typedecl's shapes of declarations (shape_map_labels, shape_map_cstrs,
+// the typ_shape of transl_declaration, the extension constructors')
+static shape::ItemMap shape_map_labels(const Slice<const tt::TLabelDeclaration*>& lds) {
+  shape::ItemMap m = shape::map::empty();
+  for (const tt::TLabelDeclaration* ld : lds) m = shape::map::add_label(m, ld->ld_id, ld->ld_uid);
+  return m;
+}
+static shape::ItemMap shape_map_cstrs(const Slice<const tt::TConstructorDeclaration*>& cds) {
+  shape::ItemMap m = shape::map::empty();
+  for (const tt::TConstructorDeclaration* cd : cds) {
+    shape::ItemMap cstr_shape_map =
+        shape_map_labels(cd->cd_args.is_record ? cd->cd_args.record : Slice<const tt::TLabelDeclaration*>{});
+    m = shape::map::add_constr(m, cd->cd_id, shape::str(&cd->cd_uid, cstr_shape_map));
+  }
+  return m;
+}
+static shape::t typ_shape(const tt::TTypeDeclaration* td) {
+  const Uid& uid = td->typ_type->type_uid;
+  switch (td->typ_kind.kind) {
+    case tt::TTypeKind::Kind::Ttype_variant: return shape::str(&uid, shape_map_cstrs(td->typ_kind.constructors));
+    case tt::TTypeKind::Kind::Ttype_record: return shape::str(&uid, shape_map_labels(td->typ_kind.labels));
+    default: return shape::leaf(uid);
+  }
+}
+static shape::t ext_shape(const tt::TExtensionConstructor* ext) {
+  shape::ItemMap map = shape::map::empty();
+  if (ext->ext_kind.kind == tt::TExtensionConstructorKind::Kind::Text_decl && ext->ext_kind.args.is_record)
+    map = shape_map_labels(ext->ext_kind.args.record);
+  return shape::str(&ext->ext_type->ext_uid, map);
+}
+
 // Env.enter_signature_and_shape: the items' shapes are projections of the
 // module's shape
 static shape::Item shape_item_of(const SignatureItem* it) {
@@ -772,7 +803,7 @@ static ItemTyped type_str_item(SignatureNames* names, bool toplevel, bool funct_
       typedecl::TranslTypeDeclResult r = typedecl::transl_type_decl(env, t->rec, t->decls);
       for (auto* td : r.decls) check_type(names, td->typ_loc, td->typ_id);
       std::vector<const SignatureItem*> items = map_rec_type_with_row_types(t->rec, r.decls);
-      for (auto* td : r.decls) shape_map = shape::map::add_type(shape_map, td->typ_id, shape::leaf(td->typ_type->type_uid));
+      for (auto* td : r.decls) shape_map = shape::map::add_type(shape_map, td->typ_id, typ_shape(td));
       return mk(mkd(tt::Tstr_type{{STK::Tstr_type}, t->rec, slice(r.decls)}), items, shape_map,
                 enrich_type_decls(anchor, r.decls, env, r.env));
     }
@@ -782,7 +813,7 @@ static ItemTyped type_str_item(SignatureNames* names, bool toplevel, bool funct_
       for (std::size_t k = 0; k < tyext->tyext_constructors.size(); ++k) {
         auto* ext = tyext->tyext_constructors[k];
         check_typext(names, ext->ext_loc, ext->ext_id);
-        shape_map = shape::map::add_extcons(shape_map, ext->ext_id, shape::leaf(ext->ext_type->ext_uid));
+        shape_map = shape::map::add_extcons(shape_map, ext->ext_id, ext_shape(ext));
       }
       for (std::size_t k = 0; k < tyext->tyext_constructors.size(); ++k) {
         auto* ext = tyext->tyext_constructors[k];
@@ -795,7 +826,7 @@ static ItemTyped type_str_item(SignatureNames* names, bool toplevel, bool funct_
       auto [ext, newenv] = typedecl::transl_type_exception(env, as<pt::Pstr_exception>(d)->exn);
       const tt::TExtensionConstructor* c = ext->tyexn_constructor;
       check_typext(names, c->ext_loc, c->ext_id);
-      shape_map = shape::map::add_extcons(shape_map, c->ext_id, shape::leaf(c->ext_type->ext_uid));
+      shape_map = shape::map::add_extcons(shape_map, c->ext_id, ext_shape(c));
       return mk(mkd(tt::Tstr_exception{{STK::Tstr_exception}, ext}),
                 {sig_typext(c->ext_id, c->ext_type, ExtStatus::Text_exception, Visibility::Exported)}, shape_map,
                 newenv);
@@ -990,8 +1021,9 @@ static StructureTyped type_structure_s(bool toplevel, bool funct_body, Path::t a
   };
   if (toplevel) delayed();
   else builtin_attributes::warning_scope(pt::Attributes{}, delayed);
-  auto* str = make<tt::Structure>(slice(items), slice(sg), env);
-  return {str, slice(sg), names, shape::str(nullptr, shape_map), env};
+  Signature sgs = slice(sg);  // one list: str_type and the module type's
+  auto* str = make<tt::Structure>(slice(items), sgs, env);
+  return {str, sgs, names, shape::str(nullptr, shape_map), env};
 }
 
 // ---- entry points ---------------------------------------------------------------------------

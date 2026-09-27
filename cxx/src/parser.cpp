@@ -109,6 +109,13 @@ class Parser {
       filenames_.push_back(d.file);
       dirs_.push_back({static_cast<int>(d.anchor_cnum), d.line, phys_line_index(d.anchor_cnum), fid});
     }
+    std::vector<ast::Comment>& cs = comments_of_last_parse();
+    cs.clear();
+    for (auto& c : lex.comments()) cs.push_back(ast::Comment{c.text, span(position(c.start), position(c.end))});
+  }
+  static std::vector<ast::Comment>& comments_of_last_parse() {
+    static std::vector<ast::Comment> cs;
+    return cs;
   }
   const std::vector<std::string>& directive_files() const { return filenames_; }
   // the span of the token starting at a ParseError's offset (Location.curr
@@ -5093,6 +5100,10 @@ class Parser {
 };
 
 }  // namespace
+
+namespace ast {
+const std::vector<Comment>& last_comments() { return Parser::comments_of_last_parse(); }
+}  // namespace ast
 
 Structure parse_structure(std::string_view src) {
   Parser p(src);

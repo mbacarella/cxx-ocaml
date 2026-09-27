@@ -1,7 +1,6 @@
-// Port of typing/includemod.ml.  See includemod.hpp.  Usage marking
-// (Env.mark_*_used), alerts and Uid.Deps only feed warnings / the cmt file
-// and are left out.
+// Port of typing/includemod.ml.  See includemod.hpp.
 #include "cppcaml/typing/includemod.hpp"
+#include "cppcaml/typing/cmt_format.hpp"
 #include "cppcaml/typing/builtin_attributes.hpp"
 
 #include "cppcaml/typing/btype.hpp"
@@ -785,7 +784,32 @@ SignDiff signature_components(const CoreRelation& core, Direction direction, con
   SignDiff first;
   first.deep_modifications = deep_modifications;
   if (item.ok) {
-    // (Uid.Deps.record_declaration_dependency: cmt only)
+    // (for the .cmt) We do not store paired uids when checking for reverse
+    // module-type inclusion as it would introduce duplicates.
+    if (!((direction.in_eq && direction.pos == Pos::Negative) || direction.mark_as_used == Mark::Mark_neither)) {
+      auto item_uid = [](const SignatureItem* it) -> const Uid& {
+        switch (it->kind) {
+          case SK::Sig_value: return it->value->val_uid;
+          case SK::Sig_type: return it->type->type_uid;
+          case SK::Sig_typext: return it->ext->ext_uid;
+          case SK::Sig_module: return it->md->md_uid;
+          case SK::Sig_modtype: return it->mtd->mtd_uid;
+          case SK::Sig_class: return it->cls->cty_uid;
+          case SK::Sig_class_type: return it->clty->clty_uid;
+        }
+        throw std::logic_error("item_uid");
+      };
+      const Uid& elt1 = item_uid(sigi1);
+      const Uid& elt2 = item_uid(sigi2);
+      using DK = cmt_format::DepKind;
+      switch (direction.pos) {
+        case Pos::Negative: cmt_format::record_declaration_dependency(DK::Declaration_to_declaration, elt2, elt1); break;
+        case Pos::Positive: cmt_format::record_declaration_dependency(DK::Declaration_to_declaration, elt1, elt2); break;
+        case Pos::Strictly_positive:
+          cmt_format::record_declaration_dependency(DK::Definition_to_declaration, elt1, elt2);
+          break;
+      }
+    }
     if (present_at_runtime) first.runtime_coercions.push_back({pos, item.value});
   } else {
     first.errors.push_back({sigi1, item.error});

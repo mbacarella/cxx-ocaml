@@ -62,6 +62,7 @@
 #include "cppcaml/typing/bytegen.hpp"
 #include "cppcaml/typing/bytepackager.hpp"
 #include "cppcaml/typing/emitcode.hpp"
+#include "cppcaml/typing/cmt_format.hpp"
 #include "cppcaml/typing/printinstr.hpp"
 #include "cppcaml/typing/simplif.hpp"
 #include "cppcaml/typing/translmod.hpp"
@@ -591,7 +592,12 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
     std::optional<ty::typedtree::Implementation> impl;
     PortResult port = port_typecheck(in_path, mod, cmo_out, /*intf=*/false,
                                      [&](ty::env::t env0, const ty::typemod::UnitInfo& target) {
-                                       ty::parsetree::Structure st = ty::parsetree::of_ast(structure, in_path, dirfiles);
+                                       // the source's name: one string object (cmt_format.hpp)
+                                       std::string_view src_name = ty::zborrow(in_path);
+                                       ty::cmt_format::set_source_name(src_name);
+                                       ty::parsetree::Structure st = ty::parsetree::of_ast(structure, src_name, dirfiles);
+                                       ty::cmt_format::set_comments(
+                                           ty::parsetree::comments_of_ast(cppcaml::ast::last_comments(), src_name, dirfiles));
                                        // an .ml without .mli: its .cmi is written here (Typemod)
                                        impl = ty::typemod::type_implementation(target, env0, st);
                                      });
@@ -688,7 +694,10 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
         in_path, module_name(cmi_out), cmi_out, /*intf=*/true,
         [&](cppcaml::typing::env::t env0, const cppcaml::typing::typemod::UnitInfo& target) {
           namespace ty = cppcaml::typing;
-          ty::parsetree::Signature sg = ty::parsetree::of_ast_signature(sig, in_path, {});
+          std::string_view src_name = ty::zborrow(in_path);  // the source's name: one string object
+          ty::cmt_format::set_source_name(src_name);
+          ty::parsetree::Signature sg = ty::parsetree::of_ast_signature(sig, src_name, {});
+          ty::cmt_format::set_comments(ty::parsetree::comments_of_ast(cppcaml::ast::last_comments(), src_name, {}));
           // Compile_common.typecheck_intf
           const ty::typedtree::Signature* tsg = ty::typemod::type_interface(target, env0, sg);
           ty::StrMap<std::string_view> alerts = ty::builtin_attributes::alerts_of_sig(true, sg);
@@ -709,8 +718,12 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
           ty::warnings::check_fatal();
           // Compile_common.interface: the .cmi unless -i
           if (ty::clflags::print_types) return;
-          // Compile_common.emit_signature
-          ty::env::save_signature(alerts, tsg->sig_type, target.modname, target.prefix + ".cmi");
+          // Compile_common.emit_signature: the .cmi, then Typemod.save_signature's .cmti
+          ty::cmi_format::CmiInfos cmi =
+              ty::env::save_signature(alerts, tsg->sig_type, target.modname, target.prefix + ".cmi");
+          ty::cmt_format::BinaryAnnots annots{ty::cmt_format::BinaryAnnots::Kind::Interface};
+          annots.signature = tsg;
+          ty::cmt_format::save_cmt(target.prefix + ".cmti", target.modname, in_path, annots, env0, &cmi, nullptr);
         });
     if (port != PortResult::Typed) return 2;
   } catch (const cppcaml::typing::arg::Bad&) {
@@ -823,6 +836,7 @@ static void profile_dump() {
 
 // Maindriver.main
 static int run_main(int argc, char** argv) {
+  cppcaml::typing::cmt_format::set_argv(std::vector<std::string>(argv, argv + argc));  // Sys.argv (cmt_args)
   namespace ty = cppcaml::typing;
   namespace cf = ty::clflags;
   namespace ce = ty::compenv;
