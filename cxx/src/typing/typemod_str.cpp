@@ -581,9 +581,18 @@ static Typed type_one_application(const Location& apply_loc, const pt::ModuleExp
     return e;
   };
   if (mt->kind == ModuleType::Kind::Mty_functor && mt->param.is_unit) {
-    if (app_view.arg && !app_view.arg->is_syntactic_unit)
-      raise_error(err(app_view.f_loc, env, EK::Apply_generative));
-    // (Generative_application_expects_unit warning)
+    if (app_view.arg) {
+      if (app_view.arg->is_syntactic_unit) {
+        // this call to warning_scope allows e.g. [F (struct end [@warning "-73"])]
+        // not to warn
+        builtin_attributes::warning_scope(app_view.arg->arg->mod_attributes, [&] {
+          location::prerr_warning(app_view.arg->arg->mod_loc,
+                                  warnings::Warning::make(warnings::Warning::K::Generative_application_expects_unit));
+        });
+      } else {
+        raise_error(err(app_view.f_loc, env, EK::Apply_generative));
+      }
+    }
     if (funct_body && mtype::contains_type(env, funct->mod_type))
       raise_error(err(apply_loc, env, EK::Not_allowed_in_functor_body));
     auto* me = make<tt::ModuleExpr>(make<tt::Tmod_apply_unit>(tt::Tmod_apply_unit{{MK::Tmod_apply_unit}, funct}),

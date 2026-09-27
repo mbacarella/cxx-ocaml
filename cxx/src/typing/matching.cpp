@@ -14,9 +14,9 @@
 // left to right, fold_right from the end, `let .. and ..` left to right.
 //
 // Not ported: the -dmatchcomp debug output (dbg / debugf and the pretty
-// printers); the Degraded_to_partial_match warning is not emitted (warning
-// messages are stage 9).
+// printers).
 #include "cppcaml/typing/matching.hpp"
+#include "cppcaml/typing/location.hpp"
 
 #include <deque>
 #include <memory>
@@ -3286,8 +3286,9 @@ lam toplevel_handler(scopes sc, const Location& loc, const Failer& failer, Parti
   if (jumps::partial(r.second) == Partial::Total) return r.first;
   if (partial.global == Partial::Total) {
     // The type-checker believed the pattern-matching to be Total, but the
-    // compiler found it to be Partial.  (Warnings.Degraded_to_partial_match
-    // is not emitted yet: warning messages are stage 9.)
+    // compiler found it to be Partial.
+    if (warnings::is_active(74))
+      location::prerr_warning(loc, warnings::Warning::make(warnings::Warning::K::Degraded_to_partial_match));
   }
   return L::lstaticcatch(r.first, final_exit, {}, failure_handler(sc, loc, failer));
 }

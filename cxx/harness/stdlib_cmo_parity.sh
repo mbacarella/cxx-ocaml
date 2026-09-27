@@ -2,12 +2,14 @@
 # stdlib .cmo parity: compile each stdlib unit as stdlib/Makefile does (Compflags, stdlib__X
 # targets) with ocamlc.opt and with c++ocamlc, one after the other in one scratch
 # dir (-g records it) against the built stdlib's .cmi; compare the .cmo bytes.  G=-g adds -g.
+# W= the warning flags (default -w -a); with W set, the compilers' stderr
+# (warnings) is compared too: LOGDIFF when only it differs.
 SELF="$(readlink -f "$0")"; ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 CPP="${CPP:-$ROOT/cxx/build-release/c++ocamlc}"
 OUT=${OUT:-/tmp/stdlib_cmo}
 rm -rf "$OUT"; mkdir -p "$OUT"
 cd "$ROOT/stdlib"
-COMP="-strict-sequence -absname -w -a -nostdlib -principal ${G:-}"
+COMP="-strict-sequence -absname ${W:--w -a} -nostdlib -principal ${G:-}"
 worker() {
   m="$1"; base=${m%.ml}
   case "$base" in
@@ -29,11 +31,12 @@ worker() {
   done
   if [ ! -f "$OUT/$m.o" ]; then echo "OFAIL $m"
   elif [ ! -f "$OUT/$m.c" ]; then echo "CFAIL $m"
-  elif cmp -s "$OUT/$m.o" "$OUT/$m.c"; then echo "SAME $m"
-  else echo "DIFF $m"; fi
+  elif ! cmp -s "$OUT/$m.o" "$OUT/$m.c"; then echo "DIFF $m"
+  elif [ -n "${W:-}" ] && ! cmp -s "$OUT/$m.o.log" "$OUT/$m.c.log"; then echo "LOGDIFF $m"
+  else echo "SAME $m"; fi
   rm -rf "${w:?}"
 }
-export -f worker; export ROOT CPP OUT COMP; export AWK=awk
+export -f worker; export ROOT CPP OUT COMP W; export AWK=awk
 ulimit -v 8000000
 ls *.ml | xargs -P 12 -I{} bash -c 'worker {}' | sort -k2 > "$OUT/results"
-awk '{f[$1]++} END{printf "SAME %d DIFF %d CFAIL %d OFAIL %d SKIP %d\n", f["SAME"],f["DIFF"],f["CFAIL"],f["OFAIL"],f["SKIP"]}' "$OUT/results"
+awk '{f[$1]++} END{printf "SAME %d DIFF %d LOGDIFF %d CFAIL %d OFAIL %d SKIP %d\n", f["SAME"],f["DIFF"],f["LOGDIFF"],f["CFAIL"],f["OFAIL"],f["SKIP"]}' "$OUT/results"

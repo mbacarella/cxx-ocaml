@@ -7,7 +7,8 @@
 # .mli is compiled first).  Files ocamlc accepts are counted, not compared.
 #
 # Usage: error_parity.sh [file.ml|file.mli ...]   (JOBS=, FLAGS= extra flags
-#   for both compilers, STOP= the stop flag, default "-stop-after typing")
+#   for both compilers, STOP= the stop flag, default "-stop-after typing",
+#   W= the warning flags, default "-w -a")
 #   no args: cxx/harness/false_accept + cxx/harness/error_probes
 #   SAME / DIFF (both reject, reports differ) / FACCEPT (c++ocamlc accepts
 #   what ocamlc rejects) / FREJECT (the reverse) / OK (both accept)
@@ -18,7 +19,8 @@ cd "$ROOT" || exit 1
 JOBS="${JOBS:-8}"
 FLAGS="${FLAGS:-}"
 STOP="${STOP--stop-after typing}"
-export FLAGS STOP
+W="${W--w -a}"
+export FLAGS STOP W
 CPP="${CPP:-$ROOT/cxx/build-release/c++ocamlc}"
 OUT=/tmp/error_parity
 
@@ -30,13 +32,13 @@ if [ "${1:-}" == "--worker" ]; then
       i="${f%.ml}.mli"
       if [ -f "$i" ]; then
         cp "$i" "$w/o/"; cp "$i" "$w/c/"
-        ( cd "$w/o" && timeout 60 "$ROOT/ocamlc.opt" -nostdlib -I "$ROOT/stdlib" -w -a $FLAGS -c "${b}i" ) >/dev/null 2>&1
-        ( cd "$w/c" && timeout 60 "$CPP" -I "$ROOT/stdlib" -w -a $FLAGS -c "${b}i" ) >/dev/null 2>&1
+        ( cd "$w/o" && timeout 60 "$ROOT/ocamlc.opt" -nostdlib -I "$ROOT/stdlib" $W $FLAGS -c "${b}i" ) >/dev/null 2>&1
+        ( cd "$w/c" && timeout 60 "$CPP" -I "$ROOT/stdlib" $W $FLAGS -c "${b}i" ) >/dev/null 2>&1
       fi ;;
   esac
-  ( cd "$w/o" && timeout 60 "$ROOT/ocamlc.opt" -nostdlib -I "$ROOT/stdlib" -w -a $FLAGS $STOP -c "$b" ) \
+  ( cd "$w/o" && timeout 60 "$ROOT/ocamlc.opt" -nostdlib -I "$ROOT/stdlib" $W $FLAGS $STOP -c "$b" ) \
       >"$OUT/$key.o.out" 2>"$OUT/$key.o"; orc=$?
-  ( cd "$w/c" && timeout 60 "$CPP" -I "$ROOT/stdlib" -w -a $FLAGS $STOP -c "$b" ) \
+  ( cd "$w/c" && timeout 60 "$CPP" -I "$ROOT/stdlib" $W $FLAGS $STOP -c "$b" ) \
       >"$OUT/$key.c.out" 2>"$OUT/$key.c"; crc=$?
   rm -rf "${w:?}"
   echo "$orc" >> "$OUT/$key.o"; echo "$crc" >> "$OUT/$key.c"

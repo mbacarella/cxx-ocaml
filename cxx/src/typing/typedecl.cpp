@@ -356,7 +356,11 @@ static const tt::TTypeDeclaration* transl_declaration(env::t env, const pt::Type
       kind->external = sk.external;
       break;
     case PK::Ptype_variant: {
-      // (the Constraint_on_gadt warning is not emitted)
+      bool gadt = false;
+      for (auto* c : sk.constructors)
+        if (c->pcd_res) gadt = true;
+      if (gadt && !constraints.empty())
+        location::prerr_warning(constraints[0].loc, warnings::Warning::make(warnings::Warning::K::Constraint_on_gadt));
       std::set<std::string_view> all_constrs;
       for (auto* c : sk.constructors) {
         if (all_constrs.count(c->pcd_name.txt)) {

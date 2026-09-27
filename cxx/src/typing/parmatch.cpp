@@ -5,6 +5,7 @@
 // The warning-only computations (fragile matches, ambiguous or-pattern
 // bindings, the counter-example message) are left out: they have no effect
 // on typing.
+#include <set>
 #include <cstdlib>
 #include <cstring>
 
@@ -2099,8 +2100,358 @@ tt::Partial check_partial(const std::function<const tt::Pattern*(const tt::Patte
   return total;
 }
 
-// Ambiguous variables in or-patterns under a guard: a warning-only check
-// (warning 57) with no effect on typing.
-void check_ambiguous_bindings(const std::vector<const tt::Case*>&) {}
+// ---- ambiguous variables in or-patterns under a guard (warning 57) ----------------------
+namespace {
+struct IdCmp {
+  bool operator()(Ident::t a, Ident::t b) const { return ident::compare(a, b) < 0; }
+};
+using IdSet = std::set<Ident::t, IdCmp>;
+
+IdSet inter(const IdSet& a, const IdSet& b) {
+  IdSet r;
+  for (Ident::t x : a)
+    if (b.count(x)) r.insert(x);
+  return r;
+}
+
+// Row for ambiguous variable search (see parmatch.ml): the traditional
+// pattern row, and the head variable sets
+struct AmbRow {
+  Pats row;
+  std::vector<IdSet> varsets;
+};
+// ('a, 'b) signed = Positive of amb_row | Negative of pattern list
+struct Signed {
+  bool positive;
+  AmbRow pos;
+  Pats neg;
+  bool empty() const { return positive ? pos.row.empty() : neg.empty(); }
+};
+
+// simplify_head_amb_pat: the variables of the head pattern are collected in
+// a new varset
+void simplify_head_amb_pat(IdSet head_bound_variables, const std::vector<IdSet>& varsets, const tt::Pattern* p,
+                           const Pats& ps, SMatrix<Signed>& out) {
+  const tt::PatternDesc* d = p->pat_desc;
+  if (auto* a = as<tt::Tpat_alias>(d)) {
+    head_bound_variables.insert(a->id);
+    simplify_head_amb_pat(head_bound_variables, varsets, a->pat, ps, out);
+  } else if (auto* v = as<tt::Tpat_var>(d)) {
+    head_bound_variables.insert(v->id);
+    simplify_head_amb_pat(head_bound_variables, varsets, omega(), ps, out);
+  } else if (auto* o = as<tt::Tpat_or>(d)) {
+    simplify_head_amb_pat(head_bound_variables, varsets, o->p1, ps, out);
+    simplify_head_amb_pat(head_bound_variables, varsets, o->p2, ps, out);
+  } else {
+    std::vector<IdSet> vs{head_bound_variables};
+    vs.insert(vs.end(), varsets.begin(), varsets.end());
+    out.push_back({deconstruct(p), Signed{true, AmbRow{ps, vs}, {}}});
+  }
+}
+// simplify_head_pat for a negative row
+void simplify_head_neg_pat(const tt::Pattern* p, const Pats& ns, SMatrix<Signed>& out) {
+  const tt::Pattern* v = strip_vars(p);
+  if (auto* o = as<tt::Tpat_or>(v->pat_desc)) {
+    simplify_head_neg_pat(o->p1, ns, out);
+    simplify_head_neg_pat(o->p2, ns, out);
+    return;
+  }
+  out.push_back({deconstruct(v), Signed{false, {}, ns}});
+}
+
+SMatrix<Signed> simplify_first_amb_col(const std::vector<Signed>& m) {
+  SMatrix<Signed> out;
+  for (const Signed& r : m) {
+    if (r.empty()) throw std::logic_error("Parmatch.simplify_first_amb_col");
+    if (!r.positive) {
+      simplify_head_neg_pat(r.neg[0], Pats(r.neg.begin() + 1, r.neg.end()), out);
+    } else {
+      simplify_head_amb_pat({}, r.pos.varsets, r.pos.row[0], Pats(r.pos.row.begin() + 1, r.pos.row.end()), out);
+    }
+  }
+  return out;
+}
+
+// stable_vars = All | Vars of Ident.Set.t
+struct StableVars {
+  bool all;
+  IdSet vars;
+};
+StableVars stable_inter(const StableVars& a, const StableVars& b) {
+  if (a.all) return b;
+  if (b.all) return a;
+  return {false, inter(a.vars, b.vars)};
+}
+
+StableVars matrix_stable_vars(const std::vector<Signed>& m) {
+  if (m.empty()) return {true, {}};
+  if (m[0].empty()) {
+    // if at least one empty row is negative, the matrix matches no value
+    std::vector<std::vector<IdSet>> rows_varsets;
+    for (const Signed& r : m) {
+      if (!r.positive) return {true, {}};
+      rows_varsets.push_back(r.pos.varsets);
+    }
+    // reduce (List.map2 Ident.Set.inter)
+    std::vector<IdSet> stables = rows_varsets[0];
+    for (std::size_t k = 1; k < rows_varsets.size(); ++k) {
+      if (rows_varsets[k].size() != stables.size()) throw std::invalid_argument("List.map2");
+      for (std::size_t i = 0; i < stables.size(); ++i) stables[i] = inter(stables[i], rows_varsets[k][i]);
+    }
+    // The stable variables are those stable at any position
+    IdSet u;
+    for (auto& st : stables) u.insert(st.begin(), st.end());
+    return {false, u};
+  }
+  bool all_negative = true;
+  for (const Signed& r : m) all_negative = all_negative && !r.positive;
+  // optimization: quit early if there are no positive rows
+  if (all_negative) return {true, {}};
+  SMatrix<Signed> sm = simplify_first_amb_col(m);
+  if (!all_coherent(first_column(sm))) return {true, {}};
+  auto extend_row = [](const Pats& columns, const Signed& r) {
+    Signed x = r;
+    if (x.positive) x.pos.row.insert(x.pos.row.begin(), columns.begin(), columns.end());
+    else x.neg.insert(x.neg.begin(), columns.begin(), columns.end());
+    return x;
+  };
+  const Head* q0 = discr_pat(omega(), sm);
+  SpecializedMatrices<Signed> spec = build_specialized_submatrices<Signed>(extend_row, q0, sm);
+  std::vector<std::vector<Signed>> submatrices;
+  if (!full_match(false, spec.constrs)) submatrices.push_back(spec.default_);
+  for (auto& [h, rows] : spec.constrs) submatrices.push_back(rows);
+  // A stable variable must be stable in each submatrix.
+  StableVars acc{true, {}};
+  for (auto& sub : submatrices) acc = stable_inter(acc, matrix_stable_vars(sub));
+  return acc;
+}
+
+StableVars pattern_stable_vars(const std::vector<Pats>& ns, const tt::Pattern* p) {
+  // List.fold_left (fun m n -> Negative n :: m) [Positive ...] ns
+  std::vector<Signed> m{Signed{true, AmbRow{{p}, {}}, {}}};
+  for (const Pats& n : ns) m.insert(m.begin(), Signed{false, {}, n});
+  return matrix_stable_vars(m);
+}
+
+// All identifier paths' heads that appear in an expression (Tast_iterator's
+// default traversal down to Texp_ident)
+struct RhsIdents {
+  IdSet ids;
+  void path(Path::t p) {
+    for (Ident::t id : path::heads(p)) ids.insert(id);
+  }
+  void vbs(Slice<const tt::ValueBinding*> l) {
+    for (auto* vb : l) expr(vb->vb_expr);
+  }
+  void cases(Slice<const tt::Case*> l) {
+    for (auto* c : l) {
+      if (c->c_guard) expr(c->c_guard);
+      expr(c->c_rhs);
+    }
+  }
+  void module_expr(const tt::ModuleExpr* me) {
+    const tt::ModuleExprDesc* d = me->mod_desc;
+    if (auto* x = as<tt::Tmod_structure>(d)) structure(x->str);
+    else if (auto* x = as<tt::Tmod_functor>(d)) module_expr(x->body);
+    else if (auto* x = as<tt::Tmod_apply>(d)) {
+      module_expr(x->fn);
+      module_expr(x->arg);
+    } else if (auto* x = as<tt::Tmod_apply_unit>(d)) module_expr(x->fn);
+    else if (auto* x = as<tt::Tmod_constraint>(d)) module_expr(x->me);
+    else if (auto* x = as<tt::Tmod_unpack>(d)) expr(x->exp);
+  }
+  void class_expr(const tt::ClassExpr* ce) {
+    const tt::ClassExprDesc* d = ce->cl_desc;
+    if (auto* x = as<tt::Tcl_constraint>(d)) class_expr(x->ce);
+    else if (auto* x = as<tt::Tcl_structure>(d)) class_structure(x->cs);
+    else if (auto* x = as<tt::Tcl_fun>(d)) {
+      for (auto& a : x->args) expr(a.exp);
+      class_expr(x->ce);
+    } else if (auto* x = as<tt::Tcl_apply>(d)) {
+      class_expr(x->ce);
+      for (auto& a : x->args)
+        if (!a.arg.omitted) expr(a.arg.arg);
+    } else if (auto* x = as<tt::Tcl_let>(d)) {
+      vbs(x->vbs);
+      for (auto& v : x->vals) expr(v.exp);
+      class_expr(x->ce);
+    } else if (auto* x = as<tt::Tcl_open>(d)) class_expr(x->ce);
+  }
+  void class_structure(const tt::ClassStructure* cs) {
+    for (const tt::ClassField* f : cs->cstr_fields) {
+      const tt::ClassFieldDesc* d = f->cf_desc;
+      if (auto* x = as<tt::Tcf_inherit>(d)) class_expr(x->ce);
+      else if (auto* x = as<tt::Tcf_val>(d)) {
+        if (!x->kind_.is_virtual) expr(x->kind_.exp);
+      } else if (auto* x = as<tt::Tcf_method>(d)) {
+        if (!x->kind_.is_virtual) expr(x->kind_.exp);
+      } else if (auto* x = as<tt::Tcf_initializer>(d)) expr(x->exp);
+    }
+  }
+  void structure_item(const tt::StructureItem* it) {
+    const tt::StructureItemDesc* d = it->str_desc;
+    if (auto* x = as<tt::Tstr_eval>(d)) expr(x->exp);
+    else if (auto* x = as<tt::Tstr_value>(d)) vbs(x->vbs);
+    else if (auto* x = as<tt::Tstr_module>(d)) module_expr(x->mb->mb_expr);
+    else if (auto* x = as<tt::Tstr_recmodule>(d)) {
+      for (auto* mb : x->mbs) module_expr(mb->mb_expr);
+    } else if (auto* x = as<tt::Tstr_open>(d)) module_expr(x->od->open_expr);
+    else if (auto* x = as<tt::Tstr_include>(d)) module_expr(x->incl->incl_mod);
+    else if (auto* x = as<tt::Tstr_class>(d)) {
+      for (auto& c : x->classes) class_expr(c.decl->ci_expr);
+    }
+  }
+  void structure(const tt::Structure* str) {
+    for (auto* it : str->str_items) structure_item(it);
+  }
+  void expr(const tt::Expression* e) {
+    const tt::ExpressionDesc* d = e->exp_desc;
+    using XK = tt::ExpressionDesc::Kind;
+    switch (d->kind) {
+      case XK::Texp_ident: path(as<tt::Texp_ident>(d)->path); return;
+      case XK::Texp_let: {
+        auto* x = as<tt::Texp_let>(d);
+        vbs(x->vbs);
+        expr(x->body);
+        return;
+      }
+      case XK::Texp_function: {
+        auto* x = as<tt::Texp_function>(d);
+        for (auto* fp : x->params)
+          if (fp->fp_kind.kind == tt::FunctionParamKind::Kind::Tparam_optional_default) expr(fp->fp_kind.default_);
+        if (x->body->kind == tt::FunctionBody::Kind::Tfunction_body) expr(x->body->body);
+        else cases(x->body->cases);
+        return;
+      }
+      case XK::Texp_apply: {
+        auto* x = as<tt::Texp_apply>(d);
+        expr(x->fn);
+        for (auto& a : x->args)
+          if (!a.arg.omitted) expr(a.arg.arg);
+        return;
+      }
+      case XK::Texp_match: {
+        auto* x = as<tt::Texp_match>(d);
+        expr(x->exp);
+        cases(x->comp_cases);
+        cases(x->eff_cases);
+        return;
+      }
+      case XK::Texp_try: {
+        auto* x = as<tt::Texp_try>(d);
+        expr(x->exp);
+        cases(x->exn_cases);
+        cases(x->eff_cases);
+        return;
+      }
+      case XK::Texp_tuple:
+        for (auto& le : as<tt::Texp_tuple>(d)->el) expr(le.exp);
+        return;
+      case XK::Texp_construct:
+        for (auto* a : as<tt::Texp_construct>(d)->args) expr(a);
+        return;
+      case XK::Texp_variant:
+        if (auto* a = as<tt::Texp_variant>(d)->arg) expr(a);
+        return;
+      case XK::Texp_record: {
+        auto* x = as<tt::Texp_record>(d);
+        for (auto& f : x->fields)
+          if (!f.def.kept) expr(f.def.exp);
+        if (x->extended_expression) expr(x->extended_expression);
+        return;
+      }
+      case XK::Texp_atomic_loc: expr(as<tt::Texp_atomic_loc>(d)->exp); return;
+      case XK::Texp_field: expr(as<tt::Texp_field>(d)->exp); return;
+      case XK::Texp_setfield: {
+        auto* x = as<tt::Texp_setfield>(d);
+        expr(x->exp);
+        expr(x->value);
+        return;
+      }
+      case XK::Texp_array:
+        for (auto* a : as<tt::Texp_array>(d)->el) expr(a);
+        return;
+      case XK::Texp_ifthenelse: {
+        auto* x = as<tt::Texp_ifthenelse>(d);
+        expr(x->cond);
+        expr(x->then_);
+        if (x->else_) expr(x->else_);
+        return;
+      }
+      case XK::Texp_sequence: {
+        auto* x = as<tt::Texp_sequence>(d);
+        expr(x->e1);
+        expr(x->e2);
+        return;
+      }
+      case XK::Texp_while: {
+        auto* x = as<tt::Texp_while>(d);
+        expr(x->cond);
+        expr(x->body);
+        return;
+      }
+      case XK::Texp_for: {
+        auto* x = as<tt::Texp_for>(d);
+        expr(x->lo);
+        expr(x->hi);
+        expr(x->body);
+        return;
+      }
+      case XK::Texp_send: expr(as<tt::Texp_send>(d)->obj); return;
+      case XK::Texp_setinstvar: expr(as<tt::Texp_setinstvar>(d)->value); return;
+      case XK::Texp_override:
+        for (auto& f : as<tt::Texp_override>(d)->fields) expr(f.exp);
+        return;
+      case XK::Texp_assert: expr(as<tt::Texp_assert>(d)->exp); return;
+      case XK::Texp_lazy: expr(as<tt::Texp_lazy>(d)->exp); return;
+      case XK::Texp_object: class_structure(as<tt::Texp_object>(d)->cs); return;
+      case XK::Texp_pack: module_expr(as<tt::Texp_pack>(d)->me); return;
+      case XK::Texp_letop: {
+        auto* x = as<tt::Texp_letop>(d);
+        expr(x->let_->bop_exp);
+        for (auto* a : x->ands) expr(a->bop_exp);
+        if (x->body->c_guard) expr(x->body->c_guard);
+        expr(x->body->c_rhs);
+        return;
+      }
+      case XK::Texp_struct_item: {
+        auto* x = as<tt::Texp_struct_item>(d);
+        structure_item(x->item);
+        expr(x->body);
+        return;
+      }
+      default: return;
+    }
+  }
+};
+}  // namespace
+
+void check_ambiguous_bindings(const std::vector<const tt::Case*>& cases) {
+  if (!warnings::is_active(57)) return;
+  std::vector<Pats> ns;  // head first
+  for (const tt::Case* c : cases) {
+    const tt::Pattern* p = c->c_lhs;
+    if (!c->c_guard) {
+      ns.insert(ns.begin(), Pats{p});
+      continue;
+    }
+    RhsIdents ri;
+    ri.expr(c->c_guard);
+    IdSet pv;
+    for (Ident::t id : tt::pat_bound_idents(p)) pv.insert(id);
+    IdSet all = inter(pv, ri.ids);
+    if (!all.empty()) {
+      StableVars sv = pattern_stable_vars(ns, p);
+      if (!sv.all) {
+        std::vector<std::string> pps;
+        for (Ident::t id : all)
+          if (!sv.vars.count(id)) pps.push_back(std::string(ident::name(id)));
+        if (!pps.empty())
+          location::prerr_warning(p->pat_loc,
+                                  warnings::Warning::with_l(warnings::Warning::K::Ambiguous_var_in_pattern_guard, pps));
+      }
+    }
+  }
+}
 
 }  // namespace cppcaml::typing::parmatch

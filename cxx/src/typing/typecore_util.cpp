@@ -351,7 +351,7 @@ ArrayInfo disambiguate_array_literal(const Location& loc, env::t env, TypeExpr* 
   };
   if (is_floatarray_type(env, expected_ty)) return ret(ctype::instance(predef::type_float()), MutableFlag::Mutable);
   if (is_iarray_type(env, expected_ty)) return ret(nullptr, MutableFlag::Immutable);
-  return ret(nullptr, MutableFlag::Mutable);
+  return ArrayInfo{nullptr, MutableFlag::Mutable};
 }
 
 bool has_poly_constraint(const pt::Pattern* spat) {
