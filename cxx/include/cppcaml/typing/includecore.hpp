@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "cppcaml/typing/ctype.hpp"
+#include "cppcaml/typing/diffing.hpp"
 #include "cppcaml/typing/typedtree.hpp"
 
 namespace cppcaml::typing::includecore {
@@ -47,26 +48,26 @@ struct LabelMismatch {  // Type | Mutability | Atomicity
   et::EqualityError err;
   Position pos = Position::First;
 };
-// A (reduced) Diffing_with_keys change: the field of the first mismatch.
-struct FieldChange {
-  enum class Kind { Change, Swap, Move, Insert, Delete };
-  Kind kind;
-  std::string_view name;
-  long pos = 0;
-};
+struct ConstructorMismatch;
+// record_change: (label_declaration, label_declaration, label_mismatch)
+// Diffing_with_keys.change
+using RecordChange = diffing::KeyedChange<const LabelDeclaration*, const LabelDeclaration*, LabelMismatch>;
 struct RecordMismatch {  // Label_mismatch of record_change list | Unboxed_float_representation
   enum class Kind { Label_mismatch, Unboxed_float_representation };
   Kind kind;
-  std::vector<FieldChange> changes;
+  std::vector<RecordChange> changes;
   Position pos = Position::First;
 };
 struct ConstructorMismatch {
   enum class Kind { Type, Arity, Inline_record, Kind_, Explicit_return_type };
   Kind kind;
   et::EqualityError err;
-  std::vector<FieldChange> changes;  // Inline_record
+  std::vector<RecordChange> changes;  // Inline_record
   Position pos = Position::First;
 };
+// variant_change: (constructor_declaration, .., constructor_mismatch) change
+using VariantChange =
+    diffing::KeyedChange<const ConstructorDeclaration*, const ConstructorDeclaration*, ConstructorMismatch>;
 struct ExtensionConstructorMismatch {  // Constructor_privacy | Constructor_mismatch of Ident.t * ..
   enum class Kind { Constructor_privacy, Constructor_mismatch };
   Kind kind;
@@ -102,8 +103,7 @@ struct TypeMismatch {
   std::optional<PrivateVariantMismatch> private_variant;
   std::optional<PrivateObjectMismatch> private_object;
   std::optional<RecordMismatch> record;
-  std::vector<FieldChange> variant_changes;  // Variant_mismatch
-  std::optional<ConstructorMismatch> variant_mismatch;
+  std::vector<VariantChange> variant_changes;  // Variant_mismatch
   Position pos = Position::First;         // Unboxed_representation
   bool immediate_violation_always = false;  // Immediate (Type_immediacy.Violation.t)
 };
@@ -121,5 +121,14 @@ const typedtree::ModuleCoercion* value_descriptions_consistency(env::t env, cons
 std::optional<TypeMismatch> type_declarations_consistency(env::t env, const TypeDeclaration* decl1,
                                                           const TypeDeclaration* decl2);
 bool class_types(env::t env, const ClassType* cty1, const ClassType* cty2);
+
+// ---- the error messages (includecore.ml's report_* functions) ----
+void report_value_mismatch(std::string_view first, std::string_view second, env::t env, format_doc::Formatter& ppf,
+                           const ValueMismatch& err);
+void report_type_mismatch(std::string_view first, std::string_view second, std::string_view decl, env::t env,
+                          format_doc::Formatter& ppf, const TypeMismatch& err);
+void report_extension_constructor_mismatch(std::string_view first, std::string_view second, std::string_view decl,
+                                           env::t env, format_doc::Formatter& ppf,
+                                           const ExtensionConstructorMismatch& err);
 
 }  // namespace cppcaml::typing::includecore

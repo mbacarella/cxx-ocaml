@@ -157,45 +157,88 @@ std::optional<LabelMismatch> compare_labels(env::t env, const std::vector<TypeEx
   return std::nullopt;
 }
 
-// Record_diffing.equal (the first mismatch is recorded in [change])
+// Record_diffing.equal
 bool record_equal(env::t env, std::vector<TypeExpr*> params1, std::vector<TypeExpr*> params2,
-                  Slice<const LabelDeclaration*> labels1, Slice<const LabelDeclaration*> labels2,
-                  FieldChange* change) {
-  std::size_t k = 0;
-  for (;; ++k) {
+                  Slice<const LabelDeclaration*> labels1, Slice<const LabelDeclaration*> labels2) {
+  for (std::size_t k = 0;; ++k) {
     if (k == labels1.size() && k == labels2.size()) return true;
-    if (k == labels1.size()) {
-      *change = {FieldChange::Kind::Insert, ident::name(labels2[k]->ld_id), static_cast<long>(k)};
-      return false;
-    }
-    if (k == labels2.size()) {
-      *change = {FieldChange::Kind::Delete, ident::name(labels1[k]->ld_id), static_cast<long>(k)};
-      return false;
-    }
+    if (k == labels1.size() || k == labels2.size()) return false;
     const LabelDeclaration* ld1 = labels1[k];
     const LabelDeclaration* ld2 = labels2[k];
-    if (ident::name(ld1->ld_id) != ident::name(ld2->ld_id)) {
-      *change = {FieldChange::Kind::Change, ident::name(ld1->ld_id), static_cast<long>(k)};
-      return false;
-    }
+    if (ident::name(ld1->ld_id) != ident::name(ld2->ld_id)) return false;
     // (check_deprecated_mutable_inclusion: warnings)
-    if (compare_labels(env, params1, params2, ld1, ld2)) {
-      *change = {FieldChange::Kind::Change, ident::name(ld1->ld_id), static_cast<long>(k)};
-      return false;
-    }
+    if (compare_labels(env, params1, params2, ld1, ld2)) return false;
     // add arguments to the parameters, cf. PR#7378
     params1.insert(params1.begin(), ld1->ld_type);
     params2.insert(params2.begin(), ld2->ld_type);
   }
 }
 
-std::optional<std::vector<FieldChange>> record_compare(env::t env, const std::vector<TypeExpr*>& params1,
-                                                       const std::vector<TypeExpr*>& params2,
-                                                       Slice<const LabelDeclaration*> l,
-                                                       Slice<const LabelDeclaration*> r) {
-  FieldChange c{};
-  if (record_equal(env, params1, params2, l, r, &c)) return std::nullopt;
-  return std::vector<FieldChange>{c};
+using ParamsState = std::pair<std::vector<TypeExpr*>, std::vector<TypeExpr*>>;
+
+// Record_diffing.diffing
+std::vector<RecordChange> record_diffing(env::t env, const std::vector<TypeExpr*>& params1,
+                                         const std::vector<TypeExpr*>& params2, Slice<const LabelDeclaration*> l,
+                                         Slice<const LabelDeclaration*> r) {
+  using LD = const LabelDeclaration*;
+  using KD = diffing::KeyedDiff<LD, LD, LabelMismatch, ParamsState>;
+  using M = diffing::Mismatch<LD, LD, LabelMismatch>;
+  KD d;
+  d.key_left = [](LD x) { return std::string(ident::name(x->ld_id)); };
+  d.key_right = d.key_left;
+  d.update = [](const KD::change& c, const ParamsState& st) {
+    if (c.k != KD::change::K::Keep) return st;
+    // We need to add equality between existential type parameters (in inline records)
+    ParamsState r = st;
+    r.first.insert(r.first.begin(), c.left.data->ld_type);
+    r.second.insert(r.second.begin(), c.right.data->ld_type);
+    return r;
+  };
+  d.test = [env](const ParamsState& st, const diffing::WithPos<LD>& x, const diffing::WithPos<LD>& y) {
+    KD::TR res{};
+    std::string name1(ident::name(x.data->ld_id)), name2(ident::name(y.data->ld_id));
+    if (name1 != name2) {
+      bool types_match = !compare_labels(env, st.first, st.second, x.data, y.data);
+      M m{M::K::Name};
+      m.types_match = types_match;
+      m.pos = x.pos;
+      m.got_name = name1;
+      m.expected_name = name2;
+      res.ok = false;
+      res.err = m;
+      return res;
+    }
+    if (std::optional<LabelMismatch> reason = compare_labels(env, st.first, st.second, x.data, y.data)) {
+      M m{M::K::Type};
+      m.pos = x.pos;
+      m.got = x.data;
+      m.expected = y.data;
+      m.reason = *reason;
+      res.ok = false;
+      res.err = m;
+      return res;
+    }
+    res.ok = true;
+    return res;
+  };
+  d.weight = [](const KD::change& c) -> long {
+    switch (c.k) {
+      case KD::change::K::Insert:
+      case KD::change::K::Delete: return 100;
+      case KD::change::K::Keep: return 0;
+      case KD::change::K::Change: return c.diff.k == M::K::Name ? (c.diff.types_match ? 98 : 99) : 50;
+    }
+    return 0;
+  };
+  return d.diff({params1, params2}, std::vector<LD>(l.begin(), l.end()), std::vector<LD>(r.begin(), r.end()));
+}
+
+std::optional<std::vector<RecordChange>> record_compare(env::t env, const std::vector<TypeExpr*>& params1,
+                                                        const std::vector<TypeExpr*>& params2,
+                                                        Slice<const LabelDeclaration*> l,
+                                                        Slice<const LabelDeclaration*> r) {
+  if (record_equal(env, params1, params2, l, r)) return std::nullopt;
+  return record_diffing(env, params1, params2, l, r);
 }
 
 std::optional<TypeMismatch> record_compare_with_representation(env::t env, const std::vector<TypeExpr*>& params1,
@@ -279,40 +322,84 @@ std::optional<ConstructorMismatch> compare_constructors(env::t env, const std::v
   return compare_constructor_arguments(env, params1, params2, args1, args2);
 }
 
+// Variant_diffing.equal
+bool variant_equal(env::t env, const std::vector<TypeExpr*>& params1, const std::vector<TypeExpr*>& params2,
+                   Slice<const ConstructorDeclaration*> cstrs1, Slice<const ConstructorDeclaration*> cstrs2) {
+  if (cstrs1.size() != cstrs2.size()) return false;
+  for (std::size_t k = 0; k < cstrs1.size(); ++k) {
+    const ConstructorDeclaration* cd1 = cstrs1[k];
+    const ConstructorDeclaration* cd2 = cstrs2[k];
+    if (ident::name(cd1->cd_id) != ident::name(cd2->cd_id)) return false;
+    // (check_alerts_inclusion: alerts)
+    if (compare_constructors(env, params1, params2, cd1->cd_res, cd2->cd_res, cd1->cd_args, cd2->cd_args))
+      return false;
+  }
+  return true;
+}
+
+// Variant_diffing.diffing
+std::vector<VariantChange> variant_diffing(env::t env, const std::vector<TypeExpr*>& params1,
+                                           const std::vector<TypeExpr*>& params2,
+                                           Slice<const ConstructorDeclaration*> l,
+                                           Slice<const ConstructorDeclaration*> r) {
+  using CD = const ConstructorDeclaration*;
+  using KD = diffing::KeyedDiff<CD, CD, ConstructorMismatch, ParamsState>;
+  using M = diffing::Mismatch<CD, CD, ConstructorMismatch>;
+  KD d;
+  d.key_left = [](CD x) { return std::string(ident::name(x->cd_id)); };
+  d.key_right = d.key_left;
+  d.update = [](const KD::change&, const ParamsState& st) { return st; };
+  d.test = [env](const ParamsState& st, const diffing::WithPos<CD>& x, const diffing::WithPos<CD>& y) {
+    KD::TR res{};
+    const ConstructorDeclaration *cd1 = x.data, *cd2 = y.data;
+    std::string name1(ident::name(cd1->cd_id)), name2(ident::name(cd2->cd_id));
+    if (name1 != name2) {
+      bool types_match =
+          !compare_constructors(env, st.first, st.second, cd1->cd_res, cd2->cd_res, cd1->cd_args, cd2->cd_args);
+      M m{M::K::Name};
+      m.types_match = types_match;
+      m.pos = x.pos;
+      m.got_name = name1;
+      m.expected_name = name2;
+      res.ok = false;
+      res.err = m;
+      return res;
+    }
+    if (std::optional<ConstructorMismatch> reason =
+            compare_constructors(env, st.first, st.second, cd1->cd_res, cd2->cd_res, cd1->cd_args, cd2->cd_args)) {
+      M m{M::K::Type};
+      m.pos = x.pos;
+      m.got = cd1;
+      m.expected = cd2;
+      m.reason = *reason;
+      res.ok = false;
+      res.err = m;
+      return res;
+    }
+    res.ok = true;
+    return res;
+  };
+  d.weight = [](const KD::change& c) -> long {
+    switch (c.k) {
+      case KD::change::K::Insert:
+      case KD::change::K::Delete: return 100;
+      case KD::change::K::Keep: return 0;
+      case KD::change::K::Change: return c.diff.k == M::K::Name ? (c.diff.types_match ? 98 : 99) : 50;
+    }
+    return 0;
+  };
+  return d.diff({params1, params2}, std::vector<CD>(l.begin(), l.end()), std::vector<CD>(r.begin(), r.end()));
+}
+
 std::optional<TypeMismatch> variant_compare_with_representation(env::t env, const std::vector<TypeExpr*>& params1,
                                                                 const std::vector<TypeExpr*>& params2,
                                                                 Slice<const ConstructorDeclaration*> cstrs1,
                                                                 Slice<const ConstructorDeclaration*> cstrs2,
                                                                 VariantRepresentation rep1,
                                                                 VariantRepresentation rep2) {
-  // Variant_diffing.equal: List.length l1 = List.length l2 && List.for_all2 ..
-  std::optional<FieldChange> change;
-  std::optional<ConstructorMismatch> first_mismatch;
-  if (cstrs1.size() != cstrs2.size()) {
-    std::size_t k = std::min(cstrs1.size(), cstrs2.size());
-    change = cstrs1.size() > cstrs2.size()
-                 ? FieldChange{FieldChange::Kind::Delete, ident::name(cstrs1[k]->cd_id), static_cast<long>(k)}
-                 : FieldChange{FieldChange::Kind::Insert, ident::name(cstrs2[k]->cd_id), static_cast<long>(k)};
-  } else {
-    for (std::size_t k = 0; k < cstrs1.size(); ++k) {
-      const ConstructorDeclaration* cd1 = cstrs1[k];
-      const ConstructorDeclaration* cd2 = cstrs2[k];
-      if (ident::name(cd1->cd_id) != ident::name(cd2->cd_id)) {
-        change = FieldChange{FieldChange::Kind::Change, ident::name(cd1->cd_id), static_cast<long>(k)};
-        break;
-      }
-      // (check_alerts_inclusion: alerts)
-      if (auto m = compare_constructors(env, params1, params2, cd1->cd_res, cd2->cd_res, cd1->cd_args, cd2->cd_args)) {
-        change = FieldChange{FieldChange::Kind::Change, ident::name(cd1->cd_id), static_cast<long>(k)};
-        first_mismatch = m;
-        break;
-      }
-    }
-  }
-  if (change) {
+  if (!variant_equal(env, params1, params2, cstrs1, cstrs2)) {
     TypeMismatch m{TypeMismatch::Kind::Variant_mismatch};
-    m.variant_changes = {*change};
-    m.variant_mismatch = first_mismatch;
+    m.variant_changes = variant_diffing(env, params1, params2, cstrs1, cstrs2);
     return m;
   }
   using VR = VariantRepresentation;

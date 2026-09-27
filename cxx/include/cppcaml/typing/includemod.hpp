@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "cppcaml/typing/ctype.hpp"
+#include "cppcaml/typing/diffing.hpp"
 #include "cppcaml/typing/includecore.hpp"
 #include "cppcaml/typing/shape.hpp"
 #include "cppcaml/typing/subst.hpp"
@@ -76,6 +77,7 @@ struct FunctorParamSymptom {
   enum class Kind { Incompatible_params, Mismatch };
   Kind kind;
   FunctorParameter arg{};  // Incompatible_params (arg side)
+  FunctorArgDescr arg_descr{FunctorArgDescr::Kind::Anonymous};  // Functor_app_diff's Incompatible_params
   FunctorParameter param{};
   std::shared_ptr<const ModuleTypeDiff> mismatch;
 };
@@ -214,5 +216,38 @@ const ModuleType* expand_module_alias(bool strengthen, env::t env, Path::t path)
 
 // Installs Env.check_functor_application (includemod.ml's toplevel `let ()`).
 void install_forward_refs();
+
+// ---- Check: the compatibility tests of Signature_matching ----
+namespace check {
+bool module_types(env::t env, subst::t s, const ModtypeDeclaration* mt1, const ModtypeDeclaration* mt2);
+bool modules(env::t env, subst::t s, const ModuleDeclaration* m1, const ModuleDeclaration* m2);
+bool values(env::t env, subst::t s, const ValueDescription* v1, const ValueDescription* v2);
+bool types(env::t env, subst::t s, const TypeDeclaration* t1, const TypeDeclaration* t2);
+bool classes(env::t env, subst::t s, const ClassDeclaration* c1, const ClassDeclaration* c2);
+bool class_types(env::t env, subst::t s, const ClassTypeDeclaration* c1, const ClassTypeDeclaration* c2);
+bool extensions(env::t env, subst::t s, const ExtensionConstructor* e1, const ExtensionConstructor* e2);
+}  // namespace check
+
+// ---- the functor diffs (Functor_inclusion_diff / Functor_app_diff) ----
+struct InclusionEnv {  // inclusion_env = { i_env; i_subst }
+  env::t i_env;
+  subst::t i_subst;
+};
+struct FunctorDiffState {
+  const ModuleType* res;  // option
+  env::t env;
+  subst::t subst;
+};
+using InclusionChange =
+    diffing::Change<FunctorParameter, FunctorParameter, const tt::ModuleCoercion*, error::FunctorParamSymptom>;
+std::vector<InclusionChange> functor_inclusion_diff(const InclusionEnv& ie,
+                                                    const std::vector<FunctorParameter>& params1,
+                                                    const ModuleType* res1,
+                                                    const std::vector<FunctorParameter>& params2);
+using AppArg = std::pair<error::FunctorArgDescr, const ModuleType*>;
+using AppChange = diffing::Change<AppArg, FunctorParameter, const tt::ModuleCoercion*, error::FunctorParamSymptom>;
+std::vector<AppChange> functor_app_diff(env::t env, const ModuleType* f, const std::vector<AppArg>& args);
+// retrieve_functor_params env mty
+error::FunctorParamsInfo retrieve_functor_params_(env::t env, const ModuleType* mty);
 
 }  // namespace cppcaml::typing::includemod

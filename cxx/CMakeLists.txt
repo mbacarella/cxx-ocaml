@@ -84,6 +84,9 @@ add_library(cppcaml_core
   src/typing/reporters.cpp
   src/typing/env_report.cpp
   src/typing/typecore_report.cpp
+  src/typing/includecore_report.cpp
+  src/typing/typedecl_report.cpp
+  src/typing/includeclass_report.cpp
   src/typing/simplif.cpp
   src/typing/tmc.cpp
   src/typing/translobj.cpp

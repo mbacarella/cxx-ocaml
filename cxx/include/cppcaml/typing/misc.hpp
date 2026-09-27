@@ -49,6 +49,9 @@ std::optional<fd::Doc> did_you_mean(const std::vector<std::string>& choices,
 std::pair<fd::Doc, fd::Doc> align_hint(std::string_view prefix, const fd::Doc& main, const fd::Doc& hint);
 std::pair<fd::Doc, fd::Doc> align_error_hint(const fd::Doc& main, const fd::Doc& hint);
 
+// ordinal_suffix n: "st" / "nd" / "rd" / "th"
+const char* ordinal_suffix(long n);
+
 // the manual references
 void print_manual_section(fd::Formatter& ppf, const std::vector<long>& section);
 void print_see_manual(fd::Formatter& ppf, const std::vector<long>& section);

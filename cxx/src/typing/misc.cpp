@@ -84,6 +84,17 @@ std::pair<fd::Doc, fd::Doc> align_error_hint(const fd::Doc& main, const fd::Doc&
   return align_hint("Error: ", main, hint);
 }
 
+const char* ordinal_suffix(long n) {
+  bool teen = (n % 100) / 10 == 1;
+  switch (n % 10) {
+    case 1: if (!teen) return "st"; break;
+    case 2: if (!teen) return "nd"; break;
+    case 3: if (!teen) return "rd"; break;
+    default: break;
+  }
+  return "th";
+}
+
 void print_manual_section(fd::Formatter& ppf, const std::vector<long>& section) {
   fd::fprintf(ppf, "manual section %a", [&](fd::Formatter& f) {
     bool first = true;

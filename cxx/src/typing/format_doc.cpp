@@ -30,7 +30,8 @@ BoxType box_type(format::BoxType b) {
 // Misc.Style.style_of_tag: the tags whose markup is "" with colours off;
 // any other tag gets Format's default markers "<t>" / "</t>"
 bool known_style_tag(const std::string& t) {
-  return t == "error" || t == "warning" || t == "loc" || t == "hint" || t == "inline_code" || t == "ralign";
+  return t == "error" || t == "warning" || t == "loc" || t == "hint" || t == "inline_code" || t == "ralign" ||
+         t == "@style";  // Misc.Style.Style (diffing.hpp)
 }
 
 }  // namespace

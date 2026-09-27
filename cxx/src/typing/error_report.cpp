@@ -306,21 +306,7 @@ std::optional<Report> classify(std::exception_ptr ep) {
   } catch (const typedecl::Error& er) {
     Report r = at(std::string("Typedecl.") + td_error_names[static_cast<int>(er.kind)], er.loc);
     if (er.kind == typedecl::Error::Kind::Duplicate_label) r.printed_loc = location::none();
-    if (er.mismatch) {
-      const includecore::TypeMismatch& m = *er.mismatch;
-      r.detail = "type_mismatch kind " + std::to_string(static_cast<int>(m.kind));
-      auto changes = [&](const std::vector<includecore::FieldChange>& cs) {
-        for (auto& c : cs)
-          r.detail += " change(" + std::to_string(static_cast<int>(c.kind)) + " " + std::string(c.name) + " " +
-                      std::to_string(c.pos) + ")";
-      };
-      if (m.record) {
-        r.detail += " record " + std::to_string(static_cast<int>(m.record->kind));
-        changes(m.record->changes);
-      }
-      changes(m.variant_changes);
-      if (m.variant_mismatch) r.detail += " ctor " + std::to_string(static_cast<int>(m.variant_mismatch->kind));
-    }
+    if (er.mismatch) r.detail = "type_mismatch kind " + std::to_string(static_cast<int>(er.mismatch->kind));
     return r;
   } catch (const attr_helper::Error& er) {
     return at("Attr_helper", er.loc);

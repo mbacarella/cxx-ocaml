@@ -1020,4 +1020,227 @@ void check_modtype_equiv(const Location& loc, env::t env, Ident::t id, const Mod
   throw Error(Explanation{env, a});
 }
 
+
+// ---- Check ----
+namespace check {
+namespace {
+Ident::t dummy_id() { return Ident::create_local("*dummy*"); }
+}  // namespace
+// check_ok f env subst l r: loc none, a fresh "*dummy*" ident, direction
+// unknown ~mark:false
+bool module_types(env::t env, subst::t s, const ModtypeDeclaration* mt1, const ModtypeDeclaration* mt2) {
+  Ident::t id = dummy_id();
+  return modtype_infos(core_inclusion(), location::none(), env, unknown(false), s, id, mt1, mt2).ok;
+}
+bool modules(env::t env, subst::t s, const ModuleDeclaration* m1, const ModuleDeclaration* m2) {
+  Ident::t id = dummy_id();
+  return module_declarations(core_inclusion(), location::none(), env, unknown(false), s, id, m1, m2,
+                             shape::leaf(uid::internal_not_actually_unique()))
+      .ok;
+}
+bool values(env::t env, subst::t s, const ValueDescription* v1, const ValueDescription* v2) {
+  Ident::t id = dummy_id();
+  return ci_value_descriptions(location::none(), env, unknown(false), s, id, v1, v2).ok;
+}
+bool types(env::t env, subst::t s, const TypeDeclaration* t1, const TypeDeclaration* t2) {
+  Ident::t id = dummy_id();
+  return ci_type_declarations(location::none(), env, unknown(false), s, id, t1, t2).ok;
+}
+bool classes(env::t env, subst::t s, const ClassDeclaration* c1, const ClassDeclaration* c2) {
+  Ident::t id = dummy_id();
+  return ci_class_declarations(location::none(), env, unknown(false), s, id, c1, c2).ok;
+}
+bool class_types(env::t env, subst::t s, const ClassTypeDeclaration* c1, const ClassTypeDeclaration* c2) {
+  Ident::t id = dummy_id();
+  return ci_class_type_declarations(location::none(), env, unknown(false), s, id, c1, c2).ok;
+}
+bool extensions(env::t env, subst::t s, const ExtensionConstructor* e1, const ExtensionConstructor* e2) {
+  Ident::t id = dummy_id();
+  return ci_extension_constructors(location::none(), env, unknown(false), s, id, e1, e2).ok;
+}
+}  // namespace check
+
+// ---- Functor_inclusion_diff ----
+
+E::FunctorParamsInfo retrieve_functor_params_(env::t env, const ModuleType* mty) {
+  return retrieve_functor_params(env, mty);
+}
+
+namespace {
+
+using FDS = FunctorDiffState;
+
+const ModuleType* keep_expansible_param(const ModuleType* mty) {
+  if (mty && (mty->kind == MK::Mty_ident || mty->kind == MK::Mty_alias)) return mty;
+  return nullptr;
+}
+
+// expand_params state: the state and the expansion
+std::pair<FDS, std::vector<FunctorParameter>> expand_params(FDS st) {
+  if (!st.res) return {st, {}};
+  E::FunctorParamsInfo info = retrieve_functor_params(st.env, st.res);
+  if (info.params.empty()) return {st, {}};
+  st.res = keep_expansible_param(info.res);
+  return {st, info.params};
+}
+
+FDS bind(Ident::t id, const ModuleType* arg, FDS st) {
+  const ModuleType* arg2 = subst::modtype(subst::Scoping::keep(), st.subst, arg);
+  st.env = env::add_module(id, ModulePresence::Mp_present, arg2, st.env);
+  return st;
+}
+
+using IDD = diffing::Define<FunctorParameter, FunctorParameter, const tt::ModuleCoercion*, E::FunctorParamSymptom, FDS>;
+
+std::pair<FDS, std::vector<FunctorParameter>> incl_update(const InclusionChange& d, const FDS& st) {
+  using K = InclusionChange::K;
+  auto named_some = [](const FunctorParameter& p) { return !p.is_unit && p.id; };
+  switch (d.k) {
+    case K::Insert:
+      if (!named_some(d.right)) return {st, {}};
+      return expand_params(bind(d.right.id, d.right.mty, st));
+    case K::Delete:
+      if (!named_some(d.left)) return {st, {}};
+      return expand_params(bind(d.left.id, d.left.mty, st));
+    case K::Keep: {
+      if (d.left.is_unit || d.right.is_unit) return {st, {}};
+      const ModuleType* arg = subst::modtype(subst::Scoping::keep(), st.subst, d.right.mty);
+      auto [env2, s2] = equate_one_functor_param(st.subst, st.env, arg, d.left.id, d.right.id);
+      FDS n = st;
+      n.env = env2;
+      n.subst = s2;
+      return expand_params(n);
+    }
+    case K::Change: {
+      // Change should be delete + insert
+      InclusionChange del{K::Delete, d.left};
+      auto [st1, _expansion] = incl_update(del, st);
+      InclusionChange ins{K::Insert};
+      ins.right = d.right;
+      return incl_update(ins, st1);
+    }
+  }
+  return {st, {}};
+}
+
+}  // namespace
+
+std::vector<InclusionChange> functor_inclusion_diff(const InclusionEnv& ie, const std::vector<FunctorParameter>& params1,
+                                                    const ModuleType* res1,
+                                                    const std::vector<FunctorParameter>& params2) {
+  auto weight = [](const InclusionChange& c) -> long {
+    if (c.k != InclusionChange::K::Keep) return 10;
+    Ident::t n1 = c.left.is_unit ? nullptr : c.left.id;
+    Ident::t n2 = c.right.is_unit ? nullptr : c.right.id;
+    if (!n1 && !n2) return 0;
+    if (n1 && n2 && ident::name(n1) == ident::name(n2)) return 0;
+    return 1;
+  };
+  auto test = [](const FDS& st, const FunctorParameter& p1, const FunctorParameter& p2) {
+    FunctorParamResult r = functor_param(core_inclusion(), unknown(false), location::none(), st.env, st.subst, p1, p2);
+    diffing::TestResult<const tt::ModuleCoercion*, E::FunctorParamSymptom> t{};
+    t.ok = r.cc.ok;
+    if (r.cc.ok)
+      t.eq = r.cc.value;
+    else
+      t.err = r.cc.error;
+    return t;
+  };
+  FDS state{keep_expansible_param(res1), ie.i_env, ie.i_subst};
+  return IDD::left_variadic(weight, test, incl_update, state, params1, params2);
+}
+
+// ---- Functor_app_diff ----
+
+namespace {
+using ADD = diffing::Define<AppArg, FunctorParameter, const tt::ModuleCoercion*, E::FunctorParamSymptom, FDS>;
+
+std::pair<FDS, std::vector<FunctorParameter>> app_update(const AppChange& d, const FDS& st) {
+  using K = AppChange::K;
+  using AK = E::FunctorArgDescr::Kind;
+  auto unnamed = [](const FunctorParameter& p) { return p.is_unit || !p.id; };
+  switch (d.k) {
+    case K::Delete: return {st, {}};
+    case K::Insert:
+    case K::Change: {
+      if (unnamed(d.right)) return {st, {}};
+      const ModuleType* mty = subst::modtype(subst::Scoping::keep(), st.subst, d.right.mty);
+      FDS n = st;
+      n.env = env::add_module(d.right.id, ModulePresence::Mp_present, mty, st.env, /*noalias=*/true);
+      return expand_params(n);
+    }
+    case K::Keep: {
+      if (d.left.first.kind == AK::Unit || unnamed(d.right)) return {st, {}};
+      Ident::t param = d.right.id;
+      if (d.left.first.kind == AK::Named) {
+        Path::t arg = d.left.first.path;
+        FDS n = st;
+        if (st.res) {
+          long scope = ctype::create_scope();
+          subst::t s1 = subst::add_module(param, arg, subst::identity());
+          n.res = subst::modtype(subst::Scoping::rescope(static_cast<int>(scope)), s1, st.res);
+        }
+        n.subst = subst::add_module(param, arg, st.subst);
+        return expand_params(n);
+      }
+      // (Anonymous | Empty_struct), Named (Some param, _)
+      const ModuleType* mty2 = subst::modtype(subst::Scoping::keep(), st.subst, d.left.second);
+      FDS n = st;
+      n.env = env::add_module(param, ModulePresence::Mp_present, mty2, st.env, /*noalias=*/true);
+      if (st.res) n.res = mtype::nondep_supertype(n.env, {param}, st.res);
+      return expand_params(n);
+    }
+  }
+  return {st, {}};
+}
+}  // namespace
+
+std::vector<AppChange> functor_app_diff(env::t env, const ModuleType* f, const std::vector<AppArg>& args) {
+  E::FunctorParamsInfo info = retrieve_functor_params(env, f);
+  using AK = E::FunctorArgDescr::Kind;
+  auto weight = [](const AppChange& c) -> long {
+    if (c.k != AppChange::K::Keep) return 10;
+    const E::FunctorArgDescr& desc1 = c.left.first;
+    Ident::t n2 = c.right.is_unit ? nullptr : c.right.id;
+    bool unnamed1 = desc1.kind != AK::Named;
+    if (unnamed1 && !n2) return 0;
+    if (desc1.kind == AK::Named && desc1.path->kind == Path::Kind::Pident && n2 &&
+        ident::name(desc1.path->id) == ident::name(n2))
+      return 0;
+    return 1;
+  };
+  auto test = [](const FDS& state, const AppArg& a, const FunctorParameter& param) {
+    diffing::TestResult<const tt::ModuleCoercion*, E::FunctorParamSymptom> t{};
+    const E::FunctorArgDescr& arg = a.first;
+    if ((arg.kind == AK::Unit || arg.kind == AK::Empty_struct) && param.is_unit) {
+      t.ok = true;
+      t.eq = tt::tcoerce_none();
+      return t;
+    }
+    if ((arg.kind == AK::Unit && !param.is_unit) ||
+        ((arg.kind == AK::Anonymous || arg.kind == AK::Named) && param.is_unit)) {
+      E::FunctorParamSymptom sy{E::FunctorParamSymptom::Kind::Incompatible_params};
+      sy.arg_descr = arg;
+      sy.param = param;
+      t.ok = false;
+      t.err = sy;
+      return t;
+    }
+    MtyResult r = modtypes_(core_inclusion(), unknown(false), location::none(), state.env, state.subst, a.second,
+                            param.mty, shape::dummy_mod());
+    if (r.ok) {
+      t.ok = true;
+      t.eq = r.value.first;
+    } else {
+      E::FunctorParamSymptom sy{E::FunctorParamSymptom::Kind::Mismatch};
+      sy.mismatch = share(r.error);
+      t.ok = false;
+      t.err = sy;
+    }
+    return t;
+  };
+  FDS state{keep_expansible_param(info.res), env, subst::identity()};
+  return ADD::right_variadic(weight, test, app_update, state, args, info.params);
+}
+
 }  // namespace cppcaml::typing::includemod
