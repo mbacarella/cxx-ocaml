@@ -33,6 +33,11 @@ struct OptStrLoc {  // string option loc
 struct LidLoc {  // Longident.t loc
   Longident::t txt;
   Location loc;
+  // the record's identity: the parser's record, which the typed tree keeps
+  // (Typetexp's Ttyp_constr lid, ...) -- a let constraint's type is typed
+  // twice, the two core types sharing the parsetree's lid (the occurrence
+  // index shows it); nullptr for a record built after parsing
+  const void* obj = nullptr;
 };
 
 template <class D>

@@ -179,7 +179,6 @@ TranslModtypeDecl transl_modtype_decl(env::t env, const pt::ModuleTypeDeclaratio
   });
 }
 
-void record_module_shape(Ident::t id, shape::t s);  // typemod_str.cpp (Env's mda_shape)
 
 TranslRecmodule transl_recmodule_modtypes(env::t env, Slice<const pt::ModuleDeclaration*> sdecls) {
   struct Cur {
@@ -187,11 +186,12 @@ TranslRecmodule transl_recmodule_modtypes(env::t env, Slice<const pt::ModuleDecl
     pt::OptStrLoc id_loc;
     const ModuleDeclaration* md;
     const tt::ModuleType* tmty;
+    shape::t shape;  // id_shape's shape
   };
   auto make_env = [&](const std::vector<Cur>& curr) {
     env::t e = env;
     for (auto& c : curr)
-      if (c.id) e = env::add_module_declaration(true, c.id, ModulePresence::Mp_present, c.md, e, true);
+      if (c.id) e = env::add_module_declaration(true, c.id, ModulePresence::Mp_present, c.md, e, true, c.shape);
     return e;
   };
   auto transition = [&](env::t env_c, const std::vector<Cur>& curr) {
@@ -201,7 +201,7 @@ TranslRecmodule transl_recmodule_modtypes(env::t env, Slice<const pt::ModuleDecl
           sdecls[k]->pmd_attributes, [&] { return transl_modtype(env_c, sdecls[k]->pmd_type); });
       auto* md = make<ModuleDeclaration>(*curr[k].md);
       md->md_type = tmty->mty_type;
-      out.push_back({curr[k].id, curr[k].id_loc, md, tmty});
+      out.push_back({curr[k].id, curr[k].id_loc, md, tmty, curr[k].shape});
     }
     return out;
   };
@@ -229,8 +229,8 @@ TranslRecmodule transl_recmodule_modtypes(env::t env, Slice<const pt::ModuleDecl
                                        parsetree::types_attributes(pmd->pmd_attributes), pmd->pmd_loc, md_uid);
     // id_shape: Shape.var md_uid id, the shape make_env's environments
     // give the module (Env.add_module_declaration ~shape)
-    if (ids[k]) record_module_shape(ids[k], shape::var(md_uid, ids[k]));
-    init.push_back({ids[k], pmd->pmd_name, md, nullptr});
+    shape::t id_shape = ids[k] ? shape::var(md_uid, ids[k]) : nullptr;
+    init.push_back({ids[k], pmd->pmd_name, md, nullptr, id_shape});
   }
   env::t abs_env = make_env(init);
   std::vector<Cur> dcl1 = warnings::without_warnings([&] { return transition(abs_env, init); });
@@ -297,7 +297,7 @@ const tt::Signature* transl_signature_(env::t env0, pt::Signature ssg) {
         return {mksig(mkd(tt::Tsig_typesubst{{TSK::Tsig_typesubst}, slice(r.decls)}), env, loc), {}, r.env};
       }
       case K::Psig_typext: {
-        auto [tyext, newenv] = typedecl::transl_type_extension(false, env, item->psig_loc, as<pt::Psig_typext>(d)->ext);
+        auto [tyext, newenv, shapes_] = typedecl::transl_type_extension(false, env, item->psig_loc, as<pt::Psig_typext>(d)->ext);
         for (auto* ext : tyext->tyext_constructors) check_typext(names, ext->ext_loc, ext->ext_id);
         std::vector<const SignatureItem*> sg;
         for (std::size_t k = 0; k < tyext->tyext_constructors.size(); ++k) {
@@ -308,7 +308,7 @@ const tt::Signature* transl_signature_(env::t env0, pt::Signature ssg) {
         return {mksig(mkd(tt::Tsig_typext{{TSK::Tsig_typext}, tyext}), env, loc), sg, newenv};
       }
       case K::Psig_exception: {
-        auto [ext, newenv] = typedecl::transl_type_exception(env, as<pt::Psig_exception>(d)->exn);
+        auto [ext, newenv, shape_] = typedecl::transl_type_exception(env, as<pt::Psig_exception>(d)->exn);
         const tt::TExtensionConstructor* c = ext->tyexn_constructor;
         check_typext(names, c->ext_loc, c->ext_id);
         return {mksig(mkd(tt::Tsig_exception{{TSK::Tsig_exception}, ext}), env, loc),

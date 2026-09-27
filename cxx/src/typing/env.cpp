@@ -442,11 +442,11 @@ t add_persistent_structure(Ident::t id, t env) {
 
 static ModuleComponents* components_of_module(StrMap<std::string_view> alerts, const Uid& uid,
                                               t env, subst::t ps, Path::t path,
-                                              AddressLazy* addr, const lz::Modtype* mty) {
+                                              AddressLazy* addr, const lz::Modtype* mty, shape::t shape) {
   return make<ModuleComponents>(
       alerts, uid,
       LazyBacktrack<ComponentsMaker, ComponentsResult>::create(
-          ComponentsMaker{env, ps, path, addr, mty}));
+          ComponentsMaker{env, ps, path, addr, mty, shape}));
 }
 
 // ---- persistent structures ---------------------------------------------------
@@ -478,11 +478,12 @@ static const ModuleData* sign_of_cmi(bool freshen, const persistent_env::Persist
   AddressLazy* mda_address = AddressLazy::create_forced(make<Address>(true, id));
   const lz::ModuleDecl* mda_declaration =
       lz::module_decl(subst::Scoping::make_local(), subst::identity(), lz::of_module_decl(md0));
+  shape::t mda_shape = shape::for_persistent_unit(cmi.cmi_name);
   const lz::Modtype* mty = lz::of_modtype(mt);
   if (freshen) mty = lz::modtype(subst::Scoping::rescope(path::scope(path)), subst::identity(), mty);
   ModuleComponents* comps = components_of_module(alerts, md0->md_uid, empty(), subst::identity(),
-                                                 path, mda_address, mty);
-  return make<ModuleData>(mda_declaration, comps, mda_address);
+                                                 path, mda_address, mty, mda_shape);
+  return make<ModuleData>(mda_declaration, comps, mda_address, mda_shape);
 }
 
 static const ModuleData* read_sign_of_cmi(const persistent_env::PersistentSignature& ps) {
@@ -741,7 +742,8 @@ static const TypeData* type_of_cstr(Path::t path, const ConstructorDescription* 
     throw std::logic_error("Env.type_of_cstr");
   std::vector<const LabelDescription*> labels;
   for (auto& [id, l] : datarepr::labels_of_type(path, decl)) labels.push_back(l);
-  return make<TypeData>(decl, descriptions_record(slice(labels), decl->type_kind->record_repr));
+  return make<TypeData>(decl, descriptions_record(slice(labels), decl->type_kind->record_repr),
+                        shape::leaf(decl->type_uid));
 }
 
 static const TypeDescriptions* abstract_descr(const TypeDeclaration* decl) {
@@ -763,7 +765,7 @@ const ConstructorDescription* find_cstr(Path::t p, std::string_view name, t env)
 
 static const TypeData* find_type_data(Path::t p, t env) {
   if (auto* decl = env->local_constraints.find_opt(p))
-    return make<TypeData>(*decl, abstract_descr(*decl));
+    return make<TypeData>(*decl, abstract_descr(*decl), shape::leaf((*decl)->type_uid));
   switch (p->kind) {
     case Path::Kind::Pident: return idtbl_find_same(p->id, env->types);
     case Path::Kind::Pdot: {
@@ -1095,7 +1097,7 @@ std::function<t(t)> make_copy_of_types(t env0) {
     auto* desc = make<ValueDescription>(*e->data->vda_description);
     desc->val_type = copy(desc->val_type);
     return static_cast<const ValueEntry*>(
-        make<ValueEntry>(true, make<ValueData>(desc, e->data->vda_address)));
+        make<ValueEntry>(true, make<ValueData>(desc, e->data->vda_address, e->data->vda_shape)));
   };
   auto values = idtbl_map<const ValueEntry*, const ValueData*>(f, env0->values);
   return [values](t env) -> t {
@@ -1514,12 +1516,13 @@ static void check_value_name(std::string_view name, const Location& loc) {
     }
 }
 
-static t store_value(const CheckFn& check, Ident::t id, AddressLazy* addr, const ValueDescription* decl, t env) {
+static t store_value(const CheckFn& check, Ident::t id, AddressLazy* addr, const ValueDescription* decl,
+                     shape::t shape, t env) {
   check_value_name(ident::name(id), decl->val_loc);
   builtin_attributes::mark_alerts_used(decl->val_attributes);
   if (check) check_usage(decl->val_loc, id, decl->val_uid, check, value_declarations);
   EnvT* e = copy_env(env);
-  e->values = idtbl_add(id, wrap_value(make<ValueData>(decl, addr)), env->values);
+  e->values = idtbl_add(id, wrap_value(make<ValueData>(decl, addr, shape)), env->values);
   Summary s{Summary::Kind::Env_value, env->summary};
   s.id = id;
   s.value = decl;
@@ -1555,7 +1558,8 @@ static t store_constructor(bool check, const TypeDeclaration* type_decl, Ident::
   builtin_attributes::mark_warn_on_literal_pattern_used(cstr->cstr_attributes);
   EnvT* e = copy_env(env);
   e->constrs =
-      tycomp_add(cstr_id, static_cast<const ConstructorData*>(make<ConstructorData>(cstr, nullptr)),
+      tycomp_add(cstr_id,
+                 static_cast<const ConstructorData*>(make<ConstructorData>(cstr, nullptr, shape::leaf(cstr->cstr_uid))),
                  env->constrs);
   return e;
 }
@@ -1592,7 +1596,7 @@ static t store_label(bool check, const TypeDeclaration* type_decl, Ident::t type
   return e;
 }
 
-static t store_type(bool check, Ident::t id, const TypeDeclaration* info, t env) {
+static t store_type(bool check, Ident::t id, const TypeDeclaration* info, shape::t shape, t env) {
   if (check)
     check_usage(info->type_loc, id, info->type_uid,
                 [](std::string s) {
@@ -1629,7 +1633,7 @@ static t store_type(bool check, Ident::t id, const TypeDeclaration* info, t env)
   }
   builtin_attributes::mark_alerts_used(info->type_attributes);
   EnvT* e = copy_env(env);
-  e->types = idtbl_add(id, static_cast<const TypeData*>(make<TypeData>(info, descrs)), env->types);
+  e->types = idtbl_add(id, static_cast<const TypeData*>(make<TypeData>(info, descrs, shape)), env->types);
   Summary s{Summary::Kind::Env_type, env->summary};
   s.id = id;
   s.type = info;
@@ -1640,9 +1644,9 @@ static t store_type(bool check, Ident::t id, const TypeDeclaration* info, t env)
 // Simplified version of store_type that doesn't compute and store
 // constructor and label infos (components_of_module keeps track of type
 // abbreviations with it).
-static t store_type_infos(Ident::t id, const TypeDeclaration* info, t env) {
+static t store_type_infos(shape::t tda_shape, Ident::t id, const TypeDeclaration* info, t env) {
   EnvT* e = copy_env(env);
-  e->types = idtbl_add(id, static_cast<const TypeData*>(make<TypeData>(info, abstract_descr(info))),
+  e->types = idtbl_add(id, static_cast<const TypeData*>(make<TypeData>(info, abstract_descr(info), tda_shape)),
                        env->types);
   Summary s{Summary::Kind::Env_type, env->summary};
   s.id = id;
@@ -1652,11 +1656,11 @@ static t store_type_infos(Ident::t id, const TypeDeclaration* info, t env) {
 }
 
 static t store_extension(bool check, bool rebind, Ident::t id, AddressLazy* addr, const ExtensionConstructor* ext,
-                         t env) {
+                         shape::t shape, t env) {
   Location loc = ext->ext_loc;
   const ConstructorDescription* cstr =
       datarepr::extension_descr(get_current_unit(), Path::pident(id), ext);
-  auto* cda = make<ConstructorData>(cstr, addr);
+  auto* cda = make<ConstructorData>(cstr, addr, shape);
   builtin_attributes::mark_alerts_used(ext->ext_attributes);
   builtin_attributes::mark_warn_on_literal_pattern_used(ext->ext_attributes);
   builtin_attributes::warning_scope(builtin_attributes::ast_attributes(ext->ext_attributes), [&] {
@@ -1692,13 +1696,13 @@ static t store_extension(bool check, bool rebind, Ident::t id, AddressLazy* addr
 static StrMap<std::string_view> alerts_of_attrs(Attributes l) { return builtin_attributes::alerts_of_attrs(l); }
 
 static t store_module(bool update_summary, const CheckFn& check, Ident::t id, AddressLazy* addr,
-                      ModulePresence presence, const lz::ModuleDecl* d, t env) {
+                      ModulePresence presence, const lz::ModuleDecl* d, shape::t shape, t env) {
   if (check) check_usage(d->mdl_loc, id, d->mdl_uid, check, module_declarations);
   builtin_attributes::mark_alerts_used(d->mdl_attributes);
   StrMap<std::string_view> alerts = alerts_of_attrs(d->mdl_attributes);
   ModuleComponents* comps = components_of_module(alerts, d->mdl_uid, env, subst::identity(),
-                                                 Path::pident(id), addr, d->mdl_type);
-  auto* mda = make<ModuleData>(d, comps, addr);
+                                                 Path::pident(id), addr, d->mdl_type, shape);
+  auto* mda = make<ModuleData>(d, comps, addr, shape);
   EnvT* e = copy_env(env);
   if (update_summary) {
     Summary s{Summary::Kind::Env_module, env->summary};
@@ -1711,7 +1715,7 @@ static t store_module(bool update_summary, const CheckFn& check, Ident::t id, Ad
   return e;
 }
 
-static t store_modtype(bool update_summary, Ident::t id, const lz::ModtypeDecl* info, t env) {
+static t store_modtype(bool update_summary, Ident::t id, const lz::ModtypeDecl* info, shape::t shape, t env) {
   builtin_attributes::mark_alerts_used(info->mtdl_attributes);
   EnvT* e = copy_env(env);
   if (update_summary) {
@@ -1721,15 +1725,15 @@ static t store_modtype(bool update_summary, Ident::t id, const lz::ModtypeDecl* 
     e->summary = summ(s);
   }
   e->modtypes =
-      idtbl_add(id, static_cast<const ModtypeData*>(make<ModtypeData>(info)), env->modtypes);
+      idtbl_add(id, static_cast<const ModtypeData*>(make<ModtypeData>(info, shape)), env->modtypes);
   return e;
 }
 
-static t store_class(Ident::t id, AddressLazy* addr, const ClassDeclaration* desc, t env) {
+static t store_class(Ident::t id, AddressLazy* addr, const ClassDeclaration* desc, shape::t shape, t env) {
   builtin_attributes::mark_alerts_used(desc->cty_attributes);
   EnvT* e = copy_env(env);
   e->classes =
-      idtbl_add(id, static_cast<const ClassData*>(make<ClassData>(desc, addr)), env->classes);
+      idtbl_add(id, static_cast<const ClassData*>(make<ClassData>(desc, addr, shape)), env->classes);
   Summary s{Summary::Kind::Env_class, env->summary};
   s.id = id;
   s.cls = desc;
@@ -1737,10 +1741,10 @@ static t store_class(Ident::t id, AddressLazy* addr, const ClassDeclaration* des
   return e;
 }
 
-static t store_cltype(Ident::t id, const ClassTypeDeclaration* desc, t env) {
+static t store_cltype(Ident::t id, const ClassTypeDeclaration* desc, shape::t shape, t env) {
   builtin_attributes::mark_alerts_used(desc->clty_attributes);
   EnvT* e = copy_env(env);
-  e->cltypes = idtbl_add(id, static_cast<const CltypeData*>(make<CltypeData>(desc)), env->cltypes);
+  e->cltypes = idtbl_add(id, static_cast<const CltypeData*>(make<CltypeData>(desc, shape)), env->cltypes);
   Summary s{Summary::Kind::Env_cltype, env->summary};
   s.id = id;
   s.clty = desc;
@@ -1771,7 +1775,8 @@ static ComponentsResult components_of_module_maker(ComponentsMaker cm) {
             AddressLazy* addr = item->value->val_kind.kind == ValueKind::Kind::Val_prim
                                     ? failed_address()
                                     : next_address();
-            c->comp_values = c->comp_values.add(ident::name(id), make<ValueData>(decl2, addr));
+            shape::t vda_shape = shape::proj(nullptr, cm.cm_shape, shape::item::value(id));
+            c->comp_values = c->comp_values.add(ident::name(id), make<ValueData>(decl2, addr, vda_shape));
             break;
           }
           case K::Sig_type: {
@@ -1788,7 +1793,7 @@ static ComponentsResult components_of_module_maker(ComponentsMaker cm) {
                   cstrs.push_back(d);
                 for (auto* d : cstrs)
                   c->comp_constrs = add_to_tbl<const ConstructorData*>(
-                      d->cstr_name, make<ConstructorData>(d, nullptr), c->comp_constrs);
+                      d->cstr_name, make<ConstructorData>(d, nullptr, shape::leaf(d->cstr_uid)), c->comp_constrs);
                 descrs->constructors = slice(cstrs);
                 descrs->variant_repr = decl->type_kind->variant_repr;
                 break;
@@ -1807,8 +1812,9 @@ static ComponentsResult components_of_module_maker(ComponentsMaker cm) {
               case TypeKind::Kind::Type_open: break;
               case TypeKind::Kind::Type_external: descrs->external = decl->type_kind->external; break;
             }
-            c->comp_types = c->comp_types.add(ident::name(id), make<TypeData>(final_decl, descrs));
-            env = store_type_infos(id, decl, env);
+            shape::t shape = shape::proj(nullptr, cm.cm_shape, shape::item::type_(id));
+            c->comp_types = c->comp_types.add(ident::name(id), make<TypeData>(final_decl, descrs, shape));
+            env = store_type_infos(shape, id, decl, env);
             break;
           }
           case K::Sig_typext: {
@@ -1816,8 +1822,9 @@ static ComponentsResult components_of_module_maker(ComponentsMaker cm) {
             const ConstructorDescription* descr =
                 datarepr::extension_descr(get_current_unit(), path, ext2);
             AddressLazy* addr = next_address();
+            shape::t cda_shape = shape::proj(nullptr, cm.cm_shape, shape::item::extension_constructor(id));
             c->comp_constrs = add_to_tbl<const ConstructorData*>(
-                ident::name(id), make<ConstructorData>(descr, addr), c->comp_constrs);
+                ident::name(id), make<ConstructorData>(descr, addr, cda_shape), c->comp_constrs);
             break;
           }
           case K::Sig_module: {
@@ -1834,29 +1841,33 @@ static ComponentsResult components_of_module_maker(ComponentsMaker cm) {
               addr = next_address();
             }
             StrMap<std::string_view> alerts = alerts_of_attrs(item->md->mdl_attributes);
+            shape::t shape = shape::proj(nullptr, cm.cm_shape, shape::item::module_(id));
             ModuleComponents* comps = components_of_module(alerts, item->md->mdl_uid, env, sub,
-                                                           path, addr, item->md->mdl_type);
+                                                           path, addr, item->md->mdl_type, shape);
             c->comp_modules =
-                c->comp_modules.add(ident::name(id), make<ModuleData>(md2, comps, addr));
-            env = store_module(false, nullptr, id, addr, item->presence, item->md, env);
+                c->comp_modules.add(ident::name(id), make<ModuleData>(md2, comps, addr, shape));
+            env = store_module(false, nullptr, id, addr, item->presence, item->md, shape, env);
             break;
           }
           case K::Sig_modtype: {
             const lz::ModtypeDecl* final_decl = lz::modtype_decl(
                 subst::Scoping::rescope(path::scope(cm.cm_path)), sub, item->mtd);
-            c->comp_modtypes = c->comp_modtypes.add(ident::name(id), make<ModtypeData>(final_decl));
-            env = store_modtype(false, id, item->mtd, env);
+            shape::t shape = shape::proj(nullptr, cm.cm_shape, shape::item::module_type(id));
+            c->comp_modtypes = c->comp_modtypes.add(ident::name(id), make<ModtypeData>(final_decl, shape));
+            env = store_modtype(false, id, item->mtd, shape, env);
             break;
           }
           case K::Sig_class: {
             const ClassDeclaration* decl2 = subst::class_declaration(sub, item->cls);
             AddressLazy* addr = next_address();
-            c->comp_classes = c->comp_classes.add(ident::name(id), make<ClassData>(decl2, addr));
+            shape::t shape = shape::proj(nullptr, cm.cm_shape, shape::item::class_(id));
+            c->comp_classes = c->comp_classes.add(ident::name(id), make<ClassData>(decl2, addr, shape));
             break;
           }
           case K::Sig_class_type: {
             const ClassTypeDeclaration* decl2 = subst::cltype_declaration(sub, item->clty);
-            c->comp_cltypes = c->comp_cltypes.add(ident::name(id), make<CltypeData>(decl2));
+            shape::t shape = shape::proj(nullptr, cm.cm_shape, shape::item::class_type(id));
+            c->comp_cltypes = c->comp_cltypes.add(ident::name(id), make<CltypeData>(decl2, shape));
             break;
           }
         }
@@ -1878,6 +1889,7 @@ static ComponentsResult components_of_module_maker(ComponentsMaker cm) {
         f->fcomp_arg.mty = lz::force_modtype(lz::modtype(scoping, sub, mty->param.mty));
       }
       f->fcomp_res = res;
+      f->fcomp_shape = cm.cm_shape;
       return ComponentsResult{true, make<ModuleComponentsRepr>(false, nullptr, f)};
     }
     case MK::MtyL_ident:
@@ -1905,9 +1917,11 @@ static ModuleComponents* components_of_functor_appl(const Location& loc, Path::t
   AddressLazy* addr = failed_address();
   if (check_well_formed_module)
     check_well_formed_module(env, loc, "the signature of " + path::name(p), mty);
+  shape::t shape_arg = shape_of_path(shape::SigComponentKind::Module, env, arg);
+  shape::t shape = shape::app(nullptr, f_comp->fcomp_shape, shape_arg);
   ModuleComponents* comps =
       components_of_module({}, uid::internal_not_actually_unique(), env, subst::identity(), p,
-                           addr, lz::of_modtype(mty));
+                           addr, lz::of_modtype(mty), shape);
   f_comp->fcomp_cache.emplace(arg, comps);
   return comps;
 }
@@ -1922,20 +1936,33 @@ t mark_not_aliasable(Ident::t id, t env) {
   return e;
 }
 
+// shape_or_leaf uid shape
+static shape::t shape_or_leaf(const Uid& uid, shape::t shape) { return shape ? shape : shape::leaf(uid); }
+
+// add_value ?check ?shape (the exported add_value has no ?shape)
+static t add_value_shape(Ident::t id, const ValueDescription* desc, t env, const CheckFn& check, shape::t shape) {
+  AddressLazy* addr = value_declaration_address(id, desc);
+  shape = shape_or_leaf(desc->val_uid, shape);
+  return store_value(check, id, addr, desc, shape, env);
+}
+
 t add_value(Ident::t id, const ValueDescription* desc, t env, const CheckFn& check) {
-  return store_value(check, id, value_declaration_address(id, desc), desc, env);
+  return add_value_shape(id, desc, env, check, nullptr);
 }
 
-t add_type(bool check, Ident::t id, const TypeDeclaration* info, t env) {
-  return store_type(check, id, info, env);
+t add_type(bool check, Ident::t id, const TypeDeclaration* info, t env, shape::t shape) {
+  shape = shape_or_leaf(info->type_uid, shape);
+  return store_type(check, id, info, shape, env);
 }
 
-t add_extension(bool check, bool rebind, Ident::t id, const ExtensionConstructor* ext, t env) {
-  return store_extension(check, rebind, id, ident_address(id), ext, env);
+t add_extension(bool check, bool rebind, Ident::t id, const ExtensionConstructor* ext, t env, shape::t shape) {
+  AddressLazy* addr = ident_address(id);
+  shape = shape_or_leaf(ext->ext_uid, shape);
+  return store_extension(check, rebind, id, addr, ext, shape, env);
 }
 
 t add_module_declaration(bool check, Ident::t id, ModulePresence presence,
-                         const ModuleDeclaration* md0, t env, bool noalias) {
+                         const ModuleDeclaration* md0, t env, bool noalias, shape::t shape) {
   CheckFn chk;
   if (!check) {
   } else if (noalias && is_in_signature(env)) {
@@ -1949,34 +1976,47 @@ t add_module_declaration(bool check, Ident::t id, ModulePresence presence,
   }
   const lz::ModuleDecl* d = lz::of_module_decl(md0);
   AddressLazy* addr = module_declaration_address(env, id, presence, d);
-  env = store_module(true, chk, id, addr, presence, d, env);
+  shape = shape_or_leaf(d->mdl_uid, shape);
+  env = store_module(true, chk, id, addr, presence, d, shape, env);
   return noalias ? mark_not_aliasable(id, env) : env;
 }
 
 t add_module_declaration_lazy(bool update_summary, Ident::t id, ModulePresence presence,
                               const lz::ModuleDecl* d, t env) {
   AddressLazy* addr = module_declaration_address(env, id, presence, d);
-  return store_module(update_summary, nullptr, id, addr, presence, d, env);
+  shape::t shape = shape::leaf(d->mdl_uid);
+  return store_module(update_summary, nullptr, id, addr, presence, d, shape, env);
 }
 
-t add_modtype(Ident::t id, const ModtypeDeclaration* info, t env) {
-  return store_modtype(true, id, lz::of_modtype_decl(info), env);
+// add_modtype ?shape / add_class ?shape / add_cltype ?shape (the exported
+// ones have no ?shape)
+static t add_modtype_shape(Ident::t id, const ModtypeDeclaration* info, t env, shape::t shape) {
+  shape = shape_or_leaf(info->mtd_uid, shape);
+  return store_modtype(true, id, lz::of_modtype_decl(info), shape, env);
 }
+static t add_class_shape(Ident::t id, const ClassDeclaration* ty, t env, shape::t shape) {
+  AddressLazy* addr = ident_address(id);
+  shape = shape_or_leaf(ty->cty_uid, shape);
+  return store_class(id, addr, ty, shape, env);
+}
+static t add_cltype_shape(Ident::t id, const ClassTypeDeclaration* ty, t env, shape::t shape) {
+  shape = shape_or_leaf(ty->clty_uid, shape);
+  return store_cltype(id, ty, shape, env);
+}
+
+t add_modtype(Ident::t id, const ModtypeDeclaration* info, t env) { return add_modtype_shape(id, info, env, nullptr); }
 
 t add_modtype_lazy(bool update_summary, Ident::t id, const lz::ModtypeDecl* info, t env) {
-  return store_modtype(update_summary, id, info, env);
+  shape::t shape = shape::leaf(info->mtdl_uid);
+  return store_modtype(update_summary, id, info, shape, env);
 }
 
-t add_class(Ident::t id, const ClassDeclaration* ty, t env) {
-  return store_class(id, ident_address(id), ty, env);
-}
+t add_class(Ident::t id, const ClassDeclaration* ty, t env) { return add_class_shape(id, ty, env, nullptr); }
 
-t add_cltype(Ident::t id, const ClassTypeDeclaration* ty, t env) {
-  return store_cltype(id, ty, env);
-}
+t add_cltype(Ident::t id, const ClassTypeDeclaration* ty, t env) { return add_cltype_shape(id, ty, env, nullptr); }
 
-t add_module(Ident::t id, ModulePresence presence, const ModuleType* mty, t env, bool noalias) {
-  return add_module_declaration(false, id, presence, md(mty), env, noalias);
+t add_module(Ident::t id, ModulePresence presence, const ModuleType* mty, t env, bool noalias, shape::t shape) {
+  return add_module_declaration(false, id, presence, md(mty), env, noalias, shape);
 }
 
 t add_module_lazy(bool update_summary, Ident::t id, ModulePresence presence,
@@ -1997,49 +2037,53 @@ std::pair<Ident::t, t> enter_value(std::string_view name, const ValueDescription
                                    const CheckFn& check) {
   Ident::t id = Ident::create_local(name);
   AddressLazy* addr = value_declaration_address(id, desc);
-  return {id, store_value(check, id, addr, desc, env)};
+  return {id, store_value(check, id, addr, desc, shape::leaf(desc->val_uid), env)};
 }
 
 std::pair<Ident::t, t> enter_type(int scope, std::string_view name, const TypeDeclaration* info,
                                   t env) {
   Ident::t id = Ident::create_scoped(scope, name);
-  return {id, store_type(true, id, info, env)};
+  return {id, store_type(true, id, info, shape::leaf(info->type_uid), env)};
 }
 
 t reenter_type(Ident::t id, const TypeDeclaration* info, t env) {
-  return store_type(true, id, info, env);
+  return store_type(true, id, info, shape::leaf(info->type_uid), env);
 }
 
 std::pair<Ident::t, t> enter_extension(int scope, bool rebind, std::string_view name,
                                        const ExtensionConstructor* ext, t env) {
   Ident::t id = Ident::create_scoped(scope, name);
-  return {id, store_extension(true, rebind, id, ident_address(id), ext, env)};
+  AddressLazy* addr = ident_address(id);
+  shape::t shape = shape::leaf(ext->ext_uid);
+  return {id, store_extension(true, rebind, id, addr, ext, shape, env)};
 }
 
 std::pair<Ident::t, t> enter_module_declaration(int scope, std::string_view name,
                                                 ModulePresence presence,
                                                 const ModuleDeclaration* md0, t env,
-                                                bool noalias) {
+                                                bool noalias, shape::t shape) {
   Ident::t id = Ident::create_scoped(scope, name);
-  return {id, add_module_declaration(true, id, presence, md0, env, noalias)};
+  return {id, add_module_declaration(true, id, presence, md0, env, noalias, shape)};
 }
 
 std::pair<Ident::t, t> enter_modtype(int scope, std::string_view name,
                                      const ModtypeDeclaration* mtd, t env) {
   Ident::t id = Ident::create_scoped(scope, name);
-  return {id, store_modtype(true, id, lz::of_modtype_decl(mtd), env)};
+  shape::t shape = shape::leaf(mtd->mtd_uid);
+  return {id, store_modtype(true, id, lz::of_modtype_decl(mtd), shape, env)};
 }
 
 std::pair<Ident::t, t> enter_class(int scope, std::string_view name, const ClassDeclaration* desc,
                                    t env) {
   Ident::t id = Ident::create_scoped(scope, name);
-  return {id, store_class(id, ident_address(id), desc, env)};
+  AddressLazy* addr = ident_address(id);
+  return {id, store_class(id, addr, desc, shape::leaf(desc->cty_uid), env)};
 }
 
 std::pair<Ident::t, t> enter_cltype(int scope, std::string_view name,
                                     const ClassTypeDeclaration* desc, t env) {
   Ident::t id = Ident::create_scoped(scope, name);
-  return {id, store_cltype(id, desc, env)};
+  return {id, store_cltype(id, desc, shape::leaf(desc->clty_uid), env)};
 }
 
 std::pair<Ident::t, t> enter_module(int scope, std::string_view name, ModulePresence presence,
@@ -2048,29 +2092,151 @@ std::pair<Ident::t, t> enter_module(int scope, std::string_view name, ModulePres
 }
 
 // ---- insertion of all components of a signature --------------------------------------
-static t add_item(const SignatureItem* comp, t env) {
+// add_item (map, mod_shape) comp env: with a module shape, each item's
+// shape is its projection, recorded in the map too
+static t add_item(shape::ItemMap& map, shape::t mod_shape, const SignatureItem* comp, t env) {
   using K = SignatureItem::Kind;
+  auto proj_shape = [&](const shape::Item& item) -> shape::t {
+    if (!mod_shape) return nullptr;
+    shape::t s = shape::proj(nullptr, mod_shape, item);
+    map = shape::map::add(map, item, s);
+    return s;
+  };
   switch (comp->kind) {
-    case K::Sig_value: return add_value(comp->id, comp->value, env);
-    case K::Sig_type: return add_type(false, comp->id, comp->type, env);
-    case K::Sig_typext: return add_extension(false, false, comp->id, comp->ext, env);
-    case K::Sig_module:
-      return add_module_declaration(false, comp->id, comp->presence, comp->md, env);
-    case K::Sig_modtype: return add_modtype(comp->id, comp->mtd, env);
-    case K::Sig_class: return add_class(comp->id, comp->cls, env);
-    case K::Sig_class_type: return add_cltype(comp->id, comp->clty, env);
+    case K::Sig_value: {
+      shape::t sh = proj_shape(shape::item::value(comp->id));
+      return add_value_shape(comp->id, comp->value, env, nullptr, sh);
+    }
+    case K::Sig_type: {
+      shape::t sh = proj_shape(shape::item::type_(comp->id));
+      return add_type(false, comp->id, comp->type, env, sh);
+    }
+    case K::Sig_typext: {
+      shape::t sh = proj_shape(shape::item::extension_constructor(comp->id));
+      return add_extension(false, false, comp->id, comp->ext, env, sh);
+    }
+    case K::Sig_module: {
+      shape::t sh = proj_shape(shape::item::module_(comp->id));
+      return add_module_declaration(false, comp->id, comp->presence, comp->md, env, false, sh);
+    }
+    case K::Sig_modtype: {
+      shape::t sh = proj_shape(shape::item::module_type(comp->id));
+      return add_modtype_shape(comp->id, comp->mtd, env, sh);
+    }
+    case K::Sig_class: {
+      shape::t sh = proj_shape(shape::item::class_(comp->id));
+      return add_class_shape(comp->id, comp->cls, env, sh);
+    }
+    case K::Sig_class_type: {
+      shape::t sh = proj_shape(shape::item::class_type(comp->id));
+      return add_cltype_shape(comp->id, comp->clty, env, sh);
+    }
   }
   return env;
 }
 
-t add_signature(Signature sg, t env) {
-  for (auto* comp : sg) env = add_item(comp, env);
+static t add_signature_shape(shape::ItemMap& map, shape::t mod_shape, Signature sg, t env) {
+  for (auto* comp : sg) env = add_item(map, mod_shape, comp, env);
   return env;
 }
 
-std::pair<Signature, t> enter_signature(int scope, Signature sg, t env) {
+t add_signature(Signature sg, t env) {
+  shape::ItemMap map = shape::map::empty();
+  return add_signature_shape(map, nullptr, sg, env);
+}
+
+std::pair<Signature, t> enter_signature(int scope, Signature sg, t env, shape::t mod_shape) {
   Signature sg2 = subst::signature(subst::Scoping::rescope(scope), subst::identity(), sg);
-  return {sg2, add_signature(sg2, env)};
+  shape::ItemMap map = shape::map::empty();
+  t env2 = add_signature_shape(map, mod_shape, sg2, env);
+  return {sg2, env2};
+}
+
+SignatureAndShape enter_signature_and_shape(int scope, shape::ItemMap parent_shape, shape::t mod_shape,
+                                            Signature sg, t env) {
+  Signature sg2 = subst::signature(subst::Scoping::rescope(scope), subst::identity(), sg);
+  t env2 = add_signature_shape(parent_shape, mod_shape, sg2, env);
+  return {sg2, parent_shape, env2};
+}
+
+// ---- shapes of the bindings ----------------------------------------------------------
+shape::t find_shape(t env, shape::SigComponentKind ns, Ident::t id) {
+  using NS = shape::SigComponentKind;
+  switch (ns) {
+    case NS::Type: return idtbl_find_same(id, env->types)->tda_shape;
+    case NS::Constructor:
+      return shape::leaf(tycomp_find_same(id, env->constrs)->cda_description->cstr_uid);
+    case NS::Label: return shape::leaf(tycomp_find_same(id, env->labels)->lbl_uid);
+    case NS::Extension_constructor: return tycomp_find_same(id, env->constrs)->cda_shape;
+    case NS::Value: {
+      const ValueEntry* v = idtbl_find_same(id, env->values);
+      if (!v->bound) throw NotFound{};
+      return v->data->vda_shape;
+    }
+    case NS::Module: {
+      const ModuleEntry* m;
+      try {
+        m = idtbl_find_same(id, env->modules);
+      } catch (const NotFound&) {
+        if (ident::persistent(id) && !current_unit_is_ident(id))
+          return shape::for_persistent_unit(ident::name(id));
+        throw;
+      }
+      switch (m->kind) {
+        case ModuleEntry::Kind::Mod_local: return m->data->mda_shape;
+        case ModuleEntry::Kind::Mod_persistent: return shape::for_persistent_unit(ident::name(id));
+        case ModuleEntry::Kind::Mod_unbound: throw std::logic_error("Env.find_shape");
+      }
+      throw std::logic_error("Env.find_shape");
+    }
+    case NS::Module_type: return idtbl_find_same(id, env->modtypes)->mtda_shape;
+    case NS::Class: return idtbl_find_same(id, env->classes)->clda_shape;
+    case NS::Class_type: return idtbl_find_same(id, env->cltypes)->cltda_shape;
+  }
+  throw std::logic_error("Env.find_shape");
+}
+
+shape::t shape_of_path(shape::SigComponentKind ns, t env, Path::t path) {
+  return shape::of_path([env](shape::SigComponentKind k, Ident::t id) { return find_shape(env, k, id); }, ns,
+                        path);
+}
+
+std::optional<Uid> find_uid(shape::SigComponentKind ns, Path::t path, t env) {
+  using NS = shape::SigComponentKind;
+  switch (ns) {
+    case NS::Value: case NS::Class: path = normalize_value_path(nullptr, env, path); break;
+    case NS::Type: case NS::Constructor: case NS::Label: case NS::Extension_constructor: case NS::Class_type:
+      path = normalize_type_path(nullptr, env, path);
+      break;
+    case NS::Module: path = normalize_module_path(nullptr, env, path); break;
+    case NS::Module_type: path = normalize_modtype_path(env, path); break;
+  }
+  // find_path_extra: Pextra_ty (ty, Pcstr_ty name) -> ty, name
+  auto path_extra = [](Path::t p) -> std::pair<Path::t, std::string_view> {
+    if (p->kind == Path::Kind::Pextra_ty && p->extra == Path::Extra::Pcstr_ty) return {p->p1, p->s};
+    throw NotFound{};
+  };
+  try {
+    switch (ns) {
+      case NS::Value: return find_value(path, env)->val_uid;
+      case NS::Extension_constructor: return find_extension_full(path, env)->cda_description->cstr_uid;
+      case NS::Constructor: {
+        auto [ty, cstr] = path_extra(path);
+        return find_cstr(ty, cstr, env)->cstr_uid;
+      }
+      case NS::Label: {
+        auto [ty, f] = path_extra(path);
+        return find_label(ty, f, env)->lbl_uid;
+      }
+      case NS::Type: return find_type(path, env)->type_uid;
+      case NS::Module: return find_module(path, env)->md_uid;
+      case NS::Module_type: return find_modtype(path, env)->mtd_uid;
+      case NS::Class: return find_class(path, env)->cty_uid;
+      case NS::Class_type: return find_cltype(path, env)->clty_uid;
+    }
+  } catch (const NotFound&) {
+  }
+  return std::nullopt;
 }
 
 // ---- "unbound" bindings -----------------------------------------------------------

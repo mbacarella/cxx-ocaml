@@ -157,7 +157,7 @@ struct Conv {
     auto& a = std::get<ast::Lapply>(l.v);
     return Longident::lapply(lid(*a.f), inner(a.f_loc), lid(*a.x), inner(a.x_loc));
   }
-  LidLoc lidloc(const ast::LongidentLoc& l) const { return {lid(l.txt), loc(l.loc)}; }
+  LidLoc lidloc(const ast::LongidentLoc& l) const { return {lid(l.txt), loc(l.loc), fresh_identity()}; }
 
   // A punned label (`~x`, `~(x:t)`, `?x`, `?(x ..)`: parser.mly's
   // label_var / mkexpvar) is the variable's own string.
@@ -868,7 +868,7 @@ struct Conv {
       if (p.alias_lid) {
         k.alias = lidloc(*p.alias_lid);
       } else {  // `( op )`: an operator name
-        k.alias = LidLoc{Longident::lident(p.alias->txt), loc(p.alias->loc)};
+        k.alias = LidLoc{Longident::lident(p.alias->txt), loc(p.alias->loc), fresh_identity()};
       }
     } else {
       k.kind = PrimitiveKind::Kind::Pprim_decl;

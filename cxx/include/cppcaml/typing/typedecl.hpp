@@ -62,15 +62,37 @@ struct Error : std::runtime_error {
   Error(const Location& l, Kind k) : std::runtime_error("Typedecl.Error"), loc(l), kind(k) {}
 };
 
+// The declarations' shapes (transl_declaration's typ_shape, an extension
+// constructor's): given to Env with the declarations, returned to Typemod
+// (the same objects)
+shape::ItemMap shape_map_labels(Slice<const tt::TLabelDeclaration*> lds);
+shape::ItemMap shape_map_cstrs(Slice<const tt::TConstructorDeclaration*> cds);
+
 struct TranslTypeDeclResult {
   std::vector<const tt::TTypeDeclaration*> decls;
   env::t env;
+  std::vector<shape::t> shapes;
 };
 TranslTypeDeclResult transl_type_decl(env::t env, RecFlag rec_flag, Slice<const pt::TypeDeclaration*> sdecl_list);
-std::pair<const tt::TExtensionConstructor*, env::t> transl_exception(env::t env, const pt::ExtensionConstructor* sext);
-std::pair<const tt::TTypeException*, env::t> transl_type_exception(env::t env, const pt::TypeException* t);
-std::pair<const tt::TTypeExtension*, env::t> transl_type_extension(bool extend, env::t env, const Location& loc,
-                                                                  const pt::TypeExtension* styext);
+struct TranslException {
+  const tt::TExtensionConstructor* ext;
+  env::t env;
+  shape::t shape;
+};
+TranslException transl_exception(env::t env, const pt::ExtensionConstructor* sext);
+struct TranslTypeException {
+  const tt::TTypeException* tyexn;
+  env::t env;
+  shape::t shape;
+};
+TranslTypeException transl_type_exception(env::t env, const pt::TypeException* t);
+struct TranslTypeExtension {
+  const tt::TTypeExtension* tyext;
+  env::t env;
+  std::vector<shape::t> shapes;
+};
+TranslTypeExtension transl_type_extension(bool extend, env::t env, const Location& loc,
+                                          const pt::TypeExtension* styext);
 std::pair<const tt::TValueDescription*, env::t> transl_value_decl(env::t env, const Location& loc,
                                                                   const pt::ValueDescription* valdecl);
 std::pair<const tt::TPrimitiveDescription*, env::t> transl_prim_desc(env::t env, const Location& loc,

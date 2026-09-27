@@ -32,6 +32,8 @@
 #include "cppcaml/typing/btype.hpp"
 #include "cppcaml/typing/clflags.hpp"
 #include "cppcaml/typing/persistent_env.hpp"
+#include "cppcaml/typing/predef.hpp"
+#include "cppcaml/typing/shape_reduce.hpp"
 
 #include "cmi_writer.hpp"
 
@@ -2266,6 +2268,915 @@ class ShapeWriter {
   std::unordered_map<shape::t, V> memo_;
 };
 
+// ---- index_occurrences: iter_on_occurrences over Tast_iterator's walk --------------
+// (-bin-annot-occurrences) Every identifier occurrence's longident, with the
+// Shape_reduce result of its path in the environment of the occurrence.  The
+// walk is Tast_iterator.default_iterator's, node for node (the index's order
+// is the order of the hooks); the hooks fire before a node's children, as
+// iter_on_occurrences' overrides call the default iterator after theirs.
+struct OccLid {  // a `Longident.t loc` record
+  // its identity: the typedtree's record (the address of its LidLoc), a
+  // longident's inner record (the Ldot / Lapply node, field 1 or 2), or a
+  // record built for the index (a fresh identity)
+  const void* key;
+  int field;
+  Longident::t txt;
+  Location loc;
+};
+
+class OccIndexer {
+ public:
+  std::vector<std::pair<OccLid, const shape_reduce::Result*>> index;  // in insertion order
+
+  void structure(const tt::Structure* s) {
+    for (const tt::StructureItem* it : s->str_items) structure_item(it);
+  }
+  void signature(const tt::Signature* s) {
+    for (const tt::SignatureItem* it : s->sig_items) signature_item(it);
+  }
+  void part(const BinaryPart& b) {  // iter_on_parts
+    using K = BinaryPart::Kind;
+    switch (b.kind) {
+      case K::Partial_structure: structure(static_cast<const tt::Structure*>(b.node)); break;
+      case K::Partial_structure_item: structure_item(static_cast<const tt::StructureItem*>(b.node)); break;
+      case K::Partial_expression: expr(static_cast<const tt::Expression*>(b.node)); break;
+      case K::Partial_pattern: pat(static_cast<const tt::Pattern*>(b.node)); break;
+      case K::Partial_class_expr: class_expr(static_cast<const tt::ClassExpr*>(b.node)); break;
+      case K::Partial_signature: signature(static_cast<const tt::Signature*>(b.node)); break;
+      case K::Partial_signature_item: signature_item(static_cast<const tt::SignatureItem*>(b.node)); break;
+      case K::Partial_module_type: module_type(static_cast<const tt::ModuleType*>(b.node)); break;
+    }
+  }
+
+ private:
+  using NS = shape::SigComponentKind;
+
+  static OccLid of(const pt::LidLoc& l) { return {l.obj ? l.obj : &l, 0, l.txt, l.loc}; }
+  // { s with txt = Longident.Lident s.txt }: a new record, a new Lident
+  static OccLid lident_of(const pt::StrLoc& s) { return {fresh_identity(), 0, Longident::lident(s.txt), s.loc}; }
+
+  // ---- index_occurrences' f ----
+  void f(NS ns, env::t env, Path::t path, const OccLid& lid) { index_components(ns, env, lid, path); }
+  void reduce_and_store(NS ns, env::t env, const OccLid& lid, Path::t path) {
+    if (lid.loc.loc_ghost) return;
+    shape::t path_shape;
+    try {
+      path_shape = env::shape_of_path(ns, env, path);
+    } catch (const env::NotFound&) {
+      return;
+    }
+    if (path_shape->has_uid && path_shape->uid.kind == Uid::Kind::Predef) return;
+    const shape_reduce::Result* result = shape_reduce::local_reduce_for_uid(env, ns, path, path_shape);
+    index.push_back({lid, result});
+  }
+  void index_components(NS ns, env::t env, const OccLid& lid, Path::t path) {
+    Path::t scraped_path = path::scrape_extra_ty(path);
+    switch (lid.txt->kind) {
+      case Longident::Kind::Ldot:
+        if (scraped_path->kind == Path::Kind::Pdot) {
+          reduce_and_store(ns, env, lid, path);
+          index_components(NS::Module, env, OccLid{lid.txt, 1, lid.txt->l1, lid.txt->l1_loc}, scraped_path->p1);
+        }
+        break;
+      case Longident::Kind::Lapply:
+        if (scraped_path->kind == Path::Kind::Papply) {
+          index_components(NS::Module, env, OccLid{lid.txt, 2, lid.txt->l2, lid.txt->l2_loc}, scraped_path->p2);
+          index_components(NS::Module, env, OccLid{lid.txt, 1, lid.txt->l1, lid.txt->l1_loc}, scraped_path->p1);
+        }
+        break;
+      case Longident::Kind::Lident: reduce_and_store(ns, env, lid, path); break;
+    }
+  }
+
+  // ---- iter_on_occurrences' helpers ----
+  static Path::t path_in_type(TypeExpr* typ, std::string_view name) {
+    if (auto* c = typing::as<Tconstr>(types::get_desc(typ))) return Path::pextra_ty(c->path, Path::Extra::Pcstr_ty, name);
+    return nullptr;
+  }
+  void add_constructor_description(env::t env, const OccLid& lid, const ConstructorDescription* d) {
+    if (d->cstr_tag.kind == ConstructorTag::Kind::Cstr_extension) {
+      f(NS::Extension_constructor, env, d->cstr_tag.ext_path, lid);
+    } else if (d->cstr_uid.kind == Uid::Kind::Predef) {
+      Ident::t id = nullptr;
+      for (auto& [name, i] : predef::builtin_idents())  // List.assoc
+        if (name == d->cstr_uid.comp_unit) {
+          id = i;
+          break;
+        }
+      if (!id) throw env::NotFound{};
+      f(NS::Constructor, env, Path::pident(id), lid);
+    } else if (Path::t p = path_in_type(d->cstr_res, d->cstr_name)) {
+      f(NS::Constructor, env, p, lid);
+    }
+  }
+  void add_label(env::t env, const OccLid& lid, const LabelDescription* l) {
+    if (Path::t p = path_in_type(l->lbl_res, l->lbl_name)) f(NS::Label, env, p, lid);
+  }
+  static bool same_pos(const Position& a, const Position& b) {
+    return a.pos_fname == b.pos_fname && a.pos_lnum == b.pos_lnum && a.pos_bol == b.pos_bol &&
+           a.pos_cnum == b.pos_cnum;
+  }
+  // In the presence of punning we want to index the label even if it is
+  // ghosted: { lid with loc = { lid.loc with loc_ghost = false } }
+  static OccLid unghosted(const pt::LidLoc& l) {
+    Location loc = l.loc;
+    loc.loc_ghost = false;
+    return {fresh_identity(), 0, l.txt, location::distinct_record(loc)};
+  }
+
+  // ---- the walk ----
+  template <class A, class F>
+  void class_infos(const tt::ClassInfos<A>* x, F&& g) {
+    for (const tt::TypeParam& p : x->ci_params) typ(p.ty);
+    g(x->ci_expr);
+  }
+  void module_type_declaration(const tt::TModuleTypeDeclaration* x) {
+    if (x->mtd_type) module_type(x->mtd_type);
+  }
+  void module_declaration(const tt::TModuleDeclaration* md) { module_type(md->md_type); }
+  void class_type_declaration(const tt::TClassTypeDeclaration* x) {
+    class_infos(x, [&](const tt::ClassType* c) { class_type(c); });
+  }
+  void class_declaration(const tt::TClassDeclaration* x) {
+    class_infos(x, [&](const tt::ClassExpr* c) { class_expr(c); });
+  }
+  void structure_item(const tt::StructureItem* it) {
+    using K = tt::StructureItemDesc::Kind;
+    const tt::StructureItemDesc* d = it->str_desc;
+    env::t str_env = it->str_env;
+    // the hook
+    if (d->kind == K::Tstr_exception) {
+      const tt::TExtensionConstructor* c = tt::as<tt::Tstr_exception>(d)->exn->tyexn_constructor;
+      if (c->ext_kind.kind == tt::TExtensionConstructorKind::Kind::Text_rebind)
+        f(NS::Extension_constructor, str_env, c->ext_kind.path, of(c->ext_kind.lid));
+    } else if (d->kind == K::Tstr_typext) {
+      const tt::TTypeExtension* te = tt::as<tt::Tstr_typext>(d)->ext;
+      f(NS::Type, str_env, te->tyext_path, of(te->tyext_txt));
+    }
+    // default_iterator.structure_item
+    switch (d->kind) {
+      case K::Tstr_eval: expr(tt::as<tt::Tstr_eval>(d)->exp); break;
+      case K::Tstr_value:
+        for (const tt::ValueBinding* vb : tt::as<tt::Tstr_value>(d)->vbs) value_binding(vb);
+        break;
+      case K::Tstr_primitive: primitive_description(tt::as<tt::Tstr_primitive>(d)->pd); break;
+      case K::Tstr_type:
+        for (const tt::TTypeDeclaration* td : tt::as<tt::Tstr_type>(d)->decls) type_declaration(td);
+        break;
+      case K::Tstr_typext: type_extension(tt::as<tt::Tstr_typext>(d)->ext); break;
+      case K::Tstr_exception: extension_constructor(tt::as<tt::Tstr_exception>(d)->exn->tyexn_constructor); break;
+      case K::Tstr_module: module_binding(tt::as<tt::Tstr_module>(d)->mb); break;
+      case K::Tstr_recmodule:
+        for (const tt::ModuleBinding* mb : tt::as<tt::Tstr_recmodule>(d)->mbs) module_binding(mb);
+        break;
+      case K::Tstr_modtype: module_type_declaration(tt::as<tt::Tstr_modtype>(d)->mtd); break;
+      case K::Tstr_class:
+        for (const tt::ClassDeclarationItem& c : tt::as<tt::Tstr_class>(d)->classes) class_declaration(c.decl);
+        break;
+      case K::Tstr_class_type:
+        for (const tt::ClassTypeDeclarationItem& c : tt::as<tt::Tstr_class_type>(d)->classes)
+          class_type_declaration(c.decl);
+        break;
+      case K::Tstr_include: module_expr(tt::as<tt::Tstr_include>(d)->incl->incl_mod); break;
+      case K::Tstr_open: module_expr(tt::as<tt::Tstr_open>(d)->od->open_expr); break;  // open_declaration
+      case K::Tstr_attribute: break;
+    }
+  }
+  void value_description(const tt::TValueDescription* x) { typ(x->val_desc); }
+  void primitive_description(const tt::TPrimitiveDescription* x) {
+    if (x->prim_kind.cty) typ(x->prim_kind.cty);  // Tprim_decl's, or Tprim_alias's option
+  }
+  void label_decl(const tt::TLabelDeclaration* ld) { typ(ld->ld_type); }
+  void constructor_args(const tt::TConstructorArguments& a) {
+    if (!a.is_record) {
+      for (const tt::CoreType* c : a.tuple) typ(c);
+    } else {
+      for (const tt::TLabelDeclaration* ld : a.record) label_decl(ld);
+    }
+  }
+  void type_declaration(const tt::TTypeDeclaration* x) {
+    for (const tt::TypeConstraintItem& c : x->typ_constraints) {
+      typ(c.t1);
+      typ(c.t2);
+    }
+    if (x->typ_kind.kind == tt::TTypeKind::Kind::Ttype_variant) {
+      for (const tt::TConstructorDeclaration* cd : x->typ_kind.constructors) {
+        constructor_args(cd->cd_args);
+        if (cd->cd_res) typ(cd->cd_res);
+      }
+    } else if (x->typ_kind.kind == tt::TTypeKind::Kind::Ttype_record) {
+      for (const tt::TLabelDeclaration* ld : x->typ_kind.labels) label_decl(ld);
+    }
+    if (x->typ_manifest) typ(x->typ_manifest);
+    for (const tt::TypeParam& p : x->typ_params) typ(p.ty);
+  }
+  void type_extension(const tt::TTypeExtension* x) {
+    for (const tt::TypeParam& p : x->tyext_params) typ(p.ty);
+    for (const tt::TExtensionConstructor* ec : x->tyext_constructors) extension_constructor(ec);
+  }
+  void extension_constructor(const tt::TExtensionConstructor* ec) {
+    if (ec->ext_kind.kind == tt::TExtensionConstructorKind::Kind::Text_decl) {
+      constructor_args(ec->ext_kind.args);
+      if (ec->ext_kind.res) typ(ec->ext_kind.res);
+    }
+  }
+  void pat_extra(const tt::PatExtra& e) {
+    switch (e.kind) {
+      case tt::PatExtra::Kind::Tpat_unpack:
+        if (e.pack) package_type(e.pack);
+        break;
+      case tt::PatExtra::Kind::Tpat_constraint: typ(e.cty); break;
+      default: break;
+    }
+  }
+  void pat(const tt::Pattern* p) {
+    using K = tt::PatternDesc::Kind;
+    const tt::PatternDesc* d = p->pat_desc;
+    env::t pat_env = p->pat_env;
+    // the hook
+    if (d->kind == K::Tpat_construct) {
+      auto* x = tt::as<tt::Tpat_construct>(d);
+      add_constructor_description(pat_env, of(x->lid), x->cstr);
+    } else if (d->kind == K::Tpat_record) {
+      for (const tt::RecordPatField& fl : tt::as<tt::Tpat_record>(d)->fields) {
+        const Location& ploc = fl.pat->pat_loc;
+        OccLid lid = (!ploc.loc_ghost && same_pos(fl.lid.loc.loc_start, ploc.loc_start) &&
+                      same_pos(fl.lid.loc.loc_end, ploc.loc_end))
+                         ? unghosted(fl.lid)
+                         : of(fl.lid);
+        add_label(pat_env, lid, fl.label);
+      }
+    }
+    for (const tt::PatExtraItem& x : p->pat_extra) {
+      if (x.extra.kind == tt::PatExtra::Kind::Tpat_open) f(NS::Module, pat_env, x.extra.path, of(x.extra.lid));
+      else if (x.extra.kind == tt::PatExtra::Kind::Tpat_type) f(NS::Type, pat_env, x.extra.path, of(x.extra.lid));
+    }
+    // default_iterator.pat
+    for (const tt::PatExtraItem& x : p->pat_extra) pat_extra(x.extra);
+    switch (d->kind) {
+      case K::Tpat_tuple:
+        for (const tt::LabeledPattern& lp : tt::as<tt::Tpat_tuple>(d)->pats) pat(lp.pat);
+        break;
+      case K::Tpat_construct: {
+        auto* x = tt::as<tt::Tpat_construct>(d);
+        for (const tt::Pattern* q : x->args) pat(q);
+        if (x->annot) typ(x->annot->cty);
+        break;
+      }
+      case K::Tpat_variant:
+        if (auto* q = tt::as<tt::Tpat_variant>(d)->arg) pat(q);
+        break;
+      case K::Tpat_record:
+        for (const tt::RecordPatField& fl : tt::as<tt::Tpat_record>(d)->fields) pat(fl.pat);
+        break;
+      case K::Tpat_array:
+        for (const tt::Pattern* q : tt::as<tt::Tpat_array>(d)->pats) pat(q);
+        break;
+      case K::Tpat_alias: pat(tt::as<tt::Tpat_alias>(d)->pat); break;
+      case K::Tpat_lazy: pat(tt::as<tt::Tpat_lazy>(d)->pat); break;
+      case K::Tpat_value: pat(tt::as<tt::Tpat_value>(d)->pat); break;
+      case K::Tpat_exception: pat(tt::as<tt::Tpat_exception>(d)->pat); break;
+      case K::Tpat_or: {
+        auto* x = tt::as<tt::Tpat_or>(d);
+        pat(x->p1);
+        pat(x->p2);
+        break;
+      }
+      default: break;
+    }
+  }
+  void extra(const tt::ExpExtra& e) {
+    using K = tt::ExpExtra::Kind;
+    switch (e.kind) {
+      case K::Texp_constraint: typ(e.cty); break;
+      case K::Texp_coerce:
+        if (e.from) typ(e.from);
+        typ(e.cty);
+        break;
+      case K::Texp_poly:
+        if (e.cty) typ(e.cty);
+        break;
+      case K::Texp_newtype: break;
+    }
+  }
+  void function_param(const tt::FunctionParam* fp) {
+    pat(fp->fp_kind.pat);
+    if (fp->fp_kind.kind == tt::FunctionParamKind::Kind::Tparam_optional_default) expr(fp->fp_kind.default_);
+  }
+  void function_body(const tt::FunctionBody* b) {
+    if (b->kind == tt::FunctionBody::Kind::Tfunction_body) {
+      expr(b->body);
+    } else {
+      for (const tt::Case* c : b->cases) case_(c);
+      if (b->exp_extra) extra(*b->exp_extra);
+    }
+  }
+  void expr(const tt::Expression* e) {
+    using K = tt::ExpressionDesc::Kind;
+    const tt::ExpressionDesc* d = e->exp_desc;
+    env::t exp_env = e->exp_env;
+    // the hook
+    switch (d->kind) {
+      case K::Texp_ident: {
+        auto* x = tt::as<tt::Texp_ident>(d);
+        f(NS::Value, exp_env, x->path, of(x->lid));
+        break;
+      }
+      case K::Texp_construct: {
+        auto* x = tt::as<tt::Texp_construct>(d);
+        add_constructor_description(exp_env, of(x->lid), x->cstr);
+        break;
+      }
+      case K::Texp_field: {
+        auto* x = tt::as<tt::Texp_field>(d);
+        add_label(exp_env, of(x->lid), x->label);
+        break;
+      }
+      case K::Texp_setfield: {
+        auto* x = tt::as<tt::Texp_setfield>(d);
+        add_label(exp_env, of(x->lid), x->label);
+        break;
+      }
+      case K::Texp_atomic_loc: {
+        auto* x = tt::as<tt::Texp_atomic_loc>(d);
+        add_label(exp_env, of(x->lid), x->label);
+        break;
+      }
+      case K::Texp_new: {
+        auto* x = tt::as<tt::Texp_new>(d);
+        f(NS::Class, exp_env, x->path, of(x->lid));
+        break;
+      }
+      case K::Texp_record:
+        for (const tt::RecordField& fl : tt::as<tt::Texp_record>(d)->fields) {
+          if (fl.def.kept) continue;
+          const Location& eloc = fl.def.exp->exp_loc;
+          OccLid lid = (!eloc.loc_ghost && same_pos(fl.def.lid.loc.loc_start, eloc.loc_start) &&
+                        same_pos(fl.def.lid.loc.loc_end, eloc.loc_end))
+                           ? unghosted(fl.def.lid)
+                           : of(fl.def.lid);
+          add_label(exp_env, lid, fl.label);
+        }
+        break;
+      case K::Texp_instvar: {
+        auto* x = tt::as<tt::Texp_instvar>(d);
+        f(NS::Value, exp_env, x->path, lident_of(x->name));
+        break;
+      }
+      case K::Texp_setinstvar: {
+        auto* x = tt::as<tt::Texp_setinstvar>(d);
+        f(NS::Value, exp_env, x->path, lident_of(x->name));
+        break;
+      }
+      case K::Texp_override:
+        for (const tt::OverrideField& o : tt::as<tt::Texp_override>(d)->fields)
+          f(NS::Value, exp_env, Path::pident(o.id), lident_of(o.name));
+        break;
+      case K::Texp_extension_constructor: {
+        auto* x = tt::as<tt::Texp_extension_constructor>(d);
+        f(NS::Extension_constructor, exp_env, x->path, of(x->lid));
+        break;
+      }
+      default: break;
+    }
+    // default_iterator.expr
+    for (const tt::ExpExtraItem& x : e->exp_extra) extra(x.extra);
+    switch (d->kind) {
+      case K::Texp_let: {
+        auto* x = tt::as<tt::Texp_let>(d);
+        for (const tt::ValueBinding* vb : x->vbs) value_binding(vb);
+        expr(x->body);
+        break;
+      }
+      case K::Texp_function: {
+        auto* x = tt::as<tt::Texp_function>(d);
+        for (const tt::FunctionParam* fp : x->params) function_param(fp);
+        function_body(x->body);
+        break;
+      }
+      case K::Texp_apply: {
+        auto* x = tt::as<tt::Texp_apply>(d);
+        expr(x->fn);
+        for (const tt::LabeledArg& a : x->args)
+          if (!a.arg.omitted) expr(a.arg.arg);
+        break;
+      }
+      case K::Texp_match: {
+        auto* x = tt::as<tt::Texp_match>(d);
+        expr(x->exp);
+        for (const tt::Case* c : x->comp_cases) case_(c);
+        for (const tt::Case* c : x->eff_cases) case_(c);
+        break;
+      }
+      case K::Texp_try: {
+        auto* x = tt::as<tt::Texp_try>(d);
+        expr(x->exp);
+        for (const tt::Case* c : x->exn_cases) case_(c);
+        for (const tt::Case* c : x->eff_cases) case_(c);
+        break;
+      }
+      case K::Texp_tuple:
+        for (const tt::LabeledExpression& le : tt::as<tt::Texp_tuple>(d)->el) expr(le.exp);
+        break;
+      case K::Texp_construct:
+        for (const tt::Expression* a : tt::as<tt::Texp_construct>(d)->args) expr(a);
+        break;
+      case K::Texp_variant:
+        if (auto* a = tt::as<tt::Texp_variant>(d)->arg) expr(a);
+        break;
+      case K::Texp_record: {
+        auto* x = tt::as<tt::Texp_record>(d);
+        for (const tt::RecordField& fl : x->fields)
+          if (!fl.def.kept) expr(fl.def.exp);
+        if (x->extended_expression) expr(x->extended_expression);
+        break;
+      }
+      case K::Texp_field: expr(tt::as<tt::Texp_field>(d)->exp); break;
+      case K::Texp_setfield: {
+        auto* x = tt::as<tt::Texp_setfield>(d);
+        expr(x->exp);
+        expr(x->value);
+        break;
+      }
+      case K::Texp_atomic_loc: expr(tt::as<tt::Texp_atomic_loc>(d)->exp); break;
+      case K::Texp_array:
+        for (const tt::Expression* a : tt::as<tt::Texp_array>(d)->el) expr(a);
+        break;
+      case K::Texp_ifthenelse: {
+        auto* x = tt::as<tt::Texp_ifthenelse>(d);
+        expr(x->cond);
+        expr(x->then_);
+        if (x->else_) expr(x->else_);
+        break;
+      }
+      case K::Texp_sequence: {
+        auto* x = tt::as<tt::Texp_sequence>(d);
+        expr(x->e1);
+        expr(x->e2);
+        break;
+      }
+      case K::Texp_while: {
+        auto* x = tt::as<tt::Texp_while>(d);
+        expr(x->cond);
+        expr(x->body);
+        break;
+      }
+      case K::Texp_for: {
+        auto* x = tt::as<tt::Texp_for>(d);
+        expr(x->lo);
+        expr(x->hi);
+        expr(x->body);
+        break;
+      }
+      case K::Texp_send: expr(tt::as<tt::Texp_send>(d)->obj); break;
+      case K::Texp_setinstvar: expr(tt::as<tt::Texp_setinstvar>(d)->value); break;
+      case K::Texp_override:
+        for (const tt::OverrideField& o : tt::as<tt::Texp_override>(d)->fields) expr(o.exp);
+        break;
+      case K::Texp_assert: expr(tt::as<tt::Texp_assert>(d)->exp); break;
+      case K::Texp_lazy: expr(tt::as<tt::Texp_lazy>(d)->exp); break;
+      case K::Texp_object: class_structure(tt::as<tt::Texp_object>(d)->cs); break;
+      case K::Texp_pack: module_expr(tt::as<tt::Texp_pack>(d)->me); break;
+      case K::Texp_letop: {
+        auto* x = tt::as<tt::Texp_letop>(d);
+        binding_op(x->let_);
+        for (const tt::BindingOp* b : x->ands) binding_op(b);
+        case_(x->body);
+        break;
+      }
+      case K::Texp_struct_item: {
+        auto* x = tt::as<tt::Texp_struct_item>(d);
+        structure_item(x->item);
+        expr(x->body);
+        break;
+      }
+      default: break;
+    }
+  }
+  void package_type(const tt::PackageType* p) {
+    for (auto& [lid, t] : p->tpt_constraints) typ(t);
+  }
+  void binding_op(const tt::BindingOp* b) {
+    // the hook: { bop_op_name with txt = Longident.Lident bop_op_name.txt }
+    f(NS::Value, b->bop_exp->exp_env, b->bop_op_path, lident_of(b->bop_op_name));
+    expr(b->bop_exp);
+  }
+  void signature_item(const tt::SignatureItem* it) {
+    using K = tt::SignatureItemDesc::Kind;
+    const tt::SignatureItemDesc* d = it->sig_desc;
+    env::t sig_env = it->sig_env;
+    // the hook
+    switch (d->kind) {
+      case K::Tsig_exception: {
+        const tt::TExtensionConstructor* c = tt::as<tt::Tsig_exception>(d)->exn->tyexn_constructor;
+        if (c->ext_kind.kind == tt::TExtensionConstructorKind::Kind::Text_rebind)
+          f(NS::Extension_constructor, sig_env, c->ext_kind.path, of(c->ext_kind.lid));
+        break;
+      }
+      case K::Tsig_modsubst: {
+        auto* ms = tt::as<tt::Tsig_modsubst>(d)->ms;
+        f(NS::Module, sig_env, ms->ms_manifest, of(ms->ms_txt));
+        break;
+      }
+      case K::Tsig_typext: {
+        auto* te = tt::as<tt::Tsig_typext>(d)->ext;
+        f(NS::Type, sig_env, te->tyext_path, of(te->tyext_txt));
+        break;
+      }
+      case K::Tsig_primitive: {
+        auto* pd = tt::as<tt::Tsig_primitive>(d)->pd;
+        if (pd->prim_kind.kind == tt::PrimitiveKind::Kind::Tprim_alias)
+          f(NS::Value, sig_env, pd->prim_kind.path, of(pd->prim_kind.lid));
+        break;
+      }
+      default: break;
+    }
+    // default_iterator.signature_item
+    switch (d->kind) {
+      case K::Tsig_value: value_description(tt::as<tt::Tsig_value>(d)->vd); break;
+      case K::Tsig_primitive: primitive_description(tt::as<tt::Tsig_primitive>(d)->pd); break;
+      case K::Tsig_type:
+        for (const tt::TTypeDeclaration* td : tt::as<tt::Tsig_type>(d)->decls) type_declaration(td);
+        break;
+      case K::Tsig_typesubst:
+        for (const tt::TTypeDeclaration* td : tt::as<tt::Tsig_typesubst>(d)->decls) type_declaration(td);
+        break;
+      case K::Tsig_typext: type_extension(tt::as<tt::Tsig_typext>(d)->ext); break;
+      case K::Tsig_exception: extension_constructor(tt::as<tt::Tsig_exception>(d)->exn->tyexn_constructor); break;
+      case K::Tsig_module: module_declaration(tt::as<tt::Tsig_module>(d)->md); break;
+      case K::Tsig_modsubst: break;
+      case K::Tsig_recmodule:
+        for (const tt::TModuleDeclaration* md : tt::as<tt::Tsig_recmodule>(d)->mds) module_declaration(md);
+        break;
+      case K::Tsig_modtype: module_type_declaration(tt::as<tt::Tsig_modtype>(d)->mtd); break;
+      case K::Tsig_modtypesubst: module_type_declaration(tt::as<tt::Tsig_modtypesubst>(d)->mtd); break;
+      case K::Tsig_include: module_type(tt::as<tt::Tsig_include>(d)->incl->incl_mod); break;
+      case K::Tsig_class:
+        for (const tt::TClassDescription* c : tt::as<tt::Tsig_class>(d)->classes) class_type_declaration(c);
+        break;
+      case K::Tsig_class_type:
+        for (const tt::TClassTypeDeclaration* c : tt::as<tt::Tsig_class_type>(d)->classes)
+          class_type_declaration(c);
+        break;
+      case K::Tsig_open: open_description(tt::as<tt::Tsig_open>(d)->od); break;
+      case K::Tsig_attribute: break;
+    }
+  }
+  void functor_parameter(const tt::FunctorParameter& p) {
+    if (!p.is_unit) module_type(p.mty);
+  }
+  void module_type(const tt::ModuleType* m) {
+    using K = tt::ModuleTypeDesc::Kind;
+    const tt::ModuleTypeDesc* d = m->mty_desc;
+    env::t mty_env = m->mty_env;
+    // the hook
+    switch (d->kind) {
+      case K::Tmty_ident: {
+        auto* x = tt::as<tt::Tmty_ident>(d);
+        f(NS::Module_type, mty_env, x->path, of(x->lid));
+        break;
+      }
+      case K::Tmty_with:
+        for (const tt::WithConstraintItem& c : tt::as<tt::Tmty_with>(d)->cstrs) {
+          using WK = tt::WithConstraint::Kind;
+          if (c.cstr.kind == WK::Twith_module || c.cstr.kind == WK::Twith_modsubst)
+            f(NS::Module, mty_env, c.cstr.path, of(c.cstr.lid));
+        }
+        break;
+      case K::Tmty_alias: {
+        auto* x = tt::as<tt::Tmty_alias>(d);
+        f(NS::Module, mty_env, x->path, of(x->lid));
+        break;
+      }
+      default: break;
+    }
+    // default_iterator.module_type
+    switch (d->kind) {
+      case K::Tmty_ident: case K::Tmty_alias: break;
+      case K::Tmty_signature: signature(tt::as<tt::Tmty_signature>(d)->sig); break;
+      case K::Tmty_functor: {
+        auto* x = tt::as<tt::Tmty_functor>(d);
+        functor_parameter(x->param);
+        module_type(x->body);
+        break;
+      }
+      case K::Tmty_with: {
+        auto* x = tt::as<tt::Tmty_with>(d);
+        module_type(x->mty);
+        for (const tt::WithConstraintItem& c : x->cstrs) with_constraint(c.cstr);
+        break;
+      }
+      case K::Tmty_typeof: module_expr(tt::as<tt::Tmty_typeof>(d)->me); break;
+    }
+  }
+  void with_constraint(const tt::WithConstraint& c) {
+    using WK = tt::WithConstraint::Kind;
+    switch (c.kind) {
+      case WK::Twith_type: case WK::Twith_typesubst: type_declaration(c.decl); break;
+      case WK::Twith_modtype: case WK::Twith_modtypesubst: module_type(c.mty); break;
+      default: break;
+    }
+  }
+  void open_description(const tt::OpenDescription* od) {
+    f(NS::Module, od->open_env, od->open_expr.path, of(od->open_expr.lid));  // the hook
+  }
+  void module_expr(const tt::ModuleExpr* m) {
+    using K = tt::ModuleExprDesc::Kind;
+    const tt::ModuleExprDesc* d = m->mod_desc;
+    if (d->kind == K::Tmod_ident) {  // the hook
+      auto* x = tt::as<tt::Tmod_ident>(d);
+      f(NS::Module, m->mod_env, x->path, of(x->lid));
+    }
+    switch (d->kind) {
+      case K::Tmod_ident: break;
+      case K::Tmod_structure: structure(tt::as<tt::Tmod_structure>(d)->str); break;
+      case K::Tmod_functor: {
+        auto* x = tt::as<tt::Tmod_functor>(d);
+        functor_parameter(x->param);
+        module_expr(x->body);
+        break;
+      }
+      case K::Tmod_apply: {
+        auto* x = tt::as<tt::Tmod_apply>(d);
+        module_expr(x->fn);
+        module_expr(x->arg);
+        break;
+      }
+      case K::Tmod_apply_unit: module_expr(tt::as<tt::Tmod_apply_unit>(d)->fn); break;
+      case K::Tmod_constraint: {
+        auto* x = tt::as<tt::Tmod_constraint>(d);
+        module_expr(x->me);
+        if (x->explicit_mty) module_type(x->explicit_mty);
+        break;
+      }
+      case K::Tmod_unpack: expr(tt::as<tt::Tmod_unpack>(d)->exp); break;
+    }
+  }
+  void module_binding(const tt::ModuleBinding* mb) { module_expr(mb->mb_expr); }
+  void class_expr(const tt::ClassExpr* c) {
+    using K = tt::ClassExprDesc::Kind;
+    const tt::ClassExprDesc* d = c->cl_desc;
+    if (d->kind == K::Tcl_ident) {  // the hook
+      auto* x = tt::as<tt::Tcl_ident>(d);
+      f(NS::Class, c->cl_env, x->path, of(x->lid));
+    }
+    switch (d->kind) {
+      case K::Tcl_constraint: {
+        auto* x = tt::as<tt::Tcl_constraint>(d);
+        class_expr(x->ce);
+        if (x->cty) class_type(x->cty);
+        break;
+      }
+      case K::Tcl_structure: class_structure(tt::as<tt::Tcl_structure>(d)->cs); break;
+      case K::Tcl_fun: {
+        auto* x = tt::as<tt::Tcl_fun>(d);
+        pat(x->pat);
+        for (const tt::IdentExpression& ie : x->args) expr(ie.exp);
+        class_expr(x->ce);
+        break;
+      }
+      case K::Tcl_apply: {
+        auto* x = tt::as<tt::Tcl_apply>(d);
+        class_expr(x->ce);
+        for (const tt::LabeledArg& a : x->args)
+          if (!a.arg.omitted) expr(a.arg.arg);
+        break;
+      }
+      case K::Tcl_let: {
+        auto* x = tt::as<tt::Tcl_let>(d);
+        for (const tt::ValueBinding* vb : x->vbs) value_binding(vb);
+        for (const tt::IdentExpression& ie : x->vals) expr(ie.exp);
+        class_expr(x->ce);
+        break;
+      }
+      case K::Tcl_ident:
+        for (const tt::CoreType* t : tt::as<tt::Tcl_ident>(d)->args) typ(t);
+        break;
+      case K::Tcl_open: {
+        auto* x = tt::as<tt::Tcl_open>(d);
+        open_description(x->od);
+        class_expr(x->ce);
+        break;
+      }
+    }
+  }
+  void class_type(const tt::ClassType* c) {
+    using K = tt::ClassTypeDesc::Kind;
+    const tt::ClassTypeDesc* d = c->cltyp_desc;
+    if (d->kind == K::Tcty_constr) {  // the hook
+      auto* x = tt::as<tt::Tcty_constr>(d);
+      f(NS::Class_type, c->cltyp_env, x->path, of(x->lid));
+    }
+    switch (d->kind) {
+      case K::Tcty_signature: class_signature(tt::as<tt::Tcty_signature>(d)->sig); break;
+      case K::Tcty_constr:
+        for (const tt::CoreType* t : tt::as<tt::Tcty_constr>(d)->args) typ(t);
+        break;
+      case K::Tcty_arrow: {
+        auto* x = tt::as<tt::Tcty_arrow>(d);
+        typ(x->arg);
+        class_type(x->cty);
+        break;
+      }
+      case K::Tcty_open: {
+        auto* x = tt::as<tt::Tcty_open>(d);
+        open_description(x->od);
+        class_type(x->cty);
+        break;
+      }
+    }
+  }
+  void class_signature(const tt::TClassSignature* s) {
+    typ(s->csig_self);
+    for (const tt::ClassTypeField* fl : s->csig_fields) {
+      using FK = tt::ClassTypeFieldDesc::Kind;
+      const tt::ClassTypeFieldDesc* fd = fl->ctf_desc;
+      switch (fd->kind) {
+        case FK::Tctf_inherit: class_type(tt::as<tt::Tctf_inherit>(fd)->cty); break;
+        case FK::Tctf_val: typ(tt::as<tt::Tctf_val>(fd)->ty); break;
+        case FK::Tctf_method: typ(tt::as<tt::Tctf_method>(fd)->ty); break;
+        case FK::Tctf_constraint: {
+          auto* x = tt::as<tt::Tctf_constraint>(fd);
+          typ(x->t1);
+          typ(x->t2);
+          break;
+        }
+        case FK::Tctf_attribute: break;
+      }
+    }
+  }
+  void typ(const tt::CoreType* t) {
+    using K = tt::CoreTypeDesc::Kind;
+    const tt::CoreTypeDesc* d = t->ctyp_desc;
+    env::t ctyp_env = t->ctyp_env;
+    // the hook
+    switch (d->kind) {
+      case K::Ttyp_constr: {
+        auto* x = tt::as<tt::Ttyp_constr>(d);
+        f(NS::Type, ctyp_env, x->path, of(x->lid));
+        break;
+      }
+      case K::Ttyp_package: {
+        auto* p = tt::as<tt::Ttyp_package>(d)->pack;
+        f(NS::Module_type, ctyp_env, p->tpt_path, of(p->tpt_txt));
+        break;
+      }
+      case K::Ttyp_class: {
+        auto* x = tt::as<tt::Ttyp_class>(d);
+        f(NS::Type, ctyp_env, x->path, of(x->lid));
+        break;
+      }
+      case K::Ttyp_open: {
+        auto* x = tt::as<tt::Ttyp_open>(d);
+        f(NS::Module, ctyp_env, x->path, of(x->lid));
+        break;
+      }
+      case K::Ttyp_functor: {
+        auto* p = tt::as<tt::Ttyp_functor>(d)->pack;
+        f(NS::Module_type, ctyp_env, p->tpt_path, of(p->tpt_txt));
+        break;
+      }
+      default: break;
+    }
+    // default_iterator.typ
+    switch (d->kind) {
+      case K::Ttyp_arrow: {
+        auto* x = tt::as<tt::Ttyp_arrow>(d);
+        typ(x->t1);
+        typ(x->t2);
+        break;
+      }
+      case K::Ttyp_tuple:
+        for (const tt::LabeledCoreType& l : tt::as<tt::Ttyp_tuple>(d)->tl) typ(l.ty);
+        break;
+      case K::Ttyp_constr:
+        for (const tt::CoreType* a : tt::as<tt::Ttyp_constr>(d)->args) typ(a);
+        break;
+      case K::Ttyp_object:
+        for (const tt::ObjectField* o : tt::as<tt::Ttyp_object>(d)->fields) typ(o->of_desc.ty);
+        break;
+      case K::Ttyp_class:
+        for (const tt::CoreType* a : tt::as<tt::Ttyp_class>(d)->args) typ(a);
+        break;
+      case K::Ttyp_alias: typ(tt::as<tt::Ttyp_alias>(d)->ty); break;
+      case K::Ttyp_variant:
+        for (const tt::RowField* r : tt::as<tt::Ttyp_variant>(d)->fields) {
+          if (r->rf_desc.is_tag) {
+            for (const tt::CoreType* a : r->rf_desc.types) typ(a);
+          } else {
+            typ(r->rf_desc.inherit);
+          }
+        }
+        break;
+      case K::Ttyp_poly: typ(tt::as<tt::Ttyp_poly>(d)->ty); break;
+      case K::Ttyp_package: package_type(tt::as<tt::Ttyp_package>(d)->pack); break;
+      case K::Ttyp_open: typ(tt::as<tt::Ttyp_open>(d)->ty); break;
+      case K::Ttyp_functor: {
+        auto* x = tt::as<tt::Ttyp_functor>(d);
+        package_type(x->pack);
+        typ(x->ty);
+        break;
+      }
+      default: break;
+    }
+  }
+  void class_structure(const tt::ClassStructure* cs) {
+    pat(cs->cstr_self);
+    for (const tt::ClassField* fl : cs->cstr_fields) {
+      using FK = tt::ClassFieldDesc::Kind;
+      const tt::ClassFieldDesc* fd = fl->cf_desc;
+      auto field_kind = [&](const tt::ClassFieldKind& k) {
+        if (k.is_virtual) typ(k.cty);
+        else expr(k.exp);
+      };
+      switch (fd->kind) {
+        case FK::Tcf_inherit: class_expr(tt::as<tt::Tcf_inherit>(fd)->ce); break;
+        case FK::Tcf_constraint: {
+          auto* x = tt::as<tt::Tcf_constraint>(fd);
+          typ(x->t1);
+          typ(x->t2);
+          break;
+        }
+        case FK::Tcf_val: field_kind(tt::as<tt::Tcf_val>(fd)->kind_); break;
+        case FK::Tcf_method: field_kind(tt::as<tt::Tcf_method>(fd)->kind_); break;
+        case FK::Tcf_initializer: expr(tt::as<tt::Tcf_initializer>(fd)->exp); break;
+        case FK::Tcf_attribute: break;
+      }
+    }
+  }
+  void case_(const tt::Case* c) {
+    pat(c->c_lhs);
+    if (c->c_guard) expr(c->c_guard);
+    expr(c->c_rhs);
+  }
+  void value_binding(const tt::ValueBinding* vb) {
+    pat(vb->vb_pat);
+    expr(vb->vb_expr);
+  }
+};
+
+// the index as marshaled: (Longident.t Location.loc * Shape_reduce.result)
+// list, newest first; a longident's own records and blocks are one value
+// each (the index's entries for M and M.x share M's)
+class OccWriter {
+ public:
+  OccWriter(Writer& w, ShapeWriter& sw) : w_(w), sw_(sw) {}
+  V list(const std::vector<std::pair<OccLid, const shape_reduce::Result*>>& index) {
+    std::vector<V> xs;
+    for (auto it = index.rbegin(); it != index.rend(); ++it) xs.push_back(o::vblock(0, {lid_rec(it->first), result(it->second)}));
+    return o::vlist(xs);
+  }
+
+ private:
+  V lid_rec(const OccLid& l) {
+    auto key = std::make_pair(l.key, l.field);
+    if (auto it = recs_.find(key); it != recs_.end()) return it->second;
+    V v = o::vblock(0, {longident(l.txt), w_.loc(l.loc)});
+    recs_[key] = v;
+    return v;
+  }
+  V longident(Longident::t l) {
+    if (auto it = lids_.find(l); it != lids_.end()) return it->second;
+    V v;
+    switch (l->kind) {
+      case Longident::Kind::Lident: v = o::vblock(0, {w_.str(l->s)}); break;
+      case Longident::Kind::Ldot:
+        v = o::vblock(1, {lid_rec(OccLid{l, 1, l->l1, l->l1_loc}), component(l)});
+        break;
+      case Longident::Kind::Lapply:
+        v = o::vblock(2, {lid_rec(OccLid{l, 1, l->l1, l->l1_loc}), lid_rec(OccLid{l, 2, l->l2, l->l2_loc})});
+        break;
+    }
+    lids_[l] = v;
+    return v;
+  }
+  V component(Longident::t l) {  // Ldot's `string loc`
+    auto key = std::make_pair(static_cast<const void*>(l), 3);
+    if (auto it = recs_.find(key); it != recs_.end()) return it->second;
+    V v = o::vblock(0, {w_.str(l->s), w_.loc(l->s_loc)});
+    recs_[key] = v;
+    return v;
+  }
+  V result(const shape_reduce::Result* r) {
+    using RK = shape_reduce::Result::Kind;
+    switch (r->kind) {
+      case RK::Resolved: return o::vblock(0, {w_.uid(r->uid)});
+      case RK::Resolved_alias: return o::vblock(1, {w_.uid(r->uid), result(r->alias)});
+      case RK::Resolved_local_use: return o::vblock(2, {w_.uid(r->uid)});
+      case RK::Unresolved: return o::vblock(3, {sw_.shape(r->shape)});
+      case RK::Approximated:
+        return o::vblock(4, {r->has_uid ? w_.some_shared(r->uid_obj, [&] { return w_.uid(r->uid); }) : w_.none()});
+      case RK::Missing_uid: return o::vblock(5, {sw_.shape(r->shape)});
+      case RK::Internal_error_missing_uid: return w_.i(0);
+    }
+    return w_.i(0);
+  }
+  Writer& w_;
+  ShapeWriter& sw_;
+  std::map<std::pair<const void*, int>, V> recs_;
+  std::unordered_map<Longident::t, V> lids_;
+};
+
 using location::rewrite_absolute_path;
 
 std::string file_digest(const std::string& path) {
@@ -2319,7 +3230,21 @@ void save_cmt(const std::string& filename, std::string_view modname, const std::
   w.set_current_unit_identity(modname);
   EventWriter ew(w);
   TreeWriter tw(w, ew);
-  // cmt_ident_occurrences: -bin-annot-occurrences is not ported (the list is [])
+  // cmt_ident_occurrences (index_occurrences binary_annots): first, before
+  // Uid.Deps.get and Env.imports (the reduction's lookups can record a
+  // dependency or load a unit)
+  OccIndexer occ;
+  if (clflags::store_occurrences) {
+    switch (annots.kind) {
+      case BinaryAnnots::Kind::Implementation: occ.structure(annots.structure); break;
+      case BinaryAnnots::Kind::Interface: occ.signature(annots.signature); break;
+      case BinaryAnnots::Kind::Partial_implementation:
+      case BinaryAnnots::Kind::Partial_interface:
+        for (saved_types_t l = annots.parts; l; l = l->next) occ.part(l->part);
+        break;
+      default: break;
+    }
+  }
   V annots_v;
   switch (annots.kind) {
     case BinaryAnnots::Kind::Implementation: annots_v = o::vblock(1, {tw.structure(annots.structure)}); break;
@@ -2348,7 +3273,9 @@ void save_cmt(const std::string& filename, std::string_view modname, const std::
     annots_v = o::vblock(tag, {o::vblock(0, parts)});
   }
   // the record's fields, right to left
-  V shape_v = shape ? w.some(ShapeWriter(w).shape(shape)) : w.none();
+  ShapeWriter sw(w);  // the reduced shapes: cmt_impl_shape's, the occurrences'
+  V occurrences_v = OccWriter(w, sw).list(occ.index);
+  V shape_v = shape ? w.some(sw.shape(shape)) : w.none();
   V interface_digest = this_crc ? w.some(o::vstr(*this_crc)) : w.none();
   // cmt_imports: List.sort compare (Env.imports ())
   auto imports = env::imports();
@@ -2409,7 +3336,7 @@ void save_cmt(const std::string& filename, std::string_view modname, const std::
                            w.b(true),                                                // cmt_use_summaries
                            tbl.value(),                                              // cmt_uid_to_decl
                            shape_v,                                                  // cmt_impl_shape
-                           w.i(0),                                                   // cmt_ident_occurrences
+                           occurrences_v,                                            // cmt_ident_occurrences
                        });
   out += cmt_magic_number;
   std::vector<std::uint8_t> bytes = o::marshal(cmt);

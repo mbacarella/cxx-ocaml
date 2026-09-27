@@ -27,7 +27,7 @@ inline constexpr long max_tag = 245;
 
 [[noreturn]] void raise_error(const Error& e);
 std::optional<bool> get_unboxed_from_attributes(const pt::TypeDeclaration* sdecl);
-env::t add_type_attrs(bool check, Ident::t id, const TypeDeclaration* decl, env::t env);
+env::t add_type_attrs(bool check, Ident::t id, const TypeDeclaration* decl, env::t env, shape::t shape = nullptr);
 env::t enter_type(const std::optional<TypeOrigin>& abstract_abbrevs, RecFlag rec_flag, env::t env,
                   const pt::TypeDeclaration* sdecl, Ident::t id, Uid uid);
 std::vector<Separability> default_separability(long arity);

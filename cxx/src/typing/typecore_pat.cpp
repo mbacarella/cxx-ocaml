@@ -592,11 +592,10 @@ env::t add_module_variables(env::t env, const ModuleVariables& module_variables)
           make<pt::Pmod_unpack>(pt::Pmod_unpack{{pt::ModuleExprDesc::Kind::Pmod_unpack}, eid}), mv.mv_loc,
           pt::Attributes{});
       auto [modl, md_shape] = type_module(env, me);
-      (void)md_shape;
       ModulePresence pres = modl->mod_type->kind == ModuleType::Kind::Mty_alias ? ModulePresence::Mp_absent
                                                                                : ModulePresence::Mp_present;
       auto* md = make<ModuleDeclaration>(ModuleDeclaration{modl->mod_type, Attributes{}, mv.mv_name.loc, mv.mv_uid});
-      return env::add_module_declaration(true, mv.mv_id, pres, md, env);
+      return env::add_module_declaration(true, mv.mv_id, pres, md, env, false, static_cast<shape::t>(md_shape));
     });
   }
   return env;

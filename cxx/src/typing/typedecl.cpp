@@ -25,10 +25,36 @@ std::optional<bool> get_unboxed_from_attributes(const pt::TypeDeclaration* sdecl
   return std::nullopt;
 }
 
-env::t add_type_attrs(bool check, Ident::t id, const TypeDeclaration* decl, env::t env) {
+env::t add_type_attrs(bool check, Ident::t id, const TypeDeclaration* decl, env::t env, shape::t shape) {
   return builtin_attributes::warning_scope(
-      builtin_attributes::ast_attributes(decl->type_attributes), [&] { return env::add_type(check, id, decl, env); },
-      false);
+      builtin_attributes::ast_attributes(decl->type_attributes),
+      [&] { return env::add_type(check, id, decl, env, shape); }, false);
+}
+
+shape::ItemMap shape_map_labels(Slice<const tt::TLabelDeclaration*> lds) {
+  shape::ItemMap m = shape::map::empty();
+  for (const tt::TLabelDeclaration* ld : lds) m = shape::map::add_label(m, ld->ld_id, ld->ld_uid);
+  return m;
+}
+
+shape::ItemMap shape_map_cstrs(Slice<const tt::TConstructorDeclaration*> cds) {
+  shape::ItemMap m = shape::map::empty();
+  for (const tt::TConstructorDeclaration* cd : cds) {
+    shape::ItemMap cstr_shape_map =
+        shape_map_labels(cd->cd_args.is_record ? cd->cd_args.record : Slice<const tt::TLabelDeclaration*>{});
+    m = shape::map::add_constr(m, cd->cd_id, shape::str(&cd->cd_uid, cstr_shape_map));
+  }
+  return m;
+}
+
+// transl_declaration's typ_shape
+static shape::t typ_shape(const tt::TTypeDeclaration* td) {
+  const Uid& uid = td->typ_type->type_uid;
+  switch (td->typ_kind.kind) {
+    case tt::TTypeKind::Kind::Ttype_variant: return shape::str(&uid, shape_map_cstrs(td->typ_kind.constructors));
+    case tt::TTypeKind::Kind::Ttype_record: return shape::str(&uid, shape_map_labels(td->typ_kind.labels));
+    default: return shape::leaf(uid);
+  }
 }
 
 // Add a dummy type declaration to the environment, with the given arity.
@@ -907,9 +933,11 @@ static void update_type(env::t temp_env, env::t env, Ident::t id, const Location
   });
 }
 
-static env::t add_types_to_env(const std::vector<std::pair<Ident::t, const TypeDeclaration*>>& decls, env::t env) {
+static env::t add_types_to_env(const std::vector<std::pair<Ident::t, const TypeDeclaration*>>& decls,
+                                const std::vector<shape::t>& shapes, env::t env) {
   // List.fold_right2
-  for (std::size_t k = decls.size(); k-- > 0;) env = add_type_attrs(true, decls[k].first, decls[k].second, env);
+  for (std::size_t k = decls.size(); k-- > 0;)
+    env = add_type_attrs(true, decls[k].first, decls[k].second, env, shapes[k]);
   return env;
 }
 
@@ -1029,6 +1057,8 @@ TranslTypeDeclResult transl_type_decl(env::t env, RecFlag rec_flag, Slice<const 
   // Copy the type declarations to remove spurious expansions
   std::vector<const tt::TTypeDeclaration*> tdecls;
   std::vector<std::pair<Ident::t, const TypeDeclaration*>> decls;
+  std::vector<shape::t> shapes;  // (transl_declaration returned each with its typ_shape)
+  for (auto* td : r.tdecls) shapes.push_back(typ_shape(td));
   for (auto* td : r.tdecls) {
     const TypeDeclaration* decl = subst::type_declaration(subst::identity(), td->typ_type);
     auto* t2 = make<tt::TTypeDeclaration>(*td);
@@ -1037,7 +1067,7 @@ TranslTypeDeclResult transl_type_decl(env::t env, RecFlag rec_flag, Slice<const 
     decls.push_back({td->typ_id, decl});
   }
   // Build the final env.
-  env::t new_env = add_types_to_env(decls, env);
+  env::t new_env = add_types_to_env(decls, shapes, env);
   // Check for ill-formed abbrevs
   std::vector<std::pair<Ident::t, Location>> id_loc_list;
   for (std::size_t k = 0; k < ids_list.size(); ++k) id_loc_list.push_back({ids_list[k].first, sdecl_list[k]->ptype_loc});
@@ -1106,7 +1136,7 @@ TranslTypeDeclResult transl_type_decl(env::t env, RecFlag rec_flag, Slice<const 
     raise_error(e);
   }
   // Compute the final environment with variance and immediacy
-  env::t final_env = add_types_to_env(decls, env);
+  env::t final_env = add_types_to_env(decls, shapes, env);
   // Check re-exportation
   for (std::size_t k = 0; k < sdecl_list.size(); ++k) check_abbrev(final_env, sdecl_list[k], decls[k].first, decls[k].second);
   // Keep original declaration
@@ -1117,7 +1147,7 @@ TranslTypeDeclResult transl_type_decl(env::t env, RecFlag rec_flag, Slice<const 
     t2->typ_type = subst::type_declaration(subst::identity(), decls[k].second);
     final_decls.push_back(t2);
   }
-  return {final_decls, final_env};
+  return {final_decls, final_env, shapes};
 }
 
 // Check the well-formedness conditions on type abbreviations defined within

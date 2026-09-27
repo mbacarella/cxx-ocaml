@@ -16,6 +16,7 @@
 #include "cppcaml/typing/datarepr.hpp"
 #include "cppcaml/typing/longident.hpp"
 #include "cppcaml/typing/persistent_env.hpp"
+#include "cppcaml/typing/shape.hpp"
 #include "cppcaml/typing/subst.hpp"
 #include "cppcaml/typing/warnings.hpp"
 
@@ -79,9 +80,12 @@ struct AddressUnforced {  // Projection {parent; pos} | ModAlias {env; path}
 using AddressLazy = LazyBacktrack<AddressUnforced, const Address*>;
 
 // ---- the data stored in environments ---------------------------------------
+// Each binding's shape (vda_shape, cda_shape, ...): what Shape_reduce
+// resolves an occurrence to (-bin-annot-occurrences, Env.shape_of_path).
 struct ValueData {
   const ValueDescription* vda_description;
   AddressLazy* vda_address;
+  shape::t vda_shape = nullptr;
 };
 struct ValueEntry {  // Val_bound of value_data | Val_unbound of reason
   bool bound;
@@ -92,6 +96,7 @@ struct ValueEntry {  // Val_bound of value_data | Val_unbound of reason
 struct ConstructorData {
   const ConstructorDescription* cda_description;
   AddressLazy* cda_address;  // nullptr = None
+  shape::t cda_shape = nullptr;
 };
 using LabelData = const LabelDescription*;
 
@@ -109,6 +114,7 @@ struct TypeDescriptions {
 struct TypeData {
   const TypeDeclaration* tda_declaration;
   const TypeDescriptions* tda_descriptions;
+  shape::t tda_shape = nullptr;
 };
 
 struct ModuleComponents;
@@ -116,6 +122,7 @@ struct ModuleData {
   const subst::lazy::ModuleDecl* mda_declaration;
   ModuleComponents* mda_components;
   AddressLazy* mda_address;
+  shape::t mda_shape = nullptr;
 };
 struct ModuleEntry {  // Mod_local | Mod_persistent | Mod_unbound
   enum class Kind : std::uint8_t { Mod_local, Mod_persistent, Mod_unbound };
@@ -125,13 +132,16 @@ struct ModuleEntry {  // Mod_local | Mod_persistent | Mod_unbound
 };
 struct ModtypeData {
   const subst::lazy::ModtypeDecl* mtda_declaration;
+  shape::t mtda_shape = nullptr;
 };
 struct ClassData {
   const ClassDeclaration* clda_declaration;
   AddressLazy* clda_address;
+  shape::t clda_shape = nullptr;
 };
 struct CltypeData {
   const ClassTypeDeclaration* cltda_declaration;
+  shape::t cltda_shape = nullptr;
 };
 
 // ---- IdTbl / TycompTbl -------------------------------------------------------
@@ -188,6 +198,7 @@ struct PathLess {
 struct FunctorComponents {
   FunctorParameter fcomp_arg;
   const ModuleType* fcomp_res;
+  shape::t fcomp_shape = nullptr;
   std::map<Path::t, ModuleComponents*, PathLess> fcomp_cache;         // memoization
   std::map<Path::t, const ModuleType*, PathLess> fcomp_subst_cache;
 };
@@ -210,6 +221,7 @@ struct ComponentsMaker {
   Path::t cm_path;
   AddressLazy* cm_addr;
   const subst::lazy::Modtype* cm_mty;
+  shape::t cm_shape;
 };
 
 struct ModuleComponents {
@@ -369,10 +381,12 @@ void add_required_global(Ident::t id);
 // ?check: the unused-declaration warning of the value (check_usage)
 using CheckFn = std::function<warnings::Warning(std::string)>;
 t add_value(Ident::t id, const ValueDescription* desc, t env, const CheckFn& check = nullptr);
-t add_type(bool check, Ident::t id, const TypeDeclaration* info, t env);
-t add_extension(bool check, bool rebind, Ident::t id, const ExtensionConstructor* ext, t env);
+// ?shape: the binding's shape (nullptr = None: Shape.leaf of its uid)
+t add_type(bool check, Ident::t id, const TypeDeclaration* info, t env, shape::t shape = nullptr);
+t add_extension(bool check, bool rebind, Ident::t id, const ExtensionConstructor* ext, t env,
+                shape::t shape = nullptr);
 t add_module_declaration(bool check, Ident::t id, ModulePresence presence,
-                         const ModuleDeclaration* md, t env, bool noalias = false);
+                         const ModuleDeclaration* md, t env, bool noalias = false, shape::t shape = nullptr);
 t add_module_declaration_lazy(bool update_summary, Ident::t id, ModulePresence presence,
                               const subst::lazy::ModuleDecl* md, t env);
 t add_modtype(Ident::t id, const ModtypeDeclaration* info, t env);
@@ -380,7 +394,7 @@ t add_modtype_lazy(bool update_summary, Ident::t id, const subst::lazy::ModtypeD
 t add_class(Ident::t id, const ClassDeclaration* ty, t env);
 t add_cltype(Ident::t id, const ClassTypeDeclaration* ty, t env);
 t add_module(Ident::t id, ModulePresence presence, const ModuleType* mty, t env,
-             bool noalias = false);
+             bool noalias = false, shape::t shape = nullptr);
 t add_module_lazy(bool update_summary, Ident::t id, ModulePresence presence,
                   const subst::lazy::Modtype* mty, t env);
 t add_local_constraint(Path::t path, const TypeDeclaration* info, t env);
@@ -398,7 +412,7 @@ std::pair<Ident::t, t> enter_extension(int scope, bool rebind, std::string_view 
 std::pair<Ident::t, t> enter_module_declaration(int scope, std::string_view name,
                                                 ModulePresence presence,
                                                 const ModuleDeclaration* md, t env,
-                                                bool noalias = false);
+                                                bool noalias = false, shape::t shape = nullptr);
 std::pair<Ident::t, t> enter_modtype(int scope, std::string_view name,
                                      const ModtypeDeclaration* mtd, t env);
 std::pair<Ident::t, t> enter_class(int scope, std::string_view name,
@@ -407,7 +421,23 @@ std::pair<Ident::t, t> enter_cltype(int scope, std::string_view name,
                                     const ClassTypeDeclaration* desc, t env);
 std::pair<Ident::t, t> enter_module(int scope, std::string_view name, ModulePresence presence,
                                     const ModuleType* mty, t env, bool noalias = false);
-std::pair<Signature, t> enter_signature(int scope, Signature sg, t env);
+// enter_signature ?mod_shape ~scope sg env: the items' shapes are
+// projections of mod_shape (nullptr = None: their own leaves)
+std::pair<Signature, t> enter_signature(int scope, Signature sg, t env, shape::t mod_shape = nullptr);
+// enter_signature_and_shape ~scope ~parent_shape mod_shape sg env
+struct SignatureAndShape {
+  Signature sg;
+  shape::ItemMap shape;
+  t env;
+};
+SignatureAndShape enter_signature_and_shape(int scope, shape::ItemMap parent_shape, shape::t mod_shape,
+                                            Signature sg, t env);
+
+// find_shape env ns id / shape_of_path ~namespace env path (raise NotFound)
+shape::t find_shape(t env, shape::SigComponentKind ns, Ident::t id);
+shape::t shape_of_path(shape::SigComponentKind ns, t env, Path::t path);
+// find_uid namespace path env (None when a lookup fails)
+std::optional<Uid> find_uid(shape::SigComponentKind ns, Path::t path, t env);
 t enter_unbound_value(std::string_view name, ValueUnboundReason reason, t env);
 t enter_unbound_module(std::string_view name, ModuleUnboundReason reason, t env);
 

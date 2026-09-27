@@ -109,17 +109,24 @@ static const tt::TExtensionConstructor* transl_extension_constructor(long scope,
     auto* ext = make<ExtensionConstructor>(type_path, typext_params, args, ret_type, priv, sext->pext_loc,
                                            parsetree::types_attributes(sext->pext_attributes),
                                            uid::mk(env::get_current_unit()));
-    // (the shape is cmt-only)
     return make<tt::TExtensionConstructor>(id, sext->pext_name, ext, kind, sext->pext_loc, sext->pext_attributes);
   });
+}
+
+// transl_extension_constructor's shape: its inline record's labels
+static shape::t ext_shape(const tt::TExtensionConstructor* ext) {
+  shape::ItemMap map = shape::map::empty();
+  if (ext->ext_kind.kind == tt::TExtensionConstructorKind::Kind::Text_decl && ext->ext_kind.args.is_record)
+    map = shape_map_labels(ext->ext_kind.args.record);
+  return shape::str(&ext->ext_type->ext_uid, map);
 }
 
 static bool is_rebind(const tt::TExtensionConstructor* ext) {
   return ext->ext_kind.kind == tt::TExtensionConstructorKind::Kind::Text_rebind;
 }
 
-std::pair<const tt::TTypeExtension*, env::t> transl_type_extension(bool extend, env::t env, const Location& loc,
-                                                                  const pt::TypeExtension* styext) {
+TranslTypeExtension transl_type_extension(bool extend, env::t env, const Location& loc,
+                                          const pt::TypeExtension* styext) {
   return builtin_attributes::warning_scope(styext->ptyext_attributes, [&] {
     const pt::LidLoc& lid = styext->ptyext_path;
     auto [type_path, type_decl] = env::lookup_type(true, lid.loc, lid.txt, env);
@@ -163,6 +170,7 @@ std::pair<const tt::TTypeExtension*, env::t> transl_type_extension(bool extend, 
     struct R {
       std::vector<tt::TypeParam> ttype_params;
       std::vector<const tt::TExtensionConstructor*> constructors;
+      std::vector<shape::t> shapes;
     };
     // Note: it would be incorrect to call [create_scope] *after*
     // [TyVarEnv.reset] or after [with_local_level] (see #10010).
@@ -177,12 +185,15 @@ std::pair<const tt::TTypeExtension*, env::t> transl_type_extension(bool extend, 
       if (inst.size() != type_params.size()) throw std::invalid_argument("List.iter2");
       for (std::size_t k = 0; k < inst.size(); ++k) ctype::unify_var(env, inst[k], type_params[k]);
       std::vector<const tt::TExtensionConstructor*> constructors;
+      std::vector<shape::t> shapes;
       // one list: every constructor's ext_type_params is typext_params
       Slice<TypeExpr*> typext_params = slice(type_params);
-      for (auto* c : styext->ptyext_constructors)
+      for (auto* c : styext->ptyext_constructors) {
         constructors.push_back(transl_extension_constructor(scope, env, type_path, type_decl->type_params, typext_params,
                                                             styext->ptyext_private, c));
-      return R{ttype_params, constructors};
+        shapes.push_back(ext_shape(constructors.back()));
+      }
+      return R{ttype_params, constructors, shapes};
     });
     // Check variances are correct ([loc] is the location of the extension)
     for (auto* ext : r.constructors) {
@@ -196,27 +207,31 @@ std::pair<const tt::TTypeExtension*, env::t> transl_type_extension(bool extend, 
     }
     // Add extension constructors to the environment
     env::t newenv = env;
-    for (auto* ext : r.constructors) newenv = env::add_extension(true, is_rebind(ext), ext->ext_id, ext->ext_type, newenv);
+    for (std::size_t k = 0; k < r.constructors.size(); ++k) {
+      const tt::TExtensionConstructor* ext = r.constructors[k];
+      newenv = env::add_extension(true, is_rebind(ext), ext->ext_id, ext->ext_type, newenv, r.shapes[k]);
+    }
     auto* tyext = make<tt::TTypeExtension>(type_path, styext->ptyext_path, slice(r.ttype_params), slice(r.constructors),
                                            styext->ptyext_private, styext->ptyext_loc, styext->ptyext_attributes);
-    return std::make_pair(static_cast<const tt::TTypeExtension*>(tyext), newenv);
+    return TranslTypeExtension{tyext, newenv, r.shapes};
   });
 }
 
-std::pair<const tt::TExtensionConstructor*, env::t> transl_exception(env::t env, const pt::ExtensionConstructor* sext) {
+TranslException transl_exception(env::t env, const pt::ExtensionConstructor* sext) {
   long scope = ctype::create_scope();
   const tt::TExtensionConstructor* ext = ctype::with_local_level_generalize([&] {
     typetexp::ty_var_env::reset();
     return transl_extension_constructor(scope, env, predef::paths().exn, {}, {}, PrivateFlag::Public, sext);
   });
-  env::t newenv = env::add_extension(true, is_rebind(ext), ext->ext_id, ext->ext_type, env);
-  return {ext, newenv};
+  shape::t shape = ext_shape(ext);
+  env::t newenv = env::add_extension(true, is_rebind(ext), ext->ext_id, ext->ext_type, env, shape);
+  return {ext, newenv, shape};
 }
 
-std::pair<const tt::TTypeException*, env::t> transl_type_exception(env::t env, const pt::TypeException* t) {
-  auto [c, newenv] = builtin_attributes::warning_scope(t->ptyexn_attributes,
-                                                       [&] { return transl_exception(env, t->ptyexn_constructor); });
-  return {make<tt::TTypeException>(c, t->ptyexn_loc, t->ptyexn_attributes), newenv};
+TranslTypeException transl_type_exception(env::t env, const pt::TypeException* t) {
+  auto [c, newenv, shape] = builtin_attributes::warning_scope(
+      t->ptyexn_attributes, [&] { return transl_exception(env, t->ptyexn_constructor); });
+  return {make<tt::TTypeException>(c, t->ptyexn_loc, t->ptyexn_attributes), newenv, shape};
 }
 
 // ---- native representations of external declarations ---------------------------------------

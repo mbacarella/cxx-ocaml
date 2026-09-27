@@ -32,7 +32,6 @@ using SK = SignatureItem::Kind;
 using MK = tt::ModuleExprDesc::Kind;
 
 // defined in typemod_str.cpp
-void record_module_shape(Ident::t id, shape::t s);
 std::pair<const tt::ModuleExpr*, shape::t> type_module_alias_with_shape(env::t env, const pt::ModuleExpr* smod);
 std::pair<const tt::StructureItem*, env::t> type_str_item_fwd(env::t env, const pt::StructureItem* item);
 const tt::ModuleExpr* wrap_constraint_package_(env::t env, bool mark, const tt::ModuleExpr* arg, const ModuleType* mty,

@@ -24,78 +24,7 @@ using STK = tt::StructureItemDesc::Kind;
 namespace tc = typecore;
 namespace et = errortrace;
 
-// ---- module shapes (Env's mda_shape) ----------------------------------------------------------
-static std::unordered_map<Ident::t, shape::t>& module_shapes() {
-  static std::unordered_map<Ident::t, shape::t> m;
-  return m;
-}
-void record_module_shape(Ident::t id, shape::t s) { module_shapes()[id] = s; }
-// Env.find_shape env Module id: the recorded shape, a persistent unit, or
-// the default leaf of a module added without a shape
-static shape::t find_shape(SigComponentKind ns, Ident::t id) {
-  if (ns == SigComponentKind::Module) {
-    auto it = module_shapes().find(id);
-    if (it != module_shapes().end()) return it->second;
-    if (ident::persistent(id)) return shape::for_persistent_unit(ident::name(id));
-  }
-  return shape::leaf(uid::internal_not_actually_unique());
-}
-shape::t shape_of_path(Path::t path) { return shape::of_path(find_shape, SigComponentKind::Module, path); }
 
-// Typedecl's shapes of declarations (shape_map_labels, shape_map_cstrs,
-// the typ_shape of transl_declaration, the extension constructors')
-static shape::ItemMap shape_map_labels(const Slice<const tt::TLabelDeclaration*>& lds) {
-  shape::ItemMap m = shape::map::empty();
-  for (const tt::TLabelDeclaration* ld : lds) m = shape::map::add_label(m, ld->ld_id, ld->ld_uid);
-  return m;
-}
-static shape::ItemMap shape_map_cstrs(const Slice<const tt::TConstructorDeclaration*>& cds) {
-  shape::ItemMap m = shape::map::empty();
-  for (const tt::TConstructorDeclaration* cd : cds) {
-    shape::ItemMap cstr_shape_map =
-        shape_map_labels(cd->cd_args.is_record ? cd->cd_args.record : Slice<const tt::TLabelDeclaration*>{});
-    m = shape::map::add_constr(m, cd->cd_id, shape::str(&cd->cd_uid, cstr_shape_map));
-  }
-  return m;
-}
-static shape::t typ_shape(const tt::TTypeDeclaration* td) {
-  const Uid& uid = td->typ_type->type_uid;
-  switch (td->typ_kind.kind) {
-    case tt::TTypeKind::Kind::Ttype_variant: return shape::str(&uid, shape_map_cstrs(td->typ_kind.constructors));
-    case tt::TTypeKind::Kind::Ttype_record: return shape::str(&uid, shape_map_labels(td->typ_kind.labels));
-    default: return shape::leaf(uid);
-  }
-}
-static shape::t ext_shape(const tt::TExtensionConstructor* ext) {
-  shape::ItemMap map = shape::map::empty();
-  if (ext->ext_kind.kind == tt::TExtensionConstructorKind::Kind::Text_decl && ext->ext_kind.args.is_record)
-    map = shape_map_labels(ext->ext_kind.args.record);
-  return shape::str(&ext->ext_type->ext_uid, map);
-}
-
-// Env.enter_signature_and_shape: the items' shapes are projections of the
-// module's shape
-static shape::Item shape_item_of(const SignatureItem* it) {
-  switch (it->kind) {
-    case SK::Sig_value: return shape::item::value(it->id);
-    case SK::Sig_type: return shape::item::type_(it->id);
-    case SK::Sig_typext: return shape::item::extension_constructor(it->id);
-    case SK::Sig_module: return shape::item::module_(it->id);
-    case SK::Sig_modtype: return shape::item::module_type(it->id);
-    case SK::Sig_class: return shape::item::class_(it->id);
-    case SK::Sig_class_type: return shape::item::class_type(it->id);
-  }
-  throw std::logic_error("shape_item_of");
-}
-static shape::ItemMap record_signature_shapes(shape::ItemMap map, shape::t mod_shape, Signature sg) {
-  for (auto* it : sg) {
-    shape::Item item = shape_item_of(it);
-    shape::t s = shape::proj(nullptr, mod_shape, item);
-    map = shape::map::add(map, item, s);
-    if (it->kind == SK::Sig_module) record_module_shape(it->id, s);
-  }
-  return map;
-}
 
 // ---- check that all core type schemes do not contain non-generalized type variables ------
 struct NongenFound {
@@ -232,8 +161,7 @@ static std::vector<RecChecked> check_recmodule_inclusion(env::t env0, const std:
         if (!b.id) continue;
         const ModuleType* mty_actual2 =
             first_time ? b.mty_actual : subst_and_strengthen(env2, scope, s, b.id, b.mty_actual);
-        env2 = env::add_module(b.id2, ModulePresence::Mp_present, mty_actual2, env2, false);
-        record_module_shape(b.id2, b.shape);
+        env2 = env::add_module(b.id2, ModulePresence::Mp_present, mty_actual2, env2, false, b.shape);
       }
       // Build the output substitution Y_i <- X_i
       subst::t s2 = subst::identity();
@@ -472,7 +400,7 @@ static Typed type_module_aux(bool alias, bool strengthen, bool funct_body, Path:
       const tt::ModuleExpr* md =
           mkmod(make<tt::Tmod_ident>(tt::Tmod_ident{{MK::Tmod_ident}, path, lid}), smod, mty_alias(path), env);
       bool aliasable = env::is_aliasable(path, env);
-      shape::t shape = shape_of_path(path);
+      shape::t shape = env::shape_of_path(SigComponentKind::Module, env, path);
       if (alias && aliasable) {
         shape = shape::alias(nullptr, shape);
         env::add_required_global(path::head(path));
@@ -530,8 +458,7 @@ static Typed type_module_aux(bool alias, bool strengthen, bool funct_body, Path:
           auto* arg_md = make<ModuleDeclaration>(mty->mty_type, Attributes{}, f->param.name.loc, md_uid);
           id = Ident::create_scoped(static_cast<int>(scope), f->param.name.txt.v);
           shape::t shape = shape::var(md_uid, id);
-          newenv = env::add_module_declaration(true, id, ModulePresence::Mp_present, arg_md, env, true);
-          record_module_shape(id, shape);
+          newenv = env::add_module_declaration(true, id, ModulePresence::Mp_present, arg_md, env, true, shape);
           funct_shape_param = id;
         }
         t_arg = tt::FunctorParameter{false, id, f->param.name, mty};
@@ -731,9 +658,8 @@ TypeOpenDeclResult type_open_decl_(std::shared_ptr<bool> used_slot, bool topleve
     }
     Typed md = type_module_s(false, true, funct_body, nullptr, env, od->popen_expr);
     long scope = ctype::create_scope();
-    auto [sg0, newenv] =
-        env::enter_signature(static_cast<int>(scope), extract_sig_open(env, md.me->mod_loc, md.me->mod_type), env);
-    record_signature_shapes(shape::map::empty(), md.shape, sg0);
+    auto [sg0, newenv] = env::enter_signature(static_cast<int>(scope),
+                                              extract_sig_open(env, md.me->mod_loc, md.me->mod_type), env, md.shape);
     std::optional<NameInfo> info;
     Visibility visibility = Visibility::Exported;
     if (!toplevel) {
@@ -806,17 +732,18 @@ static ItemTyped type_str_item(SignatureNames* names, bool toplevel, bool funct_
       typedecl::TranslTypeDeclResult r = typedecl::transl_type_decl(env, t->rec, t->decls);
       for (auto* td : r.decls) check_type(names, td->typ_loc, td->typ_id);
       std::vector<const SignatureItem*> items = map_rec_type_with_row_types(t->rec, r.decls);
-      for (auto* td : r.decls) shape_map = shape::map::add_type(shape_map, td->typ_id, typ_shape(td));
+      for (std::size_t k = 0; k < r.decls.size(); ++k)
+        shape_map = shape::map::add_type(shape_map, r.decls[k]->typ_id, r.shapes[k]);
       return mk(mkd(tt::Tstr_type{{STK::Tstr_type}, t->rec, slice(r.decls)}), items, shape_map,
                 enrich_type_decls(anchor, r.decls, env, r.env));
     }
     case K::Pstr_typext: {
-      auto [tyext, newenv] = typedecl::transl_type_extension(true, env, loc, as<pt::Pstr_typext>(d)->ext);
+      auto [tyext, newenv, shapes] = typedecl::transl_type_extension(true, env, loc, as<pt::Pstr_typext>(d)->ext);
       std::vector<const SignatureItem*> sg;
       for (std::size_t k = 0; k < tyext->tyext_constructors.size(); ++k) {
         auto* ext = tyext->tyext_constructors[k];
         check_typext(names, ext->ext_loc, ext->ext_id);
-        shape_map = shape::map::add_extcons(shape_map, ext->ext_id, ext_shape(ext));
+        shape_map = shape::map::add_extcons(shape_map, ext->ext_id, shapes[k]);
       }
       for (std::size_t k = 0; k < tyext->tyext_constructors.size(); ++k) {
         auto* ext = tyext->tyext_constructors[k];
@@ -826,10 +753,10 @@ static ItemTyped type_str_item(SignatureNames* names, bool toplevel, bool funct_
       return mk(mkd(tt::Tstr_typext{{STK::Tstr_typext}, tyext}), sg, shape_map, newenv);
     }
     case K::Pstr_exception: {
-      auto [ext, newenv] = typedecl::transl_type_exception(env, as<pt::Pstr_exception>(d)->exn);
+      auto [ext, newenv, shape] = typedecl::transl_type_exception(env, as<pt::Pstr_exception>(d)->exn);
       const tt::TExtensionConstructor* c = ext->tyexn_constructor;
       check_typext(names, c->ext_loc, c->ext_id);
-      shape_map = shape::map::add_extcons(shape_map, c->ext_id, ext_shape(c));
+      shape_map = shape::map::add_extcons(shape_map, c->ext_id, shape);
       return mk(mkd(tt::Tstr_exception{{STK::Tstr_exception}, ext}),
                 {sig_typext(c->ext_id, c->ext_type, ExtStatus::Text_exception, Visibility::Exported)}, shape_map,
                 newenv);
@@ -852,8 +779,8 @@ static ItemTyped type_str_item(SignatureNames* names, bool toplevel, bool funct_
       env::t newenv = env;
       std::vector<const SignatureItem*> sg;
       if (mb->pmb_name.txt.some) {
-        auto [i, e] = env::enter_module_declaration(static_cast<int>(scope), mb->pmb_name.txt.v, pres, md, env);
-        record_module_shape(i, md_shape);
+        auto [i, e] =
+            env::enter_module_declaration(static_cast<int>(scope), mb->pmb_name.txt.v, pres, md, env, false, md_shape);
         check_module(names, mb->pmb_loc, i);
         id = i;
         newenv = e;
@@ -900,8 +827,7 @@ static ItemTyped type_str_item(SignatureNames* names, bool toplevel, bool funct_
       for (auto& b : bindings1) {
         if (!b.id) continue;
         auto* mdecl = make<ModuleDeclaration>(b.mty_decl->mty_type, parsetree::types_attributes(b.attrs), b.loc, b.uid);
-        newenv = env::add_module_declaration(true, b.id, ModulePresence::Mp_present, mdecl, newenv);
-        record_module_shape(b.id, b.shape);
+        newenv = env::add_module_declaration(true, b.id, ModulePresence::Mp_present, mdecl, newenv, false, b.shape);
       }
       std::vector<RecChecked> bindings2 = check_recmodule_inclusion(newenv, bindings1);
       std::vector<const tt::ModuleBinding*> mbs_all;
@@ -988,9 +914,10 @@ static ItemTyped type_str_item(SignatureNames* names, bool toplevel, bool funct_
       long scope = ctype::create_scope();
       // Rename all identifiers bound by this signature to avoid clashes
       // (Env.enter_signature_and_shape)
-      auto [sg, new_env] = env::enter_signature(
-          static_cast<int>(scope), extract_sig_open(env, smodl->pmod_loc, modl.me->mod_type), env);
-      shape_map = record_signature_shapes(shape_map, modl.shape, sg);
+      auto [sg, shape_map2, new_env] = env::enter_signature_and_shape(
+          static_cast<int>(scope), shape_map, modl.shape, extract_sig_open(env, smodl->pmod_loc, modl.me->mod_type), env);
+      shape_map = shape_map2;
+
       signature_group::iter([&](const signature_group::RecGroup& g) { check_sig_item(names, loc, g); }, sg);
       auto* incl = make<tt::IncludeDeclaration>(modl.me, sg, sincl->pincl_loc, sincl->pincl_attributes);
       return mk(mkd(tt::Tstr_include{{STK::Tstr_include}, incl}), std::vector<const SignatureItem*>(sg.begin(), sg.end()),
