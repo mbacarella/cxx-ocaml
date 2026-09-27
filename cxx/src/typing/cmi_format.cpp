@@ -1009,7 +1009,8 @@ class Writer {
         V e = position(l.loc_end);
         it->second = o::vblock(0, {a, e, b(l.loc_ghost)});
         // a copy of it the port rebuilt from its positions is this record too
-        locs_.try_emplace(std::make_tuple(a.get(), e.get(), l.loc_ghost), it->second);
+        // (not for a parser record distinct from its equal-valued twin)
+        if (!l.distinct) locs_.try_emplace(std::make_tuple(a.get(), e.get(), l.loc_ghost), it->second);
       }
       return it->second;
     }
@@ -1146,7 +1147,17 @@ class Writer {
     return i(0);
   }
   V path_args(const PathArgs* pa) {
-    return shared(memo_, pa, 0, [&]() -> std::vector<V> { return {path(pa->path), tys(pa->args)}; });
+    return shared(memo_, pa, 0, [&]() -> std::vector<V> { return {path(pa->path), path_args_list(pa)}; });
+  }
+  // `x :: tail` with the tail list shared (PathArgs::tail), else the list
+  V path_args_list(const PathArgs* pa) {
+    if (pa->tail.empty()) return tys(pa->args);
+    auto key = std::make_pair(static_cast<const void*>(pa->args.p), pa->args.n);
+    if (auto it = lists_.find(key); it != lists_.end()) return it->second;
+    V hd = ty(pa->args[0]);
+    V v = o::vblock(0, {hd, tys(pa->tail)});
+    lists_[key] = v;
+    return v;
   }
   V name_ref(const NameRef* r) {
     return shared(memo_, r, 0, [&]() -> std::vector<V> {
@@ -1450,12 +1461,18 @@ class Writer {
       case ValueKind::Kind::Val_ivar: return o::vblock(1, {mutable_flag(k.ivar_mut), str(k.ivar_name)});
       // (never in a signature: a debug event's Env summary)
       case ValueKind::Kind::Val_self: {
+        // the self_meths value: typeclass builds one per class
+        // (self_var_kind) for every Val_self of it -- one per k.meths
         V meths;
-        if (!k.self_virtual) {
+        if (auto it = self_meths_.find(k.meths); it != self_meths_.end()) {
+          meths = it->second;
+        } else if (!k.self_virtual) {
           meths = o::vblock(0, {ident_map(*k.meths)});  // Self_concrete
+          self_meths_[k.meths] = meths;
         } else {                                        // Self_virtual of a ref
           V r = shared(memo_, k.meths, 0, [&]() -> std::vector<V> { return {ident_map(*k.meths)}; });
           meths = o::vblock(1, {r});
+          self_meths_[k.meths] = meths;
         }
         return o::vblock(2, {class_sig(k.sign), meths, ident_map(k.vars), str(k.cl_num)});
       }
@@ -1560,6 +1577,7 @@ class Writer {
   std::map<std::tuple<int, const char*, std::size_t>, V> labels_;
   std::map<std::tuple<const void*, long, long, long>, V> poss_;
   std::map<std::tuple<const void*, const void*, bool>, V> locs_;
+  std::unordered_map<const void*, V> self_meths_;  // Val_self's self_meths blocks
   std::unordered_map<const void*, V> pos_objs_, loc_objs_;
   std::unordered_map<const void*, V> somes_;
   std::unordered_map<const void*, V> val_prims_;

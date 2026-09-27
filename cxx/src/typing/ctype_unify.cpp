@@ -638,7 +638,7 @@ static void reify(const Uenv& uenv, TypeExpr* t, TypeExpr* eqn_lhs = nullptr,
     const TypeDeclaration* decl = new_local_type(origin);
     env::t env = get_env(uenv);
     // unique names are needed only for error messages
-    std::string new_name = in_counterexample(uenv) ? nm : get_new_abstract_name(env, nm);
+    std::string new_name = in_counterexample(uenv) ? nm : std::string(get_new_abstract_name(env, nm));
     Ident::t id = uenv.penv->enter_type(fresh_constr_scope, new_name, decl);
     Path::t path = Path::pident(id);
     TypeExpr* t2 = newty2(lev, tconstr(path, {}, make<MemoRef>(mnil())));

@@ -29,6 +29,9 @@ struct Location {
   Position loc_end;
   bool loc_ghost = false;
   const Location* obj = nullptr;  // as Position::obj
+  // [obj] is a parser record distinct from the equal-valued ones: the
+  // parser's second `make_loc` of one span (location::distinct_record)
+  bool distinct = false;
 };
 // [x] is still the record [x.obj] identifies
 bool same_record(const Position& x);
@@ -36,6 +39,10 @@ bool same_record(const Location& x);
 namespace location {
 // Location.none
 Location none();
+// [l] as a record of its own: the writers keep it apart from equal-valued
+// locations (which they merge, as typing shares parsed locations by
+// reference) -- for a span the parser gives two `make_loc` records
+Location distinct_record(Location l);
 }
 
 // ---- Asttypes ------------------------------------------------------------

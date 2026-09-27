@@ -83,6 +83,10 @@ struct MemoRef {  // abbrev_memo ref
 struct PathArgs {
   Path::t path;
   Slice<TypeExpr*> args;
+  // non-empty: args is `x :: tail` with tail that very list (a Slice's
+  // storage is the list's identity) -- set_object_name's `rv :: params`
+  // shares its params, which may be a declaration's type_params
+  Slice<TypeExpr*> tail{};
 };
 struct NameRef {  // (Path.t * type_expr list) option ref
   const PathArgs* contents;  // nullptr = None

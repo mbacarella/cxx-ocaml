@@ -17,7 +17,10 @@ namespace cppcaml::typing::parsetree {
 typing::Attributes types_attributes(const Attributes& l) {
   std::vector<const typing::Attribute*> out;
   for (const Attribute* a : l) {
-    bool doc = a->attr_name.txt == "ocaml.doc" || a->attr_name.txt == "ocaml.text";
+    // a docstring's attribute (Docstrings builds it, with a Location.none
+    // name); an explicit [@@ocaml.doc ...] is the parser's like any other
+    bool doc = (a->attr_name.txt == "ocaml.doc" || a->attr_name.txt == "ocaml.text") &&
+               a->attr_name.loc.loc_start.pos_cnum == -1;
     // Docstrings's doc_loc / text_loc: one {txt; loc} record each
     static const std::string_view doc_name = OCAML_LIT("ocaml.doc"), text_name = OCAML_LIT("ocaml.text");
     std::string_view name = !doc ? a->attr_name.txt : a->attr_name.txt == "ocaml.doc" ? doc_name : text_name;
@@ -219,7 +222,9 @@ struct Conv {
       d.has_suffix = f.suffix.has_value();
       d.suffix = f.suffix.value_or('\0');
     }
-    return Constant{d, loc(c.loc)};
+    // Const.mk ~loc:(make_loc loc): a record of its own beside the
+    // expression's / pattern's (mkexp / mkpat ~loc:$sloc)
+    return Constant{d, location::distinct_record(loc(c.loc))};
   }
 
   // ---- core types ----
@@ -477,8 +482,10 @@ struct Conv {
               fb = make<FunctionBody>(FunctionBody::Kind::Pfunction_body, expression(*b->e));
             } else {
               auto& c = std::get<ast::Pfunction_cases>(v.body->v);
+              // Pfunction_cases (cases, make_loc $sloc, _): a record of its
+              // own beside the expression's (mkexp ~loc:$sloc)
               fb = make<FunctionBody>(FunctionBody::Kind::Pfunction_cases, nullptr, cases(c.cases),
-                                      loc(c.loc), attrs(c.attrs));
+                                      location::distinct_record(loc(c.loc)), attrs(c.attrs));
             }
             d = make<Pexp_function>(Pexp_function{{K::Pexp_function}, ps, tc, fb});
           } else if constexpr (std::is_same_v<T, ast::Pexp_apply>) {

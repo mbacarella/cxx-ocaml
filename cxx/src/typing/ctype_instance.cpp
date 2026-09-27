@@ -251,7 +251,7 @@ static long find_first_mono(const std::function<bool(long)>& p) {
 
 // Create unique names to new type constructors (existentials, local
 // constraints).
-std::string get_new_abstract_name(env::t env, std::string_view s) {
+std::string_view get_new_abstract_name(env::t env, std::string_view s) {
   auto name = [&](long index) {
     if (index == 0 && !s.empty() && s.back() != '$') return std::string(s);
     return std::string(s) + std::to_string(index);
@@ -264,7 +264,9 @@ std::string get_new_abstract_name(env::t env, std::string_view s) {
       return true;
     }
   });
-  return name(index);
+  // `name 0` is s itself
+  if (index == 0 && !s.empty() && s.back() != '$') return zborrow(s);
+  return zborrow(name(index));
 }
 
 const TypeDeclaration* new_local_type(TypeOrigin origin, const Location& loc, TypeExpr* manifest,
@@ -310,6 +312,7 @@ InstancedConstructor instance_constructor(ExistentialTreatment et,
       TypeOrigin origin;
       origin.kind = TypeOrigin::Kind::Existential;
       origin.existential = cstr->cstr_name;
+      origin.obj = fresh_identity();  // `Existential cstr_name`: one block per call
       const TypeDeclaration* decl = new_local_type(origin);
       std::string name = existential_name(name_counter, existential);
       Ident::t id = penv->enter_type(fresh_constr_scope, get_new_abstract_name(env, name), decl);

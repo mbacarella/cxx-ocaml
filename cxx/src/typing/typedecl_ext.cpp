@@ -11,7 +11,7 @@ using pt::as;
 // ---- translating type extensions -------------------------------------------------------------
 static const tt::TExtensionConstructor* transl_extension_constructor(long scope, env::t env, Path::t type_path,
                                                                      Slice<TypeExpr*> type_params,
-                                                                     const std::vector<TypeExpr*>& typext_params,
+                                                                     Slice<TypeExpr*> typext_params,
                                                                      PrivateFlag priv,
                                                                      const pt::ExtensionConstructor* sext) {
   return builtin_attributes::warning_scope(sext->pext_attributes, [&]() -> const tt::TExtensionConstructor* {
@@ -21,7 +21,8 @@ static const tt::TExtensionConstructor* transl_extension_constructor(long scope,
     tt::TExtensionConstructorKind kind{};
     const pt::ExtensionConstructorKind& sk = sext->pext_kind;
     if (sk.kind == pt::ExtensionConstructorKind::Kind::Pext_decl) {
-      MadeConstructor mc = make_constructor(env, sext->pext_loc, type_path, typext_params, sk.vars, sk.args, sk.res);
+      MadeConstructor mc = make_constructor(env, sext->pext_loc, type_path,
+                                            std::vector<TypeExpr*>(typext_params.begin(), typext_params.end()), sk.vars, sk.args, sk.res);
       args = mc.args;
       ret_type = mc.ret_type;
       kind.kind = tt::TExtensionConstructorKind::Kind::Text_decl;
@@ -41,7 +42,7 @@ static const tt::TExtensionConstructor* transl_extension_constructor(long scope,
         res = ctype::newconstr(type_path, slice(params));
         ret_type = ctype::newconstr(type_path, slice(params));
       } else {
-        res = ctype::newconstr(type_path, slice(typext_params));
+        res = ctype::newconstr(type_path, typext_params);
       }
       try {
         ctype::unify(env, ic.res, res);
@@ -105,7 +106,7 @@ static const tt::TExtensionConstructor* transl_extension_constructor(long scope,
       kind.path = path;
       kind.lid = lid;
     }
-    auto* ext = make<ExtensionConstructor>(type_path, slice(typext_params), args, ret_type, priv, sext->pext_loc,
+    auto* ext = make<ExtensionConstructor>(type_path, typext_params, args, ret_type, priv, sext->pext_loc,
                                            parsetree::types_attributes(sext->pext_attributes),
                                            uid::mk(env::get_current_unit()));
     // (the shape is cmt-only)
@@ -176,8 +177,10 @@ std::pair<const tt::TTypeExtension*, env::t> transl_type_extension(bool extend, 
       if (inst.size() != type_params.size()) throw std::invalid_argument("List.iter2");
       for (std::size_t k = 0; k < inst.size(); ++k) ctype::unify_var(env, inst[k], type_params[k]);
       std::vector<const tt::TExtensionConstructor*> constructors;
+      // one list: every constructor's ext_type_params is typext_params
+      Slice<TypeExpr*> typext_params = slice(type_params);
       for (auto* c : styext->ptyext_constructors)
-        constructors.push_back(transl_extension_constructor(scope, env, type_path, type_decl->type_params, type_params,
+        constructors.push_back(transl_extension_constructor(scope, env, type_path, type_decl->type_params, typext_params,
                                                             styext->ptyext_private, c));
       return R{ttype_params, constructors};
     });

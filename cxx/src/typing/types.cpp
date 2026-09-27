@@ -55,6 +55,14 @@ std::string_view zborrow(std::string_view s) {
   return zone().str(s);
 }
 
+Location location::distinct_record(Location l) {
+  auto* r = make<Location>(l);
+  l.obj = r;
+  l.distinct = true;
+  *r = l;
+  return l;
+}
+
 Location location::none() {
   Position p{"_none_", 0, 0, -1};  // Lexing.dummy_pos with pos_fname "_none_"
   return Location{p, p, true};
@@ -517,7 +525,7 @@ const RowDesc* subst_row_name_path(
     const std::vector<std::pair<Ident::t, Path::t>>& id_map, const RowDesc* row) {
   const PathArgs* nm = row_name(row);
   if (!nm) return row;
-  return set_row_name(row, make<PathArgs>(path::subst(id_map, nm->path), nm->args));
+  return set_row_name(row, make<PathArgs>(path::subst(id_map, nm->path), nm->args, nm->tail));
 }
 
 RowDescRepr row_repr(const RowDesc* row) {

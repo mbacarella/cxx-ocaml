@@ -406,7 +406,8 @@ TypeExpr* instance(TypeExpr* sch, std::optional<bool> partial = std::nullopt);
 TypeExpr* generic_instance(TypeExpr* sch);
 std::vector<TypeExpr*> instance_list(const std::vector<TypeExpr*>& schl);
 TypeExpr* subst_unscoped(ident::Unscoped* us1, ident::Unscoped* us2, TypeExpr* ty);
-std::string get_new_abstract_name(env::t env, std::string_view s);
+// s itself (its identity kept) at index 0, else a fresh "s<index>"
+std::string_view get_new_abstract_name(env::t env, std::string_view s);
 const TypeDeclaration* new_local_type(TypeOrigin origin, const Location& loc = location::none(),
                                       TypeExpr* manifest = nullptr, long scope = 0);
 

@@ -1323,7 +1323,7 @@ static TypeExpr* nondep_type_rec_aux(bool expand_private, env::t env, NondepScop
         if (nm && path::exists_free(ids, nm->path))
           desc2 = tvariant(set_row_name(row2, nullptr));
         else if (nm)
-          desc2 = tvariant(set_row_name(row2, make<PathArgs>(path::subst(id_map, nm->path), nm->args)));
+          desc2 = tvariant(set_row_name(row2, make<PathArgs>(path::subst(id_map, nm->path), nm->args, nm->tail)));
         else
           desc2 = tvariant(row2);
         break;

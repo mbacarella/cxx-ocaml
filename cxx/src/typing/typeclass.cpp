@@ -1356,7 +1356,7 @@ Slice<Separability> default_separability(long arity) {
 }
 
 struct TempAbbrev {
-  std::vector<TypeExpr*> params;
+  Slice<TypeExpr*> params;  // the declaration's type_params list
   TypeExpr* ty;
   const TypeDeclaration* td;
 };
@@ -1367,7 +1367,7 @@ TempAbbrev temp_abbrev(const Location& loc, long arity, Uid uid) {
   auto* td = make<TypeDeclaration>(slice(params), arity, abstract_definition_kind(), PrivateFlag::Public, ty,
                                    slice(variance::unknown_signature(false, arity)), default_separability(arity),
                                    false, lowest_level, loc, Attributes{}, TypeImmediacy::Unknown, false, uid);
-  return {params, ty, td};
+  return {td->type_params, ty, td};
 }
 
 template <class S>
@@ -1380,9 +1380,9 @@ template <class S>
 struct Pending {
   const pt::ClassInfos<S>* cl;
   Ident::t id, ty_id, obj_id;
-  std::vector<TypeExpr*> obj_params;
+  Slice<TypeExpr*> obj_params;  // the temporary abbreviations' type_params lists
   TypeExpr* obj_ty;
-  std::vector<TypeExpr*> cl_params;
+  Slice<TypeExpr*> cl_params;
   TypeExpr* cl_ty;
   const TypeDeclaration* cl_td;
   TypeExpr* constr_type;
@@ -1482,20 +1482,22 @@ env::t class_infos_(bool define_class, const KindFn<S, T>& kind, const Pending<S
   // ~post: Generalize the row variable
   for (TypeExpr* inside : r.params) ctype::limited_generalize(r.sign->csig_self_row, inside);
   ctype::limited_generalize_class_type(r.sign->csig_self_row, r.typ);
-  const std::vector<TypeExpr*>& params = r.params;
+  // one list, as class_infos' `params`: the temporary cltydef / clty and the
+  // self object's name (`rv :: params`) share it
+  Slice<TypeExpr*> params = slice(r.params);
   const ClassType* typ = r.typ;
   // Check the abbreviation for the object type
-  auto [obj_params2, obj_type] = ctype::instance_class(slice(params), typ);
-  TypeExpr* constr = ctype::newconstr(Path::pident(p.obj_id), slice(p.obj_params));
+  auto [obj_params2, obj_type] = ctype::instance_class(params, typ);
+  TypeExpr* constr = ctype::newconstr(Path::pident(p.obj_id), p.obj_params);
   {
     TypeExpr* row = self_type_row(obj_type);
     ctype::unify(env, row, ctype::newty(tnil()));
     try {
-      unify_params(env, p.obj_params, obj_params2);
+      unify_params(env, std::vector<TypeExpr*>(p.obj_params.begin(), p.obj_params.end()), obj_params2);
     } catch (const ctype::Unify&) {
       Error e = err(cl->pci_loc, env, EK::Bad_parameters);
       e.id = p.obj_id;
-      e.tys = p.obj_params;
+      e.tys.assign(p.obj_params.begin(), p.obj_params.end());
       e.tys2 = obj_params2;
       raise_error(e);
     }
@@ -1503,7 +1505,7 @@ env::t class_infos_(bool define_class, const KindFn<S, T>& kind, const Pending<S
     try {
       ctype::unify(env, ty, constr);
     } catch (const ctype::Unify&) {
-      TypeExpr* constr2 = ctype::newconstr(Path::pident(p.obj_id), slice(p.obj_params));
+      TypeExpr* constr2 = ctype::newconstr(Path::pident(p.obj_id), p.obj_params);
       TypeExpr* exp = ctype::expand_head(env, constr2);
       Error e = err(cl->pci_loc, env, EK::Abbrev_type_clash);
       e.ty = constr2;
@@ -1512,17 +1514,17 @@ env::t class_infos_(bool define_class, const KindFn<S, T>& kind, const Pending<S
       raise_error(e);
     }
   }
-  ctype::set_object_name(Path::pident(p.obj_id), slice(params), self_type(typ));
+  ctype::set_object_name(Path::pident(p.obj_id), params, self_type(typ));
   // Check the other temporary abbreviation (#-type)
   {
-    auto [cl_params2, cl_type] = ctype::instance_class(slice(params), typ);
+    auto [cl_params2, cl_type] = ctype::instance_class(params, typ);
     TypeExpr* ty = self_type(cl_type);
     try {
-      unify_params(env, p.cl_params, cl_params2);
+      unify_params(env, std::vector<TypeExpr*>(p.cl_params.begin(), p.cl_params.end()), cl_params2);
     } catch (const ctype::Unify&) {
       Error e = err(cl->pci_loc, env, EK::Bad_class_type_parameters);
       e.id = p.ty_id;
-      e.tys = p.cl_params;
+      e.tys.assign(p.cl_params.begin(), p.cl_params.end());
       e.tys2 = cl_params2;
       raise_error(e);
     }
@@ -1552,10 +1554,10 @@ env::t class_infos_(bool define_class, const KindFn<S, T>& kind, const Pending<S
   Slice<variance::t> cty_variance = slice(variance::unknown_signature(false, static_cast<long>(params.size())));
   // each `Path.Pident obj_id` of typeclass.ml is its own block
   TypeExpr* cty_new = cl->pci_virt == VirtualFlag::Virtual ? nullptr : p.constr_type;
-  auto* cltydef0 = make<ClassTypeDeclaration>(slice(params), class_body(typ), Path::pident(p.obj_id), p.cl_td, cty_variance,
+  auto* cltydef0 = make<ClassTypeDeclaration>(params, class_body(typ), Path::pident(p.obj_id), p.cl_td, cty_variance,
                                               cl->pci_loc, pt::types_attributes(cl->pci_attributes),
                                               p.dummy_class->cty_uid);
-  auto* clty0 = make<ClassDeclaration>(slice(params), typ, Path::pident(p.obj_id), cty_new, cty_variance, cl->pci_loc,
+  auto* clty0 = make<ClassDeclaration>(params, typ, Path::pident(p.obj_id), cty_new, cty_variance, cl->pci_loc,
                                        pt::types_attributes(cl->pci_attributes), p.dummy_class->cty_uid);
   p.dummy_class->cty_type = typ;
   if (define_class) env = env::add_class(p.id, clty0, env);
@@ -1564,21 +1566,24 @@ env::t class_infos_(bool define_class, const KindFn<S, T>& kind, const Pending<S
   long arity = class_type_arity(typ);
   std::vector<std::string_view> pub_meths = public_methods(r.sign);
   // Final definitions
-  auto [params2, typ2] = ctype::instance_class(slice(params), typ);
+  auto [params2_v, typ2] = ctype::instance_class(params, typ);
+  Slice<TypeExpr*> params2 = slice(params2_v);  // params': clty's and cltydef's one list
   TypeExpr* cty_new2 = cl->pci_virt == VirtualFlag::Virtual ? nullptr : ctype::instance(p.constr_type);
-  auto* clty = make<ClassDeclaration>(slice(params2), typ2, Path::pident(p.obj_id), cty_new2, cty_variance, cl->pci_loc,
+  auto* clty = make<ClassDeclaration>(params2, typ2, Path::pident(p.obj_id), cty_new2, cty_variance, cl->pci_loc,
                                       pt::types_attributes(cl->pci_attributes), p.dummy_class->cty_uid);
   long oarity = static_cast<long>(p.obj_params.size());
-  auto* obj_abbr = make<TypeDeclaration>(slice(p.obj_params), oarity, abstract_definition_kind(), PrivateFlag::Public,
+  auto* obj_abbr = make<TypeDeclaration>(p.obj_params, oarity, abstract_definition_kind(), PrivateFlag::Public,
                                          p.obj_ty, slice(variance::unknown_signature(false, oarity)),
                                          default_separability(oarity), false, lowest_level, cl->pci_loc, Attributes{},
                                          TypeImmediacy::Unknown, false, p.dummy_class->cty_uid);
-  auto [cl_params, cl_ty] = ctype::instance_parameterized_type(slice(params), self_type(typ));
-  ctype::set_object_name(Path::pident(p.obj_id), slice(cl_params), cl_ty);
+  auto [cl_params, cl_ty] = ctype::instance_parameterized_type(params, self_type(typ));
+  // one list: the object name's `rv :: cl_params` shares it with cl_abbr
+  Slice<TypeExpr*> cl_params_l = slice(cl_params);
+  ctype::set_object_name(Path::pident(p.obj_id), cl_params_l, cl_ty);
   auto* cl_abbr = make<TypeDeclaration>(*p.cl_td);
-  cl_abbr->type_params = slice(cl_params);
+  cl_abbr->type_params = cl_params_l;
   cl_abbr->type_manifest = cl_ty;
-  auto* cltydef = make<ClassTypeDeclaration>(slice(params2), class_body(typ2), Path::pident(p.obj_id), cl_abbr, cty_variance,
+  auto* cltydef = make<ClassTypeDeclaration>(params2, class_body(typ2), Path::pident(p.obj_id), cl_abbr, cty_variance,
                                              cl->pci_loc, pt::types_attributes(cl->pci_attributes),
                                              p.dummy_class->cty_uid);
   // List.rev !coercion_locs (the head of the OCaml list is the vector's front)

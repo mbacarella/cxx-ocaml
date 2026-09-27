@@ -77,8 +77,8 @@ Slice<const tt::Case*> type_effect_cases(tt::PatternCategory category, env::t en
     // Create a locally abstract type for effect type.
     const TypeDeclaration* decl = ctype::new_local_type(TypeOrigin{}, loc);
     long scope = ctype::create_scope();
-    std::string name = ctype::get_new_abstract_name(env, "%eff");
-    Ident::t id = Ident::create_scoped(static_cast<int>(scope), zborrow(name));
+    std::string_view name = ctype::get_new_abstract_name(env, OCAML_LIT("%eff"));
+    Ident::t id = Ident::create_scoped(static_cast<int>(scope), name);
     env::t new_env = env::add_type(false, id, decl, env);
     TypeExpr* ty_eff = newgenty(tconstr(Path::pident(id), {}, make<MemoRef>(mnil())));
     // (new_env, Predef.type_eff ty_eff, Predef.type_continuation ty_eff ty_res): right to left

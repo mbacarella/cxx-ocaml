@@ -376,7 +376,7 @@ void set_object_name(Path::t p, Slice<TypeExpr*> params, TypeExpr* ty) {
     TypeExpr* rv = fields_row_variable(o->fields);
     std::vector<TypeExpr*> args{rv};
     args.insert(args.end(), params.begin(), params.end());
-    set_name(o->name, make<PathArgs>(p, slice(args)));
+    set_name(o->name, make<PathArgs>(p, slice(args), params));  // Some (p, rv :: params)
   } else if (d->kind != DescKind::Tconstr) {
     throw std::logic_error("Ctype.set_object_name");
   }

@@ -337,7 +337,7 @@ static TypeExpr* typexp(CopyScope& copy_scope, t s, TypeExpr* ty) {
           const PathArgs* name =
               to_subst_by_type_function(s, nm->path)
                   ? nullptr
-                  : make<PathArgs>(type_path(s, nm->path), nm->args);
+                  : make<PathArgs>(type_path(s, nm->path), nm->args, nm->tail);
           desc2 = tvariant(set_row_name(row2, name));
         } else {
           desc2 = tvariant(row2);
