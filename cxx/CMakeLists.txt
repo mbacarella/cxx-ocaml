@@ -69,6 +69,8 @@ add_library(cppcaml_core
   src/typing/typemod_util.cpp
   src/typing/error_report.cpp
   src/typing/warnings.cpp
+  src/typing/warnings_message.cpp
+  src/typing/builtin_attributes.cpp
   src/typing/lambda.cpp
   src/typing/format.cpp
   src/typing/printlambda.cpp

@@ -49,17 +49,17 @@ Signature extract_sig_open(env::t env, const Location& loc, const ModuleType* mt
 }
 
 // Compute the environment after opening a module
-std::pair<Path::t, env::t> type_open_(bool*, bool toplevel, OverrideFlag ovf, env::t env, const Location& loc,
+std::pair<Path::t, env::t> type_open_(std::shared_ptr<bool> used_slot, bool toplevel, OverrideFlag ovf, env::t env, const Location& loc,
                                       const pt::LidLoc& lid) {
   Path::t path = env::lookup_module_path(true, lid.loc, true, lid.txt, env);
-  env::OpenResult r = env::open_signature(ovf, path, env, loc, toplevel);
+  env::OpenResult r = env::open_signature(ovf, path, env, loc, toplevel, used_slot);
   if (r.kind == env::OpenResult::Kind::Ok) return {path, r.env};
   const ModuleDeclaration* md = env::find_module(path, env);
   extract_sig_open(env, lid.loc, md->md_type);
   throw std::logic_error("type_open_");
 }
 
-std::pair<const tt::OpenDescription*, env::t> type_open_descr(bool* used_slot, bool toplevel, env::t env,
+std::pair<const tt::OpenDescription*, env::t> type_open_descr(std::shared_ptr<bool> used_slot, bool toplevel, env::t env,
                                                               const pt::OpenDescription* sod) {
   auto [path, newenv] = builtin_attributes::warning_scope(sod->popen_attributes, [&] {
     return type_open_(used_slot, toplevel, sod->popen_override, env, sod->popen_loc, sod->popen_expr);
@@ -1055,8 +1055,9 @@ static Signature approx_sig(env::t env, pt::Signature ssg, std::size_t k) {
   }
 }
 
-// (Warnings.without_warnings)
-const ModuleType* approx_modtype(env::t env, const pt::ModuleType* smty) { return approx_modtype_(env, smty); }
+const ModuleType* approx_modtype(env::t env, const pt::ModuleType* smty) {
+  return warnings::without_warnings([&] { return approx_modtype_(env, smty); });
+}
 
 // ---- module Signature_names ----------------------------------------------------------------
 enum class HideReason { From_open, Shadowed_by };

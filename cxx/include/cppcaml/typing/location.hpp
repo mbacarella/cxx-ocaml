@@ -18,6 +18,7 @@
 #include "cppcaml/typing/format.hpp"
 #include "cppcaml/typing/format_doc.hpp"
 #include "cppcaml/typing/support.hpp"
+#include "cppcaml/typing/warnings.hpp"
 
 namespace cppcaml::typing::location {
 
@@ -119,5 +120,21 @@ bool report_exception(format::Formatter& ppf, std::exception_ptr ep);
 // goes to stderr at each flush (err_flush)
 format::Formatter& err_formatter();
 void err_flush();
+
+// ---- warnings and alerts (the default reporters) ----
+// report_warning loc w / report_alert loc a: None when inactive
+std::optional<Report> report_warning(const Location& loc, const warnings::Warning& w);
+std::optional<Report> report_alert(const Location& loc, const warnings::Alert& a);
+// print_warning loc ppf w / prerr_warning loc w (on formatter_for_warnings,
+// Format.err_formatter)
+void print_warning(const Location& loc, format::Formatter& ppf, const warnings::Warning& w);
+void prerr_warning(const Location& loc, const warnings::Warning& w);
+void print_alert(const Location& loc, format::Formatter& ppf, const warnings::Alert& a);
+void prerr_alert(const Location& loc, const warnings::Alert& a);
+// alert ?def ?use ~kind loc message / deprecated ?def ?use loc message
+void alert(const Location& loc, std::string kind, std::string message, const Location& def = none(),
+           const Location& use = none());
+void deprecated(const Location& loc, std::string message, const Location& def = none(),
+                const Location& use = none());
 
 }  // namespace cppcaml::typing::location

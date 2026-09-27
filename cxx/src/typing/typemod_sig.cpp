@@ -224,7 +224,7 @@ TranslRecmodule transl_recmodule_modtypes(env::t env, Slice<const pt::ModuleDecl
     init.push_back({ids[k], pmd->pmd_name, md, nullptr});
   }
   env::t abs_env = make_env(init);
-  std::vector<Cur> dcl1 = transition(abs_env, init);  // (Warnings.without_warnings)
+  std::vector<Cur> dcl1 = warnings::without_warnings([&] { return transition(abs_env, init); });
   env::t env1 = make_env(dcl1);
   check_recmod_typedecls(env1, map_mtys(dcl1));
   std::vector<Cur> dcl2 = transition(env1, dcl1);

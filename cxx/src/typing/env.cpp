@@ -1,6 +1,8 @@
 // Port of typing/env.ml.  See env.hpp for the deviations (no shapes; no
 // warnings / alerts / usage tracking yet).  Sections follow env.ml.
 #include "cppcaml/typing/env.hpp"
+#include "cppcaml/typing/builtin_attributes.hpp"
+#include "cppcaml/typing/location.hpp"
 
 #include <algorithm>
 
@@ -60,15 +62,14 @@ static IdTbl<A, B> idtbl_remove(Ident::t id, const IdTbl<A, B>& tbl) {
   return r;
 }
 
-// add_open slot wrap root components next.  The `using` callback is built
-// only for the unused-open / shadowing warnings, which are not ported: the
-// slot is always None here.
+// add_open slot wrap root components next: `using` (the slot, applied to
+// the component's kind) detects unused opens and shadowing
 template <class A, class B>
-static IdTbl<A, B> idtbl_add_open(Path::t root, const StrMap<B>& components,
-                                  const IdTbl<A, B>& next) {
+static IdTbl<A, B> idtbl_add_open(Path::t root, const StrMap<B>& components, const IdTbl<A, B>& next,
+                                  const UsingFn<A>* using_) {
   IdTbl<A, B> r;
   using L = typename IdTbl<A, B>::Layer;
-  r.layer = make<L>(L{true, root, components, nullptr, {}, next});
+  r.layer = make<L>(L{true, root, components, using_, {}, next});
   return r;
 }
 
@@ -113,9 +114,21 @@ static std::pair<Path::t, A> idtbl_find_name(W&& wrap, bool mark, std::string_vi
   if (L->is_open) {
     if (const B* c = L->components.find_opt(name)) {
       A descr = wrap(*c);
-      // (mark && using: the unused-open / shadowing callback -- not ported)
-      (void)mark;
-      return {Path::pdot(L->root, name), descr};
+      std::pair<Path::t, A> res{Path::pdot(L->root, name), descr};
+      if (mark && L->using_) {
+        std::optional<std::pair<Path::t, A>> hidden;
+        try {
+          hidden = idtbl_find_name(wrap, false, name, L->next);
+        } catch (const NotFound&) {
+        }
+        if (!hidden) {
+          (*L->using_)(name, nullptr);
+        } else {
+          std::pair<A, A> both{hidden->second, descr};
+          (*L->using_)(name, &both);
+        }
+      }
+      return res;
     }
     return idtbl_find_name(wrap, mark, name, L->next);
   }
@@ -196,10 +209,10 @@ static TycompTbl<A> tycomp_add(Ident::t id, const A& x, const TycompTbl<A>& tbl)
 
 template <class A>
 static TycompTbl<A> tycomp_add_open(Path::t root, const StrMap<Slice<A>>& components,
-                                    const TycompTbl<A>& next) {
+                                    const TycompTbl<A>& next, const UsingFn<A>* using_) {
   TycompTbl<A> r;
   using O = typename TycompTbl<A>::Opened;
-  r.opened = make<O>(O{components, root, nullptr, next});
+  r.opened = make<O>(O{components, root, using_, next});
   return r;
 }
 
@@ -230,8 +243,26 @@ static std::vector<std::pair<A, std::function<void()>>> tycomp_find_all(
   for (auto& [id, d] : tbl.current.find_all(name)) out.emplace_back(*d, [] {});
   if (!tbl.opened) return out;
   auto rest = tycomp_find_all(mark, name, tbl.opened->next);
+  const UsingFn<A>* using_ = mark ? tbl.opened->using_ : nullptr;
   if (const Slice<A>* opened = tbl.opened->components.find_opt(name))
-    for (const A& desc : *opened) out.emplace_back(desc, [] {});  // mk_callback: not ported
+    for (const A& desc : *opened) {
+      // mk_callback rest name desc using
+      std::function<void()> cb = [] {};
+      if (using_) {
+        std::optional<A> hidden;
+        if (!rest.empty()) hidden = rest.front().first;
+        std::string n(name);
+        cb = [using_, n, desc, hidden] {
+          if (!hidden) {
+            (*using_)(n, nullptr);
+          } else {
+            std::pair<A, A> both{desc, *hidden};
+            (*using_)(n, &both);
+          }
+        };
+      }
+      out.emplace_back(desc, cb);
+    }
   out.insert(out.end(), rest.begin(), rest.end());
   return out;
 }
@@ -520,7 +551,7 @@ void register_import_as_opaque(const std::string& m) {
 void reset_cache() {
   g_current_unit.reset();
   g_persistent_env.clear();
-  // reset_declaration_caches: the usage tables are not ported
+  reset_declaration_caches();
 }
 
 // ---- get_components --------------------------------------------------------------
@@ -1192,8 +1223,129 @@ static AddressLazy* module_declaration_address(t env, Ident::t id, ModulePresenc
   return ident_address(id);
 }
 
+// ---- tracking usage -----------------------------------------------------------------
+// 'a usage_tbl: ('a -> unit) Types.Uid.Tbl.t -- a Hashtbl, whose add shadows
+// and whose find returns the latest binding
+
+std::function<void(std::function<void()>)> add_delayed_check_forward = [](std::function<void()>) {
+  throw std::logic_error("Env.add_delayed_check_forward");
+};
+
+namespace {
+using UidKey = std::tuple<int, std::string, long, int>;
+UidKey uid_key(const Uid& u) {
+  return UidKey{static_cast<int>(u.kind), std::string(u.comp_unit), u.id, static_cast<int>(u.from)};
+}
+template <class Fn>
+struct UsageTbl {
+  std::map<UidKey, std::vector<Fn>> m;
+  bool mem(const Uid& u) const { return m.count(uid_key(u)) != 0; }
+  void add(const Uid& u, Fn f) { m[uid_key(u)].push_back(std::move(f)); }
+  const Fn* find(const Uid& u) const {
+    auto it = m.find(uid_key(u));
+    return it == m.end() ? nullptr : &it->second.back();
+  }
+  void replace(const Uid& u, Fn f) {
+    std::vector<Fn>& v = m[uid_key(u)];
+    if (v.empty()) v.push_back(std::move(f));
+    else v.back() = std::move(f);
+  }
+  void clear() { m.clear(); }
+};
+UsageTbl<std::function<void()>> value_declarations, type_declarations, module_declarations;
+
+struct ConstructorUsages {
+  bool cu_positive = false, cu_pattern = false, cu_exported_private = false;
+};
+void add_constructor_usage(ConstructorUsages& cu, ConstructorUsage usage) {
+  switch (usage) {
+    case ConstructorUsage::Positive: cu.cu_positive = true; break;
+    case ConstructorUsage::Pattern: cu.cu_pattern = true; break;
+    case ConstructorUsage::Exported_private: cu.cu_exported_private = true; break;
+    case ConstructorUsage::Exported: cu.cu_positive = cu.cu_pattern = cu.cu_exported_private = true; break;
+  }
+}
+std::optional<warnings::ConstructorUsage> constructor_usage_complaint(bool rebind, PrivateFlag priv,
+                                                                      const ConstructorUsages& cu) {
+  using W = warnings::ConstructorUsage;
+  if (priv == PrivateFlag::Private && !rebind) return std::nullopt;
+  if (rebind) {
+    if (cu.cu_positive || cu.cu_pattern || cu.cu_exported_private) return std::nullopt;
+    return W::Unused;
+  }
+  if (cu.cu_positive) return std::nullopt;
+  if (!cu.cu_pattern && !cu.cu_exported_private) return W::Unused;
+  if (cu.cu_pattern) return W::Not_constructed;
+  return W::Only_exported_private;
+}
+UsageTbl<std::function<void(ConstructorUsage)>> used_constructors;
+
+struct LabelUsages {
+  bool lu_projection = false, lu_mutation = false, lu_construct = false;
+};
+void add_label_usage(LabelUsages& lu, LabelUsage usage) {
+  switch (usage) {
+    case LabelUsage::Projection: lu.lu_projection = true; break;
+    case LabelUsage::Mutation: lu.lu_mutation = true; break;
+    case LabelUsage::Construct: lu.lu_construct = true; break;
+    case LabelUsage::Exported_private: lu.lu_projection = true; break;
+    case LabelUsage::Exported: lu.lu_projection = lu.lu_mutation = lu.lu_construct = true; break;
+  }
+}
+bool is_mutating_label_usage(LabelUsage u) { return u == LabelUsage::Mutation; }
+std::optional<warnings::FieldUsage> label_usage_complaint(PrivateFlag priv, MutableFlag mut, const LabelUsages& lu) {
+  using W = warnings::FieldUsage;
+  if (priv == PrivateFlag::Private) {
+    if (lu.lu_projection) return std::nullopt;
+    return W::Unused;
+  }
+  if (mut == MutableFlag::Immutable) {
+    if (lu.lu_projection) return std::nullopt;
+    if (!lu.lu_construct) return W::Unused;
+    return W::Not_read;
+  }
+  if (lu.lu_projection && lu.lu_mutation) return std::nullopt;
+  if (!lu.lu_projection && !lu.lu_mutation && !lu.lu_construct) return W::Unused;
+  if (!lu.lu_projection) return W::Not_read;
+  return W::Not_mutated;
+}
+UsageTbl<std::function<void(LabelUsage)>> used_labels;
+}  // namespace
+
+void reset_declaration_caches() {
+  value_declarations.clear();
+  type_declarations.clear();
+  module_declarations.clear();
+  used_constructors.clear();
+  used_labels.clear();
+}
+
 // ---- insertion of bindings by identifier + path ----------------------------------
-// (check_usage / Builtin_attributes marking: not ported, see env.hpp)
+
+// A Types attribute list as the parsetree attributes warning_scope reads
+// (in OCaml they are one type; a .cmi's attributes have no parsetree here,
+// and their [@warning] settings only matter inside the scope)
+static parsetree::Attributes ast_attributes(const Attributes& l) {
+  std::vector<const parsetree::Attribute*> out;
+  for (const Attribute* a : l)
+    if (a->ast) out.push_back(a->ast);
+  return slice(out);
+}
+
+// check_usage loc id uid warn tbl
+static void check_usage(const Location& loc, Ident::t id, const Uid& uid, const CheckFn& warn,
+                        UsageTbl<std::function<void()>>& tbl) {
+  if (!loc.loc_ghost && uid::for_actual_declaration(uid) && warnings::is_active(warn(""))) {
+    std::string name(ident::name(id));
+    if (tbl.mem(uid)) return;
+    auto used = std::make_shared<bool>(false);
+    tbl.add(uid, [used] { *used = true; });
+    if (!(name.empty() || name[0] == '_' || name[0] == '#'))
+      add_delayed_check_forward([used, loc, warn, name] {
+        if (!*used) location::prerr_warning(loc, warn(name));
+      });
+  }
+}
 
 static void check_value_name(std::string_view name, const Location& loc) {
   // Utf8_lexeme.starts_like_a_valid_identifier, ASCII approximation: a
@@ -1211,8 +1363,10 @@ static void check_value_name(std::string_view name, const Location& loc) {
     }
 }
 
-static t store_value(Ident::t id, AddressLazy* addr, const ValueDescription* decl, t env) {
+static t store_value(const CheckFn& check, Ident::t id, AddressLazy* addr, const ValueDescription* decl, t env) {
   check_value_name(ident::name(id), decl->val_loc);
+  builtin_attributes::mark_alerts_used(decl->val_attributes);
+  if (check) check_usage(decl->val_loc, id, decl->val_uid, check, value_declarations);
   EnvT* e = copy_env(env);
   e->values = idtbl_add(id, wrap_value(make<ValueData>(decl, addr)), env->values);
   Summary s{Summary::Kind::Env_value, env->summary};
@@ -1222,7 +1376,32 @@ static t store_value(Ident::t id, AddressLazy* addr, const ValueDescription* dec
   return e;
 }
 
-static t store_constructor(Ident::t cstr_id, const ConstructorDescription* cstr, t env) {
+static t store_constructor(bool check, const TypeDeclaration* type_decl, Ident::t type_id, Ident::t cstr_id,
+                           const ConstructorDescription* cstr, t env) {
+  builtin_attributes::warning_scope(ast_attributes(cstr->cstr_attributes), [&] {
+    if (check && !type_decl->type_loc.loc_ghost && warnings::is_active(37)) {
+      std::string ty_name(ident::name(type_id));
+      std::string name(cstr->cstr_name);
+      Location loc = cstr->cstr_loc;
+      const Uid& k = cstr->cstr_uid;
+      PrivateFlag priv = type_decl->type_private;
+      if (!used_constructors.mem(k)) {
+        auto used = std::make_shared<ConstructorUsages>();
+        used_constructors.add(k, [used](ConstructorUsage u) { add_constructor_usage(*used, u); });
+        if (!(ty_name.empty() || ty_name[0] == '_'))
+          add_delayed_check_forward([used, loc, name, priv, env] {
+            if (std::optional<warnings::ConstructorUsage> c = constructor_usage_complaint(false, priv, *used))
+              if (!is_in_signature(env)) {
+                warnings::Warning w = warnings::Warning::with_s(warnings::Warning::K::Unused_constructor, name);
+                w.cusage = *c;
+                location::prerr_warning(loc, w);
+              }
+          });
+      }
+    }
+  });
+  builtin_attributes::mark_alerts_used(cstr->cstr_attributes);
+  builtin_attributes::mark_warn_on_literal_pattern_used(cstr->cstr_attributes);
   EnvT* e = copy_env(env);
   e->constrs =
       tycomp_add(cstr_id, static_cast<const ConstructorData*>(make<ConstructorData>(cstr, nullptr)),
@@ -1230,13 +1409,47 @@ static t store_constructor(Ident::t cstr_id, const ConstructorDescription* cstr,
   return e;
 }
 
-static t store_label(Ident::t lbl_id, const LabelDescription* lbl, t env) {
+static t store_label(bool check, const TypeDeclaration* type_decl, Ident::t type_id, Ident::t lbl_id,
+                     const LabelDescription* lbl, t env) {
+  builtin_attributes::warning_scope(ast_attributes(lbl->lbl_attributes), [&] {
+    if (check && !type_decl->type_loc.loc_ghost && warnings::is_active(69)) {
+      std::string ty_name(ident::name(type_id));
+      PrivateFlag priv = type_decl->type_private;
+      std::string name(lbl->lbl_name);
+      Location loc = lbl->lbl_loc;
+      MutableFlag mut = lbl->lbl_mut;
+      const Uid& k = lbl->lbl_uid;
+      if (!used_labels.mem(k)) {
+        auto used = std::make_shared<LabelUsages>();
+        used_labels.add(k, [used](LabelUsage u) { add_label_usage(*used, u); });
+        if (!(ty_name.empty() || ty_name[0] == '_' || name[0] == '_'))
+          add_delayed_check_forward([used, loc, name, priv, mut, env] {
+            if (std::optional<warnings::FieldUsage> c = label_usage_complaint(priv, mut, *used))
+              if (!is_in_signature(env)) {
+                warnings::Warning w = warnings::Warning::with_s(warnings::Warning::K::Unused_field, name);
+                w.fusage = *c;
+                location::prerr_warning(loc, w);
+              }
+          });
+      }
+    }
+  });
+  builtin_attributes::mark_alerts_used(lbl->lbl_attributes);
+  if (lbl->lbl_mut == MutableFlag::Mutable) builtin_attributes::mark_deprecated_mutable_used(lbl->lbl_attributes);
   EnvT* e = copy_env(env);
   e->labels = tycomp_add(lbl_id, lbl, env->labels);
   return e;
 }
 
-static t store_type(bool /*check*/, Ident::t id, const TypeDeclaration* info, t env) {
+static t store_type(bool check, Ident::t id, const TypeDeclaration* info, t env) {
+  if (check)
+    check_usage(info->type_loc, id, info->type_uid,
+                [](std::string s) {
+                  warnings::Warning w = warnings::Warning::with_s(warnings::Warning::K::Unused_type_declaration, s);
+                  w.tdusage = warnings::TypeDeclarationUsage::Declaration;
+                  return w;
+                },
+                type_declarations);
   Path::t path = Path::pident(id);
   auto* descrs = make<TypeDescriptions>();
   descrs->kind = info->type_kind->kind;
@@ -1247,7 +1460,7 @@ static t store_type(bool /*check*/, Ident::t id, const TypeDeclaration* info, t 
       for (auto& [cid, c] : constructors) cs.push_back(c);
       descrs->constructors = slice(cs);
       descrs->variant_repr = info->type_kind->variant_repr;
-      for (auto& [cid, c] : constructors) env = store_constructor(cid, c, env);
+      for (auto& [cid, c] : constructors) env = store_constructor(check, info, id, cid, c, env);
       break;
     }
     case TypeKind::Kind::Type_record: {
@@ -1256,13 +1469,14 @@ static t store_type(bool /*check*/, Ident::t id, const TypeDeclaration* info, t 
       for (auto& [lid, l] : labels) ls.push_back(l);
       descrs->labels = slice(ls);
       descrs->record_repr = info->type_kind->record_repr;
-      for (auto& [lid, l] : labels) env = store_label(lid, l, env);
+      for (auto& [lid, l] : labels) env = store_label(check, info, id, lid, l, env);
       break;
     }
     case TypeKind::Kind::Type_abstract: descrs->origin = info->type_kind->origin; break;
     case TypeKind::Kind::Type_open: break;
     case TypeKind::Kind::Type_external: descrs->external = info->type_kind->external; break;
   }
+  builtin_attributes::mark_alerts_used(info->type_attributes);
   EnvT* e = copy_env(env);
   e->types = idtbl_add(id, static_cast<const TypeData*>(make<TypeData>(info, descrs)), env->types);
   Summary s{Summary::Kind::Env_type, env->summary};
@@ -1286,10 +1500,35 @@ static t store_type_infos(Ident::t id, const TypeDeclaration* info, t env) {
   return e;
 }
 
-static t store_extension(Ident::t id, AddressLazy* addr, const ExtensionConstructor* ext, t env) {
+static t store_extension(bool check, bool rebind, Ident::t id, AddressLazy* addr, const ExtensionConstructor* ext,
+                         t env) {
+  Location loc = ext->ext_loc;
   const ConstructorDescription* cstr =
       datarepr::extension_descr(get_current_unit(), Path::pident(id), ext);
   auto* cda = make<ConstructorData>(cstr, addr);
+  builtin_attributes::mark_alerts_used(ext->ext_attributes);
+  builtin_attributes::mark_warn_on_literal_pattern_used(ext->ext_attributes);
+  builtin_attributes::warning_scope(ast_attributes(ext->ext_attributes), [&] {
+    if (check && !loc.loc_ghost && warnings::is_active(38)) {
+      PrivateFlag priv = ext->ext_private;
+      bool is_exception = path::same(ext->ext_type_path, predef::paths().exn);
+      std::string name(cstr->cstr_name);
+      const Uid& k = cstr->cstr_uid;
+      if (!used_constructors.mem(k)) {
+        auto used = std::make_shared<ConstructorUsages>();
+        used_constructors.add(k, [used](ConstructorUsage u) { add_constructor_usage(*used, u); });
+        add_delayed_check_forward([used, loc, name, priv, rebind, is_exception, env] {
+          if (std::optional<warnings::ConstructorUsage> c = constructor_usage_complaint(rebind, priv, *used))
+            if (!is_in_signature(env)) {
+              warnings::Warning w = warnings::Warning::with_s(warnings::Warning::K::Unused_extension, name);
+              w.b = is_exception;
+              w.cusage = *c;
+              location::prerr_warning(loc, w);
+            }
+        });
+      }
+    }
+  });
   EnvT* e = copy_env(env);
   e->constrs = tycomp_add(id, static_cast<const ConstructorData*>(cda), env->constrs);
   Summary s{Summary::Kind::Env_extension, env->summary};
@@ -1299,13 +1538,12 @@ static t store_extension(Ident::t id, AddressLazy* addr, const ExtensionConstruc
   return e;
 }
 
-static StrMap<std::string_view> alerts_of_attrs(Attributes) {
-  // Builtin_attributes.alerts_of_attrs: not ported (alerts), see env.hpp
-  return {};
-}
+static StrMap<std::string_view> alerts_of_attrs(Attributes l) { return builtin_attributes::alerts_of_attrs(l); }
 
-static t store_module(bool update_summary, Ident::t id, AddressLazy* addr,
+static t store_module(bool update_summary, const CheckFn& check, Ident::t id, AddressLazy* addr,
                       ModulePresence presence, const lz::ModuleDecl* d, t env) {
+  if (check) check_usage(d->mdl_loc, id, d->mdl_uid, check, module_declarations);
+  builtin_attributes::mark_alerts_used(d->mdl_attributes);
   StrMap<std::string_view> alerts = alerts_of_attrs(d->mdl_attributes);
   ModuleComponents* comps = components_of_module(alerts, d->mdl_uid, env, subst::identity(),
                                                  Path::pident(id), addr, d->mdl_type);
@@ -1323,6 +1561,7 @@ static t store_module(bool update_summary, Ident::t id, AddressLazy* addr,
 }
 
 static t store_modtype(bool update_summary, Ident::t id, const lz::ModtypeDecl* info, t env) {
+  builtin_attributes::mark_alerts_used(info->mtdl_attributes);
   EnvT* e = copy_env(env);
   if (update_summary) {
     Summary s{Summary::Kind::Env_modtype, env->summary};
@@ -1336,6 +1575,7 @@ static t store_modtype(bool update_summary, Ident::t id, const lz::ModtypeDecl* 
 }
 
 static t store_class(Ident::t id, AddressLazy* addr, const ClassDeclaration* desc, t env) {
+  builtin_attributes::mark_alerts_used(desc->cty_attributes);
   EnvT* e = copy_env(env);
   e->classes =
       idtbl_add(id, static_cast<const ClassData*>(make<ClassData>(desc, addr)), env->classes);
@@ -1347,6 +1587,7 @@ static t store_class(Ident::t id, AddressLazy* addr, const ClassDeclaration* des
 }
 
 static t store_cltype(Ident::t id, const ClassTypeDeclaration* desc, t env) {
+  builtin_attributes::mark_alerts_used(desc->clty_attributes);
   EnvT* e = copy_env(env);
   e->cltypes = idtbl_add(id, static_cast<const CltypeData*>(make<CltypeData>(desc)), env->cltypes);
   Summary s{Summary::Kind::Env_cltype, env->summary};
@@ -1446,7 +1687,7 @@ static ComponentsResult components_of_module_maker(ComponentsMaker cm) {
                                                            path, addr, item->md->mdl_type);
             c->comp_modules =
                 c->comp_modules.add(ident::name(id), make<ModuleData>(md2, comps, addr));
-            env = store_module(false, id, addr, item->presence, item->md, env);
+            env = store_module(false, nullptr, id, addr, item->presence, item->md, env);
             break;
           }
           case K::Sig_modtype: {
@@ -1530,31 +1771,41 @@ t mark_not_aliasable(Ident::t id, t env) {
   return e;
 }
 
-t add_value(Ident::t id, const ValueDescription* desc, t env) {
-  return store_value(id, value_declaration_address(id, desc), desc, env);
+t add_value(Ident::t id, const ValueDescription* desc, t env, const CheckFn& check) {
+  return store_value(check, id, value_declaration_address(id, desc), desc, env);
 }
 
 t add_type(bool check, Ident::t id, const TypeDeclaration* info, t env) {
   return store_type(check, id, info, env);
 }
 
-t add_extension(bool /*check*/, bool /*rebind*/, Ident::t id, const ExtensionConstructor* ext,
-                t env) {
-  return store_extension(id, ident_address(id), ext, env);
+t add_extension(bool check, bool rebind, Ident::t id, const ExtensionConstructor* ext, t env) {
+  return store_extension(check, rebind, id, ident_address(id), ext, env);
 }
 
-t add_module_declaration(bool /*check*/, Ident::t id, ModulePresence presence,
+t add_module_declaration(bool check, Ident::t id, ModulePresence presence,
                          const ModuleDeclaration* md0, t env, bool noalias) {
+  CheckFn chk;
+  if (!check) {
+  } else if (noalias && is_in_signature(env)) {
+    // While recursive modules are also added with the noalias flag when
+    // typing the recursive definitions, they are then added back without the
+    // flag (to be aliased from the outside), and therefore could not throw
+    // the warning, leaving only functor parameters
+    chk = [](std::string s) { return warnings::Warning::with_s(warnings::Warning::K::Unused_functor_parameter, s); };
+  } else {
+    chk = [](std::string s) { return warnings::Warning::with_s(warnings::Warning::K::Unused_module, s); };
+  }
   const lz::ModuleDecl* d = lz::of_module_decl(md0);
   AddressLazy* addr = module_declaration_address(env, id, presence, d);
-  env = store_module(true, id, addr, presence, d, env);
+  env = store_module(true, chk, id, addr, presence, d, env);
   return noalias ? mark_not_aliasable(id, env) : env;
 }
 
 t add_module_declaration_lazy(bool update_summary, Ident::t id, ModulePresence presence,
                               const lz::ModuleDecl* d, t env) {
   AddressLazy* addr = module_declaration_address(env, id, presence, d);
-  return store_module(update_summary, id, addr, presence, d, env);
+  return store_module(update_summary, nullptr, id, addr, presence, d, env);
 }
 
 t add_modtype(Ident::t id, const ModtypeDeclaration* info, t env) {
@@ -1591,10 +1842,11 @@ t add_local_constraint(Path::t path, const TypeDeclaration* info, t env) {
 }
 
 // ---- insertion of bindings by name ---------------------------------------------------
-std::pair<Ident::t, t> enter_value(std::string_view name, const ValueDescription* desc, t env) {
+std::pair<Ident::t, t> enter_value(std::string_view name, const ValueDescription* desc, t env,
+                                   const CheckFn& check) {
   Ident::t id = Ident::create_local(name);
   AddressLazy* addr = value_declaration_address(id, desc);
-  return {id, store_value(id, addr, desc, env)};
+  return {id, store_value(check, id, addr, desc, env)};
 }
 
 std::pair<Ident::t, t> enter_type(int scope, std::string_view name, const TypeDeclaration* info,
@@ -1607,10 +1859,10 @@ t reenter_type(Ident::t id, const TypeDeclaration* info, t env) {
   return store_type(true, id, info, env);
 }
 
-std::pair<Ident::t, t> enter_extension(int scope, bool /*rebind*/, std::string_view name,
+std::pair<Ident::t, t> enter_extension(int scope, bool rebind, std::string_view name,
                                        const ExtensionConstructor* ext, t env) {
   Ident::t id = Ident::create_scoped(scope, name);
-  return {id, store_extension(id, ident_address(id), ext, env)};
+  return {id, store_extension(true, rebind, id, ident_address(id), ext, env)};
 }
 
 std::pair<Ident::t, t> enter_module_declaration(int scope, std::string_view name,
@@ -1699,23 +1951,63 @@ t enter_unbound_module(std::string_view name, ModuleUnboundReason reason, t env)
 }
 
 // ---- open a signature path ----------------------------------------------------------
-static t add_components(Path::t root, t env0, const StructureComponents* comps) {
+// A slot: the component's name and, when it shadows a binding,
+// check_shadowing's kind of the shadowed binding (None: no report)
+using Slot = std::function<void(std::string_view, std::optional<std::string>)>;
+
+// check_shadowing env: the kind of a shadowed binding worth reporting
+template <class A>
+static const UsingFn<A>* mk_using(const Slot& slot, std::function<std::optional<std::string>(const std::pair<A, A>&)> kind) {
+  if (!slot) return nullptr;
+  return make<UsingFn<A>>([slot, kind](std::string_view name, const std::pair<A, A>* both) {
+    slot(name, both ? kind(*both) : std::nullopt);
+  });
+}
+
+static t add_components(const Slot& slot, t env, Path::t root, t env0, const StructureComponents* comps) {
   EnvT* e = copy_env(env0);
   Summary s{Summary::Kind::Env_open, env0->summary};
   s.path = root;
   e->summary = summ(s);
-  e->constrs = tycomp_add_open(root, comps->comp_constrs, env0->constrs);
-  e->labels = tycomp_add_open(root, comps->comp_labels, env0->labels);
-  e->values = idtbl_add_open(root, comps->comp_values, env0->values);
-  e->types = idtbl_add_open(root, comps->comp_types, env0->types);
-  e->modtypes = idtbl_add_open(root, comps->comp_modtypes, env0->modtypes);
-  e->classes = idtbl_add_open(root, comps->comp_classes, env0->classes);
-  e->cltypes = idtbl_add_open(root, comps->comp_cltypes, env0->cltypes);
-  e->modules = idtbl_add_open(root, comps->comp_modules, env0->modules);
+  auto str = [](const char* k) { return std::optional<std::string>(k); };
+  e->constrs = tycomp_add_open(
+      root, comps->comp_constrs, env0->constrs,
+      mk_using<const ConstructorData*>(slot, [env, str](const std::pair<const ConstructorData*, const ConstructorData*>& p)
+                                             -> std::optional<std::string> {
+        if (!same_constr(env, p.first->cda_description->cstr_res, p.second->cda_description->cstr_res))
+          return str("constructor");
+        return std::nullopt;
+      }));
+  e->labels = tycomp_add_open(root, comps->comp_labels, env0->labels,
+                              mk_using<LabelData>(slot, [env, str](const std::pair<LabelData, LabelData>& p)
+                                                      -> std::optional<std::string> {
+                                if (!same_constr(env, p.first->lbl_res, p.second->lbl_res)) return str("label");
+                                return std::nullopt;
+                              }));
+  e->values = idtbl_add_open(root, comps->comp_values, env0->values,
+                             mk_using<const ValueEntry*>(slot, [str](const std::pair<const ValueEntry*, const ValueEntry*>& p)
+                                                             -> std::optional<std::string> {
+                               if (!p.first->bound) return std::nullopt;
+                               return str("value");
+                             }));
+  e->types = idtbl_add_open(root, comps->comp_types, env0->types,
+                            mk_using<const TypeData*>(slot, [str](const auto&) { return str("type"); }));
+  e->modtypes = idtbl_add_open(root, comps->comp_modtypes, env0->modtypes,
+                               mk_using<const ModtypeData*>(slot, [str](const auto&) { return str("module type"); }));
+  e->classes = idtbl_add_open(root, comps->comp_classes, env0->classes,
+                              mk_using<const ClassData*>(slot, [str](const auto&) { return str("class"); }));
+  e->cltypes = idtbl_add_open(root, comps->comp_cltypes, env0->cltypes,
+                              mk_using<const CltypeData*>(slot, [str](const auto&) { return str("class type"); }));
+  e->modules = idtbl_add_open(root, comps->comp_modules, env0->modules,
+                              mk_using<const ModuleEntry*>(slot, [str](const std::pair<const ModuleEntry*, const ModuleEntry*>& p)
+                                                               -> std::optional<std::string> {
+                                if (p.first->kind == ModuleEntry::Kind::Mod_unbound) return std::nullopt;
+                                return str("module");
+                              }));
   return e;
 }
 
-static OpenResult open_signature_(Path::t root, t env0) {
+static OpenResult open_signature_(const Slot& slot, Path::t root, t env0) {
   ComponentsResult r;
   try {
     r = get_components_res(find_module_components(root, env0));
@@ -1724,16 +2016,49 @@ static OpenResult open_signature_(Path::t root, t env0) {
   }
   if (!r.ok) return {OpenResult::Kind::Not_found};
   if (!r.repr->is_structure) return {OpenResult::Kind::Functor};
-  return {OpenResult::Kind::Ok, add_components(root, env0, r.repr->structure)};
+  return {OpenResult::Kind::Ok, add_components(slot, env0, root, env0, r.repr->structure)};
 }
 
-// (the unused-open and shadowing warnings are not ported)
-OpenResult open_signature(OverrideFlag, Path::t root, t env, const Location&, bool) {
-  return open_signature_(root, env);
+OpenResult open_signature(OverrideFlag ovf, Path::t root, t env, const Location& loc, bool toplevel,
+                          std::shared_ptr<bool> used_slot) {
+  if (!used_slot) used_slot = std::make_shared<bool>(false);
+  warnings::Warning unused = warnings::Warning::with_s(
+      ovf == OverrideFlag::Fresh ? warnings::Warning::K::Unused_open : warnings::Warning::K::Unused_open_bang,
+      path::name(root));
+  bool warn_unused = warnings::is_active(unused);
+  bool warn_shadow_id = warnings::is_active(44);
+  bool warn_shadow_lc = warnings::is_active(45);
+  if (!toplevel && !loc.loc_ghost && (warn_unused || warn_shadow_id || warn_shadow_lc)) {
+    std::shared_ptr<bool> used = used_slot;
+    if (warn_unused)
+      add_delayed_check_forward([used, loc, unused] {
+        if (!*used) {
+          *used = true;
+          location::prerr_warning(loc, unused);
+        }
+      });
+    auto shadowed = std::make_shared<std::vector<std::pair<std::string, std::string>>>();
+    Slot slot = [ovf, shadowed, loc, used](std::string_view s, std::optional<std::string> kind) {
+      if (kind && ovf == OverrideFlag::Fresh &&
+          std::find(shadowed->begin(), shadowed->end(), std::make_pair(*kind, std::string(s))) == shadowed->end()) {
+        shadowed->insert(shadowed->begin(), {*kind, std::string(s)});
+        warnings::Warning w = warnings::Warning::make(
+            *kind == "label" || *kind == "constructor" ? warnings::Warning::K::Open_shadow_label_constructor
+                                                       : warnings::Warning::K::Open_shadow_identifier);
+        w.s = *kind;
+        w.s2 = std::string(s);
+        location::prerr_warning(loc, w);
+      }
+      *used = true;
+    };
+    // (the slot's check_shadowing reads the environment before the open)
+    return open_signature_(slot, root, env);
+  }
+  return open_signature_(nullptr, root, env);
 }
 
 OpenResult open_pers_signature(std::string_view name, t env) {
-  OpenResult r = open_signature_(Path::pident(Ident::create_persistent(name)), env);
+  OpenResult r = open_signature_(nullptr, Path::pident(Ident::create_persistent(name)), env);
   if (r.kind == OpenResult::Kind::Functor)
     throw std::logic_error("Env.open_pers_signature: a compilation unit cannot be a functor");
   return r;
@@ -1804,6 +2129,114 @@ t initial() {
   return initial_env;
 }
 
+// ---- tracking usage: mark_*_used ----
+void mark_module_used(const Uid& uid) {
+  if (auto* f = module_declarations.find(uid)) (*f)();
+}
+void mark_modtype_used(const Uid&) {}
+void mark_value_used(const Uid& uid) {
+  if (auto* f = value_declarations.find(uid)) (*f)();
+}
+void mark_type_used(const Uid& uid) {
+  if (auto* f = type_declarations.find(uid)) (*f)();
+}
+void mark_type_path_used(t env, Path::t path) {
+  const TypeDeclaration* decl;
+  try {
+    decl = find_type(path, env);
+  } catch (const NotFound&) {
+    return;
+  }
+  mark_type_used(decl->type_uid);
+}
+void mark_constructor_used(ConstructorUsage usage, const Uid& uid) {
+  if (auto* f = used_constructors.find(uid)) (*f)(usage);
+}
+void mark_extension_used(ConstructorUsage usage, const Uid& uid) {
+  if (auto* f = used_constructors.find(uid)) (*f)(usage);
+}
+void mark_label_used(LabelUsage usage, const Uid& uid) {
+  if (auto* f = used_labels.find(uid)) (*f)(usage);
+}
+static Path::t tconstr_path(TypeExpr* ty) {
+  auto* c = as<Tconstr>(get_desc(ty));
+  if (!c) throw std::logic_error("Env: not a Tconstr");
+  return c->path;
+}
+void mark_constructor_description_used(ConstructorUsage usage, t env, const ConstructorDescription* cstr) {
+  mark_type_path_used(env, tconstr_path(cstr->cstr_res));  // cstr_res_type_path
+  if (auto* f = used_constructors.find(cstr->cstr_uid)) (*f)(usage);
+}
+void mark_label_description_used(LabelUsage usage, t env, const LabelDescription* lbl) {
+  mark_type_path_used(env, tconstr_path(lbl->lbl_res));
+  if (auto* f = used_labels.find(lbl->lbl_uid)) (*f)(usage);
+}
+void mark_class_used(const Uid& uid) {
+  if (auto* f = type_declarations.find(uid)) (*f)();
+}
+void mark_cltype_used(const Uid& uid) {
+  if (auto* f = type_declarations.find(uid)) (*f)();
+}
+void set_value_used_callback(const ValueDescription* vd, std::function<void()> callback) {
+  value_declarations.add(vd->val_uid, std::move(callback));
+}
+void set_type_used_callback(const TypeDeclaration* td, std::function<void(std::function<void()>)> callback) {
+  if (!uid::for_actual_declaration(td->type_uid)) return;
+  std::function<void()> old = [] {};
+  if (auto* f = type_declarations.find(td->type_uid)) old = *f;
+  type_declarations.replace(td->type_uid, [callback, old] { callback(old); });
+}
+
+// ---- use_* (the marks and the alerts of a lookup) ----
+static void use_module(bool use, const Location& loc, Path::t path, const ModuleData* mda) {
+  if (!use) return;
+  const ModuleComponents* comps = mda->mda_components;
+  mark_module_used(comps->uid);
+  comps->alerts.iter([&](std::string_view kind, std::string_view message) {
+    std::string m = message.empty() ? std::string() : "\n" + std::string(message);
+    location::alert(loc, std::string(kind), "module " + path::name(path) + m);
+  });
+}
+static void use_value(bool use, const Location& loc, Path::t path, const ValueDescription* desc) {
+  if (!use) return;
+  mark_value_used(desc->val_uid);
+  builtin_attributes::check_alerts(loc, desc->val_attributes, path::name(path));
+}
+static void use_type(bool use, const Location& loc, Path::t path, const TypeData* tda) {
+  if (!use) return;
+  const TypeDeclaration* decl = tda->tda_declaration;
+  mark_type_used(decl->type_uid);
+  builtin_attributes::check_alerts(loc, decl->type_attributes, path::name(path));
+}
+static void use_modtype(bool use, const Location& loc, Path::t path, const lz::ModtypeDecl* desc) {
+  if (!use) return;
+  mark_modtype_used(desc->mtdl_uid);
+  builtin_attributes::check_alerts(loc, desc->mtdl_attributes, path::name(path));
+}
+static void use_class(bool use, const Location& loc, Path::t path, const ClassDeclaration* desc) {
+  if (!use) return;
+  mark_class_used(desc->cty_uid);
+  builtin_attributes::check_alerts(loc, desc->cty_attributes, path::name(path));
+}
+static void use_cltype(bool use, const Location& loc, Path::t path, const ClassTypeDeclaration* desc) {
+  if (!use) return;
+  mark_cltype_used(desc->clty_uid);
+  builtin_attributes::check_alerts(loc, desc->clty_attributes, path::name(path));
+}
+static void use_label(bool use, const Location& loc, LabelUsage usage, t env, const LabelDescription* lbl) {
+  if (!use) return;
+  mark_label_description_used(usage, env, lbl);
+  builtin_attributes::check_alerts(loc, lbl->lbl_attributes, lbl->lbl_name);
+  if (is_mutating_label_usage(usage))
+    builtin_attributes::check_deprecated_mutable(loc, lbl->lbl_attributes, lbl->lbl_name);
+}
+static void use_constructor_desc(bool use, const Location& loc, ConstructorUsage usage, t env,
+                                 const ConstructorDescription* cstr) {
+  if (!use) return;
+  mark_constructor_description_used(usage, env, cstr);
+  builtin_attributes::check_alerts(loc, cstr->cstr_attributes, cstr->cstr_name);
+}
+
 // ============================================================================
 // Lookup by name
 // (use_* marking and alerts are not ported; `use` is carried for fidelity)
@@ -1850,6 +2283,7 @@ static std::pair<Path::t, const ModuleData*> lookup_ident_module(bool load, bool
   auto [path, data] = r;
   switch (data->kind) {
     case ModuleEntry::Kind::Mod_local:
+      use_module(use, loc, path, data->data);
       return {path, load ? data->data : nullptr};
     case ModuleEntry::Kind::Mod_unbound:
       report_module_unbound(errors, loc, env, data->reason);
@@ -1859,12 +2293,15 @@ static std::pair<Path::t, const ModuleData*> lookup_ident_module(bool load, bool
         g_persistent_env.check(s);  // check_pers_mod ~allow_hidden:false
         return {path, nullptr};
       }
+      const ModuleData* mda;
       try {
-        return {path, find_pers_mod(false, s)};
+        mda = find_pers_mod(false, s);
       } catch (const NotFound&) {
         may_lookup_error(errors, loc, env,
                          lerr(LookupError::Kind::Unbound_module, Longident::lident(s)));
       }
+      use_module(use, loc, path, mda);
+      return {path, mda};
   }
   throw NotFound{};
 }
@@ -1880,7 +2317,10 @@ static std::pair<Path::t, const ValueDescription*> lookup_ident_value(bool error
     LookupError e = lerr(LookupError::Kind::Unbound_value, Longident::lident(name));
     may_lookup_error(errors, loc, env, e);
   }
-  if (r.second->bound) return {r.first, r.second->data->vda_description};
+  if (r.second->bound) {
+    use_value(use, loc, r.first, r.second->data->vda_description);
+    return {r.first, r.second->data->vda_description};
+  }
   report_value_unbound(errors, loc, env, r.second->reason, Longident::lident(name));
   throw NotFound{};
 }
@@ -1896,54 +2336,31 @@ static std::pair<Path::t, A> lookup_ident_generic(bool errors, bool use, const L
   }
 }
 
-// ---- use_label / use_constructor (env.ml) ----
-// The usage marks themselves (Uid tables of the unused-declaration
-// warnings) and the alerts are stage 9; what matters here is
-// mark_type_path_used's lookup, which forces the type's descriptions (an
-// inlined record's labels allocate a type: Datarepr.labels_of_type).
-static void mark_type_path_used(t env, Path::t path) {
-  try {
-    (void)find_type(path, env);
-  } catch (const NotFound&) {
-  }
-}
-static Path::t tconstr_path(TypeExpr* ty) {
-  auto* c = as<Tconstr>(get_desc(ty));
-  if (!c) throw std::logic_error("Env: not a Tconstr");
-  return c->path;
-}
-static void use_label(bool use, t env, const LabelDescription* lbl) {
-  if (use) mark_type_path_used(env, tconstr_path(lbl->lbl_res));  // mark_label_description_used
-}
-static void use_constructor_desc(bool use, t env, const ConstructorDescription* cstr) {
-  if (use) mark_type_path_used(env, tconstr_path(cstr->cstr_res));  // mark_constructor_description_used
-}
-
 static std::vector<std::pair<const LabelDescription*, std::function<void()>>>
-lookup_all_ident_labels(bool errors, bool use, const Location& loc, std::string_view s, t env) {
+lookup_all_ident_labels(bool errors, bool use, const Location& loc, LabelUsage usage, std::string_view s, t env) {
   auto lbls = tycomp_find_all(use, s, env->labels);
   if (lbls.empty())
     may_lookup_error(errors, loc, env, lerr(LookupError::Kind::Unbound_label, Longident::lident(s)));
   std::vector<std::pair<const LabelDescription*, std::function<void()>>> out;
   for (auto& [l, fn] : lbls)
-    out.emplace_back(l, [use, env, l = l, fn = fn] {
-      use_label(use, env, l);
+    out.emplace_back(l, [use, loc, usage, env, l = l, fn = fn] {
+      use_label(use, loc, usage, env, l);
       fn();
     });
   return out;
 }
 
 static std::vector<std::pair<const ConstructorDescription*, std::function<void()>>>
-lookup_all_ident_constructors(bool errors, bool use, const Location& loc, std::string_view s,
-                              t env) {
+lookup_all_ident_constructors(bool errors, bool use, const Location& loc, ConstructorUsage usage,
+                              std::string_view s, t env) {
   auto cstrs = tycomp_find_all(use, s, env->constrs);
   if (cstrs.empty())
     may_lookup_error(errors, loc, env,
                      lerr(LookupError::Kind::Unbound_constructor, Longident::lident(s)));
   std::vector<std::pair<const ConstructorDescription*, std::function<void()>>> out;
   for (auto& [cda, fn] : cstrs)
-    out.emplace_back(cda->cda_description, [use, env, c = cda->cda_description, fn = fn] {
-      use_constructor_desc(use, env, c);
+    out.emplace_back(cda->cda_description, [use, loc, usage, env, c = cda->cda_description, fn = fn] {
+      use_constructor_desc(use, loc, usage, env, c);
       fn();
     });
   return out;
@@ -2092,7 +2509,11 @@ static std::pair<Path::t, const ModuleData*> lookup_dot_module(bool errors, bool
                                                                Longident::t l, const Location& lloc,
                                                                std::string_view s, t env) {
   auto [p, comps] = lookup_structure_components(errors, use, l, lloc, env);
-  if (auto* mda = comps->comp_modules.find_opt(s)) return {Path::pdot(p, s), *mda};
+  if (auto* mda = comps->comp_modules.find_opt(s)) {
+    Path::t path = Path::pdot(p, s);
+    use_module(use, loc, path, *mda);
+    return {path, *mda};
+  }
   may_lookup_error(errors, loc, env,
                    lerr(LookupError::Kind::Unbound_module, dot_lid(l, lloc, s, loc)));
 }
@@ -2128,8 +2549,11 @@ static std::pair<Path::t, const ValueDescription*> lookup_value_(bool errors, bo
   if (lid->kind == Longident::Kind::Lident) return lookup_ident_value(errors, use, loc, lid->s, env);
   if (lid->kind == Longident::Kind::Ldot) {
     auto [p, comps] = lookup_structure_components(errors, use, lid->l1, lid->l1_loc, env);
-    if (auto* vda = comps->comp_values.find_opt(lid->s))
-      return {Path::pdot(p, lid->s), (*vda)->vda_description};
+    if (auto* vda = comps->comp_values.find_opt(lid->s)) {
+      Path::t path = Path::pdot(p, lid->s);
+      use_value(use, loc, path, (*vda)->vda_description);
+      return {path, (*vda)->vda_description};
+    }
     may_lookup_error(errors, loc, env, lerr(LookupError::Kind::Unbound_value, lid));
   }
   throw std::logic_error("Env.lookup_value: Lapply");
@@ -2138,14 +2562,17 @@ static std::pair<Path::t, const ValueDescription*> lookup_value_(bool errors, bo
 static std::pair<Path::t, const TypeData*> lookup_type_full(bool errors, bool use,
                                                             const Location& loc, Longident::t lid,
                                                             t env) {
+  std::pair<Path::t, const TypeData*> r;
   if (lid->kind == Longident::Kind::Lident)
-    return lookup_ident_generic(errors, use, loc, lid->s, env->types, env,
-                                LookupError::Kind::Unbound_type);
-  if (lid->kind == Longident::Kind::Ldot)
-    return lookup_dot_generic<const TypeData*>(
+    r = lookup_ident_generic(errors, use, loc, lid->s, env->types, env, LookupError::Kind::Unbound_type);
+  else if (lid->kind == Longident::Kind::Ldot)
+    r = lookup_dot_generic<const TypeData*>(
         errors, use, loc, lid, env, [](StructureComponents* c) { return c->comp_types; },
         LookupError::Kind::Unbound_type);
-  throw std::logic_error("Env.lookup_type: Lapply");
+  else
+    throw std::logic_error("Env.lookup_type: Lapply");
+  use_type(use, loc, r.first, r.second);
+  return r;
 }
 
 static std::pair<Path::t, const lz::ModtypeDecl*> lookup_modtype_lazy(bool errors, bool use,
@@ -2161,6 +2588,7 @@ static std::pair<Path::t, const lz::ModtypeDecl*> lookup_modtype_lazy(bool error
         LookupError::Kind::Unbound_modtype);
   else
     throw std::logic_error("Env.lookup_modtype: Lapply");
+  use_modtype(use, loc, r.first, r.second->mtda_declaration);
   return {r.first, r.second->mtda_declaration};
 }
 
@@ -2177,6 +2605,7 @@ static std::pair<Path::t, const ClassDeclaration*> lookup_class_(bool errors, bo
         LookupError::Kind::Unbound_class);
   else
     throw std::logic_error("Env.lookup_class: Lapply");
+  use_class(use, loc, r.first, r.second->clda_declaration);
   return {r.first, r.second->clda_declaration};
 }
 
@@ -2193,33 +2622,35 @@ static std::pair<Path::t, const ClassTypeDeclaration*> lookup_cltype_(bool error
         LookupError::Kind::Unbound_cltype);
   else
     throw std::logic_error("Env.lookup_cltype: Lapply");
+  use_cltype(use, loc, r.first, r.second->cltda_declaration);
   return {r.first, r.second->cltda_declaration};
 }
 
 static std::vector<std::pair<const LabelDescription*, std::function<void()>>> lookup_all_labels_(
-    bool errors, bool use, const Location& loc, Longident::t lid, t env) {
+    bool errors, bool use, const Location& loc, LabelUsage usage, Longident::t lid, t env) {
   if (lid->kind == Longident::Kind::Lident)
-    return lookup_all_ident_labels(errors, use, loc, lid->s, env);
+    return lookup_all_ident_labels(errors, use, loc, usage, lid->s, env);
   if (lid->kind == Longident::Kind::Ldot) {
     auto [p, comps] = lookup_structure_components(errors, use, lid->l1, lid->l1_loc, env);
     const Slice<LabelData>* lbls = comps->comp_labels.find_opt(lid->s);
     if (!lbls || lbls->empty())
       may_lookup_error(errors, loc, env, lerr(LookupError::Kind::Unbound_label, lid));
     std::vector<std::pair<const LabelDescription*, std::function<void()>>> out;
-    for (auto* l : *lbls) out.emplace_back(l, [use, env, l] { use_label(use, env, l); });
+    for (auto* l : *lbls) out.emplace_back(l, [use, loc, usage, env, l] { use_label(use, loc, usage, env, l); });
     return out;
   }
   throw std::logic_error("Env.lookup_all_labels: Lapply");
 }
 
 static std::vector<std::pair<const ConstructorDescription*, std::function<void()>>>
-lookup_all_constructors_(bool errors, bool use, const Location& loc, Longident::t lid, t env) {
+lookup_all_constructors_(bool errors, bool use, const Location& loc, ConstructorUsage usage, Longident::t lid,
+                         t env) {
   if (lid->kind == Longident::Kind::Lident)
-    return lookup_all_ident_constructors(errors, use, loc, lid->s, env);
+    return lookup_all_ident_constructors(errors, use, loc, usage, lid->s, env);
   if (lid->kind == Longident::Kind::Ldot) {
     if (lid->l1->kind == Longident::Kind::Lident && lid->l1->s == "*predef*")
       // Hack to support compilation of default arguments
-      return lookup_all_ident_constructors(errors, use, lid->s_loc, lid->s, initial());
+      return lookup_all_ident_constructors(errors, use, lid->s_loc, usage, lid->s, initial());
     auto [p, comps] = lookup_structure_components(errors, use, lid->l1, lid->l1_loc, env);
     const Slice<const ConstructorData*>* cstrs = comps->comp_constrs.find_opt(lid->s);
     if (!cstrs || cstrs->empty())
@@ -2227,7 +2658,9 @@ lookup_all_constructors_(bool errors, bool use, const Location& loc, Longident::
     std::vector<std::pair<const ConstructorDescription*, std::function<void()>>> out;
     for (auto* cda : *cstrs)
       out.emplace_back(cda->cda_description,
-                       [use, env, c = cda->cda_description] { use_constructor_desc(use, env, c); });
+                       [use, loc, usage, env, c = cda->cda_description] {
+                         use_constructor_desc(use, loc, usage, env, c);
+                       });
     return out;
   }
   throw std::logic_error("Env.lookup_all_constructors: Lapply");
@@ -2268,11 +2701,11 @@ std::pair<Path::t, const ClassTypeDeclaration*> lookup_cltype(bool use, const Lo
   return lookup_cltype_(true, use, loc, lid, env);
 }
 
-LookupAllCstrs lookup_all_constructors(bool use, const Location& loc, ConstructorUsage,
+LookupAllCstrs lookup_all_constructors(bool use, const Location& loc, ConstructorUsage usage,
                                        Longident::t lid, t env) {
   // Typing_recovery.uncatch_errors: the caller processes the errors
   try {
-    return LookupAllCstrs{true, lookup_all_constructors_(true, use, loc, lid, env)};
+    return LookupAllCstrs{true, lookup_all_constructors_(true, use, loc, usage, lid, env)};
   } catch (const Error& e) {
     if (e.kind != Error::Kind::Lookup_error) throw;
     LookupAllCstrs r{false};
@@ -2283,16 +2716,16 @@ LookupAllCstrs lookup_all_constructors(bool use, const Location& loc, Constructo
   }
 }
 
-const ConstructorDescription* lookup_constructor(bool use, const Location& loc, ConstructorUsage,
+const ConstructorDescription* lookup_constructor(bool use, const Location& loc, ConstructorUsage usage,
                                                  Longident::t lid, t env) {
-  auto l = lookup_all_constructors_(true, use, loc, lid, env);
+  auto l = lookup_all_constructors_(true, use, loc, usage, lid, env);
   if (l.empty()) throw std::logic_error("Env.lookup_constructor");
   l.front().second();
   return l.front().first;
 }
 
 std::vector<std::pair<const ConstructorDescription*, std::function<void()>>>
-lookup_all_constructors_from_type(bool use, const Location&, ConstructorUsage, Path::t ty_path, t env) {
+lookup_all_constructors_from_type(bool use, const Location& loc, ConstructorUsage usage, Path::t ty_path, t env) {
   std::vector<std::pair<const ConstructorDescription*, std::function<void()>>> out;
   const TypeDescriptions* d;
   try {
@@ -2301,14 +2734,15 @@ lookup_all_constructors_from_type(bool use, const Location&, ConstructorUsage, P
     return out;
   }
   if (d->kind != TypeKind::Kind::Type_variant) return out;
-  for (auto* c : d->constructors) out.emplace_back(c, [use, env, c] { use_constructor_desc(use, env, c); });
+  for (auto* c : d->constructors)
+    out.emplace_back(c, [use, loc, usage, env, c] { use_constructor_desc(use, loc, usage, env, c); });
   return out;
 }
 
-LookupAllLabels lookup_all_labels(bool use, const Location& loc, LabelUsage, Longident::t lid,
+LookupAllLabels lookup_all_labels(bool use, const Location& loc, LabelUsage usage, Longident::t lid,
                                   t env) {
   try {
-    return LookupAllLabels{true, lookup_all_labels_(true, use, loc, lid, env)};
+    return LookupAllLabels{true, lookup_all_labels_(true, use, loc, usage, lid, env)};
   } catch (const Error& e) {
     if (e.kind != Error::Kind::Lookup_error) throw;
     LookupAllLabels r{false};
@@ -2319,16 +2753,16 @@ LookupAllLabels lookup_all_labels(bool use, const Location& loc, LabelUsage, Lon
   }
 }
 
-const LabelDescription* lookup_label(bool use, const Location& loc, LabelUsage, Longident::t lid,
+const LabelDescription* lookup_label(bool use, const Location& loc, LabelUsage usage, Longident::t lid,
                                      t env) {
-  auto l = lookup_all_labels_(true, use, loc, lid, env);
+  auto l = lookup_all_labels_(true, use, loc, usage, lid, env);
   if (l.empty()) throw std::logic_error("Env.lookup_label");
   l.front().second();
   return l.front().first;
 }
 
 std::vector<std::pair<const LabelDescription*, std::function<void()>>> lookup_all_labels_from_type(
-    bool use, const Location&, LabelUsage, Path::t ty_path, t env) {
+    bool use, const Location& loc, LabelUsage usage, Path::t ty_path, t env) {
   std::vector<std::pair<const LabelDescription*, std::function<void()>>> out;
   const TypeDescriptions* d;
   try {
@@ -2337,7 +2771,7 @@ std::vector<std::pair<const LabelDescription*, std::function<void()>>> lookup_al
     return out;
   }
   if (d->kind != TypeKind::Kind::Type_record) return out;
-  for (auto* l : d->labels) out.emplace_back(l, [use, env, l] { use_label(use, env, l); });
+  for (auto* l : d->labels) out.emplace_back(l, [use, loc, usage, env, l] { use_label(use, loc, usage, env, l); });
   return out;
 }
 
@@ -2354,8 +2788,10 @@ InstanceVariable lookup_instance_variable(bool use, const Location& loc, std::st
   auto [path, entry] = r;
   if (entry->bound) {
     const ValueDescription* desc = entry->data->vda_description;
-    if (desc->val_kind.kind == ValueKind::Kind::Val_ivar)
+    if (desc->val_kind.kind == ValueKind::Kind::Val_ivar) {
+      use_value(use, loc, path, desc);
       return {path, desc->val_kind.ivar_mut, desc->val_kind.ivar_name, desc->val_type};
+    }
     LookupError e = lerr(LookupError::Kind::Not_an_instance_variable);
     e.name = zborrow(name);
     lookup_error(loc, env, e);
@@ -2401,11 +2837,11 @@ std::pair<Path::t, const ClassTypeDeclaration*> find_cltype_by_name(Longident::t
   return lookup_cltype_(false, false, location::none(), lid, env);
 }
 const ConstructorDescription* find_constructor_by_name(Longident::t lid, t env) {
-  auto l = lookup_all_constructors_(false, false, location::none(), lid, env);
+  auto l = lookup_all_constructors_(false, false, location::none(), ConstructorUsage::Positive, lid, env);
   return l.front().first;
 }
 const LabelDescription* find_label_by_name(Longident::t lid, t env) {
-  auto l = lookup_all_labels_(false, false, location::none(), lid, env);
+  auto l = lookup_all_labels_(false, false, location::none(), LabelUsage::Projection, lid, env);
   return l.front().first;
 }
 

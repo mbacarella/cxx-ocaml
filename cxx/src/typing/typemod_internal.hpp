@@ -27,7 +27,7 @@ inline Error err(const Location& loc, env::t env, EK k) { return Error(loc, env,
 Path::t path_concat(Ident::t head, Path::t p);
 Signature extract_sig(env::t env, const Location& loc, const ModuleType* mty);
 Signature extract_sig_open(env::t env, const Location& loc, const ModuleType* mty);
-std::pair<const tt::OpenDescription*, env::t> type_open_descr(bool* used_slot, bool toplevel, env::t env,
+std::pair<const tt::OpenDescription*, env::t> type_open_descr(std::shared_ptr<bool> used_slot, bool toplevel, env::t env,
                                                               const pt::OpenDescription* sod);
 extern std::function<std::pair<const tt::ModuleExpr*, const ModuleType*>(env::t, const pt::ModuleExpr*)>
     type_module_type_of_fwd;
@@ -161,7 +161,7 @@ struct TypeOpenDeclResult {
   Signature sg;
   env::t env;
 };
-TypeOpenDeclResult type_open_decl_(bool* used_slot, bool toplevel, bool funct_body, SignatureNames* names,
+TypeOpenDeclResult type_open_decl_(std::shared_ptr<bool> used_slot, bool toplevel, bool funct_body, SignatureNames* names,
                                    env::t env, const pt::OpenDeclaration* sod);
 
 }  // namespace cppcaml::typing::typemod

@@ -79,7 +79,7 @@ auto with_local_scope(F&& f) -> decltype(f()) {
 }  // namespace ty_var_env
 
 // Forward declarations (set by Typemod)
-extern std::function<std::pair<Path::t, env::t>(bool* used_slot, OverrideFlag, env::t,
+extern std::function<std::pair<Path::t, env::t>(std::shared_ptr<bool> used_slot, OverrideFlag, env::t,
                                                 const Location&, const pt::LidLoc&)>
     type_open;
 extern std::function<Path::t(const Location&, env::t, Longident::t)> transl_modtype_longident;

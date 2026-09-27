@@ -293,7 +293,7 @@ using ty_var_env::Policy;
 using RowContext = std::vector<TyOptRef*>;
 
 // ---- support for first-class modules ---------------------------------------------------
-std::function<std::pair<Path::t, env::t>(bool*, OverrideFlag, env::t, const Location&,
+std::function<std::pair<Path::t, env::t>(std::shared_ptr<bool>, OverrideFlag, env::t, const Location&,
                                          const pt::LidLoc&)>
     type_open;
 std::function<Path::t(const Location&, env::t, Longident::t)> transl_modtype_longident;

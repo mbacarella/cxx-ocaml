@@ -1,8 +1,5 @@
 // Port of lambda/translattribute.ml (TYPECHECKER.md stage 10).
 //
-// The warnings it reports (Duplicated_attribute, Attribute_payload,
-// Inlining_impossible) are not emitted: warning emission is stage 9.  The
-// marking of used attributes (Builtin_attributes.mark_used) is not ported.
 
 #include "cppcaml/typing/translattribute.hpp"
 
@@ -12,6 +9,7 @@
 #include <vector>
 
 #include "cppcaml/typing/builtin_attributes.hpp"
+#include "cppcaml/typing/location.hpp"
 #include "typecore_internal.hpp"
 
 namespace cppcaml::typing::translattribute {
@@ -42,25 +40,27 @@ const Actions is_tailcall_attribute = {{"tailcall", Action::Return}};
 const Actions is_tmc_attribute = {{"tail_mod_cons", Action::Return}};
 const Actions is_poll_attribute = {{"poll", Action::Return}};
 
-// Builtin_attributes.select_attributes
+// Builtin_attributes.select_attributes (the named attributes marked used)
 std::vector<const pt::Attribute*> select_attributes(const Actions& actions, const pt::Attributes& attrs) {
-  std::vector<const pt::Attribute*> r;
-  for (const pt::Attribute* a : attrs) {
-    bool keep = false;
-    for (auto& [nm, action] : actions)
-      if (attr_equals_builtin(a->attr_name.txt, nm) && action == Action::Return) {
-        keep = true;
-        break;
-      }
-    if (keep) r.push_back(a);
-  }
-  return r;
+  std::vector<std::pair<std::string_view, builtin_attributes::AttrAction>> acts;
+  for (auto& [nm, action] : actions)
+    acts.emplace_back(nm, action == Action::Return ? builtin_attributes::AttrAction::Return
+                                                   : builtin_attributes::AttrAction::Mark_used_only);
+  return builtin_attributes::select_attributes(acts, attrs);
+}
+
+void warn(const Location& loc, warnings::Warning::K k, std::string s, std::string s2 = {}) {
+  warnings::Warning w = warnings::Warning::make(k);
+  w.s = std::move(s);
+  w.s2 = std::move(s2);
+  location::prerr_warning(loc, w);
 }
 
 const pt::Attribute* find_attribute(const Actions& p, const pt::Attributes& attributes) {
   std::vector<const pt::Attribute*> l = select_attributes(p, attributes);
   if (l.empty()) return nullptr;
-  // (two or more: Warnings.Duplicated_attribute on the second, not emitted)
+  if (l.size() >= 2)
+    warn(l[1]->attr_name.loc, warnings::Warning::K::Duplicated_attribute, std::string(l[1]->attr_name.txt));
   return l[0];
 }
 
@@ -121,15 +121,24 @@ std::optional<bool> get_bool_from_exp(const pt::Expression* e) {
 }
 
 template <class R>
-R parse_id_payload(R default_, R empty, const std::vector<std::pair<std::string_view, R>>& cases,
-                   const pt::Payload& payload) {
-  // warn (): Warnings.Attribute_payload, not emitted
+R parse_id_payload(std::string_view txt, const Location& loc, R default_, R empty,
+                   const std::vector<std::pair<std::string_view, R>>& cases, const pt::Payload& payload) {
+  auto warn_ = [&] {
+    std::string msg;
+    for (std::size_t i = 0; i < cases.size(); ++i) {
+      if (i > 0) msg += ", ";
+      msg += "'" + std::string(cases[i].first) + "'";
+    }
+    msg = "It must be either " + msg + " or empty";
+    warn(loc, warnings::Warning::K::Attribute_payload, std::string(txt), msg);
+    return default_;
+  };
   Res<std::string_view> r = get_optional_payload<std::string_view>(get_id_from_exp, payload);
-  if (!r.ok) return default_;
+  if (!r.ok) return warn_();
   if (!r.v) return empty;
   for (auto& [id, v] : cases)
     if (id == *r.v) return v;
-  return default_;
+  return warn_();
 }
 
 InlineAttribute inl(InlineAttribute::Kind k) { return InlineAttribute{k, 0}; }
@@ -137,14 +146,18 @@ InlineAttribute inl(InlineAttribute::Kind k) { return InlineAttribute{k, 0}; }
 InlineAttribute parse_inline_attribute(const pt::Attribute* attr) {
   using IK = InlineAttribute::Kind;
   if (!attr) return inl(IK::Default_inline);
+  std::string_view txt = attr->attr_name.txt;
+  const Location& loc = attr->attr_name.loc;
   if (attr_equals_builtin(attr->attr_name.txt, "unrolled")) {
+    // the 'unrolled' attributes must be used as [@unrolled n].
     const pt::Expression* e = get_payload(attr->attr_payload);
     std::optional<long> n = e ? get_int_from_exp(e) : std::nullopt;
     if (n) return InlineAttribute{IK::Unroll, *n};
+    warn(loc, warnings::Warning::K::Attribute_payload, std::string(txt), "It must be an integer literal");
     return inl(IK::Default_inline);
   }
   return parse_id_payload<InlineAttribute>(
-      inl(IK::Default_inline), inl(IK::Always_inline),
+      txt, loc, inl(IK::Default_inline), inl(IK::Always_inline),
       {{"never", inl(IK::Never_inline)}, {"always", inl(IK::Always_inline)}, {"hint", inl(IK::Hint_inline)}},
       attr->attr_payload);
 }
@@ -152,7 +165,7 @@ InlineAttribute parse_inline_attribute(const pt::Attribute* attr) {
 SpecialiseAttribute parse_specialise_attribute(const pt::Attribute* attr) {
   using S = SpecialiseAttribute;
   if (!attr) return S::Default_specialise;
-  return parse_id_payload<S>(S::Default_specialise, S::Always_specialise,
+  return parse_id_payload<S>(attr->attr_name.txt, attr->attr_name.loc, S::Default_specialise, S::Always_specialise,
                              {{"never", S::Never_specialise}, {"always", S::Always_specialise}},
                              attr->attr_payload);
 }
@@ -160,7 +173,7 @@ SpecialiseAttribute parse_specialise_attribute(const pt::Attribute* attr) {
 LocalAttribute parse_local_attribute(const pt::Attribute* attr) {
   using L = LocalAttribute;
   if (!attr) return L::Default_local;
-  return parse_id_payload<L>(L::Default_local, L::Always_local,
+  return parse_id_payload<L>(attr->attr_name.txt, attr->attr_name.loc, L::Default_local, L::Always_local,
                              {{"never", L::Never_local}, {"always", L::Always_local}, {"maybe", L::Default_local}},
                              attr->attr_payload);
 }
@@ -168,37 +181,58 @@ LocalAttribute parse_local_attribute(const pt::Attribute* attr) {
 PollAttribute parse_poll_attribute(const pt::Attribute* attr) {
   using P = PollAttribute;
   if (!attr) return P::Default_poll;
-  return parse_id_payload<P>(P::Default_poll, P::Default_poll, {{"error", P::Error_poll}}, attr->attr_payload);
+  return parse_id_payload<P>(attr->attr_name.txt, attr->attr_name.loc, P::Default_poll, P::Default_poll,
+                             {{"error", P::Error_poll}}, attr->attr_payload);
 }
 
 PollAttribute get_poll_attribute(const pt::Attributes& l) {
   return parse_poll_attribute(find_attribute(is_poll_attribute, l));
 }
 
-// (check_local_inline / check_poll_inline / check_poll_local only warn)
+bool inlines(const InlineAttribute& i) {
+  using IK = InlineAttribute::Kind;
+  return i.kind == IK::Always_inline || i.kind == IK::Hint_inline || i.kind == IK::Unroll;
+}
+void check_local_inline(const Location& loc, const FunctionAttribute& attr) {
+  if (attr.local == LocalAttribute::Always_local && inlines(attr.inline_))
+    warn(loc, warnings::Warning::K::Duplicated_attribute, "local/inline");
+}
+void check_poll_inline(const Location& loc, const FunctionAttribute& attr) {
+  if (attr.poll == PollAttribute::Error_poll && inlines(attr.inline_))
+    warn(loc, warnings::Warning::K::Inlining_impossible, "[@poll error] is incompatible with inlining");
+}
+void check_poll_local(const Location& loc, const FunctionAttribute& attr) {
+  if (attr.poll == PollAttribute::Error_poll && attr.local == LocalAttribute::Always_local)
+    warn(loc, warnings::Warning::K::Inlining_impossible,
+         "[@poll error] is incompatible with local function optimization");
+}
 
 lam_t lfunction_with_attr(const FunctionAttribute& attr, const LFunction* f) {
   return lfunction(f->kind, f->params, f->return_, f->body, attr, f->loc);
 }
 
-lam_t add_tmc_attribute(lam_t expr, const Location&, const pt::Attributes& attributes) {
+lam_t add_tmc_attribute(lam_t expr, const Location& loc, const pt::Attributes& attributes) {
   auto* lf = as<Lfunction>(expr);
   if (!lf) return expr;
   const pt::Attribute* attr = find_attribute(is_tmc_attribute, attributes);
   if (!attr) return expr;
-  // (tmc_candidate already set: Duplicated_attribute, not emitted)
+  if (lf->f->attr.tmc_candidate) warn(loc, warnings::Warning::K::Duplicated_attribute, "tail_mod_cons");
   FunctionAttribute a = lf->f->attr;
   a.tmc_candidate = true;
   return lfunction_with_attr(a, lf->f);
 }
 
-lam_t add_poll_attribute(lam_t expr, const Location&, const pt::Attributes& attributes) {
+lam_t add_poll_attribute(lam_t expr, const Location& loc, const pt::Attributes& attributes) {
   auto* lf = as<Lfunction>(expr);
   if (!lf || lf->f->attr.stub) return expr;
   PollAttribute poll = get_poll_attribute(attributes);
   if (poll == PollAttribute::Default_poll) return expr;
+  if (lf->f->attr.poll == PollAttribute::Error_poll)
+    warn(loc, warnings::Warning::K::Duplicated_attribute, "poll error");
   FunctionAttribute a = lf->f->attr;
   a.poll = poll;
+  check_poll_inline(loc, a);
+  check_poll_local(loc, a);
   a.inline_ = inl(InlineAttribute::Kind::Never_inline);
   a.local = LocalAttribute::Never_local;
   return lfunction_with_attr(a, lf->f);
@@ -218,33 +252,43 @@ LocalAttribute get_local_attribute(const pt::Attributes& l) {
   return parse_local_attribute(find_attribute(is_local_attribute, l));
 }
 
-lam_t add_inline_attribute(lam_t expr, const Location&, const pt::Attributes& attributes) {
+lam_t add_inline_attribute(lam_t expr, const Location& loc, const pt::Attributes& attributes) {
   auto* lf = as<Lfunction>(expr);
   if (!lf || lf->f->attr.stub) return expr;
   InlineAttribute inline_ = get_inline_attribute(attributes);
   if (inline_.kind == InlineAttribute::Kind::Default_inline) return expr;
+  if (lf->f->attr.inline_.kind != InlineAttribute::Kind::Default_inline)
+    warn(loc, warnings::Warning::K::Duplicated_attribute, "inline");
   FunctionAttribute a = lf->f->attr;
   a.inline_ = inline_;
+  check_local_inline(loc, a);
+  check_poll_inline(loc, a);
   return lfunction_with_attr(a, lf->f);
 }
 
-lam_t add_specialise_attribute(lam_t expr, const Location&, const pt::Attributes& attributes) {
+lam_t add_specialise_attribute(lam_t expr, const Location& loc, const pt::Attributes& attributes) {
   auto* lf = as<Lfunction>(expr);
   if (!lf || lf->f->attr.stub) return expr;
   SpecialiseAttribute specialise = get_specialise_attribute(attributes);
   if (specialise == SpecialiseAttribute::Default_specialise) return expr;
+  if (lf->f->attr.specialise != SpecialiseAttribute::Default_specialise)
+    warn(loc, warnings::Warning::K::Duplicated_attribute, "specialise");
   FunctionAttribute a = lf->f->attr;
   a.specialise = specialise;
   return lfunction_with_attr(a, lf->f);
 }
 
-lam_t add_local_attribute(lam_t expr, const Location&, const pt::Attributes& attributes) {
+lam_t add_local_attribute(lam_t expr, const Location& loc, const pt::Attributes& attributes) {
   auto* lf = as<Lfunction>(expr);
   if (!lf || lf->f->attr.stub) return expr;
   LocalAttribute local = get_local_attribute(attributes);
   if (local == LocalAttribute::Default_local) return expr;
+  if (lf->f->attr.local != LocalAttribute::Default_local)
+    warn(loc, warnings::Warning::K::Duplicated_attribute, "local");
   FunctionAttribute a = lf->f->attr;
   a.local = local;
+  check_local_inline(loc, a);
+  check_poll_local(loc, a);
   return lfunction_with_attr(a, lf->f);
 }
 
@@ -269,7 +313,11 @@ TailcallAttribute get_tailcall_attribute(const tt::Expression* e) {
   const pt::Attribute* attr = find_attribute(is_tailcall_attribute, e->exp_attributes);
   if (!attr) return TailcallAttribute::Default_tailcall;
   Res<bool> r = get_optional_payload<bool>(get_bool_from_exp, attr->attr_payload);
-  if (!r.ok) return TailcallAttribute::Default_tailcall;  // (Attribute_payload, not emitted)
+  if (!r.ok) {
+    warn(attr->attr_name.loc, warnings::Warning::K::Attribute_payload, std::string(attr->attr_name.txt),
+         "Only an optional boolean literal is supported.");
+    return TailcallAttribute::Default_tailcall;
+  }
   if (!r.v || *r.v) return TailcallAttribute::Tailcall_expectation_true;
   return TailcallAttribute::Tailcall_expectation_false;
 }

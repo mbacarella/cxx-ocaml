@@ -7,6 +7,7 @@
 // span for the declarations it wraps), and otherwise set to `gap_loc()`:
 // Location.none marked with pos_cnum = -2, so the parsetree dump can print
 // them as masked.  TYPECHECKER.md lists the gaps.
+#include "cppcaml/typing/builtin_attributes.hpp"
 #include "cppcaml/typing/parsetree_ovalue.hpp"
 #include <stdexcept>
 
@@ -174,7 +175,21 @@ struct Conv {
     }
     return p;
   }
+  // Builtin_attributes.register_attr: the parser's mk_attr registers every
+  // attribute, and marks those of an attribute's payload used once the
+  // payload is read (mark_payload_attrs_used); Ast_invariants registers
+  // all but those.  So: the attributes outside attribute payloads.
+  mutable int attr_payload_depth = 0;
+  const Attribute* registered(const Attribute* a) const {
+    if (attr_payload_depth == 0) builtin_attributes::register_attr(a->attr_name.txt, a->attr_name.loc);
+    return a;
+  }
   const Attribute* attribute(const ast::Attribute& a) const {
+    ++attr_payload_depth;
+    struct Leave {
+      int& d;
+      ~Leave() { --d; }
+    } leave{attr_payload_depth};
     Payload p{};
     if (a.typ) {
       p.kind = Payload::Kind::PTyp;
@@ -194,7 +209,11 @@ struct Conv {
     if (a.loc.start.cnum == 0 && a.loc.end.cnum == 0 && p.kind == Payload::Kind::PStr &&
         !p.str.empty())
       al = p.str[0]->pstr_loc;
-    return make<Attribute>(StrLoc{zborrow(a.name), unset ? location::none() : loc(a.name_loc)}, p, al);
+    --attr_payload_depth;
+    const Attribute* r =
+        registered(make<Attribute>(StrLoc{zborrow(a.name), unset ? location::none() : loc(a.name_loc)}, p, al));
+    ++attr_payload_depth;
+    return r;
   }
   Attributes attrs(const ast::Attributes& l) const {
     return map_slice<const Attribute*>(l, [&](const ast::Attribute& a) { return attribute(a); });
@@ -203,7 +222,10 @@ struct Conv {
   // ast keeps only the name and the payload; the attribute spans the item.
   const Attribute* item_attribute(const std::string& name, const ast::Structure& payload,
                                   const Location& item_loc) const {
-    return make<Attribute>(StrLoc{zborrow(name), gap_loc()}, payload_str(payload), item_loc);
+    ++attr_payload_depth;
+    Payload p = payload_str(payload);
+    --attr_payload_depth;
+    return registered(make<Attribute>(StrLoc{zborrow(name), gap_loc()}, p, item_loc));
   }
   const Extension* extension(const ast::ExtName& name, const ast::ExtPayload& p) const {
     return make<Extension>(StrLoc{zborrow(name), name.has_loc ? loc(name.loc) : gap_loc()}, ext_payload(p));

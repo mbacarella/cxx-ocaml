@@ -2,6 +2,7 @@
 // (Env.mark_*_used), alerts and Uid.Deps only feed warnings / the cmt file
 // and are left out.
 #include "cppcaml/typing/includemod.hpp"
+#include "cppcaml/typing/builtin_attributes.hpp"
 
 #include "cppcaml/typing/btype.hpp"
 #include "cppcaml/typing/includeclass.hpp"
@@ -63,6 +64,15 @@ Direction strictly_positive(bool mark, bool both) {
   return {false, m, Pos::Strictly_positive};
 }
 Direction unknown(bool mark) { return {false, mark ? Mark::Mark_both : Mark::Mark_neither, Pos::Positive}; }
+// Directionality.mark_as_used
+bool mark_as_used(const Direction& d) {
+  switch (d.mark_as_used) {
+    case Mark::Mark_neither: return false;
+    case Mark::Mark_both: return true;
+    case Mark::Mark_positive: return d.pos != Pos::Negative;
+  }
+  return false;
+}
 Direction negate(Direction d) {
   d.pos = d.pos == Pos::Negative ? Pos::Positive : Pos::Negative;
   return d;
@@ -91,8 +101,9 @@ E::SigitemSymptom core_symptom(E::CoreSigitemSymptom c) {
 
 // Core_inclusion: all functions "blah env x1 x2" check that x1 is included
 // in x2.
-CoreResult ci_value_descriptions(const Location& loc, env::t env, Direction, subst::t s, Ident::t id,
+CoreResult ci_value_descriptions(const Location& loc, env::t env, Direction d, subst::t s, Ident::t id,
                                  const ValueDescription* vd1_, const ValueDescription* vd2_) {
+  if (mark_as_used(d)) env::mark_value_used(vd1_->val_uid);
   // Using [Subst] reverts expansions
   const ValueDescription* vd1 = subst::value_description(subst::identity(), vd1_);
   const ValueDescription* vd2 = subst::value_description(s, vd2_);
@@ -108,8 +119,8 @@ CoreResult ci_value_descriptions(const Location& loc, env::t env, Direction, sub
 }
 CoreResult ci_type_declarations(const Location& loc, env::t env, Direction d, subst::t s, Ident::t id,
                                 const TypeDeclaration* decl1_, const TypeDeclaration* decl2_) {
-  bool mark = d.mark_as_used == Mark::Mark_both ||
-              (d.mark_as_used == Mark::Mark_positive && d.pos != Pos::Negative);
+  bool mark = mark_as_used(d);
+  if (mark) env::mark_type_used(decl1_->type_uid);
   const TypeDeclaration* decl1 = subst::type_declaration(subst::identity(), decl1_);
   const TypeDeclaration* decl2 = subst::type_declaration(s, decl2_);
   if (auto err = includecore::type_declarations(false, loc, env, mark, ident::name(id), decl1, Path::pident(id), decl2)) {
@@ -123,8 +134,7 @@ CoreResult ci_type_declarations(const Location& loc, env::t env, Direction d, su
 }
 CoreResult ci_extension_constructors(const Location& loc, env::t env, Direction d, subst::t s, Ident::t id,
                                      const ExtensionConstructor* ext1_, const ExtensionConstructor* ext2_) {
-  bool mark = d.mark_as_used == Mark::Mark_both ||
-              (d.mark_as_used == Mark::Mark_positive && d.pos != Pos::Negative);
+  bool mark = mark_as_used(d);
   const ExtensionConstructor* ext1 = subst::extension_constructor(subst::identity(), ext1_);
   const ExtensionConstructor* ext2 = subst::extension_constructor(s, ext2_);
   if (auto err = includecore::extension_constructors(loc, env, mark, id, ext1, ext2)) {
@@ -794,8 +804,10 @@ SignDiff signature_components(const CoreRelation& core, Direction direction, con
 MtyResult module_declarations(const CoreRelation& core, const Location& loc, env::t env, Direction direction,
                               subst::t s, Ident::t id1, const ModuleDeclaration* md1, const ModuleDeclaration* md2,
                               shape::t orig_shape) {
-  // (alerts; Env.mark_module_used)
+  builtin_attributes::check_alerts_inclusion(md1->md_loc, md2->md_loc, loc, md1->md_attributes, md2->md_attributes,
+                                             ident::name(id1));
   Path::t p1 = Path::pident(id1);
+  if (mark_as_used(direction)) env::mark_module_used(md1->md_uid);
   return strengthened_modtypes(core, direction, loc, true, env, s, md1->md_type, p1, md2->md_type, orig_shape);
 }
 
@@ -805,6 +817,8 @@ Result<const tt::ModuleCoercion*, E::SigitemSymptom> modtype_infos(const CoreRel
                                                                   Ident::t id, const ModtypeDeclaration* info1,
                                                                   const ModtypeDeclaration* info2_) {
   using R = Result<const tt::ModuleCoercion*, E::SigitemSymptom>;
+  builtin_attributes::check_alerts_inclusion(info1->mtd_loc, info2_->mtd_loc, loc, info1->mtd_attributes,
+                                             info2_->mtd_attributes, ident::name(id));
   const ModtypeDeclaration* info2 = subst::modtype_declaration(subst::Scoping::keep(), s, info2_);
   Result<const tt::ModuleCoercion*, E::ModuleTypeDeclarationSymptom> r;
   if (!info2->mtd_type) {

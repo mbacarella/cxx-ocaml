@@ -674,7 +674,7 @@ static Typed type_application(const Location& loc, bool strengthen, bool funct_b
   return acc;
 }
 
-TypeOpenDeclResult type_open_decl_(bool* used_slot, bool toplevel, bool funct_body, SignatureNames* names, env::t env,
+TypeOpenDeclResult type_open_decl_(std::shared_ptr<bool> used_slot, bool toplevel, bool funct_body, SignatureNames* names, env::t env,
                                    const pt::OpenDeclaration* od) {
   return builtin_attributes::warning_scope(od->popen_attributes, [&]() -> TypeOpenDeclResult {
     const Location& loc = od->popen_loc;

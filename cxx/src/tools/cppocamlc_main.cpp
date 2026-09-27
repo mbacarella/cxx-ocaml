@@ -531,6 +531,19 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
                 << std::chrono::duration<double, std::milli>(now - prev).count() << " ms\n";
     prev = now;
   };
+  // Compile_common.implementation's end: Builtin_attributes.warn_unused ();
+  // Warnings.check_fatal () (Warnings.Errors: Already_displayed_error, the
+  // .cmo removed, exit 2)
+  auto finish = [&]() -> int {
+    ty::builtin_attributes::warn_unused();
+    try {
+      ty::warnings::check_fatal();
+    } catch (const ty::location::AlreadyDisplayed&) {
+      std::remove(cmo_out.c_str());
+      return 2;
+    }
+    return 0;
+  };
   try {
     auto tp = t0;
     std::vector<std::string> dirfiles;
@@ -538,7 +551,7 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
     lap("parse", tp);
     if (g_dump.parsetree)
       cppcaml::ast::print_dparsetree(structure, in_path, std::cout, dirfiles);
-    if (g_stop_after == StopAfter::Parsing) return 0;
+    if (g_stop_after == StopAfter::Parsing) return finish();
     // Compile_common.implementation: typecheck_impl
     std::optional<ty::typedtree::Implementation> impl;
     PortResult port = port_typecheck(in_path, mod, stdlib_dir, cmo_out, /*intf=*/false,
@@ -550,7 +563,7 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
     if (port != PortResult::Typed) return 2;
     lap("typecheck", tp);
     // Clflags.should_stop_after Typing (-i prints the signature, writes nothing)
-    if (g_stop_after == StopAfter::Typing || ty::clflags::print_types) return 0;
+    if (g_stop_after == StopAfter::Typing || ty::clflags::print_types) return finish();
     // Compile.to_bytecode: Translmod.transl_implementation, -drawlambda,
     // Simplif.simplify_lambda, -dlambda, Bytegen.compile_implementation,
     // -dinstr (the dumps on stderr, as ocamlc's ppf_dump)
@@ -563,7 +576,7 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
     ty::lambda::lambda lam = ty::simplif::simplify_lambda(prog.code);
     if (g_dump.lambda) std::cerr << ty::printlambda::dump(lam);
     lap("lambda", tp);
-    if (g_stop_after == StopAfter::Lambda) return 0;
+    if (g_stop_after == StopAfter::Lambda) return finish();
     ty::instruct::code bytecode = ty::bytegen::compile_implementation(modname, lam);
     if (g_dump.instr) std::cerr << ty::printinstr::dump(bytecode);
     lap("bytegen", tp);
@@ -585,6 +598,7 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out,
     if (prof)
       std::cerr << "  TOTAL compile " << in_path << ": "
                 << std::chrono::duration<double, std::milli>(clk::now() - t0).count() << " ms\n";
+    return finish();
   } catch (const cppcaml::ParseError& e) {
     report_syntax_error(in_path, src, e);
     return 2;
@@ -633,6 +647,7 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
           ty::parsetree::Signature sg = ty::parsetree::of_ast_signature(sig, in_path, {});
           // Compile_common.typecheck_intf
           const ty::typedtree::Signature* tsg = ty::typemod::type_interface(target, env0, sg);
+          ty::StrMap<std::string_view> alerts = ty::builtin_attributes::alerts_of_sig(true, sg);
           if (ty::clflags::print_types) {
             ty::printtyp::wrap_printing_env(false, env0, [&] {
               ty::format_doc::Formatter d;
@@ -646,10 +661,11 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
           }
           (void)ty::includemod::signatures(env0, true, tsg->sig_type, tsg->sig_type);
           ty::typecore::force_delayed_checks();
+          ty::builtin_attributes::warn_unused();
+          ty::warnings::check_fatal();
           if (g_stop_after == StopAfter::Typing || ty::clflags::print_types) return;
           // Compile_common.emit_signature
-          ty::env::save_signature(ty::builtin_attributes::alerts_of_sig(sg), tsg->sig_type, target.modname,
-                                  target.prefix + ".cmi");
+          ty::env::save_signature(alerts, tsg->sig_type, target.modname, target.prefix + ".cmi");
         });
     if (port != PortResult::Typed) return 2;
   } catch (const cppcaml::ParseError& e) {
@@ -747,6 +763,8 @@ static int run_main(int argc, char** argv) {
       if (pass == "parsing") g_stop_after = StopAfter::Parsing;
       else if (pass == "typing") g_stop_after = StopAfter::Typing;
       else if (pass == "lambda") g_stop_after = StopAfter::Lambda;
+      cppcaml::typing::builtin_attributes::stops_before_lambda =
+          g_stop_after == StopAfter::Parsing || g_stop_after == StopAfter::Typing;
     }
     else if (a == "-open") g_open_modules.push_back(need_arg("-open"));
     else if (a == "-i") cppcaml::typing::clflags::print_types = true;

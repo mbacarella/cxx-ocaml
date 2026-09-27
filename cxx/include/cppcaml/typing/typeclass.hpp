@@ -98,7 +98,7 @@ struct ErrorForward : std::runtime_error {
 };
 
 // Forward declaration, set by Typemod: type_open_descr ?used_slot env od
-extern std::function<std::pair<const tt::OpenDescription*, env::t>(bool* used_slot, env::t,
+extern std::function<std::pair<const tt::OpenDescription*, env::t>(std::shared_ptr<bool> used_slot, env::t,
                                                                   const pt::OpenDescription*)>
     type_open_descr;
 

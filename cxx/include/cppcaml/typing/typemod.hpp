@@ -88,7 +88,7 @@ TypeStructureResult type_structure(env::t env, pt::Structure sstr);
 TypeStructureResult type_toplevel_phrase(env::t env, pt::Structure sstr);
 const tt::Signature* transl_signature(env::t env, pt::Signature ssg);
 void check_nongen_signature(env::t env, Signature sg);
-std::pair<Path::t, env::t> type_open_(bool* used_slot, bool toplevel, OverrideFlag ovf, env::t env,
+std::pair<Path::t, env::t> type_open_(std::shared_ptr<bool> used_slot, bool toplevel, OverrideFlag ovf, env::t env,
                                       const Location& loc, const pt::LidLoc& lid);
 const ModuleType* modtype_of_package(env::t env, const Location& loc, const Package* pack);
 

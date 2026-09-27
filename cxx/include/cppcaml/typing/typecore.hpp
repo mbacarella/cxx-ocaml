@@ -137,7 +137,7 @@ extern std::function<std::pair<const tt::ModuleExpr*, const void*>(env::t, const
     type_module;
 extern std::function<std::pair<const tt::StructureItem*, env::t>(env::t, const pt::StructureItem*)>
     type_str_item;
-extern std::function<std::pair<Path::t, env::t>(bool* used_slot, OverrideFlag, env::t,
+extern std::function<std::pair<Path::t, env::t>(std::shared_ptr<bool> used_slot, OverrideFlag, env::t,
                                                 const Location&, const pt::LidLoc&)>
     type_open;
 struct TypeOpenDeclResult {
@@ -145,7 +145,7 @@ struct TypeOpenDeclResult {
   Signature sg;
   env::t env;
 };
-extern std::function<TypeOpenDeclResult(bool* used_slot, env::t, const pt::OpenDeclaration*)>
+extern std::function<TypeOpenDeclResult(std::shared_ptr<bool> used_slot, env::t, const pt::OpenDeclaration*)>
     type_open_decl;
 // type_package env m pack -> (module_expr, pack')
 extern std::function<std::pair<const tt::ModuleExpr*, const Package*>(env::t, const pt::ModuleExpr*,
@@ -174,6 +174,7 @@ TypeBindingResult type_let(std::optional<ExistentialRestriction> existential_con
                            RecFlag rec_flag, Slice<const pt::ValueBinding*> spat_sexp_list);
 void reset_delayed_checks();
 void force_delayed_checks();
+void add_delayed_check(std::function<void()> f);
 bool is_nonexpansive(const tt::Expression* exp);
 TypeExpr* type_constant(const tt::Constant& c);
 

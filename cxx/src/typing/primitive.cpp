@@ -2,15 +2,14 @@
 #include "cppcaml/typing/primitive.hpp"
 
 #include "cppcaml/typing/builtin_attributes.hpp"
+#include "cppcaml/typing/location.hpp"
 
 namespace cppcaml::typing {
 
 namespace attr_helper {
 std::optional<parsetree::StrLoc> get_no_payload_attribute(std::string_view nm, const parsetree::Attributes& attrs) {
-  // Builtin_attributes.select_attributes [(nm, Return)] attrs
-  std::vector<const parsetree::Attribute*> sel;
-  for (auto* a : attrs)
-    if (builtin_attributes::attr_equals_builtin(a->attr_name.txt, nm)) sel.push_back(a);
+  std::vector<const parsetree::Attribute*> sel =
+      builtin_attributes::select_attributes({{nm, builtin_attributes::AttrAction::Return}}, attrs);
   if (sel.empty()) return std::nullopt;
   if (sel.size() == 1) {
     const parsetree::Payload& p = sel[0]->attr_payload;
@@ -61,7 +60,10 @@ const PrimitiveDescription* parse_description(const std::vector<NativeRepr>& nat
   if (old_style_noalloc && noalloc_attribute) throw Error(loc, Error::Kind::Old_style_noalloc_with_noalloc_attribute);
   // The compiler used to assume "noalloc" with "float" (GPR#167)
   old_style_noalloc = old_style_noalloc || old_style_float;
-  // (the deprecation alerts are not emitted)
+  if (old_style_float)
+    location::deprecated(loc, "[@@unboxed] + [@@noalloc] should be used\ninstead of \"float\"");
+  else if (old_style_noalloc)
+    location::deprecated(loc, "[@@noalloc] should be used instead of \"noalloc\"");
   if (native_name.empty() && !all_ocaml) throw Error(loc, Error::Kind::No_native_primitive_with_repr_attribute);
   bool noalloc = old_style_noalloc || noalloc_attribute;
   std::vector<NativeRepr> native_repr_args = native_repr_args0;

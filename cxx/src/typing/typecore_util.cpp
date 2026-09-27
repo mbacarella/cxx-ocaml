@@ -21,10 +21,10 @@ std::function<std::pair<const tt::ModuleExpr*, const void*>(env::t, const pt::Mo
     type_module;
 std::function<std::pair<const tt::StructureItem*, env::t>(env::t, const pt::StructureItem*)>
     type_str_item;
-std::function<std::pair<Path::t, env::t>(bool*, OverrideFlag, env::t, const Location&,
+std::function<std::pair<Path::t, env::t>(std::shared_ptr<bool>, OverrideFlag, env::t, const Location&,
                                          const pt::LidLoc&)>
     type_open;
-std::function<TypeOpenDeclResult(bool*, env::t, const pt::OpenDeclaration*)> type_open_decl;
+std::function<TypeOpenDeclResult(std::shared_ptr<bool>, env::t, const pt::OpenDeclaration*)> type_open_decl;
 std::function<std::pair<const tt::ModuleExpr*, const Package*>(env::t, const pt::ModuleExpr*,
                                                               const Package*)>
     type_package;

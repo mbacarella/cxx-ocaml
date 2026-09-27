@@ -4,6 +4,7 @@
 // are includecore.ml's.  Alerts / deprecation checks and usage marking only
 // feed warnings and are left out.
 #include "cppcaml/typing/includecore.hpp"
+#include "cppcaml/typing/builtin_attributes.hpp"
 
 #include "cppcaml/typing/btype.hpp"
 
@@ -79,9 +80,10 @@ const typedtree::ModuleCoercion* value_descriptions_consistency(env::t env, cons
   return typedtree::tcoerce_none();
 }
 
-const typedtree::ModuleCoercion* value_descriptions(const Location&, env::t env, std::string_view,
+const typedtree::ModuleCoercion* value_descriptions(const Location& loc, env::t env, std::string_view name,
                                                     const ValueDescription* vd1, const ValueDescription* vd2) {
-  // (Builtin_attributes.check_alerts_inclusion: alerts are not ported)
+  builtin_attributes::check_alerts_inclusion(vd1->val_loc, vd2->val_loc, loc, vd1->val_attributes, vd2->val_attributes,
+                                             name);
   try {
     ctype::moregeneral(env, vd1->val_type, vd2->val_type);
   } catch (const ctype::Moregen& m) {
@@ -158,7 +160,7 @@ std::optional<LabelMismatch> compare_labels(env::t env, const std::vector<TypeEx
 }
 
 // Record_diffing.equal
-bool record_equal(env::t env, std::vector<TypeExpr*> params1, std::vector<TypeExpr*> params2,
+bool record_equal(const Location& loc, env::t env, std::vector<TypeExpr*> params1, std::vector<TypeExpr*> params2,
                   Slice<const LabelDeclaration*> labels1, Slice<const LabelDeclaration*> labels2) {
   for (std::size_t k = 0;; ++k) {
     if (k == labels1.size() && k == labels2.size()) return true;
@@ -166,7 +168,8 @@ bool record_equal(env::t env, std::vector<TypeExpr*> params1, std::vector<TypeEx
     const LabelDeclaration* ld1 = labels1[k];
     const LabelDeclaration* ld2 = labels2[k];
     if (ident::name(ld1->ld_id) != ident::name(ld2->ld_id)) return false;
-    // (check_deprecated_mutable_inclusion: warnings)
+    builtin_attributes::check_deprecated_mutable_inclusion(ld1->ld_loc, ld2->ld_loc, loc, ld1->ld_attributes,
+                                                           ld2->ld_attributes, ident::name(ld1->ld_id));
     if (compare_labels(env, params1, params2, ld1, ld2)) return false;
     // add arguments to the parameters, cf. PR#7378
     params1.insert(params1.begin(), ld1->ld_type);
@@ -177,7 +180,7 @@ bool record_equal(env::t env, std::vector<TypeExpr*> params1, std::vector<TypeEx
 using ParamsState = std::pair<std::vector<TypeExpr*>, std::vector<TypeExpr*>>;
 
 // Record_diffing.diffing
-std::vector<RecordChange> record_diffing(env::t env, const std::vector<TypeExpr*>& params1,
+std::vector<RecordChange> record_diffing(const Location& loc, env::t env, const std::vector<TypeExpr*>& params1,
                                          const std::vector<TypeExpr*>& params2, Slice<const LabelDeclaration*> l,
                                          Slice<const LabelDeclaration*> r) {
   using LD = const LabelDeclaration*;
@@ -233,22 +236,22 @@ std::vector<RecordChange> record_diffing(env::t env, const std::vector<TypeExpr*
   return d.diff({params1, params2}, std::vector<LD>(l.begin(), l.end()), std::vector<LD>(r.begin(), r.end()));
 }
 
-std::optional<std::vector<RecordChange>> record_compare(env::t env, const std::vector<TypeExpr*>& params1,
+std::optional<std::vector<RecordChange>> record_compare(const Location& loc, env::t env, const std::vector<TypeExpr*>& params1,
                                                         const std::vector<TypeExpr*>& params2,
                                                         Slice<const LabelDeclaration*> l,
                                                         Slice<const LabelDeclaration*> r) {
-  if (record_equal(env, params1, params2, l, r)) return std::nullopt;
-  return record_diffing(env, params1, params2, l, r);
+  if (record_equal(loc, env, params1, params2, l, r)) return std::nullopt;
+  return record_diffing(loc, env, params1, params2, l, r);
 }
 
-std::optional<TypeMismatch> record_compare_with_representation(env::t env, const std::vector<TypeExpr*>& params1,
+std::optional<TypeMismatch> record_compare_with_representation(const Location& loc, env::t env, const std::vector<TypeExpr*>& params1,
                                                                const std::vector<TypeExpr*>& params2,
                                                                Slice<const LabelDeclaration*> l,
                                                                Slice<const LabelDeclaration*> r,
                                                                const RecordRepresentation& rep1,
                                                                const RecordRepresentation& rep2) {
   using RK = RecordRepresentation::Kind;
-  if (auto ch = record_compare(env, params1, params2, l, r)) {
+  if (auto ch = record_compare(loc, env, params1, params2, l, r)) {
     TypeMismatch m{TypeMismatch::Kind::Record_mismatch};
     m.record = RecordMismatch{RecordMismatch::Kind::Label_mismatch, *ch};
     return m;
@@ -274,7 +277,7 @@ std::optional<TypeMismatch> record_compare_with_representation(env::t env, const
 }
 
 // ---- Variant_diffing ----
-std::optional<ConstructorMismatch> compare_constructor_arguments(env::t env, const std::vector<TypeExpr*>& params1,
+std::optional<ConstructorMismatch> compare_constructor_arguments(const Location& loc, env::t env, const std::vector<TypeExpr*>& params1,
                                                                  const std::vector<TypeExpr*>& params2,
                                                                  const ConstructorArguments& arg1,
                                                                  const ConstructorArguments& arg2) {
@@ -290,7 +293,7 @@ std::optional<ConstructorMismatch> compare_constructor_arguments(env::t env, con
     return std::nullopt;
   }
   if (arg1.kind == CK::Cstr_record && arg2.kind == CK::Cstr_record) {
-    if (auto ch = record_compare(env, params1, params2, arg1.record, arg2.record)) {
+    if (auto ch = record_compare(loc, env, params1, params2, arg1.record, arg2.record)) {
       ConstructorMismatch m{ConstructorMismatch::Kind::Inline_record};
       m.changes = *ch;
       return m;
@@ -302,7 +305,7 @@ std::optional<ConstructorMismatch> compare_constructor_arguments(env::t env, con
   return m;
 }
 
-std::optional<ConstructorMismatch> compare_constructors(env::t env, const std::vector<TypeExpr*>& params1,
+std::optional<ConstructorMismatch> compare_constructors(const Location& loc, env::t env, const std::vector<TypeExpr*>& params1,
                                                         const std::vector<TypeExpr*>& params2, TypeExpr* res1,
                                                         TypeExpr* res2, const ConstructorArguments& args1,
                                                         const ConstructorArguments& args2) {
@@ -312,33 +315,34 @@ std::optional<ConstructorMismatch> compare_constructors(env::t env, const std::v
       m.err = *e;
       return m;
     }
-    return compare_constructor_arguments(env, {res1}, {res2}, args1, args2);
+    return compare_constructor_arguments(loc, env, {res1}, {res2}, args1, args2);
   }
   if (res1 || res2) {
     ConstructorMismatch m{ConstructorMismatch::Kind::Explicit_return_type};
     m.pos = res1 ? Position::First : Position::Second;
     return m;
   }
-  return compare_constructor_arguments(env, params1, params2, args1, args2);
+  return compare_constructor_arguments(loc, env, params1, params2, args1, args2);
 }
 
 // Variant_diffing.equal
-bool variant_equal(env::t env, const std::vector<TypeExpr*>& params1, const std::vector<TypeExpr*>& params2,
+bool variant_equal(const Location& loc, env::t env, const std::vector<TypeExpr*>& params1, const std::vector<TypeExpr*>& params2,
                    Slice<const ConstructorDeclaration*> cstrs1, Slice<const ConstructorDeclaration*> cstrs2) {
   if (cstrs1.size() != cstrs2.size()) return false;
   for (std::size_t k = 0; k < cstrs1.size(); ++k) {
     const ConstructorDeclaration* cd1 = cstrs1[k];
     const ConstructorDeclaration* cd2 = cstrs2[k];
     if (ident::name(cd1->cd_id) != ident::name(cd2->cd_id)) return false;
-    // (check_alerts_inclusion: alerts)
-    if (compare_constructors(env, params1, params2, cd1->cd_res, cd2->cd_res, cd1->cd_args, cd2->cd_args))
+    builtin_attributes::check_alerts_inclusion(cd1->cd_loc, cd2->cd_loc, loc, cd1->cd_attributes, cd2->cd_attributes,
+                                               ident::name(cd1->cd_id));
+    if (compare_constructors(loc, env, params1, params2, cd1->cd_res, cd2->cd_res, cd1->cd_args, cd2->cd_args))
       return false;
   }
   return true;
 }
 
 // Variant_diffing.diffing
-std::vector<VariantChange> variant_diffing(env::t env, const std::vector<TypeExpr*>& params1,
+std::vector<VariantChange> variant_diffing(const Location& loc, env::t env, const std::vector<TypeExpr*>& params1,
                                            const std::vector<TypeExpr*>& params2,
                                            Slice<const ConstructorDeclaration*> l,
                                            Slice<const ConstructorDeclaration*> r) {
@@ -349,13 +353,13 @@ std::vector<VariantChange> variant_diffing(env::t env, const std::vector<TypeExp
   d.key_left = [](CD x) { return std::string(ident::name(x->cd_id)); };
   d.key_right = d.key_left;
   d.update = [](const KD::change&, const ParamsState& st) { return st; };
-  d.test = [env](const ParamsState& st, const diffing::WithPos<CD>& x, const diffing::WithPos<CD>& y) {
+  d.test = [env, loc](const ParamsState& st, const diffing::WithPos<CD>& x, const diffing::WithPos<CD>& y) {
     KD::TR res{};
     const ConstructorDeclaration *cd1 = x.data, *cd2 = y.data;
     std::string name1(ident::name(cd1->cd_id)), name2(ident::name(cd2->cd_id));
     if (name1 != name2) {
       bool types_match =
-          !compare_constructors(env, st.first, st.second, cd1->cd_res, cd2->cd_res, cd1->cd_args, cd2->cd_args);
+          !compare_constructors(loc, env, st.first, st.second, cd1->cd_res, cd2->cd_res, cd1->cd_args, cd2->cd_args);
       M m{M::K::Name};
       m.types_match = types_match;
       m.pos = x.pos;
@@ -366,7 +370,7 @@ std::vector<VariantChange> variant_diffing(env::t env, const std::vector<TypeExp
       return res;
     }
     if (std::optional<ConstructorMismatch> reason =
-            compare_constructors(env, st.first, st.second, cd1->cd_res, cd2->cd_res, cd1->cd_args, cd2->cd_args)) {
+            compare_constructors(loc, env, st.first, st.second, cd1->cd_res, cd2->cd_res, cd1->cd_args, cd2->cd_args)) {
       M m{M::K::Type};
       m.pos = x.pos;
       m.got = cd1;
@@ -391,15 +395,15 @@ std::vector<VariantChange> variant_diffing(env::t env, const std::vector<TypeExp
   return d.diff({params1, params2}, std::vector<CD>(l.begin(), l.end()), std::vector<CD>(r.begin(), r.end()));
 }
 
-std::optional<TypeMismatch> variant_compare_with_representation(env::t env, const std::vector<TypeExpr*>& params1,
+std::optional<TypeMismatch> variant_compare_with_representation(const Location& loc, env::t env, const std::vector<TypeExpr*>& params1,
                                                                 const std::vector<TypeExpr*>& params2,
                                                                 Slice<const ConstructorDeclaration*> cstrs1,
                                                                 Slice<const ConstructorDeclaration*> cstrs2,
                                                                 VariantRepresentation rep1,
                                                                 VariantRepresentation rep2) {
-  if (!variant_equal(env, params1, params2, cstrs1, cstrs2)) {
+  if (!variant_equal(loc, env, params1, params2, cstrs1, cstrs2)) {
     TypeMismatch m{TypeMismatch::Kind::Variant_mismatch};
-    m.variant_changes = variant_diffing(env, params1, params2, cstrs1, cstrs2);
+    m.variant_changes = variant_diffing(loc, env, params1, params2, cstrs1, cstrs2);
     return m;
   }
   using VR = VariantRepresentation;
@@ -610,11 +614,11 @@ std::optional<TypeMismatch> type_declarations_consistency(env::t env, const Type
   return std::nullopt;
 }
 
-std::optional<TypeMismatch> type_declarations(bool equality, const Location&, env::t env, bool mark,
-                                              std::string_view, const TypeDeclaration* decl1, Path::t path,
+std::optional<TypeMismatch> type_declarations(bool equality, const Location& loc, env::t env, bool mark,
+                                              std::string_view name, const TypeDeclaration* decl1, Path::t path,
                                               const TypeDeclaration* decl2) {
-  (void)equality;
-  (void)mark;  // (usage marking only feeds warnings)
+  builtin_attributes::check_alerts_inclusion(decl1->type_loc, decl2->type_loc, loc, decl1->type_attributes,
+                                             decl2->type_attributes, name);
   if (auto err = type_declarations_consistency(env, decl1, decl2)) return err;
   std::optional<TypeMismatch> err;
   auto constraint_err = [](const et::EqualityError& e) {
@@ -641,11 +645,29 @@ std::optional<TypeMismatch> type_declarations(bool equality, const Location&, en
   TK k1 = decl1->type_kind->kind, k2 = decl2->type_kind->kind;
   if (k2 == TK::Type_abstract) {
   } else if (k1 == TK::Type_variant && k2 == TK::Type_variant) {
-    err = variant_compare_with_representation(env, vec(decl1->type_params), vec(decl2->type_params),
+    if (mark) {
+      auto mark_cstrs = [](env::ConstructorUsage usage, Slice<const ConstructorDeclaration*> cstrs) {
+        for (const ConstructorDeclaration* c : cstrs) env::mark_constructor_used(usage, c->cd_uid);
+      };
+      env::ConstructorUsage usage = decl2->type_private == PrivateFlag::Public ? env::ConstructorUsage::Exported
+                                                                              : env::ConstructorUsage::Exported_private;
+      mark_cstrs(usage, decl1->type_kind->constructors);
+      if (equality) mark_cstrs(env::ConstructorUsage::Exported, decl2->type_kind->constructors);
+    }
+    err = variant_compare_with_representation(loc, env, vec(decl1->type_params), vec(decl2->type_params),
                                               decl1->type_kind->constructors, decl2->type_kind->constructors,
                                               decl1->type_kind->variant_repr, decl2->type_kind->variant_repr);
   } else if (k1 == TK::Type_record && k2 == TK::Type_record) {
-    err = record_compare_with_representation(env, vec(decl1->type_params), vec(decl2->type_params),
+    if (mark) {
+      auto mark_lbls = [](env::LabelUsage usage, Slice<const LabelDeclaration*> lbls) {
+        for (const LabelDeclaration* l : lbls) env::mark_label_used(usage, l->ld_uid);
+      };
+      env::LabelUsage usage =
+          decl2->type_private == PrivateFlag::Public ? env::LabelUsage::Exported : env::LabelUsage::Exported_private;
+      mark_lbls(usage, decl1->type_kind->labels);
+      if (equality) mark_lbls(env::LabelUsage::Exported, decl2->type_kind->labels);
+    }
+    err = record_compare_with_representation(loc, env, vec(decl1->type_params), vec(decl2->type_params),
                                              decl1->type_kind->labels, decl2->type_kind->labels,
                                              decl1->type_kind->record_repr, decl2->type_kind->record_repr);
   } else if (k1 == TK::Type_open && k2 == TK::Type_open) {
@@ -702,10 +724,14 @@ std::optional<TypeMismatch> type_declarations(bool equality, const Location&, en
 }
 
 // Inclusion between extension constructors
-std::optional<ExtensionConstructorMismatch> extension_constructors(const Location&, env::t env, bool, Ident::t id,
+std::optional<ExtensionConstructorMismatch> extension_constructors(const Location& loc, env::t env, bool mark, Ident::t id,
                                                                    const ExtensionConstructor* ext1,
                                                                    const ExtensionConstructor* ext2) {
-  // (Env.mark_extension_used: warnings)
+  if (mark) {
+    env::ConstructorUsage usage =
+        ext2->ext_private == PrivateFlag::Public ? env::ConstructorUsage::Exported : env::ConstructorUsage::Exported_private;
+    env::mark_extension_used(usage, ext1->ext_uid);
+  }
   TypeExpr* ty1 = newgenty(tconstr(ext1->ext_type_path, ext1->ext_type_params, make<MemoRef>(mnil())));
   TypeExpr* ty2 = newgenty(tconstr(ext2->ext_type_path, ext2->ext_type_params, make<MemoRef>(mnil())));
   auto tl1 = cat({ty1}, vec(ext1->ext_type_params));
@@ -723,7 +749,7 @@ std::optional<ExtensionConstructorMismatch> extension_constructors(const Locatio
     c.err = *e;
     return mismatch(c);
   }
-  if (auto r = compare_constructors(env, vec(ext1->ext_type_params), vec(ext2->ext_type_params), ext1->ext_ret_type,
+  if (auto r = compare_constructors(loc, env, vec(ext1->ext_type_params), vec(ext2->ext_type_params), ext1->ext_ret_type,
                                     ext2->ext_ret_type, ext1->ext_args, ext2->ext_args))
     return mismatch(*r);
   if (ext1->ext_private == PrivateFlag::Private && ext2->ext_private == PrivateFlag::Public)

@@ -909,14 +909,22 @@ void check_unused(long lev, env::t env, TypeExpr* expected_ty,
 }
 
 // ---- delayed checks, executed after typing the whole compilation unit ----------------------
-static std::vector<std::function<void()>> delayed_checks;  // head first
+// (f, Warnings.backup ()) pairs, head first
+static std::vector<std::pair<std::function<void()>, warnings::State>> delayed_checks;
 void reset_delayed_checks() { delayed_checks.clear(); }
-void add_delayed_check(std::function<void()> f) { delayed_checks.insert(delayed_checks.begin(), std::move(f)); }
+void add_delayed_check(std::function<void()> f) {
+  delayed_checks.insert(delayed_checks.begin(), {std::move(f), warnings::backup()});
+}
 void force_delayed_checks() {
   // checks may change type levels
   Snapshot snap = btype::snapshot();
-  std::vector<std::function<void()>> l(delayed_checks.rbegin(), delayed_checks.rend());
-  for (auto& f : l) f();
+  warnings::State w_old = warnings::backup();
+  std::vector<std::pair<std::function<void()>, warnings::State>> l(delayed_checks.rbegin(), delayed_checks.rend());
+  for (auto& [f, w] : l) {
+    warnings::restore(w);
+    f();
+  }
+  warnings::restore(w_old);
   reset_delayed_checks();
   btype::backtrack(snap);
 }

@@ -203,17 +203,17 @@ void install_forward_refs() {
     return env::lookup_modtype_path(true, loc, lid, env);
   };
   typetexp::transl_modtype = transl_modtype;
-  typecore::type_open = [](bool* used_slot, OverrideFlag ovf, env::t env, const Location& loc, const pt::LidLoc& lid) {
+  typecore::type_open = [](std::shared_ptr<bool> used_slot, OverrideFlag ovf, env::t env, const Location& loc, const pt::LidLoc& lid) {
     return type_open_(used_slot, false, ovf, env, loc, lid);
   };
   typetexp::type_open = typecore::type_open;
-  typecore::type_open_decl = [](bool* used_slot, env::t env, const pt::OpenDeclaration* od) {
+  typecore::type_open_decl = [](std::shared_ptr<bool> used_slot, env::t env, const pt::OpenDeclaration* od) {
     TypeOpenDeclResult r = type_open_decl_(used_slot, false, false, create_signature_names(), env, od);
     return typecore::TypeOpenDeclResult{r.od, r.sg, r.env};
   };
   typecore::type_package = type_package;
   typecore::check_package_closed = check_package_closed_;
-  typeclass::type_open_descr = [](bool* used_slot, env::t env, const pt::OpenDescription* od) {
+  typeclass::type_open_descr = [](std::shared_ptr<bool> used_slot, env::t env, const pt::OpenDescription* od) {
     return type_open_descr(used_slot, false, env, od);
   };
   type_module_type_of_fwd = type_module_type_of;
@@ -221,6 +221,7 @@ void install_forward_refs() {
   ctype::package_subtype = package_subtype_;
   ctype::set_modtype_of_package(modtype_of_package);
   env::check_well_formed_module = check_well_formed_module;
+  env::add_delayed_check_forward = typecore::add_delayed_check;
   typeclass::install_forward_refs();
   includemod::install_forward_refs();
 }
@@ -270,7 +271,8 @@ tt::Implementation type_implementation(const UnitInfo& target, env::t initial_en
     typecore::force_delayed_checks();
     return {r.str, coercion, dclsig};
   }
-  // (the Missing_mli warning is not emitted)
+  location::prerr_warning(location::in_file(target.source_file),
+                          warnings::Warning::make(warnings::Warning::K::Missing_mli));
   auto [coercion, shape] = includemod::compunit(initial_env, true, target.source_file, r.sg, "(inferred signature)",
                                                 simple_sg, shape0);
   (void)shape;
@@ -278,7 +280,7 @@ tt::Implementation type_implementation(const UnitInfo& target, env::t initial_en
   normalize_signature(simple_sg);
   typecore::force_delayed_checks();
   // (the shape's Shape_reduce.local_reduce is not ported: no cmt)
-  StrMap<std::string_view> alerts = builtin_attributes::alerts_of_str(ast);
+  StrMap<std::string_view> alerts = builtin_attributes::alerts_of_str(true, ast);
   if (!clflags::dont_write_files) env::save_signature(alerts, simple_sg, target.modname, target.prefix + ".cmi");
   return {r.str, coercion, simple_sg};
 }

@@ -559,4 +559,50 @@ void err_flush() {
   std::fflush(stderr);
 }
 
+// ---- warnings and alerts ------------------------------------------------------------
+
+namespace {
+// default_warning_alert_reporter report mk loc w
+std::optional<Report> reporting(const Location& loc, const std::optional<warnings::ReportingInformation>& ri,
+                                ReportKind k_ok, ReportKind k_err) {
+  if (!ri) return std::nullopt;
+  Report r;
+  r.kind = ri->is_error ? k_err : k_ok;
+  r.kind_arg = ri->id;
+  r.main = Msg{loc, ri->message};
+  for (auto& [l, m] : ri->sub_locs) r.sub.push_back(Msg{l, m});
+  return r;
+}
+}  // namespace
+
+std::optional<Report> report_warning(const Location& loc, const warnings::Warning& w) {
+  return reporting(loc, warnings::report(w), ReportKind::Report_warning, ReportKind::Report_warning_as_error);
+}
+std::optional<Report> report_alert(const Location& loc, const warnings::Alert& a) {
+  return reporting(loc, warnings::report_alert(a), ReportKind::Report_alert, ReportKind::Report_alert_as_error);
+}
+
+void print_warning(const Location& loc, format::Formatter& ppf, const warnings::Warning& w) {
+  if (std::optional<Report> r = report_warning(loc, w)) print_report(ppf, *r);
+}
+// formatter_for_warnings = Format.err_formatter (its text reaches stderr
+// at the report's flush)
+void prerr_warning(const Location& loc, const warnings::Warning& w) {
+  print_warning(loc, err_formatter(), w);
+  err_flush();
+}
+void print_alert(const Location& loc, format::Formatter& ppf, const warnings::Alert& a) {
+  if (std::optional<Report> r = report_alert(loc, a)) print_report(ppf, *r);
+}
+void prerr_alert(const Location& loc, const warnings::Alert& a) {
+  print_alert(loc, err_formatter(), a);
+  err_flush();
+}
+void alert(const Location& loc, std::string kind, std::string message, const Location& def, const Location& use) {
+  prerr_alert(loc, warnings::Alert{std::move(kind), std::move(message), def, use});
+}
+void deprecated(const Location& loc, std::string message, const Location& def, const Location& use) {
+  alert(loc, "deprecated", std::move(message), def, use);
+}
+
 }  // namespace cppcaml::typing::location

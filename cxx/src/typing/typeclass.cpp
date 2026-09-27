@@ -26,7 +26,7 @@ using TK = tt::ClassExprDesc::Kind;
 using EK = Error::K;
 using MethSet = std::set<std::string_view>;
 
-std::function<std::pair<const tt::OpenDescription*, env::t>(bool*, env::t, const pt::OpenDescription*)>
+std::function<std::pair<const tt::OpenDescription*, env::t>(std::shared_ptr<bool>, env::t, const pt::OpenDescription*)>
     type_open_descr;
 
 namespace {
@@ -1296,9 +1296,9 @@ const tt::ClassExpr* class_expr_aux(std::string_view cl_num, Final final, env::t
     }
     case PK::Pcl_open: {
       auto* o = as<pt::Pcl_open>(d);
-      bool used_slot = false;
-      auto [od, new_val_env] = type_open_descr(&used_slot, val_env, o->od);
-      env::t new_met_env = type_open_descr(&used_slot, met_env, o->od).second;
+      auto used_slot = std::make_shared<bool>(false);
+      auto [od, new_val_env] = type_open_descr(used_slot, val_env, o->od);
+      env::t new_met_env = type_open_descr(used_slot, met_env, o->od).second;
       const tt::ClassExpr* cl = class_expr(cl_num, final, new_val_env, new_met_env, virt, self_scope, o->ce);
       return mk_cl(mkd(tt::Tcl_open{{TK::Tcl_open}, od, cl}), scl->pcl_loc, cl->cl_type, val_env, scl->pcl_attributes);
     }

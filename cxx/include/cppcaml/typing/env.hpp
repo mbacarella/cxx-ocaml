@@ -2,15 +2,13 @@
 //
 // Deviations, each marked at its site in env.cpp:
 //  - no shapes (Shape.t only feeds .cmt / project-index output);
-//  - warnings, alerts and usage tracking (Builtin_attributes, the
-//    *_declarations usage tables, delayed checks) are not ported yet: they
-//    never change whether a program type-checks;
 //  - save_signature and the short-path iterators (iter_env, run_iter_cont)
 //    come with the cmi-writing and printing stages.
 #pragma once
 
 #include <functional>
 #include <map>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -20,6 +18,7 @@
 #include "cppcaml/typing/longident.hpp"
 #include "cppcaml/typing/persistent_env.hpp"
 #include "cppcaml/typing/subst.hpp"
+#include "cppcaml/typing/warnings.hpp"
 
 namespace cppcaml::typing::env {
 
@@ -364,7 +363,9 @@ std::vector<Ident::t> get_required_globals();
 void add_required_global(Ident::t id);
 
 // ---- insertion -------------------------------------------------------------------
-t add_value(Ident::t id, const ValueDescription* desc, t env);
+// ?check: the unused-declaration warning of the value (check_usage)
+using CheckFn = std::function<warnings::Warning(std::string)>;
+t add_value(Ident::t id, const ValueDescription* desc, t env, const CheckFn& check = nullptr);
 t add_type(bool check, Ident::t id, const TypeDeclaration* info, t env);
 t add_extension(bool check, bool rebind, Ident::t id, const ExtensionConstructor* ext, t env);
 t add_module_declaration(bool check, Ident::t id, ModulePresence presence,
@@ -384,7 +385,8 @@ t add_persistent_structure(Ident::t id, t env);
 t add_signature(Signature sg, t env);
 t mark_not_aliasable(Ident::t id, t env);
 
-std::pair<Ident::t, t> enter_value(std::string_view name, const ValueDescription* desc, t env);
+std::pair<Ident::t, t> enter_value(std::string_view name, const ValueDescription* desc, t env,
+                                   const CheckFn& check = nullptr);
 std::pair<Ident::t, t> enter_type(int scope, std::string_view name, const TypeDeclaration* info,
                                   t env);
 t reenter_type(Ident::t id, const TypeDeclaration* info, t env);
@@ -413,8 +415,8 @@ struct OpenResult {
   Kind kind;
   t env = nullptr;
 };
-OpenResult open_signature(OverrideFlag ovf, Path::t root, t env,
-                          const Location& loc = location::none(), bool toplevel = false);
+OpenResult open_signature(OverrideFlag ovf, Path::t root, t env, const Location& loc = location::none(),
+                          bool toplevel = false, std::shared_ptr<bool> used_slot = nullptr);
 OpenResult open_pers_signature(std::string_view name, t env);
 t remove_last_open(Path::t root, t env);  // nullptr = None
 
@@ -436,6 +438,26 @@ std::pair<Path::t, const ClassTypeDeclaration*> lookup_cltype(bool use, const Lo
 
 enum class ConstructorUsage { Positive, Pattern, Exported_private, Exported };
 enum class LabelUsage { Projection, Mutation, Construct, Exported_private, Exported };
+
+// ---- tracking usage (the unused-declaration warnings) ----
+// add_delayed_check_forward (Typecore.add_delayed_check)
+extern std::function<void(std::function<void()>)> add_delayed_check_forward;
+void reset_declaration_caches();
+void mark_module_used(const Uid& uid);
+void mark_modtype_used(const Uid& uid);
+void mark_value_used(const Uid& uid);
+void mark_type_used(const Uid& uid);
+void mark_type_path_used(t env, Path::t path);
+void mark_constructor_used(ConstructorUsage usage, const Uid& uid);
+void mark_extension_used(ConstructorUsage usage, const Uid& uid);
+void mark_label_used(LabelUsage usage, const Uid& uid);
+void mark_constructor_description_used(ConstructorUsage usage, t env, const ConstructorDescription* cstr);
+void mark_label_description_used(LabelUsage usage, t env, const LabelDescription* lbl);
+void mark_class_used(const Uid& uid);
+void mark_cltype_used(const Uid& uid);
+void set_value_used_callback(const ValueDescription* vd, std::function<void()> callback);
+// set_type_used_callback td callback: callback receives the previous one
+void set_type_used_callback(const TypeDeclaration* td, std::function<void(std::function<void()>)> callback);
 
 // lookup_all_constructors: Ok list | Error (loc, env, lookup_error)
 struct LookupAllCstrs {
