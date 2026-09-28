@@ -235,7 +235,11 @@ mimalloc and mimalloc-dev store paths): with glibc's malloc the compiler
 corpus is ~1.1x.  mimalloc's arenas on transparent huge pages are part of
 the speed and most of the small units' extra RSS (without eager commit a
 trivial unit peaks at 14 MB, below ocamlc.opt's 15, but the compiler corpus
-takes ~0.93x).
+takes ~0.93x).  PGO + ThinLTO (`cxx/tools/pgo_build.sh`: an instrumented
+build trained on bench.sh's corpora; needs lld and an llvm-profdata of the
+compiler's major version) is optional: head to head against the plain
+release build of the same commit it gives 0.95x on the compiler corpus and
+~1.0x on small units -- build flags are not where the remaining speed is.
 
 Memory: OCaml's GC reclaims what a phase leaves behind; the zones keep
 everything to the end, so the port reclaims explicitly where OCaml's
