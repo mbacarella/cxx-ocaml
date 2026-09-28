@@ -57,6 +57,7 @@ void warn(const Location& loc, warnings::Warning::K k, std::string s, std::strin
 }
 
 const pt::Attribute* find_attribute(const Actions& p, const pt::Attributes& attributes) {
+  if (attributes.empty()) return nullptr;  // nothing to select nor mark used
   std::vector<const pt::Attribute*> l = select_attributes(p, attributes);
   if (l.empty()) return nullptr;
   if (l.size() >= 2)

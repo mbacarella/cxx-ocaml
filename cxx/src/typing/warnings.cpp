@@ -1,4 +1,5 @@
 // See warnings.hpp: utils/warnings.ml's state, option parsing and scopes.
+#include <deque>
 #include <cstdio>
 #include "cppcaml/typing/warnings.hpp"
 
@@ -121,8 +122,8 @@ std::vector<int> letter(char c) {
   }
 }
 
-State initial_state() {
-  State s;
+StateData initial_state() {
+  StateData s;
   s.active.fill(true);
   s.error.fill(false);
   s.alerts = std::make_shared<const AlertSet>(AlertSet{{}, false});
@@ -130,12 +131,25 @@ State initial_state() {
   return s;
 }
 
-State& current() {
-  static State s = [] {
-    State st = initial_state();
-    return st;
+// the versions of the state (kept for the process: a saved State may be
+// restored at any time) and the current one
+std::deque<StateData>& versions() {
+  static std::deque<StateData> v;
+  return v;
+}
+const StateData*& current_ptr() {
+  static const StateData* p = [] {
+    versions().push_back(initial_state());
+    return &versions().back();
   }();
-  return s;
+  return p;
+}
+const StateData& current() { return *current_ptr(); }
+// a new version, a copy of the current one, made current (to be changed)
+StateData& modify() {
+  versions().push_back(current());
+  current_ptr() = &versions().back();
+  return versions().back();
 }
 
 void set_alert(bool error, bool enable, std::string_view s) {
@@ -148,8 +162,9 @@ void set_alert(bool error, bool enable, std::string_view s) {
     else upd.set.erase(std::string(s));
   }
   auto p = std::make_shared<const AlertSet>(std::move(upd));
-  if (error) current().alert_errors = p;
-  else current().alerts = p;
+  StateData& m = modify();
+  if (error) m.alert_errors = p;
+  else m.alerts = p;
 }
 
 enum class Modifier { Set, Clear, Set_all };
@@ -329,8 +344,11 @@ std::optional<Alert> parse_options_(bool errflag, std::string_view s) {
   auto error = current().error;
   auto active = current().active;
   std::optional<Alert> alrt = parse_opt(error, active, errflag, s);
-  current().error = error;
-  current().active = active;
+  if (error != current().error || active != current().active) {
+    StateData& m = modify();
+    m.error = error;
+    m.active = active;
+  }
   return alrt;
 }
 
@@ -353,11 +371,11 @@ static void ensure_defaults() {
 
 State backup() {
   ensure_defaults();
-  return current();
+  return State{current_ptr()};
 }
 void restore(const State& s) {
   ensure_defaults();
-  current() = s;
+  current_ptr() = s.p;
 }
 bool is_active(int number) {
   ensure_defaults();

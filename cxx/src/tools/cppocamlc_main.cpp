@@ -598,6 +598,12 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
       }
       std::cerr << "  mem after " << what << ": rss " << resident * ::sysconf(_SC_PAGESIZE) / (1 << 20)
                 << " MB, zones " << cppcaml::typing::Zone::block_bytes() / (1 << 20) << " MB\n";
+      // the phase's end on CLOCK_MONOTONIC (steady_clock's), to cut a
+      // `perf record -k CLOCK_MONOTONIC` profile into phases
+      char at[32];
+      std::snprintf(at, sizeof at, "%.6f",
+                    std::chrono::duration<double>(now.time_since_epoch()).count());
+      std::cerr << "  end of " << what << " at " << at << " s\n";
     }
     prev = now;
   };

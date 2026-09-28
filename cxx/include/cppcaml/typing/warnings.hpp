@@ -34,13 +34,18 @@ struct AlertSet {
 };
 
 // warnings.ml's state is an immutable record that backup / restore pass
-// around; the alert sets are shared here, and replaced (never mutated) by
-// set_alert, so that saving a state (warning scopes, delayed checks) is cheap.
-struct State {
+// around: here a version of it, never changed once made (a change -- an
+// option, a [@warning] attribute -- makes a new version), so a State is a
+// pointer to one and saving it (every warning scope, delayed checks) costs
+// a pointer copy.
+struct StateData {
   std::array<bool, last_warning_number + 1> active{};
   std::array<bool, last_warning_number + 1> error{};
   std::shared_ptr<const AlertSet> alerts;
   std::shared_ptr<const AlertSet> alert_errors;
+};
+struct State {
+  const StateData* p = nullptr;
 };
 
 // Arg.Bad of the option parsers

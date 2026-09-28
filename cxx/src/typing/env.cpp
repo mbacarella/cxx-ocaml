@@ -101,22 +101,23 @@ static A idtbl_find_same(Ident::t id, const IdTbl<A, B>& tbl) {
   return tbl.layer->f(idtbl_find_same(id, tbl.layer->next));
 }
 
+// idtbl_find_name, nullopt where it raises Not_found: nothing observable
+// happens on that path (wrap and the using callbacks run only on a find), so
+// the callers that catch Not_found at once test the result instead -- a throw
+// from the bottom of the layers unwinds one frame per `open`
 template <class A, class B, class W>
-static std::pair<Path::t, A> idtbl_find_name(W&& wrap, bool mark, std::string_view name,
-                                             const IdTbl<A, B>& tbl) {
-  if (auto [id, desc] = tbl.current.find_name_opt(name); desc) return {Path::pident(id), *desc};
-  if (!tbl.layer) throw NotFound{};
+static std::optional<std::pair<Path::t, A>> idtbl_find_name_opt(W&& wrap, bool mark, std::string_view name,
+                                                                const IdTbl<A, B>& tbl) {
+  if (auto [id, desc] = tbl.current.find_name_opt(name); desc)
+    return std::pair<Path::t, A>{Path::pident(id), *desc};
+  if (!tbl.layer) return std::nullopt;
   const auto* L = tbl.layer;
   if (L->is_open) {
     if (const B* c = L->components.find_opt(name)) {
       A descr = wrap(*c);
       std::pair<Path::t, A> res{Path::pdot(L->root, name), descr};
       if (mark && L->using_) {
-        std::optional<std::pair<Path::t, A>> hidden;
-        try {
-          hidden = idtbl_find_name(wrap, false, name, L->next);
-        } catch (const NotFound&) {
-        }
+        std::optional<std::pair<Path::t, A>> hidden = idtbl_find_name_opt(wrap, false, name, L->next);
         if (!hidden) {
           (*L->using_)(name, nullptr);
         } else {
@@ -126,10 +127,18 @@ static std::pair<Path::t, A> idtbl_find_name(W&& wrap, bool mark, std::string_vi
       }
       return res;
     }
-    return idtbl_find_name(wrap, mark, name, L->next);
+    return idtbl_find_name_opt(wrap, mark, name, L->next);
   }
-  auto [p, desc] = idtbl_find_name(wrap, mark, name, L->next);
-  return {p, L->f(desc)};
+  auto r = idtbl_find_name_opt(wrap, mark, name, L->next);
+  if (!r) return std::nullopt;
+  return std::pair<Path::t, A>{r->first, L->f(r->second)};
+}
+template <class A, class B, class W>
+static std::pair<Path::t, A> idtbl_find_name(W&& wrap, bool mark, std::string_view name,
+                                             const IdTbl<A, B>& tbl) {
+  auto r = idtbl_find_name_opt(wrap, mark, name, tbl);
+  if (!r) throw NotFound{};
+  return *r;
 }
 
 template <class A, class B, class W>
@@ -408,12 +417,9 @@ static const ModuleEntry* find_same_module(Ident::t id,
 
 static std::pair<Path::t, const ModuleEntry*> find_name_module(
     bool mark, std::string_view name, const IdTbl<const ModuleEntry*, const ModuleData*>& tbl) {
-  try {
-    return idtbl_find_name(wrap_module, mark, name, tbl);
-  } catch (const NotFound&) {
-    if (current_unit_is(name)) throw;
-    return {Path::pident(Ident::create_persistent(name)), mod_persistent()};
-  }
+  if (auto r = idtbl_find_name_opt(wrap_module, mark, name, tbl)) return *r;
+  if (current_unit_is(name)) throw NotFound{};
+  return {Path::pident(Ident::create_persistent(name)), mod_persistent()};
 }
 
 static const bool& no_alias_deps = clflags::no_alias_deps;
@@ -423,13 +429,9 @@ t add_persistent_structure(Ident::t id, t env) {
   if (current_unit_is_ident(id)) return env;
   // This addition only observably changes the environment if it shadows a
   // non-persistent module already in the environment (PR#9345).
-  bool material;
-  try {
-    auto r = idtbl_find_name(wrap_module, false, ident::name(id), env->modules);
-    material = r.second->kind != ModuleEntry::Kind::Mod_persistent;
-  } catch (const NotFound&) {
-    material = false;
-  }
+  bool material = false;
+  if (auto r = idtbl_find_name_opt(wrap_module, false, ident::name(id), env->modules))
+    material = r->second->kind != ModuleEntry::Kind::Mod_persistent;
   EnvT* e = copy_env(env);
   if (material) {
     Summary s{Summary::Kind::Env_persistent, env->summary};
@@ -2635,9 +2637,9 @@ static std::pair<Path::t, const ValueDescription*> lookup_ident_value(bool error
                                                                       std::string_view name,
                                                                       t env) {
   std::pair<Path::t, const ValueEntry*> r;
-  try {
-    r = idtbl_find_name(wrap_value, use, name, env->values);
-  } catch (const NotFound&) {
+  if (auto f = idtbl_find_name_opt(wrap_value, use, name, env->values)) {
+    r = *f;
+  } else {
     LookupError e = lerr(LookupError::Kind::Unbound_value, Longident::lident(name));
     may_lookup_error(errors, loc, env, e);
   }
@@ -2653,11 +2655,8 @@ template <class A, class B>
 static std::pair<Path::t, A> lookup_ident_generic(bool errors, bool use, const Location& loc,
                                                   std::string_view s, const IdTbl<A, B>& tbl,
                                                   t env, LookupError::Kind unbound) {
-  try {
-    return idtbl_find_name(wrap_identity<A>, use, s, tbl);
-  } catch (const NotFound&) {
-    may_lookup_error(errors, loc, env, lerr(unbound, Longident::lident(s)));
-  }
+  if (auto r = idtbl_find_name_opt(wrap_identity<A>, use, s, tbl)) return *r;
+  may_lookup_error(errors, loc, env, lerr(unbound, Longident::lident(s)));
 }
 
 static std::vector<std::pair<const LabelDescription*, std::function<void()>>>
@@ -3102,9 +3101,9 @@ std::vector<std::pair<const LabelDescription*, std::function<void()>>> lookup_al
 InstanceVariable lookup_instance_variable(bool use, const Location& loc, std::string_view name,
                                           t env) {
   std::pair<Path::t, const ValueEntry*> r;
-  try {
-    r = idtbl_find_name(wrap_value, use, name, env->values);
-  } catch (const NotFound&) {
+  if (auto f = idtbl_find_name_opt(wrap_value, use, name, env->values)) {
+    r = *f;
+  } else {
     LookupError e = lerr(LookupError::Kind::Unbound_instance_variable);
     e.name = zborrow(name);
     lookup_error(loc, env, e);
@@ -3171,11 +3170,7 @@ const LabelDescription* find_label_by_name(Longident::t lid, t env) {
 
 // ---- checking if a name is bound ------------------------------------------------------
 bool bound_module(std::string_view name, t env) {
-  try {
-    idtbl_find_name(wrap_module, false, name, env->modules);
-    return true;
-  } catch (const NotFound&) {
-  }
+  if (idtbl_find_name_opt(wrap_module, false, name, env->modules)) return true;
   if (current_unit_is(name)) return false;
   try {
     find_pers_mod(false, name);
@@ -3187,12 +3182,7 @@ bool bound_module(std::string_view name, t env) {
 
 template <class A, class B, class W>
 static bool bound(W&& wrap, const IdTbl<A, B>& tbl, std::string_view name) {
-  try {
-    idtbl_find_name(wrap, false, name, tbl);
-    return true;
-  } catch (const NotFound&) {
-    return false;
-  }
+  return idtbl_find_name_opt(wrap, false, name, tbl).has_value();
 }
 bool bound_value(std::string_view n, t env) { return bound(wrap_value, env->values, n); }
 bool bound_type(std::string_view n, t env) {
