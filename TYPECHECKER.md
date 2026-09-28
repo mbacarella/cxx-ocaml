@@ -227,22 +227,29 @@ recovery (`-typing-recovery`).
 `cxx/harness/bench.sh` times c++ocamlc against ocamlc.opt unit by unit
 (interleaved, median of REPS, peak RSS); `BASELINE=cxx/harness/bench_baseline.tsv`
 compares a run with the committed baseline, `MAXRATIO=1.0` fails a corpus
-slower than ocamlc.opt; `CPPCAML_PROFILE=1` prints each phase's time and the
-resident set / zone storage after it.  Baseline (2026-09-28, release build
-with mimalloc, REPS=3), c++ocamlc / ocamlc.opt: startup 0.87x (31 vs 16 MB
-peak RSS), small 0.84x (48 vs 21 MB), compiler 0.81x (240 vs 92 MB), stdlib
-0.81x (160 vs 61 MB).  The release build must link mimalloc
+slower than ocamlc.opt; `CPPCAML_PROFILE=1` prints each phase's time, the
+resident set / zone storage after it, and its end on CLOCK_MONOTONIC (to cut
+a `perf record -k CLOCK_MONOTONIC` profile into phases).  Baseline
+(2026-09-28, release build with mimalloc, the .cmi image cache warm,
+REPS=3, a loaded machine), c++ocamlc / ocamlc.opt: startup 0.66x, small
+0.63x, compiler 0.57x, stdlib 0.65x; peak RSS 1.5-2.7x.  On typing/typecore.ml
+(-g -principal) against ocamlc.opt's -dtimings: parse 9 vs 26 ms, typing
+~92 vs ~180, translation + simplif ~33 vs ~25, bytegen + emitcode ~32 vs
+~45.  perf stat there: c++ocamlc executes 1.38 G instructions to ocamlc.opt's
+3.05 G, at a lower IPC (1.5 vs 2.0) with fewer cache, TLB and branch misses
+-- the profile is flat; what is left is many small costs (Env's layered
+table lookups, the translation phase's vector churn, the -g debug graph).
+On small units a third of a trivial compile is building the initial
+environment (predef + opening Stdlib): snapshotting it in the image cache
+is the next large step there.  The release build must link mimalloc
 (`CPPCAML_MIMALLOC`, on by default; the nix dev shell sets
 `CMAKE_PREFIX_PATH` for it -- outside it, point CMAKE_PREFIX_PATH at the
 mimalloc and mimalloc-dev store paths): with glibc's malloc the compiler
-corpus is ~1.1x.  mimalloc's arenas on transparent huge pages are part of
-the speed and most of the small units' extra RSS (without eager commit a
-trivial unit peaks at 14 MB, below ocamlc.opt's 15, but the compiler corpus
-takes ~0.93x).  PGO + ThinLTO (`cxx/tools/pgo_build.sh`: an instrumented
-build trained on bench.sh's corpora; needs lld and an llvm-profdata of the
-compiler's major version) is optional: head to head against the plain
-release build of the same commit it gives 0.95x on the compiler corpus and
-~1.0x on small units -- build flags are not where the remaining speed is.
+corpus loses ~25%.  PGO + ThinLTO (`cxx/tools/pgo_build.sh`: an
+instrumented build trained on bench.sh's corpora; needs lld and an
+llvm-profdata of the compiler's major version) is optional: head to head
+against the plain release build of the same commit it gives 0.95x on the
+compiler corpus and ~1.0x on small units.
 
 Memory: OCaml's GC reclaims what a phase leaves behind; the zones keep
 everything to the end, so the port reclaims explicitly where OCaml's
