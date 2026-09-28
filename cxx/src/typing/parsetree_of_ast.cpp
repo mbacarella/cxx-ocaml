@@ -12,6 +12,7 @@
 #include <stdexcept>
 
 #include "cppcaml/typing/parsetree.hpp"
+#include "cppcaml/typing/clflags.hpp"
 
 namespace cppcaml::typing::parsetree {
 
@@ -34,8 +35,9 @@ typing::Attributes types_attributes(const Attributes& l) {
   for (const Attribute* a : l) {
     // a docstring's attribute (Docstrings builds it, with a Location.none
     // name); an explicit [@@ocaml.doc ...] is the parser's like any other
+    // (not one input_value read: its sharing is the marshaled data's)
     bool doc = (a->attr_name.txt == "ocaml.doc" || a->attr_name.txt == "ocaml.text") &&
-               a->attr_name.loc.loc_start.pos_cnum == -1;
+               a->attr_name.loc.loc_start.pos_cnum == -1 && !same_record(a->attr_name.loc);
     // Docstrings's doc_loc / text_loc: one {txt; loc} record each
     static const std::string_view doc_name = ocaml_literal("parsing/docstrings.ml", "ocaml.doc"),
                                   text_name = ocaml_literal("parsing/docstrings.ml", "ocaml.text");
@@ -243,7 +245,10 @@ struct Conv {
   // all but those.  So: the attributes outside attribute payloads.
   mutable int attr_payload_depth = 0;
   const Attribute* registered(const Attribute* a) const {
-    if (attr_payload_depth == 0) builtin_attributes::register_attr(a->attr_name.txt, a->attr_name.loc);
+    // (register_attr Parser: nothing under -ppx, Ast_invariants registers
+    // the rewritten tree's)
+    if (attr_payload_depth == 0 && clflags::all_ppx.empty())
+      builtin_attributes::register_attr(a->attr_name.txt, a->attr_name.loc);
     return a;
   }
   const Attribute* attribute(const ast::Attribute& a) const {

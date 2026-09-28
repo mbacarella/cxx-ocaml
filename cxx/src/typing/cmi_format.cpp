@@ -882,6 +882,23 @@ std::vector<std::uint8_t> marshal_debug_events(const std::vector<const instruct:
   return o::marshal(o::vlist(evs));
 }
 
+const OValue* input_ovalue(const std::uint8_t* data, std::size_t len, std::size_t& off) {
+  m::Arena arena;
+  std::size_t root = m::read_value(data, len, off, arena);
+  arena.finalize();
+  Reader r(arena);
+  try {
+    return r.ovalue(root);
+  } catch (const Corrupt&) {
+    throw m::Error("input_value: ill-formed value");
+  }
+}
+
+std::vector<std::uint8_t> output_ovalue(const OValue* v) {
+  Writer w;
+  return o::marshal(w.ovalue(v));
+}
+
 std::size_t marshaled_size(const ModuleType* a, const ModuleType* b) {
   Writer w;
   w.set_current_unit(env::get_current_unit_name());

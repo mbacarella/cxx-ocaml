@@ -41,6 +41,7 @@
 #include "cppcaml/parser.hpp"
 #include "cppcaml/lexer.hpp"
 #include "cppcaml/typing/misc.hpp"
+#include "cppcaml/typing/pparse.hpp"
 #include "cppcaml/typing/builtin_attributes.hpp"
 #include "cppcaml/typing/clflags.hpp"
 #include "cppcaml/typing/oprint.hpp"
@@ -270,7 +271,7 @@ static cppcaml::typing::env::t initial_env() {
 // location line and the error's constructor until Printtyp is ported.  An
 // internal failure is reported as one (CPPCAML_TYPECHECK_DEBUG adds the
 // error's details).
-using PortBody = std::function<void(cppcaml::typing::env::t, const cppcaml::typing::typemod::UnitInfo&)>;
+using PortBody = std::function<void(cppcaml::typing::env::t, cppcaml::typing::typemod::UnitInfo&)>;
 // Typed: the port typed the unit (and, for an .ml without .mli, wrote its
 // .cmi); Failed: an internal failure (reported); Rejected: a type error was
 // reported.
@@ -306,7 +307,6 @@ static PortResult port_typecheck(const std::string& in_path, const std::string& 
     target.modname = mod;
     target.prefix = fs::path(out).replace_extension("").string();
     // Unit_info.mli_from_source: the source's prefix and -intf-suffix
-    target.has_mli = !intf && fs::exists(remove_extension(in_path) + ty::config::interface_suffix);
     target.cmi_file = target.prefix + ".cmi";
     body(env0, target);
     return PortResult::Typed;
@@ -569,9 +569,17 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
   namespace ty = cppcaml::typing;
   std::string src;  // Pparse.parse_file: the (preprocessed) source text
   if (!read_source(in_path, src)) return 2;
-  // Pparse: Location.input_name, the lexbuf holding the whole source
+  // Pparse: Location.input_name; a source's lexbuf holds the whole source
+  // (a binary AST's, the file it names: Pparse.read_ast_structure)
   cppcaml::typing::location::input_name = in_path;
-  cppcaml::typing::location::input_source = src;
+  bool ast_file = false;
+  try {
+    ast_file = cppcaml::typing::pparse::is_ast_file(src, cppcaml::typing::pparse::AstKind::Structure);
+  } catch (...) {
+    if (uncaught_fatal_error(std::current_exception())) return 2;
+    throw;
+  }
+  if (!ast_file) cppcaml::typing::location::input_source = src;
   // Unit_info.modname: from the output prefix (-o stdlib__Arg.cmo -> Stdlib__Arg)
   std::string mod = module_name(cmo_out);
   using clk = std::chrono::steady_clock;
@@ -609,32 +617,60 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
   try {
     auto tp = t0;
     std::vector<std::string> dirfiles;
-    init_lexer();
-    auto structure = cppcaml::parse_structure(src, dirfiles);
-    emit_lex_warnings(in_path, src, static_cast<size_t>(-1));
+    // Pparse.file_aux: a source is parsed (a binary AST is read in the
+    // typing body, after Compmisc.initial_env as in ocamlc)
+    cppcaml::ast::Structure structure;
+    if (!ast_file) {
+      init_lexer();
+      structure = cppcaml::parse_structure(src, dirfiles);
+      emit_lex_warnings(in_path, src, static_cast<size_t>(-1));
+    }
     lap("parse", tp);
+    // -dparsetree prints the parser's tree; a binary AST's or a rewritten
+    // one has no printer yet (Printast on the typing port's parsetree)
+    const bool rewritten = ast_file || !cf::all_ppx.empty();
+    if (cf::dump_parsetree && rewritten) {
+      std::cout.flush();
+      std::cerr << "c++ocamlc: option -dparsetree is not supported yet with -ppx or a binary AST input\n";
+      return 2;
+    }
     if (cf::dump_parsetree) cppcaml::ast::print_dparsetree(structure, in_path, ppf_dump.out(), dirfiles);
-    if (cf::should_stop_after(cf::Pass::Parsing)) return finish();
+    if (cf::should_stop_after(cf::Pass::Parsing) && !rewritten) return finish();
     // Compile_common.implementation: typecheck_impl
     std::optional<ty::typedtree::Implementation> impl;
+    bool stopped = false;
     PortResult port = port_typecheck(in_path, mod, cmo_out, /*intf=*/false,
-                                     [&](ty::env::t env0, const ty::typemod::UnitInfo& target) {
+                                     [&](ty::env::t env0, ty::typemod::UnitInfo& target) {
                                        // the source's name: one string object (cmt_format.hpp)
                                        std::string_view src_name = ty::zborrow(in_path);
                                        ty::cmt_format::set_source_name(src_name);
-                                       // with -pp the lexer's positions name the file through a
-                                       // string of their own (Pparse's preprocessed input)
-                                       std::string_view pos_name = cf::preprocessor ? ty::zstr(in_path) : src_name;
-                                       ty::parsetree::Structure st = ty::parsetree::of_ast(structure, pos_name, dirfiles);
-                                       // the C++ parser's tree is not read again (Parsetree's is a
-                                       // copy in the zone): free it before typing
-                                       decltype(structure)().swap(structure);
-                                       ty::cmt_format::set_comments(
-                                           ty::parsetree::comments_of_ast(cppcaml::ast::last_comments(), pos_name, dirfiles));
+                                       ty::parsetree::Structure st;
+                                       if (ast_file) {
+                                         st = ty::pparse::read_ast_structure(src);
+                                         ty::cmt_format::set_comments({});  // no lexing: Lexer.comments () = []
+                                       } else {
+                                         // with -pp the lexer's positions name the file through a
+                                         // string of their own (Pparse's preprocessed input)
+                                         std::string_view pos_name = cf::preprocessor ? ty::zstr(in_path) : src_name;
+                                         st = ty::parsetree::of_ast(structure, pos_name, dirfiles);
+                                         // the C++ parser's tree is not read again (Parsetree's is a
+                                         // copy in the zone): free it before typing
+                                         decltype(structure)().swap(structure);
+                                         ty::cmt_format::set_comments(ty::parsetree::comments_of_ast(
+                                             cppcaml::ast::last_comments(), pos_name, dirfiles));
+                                       }
+                                       st = ty::pparse::apply_rewriters_str(st, "ocamlc");
+                                       // Compile_common.Parse_result.update_unit_info
+                                       target.human_source_file = ty::location::input_name;
+                                       if (cf::should_stop_after(cf::Pass::Parsing)) {
+                                         stopped = true;
+                                         return;
+                                       }
                                        // an .ml without .mli: its .cmi is written here (Typemod)
                                        impl = ty::typemod::type_implementation(target, env0, st);
                                      });
     if (port != PortResult::Typed) return 2;
+    if (stopped) return finish();
     lap("typecheck", tp);
     // Clflags.should_stop_after Typing (-i prints the signature, writes nothing)
     if (cf::should_stop_after(cf::Pass::Typing)) return finish();
@@ -716,31 +752,53 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
   check_unit_name(in_path, module_name(cmi_out));
   std::string src;  // Pparse.parse_file: the (preprocessed) source text
   if (!read_source(in_path, src)) return 2;
-  // Pparse: Location.input_name, the lexbuf holding the whole source
+  // Pparse: Location.input_name; a source's lexbuf holds the whole source
+  // (a binary AST's, the file it names: Pparse.read_ast_signature)
   cppcaml::typing::location::input_name = in_path;
-  cppcaml::typing::location::input_source = src;
+  bool ast_file = false;
   try {
-    init_lexer();
+    ast_file = cppcaml::typing::pparse::is_ast_file(src, cppcaml::typing::pparse::AstKind::Signature);
+  } catch (...) {
+    if (uncaught_fatal_error(std::current_exception())) return 2;
+    throw;
+  }
+  if (!ast_file) cppcaml::typing::location::input_source = src;
+  try {
     std::vector<std::string> dirfiles;  // the `# N "file"` directives' names
-    auto sig = cppcaml::parse_signature(src, dirfiles);
-    emit_lex_warnings(in_path, src, static_cast<size_t>(-1));
-    if (cf::should_stop_after(cf::Pass::Parsing)) return 0;
+    cppcaml::ast::Signature sig;
+    if (!ast_file) {
+      init_lexer();
+      sig = cppcaml::parse_signature(src, dirfiles);
+      emit_lex_warnings(in_path, src, static_cast<size_t>(-1));
+    }
+    const bool rewritten = ast_file || !cf::all_ppx.empty();
+    if (cf::should_stop_after(cf::Pass::Parsing) && !rewritten) return 0;
     PortResult port = port_typecheck(
         in_path, module_name(cmi_out), cmi_out, /*intf=*/true,
-        [&](cppcaml::typing::env::t env0, const cppcaml::typing::typemod::UnitInfo& target) {
+        [&](cppcaml::typing::env::t env0, cppcaml::typing::typemod::UnitInfo& target) {
           namespace ty = cppcaml::typing;
           std::string_view src_name = ty::zborrow(in_path);  // the source's name: one string object
           ty::cmt_format::set_source_name(src_name);
-          std::string_view pos_name = cf::preprocessor ? ty::zstr(in_path) : src_name;  // as compile_ml's
-          ty::parsetree::Signature sg = ty::parsetree::of_ast_signature(sig, pos_name, dirfiles);
-          ty::cmt_format::set_comments(ty::parsetree::comments_of_ast(cppcaml::ast::last_comments(), pos_name, dirfiles));
+          ty::parsetree::Signature sg;
+          if (ast_file) {
+            sg = ty::pparse::read_ast_signature(src);
+            ty::cmt_format::set_comments({});  // no lexing: Lexer.comments () = []
+          } else {
+            std::string_view pos_name = cf::preprocessor ? ty::zstr(in_path) : src_name;  // as compile_ml's
+            sg = ty::parsetree::of_ast_signature(sig, pos_name, dirfiles);
+            ty::cmt_format::set_comments(
+                ty::parsetree::comments_of_ast(cppcaml::ast::last_comments(), pos_name, dirfiles));
+          }
+          sg = ty::pparse::apply_rewriters_sig(sg, "ocamlc");
+          target.human_source_file = ty::location::input_name;  // update_unit_info
+          if (cf::should_stop_after(cf::Pass::Parsing)) return;
           // Compile_common.typecheck_intf
           const ty::typedtree::Signature* tsg = ty::typemod::type_interface(target, env0, sg);
           ty::StrMap<std::string_view> alerts = ty::builtin_attributes::alerts_of_sig(true, sg);
           if (ty::clflags::print_types) {
             ty::printtyp::wrap_printing_env(false, env0, [&] {
               ty::format_doc::Formatter d;
-              ty::printtyp::printed_signature(in_path, d, tsg->sig_type);
+              ty::printtyp::printed_signature(target.human(), d, tsg->sig_type);
               ty::format::Formatter out;
               ty::format_doc::format(out, d.doc);
               out.print_newline();

@@ -5,6 +5,7 @@
 // cmt / annot output and the printing of inferred signatures (-i) are not
 // ported; writing the cmi is the driver's (env::save_signature is not
 // ported yet).
+#include <sys/stat.h>
 #include <algorithm>
 #include <cstdio>
 #include <filesystem>
@@ -293,7 +294,7 @@ static tt::Implementation type_implementation_(const UnitInfo& target, env::t in
     // Format.fprintf std_formatter "%a@." (Printtyp.printed_signature sourcefile) simple_sg
     printtyp::wrap_printing_env(false, initial_env, [&] {
       format_doc::Formatter d;
-      printtyp::printed_signature(target.source_file, d, simple_sg);
+      printtyp::printed_signature(target.human(), d, simple_sg);
       format::Formatter out;
       format_doc::format(out, d.doc);
       out.print_newline();
@@ -303,9 +304,11 @@ static tt::Implementation type_implementation_(const UnitInfo& target, env::t in
     // (the result is ignored by Compile.implementation)
     return {r.str, tt::tcoerce_none(), simple_sg};
   }
-  // Unit_info.mli_from_source: the source's prefix and Config.interface_suffix
-  std::string source_intf = remove_extension(target.source_file) + config::interface_suffix;
-  if (clflags::cmi_file || target.has_mli) {
+  // Unit_info.mli_from_source: the (human) source's prefix and
+  // Config.interface_suffix
+  std::string source_intf = remove_extension(target.human()) + config::interface_suffix;
+  struct stat sb;
+  if (clflags::cmi_file || ::stat(source_intf.c_str(), &sb) == 0) {
     std::string compiled_intf_file, intf_modname = target.modname;
     if (clflags::cmi_file) {
       // Unit_info.Artifact.from_filename: the unit named after the file
@@ -316,14 +319,14 @@ static tt::Implementation type_implementation_(const UnitInfo& target, env::t in
       try {
         compiled_intf_file = load_path::find_normalized(target.modname + ".cmi");
       } catch (const load_path::NotFound&) {
-        Error e(location::in_file(target.source_file), env::empty(), EK::Interface_not_compiled);
+        Error e(location::in_file(target.human()), env::empty(), EK::Interface_not_compiled);
         e.name = source_intf;
         typing_recovery::log_and_raise(e);
       }
     }
     Signature dclsig = env::read_signature(intf_modname, compiled_intf_file);
     auto [coercion, shape] =
-        includemod::compunit(initial_env, true, target.source_file, r.sg, source_intf, dclsig, shape0);
+        includemod::compunit(initial_env, true, target.human(), r.sg, source_intf, dclsig, shape0);
     typecore::force_delayed_checks();
     // It is important to run these checks after the inclusion test above,
     // so that value declarations which are not used internally but
@@ -334,9 +337,9 @@ static tt::Implementation type_implementation_(const UnitInfo& target, env::t in
     save_cmt(target, annots, initial_env, nullptr, reduced);
     return {r.str, coercion, dclsig};
   }
-  location::prerr_warning(location::in_file(target.source_file),
+  location::prerr_warning(location::in_file(target.human()),
                           warnings::Warning::make(warnings::Warning::K::Missing_mli));
-  auto [coercion, shape] = includemod::compunit(initial_env, true, target.source_file, r.sg, "(inferred signature)",
+  auto [coercion, shape] = includemod::compunit(initial_env, true, target.human(), r.sg, "(inferred signature)",
                                                 simple_sg, shape0);
   check_nongen_signature(r.env, simple_sg);
   normalize_signature(simple_sg);

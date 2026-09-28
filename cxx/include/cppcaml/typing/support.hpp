@@ -167,6 +167,10 @@ struct OValue {
   // a Location.t block converted from a parsetree location record (its
   // identity, Location::obj): the writers make it that record's one value
   const Location* loc_rec = nullptr;
+  // a Location.t block of a whole parsetree being written (Pparse.write_ast):
+  // the location itself, which the writer gives the value it gives the
+  // same location of a typed tree (by value, or by its record's identity)
+  const Location* loc_val = nullptr;
 };
 
 // ---- Parsetree.attribute ------------------------------------------------

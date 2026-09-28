@@ -76,7 +76,15 @@ V loc_block(const Location& l, V a, V b) {
   if (same_record(l)) const_cast<OValue*>(r)->loc_rec = l.obj;
   return r;
 }
+// Writing a whole parsetree (Pparse.write_ast): every location is written
+// as the writer writes the same location of a typed tree (loc_val)
+bool whole_ast = false;
 V loc(const Location& l) {
+  if (whole_ast && !same_record(l)) {
+    V r = B(0, {position(l.loc_start), position(l.loc_end), boolean(l.loc_ghost)});
+    const_cast<OValue*>(r)->loc_val = make<Location>(l);
+    return r;
+  }
   if (!loc_memo) return loc_block(l, position(l.loc_start), position(l.loc_end));
   auto [it, fresh] = loc_memo->try_emplace({pos_key(l.loc_start), pos_key(l.loc_end), l.loc_ghost}, nullptr);
   if (fresh) {
@@ -918,6 +926,20 @@ const OValue* ovalue_of_payload(const Payload& p, bool docstring) {
 }
 const OValue* ovalue_of_attribute(const Attribute* a) { return attribute(a); }
 const OValue* ovalue_of_structure(Structure s) { return structure(s); }
+const OValue* ovalue_of_ast_structure(Structure s) {
+  bool saved = whole_ast;
+  whole_ast = true;
+  const OValue* r = structure(s);
+  whole_ast = saved;
+  return r;
+}
+const OValue* ovalue_of_ast_signature(Signature s) {
+  bool saved = whole_ast;
+  whole_ast = true;
+  const OValue* r = signature(s);
+  whole_ast = saved;
+  return r;
+}
 const OValue* ovalue_of_signature(Signature s) { return signature(s); }
 const OValue* ovalue_of_core_type(const CoreType* t) { return core_type(t); }
 const OValue* ovalue_of_expression(const Expression* e) { return expression(e); }

@@ -277,6 +277,7 @@ class Writer {
           l.obj = x->loc_rec;
           return loc(l);
         }
+        if (x->loc_val) return loc(*x->loc_val);
         return shared(memo_, x, static_cast<int>(x->tag), [&]() -> std::vector<V> {
           std::vector<V> fs;
           for (const OValue* f : x->fields) fs.push_back(ovalue(f));
