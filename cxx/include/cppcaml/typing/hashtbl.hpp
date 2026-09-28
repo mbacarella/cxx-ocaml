@@ -41,6 +41,11 @@ inline std::uint32_t mix_string(std::uint32_t h, const std::string& s) {
   }
   return h ^ static_cast<std::uint32_t>(len);
 }
+// caml_hash_mix_intnat on a 64-bit value (the tagged representation)
+inline std::uint32_t mix_intnat(std::uint32_t h, std::int64_t d) {
+  std::int64_t n = (d >> 32) ^ (d >> 63) ^ d;
+  return mix_uint32(h, static_cast<std::uint32_t>(n));
+}
 inline long final_mix(std::uint32_t h) {
   h ^= h >> 16;
   h *= 0x85ebca6bU;
@@ -86,6 +91,14 @@ class Hashtbl {
   Hashtbl& operator=(const Hashtbl&) = delete;
 
   long length() const { return size_; }
+  // clear: the bindings dropped, the bucket array kept (not reset)
+  void clear() {
+    if (size_ > 0) {
+      size_ = 0;
+      for (Cell*& c : data_) c = nullptr;
+      cells_.clear();
+    }
+  }
 
   void add(const K& key, const V& data) {
     std::size_t i = index(key);

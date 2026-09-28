@@ -178,6 +178,19 @@ c_unix_str() { case_dir unix_str; compile -I +unix -I +str -c u.ml; both unix_st
 c_unix_str_g() { case_dir unix_str_g; compile -g -I +unix -I +str -c u.ml; both unix_str_g prog -- -g -I +unix -I +str unix.cma str.cma u.cmo -o prog; run_exe unix_str_g prog; verdict unix_str_g; }
 c_threads() { case_dir threads; compile -I +unix -I +threads -c t.ml; both threads prog -- -I +unix -I +threads unix.cma threads.cma t.cmo -o prog; run_exe threads prog; verdict threads; }
 c_noautolink() { case_dir noautolink; compile -I +unix -I +str -c u.ml; both noautolink prog -- -noautolink -I +unix -I +str unix.cma str.cma u.cmo -o prog; verdict noautolink; }
+# a unit using two externals of another unit, named directly (-no-alias-deps,
+# as dune builds): Translmod.required_globals folds Translprim's
+# used_primitives in Hashtbl order and keeps the first ident of the unit --
+# the name string cu_required_compunits carries (shared with cu_imports' or
+# not); found building ctypes in an opam switch
+c_usedprims() {
+  case_dir usedprims; mkdir -p lib
+  printf 'external intptr_t_size : unit -> int = "a_size"\nexternal uintptr_t_size : unit -> int = "b_size"\n' > lib/my_view_stubs.ml
+  printf 'let f () = My_view_stubs.intptr_t_size ()\nlet g () = My_view_stubs.uintptr_t_size ()\n' > lib/my_views.ml
+  (cd lib && compile -no-alias-deps -c my_view_stubs.ml)
+  both usedprims my_views.cmo -- -I lib -no-alias-deps -o my_views.cmo -c -impl lib/my_views.ml
+  verdict usedprims
+}
 c_lib() { case_dir lib; compile -c a.mli a.ml b.ml; both lib lib.cma -- -a a.cmo -o lib.cma; verdict lib; }
 c_lib_g() { case_dir lib_g; compile -g -c a.mli a.ml b.ml; both lib_g lib.cma -- -a -g a.cmo b.cmo -o lib.cma; verdict lib_g; }
 c_lib_linkall() { case_dir lib_linkall; compile -c a.mli a.ml b.ml; both lib_linkall lib.cma -- -a -linkall a.cmo -o lib.cma; verdict lib_linkall; }
@@ -298,7 +311,7 @@ c_lib_stub_dll() {
 
 ALL="plain g g_nog linkall hints dllpath launch_exe launch_exe_bindir launch_sh launch_binsh search_fallback_exe
 search_enable_exe use_runtime runtime_variant without_runtime stdlib_default unix_str unix_str_g threads noautolink
-lib lib_g lib_linkall lib_cstuff lib_custom lib_of_lib link_lib link_lib_unused link_lib_dllib err_missing
+usedprims lib lib_g lib_linkall lib_cstuff lib_custom lib_of_lib link_lib link_lib_unused link_lib_dllib err_missing
 err_notobj err_order err_dup err_noimpl err_inconsistent err_prim err_wrongname err_dll err_lib_missing custom
 custom_stub camlprimc output_c output_obj output_complete_obj output_complete_exe output_complete_exe_stub
 make_runtime custom_unix cfile_only cfile_o lib_stub_dll"
