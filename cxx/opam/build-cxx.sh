@@ -35,13 +35,19 @@ zstd_libs() { sed -n 's/^ZSTD_LIBS=//p' "$root/Makefile.config"; }
 cmake_zstd_args() {
   if [ -n "$(zstd_libs)" ]; then
     # the SHARED library, the one the OCaml runtime loads: the same
-    # compressor code, hence the same bytes
-    inc=$(pkg-config --variable=includedir libzstd 2>/dev/null || echo /usr/include)
-    lib=$(pkg-config --variable=libdir libzstd 2>/dev/null || echo /usr/lib)
-    [ -f "$inc/zstd.h" ] || die "this OCaml compresses with zstd but zstd.h is not in $inc (install libzstd's development files)"
-    so=""
-    for c in "$lib/libzstd.so" "$lib/libzstd.so.1"; do [ -e "$c" ] && { so=$c; break; }; done
-    [ -n "$so" ] || die "no shared libzstd in $lib"
+    # compressor code, hence the same bytes.  pkg-config if present, else
+    # wherever the C compiler finds them.
+    cc=${CC:-cc}
+    if command -v pkg-config >/dev/null && pkg-config --exists libzstd; then
+      inc=$(pkg-config --variable=includedir libzstd)
+      so="$(pkg-config --variable=libdir libzstd)/libzstd.so"
+    else
+      inc=$(printf '#include <zstd.h>\n' | "$cc" -E -x c - 2>/dev/null |
+            sed -n 's|^# [0-9]* "\(.*\)/zstd\.h".*|\1|p' | head -1)
+      so=$("$cc" -print-file-name=libzstd.so)
+    fi
+    [ -n "$inc" ] && [ -f "$inc/zstd.h" ] || die "this OCaml compresses with zstd but zstd.h was not found (install libzstd's development files)"
+    [ -e "$so" ] || die "this OCaml compresses with zstd but the shared libzstd was not found"
     echo "-DCPPCAML_ZSTD=ON -DZSTD_INCLUDE_DIR=$inc -DZSTD_LIBRARY=$so"
   else
     echo "-DCPPCAML_ZSTD=OFF"
@@ -82,9 +88,10 @@ do_build() {
   [ -x "$sbin/ocamlc.opt" ] || die "the staged installation has no bin/ocamlc.opt"
   # 3. c++ocamlc for this installation
   INSTALL="$sp" "$root/cxx/harness/gen_driver_tables.sh"
-  # shellcheck disable=SC2046
+  zstd_args=$(cmake_zstd_args) || exit 1
+  # shellcheck disable=SC2086
   cmake -S "$root/cxx" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_CXX_COMPILER="$CXX" $mi_args $(cmake_zstd_args) >/dev/null
+    -DCMAKE_CXX_COMPILER="$CXX" $mi_args $zstd_args >/dev/null
   ninja -C "$build" -j "$jobs" c++ocamlc
   new="$build/c++ocamlc"
   # 4. the checks, in the stage
