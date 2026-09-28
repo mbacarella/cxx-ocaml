@@ -111,12 +111,9 @@ build: [
   [make "-j%{jobs}%"]
   [make "INSTALL_MODE=opam" "install"]
   # c++ocamlc as the switch's ocamlc (cxx/INSTALL.md)
-  ["sh" "cxx/opam/build-cxx.sh" "build" jobs] {ocaml-option-cxx:installed}
+  ["sh" "cxx/opam/build-cxx.sh" prefix jobs] {ocaml-option-cxx:installed}
 ]
-install: [
-  ["sh" "./%{name}%-fixup.sh" prefix]
-  ["sh" "cxx/opam/build-cxx.sh" "install" prefix jobs] {ocaml-option-cxx:installed}
-]
+install: ["sh" "./%{name}%-fixup.sh" prefix]
 depopts: [
   "ocaml-option-32bit"
   "ocaml-option-afl"
