@@ -4,6 +4,7 @@
 // operator precedence, validated against `ocamlc -dparsetree`.
 #include "cppcaml/parser.hpp"
 
+#include <cctype>
 #include <optional>
 #include <unordered_set>
 #include <utility>
@@ -1438,8 +1439,9 @@ class Parser {
         ExprBox th = parse_expr_no_seq();
         std::optional<ExprBox> el;
         if (cur().kind == Kind::ELSE) { advance(); el = parse_expr_no_seq(); }
-        Position end = el ? (*el)->loc.end : th->loc.end;
-        Location l = span(position(t.start), end);
+        // $endpos of the last branch: its last token, a trailing `[@attr]`
+        // included (which does not extend the branch expression's own loc)
+        Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
         return wrap_ext(E({Pexp_ifthenelse{std::move(c), std::move(th), std::move(el)}, l}), std::move(ext), std::move(attrs));
       }
       case Kind::MATCH: {
@@ -1498,8 +1500,9 @@ class Parser {
         for (auto& p : params)
           if (!std::holds_alternative<Pparam_newtype>(p.desc)) all_newtype = false;
         // `fun params -> function cases` is one Pexp_function whose body is the
-        // Pfunction_cases directly (not a nested function under Pfunction_body).
-        if (!all_newtype && cur().kind == Kind::FUNCTION) {
+        // Pfunction_cases directly (not a nested function under Pfunction_body)
+        // -- newtype-only params included: mkfunction desugars Pfunction_body only.
+        if (cur().kind == Kind::FUNCTION) {
           const Token& fkw = cur(); advance();
           Attributes fnattrs;  // `function[@attr] …` — attaches to the Pfunction_cases
           while (cur().kind == Kind::LBRACKETAT) { advance(); fnattrs.push_back(parse_attribute_body()); }
@@ -1511,9 +1514,13 @@ class Parser {
                               span(position(t.start), last)}));
         }
         ExprBox body = parse_expr();
-        if (all_newtype) {
+        if (all_newtype) {  // mkghost_newtype_function_body
           ExprBox acc = std::move(body);
           Position bend = acc->loc.end;
+          if (fconstr) {  // the return constraint on the body, ghost at its location
+            Location cloc{acc->loc.start, acc->loc.end, /*ghost=*/true};
+            acc = E({Pexp_constraint{std::move(acc), std::move(std::get<Pconstraint>(*fconstr).type)}, cloc});
+          }
           for (int i = static_cast<int>(params.size()) - 1; i >= 0; --i) {
             auto& nt = std::get<Pparam_newtype>(params[i].desc);
             Position s = (i == 0) ? position(t.start) : nt.loc.start;  // outermost from `fun`
@@ -1810,6 +1817,7 @@ class Parser {
     else if (cur().kind == Kind::LIDENT && peek(1).kind == Kind::COLON) {
       firstLabel = cur().text; advance(); advance();  // x :   (tentative tuple label)
     }
+    Position tuple_start = position(cur().start);  // $startpos of the tuple
     CoreTypeBox first = parse_type_app();
     std::vector<CoreTypeBox> elems;
     std::vector<std::optional<std::string>> labels;
@@ -1830,7 +1838,9 @@ class Parser {
     };
     auto build_dom = [&]() -> CoreTypeBox {
       if (!is_tuple) return std::move(elems[0]);
-      Location tl = span(elems.front()->loc.start, elems.back()->loc.end);
+      // mktyp ~loc:$sloc: the tuple's tokens, parentheses of its first /
+      // last element included (a parenthesized type keeps the inner loc)
+      Location tl = span(tuple_start, position(tokens_[idx_ - 1].end));
       clear_none(labels);
       return box(CoreType{Ptyp_tuple{std::move(elems), std::move(labels)}, tl});
     };
@@ -3701,16 +3711,37 @@ class Parser {
     return StructureItem{Pstr_eval{std::move(e), std::move(attrs)}, l};
   }
 
+  // single_attr_id: an identifier or any of these keywords (their text)
+  static std::optional<std::string> single_attr_id(const Token& t) {
+    switch (t.kind) {
+      case Kind::LIDENT: case Kind::UIDENT: return t.text;
+      case Kind::AND: case Kind::AS: case Kind::ASSERT: case Kind::BEGIN: case Kind::CLASS:
+      case Kind::CONSTRAINT: case Kind::DO: case Kind::DONE: case Kind::DOWNTO: case Kind::EFFECT:
+      case Kind::ELSE: case Kind::END: case Kind::EXCEPTION: case Kind::EXTERNAL: case Kind::FALSE:
+      case Kind::FOR: case Kind::FUN: case Kind::FUNCTION: case Kind::FUNCTOR: case Kind::IF:
+      case Kind::IN: case Kind::INCLUDE: case Kind::INHERIT: case Kind::INITIALIZER: case Kind::LAZY:
+      case Kind::LET: case Kind::MATCH: case Kind::METHOD: case Kind::MODULE: case Kind::MUTABLE:
+      case Kind::NEW: case Kind::NONREC: case Kind::OBJECT: case Kind::OF: case Kind::OPEN:
+      case Kind::OR: case Kind::PRIVATE: case Kind::REC: case Kind::SIG: case Kind::STRUCT:
+      case Kind::THEN: case Kind::TO: case Kind::TRUE: case Kind::TRY: case Kind::TYPE:
+      case Kind::VAL: case Kind::VIRTUAL: case Kind::WHEN: case Kind::WHILE: case Kind::WITH: {
+        std::string k(kind_name(t.kind));
+        for (char& c : k) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return k;
+      }
+      default: return std::nullopt;
+    }
+  }
+  // attr_id: single_attr_id (DOT single_attr_id)*
   std::string parse_attr_name() {
     const Token& first = cur();
-    if (first.kind != Kind::LIDENT && first.kind != Kind::UIDENT)
-      throw ParseError("expected attribute name", first.start);
+    std::optional<std::string> id = single_attr_id(first);
+    if (!id) throw ParseError("expected attribute name", first.start);
     advance();
-    std::string name = first.text;
-    while (cur().kind == Kind::DOT &&
-           (peek(1).kind == Kind::LIDENT || peek(1).kind == Kind::UIDENT)) {
+    std::string name = *id;
+    while (cur().kind == Kind::DOT && single_attr_id(peek(1))) {
       advance();
-      name += "." + cur().text;
+      name += "." + *single_attr_id(cur());
       advance();
     }
     return name;
