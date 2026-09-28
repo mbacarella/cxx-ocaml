@@ -328,9 +328,14 @@ class Reader {
   }
 
   Attributes attributes(std::size_t id) {
+    // one attribute per marshaled block, whatever list it is reached from
+    // (Subst's List.filter builds new lists of the same attributes)
     return list<const Attribute*>(id, [&](std::size_t a) -> const Attribute* {
-      std::size_t nm = f(a, 0);  // string loc = {txt; loc}
-      return make<Attribute>(str(f(nm, 0)), loc(f(nm, 1)), ovalue(f(a, 1)), loc(f(a, 2)));
+      return attr_.get_or(a, [&] {
+        std::size_t nm = f(a, 0);  // string loc = {txt; loc}
+        return static_cast<const Attribute*>(
+            make<Attribute>(str(f(nm, 0)), loc(f(nm, 1)), ovalue(f(a, 1)), loc(f(a, 2))));
+      });
     });
   }
 
@@ -755,11 +760,16 @@ class Reader {
     switch (tag(id)) {
       case 0: {
         k.kind = ValueKind::Kind::Val_prim;
+        // one description per marshaled block: input_value keeps a
+        // description reached twice (a signature's value copied by Subst
+        // keeps its val_kind) one object, which the writers share
         std::size_t p = f(id, 0);
-        k.prim = make<PrimitiveDescription>(
-            str(f(p, 0)), ival(f(p, 1)), boolean(f(p, 2)), str(f(p, 3)),
-            list<NativeRepr>(f(p, 4), [&](std::size_t x) { return native_repr(x); }),
-            native_repr(f(p, 5)));
+        k.prim = prim_.get_or(p, [&] {
+          return static_cast<const PrimitiveDescription*>(make<PrimitiveDescription>(
+              str(f(p, 0)), ival(f(p, 1)), boolean(f(p, 2)), str(f(p, 3)),
+              list<NativeRepr>(f(p, 4), [&](std::size_t x) { return native_repr(x); }),
+              native_repr(f(p, 5))));
+        });
         break;
       }
       case 1:
@@ -919,6 +929,8 @@ class Reader {
   FlatMemo<const void*, 19> repr_obj_{slots_};
   FlatMemo<const void*, 20> optstr_obj_{slots_};
   FlatMemo<ListMemo, 21> list_memo_{slots_};
+  FlatMemo<const PrimitiveDescription*, 22> prim_{slots_};
+  FlatMemo<const Attribute*, 23> attr_{slots_};
 };
 
 

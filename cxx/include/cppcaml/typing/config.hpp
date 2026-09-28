@@ -23,8 +23,13 @@ const std::string& version();
 // (standard_library is $OCAMLLIB, else $CAMLLIB, else the default)
 extern std::string standard_library_default;
 extern std::string standard_library;
-// the configured standard_library_default (config_table.inc)
+// the configured standard_library_default (config_table.inc); configured
+// --with-relative-libdir (standard_library_relative non-empty), resolved
+// against the compiler's own directory as caml_locate_standard_library does
+// (config.common.ml's stdlib_dirs), which also sets relative_root_dir
 std::string configured_standard_library_default();
+// Config.bindir: relative_root_dir when configured --with-relative-libdir
+const std::string& resolved_bindir();
 // Config.interface_suffix (-intf-suffix)
 extern std::string interface_suffix;
 inline const char* default_executable_name = "a.out";

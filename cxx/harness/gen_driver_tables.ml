@@ -67,9 +67,15 @@ let () =
       let str n v = Printf.printf "inline const std::string %s = \"%s\";\n" n (esc v)
       and bool n v = Printf.printf "inline constexpr bool %s = %b;\n" n v
       and int n v = Printf.printf "inline constexpr long %s = %d;\n" n v in
-      str "bindir" Config.bindir;
-      (* (config.common.ml's "." rule is applied by config.hpp) *)
-      str "target_bindir_raw" Config.target_bindir;
+      (* configured --with-relative-libdir, Config.bindir is the directory the
+         running compiler resolved the stdlib from (relative_root_dir):
+         config.cpp recomputes it for c++ocamlc ("" here) *)
+      str "bindir" (if Config.standard_library_relative = None then Config.bindir else "");
+      (* config.common.ml's "." rule (Filename.dirname Sys.executable_name)
+         is applied by config.cpp: recover the "." this generator saw resolved *)
+      str "target_bindir_raw"
+        (if Config.target_bindir = Filename.dirname Sys.executable_name
+         then Filename.current_dir_name else Config.target_bindir);
       str "ccomp_type" Config.ccomp_type;
       str "c_compiler" Config.c_compiler;
       str "c_output_obj" Config.c_output_obj;

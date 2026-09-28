@@ -901,7 +901,7 @@ void to_file(std::FILE* outchan, std::string_view filename, std::string_view mod
   long size_hint = static_cast<long>(buf.size()) - pos_hint;
 
   Values w;
-  V cu_name = w.str(modname);
+  V cu_name = w.str(uid::unit_name_string(modname));  // Unit_info.modname: the one string
   std::vector<V> relocs;
   for (const Reloc& r : em.reloc_info) {
     V info;
