@@ -13,6 +13,8 @@ verified against ocamlc oracles).  c++ocamlc type-checks every unit, writes
 the port's .cmi and generates code from the port's typed tree; the old
 approximating typers and translator and the legacy .cmi code
 (`cxx/src/cmi.cpp`) are deleted; `-pack` is Bytepackager's port.
+`cxx/INSTALL.md`: an opam switch whose `ocamlc` is c++ocamlc
+(`ocaml-option-cxx`).
 
 ## AI contribution policy
 
