@@ -35,29 +35,14 @@ class Zone {
   // transparent huge pages (Free unmaps it)
   static char* huge_block(std::size_t sz);
 
+  // (the bump is inlined at every allocation; a new block is out of line)
   void* alloc(std::size_t n, std::size_t align) {
-    // new char[] storage is aligned for any fundamental type, so a fresh
-    // block starts at offset 0 for every alignment we allocate.
-    static_assert(alignof(std::max_align_t) >= 8);
     std::size_t off = (off_ + align - 1) & ~(align - 1);
-    if (!cur_ || off + n > cap_) {
-      // a zone that has grown takes big blocks backed by huge pages (the
-      // typing data's TLB misses); a small one stays in small blocks
-      bool big = blocks_.size() >= kSmallBlocks;
-      std::size_t unit = big ? kBigBlock : kBlock;
-      std::size_t sz = n > unit ? n : unit;
-      block_bytes() += sz;
-      char* blk = big ? huge_block(sz) : static_cast<char*>(std::malloc(sz));
-      if (!blk) throw std::bad_alloc();
-      blocks_.emplace_back(blk, Free{big ? sz : 0});
-      cur_ = blk;
-      ranges_.emplace(cur_, sz);
-      cap_ = sz;
-      off = 0;
+    if (cur_ && off + n <= cap_) [[likely]] {
+      off_ = off + n;
+      return cur_ + off;
     }
-    void* p = cur_ + off;
-    off_ = off + n;
-    return p;
+    return alloc_block(n);
   }
 
   template <class T, class... A>
@@ -95,6 +80,21 @@ class Zone {
     off_ = 0;
   }
 
+  // A zone allocating only from [base, base + cap) (a .cmi image being
+  // recorded, cmi_image.hpp): past it, alloc throws RegionFull.
+  struct RegionFull {};
+  void use_region(char* base, std::size_t cap) {
+    cur_ = base;
+    cap_ = cap;
+    off_ = 0;
+    fixed_ = true;
+    ranges_.emplace(base, cap);
+  }
+  std::size_t region_used() const { return off_; }
+  // [base, base + n) is zone storage from now on (a mapped .cmi image): its
+  // strings are borrowed, not copied (zborrow).
+  void adopt(const char* base, std::size_t n) { ranges_.emplace(base, n); }
+
   // whether [p] points into this zone's storage
   bool owns(const char* p) const {
     auto it = ranges_.upper_bound(p);
@@ -113,6 +113,27 @@ class Zone {
   }
 
  private:
+  // A fresh block for an allocation of [n] bytes (malloc'd and huge-page
+  // storage is aligned for any fundamental type, so it starts at offset 0
+  // whatever the alignment); a fixed region has no more.
+  [[gnu::noinline]] void* alloc_block(std::size_t n) {
+    static_assert(alignof(std::max_align_t) >= 8);
+    if (fixed_) throw RegionFull{};
+    // a zone that has grown takes big blocks backed by huge pages (the
+    // typing data's TLB misses); a small one stays in small blocks
+    bool big = blocks_.size() >= kSmallBlocks;
+    std::size_t unit = big ? kBigBlock : kBlock;
+    std::size_t sz = n > unit ? n : unit;
+    block_bytes() += sz;
+    char* blk = big ? huge_block(sz) : static_cast<char*>(std::malloc(sz));
+    if (!blk) throw std::bad_alloc();
+    blocks_.emplace_back(blk, Free{big ? sz : 0});
+    cur_ = blk;
+    ranges_.emplace(cur_, sz);
+    cap_ = sz;
+    off_ = n;
+    return cur_;
+  }
   static constexpr std::size_t kBlock = 1 << 20;
   static constexpr std::size_t kBigBlock = 8 << 20;
   static constexpr std::size_t kSmallBlocks = 8;
@@ -124,6 +145,7 @@ class Zone {
   std::map<const char*, std::size_t> ranges_;  // block start -> size
   char* cur_ = nullptr;
   std::size_t cap_ = 0, off_ = 0;
+  bool fixed_ = false;
   std::vector<std::pair<void*, void (*)(void*)>> dtors_;
 };
 

@@ -1,6 +1,7 @@
 #include <sys/mman.h>
 // Port of typing/types.ml.  See types.hpp.
 #include "cppcaml/typing/types.hpp"
+#include "cppcaml/typing/cmi_image.hpp"
 
 #include <algorithm>
 #include <map>
@@ -224,25 +225,39 @@ std::vector<t> unknown_signature(bool injective, long arity) {
 namespace types {
 
 // ---- singletons ------------------------------------------------------------
-static const Tnil g_tnil{{DescKind::Tnil}};
-static Commutable g_cok{Commutable::Kind::Cok, nullptr};
-static Commutable g_cunknown{Commutable::Kind::Cunknown, nullptr};
-static FieldKind g_fkprivate{FieldKind::Kind::FKprivate, nullptr};
-static FieldKind g_fkpublic{FieldKind::Kind::FKpublic, nullptr};
-static FieldKind g_fkabsent{FieldKind::Kind::FKabsent, nullptr};
-static const RowField g_rfabsent{RowField::Kind::RFabsent};
-static const RowField g_rfnone{RowField::Kind::RFnone};
-static const AbbrevMemo g_mnil{AbbrevMemo::Kind::Mnil};
+// In the pinned region (a fixed address): the objects a .cmi decodes to
+// point at them, and cmi_image.hpp maps such objects back into later
+// processes unrelocated.
+// All in one record at the start of the region, so that each has the same
+// address in every process (allocated on first use, whatever static
+// initializer asks first).
+namespace {
+struct Singletons {
+  Tnil tnil{{DescKind::Tnil}};
+  Commutable cok{Commutable::Kind::Cok, nullptr};
+  Commutable cunknown{Commutable::Kind::Cunknown, nullptr};
+  FieldKind fkprivate{FieldKind::Kind::FKprivate, nullptr};
+  FieldKind fkpublic{FieldKind::Kind::FKpublic, nullptr};
+  FieldKind fkabsent{FieldKind::Kind::FKabsent, nullptr};
+  RowField rfabsent{RowField::Kind::RFabsent};
+  RowField rfnone{RowField::Kind::RFnone};
+  AbbrevMemo mnil{AbbrevMemo::Kind::Mnil};
+};
+Singletons& singletons() {
+  static Singletons* const p = cmi_image::pinned_new<Singletons>();
+  return *p;
+}
+}  // namespace
 
-const TypeDesc* tnil() { return &g_tnil; }
-Commutable* cok() { return &g_cok; }
-Commutable* cunknown() { return &g_cunknown; }
-FieldKind* fkprivate() { return &g_fkprivate; }
-FieldKind* fkpublic() { return &g_fkpublic; }
-FieldKind* fkabsent() { return &g_fkabsent; }
-const RowField* rfabsent() { return &g_rfabsent; }
-const RowField* rfnone() { return &g_rfnone; }
-const AbbrevMemo* mnil() { return &g_mnil; }
+const TypeDesc* tnil() { return &singletons().tnil; }
+Commutable* cok() { return &singletons().cok; }
+Commutable* cunknown() { return &singletons().cunknown; }
+FieldKind* fkprivate() { return &singletons().fkprivate; }
+FieldKind* fkpublic() { return &singletons().fkpublic; }
+FieldKind* fkabsent() { return &singletons().fkabsent; }
+const RowField* rfabsent() { return &singletons().rfabsent; }
+const RowField* rfnone() { return &singletons().rfnone; }
+const AbbrevMemo* mnil() { return &singletons().mnil; }
 
 // ---- desc constructors ------------------------------------------------------
 const TypeDesc* tvar(OptStr name) { return make<Tvar>(TypeDesc{DescKind::Tvar}, name); }

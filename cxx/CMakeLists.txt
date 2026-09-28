@@ -160,7 +160,9 @@ add_library(cppcaml_core
   src/typing/typemod_pack.cpp
   src/typing/typecore_class.cpp
   src/typing/typeclass.cpp
-  src/typing/cmi_format.cpp)
+  src/typing/cmi_format.cpp
+  src/typing/cmi_marshal.cpp
+  src/typing/cmi_image.cpp)
 target_include_directories(cppcaml_core PUBLIC include)
 # The typing/ port initializes aggregates partially on purpose (an OCaml
 # constructor's unused fields stay defaulted).
@@ -211,7 +213,9 @@ target_link_libraries(c++ocamlc PRIVATE cppcaml_core)
 # A compiler process is short-lived and started once per unit: linking the
 # C++ runtime in saves the dynamic loader's symbol resolution (~0.3 ms of a
 # ~3 ms small-unit compile) and makes the binary self-contained.
-target_link_options(c++ocamlc PRIVATE -static-libstdc++ -static-libgcc)
+target_link_options(c++ocamlc PRIVATE -static-libstdc++ -static-libgcc
+  # a GNU build-id: the .cmi image cache is keyed by it (cmi_image.hpp)
+  -Wl,--build-id=sha1)
 
 # Stage-1 oracle for the typing/ port: dump a cmi's decoded Types graph
 # (compared against cxx/harness/typing_cmidump.ml).
