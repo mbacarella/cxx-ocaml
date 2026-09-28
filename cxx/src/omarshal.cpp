@@ -2,6 +2,12 @@
 #include <cstdlib>
 #include "cppcaml/omarshal.hpp"
 
+#include <new>
+#include <stdexcept>
+#ifdef CPPCAML_HAVE_ZSTD
+#include <zstd.h>
+#endif
+
 #include <cstdint>
 #include <cstring>
 #include <new>
@@ -126,6 +132,7 @@ struct Marshaler {
   // field may point back at the block itself (cycles).
   // (the index lives in the object itself, stamped with this session)
   std::uint32_t session;
+  bool compressed = false;  // absolute shared references (extern.c #4056)
   void byte(int b) { *room(1) = static_cast<std::uint8_t>(b); }
   void bytes(const std::string& s) {
     if (!s.empty()) std::memcpy(room(s.size()), s.data(), s.size());
@@ -167,7 +174,10 @@ struct Marshaler {
       return;
     }
     // a sharable object already serialized -> a back-reference (objs[nobjs-dist])
-    if (v->seen_session == session) { emit_shared(nobjs - v->seen_index); return; }
+    if (v->seen_session == session) {
+      emit_shared(compressed ? v->seen_index : nobjs - v->seen_index);
+      return;
+    }
     // An Int is an IMMEDIATE: it takes no object slot, so registering it would
     // file the NEXT object's index under it and a second use of the same
     // ValPtr would emit a back-reference to the wrong object.
@@ -218,11 +228,75 @@ struct Marshaler {
 };
 }  // namespace
 
-std::vector<std::uint8_t> marshal(const ValPtr& root) {
+namespace {
+// extern.c storevlq: base-128 digits, most significant first, all but the
+// last with the high bit set
+void storevlq(std::vector<std::uint8_t>& out, std::uint64_t n) {
+  int ndigits = 1;
+  for (std::uint64_t m = n >> 7; m != 0; m >>= 7) ndigits++;
+  std::size_t at = out.size();
+  out.resize(at + ndigits);
+  std::uint8_t* dst = out.data() + at + ndigits - 1;
+  *dst = n & 0x7F;
+  for (n >>= 7; n != 0; n >>= 7) *--dst = 0x80 | (n & 0x7F);
+}
+}  // namespace
+
+bool zstd_available() {
+#ifdef CPPCAML_HAVE_ZSTD
+  return true;
+#else
+  return false;
+#endif
+}
+
+std::vector<std::uint8_t> marshal(const ValPtr& root, bool compressed) {
   static std::uint32_t sessions = 0;
   Marshaler m;
   m.session = ++sessions;
+  m.compressed = compressed;
   m.emit(root);
+  if (compressed) {
+#ifdef CPPCAML_HAVE_ZSTD
+    // zstd.c caml_zstd_compress: a default context, the output streamed with
+    // ZSTD_e_continue, then ZSTD_e_end on no more input -- the frame carries no
+    // content size.  (zstd's output does not depend on how the input is split
+    // into extern.c's blocks.)
+    const std::uint8_t* src = m.out.data() + Marshaler::kHeader;
+    std::size_t uncompressed_len = m.len - Marshaler::kHeader;
+    ZSTD_CCtx* ctx = ZSTD_createCCtx();
+    if (!ctx) throw std::bad_alloc();
+    std::vector<std::uint8_t> body(ZSTD_compressBound(uncompressed_len) + 64);
+    ZSTD_outBuffer out{body.data(), body.size(), 0};
+    ZSTD_inBuffer in{src, uncompressed_len, 0};
+    while (in.pos < in.size) {
+      std::size_t rc = ZSTD_compressStream2(ctx, &out, &in, ZSTD_e_continue);
+      if (ZSTD_isError(rc)) { ZSTD_freeCCtx(ctx); throw std::runtime_error("output_value: compression error"); }
+      if (out.pos == out.size) { body.resize(body.size() * 2); out.dst = body.data(); out.size = body.size(); }
+    }
+    ZSTD_inBuffer none{nullptr, 0, 0};
+    for (;;) {
+      std::size_t rc = ZSTD_compressStream2(ctx, &out, &none, ZSTD_e_end);
+      if (ZSTD_isError(rc)) { ZSTD_freeCCtx(ctx); throw std::runtime_error("output_value: compression error"); }
+      if (rc == 0) break;
+      body.resize(body.size() * 2); out.dst = body.data(); out.size = body.size();
+    }
+    ZSTD_freeCCtx(ctx);
+    // the header in compressed format: magic, its own length, then the
+    // compressed and uncompressed lengths, the object count, size_32, size_64
+    std::vector<std::uint8_t> res = {0x84, 0x95, 0xA6, 0xBD, 0};
+    storevlq(res, out.pos);
+    storevlq(res, uncompressed_len);
+    storevlq(res, m.nobjs);
+    storevlq(res, m.w32);
+    storevlq(res, m.w64);
+    res[4] = static_cast<std::uint8_t>(res.size());
+    res.insert(res.end(), body.data(), body.data() + out.pos);
+    return res;
+#else
+    throw std::logic_error("omarshal: compressed output needs a c++ocamlc built with zstd");
+#endif
+  }
   std::vector<std::uint8_t> out = std::move(m.out);
   out.resize(m.len);
   std::uint8_t* h = out.data();

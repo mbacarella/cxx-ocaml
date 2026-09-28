@@ -23,6 +23,7 @@ inline constexpr bool target_win32 = false;
 inline constexpr bool windows_unicode = false;
 inline constexpr bool supports_shared_libraries = true;
 inline const std::string compression_c_libraries = "";
+inline constexpr bool compression_supported = false;
 inline constexpr bool suffixing = true;
 inline constexpr bool shebangscripts = true;
 inline constexpr bool flat_float_array = true;

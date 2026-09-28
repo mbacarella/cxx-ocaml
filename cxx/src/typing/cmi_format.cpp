@@ -5,6 +5,7 @@
 // ones are blocks tagged in declaration order, records and inline records are
 // blocks of their fields in order, `option` is 0 | Some = block tag 0.
 #include "cppcaml/typing/cmi_format.hpp"
+#include "cppcaml/typing/config.hpp"
 
 #include <fstream>
 #include <functional>
@@ -958,7 +959,7 @@ std::vector<std::uint8_t> marshal_debug_events(const std::vector<const instruct:
   EventWriter ew(w);
   std::vector<o::ValPtr> evs;
   for (const instruct::DebugEvent* ev : events) evs.push_back(ew.event(ev));
-  return o::marshal(o::vlist(evs));
+  return o::marshal(o::vlist(evs), config::compression_supported);  // Compression.output_value
 }
 
 const OValue* input_ovalue(const std::uint8_t* data, std::size_t len, std::size_t& off) {
@@ -999,7 +1000,7 @@ std::pair<std::string, std::string> output_cmi_bytes(const CmiInfos& cmi) {
   w.set_current_unit(cmi.cmi_name);
   o::ValPtr name = w.unit_name(cmi.cmi_name);
   o::ValPtr header = o::vblock(0, {name, w.signature(cmi.cmi_sign)});
-  std::vector<std::uint8_t> hbytes = o::marshal(header);
+  std::vector<std::uint8_t> hbytes = o::marshal(header, config::compression_supported);  // Compression.output_value
   std::string prefix(cmi_magic_number);
   prefix.append(reinterpret_cast<const char*>(hbytes.data()), hbytes.size());
   // Digest.BLAKE128.file filename, after the flush: the magic and the header

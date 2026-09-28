@@ -173,6 +173,19 @@ private:
 // 4-byte Marshal magic).  Returns the arena id of the decoded root and advances
 // `off` past the consumed value.  Multiple values can be read in sequence from
 // the same buffer by threading `off`.
+// A compressed marshaled value (magic 0x8495A6BD, Compression.output_value
+// on an OCaml with zstd; intern.c's parse_header): its header at data[off],
+// false when the value there is not compressed.  The payload is at
+// off + header_len, data_len bytes of a zstd frame.
+struct CompressedHeader {
+  std::size_t header_len, data_len, uncompressed_len, num_objects;
+};
+bool compressed_header(const std::uint8_t* data, std::size_t len, std::size_t off, CompressedHeader& h);
+// intern.c's caml_intern_decompress_input (zstd.c: ZSTD_decompress);
+// throws Error without zstd (a c++ocamlc built without CPPCAML_ZSTD)
+std::vector<std::uint8_t> decompress(const std::uint8_t* data, std::size_t len, std::size_t off,
+                                     const CompressedHeader& h);
+
 std::size_t read_value(const std::uint8_t* data, std::size_t len,
                        std::size_t& off, Arena& arena);
 

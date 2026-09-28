@@ -10,12 +10,12 @@
 # Files the oracle cannot compile stand-alone (multi-module tests, otherlibs
 # deps, intended type errors) or whose oracle binary times out are SKIPped.
 #
-# Usage: exec_parity.sh [N]      (JOBS=, CPP_TIMEOUT=, CACHE= overridable)
+# Usage: exec_parity.sh [N]      (JOBS=, CPP_TIMEOUT=, CACHE=, CPP= overridable)
 set -u
 SELF="$(readlink -f "$0")"
 cd "$(dirname "$SELF")/../.." || exit 1
 ROOT=$PWD
-CPP=$ROOT/cxx/build/c++ocamlc
+CPP="${CPP:-$ROOT/cxx/build/c++ocamlc}"
 RUN=$ROOT/runtime/ocamlrun
 JOBS="${JOBS:-4}"
 TIMEOUT="${CPP_TIMEOUT:-10}"

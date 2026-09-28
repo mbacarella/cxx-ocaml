@@ -98,6 +98,10 @@ let () =
       bool "windows_unicode" Config.windows_unicode;
       bool "supports_shared_libraries" Config.supports_shared_libraries;
       str "compression_c_libraries" Config.compression_c_libraries;
+      (* Compression.compression_supported: whether this installation's
+         runtime has zstd (caml_zstd_initialize) -- this generator runs on
+         it, so it answers as ocamlc would *)
+      bool "compression_supported" Compression.compression_supported;
       bool "suffixing" Config.suffixing;
       bool "shebangscripts" Config.shebangscripts;
       bool "flat_float_array" Config.flat_float_array;

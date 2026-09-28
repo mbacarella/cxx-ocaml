@@ -27,7 +27,8 @@ struct Node {
   std::uint8_t tag;   // Block
   std::uint32_t n;    // Block: fields; String: bytes; DoubleArray: elements
   std::uint64_t v;    // Int: value (a boxed-integer custom); Block: first field in the pool;
-                      // String / DoubleArray: offset in the input; Double: bits
+                      // String / DoubleArray: offset in the input (the top byte: 0,
+                      // or k for the k-th decompressed value's buffer); Double: bits
 };
 static_assert(sizeof(Node) == 16);
 
@@ -39,6 +40,14 @@ inline std::size_t node_index(Id id) { return static_cast<std::size_t>(id >> 1);
 class Graph {
  public:
   const std::uint8_t* data = nullptr;   // the input the strings point into
+  // the payloads of compressed values (Compression.output_value on an OCaml
+  // with zstd), decompressed: their strings' offsets carry the buffer's index
+  std::vector<std::vector<std::uint8_t>> owned;
+  static constexpr int kBufShift = 56;
+  const std::uint8_t* base(std::uint64_t v) const {
+    std::uint64_t k = v >> kBufShift;
+    return k ? owned[k - 1].data() : data;
+  }
   std::vector<Node> nodes;
   // the blocks' fields, contiguous per block (uninitialized storage, grown
   // before each value by the value's size: every field takes a byte)
@@ -55,7 +64,7 @@ class Graph {
   }
   const Node& node(Id id) const { return nodes[node_index(id)]; }
   std::string_view string(const Node& x) const {
-    return {reinterpret_cast<const char*>(data) + x.v, x.n};
+    return {reinterpret_cast<const char*>(base(x.v)) + (x.v & ((std::uint64_t{1} << kBufShift) - 1)), x.n};
   }
   double dbl(const Node& x) const {
     double d;

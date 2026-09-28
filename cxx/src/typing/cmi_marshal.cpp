@@ -50,6 +50,27 @@ class Decoder {
       : d_(data), len_(len), pos_(pos), g_(g) {}
 
   Id read_root() {
+    marshal::CompressedHeader ch;
+    if (marshal::compressed_header(d_, len_, pos_, ch)) {
+      // intern.c: the payload decompressed, then read with absolute shared
+      // references; its strings point into the graph's owned buffer
+      g_.owned.push_back(marshal::decompress(d_, len_, pos_, ch));
+      const std::vector<std::uint8_t>& buf = g_.owned.back();
+      std::size_t end = pos_ + ch.header_len + ch.data_len;
+      const std::uint8_t* d = d_;
+      std::size_t len = len_;
+      d_ = buf.data(); len_ = buf.size(); pos_ = 0;
+      compressed_ = true;
+      buf_tag_ = static_cast<std::uint64_t>(g_.owned.size()) << Graph::kBufShift;
+      if (ch.num_objects <= buf.size()) {
+        g_.nodes.reserve(g_.nodes.size() + ch.num_objects + 16);
+        objs_.reserve(ch.num_objects);
+      }
+      g_.reserve_fields(buf.size());
+      Id root = value();
+      d_ = d; len_ = len; pos_ = end; compressed_ = false; buf_tag_ = 0;
+      return root;
+    }
     std::uint32_t magic = u32();
     std::uint64_t data_len, num_objects;
     if (magic == MAGIC_SMALL) {
@@ -61,8 +82,6 @@ class Decoder {
       data_len = u64();
       num_objects = u64();
       (void)u64();
-    } else if (magic == MAGIC_COMPRESSED) {
-      throw Error("marshal: compressed values not supported yet");
     } else {
       throw Error("marshal: bad magic number");
     }
@@ -120,7 +139,7 @@ class Decoder {
 
   Id string(std::uint64_t n) {
     need(n);
-    Id id = new_node(Kind::String, 0, static_cast<std::uint32_t>(n), pos_);
+    Id id = new_node(Kind::String, 0, static_cast<std::uint32_t>(n), pos_ | buf_tag_);
     pos_ += n;
     return registered(id);
   }
@@ -137,7 +156,7 @@ class Decoder {
   }
   Id dbl_array(std::uint64_t n, bool little) {
     // registered before its elements, as the runtime allocates then fills
-    Id id = registered(new_node(Kind::DoubleArray, little ? 1 : 0, static_cast<std::uint32_t>(n), pos_));
+    Id id = registered(new_node(Kind::DoubleArray, little ? 1 : 0, static_cast<std::uint32_t>(n), pos_ | buf_tag_));
     need(n * 8);
     pos_ += n * 8;
     return id;
@@ -156,6 +175,10 @@ class Decoder {
     return id;
   }
   Id shared(std::uint64_t dist) {
+    if (compressed_) {  // intern.c: an absolute reference in the compressed format
+      if (dist >= objs_.size()) throw Error("marshal: shared back-reference out of range");
+      return objs_[dist];
+    }
     if (dist == 0 || dist > objs_.size()) throw Error("marshal: shared back-reference out of range");
     return objs_[objs_.size() - dist];
   }
@@ -189,7 +212,7 @@ class Decoder {
     }
     // a boxed integer reads as an integer; anything else as its raw bytes
     if (scalar) return registered(new_node(Kind::Int, 0, 0, static_cast<std::uint64_t>(val)));
-    return registered(new_node(Kind::String, 0, static_cast<std::uint32_t>(pos_ - start), start));
+    return registered(new_node(Kind::String, 0, static_cast<std::uint32_t>(pos_ - start), start | buf_tag_));
   }
 
   Id value() {
@@ -244,6 +267,8 @@ class Decoder {
   std::size_t pos_;
   Graph& g_;
   std::vector<Id> objs_;
+  bool compressed_ = false;
+  std::uint64_t buf_tag_ = 0;  // the current buffer's index, in a String's offset
 };
 
 }  // namespace

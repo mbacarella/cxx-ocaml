@@ -1,4 +1,8 @@
 #include "cppcaml/marshal.hpp"
+
+#ifdef CPPCAML_HAVE_ZSTD
+#include <zstd.h>
+#endif
 #include <cstdio>
 #include <cstdlib>
 
@@ -51,6 +55,19 @@ public:
       : data_(data), len_(len), pos_(off), arena_(arena) {}
 
   std::size_t read_root() {
+    CompressedHeader ch;
+    if (compressed_header(data_, len_, pos_, ch)) {
+      // intern.c: decompress, then read with absolute shared references
+      std::vector<std::uint8_t> buf = decompress(data_, len_, pos_, ch);
+      std::size_t end = pos_ + ch.header_len + ch.data_len;
+      const std::uint8_t* data = data_;
+      std::size_t len = len_;
+      data_ = buf.data(); len_ = buf.size(); pos_ = 0; data_end_ = buf.size();
+      compressed_ = true;
+      std::size_t root = read_value();
+      data_ = data; len_ = len; pos_ = end; compressed_ = false;
+      return root;
+    }
     parse_header();
     std::size_t root = read_value();
     pos_ = data_end_;  // skip any trailing padding the header accounted for
@@ -59,6 +76,8 @@ public:
 
   // Parse only the header and jump to the value's end, decoding nothing.
   std::size_t skip_root() {
+    CompressedHeader ch;
+    if (compressed_header(data_, len_, pos_, ch)) return pos_ = pos_ + ch.header_len + ch.data_len;
     parse_header();
     pos_ = data_end_;
     return pos_;
@@ -99,8 +118,6 @@ private:
       data_len = u64();
       (void)u64();  // num_objects
       (void)u64();  // size_64
-    } else if (magic == MAGIC_COMPRESSED) {
-      throw Error("marshal: compressed values not supported yet");
     } else {
       throw Error("marshal: bad magic number");
     }
@@ -186,6 +203,10 @@ private:
   }
 
   std::size_t shared(std::uint64_t dist) {
+    if (compressed_) {  // intern.c: an absolute reference in the compressed format
+      if (dist >= objs_.size()) throw Error("marshal: shared back-reference out of range");
+      return objs_[dist];
+    }
     if (dist == 0 || dist > objs_.size())
       throw Error("marshal: shared back-reference out of range");
     return objs_[objs_.size() - dist];
@@ -291,11 +312,53 @@ private:
   std::size_t len_;
   std::size_t pos_;
   std::size_t data_end_ = 0;
+  bool compressed_ = false;
   Arena& arena_;
   std::vector<std::size_t> objs_;
 };
 
 }  // namespace
+
+bool compressed_header(const std::uint8_t* data, std::size_t len, std::size_t off, CompressedHeader& h) {
+  if (off + 5 > len) return false;
+  std::uint32_t magic = (std::uint32_t(data[off]) << 24) | (std::uint32_t(data[off + 1]) << 16) |
+                        (std::uint32_t(data[off + 2]) << 8) | data[off + 3];
+  if (magic != MAGIC_COMPRESSED) return false;
+  std::size_t p = off + 4;
+  h.header_len = data[p++] & 0x3F;
+  auto vlq = [&]() -> std::uint64_t {  // intern.c readvlq
+    if (p >= len) throw Error("marshal: truncated compressed header");
+    std::uint8_t c = data[p++];
+    std::uint64_t n = c & 0x7F;
+    while (c & 0x80) {
+      if (p >= len) throw Error("marshal: truncated compressed header");
+      c = data[p++];
+      n = (n << 7) | (c & 0x7F);
+    }
+    return n;
+  };
+  h.data_len = vlq();
+  h.uncompressed_len = vlq();
+  h.num_objects = vlq();
+  (void)vlq();  // size_32
+  (void)vlq();  // size_64
+  if (off + h.header_len + h.data_len > len) throw Error("marshal: truncated compressed value");
+  return true;
+}
+
+std::vector<std::uint8_t> decompress(const std::uint8_t* data, std::size_t len, std::size_t off,
+                                     const CompressedHeader& h) {
+#ifdef CPPCAML_HAVE_ZSTD
+  (void)len;
+  std::vector<std::uint8_t> out(h.uncompressed_len);
+  std::size_t res = ZSTD_decompress(out.data(), out.size(), data + off + h.header_len, h.data_len);
+  if (ZSTD_isError(res) || res != h.uncompressed_len) throw Error("input_value: decompression error");
+  return out;
+#else
+  (void)data; (void)len; (void)off; (void)h;
+  throw Error("input_value: compressed object, cannot decompress");
+#endif
+}
 
 std::size_t read_value(const std::uint8_t* data, std::size_t len,
                        std::size_t& off, Arena& arena) {

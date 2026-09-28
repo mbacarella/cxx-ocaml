@@ -52,7 +52,7 @@ WORK=/tmp/dune_parity_work   # the one build directory both runs use
 mkdir -p "$OUT"
 ulimit -v 16000000
 # the structural .cmt dumper (shared with cmt_parity.sh)
-TOOLS=/tmp/cmt_parity_tools
+TOOLS="${TOOLS:-/tmp/cmt_parity_tools}"  # built with this tree's ocamlc.opt
 if [ ! -x "$TOOLS/cmtdump" ] || [ "$ROOT/cxx/harness/cmt/cmtdump.ml" -nt "$TOOLS/cmtdump" ]; then
   mkdir -p "$TOOLS"
   ( cd "$TOOLS" && cp "$ROOT/cxx/harness/cmt/cmtdump.ml" . &&

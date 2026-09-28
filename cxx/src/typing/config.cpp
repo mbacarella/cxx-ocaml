@@ -6,6 +6,13 @@
 #include <cstdlib>
 #include <iostream>
 
+// an installation whose runtime has zstd writes compressed .cmi / .cmt / debug
+// and hint sections (Compression.output_value): c++ocamlc must be able to
+#ifndef CPPCAML_HAVE_ZSTD
+static_assert(!cppcaml::typing::config::compression_supported,
+              "this installation's OCaml compresses with zstd: build c++ocamlc with CPPCAML_ZSTD");
+#endif
+
 namespace cppcaml::typing::config {
 
 namespace {

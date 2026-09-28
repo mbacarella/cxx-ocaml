@@ -13,6 +13,7 @@
 // (the toplevel's) are not ported.
 #include "cppcaml/flat_map.hpp"
 #include "cppcaml/typing/emitcode.hpp"
+#include "cppcaml/typing/config.hpp"
 #include "cppcaml/typing/location.hpp"
 
 #include <optional>
@@ -828,9 +829,13 @@ void output_binary_int(std::string& out, long n) {
   out.push_back(static_cast<char>((n >> 8) & 0xff));
   out.push_back(static_cast<char>(n & 0xff));
 }
-void output_value(std::string& out, const V& v) {
-  std::vector<std::uint8_t> bytes = o::marshal(v);
+void output_value(std::string& out, const V& v, bool compressed = false) {
+  std::vector<std::uint8_t> bytes = o::marshal(v, compressed);
   out.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+}
+// Compression.output_value
+void compressed_output_value(std::string& out, const V& v) {
+  output_value(out, v, config::compression_supported);
 }
 
 V reloc_info_value(Values& w, const Reloc& r) {
@@ -886,7 +891,7 @@ void to_file(std::FILE* outchan, std::string_view filename, std::string_view mod
     buf.append(reinterpret_cast<const char*>(ev_bytes.data()), ev_bytes.size());
     std::vector<V> dv;
     for (std::string& d : dirs) dv.push_back(o::vstr(std::move(d)));
-    output_value(buf, o::vlist(dv));
+    compressed_output_value(buf, o::vlist(dv));
     pos_debug = p;
     size_debug = static_cast<long>(buf.size()) - p;
   }
@@ -896,7 +901,7 @@ void to_file(std::FILE* outchan, std::string_view filename, std::string_view mod
     std::vector<V> hs;
     for (auto it = em.hints.rbegin(); it != em.hints.rend(); ++it)  // !hints
       hs.push_back(o::vblock(0, {hv.i(it->first), hv.optimization_hint(it->second)}));
-    output_value(buf, o::vlist(hs));
+    compressed_output_value(buf, o::vlist(hs));
   }
   long size_hint = static_cast<long>(buf.size()) - pos_hint;
 

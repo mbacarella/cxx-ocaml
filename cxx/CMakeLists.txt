@@ -170,6 +170,29 @@ file(GLOB CPPCAML_TYPING_SOURCES CONFIGURE_DEPENDS src/typing/*.cpp)
 set_source_files_properties(${CPPCAML_TYPING_SOURCES} src/tools/typing_dump_main.cpp
   PROPERTIES COMPILE_OPTIONS -Wno-missing-field-initializers)
 
+# zstd: Compression.output_value / input_value for an OCaml configured with
+# zstd (runtime/zstd.c).  Compressed output is only byte-identical with the
+# SAME libzstd version the installation's runtime links: point
+# CMAKE_PREFIX_PATH at it (searched first, per directory).  Without zstd,
+# c++ocamlc can serve only installations without it (config.cpp checks).
+option(CPPCAML_ZSTD "Link libzstd (compressed Marshal)" ON)
+if(CPPCAML_ZSTD)
+  # (not the host's /usr: its headers would mix another libc's into the
+  # toolchain's -- zstd comes from CMAKE_PREFIX_PATH, as mimalloc)
+  find_path(ZSTD_INCLUDE_DIR zstd.h NO_CMAKE_SYSTEM_PATH NO_SYSTEM_ENVIRONMENT_PATH
+            DOC "zstd header directory")
+  find_library(ZSTD_LIBRARY NAMES libzstd.a zstd NAMES_PER_DIR
+               NO_CMAKE_SYSTEM_PATH NO_SYSTEM_ENVIRONMENT_PATH DOC "libzstd")
+  if(ZSTD_INCLUDE_DIR AND ZSTD_LIBRARY)
+    message(STATUS "zstd: ${ZSTD_LIBRARY}")
+    target_include_directories(cppcaml_core PUBLIC ${ZSTD_INCLUDE_DIR})
+    target_link_libraries(cppcaml_core PUBLIC ${ZSTD_LIBRARY})
+    target_compile_definitions(cppcaml_core PUBLIC CPPCAML_HAVE_ZSTD=1)
+  else()
+    message(STATUS "zstd not found: compressed Marshal unsupported")
+  endif()
+endif()
+
 # mimalloc: statically link its malloc override into every tool that uses the
 # core library.  glibc malloc is the measured bottleneck (the compiler is
 # allocation-/data-cache bound); the override is ~9% faster on a full compiler

@@ -172,6 +172,25 @@ tree, that directory holding no stdlib, takes the stdlib next to it as
   (`cli_parity.sh` checks the refusals too.)
 - c++ocamlc's own: `-stdlib <dir>` (Config.standard_library, undocumented:
   the bootstrap harnesses build against a stdlib being built).
+- **Compressed Marshal (zstd).**  An OCaml configured with zstd writes its
+  `.cmi` header, `.cmt`, and the `.cmo` / `-pack` debug-event and hint
+  sections with `Compression.output_value` (runtime/extern.c's COMPRESSED
+  flag: absolute shared references, the body through ZSTD streaming, the
+  compressed header), and reads them back (the linker, the packager, the
+  .cmi reader).  c++ocamlc does the same when its installation's runtime
+  has zstd: `gen_driver_tables.sh` asks the generator it links against that
+  runtime (`Compression.compression_supported`) and records it in
+  config_link.inc; c++ocamlc links libzstd (`CPPCAML_ZSTD`, from
+  CMAKE_PREFIX_PATH -- the same libzstd version as the installation, or
+  the compressed bytes differ; config.cpp refuses to build a c++ocamlc
+  without zstd for an installation with it).  It reads compressed values
+  whatever its configuration.  `cxx/harness/zstd_reference.sh` builds a
+  zstd-configured reference worktree and a c++ocamlc for it; there, byte for
+  byte: .cmo probes 6530/6536 (and -g; the 2 .cmi leftovers), stdlib 72/72
+  (and -g), compiler .cmi 145/145, standalone .cmi 6534/6536, effid 139/139,
+  .cmt stdlib 72/72 / compiler 138+7 SHARING / probes 6462+72, packs 24/24
+  (-g, .cmt), link_parity 46 + 6 NONDET-OK, dune_parity 0 DIFF, exec
+  722/722, and the error / warning / -i / ppx / cli parities unchanged.
 - Development switches (environment, not ocamlc's): `CPPCAML_PROFILE=1`
   (phase timers on stderr; `cxx/harness/bench.sh PHASES=1` sums them),
   `CPPCAML_TYPECHECK_DEBUG=1` / `CPPCAML_REPORT_DEBUG=1` (the details of an

@@ -34,7 +34,7 @@ W="${W--w -a}"
 CPP="${CPP:-$ROOT/cxx/build-release/c++ocamlc}"
 REF="${REF:-$ROOT/ocamlc.opt}"
 OUT=/tmp/cmt_parity
-TOOLS=/tmp/cmt_parity_tools
+TOOLS="${TOOLS:-/tmp/cmt_parity_tools}"  # built with this tree's ocamlc.opt
 export FLAGS W CPP REF OUT TOOLS
 
 # judge KEY NAME: the worst of the unit's .cmt / .cmti ($OUT/KEY.o|c.ext)

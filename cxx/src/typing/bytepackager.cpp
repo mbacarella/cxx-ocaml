@@ -7,6 +7,7 @@
 // marshaling context: the packed descriptor shares strings exactly where
 // OCaml's does.
 #include "cppcaml/typing/bytepackager.hpp"
+#include "cppcaml/typing/config.hpp"
 
 #include <cstring>
 #include <filesystem>
@@ -515,9 +516,13 @@ void output_binary_int(std::string& out, long n) {
   out.push_back(static_cast<char>((n >> 8) & 0xff));
   out.push_back(static_cast<char>(n & 0xff));
 }
-void output_value(std::string& out, const V& v) {
-  std::vector<std::uint8_t> bytes = o::marshal(v);
+void output_value(std::string& out, const V& v, bool compressed = false) {
+  std::vector<std::uint8_t> bytes = o::marshal(v, compressed);
   out.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+}
+// Compression.output_value
+void compressed_output_value(std::string& out, const V& v) {
+  output_value(out, v, config::compression_supported);
 }
 
 // Build the .cmo file obtained by packaging the given .cmo files.
@@ -574,13 +579,13 @@ void package_object_files(std::vector<std::string>& files, const std::string& ta
   }
   long pos_debug = static_cast<long>(oc.size());
   if (clflags::debug && !st.events.empty()) {
-    output_value(oc, o::vlist(st.events));
+    compressed_output_value(oc, o::vlist(st.events));
     std::vector<V> dirs;
     for (const std::string& d : st.debug_dirs) dirs.push_back(o::vstr(d));
-    output_value(oc, o::vlist(dirs));
+    compressed_output_value(oc, o::vlist(dirs));
   }
   long pos_hint = static_cast<long>(oc.size());
-  if (!st.hints.empty()) output_value(oc, o::vlist(st.hints));
+  if (!st.hints.empty()) compressed_output_value(oc, o::vlist(st.hints));
   bool force_link = false;
   for (const Member& mb : members)
     if (!mb.intf && mb.int_field(cu_force_link)) force_link = true;

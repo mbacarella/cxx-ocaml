@@ -14,7 +14,7 @@
 #               built on demand -- delete the dir to force a rebuild)
 #   V=1         list every divergent module with its diff-line count
 set -u
-ROOT=/home/mbac/code/c++caml; cd "$ROOT"
+SELF="$(readlink -f "$0")"; ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"; cd "$ROOT" || exit 1
 RUN=$ROOT/runtime/ocamlrun; DUMP="$ROOT/runtime/ocamlrun $ROOT/tools/dumpobj -effid"
 OUR=$ROOT/cxx/build-release/c++ocamlc
 REF=${REF:-/tmp/effid_ref}

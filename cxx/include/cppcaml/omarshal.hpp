@@ -133,7 +133,12 @@ ValPtr vcustom2(std::string raw, long long bytes32, long long bytes64);
 ValPtr vlist(const std::vector<ValPtr>& xs);  // OCaml list (cons / [])
 
 // Serialize `root` to a complete marshaled blob (20-byte small header + body).
-std::vector<std::uint8_t> marshal(const ValPtr& root);
+// compressed: extern.c's COMPRESSED flag (Compression.output_value on an OCaml
+// with zstd): absolute shared references, the body through ZSTD streaming,
+// the compressed header (magic, header length, VLQ lengths / counts).
+std::vector<std::uint8_t> marshal(const ValPtr& root, bool compressed = false);
+// whether this c++ocamlc was built with libzstd (CPPCAML_ZSTD)
+bool zstd_available();
 
 }  // namespace cppcaml::omarshal
 

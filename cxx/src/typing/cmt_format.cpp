@@ -15,6 +15,7 @@
 // layout comes from Hashtbl.hash, ported: caml_hash).
 #include "cppcaml/flat_map.hpp"
 #include "cppcaml/typing/cmt_format.hpp"
+#include "cppcaml/typing/config.hpp"
 #include "cppcaml/typing/location.hpp"
 
 #include <unistd.h>
@@ -3340,7 +3341,7 @@ void save_cmt(const std::string& filename, std::string_view modname, const std::
                            occurrences_v,                                            // cmt_ident_occurrences
                        });
   out += cmt_magic_number;
-  std::vector<std::uint8_t> bytes = o::marshal(cmt);
+  std::vector<std::uint8_t> bytes = o::marshal(cmt, config::compression_supported);  // Compression.output_value
   out.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
   // Misc.output_to_file_via_temporary
   std::string tmp = filename + ".tmp";
