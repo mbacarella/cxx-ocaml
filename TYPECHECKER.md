@@ -177,7 +177,10 @@ tree, that directory holding no stdlib, takes the stdlib next to it as
   `CPPCAML_TYPECHECK_DEBUG=1` / `CPPCAML_REPORT_DEBUG=1` (the details of an
   internal failure / of an error reporter that raised),
   `CPPCAML_NO_FASTEXIT=1` (tear the process down normally instead of
-  `_exit`, e.g. for leak checkers).
+  `_exit`, e.g. for leak checkers), and the .cmi image cache's
+  `CPPCAML_CMI_CACHE` (`0` disables it, a directory relocates it),
+  `CPPCAML_CMI_CACHE_VERIFY`, `CPPCAML_CMI_CACHE_MAX`,
+  `CPPCAML_CMI_CACHE_DEBUG` (`typing/cmi_image.hpp`).
 
 ### `-bin-annot`: the .cmt / .cmti (Cmt_format)
 
@@ -251,6 +254,26 @@ with an AddressSanitizer build (sanitizer builds run on the thread's own
 stack) over the probes, the compiler and the testsuite.  The ported code
 also keeps OCaml's `try ... with Not_found` off the C++ exception path on
 hot lookups (the first port threw 1.4 M exceptions compiling typecore.ml).
+
+Loading .cmi files was half of a small unit's instructions (54% of a
+trivial one, 52% of typing/printtyp.ml): ocamlc.opt pays one C
+`input_value`, the port paid a generic Marshal decode and then the Reader.
+Two changes, no output change:
+- `cmi_marshal.{hpp,cpp}`: the Reader decodes from a lean graph (16-byte
+  nodes, immediate integers in the ids, strings as spans of the file,
+  reserved from the Marshal header), its memos one slot per node instead of
+  22 hash maps; with the Zone's bump allocation inlined, a cold `read_cmi`
+  takes 54% fewer instructions.
+- `cmi_image.{hpp,cpp}`: a decoded .cmi is cached as an image of its zone
+  objects, mapped back at the address it was recorded at (the singletons
+  its objects point at live at a pinned address) instead of decoded -- see
+  the header for the keys, the checks and CPPCAML_CMI_CACHE*.  Warm, a
+  trivial unit takes 46% fewer instructions than before either change,
+  printtyp.ml 55% fewer; wall time 6.9 -> 4.8 ms and 16.0 -> 10.5 ms.
+  bench.sh (2026-09-28, warm; main's binary in the same run): startup
+  0.84 -> 0.67, small 0.80 -> 0.62, compiler 0.82 -> 0.63, stdlib 0.77 ->
+  0.67; peak RSS of a trivial unit 32 -> 25 MB.  The gates run with the
+  cache off, cold and warm; DDC with it on.
 
 ## What counts as progress
 

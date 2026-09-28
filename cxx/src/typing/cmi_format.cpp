@@ -11,6 +11,7 @@
 #include <map>
 #include <tuple>
 #include <iterator>
+#include <type_traits>
 #include <unordered_map>
 
 #include <cstdio>
@@ -18,9 +19,11 @@
 #include "cppcaml/blake2.hpp"
 #include "cppcaml/marshal.hpp"
 #include "cppcaml/omarshal.hpp"
+#include "cppcaml/typing/cmi_image.hpp"
 #include "cppcaml/typing/env.hpp"
 #include "cppcaml/typing/instruct.hpp"
 
+#include "cmi_marshal.hpp"
 #include "cmi_writer.hpp"
 
 namespace cppcaml::typing::cmi_format {
@@ -43,33 +46,108 @@ namespace {
 
 struct Corrupt {};
 
+// The Reader's memos -- one decoded object per marshaled block and kind of
+// object -- in one slot per node of the graph: a node is decoded as one kind
+// of object, save rare cases (a payload's position record, also an OValue),
+// which go to an overflow map.  Values: at most 16 bytes, trivially copyable.
+class SlotTable {
+ public:
+  struct Slot {
+    alignas(8) unsigned char val[16];
+    std::uint8_t kind = 0;  // 0: empty
+  };
+  explicit SlotTable(std::size_t n) : slots(n) {}
+  std::vector<Slot> slots;
+};
+template <class V, std::uint8_t K>
+class FlatMemo {
+  static_assert(sizeof(V) <= 16 && std::is_trivially_copyable_v<V>);
+
+ public:
+  explicit FlatMemo(SlotTable& t) : t_(t) {}
+  bool get(std::size_t id, V& out) const {
+    if (!cmi_marshal::is_imm(id)) {
+      const SlotTable::Slot& sl = t_.slots[cmi_marshal::node_index(id)];
+      if (sl.kind == K) {
+        std::memcpy(&out, sl.val, sizeof(V));
+        return true;
+      }
+      if (sl.kind == 0) return false;
+    }
+    auto it = over_.find(id);
+    if (it == over_.end()) return false;
+    out = it->second;
+    return true;
+  }
+  void put(std::size_t id, const V& v) {
+    if (!cmi_marshal::is_imm(id)) {
+      SlotTable::Slot& sl = t_.slots[cmi_marshal::node_index(id)];
+      if (sl.kind == 0 || sl.kind == K) {
+        std::memcpy(sl.val, &v, sizeof(V));
+        sl.kind = K;
+        return;
+      }
+    }
+    over_[id] = v;
+  }
+  template <class F>
+  V get_or(std::size_t id, F&& make_value) {
+    V v;
+    if (get(id, v)) return v;
+    v = make_value();
+    put(id, v);
+    return v;
+  }
+  V must(std::size_t id) const {
+    V v;
+    if (!get(id, v)) throw std::out_of_range("cmi_format: memo");
+    return v;
+  }
+
+ private:
+  SlotTable& t_;
+  std::unordered_map<std::size_t, V> over_;
+};
+struct ListMemo {
+  const void* p;
+  std::size_t n;
+};
+// one identity token per marshaled block
+inline const void* new_identity() { return zone().alloc(1, 1); }
+
 class Reader {
  public:
-  explicit Reader(const m::Arena& a) : a_(a) {}
+  explicit Reader(const cmi_marshal::Graph& g) : g_(g), slots_(g.nodes.size()) {}
 
   // ---- primitive access ----
-  const m::Value& v(std::size_t id) const { return a_[id]; }
-  bool is_int(std::size_t id) const { return v(id).kind == m::Value::Kind::Int; }
+  bool is_int(std::size_t id) const {
+    return cmi_marshal::is_imm(id) || g_.node(id).kind == cmi_marshal::Kind::Int;
+  }
   long ival(std::size_t id) const {
-    if (!is_int(id)) throw Corrupt{};
-    return static_cast<long>(v(id).i);
+    if (cmi_marshal::is_imm(id)) return cmi_marshal::imm(id);
+    const cmi_marshal::Node& x = g_.node(id);
+    if (x.kind != cmi_marshal::Kind::Int) throw Corrupt{};
+    return static_cast<long>(static_cast<std::int64_t>(x.v));
   }
   unsigned tag(std::size_t id) const {
-    if (v(id).kind != m::Value::Kind::Block) throw Corrupt{};
-    return v(id).tag;
+    if (cmi_marshal::is_imm(id)) throw Corrupt{};
+    const cmi_marshal::Node& x = g_.node(id);
+    if (x.kind != cmi_marshal::Kind::Block) throw Corrupt{};
+    return x.tag;
   }
   std::size_t f(std::size_t id, std::size_t k) const {
-    const m::Value& x = v(id);
-    if (x.kind != m::Value::Kind::Block || k >= x.fields.size()) throw Corrupt{};
-    return x.fields[k];
+    if (cmi_marshal::is_imm(id)) throw Corrupt{};
+    const cmi_marshal::Node& x = g_.node(id);
+    if (x.kind != cmi_marshal::Kind::Block || k >= x.n) throw Corrupt{};
+    return g_.field(x.v + k);
   }
   // one copy per marshaled string: input_value's sharing (a string the
   // .cmi shares stays one string, which output_cmi shares again)
   std::string_view str(std::size_t id) {
-    if (v(id).kind != m::Value::Kind::String) throw Corrupt{};
-    if (auto it = str_.find(id); it != str_.end()) return it->second;
-    std::string_view s = zstr(v(id).str());
-    str_[id] = s;
+    if (cmi_marshal::is_imm(id) || g_.node(id).kind != cmi_marshal::Kind::String) throw Corrupt{};
+    if (std::string_view s; str_.get(id, s)) return s;
+    std::string_view s = zstr(g_.string(g_.node(id)));
+    str_.put(id, s);
     return s;
   }
   bool boolean(std::size_t id) const { return ival(id) != 0; }
@@ -79,8 +157,7 @@ class Reader {
   template <class T, class F>
   Slice<T> list(std::size_t id, F&& elt) {
     if (is_int(id)) return {};
-    if (auto it = list_memo_.find(id); it != list_memo_.end())
-      return Slice<T>{static_cast<const T*>(it->second.first), it->second.second};
+    if (ListMemo lm; list_memo_.get(id, lm)) return Slice<T>{static_cast<const T*>(lm.p), lm.n};
     std::size_t start = id;
     std::vector<T> out;
     while (!is_int(id)) {
@@ -88,7 +165,7 @@ class Reader {
       id = f(id, 1);
     }
     Slice<T> r = slice(out);
-    list_memo_[start] = {static_cast<const void*>(r.p), r.n};
+    list_memo_.put(start, ListMemo{static_cast<const void*>(r.p), r.n});
     return r;
   }
   template <class T, class F>
@@ -108,16 +185,15 @@ class Reader {
   }
   OptStr opt_str(std::size_t id) {
     if (is_int(id)) return OptStr::none();
-    auto [it, fresh] = optstr_obj_.try_emplace(id, nullptr);
-    if (fresh) it->second = zone().alloc(1, 1);
-    return OptStr{true, str(f(id, 0)), it->second};
+    const void* obj = optstr_obj_.get_or(id, new_identity);
+    return OptStr{true, str(f(id, 0)), obj};
   }
 
   // ---- Ident / Path ----
   ident::Unscoped* unscoped(std::size_t id) {
-    if (auto it = us_.find(id); it != us_.end()) return it->second;
+    if (ident::Unscoped* mv; us_.get(id, mv)) return mv;
     auto* u = make<ident::Unscoped>(ident::Unscoped::State::Udesc);
-    us_[id] = u;
+    us_.put(id, u);
     std::size_t st = f(id, 0);  // { mutable state }
     if (tag(st) == 0) {         // Udesc of desc
       std::size_t d = f(st, 0);
@@ -133,9 +209,9 @@ class Reader {
   // idents and paths are shared as input_value shares them: one object per
   // marshaled block (a cmi's Predef idents, its repeated paths)
   Ident::t ident(std::size_t id) {
-    if (auto it = ident_.find(id); it != ident_.end()) return it->second;
+    if (Ident::t mv; ident_.get(id, mv)) return mv;
     Ident::t r = ident_raw(id);
-    ident_[id] = r;
+    ident_.put(id, r);
     return r;
   }
   Ident::t ident_raw(std::size_t id) {
@@ -153,9 +229,9 @@ class Reader {
   }
 
   Path::t path(std::size_t id) {
-    if (auto it = path_.find(id); it != path_.end()) return it->second;
+    if (Path::t mv; path_.get(id, mv)) return mv;
     Path::t r = path_raw(id);
-    path_[id] = r;
+    path_.put(id, r);
     return r;
   }
   Path::t path_raw(std::size_t id) {
@@ -175,19 +251,19 @@ class Reader {
   // ---- support ----
   // one record per marshaled block, with its identity (support.hpp)
   Position position(std::size_t id) {
-    if (auto it = pos_.find(id); it != pos_.end()) return *it->second;
+    if (const Position* mv; pos_.get(id, mv)) return *mv;
     auto* p = make<Position>(Position{str(f(id, 0)), ival(f(id, 1)), ival(f(id, 2)), ival(f(id, 3))});
     p->obj = p;
-    pos_[id] = p;
+    pos_.put(id, p);
     return *p;
   }
   Location loc(std::size_t id) {
-    if (auto it = loc_.find(id); it != loc_.end()) return *it->second;
+    if (const Location* mv; loc_.get(id, mv)) return *mv;
     Position a = position(f(id, 0));
     Position e = position(f(id, 1));
     auto* l = make<Location>(Location{a, e, boolean(f(id, 2))});
     l->obj = l;
-    loc_[id] = l;
+    loc_.put(id, l);
     return *l;
   }
   Uid uid(std::size_t id) {
@@ -197,9 +273,7 @@ class Reader {
       return u;
     }
     // one identity per marshaled record (input_value's sharing)
-    auto [ot, fresh] = uid_obj_.try_emplace(id, nullptr);
-    if (fresh) ot->second = zone().alloc(1, 1);
-    u.obj = ot->second;
+    u.obj = uid_obj_.get_or(id, new_identity);
     switch (tag(id)) {
       case 0: u.kind = Uid::Kind::Compilation_unit; u.comp_unit = str(f(id, 0)); break;
       case 1:
@@ -225,24 +299,26 @@ class Reader {
   }
 
   const OValue* ovalue(std::size_t id) {
-    const m::Value& x = v(id);
+    if (cmi_marshal::is_imm(id)) return make<OValue>(OValue::Kind::Int, cmi_marshal::imm(id));
+    const cmi_marshal::Node& x = g_.node(id);
     switch (x.kind) {
-      case m::Value::Kind::Int: return make<OValue>(OValue::Kind::Int, (long)x.i);
-      case m::Value::Kind::String:
+      case cmi_marshal::Kind::Int:
+        return make<OValue>(OValue::Kind::Int, static_cast<long>(static_cast<std::int64_t>(x.v)));
+      case cmi_marshal::Kind::String:
         return make<OValue>(OValue::Kind::String, 0L, str(id));  // input_value's sharing
-      case m::Value::Kind::Double:
-        return make<OValue>(OValue::Kind::Double, 0L, std::string_view{}, x.d());
-      case m::Value::Kind::Block: {
-        if (auto it = ov_.find(id); it != ov_.end()) return it->second;
+      case cmi_marshal::Kind::Double:
+        return make<OValue>(OValue::Kind::Double, 0L, std::string_view{}, g_.dbl(x));
+      case cmi_marshal::Kind::Block: {
+        if (OValue* o; ov_.get(id, o)) return o;
         auto* o = make<OValue>(OValue::Kind::Block, 0L, std::string_view{}, 0.0, x.tag);
-        ov_[id] = o;
+        ov_.put(id, o);
         std::vector<const OValue*> fs;
-        for (std::size_t k = 0; k < x.fields.size(); ++k) fs.push_back(ovalue(x.fields[k]));
+        for (std::size_t k = 0; k < x.n; ++k) fs.push_back(ovalue(g_.field(x.v + k)));
         o->fields = slice(fs);
         if (x.tag == 0 && fs.size() == 4 && fs[0]->kind == OValue::Kind::String && fs[1]->kind == OValue::Kind::Int &&
             fs[2]->kind == OValue::Kind::Int && fs[3]->kind == OValue::Kind::Int) {
           (void)position(id);
-          o->pos = pos_.at(id);
+          o->pos = pos_.must(id);
         }
         return o;
       }
@@ -261,9 +337,9 @@ class Reader {
   // ---- type expressions ----
   Commutable* commu(std::size_t id) {
     if (is_int(id)) return ival(id) == 0 ? types::cok() : types::cunknown();
-    if (auto it = commu_.find(id); it != commu_.end()) return it->second;
+    if (Commutable* mv; commu_.get(id, mv)) return mv;
     auto* c = make<Commutable>(Commutable::Kind::Cvar, nullptr);
-    commu_[id] = c;
+    commu_.put(id, c);
     c->commu = commu(f(id, 0));
     return c;
   }
@@ -276,9 +352,9 @@ class Reader {
         default: return types::fkabsent();
       }
     }
-    if (auto it = fk_.find(id); it != fk_.end()) return it->second;
+    if (FieldKind* mv; fk_.get(id, mv)) return mv;
     auto* k = make<FieldKind>(FieldKind::Kind::FKvar, nullptr);
-    fk_[id] = k;
+    fk_.put(id, k);
     k->field_kind = field_kind(f(id, 0));
     return k;
   }
@@ -290,9 +366,9 @@ class Reader {
   }
 
   NameRef* name_ref(std::size_t id) {
-    if (auto it = nm_.find(id); it != nm_.end()) return it->second;
+    if (NameRef* mv; nm_.get(id, mv)) return mv;
     auto* r = make<NameRef>(nullptr);
-    nm_[id] = r;
+    nm_.put(id, r);
     r->contents = opt_ptr(f(id, 0), [&](std::size_t x) { return path_args(x); });
     return r;
   }
@@ -308,17 +384,17 @@ class Reader {
   }
 
   MemoRef* memo_ref(std::size_t id) {
-    if (auto it = memo_.find(id); it != memo_.end()) return it->second;
+    if (MemoRef* mv; memo_.get(id, mv)) return mv;
     auto* r = make<MemoRef>(types::mnil());
-    memo_[id] = r;
+    memo_.put(id, r);
     r->contents = memo(f(id, 0));
     return r;
   }
 
   RowFieldCell* row_cell(std::size_t id) {
-    if (auto it = cell_.find(id); it != cell_.end()) return it->second;
+    if (RowFieldCell* mv; cell_.get(id, mv)) return mv;
     auto* c = make<RowFieldCell>(types::rfnone());
-    cell_[id] = c;
+    cell_.put(id, c);
     c->contents = row_field(f(id, 0));
     return c;
   }
@@ -372,7 +448,7 @@ class Reader {
       if (ival(id) == 0) return types::tnil();
       throw Corrupt{};
     }
-    if (auto it = desc_.find(id); it != desc_.end()) return it->second;
+    if (const TypeDesc* mv; desc_.get(id, mv)) return mv;
     const TypeDesc* d = nullptr;
     switch (tag(id)) {
       case 0: d = types::tvar(opt_str(f(id, 0))); break;
@@ -431,15 +507,15 @@ class Reader {
       }
       default: throw Corrupt{};
     }
-    desc_[id] = d;
+    desc_.put(id, d);
     return d;
   }
 
   TypeExpr* ty(std::size_t id) {
-    if (auto it = ty_.find(id); it != ty_.end()) return it->second;
+    if (TypeExpr* mv; ty_.get(id, mv)) return mv;
     // transient_expr = { mutable desc; mutable level; mutable scope; id }
     auto* t = types::create_expr(nullptr, ival(f(id, 1)), ival(f(id, 2)), ival(f(id, 3)));
-    ty_[id] = t;
+    ty_.put(id, t);
     t->desc = desc(f(id, 0));
     return t;
   }
@@ -524,9 +600,7 @@ class Reader {
         if (is_int(r)) {
           k->record_repr.kind = ival(r) == 0 ? RK::Record_regular : RK::Record_float;
         } else {
-          auto [ot, fresh] = repr_obj_.try_emplace(r, nullptr);
-          if (fresh) ot->second = zone().alloc(1, 1);
-          k->record_repr.obj = ot->second;
+          k->record_repr.obj = repr_obj_.get_or(r, new_identity);
           switch (tag(r)) {
             case 0: k->record_repr.kind = RK::Record_unboxed;
                     k->record_repr.unboxed_inlined = boolean(f(r, 0)); break;
@@ -606,9 +680,9 @@ class Reader {
   }
 
   ClassSignature* class_sig(std::size_t id) {
-    if (auto it = csig_.find(id); it != csig_.end()) return it->second;
+    if (ClassSignature* mv; csig_.get(id, mv)) return mv;
     auto* c = make<ClassSignature>();
-    csig_[id] = c;
+    csig_.put(id, c);
     c->csig_self = ty(f(id, 0));
     c->csig_self_row = ty(f(id, 1));
     c->csig_dummy_method = field_kind(f(id, 2));
@@ -669,9 +743,7 @@ class Reader {
       }
     } else {
       n.kind = NativeRepr::Kind::Unboxed_integer;
-      auto [ot, fresh] = repr_obj_.try_emplace(id, nullptr);
-      if (fresh) ot->second = zone().alloc(1, 1);
-      n.obj = ot->second;
+      n.obj = repr_obj_.get_or(id, new_identity);
       n.bi = static_cast<BoxedInteger>(ival(f(id, 0)));
     }
     return n;
@@ -714,9 +786,7 @@ class Reader {
           mt->param.is_unit = false;
           mt->param.id = opt_ptr(f(p, 0), [&](std::size_t x) { return ident(x); });
           if (!is_int(f(p, 0))) {  // one identity per marshaled `Some` block
-            auto [ot, fresh] = some_obj_.try_emplace(f(p, 0), nullptr);
-            if (fresh) ot->second = zone().alloc(1, 1);
-            mt->param.some_obj = ot->second;
+            mt->param.some_obj = some_obj_.get_or(f(p, 0), new_identity);
           }
           mt->param.mty = module_type(f(p, 1));
         }
@@ -824,34 +894,31 @@ class Reader {
   }
 
  private:
-  const m::Arena& a_;
-  std::unordered_map<std::size_t, TypeExpr*> ty_;
-  std::unordered_map<std::size_t, const TypeDesc*> desc_;
-  std::unordered_map<std::size_t, Commutable*> commu_;
-  std::unordered_map<std::size_t, FieldKind*> fk_;
-  std::unordered_map<std::size_t, NameRef*> nm_;
-  std::unordered_map<std::size_t, MemoRef*> memo_;
-  std::unordered_map<std::size_t, RowFieldCell*> cell_;
-  std::unordered_map<std::size_t, ident::Unscoped*> us_;
-  std::unordered_map<std::size_t, ClassSignature*> csig_;
-  std::unordered_map<std::size_t, const OValue*> ov_;
-  std::unordered_map<std::size_t, std::string_view> str_;
-  std::unordered_map<std::size_t, Ident::t> ident_;
-  std::unordered_map<std::size_t, Path::t> path_;
-  std::unordered_map<std::size_t, const void*> uid_obj_;
-  std::unordered_map<std::size_t, const void*> some_obj_;
-  std::unordered_map<std::size_t, const void*> block_obj_;
+  const cmi_marshal::Graph& g_;
+  SlotTable slots_;
+  FlatMemo<TypeExpr*, 1> ty_{slots_};
+  FlatMemo<const TypeDesc*, 2> desc_{slots_};
+  FlatMemo<Commutable*, 3> commu_{slots_};
+  FlatMemo<FieldKind*, 4> fk_{slots_};
+  FlatMemo<NameRef*, 5> nm_{slots_};
+  FlatMemo<MemoRef*, 6> memo_{slots_};
+  FlatMemo<RowFieldCell*, 7> cell_{slots_};
+  FlatMemo<ident::Unscoped*, 8> us_{slots_};
+  FlatMemo<ClassSignature*, 9> csig_{slots_};
+  FlatMemo<OValue*, 10> ov_{slots_};
+  FlatMemo<std::string_view, 11> str_{slots_};
+  FlatMemo<Ident::t, 12> ident_{slots_};
+  FlatMemo<Path::t, 13> path_{slots_};
+  FlatMemo<const void*, 14> uid_obj_{slots_};
+  FlatMemo<const void*, 15> some_obj_{slots_};
+  FlatMemo<const void*, 16> block_obj_{slots_};
   // one identity per marshaled block
-  const void* block_identity(std::size_t id) {
-    auto [it, fresh] = block_obj_.try_emplace(id, nullptr);
-    if (fresh) it->second = zone().alloc(1, 1);
-    return it->second;
-  }
-  std::unordered_map<std::size_t, const Position*> pos_;
-  std::unordered_map<std::size_t, const Location*> loc_;
-  std::unordered_map<std::size_t, const void*> repr_obj_;
-  std::unordered_map<std::size_t, const void*> optstr_obj_;
-  std::unordered_map<std::size_t, std::pair<const void*, std::size_t>> list_memo_;
+  const void* block_identity(std::size_t id) { return block_obj_.get_or(id, new_identity); }
+  FlatMemo<const Position*, 17> pos_{slots_};
+  FlatMemo<const Location*, 18> loc_{slots_};
+  FlatMemo<const void*, 19> repr_obj_{slots_};
+  FlatMemo<const void*, 20> optstr_obj_{slots_};
+  FlatMemo<ListMemo, 21> list_memo_{slots_};
 };
 
 
@@ -883,10 +950,9 @@ std::vector<std::uint8_t> marshal_debug_events(const std::vector<const instruct:
 }
 
 const OValue* input_ovalue(const std::uint8_t* data, std::size_t len, std::size_t& off) {
-  m::Arena arena;
-  std::size_t root = m::read_value(data, len, off, arena);
-  arena.finalize();
-  Reader r(arena);
+  cmi_marshal::Graph graph;
+  std::size_t root = cmi_marshal::read_value(data, len, off, graph);
+  Reader r(graph);
   try {
     return r.ovalue(root);
   } catch (const Corrupt&) {
@@ -966,7 +1032,50 @@ std::string output_cmi(const std::string& filename, const CmiInfos& cmi) {
   return crc;
 }
 
+namespace {
+// read_cmi's decoding of the file's bytes (after its magic)
+CmiInfos decode_cmi(const std::vector<std::uint8_t>& bytes, std::size_t magic_size, const std::string& filename) {
+  try {
+    cmi_marshal::Graph graph;
+    std::size_t off = magic_size;
+    std::size_t header = cmi_marshal::read_value(bytes.data(), bytes.size(), off, graph);
+    std::size_t crcs = cmi_marshal::read_value(bytes.data(), bytes.size(), off, graph);
+    std::size_t flags = cmi_marshal::read_value(bytes.data(), bytes.size(), off, graph);
+    Reader r(graph);
+    CmiInfos ci;
+    ci.cmi_name = r.str(r.f(header, 0));
+    ci.cmi_sign = r.signature(r.f(header, 1));
+    ci.cmi_crcs = r.list_vec<std::pair<std::string, std::optional<std::string>>>(
+        crcs, [&](std::size_t e) {
+          std::pair<std::string, std::optional<std::string>> p;
+          p.first = std::string(r.str(r.f(e, 0)));
+          std::size_t d = r.f(e, 1);
+          if (!r.is_int(d)) p.second = std::string(r.str(r.f(d, 0)));
+          return p;
+        });
+    ci.cmi_flags = r.list_vec<PersFlag>(flags, [&](std::size_t x) {
+      PersFlag pf{PersFlag::Kind::Rectypes};
+      if (r.is_int(x)) {
+        pf.kind = r.ival(x) == 0 ? PersFlag::Kind::Rectypes : PersFlag::Kind::Opaque;
+      } else {
+        pf.kind = PersFlag::Kind::Alerts;
+        pf.alerts = StrMap<std::string_view>(r.strmap<std::string_view>(
+            r.f(x, 0), [&](std::size_t s) { return r.str(s); }));
+      }
+      return pf;
+    });
+    return ci;
+  } catch (const Corrupt&) {
+    throw Error(Error::Kind::Corrupted_interface, filename);
+  } catch (const m::Error&) {
+    throw Error(Error::Kind::Corrupted_interface, filename);
+  }
+}
+}  // namespace
+
 CmiInfos read_cmi(const std::string& filename) {
+  // a decoded image of this very file, mapped (cmi_image.hpp)
+  if (std::optional<CmiInfos> ci = cmi_image::load(filename)) return std::move(*ci);
   // the whole file in one read (a .cmi is read on every unit's startup)
   std::vector<std::uint8_t> bytes;
   {
@@ -998,42 +1107,12 @@ CmiInfos read_cmi(const std::string& filename) {
                   buffer < magic ? "an older" : "a newer");
     throw Error(Error::Kind::Not_an_interface, filename);
   }
-  try {
-    m::Arena arena;
-    std::size_t off = magic.size();
-    std::size_t header = m::read_value(bytes.data(), bytes.size(), off, arena);
-    std::size_t crcs = m::read_value(bytes.data(), bytes.size(), off, arena);
-    std::size_t flags = m::read_value(bytes.data(), bytes.size(), off, arena);
-    arena.finalize();
-    Reader r(arena);
-    CmiInfos ci;
-    ci.cmi_name = r.str(r.f(header, 0));
-    ci.cmi_sign = r.signature(r.f(header, 1));
-    ci.cmi_crcs = r.list_vec<std::pair<std::string, std::optional<std::string>>>(
-        crcs, [&](std::size_t e) {
-          std::pair<std::string, std::optional<std::string>> p;
-          p.first = std::string(r.str(r.f(e, 0)));
-          std::size_t d = r.f(e, 1);
-          if (!r.is_int(d)) p.second = std::string(r.str(r.f(d, 0)));
-          return p;
-        });
-    ci.cmi_flags = r.list_vec<PersFlag>(flags, [&](std::size_t x) {
-      PersFlag pf{PersFlag::Kind::Rectypes};
-      if (r.is_int(x)) {
-        pf.kind = r.ival(x) == 0 ? PersFlag::Kind::Rectypes : PersFlag::Kind::Opaque;
-      } else {
-        pf.kind = PersFlag::Kind::Alerts;
-        pf.alerts = StrMap<std::string_view>(r.strmap<std::string_view>(
-            r.f(x, 0), [&](std::size_t s) { return r.str(s); }));
-      }
-      return pf;
-    });
-    return ci;
-  } catch (const Corrupt&) {
-    throw Error(Error::Kind::Corrupted_interface, filename);
-  } catch (const m::Error&) {
-    throw Error(Error::Kind::Corrupted_interface, filename);
-  }
+  // decoded into an image recorded for the next compilations, when possible
+  if (std::optional<CmiInfos> ci = cmi_image::record(filename, bytes.size(), [&] {
+        return decode_cmi(bytes, magic.size(), filename);
+      }))
+    return std::move(*ci);
+  return decode_cmi(bytes, magic.size(), filename);
 }
 
 }  // namespace cppcaml::typing::cmi_format
