@@ -231,9 +231,9 @@ class TreeWriter {
     switch (l->kind) {
       case Longident::Kind::Lident: return o::vblock(0, {w_.str(l->s)});
       case Longident::Kind::Ldot:
-        return o::vblock(1, {o::vblock(0, {lid(l->l1), loc(l->l1_loc)}), o::vblock(0, {w_.str(l->s), loc(l->s_loc)})});
+        return o::vblock(1, {o::vblock(0, {lid(l->l1), loc(l->l1_loc())}), o::vblock(0, {w_.str(l->s), loc(l->s_loc())})});
       case Longident::Kind::Lapply:
-        return o::vblock(2, {o::vblock(0, {lid(l->l1), loc(l->l1_loc)}), o::vblock(0, {lid(l->l2), loc(l->l2_loc)})});
+        return o::vblock(2, {o::vblock(0, {lid(l->l1), loc(l->l1_loc())}), o::vblock(0, {lid(l->l2), loc(l->l2_loc())})});
     }
     return w_.i(0);
   }
@@ -2335,13 +2335,13 @@ class OccIndexer {
       case Longident::Kind::Ldot:
         if (scraped_path->kind == Path::Kind::Pdot) {
           reduce_and_store(ns, env, lid, path);
-          index_components(NS::Module, env, OccLid{lid.txt, 1, lid.txt->l1, lid.txt->l1_loc}, scraped_path->p1);
+          index_components(NS::Module, env, OccLid{lid.txt, 1, lid.txt->l1, lid.txt->l1_loc()}, scraped_path->p1);
         }
         break;
       case Longident::Kind::Lapply:
         if (scraped_path->kind == Path::Kind::Papply) {
-          index_components(NS::Module, env, OccLid{lid.txt, 2, lid.txt->l2, lid.txt->l2_loc}, scraped_path->p2);
-          index_components(NS::Module, env, OccLid{lid.txt, 1, lid.txt->l1, lid.txt->l1_loc}, scraped_path->p1);
+          index_components(NS::Module, env, OccLid{lid.txt, 2, lid.txt->l2, lid.txt->l2_loc()}, scraped_path->p2);
+          index_components(NS::Module, env, OccLid{lid.txt, 1, lid.txt->l1, lid.txt->l1_loc()}, scraped_path->p1);
         }
         break;
       case Longident::Kind::Lident: reduce_and_store(ns, env, lid, path); break;
@@ -3141,10 +3141,10 @@ class OccWriter {
     switch (l->kind) {
       case Longident::Kind::Lident: v = o::vblock(0, {w_.str(l->s)}); break;
       case Longident::Kind::Ldot:
-        v = o::vblock(1, {lid_rec(OccLid{l, 1, l->l1, l->l1_loc}), component(l)});
+        v = o::vblock(1, {lid_rec(OccLid{l, 1, l->l1, l->l1_loc()}), component(l)});
         break;
       case Longident::Kind::Lapply:
-        v = o::vblock(2, {lid_rec(OccLid{l, 1, l->l1, l->l1_loc}), lid_rec(OccLid{l, 2, l->l2, l->l2_loc})});
+        v = o::vblock(2, {lid_rec(OccLid{l, 1, l->l1, l->l1_loc()}), lid_rec(OccLid{l, 2, l->l2, l->l2_loc()})});
         break;
     }
     lids_[l] = v;
@@ -3153,7 +3153,7 @@ class OccWriter {
   V component(Longident::t l) {  // Ldot's `string loc`
     auto key = std::make_pair(static_cast<const void*>(l), 3);
     if (auto it = recs_.find(key); it != recs_.end()) return it->second;
-    V v = o::vblock(0, {w_.str(l->s), w_.loc(l->s_loc)});
+    V v = o::vblock(0, {w_.str(l->s), w_.loc(l->s_loc())});
     recs_[key] = v;
     return v;
   }

@@ -86,7 +86,7 @@ std::optional<Doc> spellcheck(const Extract& extract, env::t env, Longident::t l
     case Longident::Kind::Lident: return misc::did_you_mean(misc::spellcheck(extract(nullptr, env), lid->s));
     case Longident::Kind::Ldot: {
       Longident::t r = lid->l1;
-      Location rloc = lid->l1_loc;
+      Location rloc = lid->l1_loc();
       auto pp = [r, rloc](Formatter& ppf, const std::string& s) {
         misc::style::as_inline_code(pprintast::longident, ppf, Longident::ldot(r, rloc, s, location::none()));
       };

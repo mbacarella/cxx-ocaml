@@ -1,3 +1,4 @@
+#include <sys/mman.h>
 // Port of typing/types.ml.  See types.hpp.
 #include "cppcaml/typing/types.hpp"
 
@@ -17,6 +18,24 @@ void set_zone(Zone* z) { g_zone = z ? z : &g_default_zone; }
 ZoneScope::ZoneScope(Zone& z) : saved(g_zone) { g_zone = &z; }
 ZoneScope::~ZoneScope() { g_zone = saved; }
 const void* fresh_identity() { return zone().alloc(1, 1); }
+
+char* Zone::huge_block(std::size_t sz) {
+  constexpr std::size_t huge = 2 << 20;
+  // over-map by one huge page and trim to a 2 MiB-aligned [sz] span
+  void* m = ::mmap(nullptr, sz + huge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (m == MAP_FAILED) return nullptr;
+  char* base = static_cast<char*>(m);
+  char* p = reinterpret_cast<char*>((reinterpret_cast<std::uintptr_t>(base) + huge - 1) & ~(huge - 1));
+  if (p > base) ::munmap(base, p - base);
+  char* end = base + sz + huge;
+  if (end > p + sz) ::munmap(p + sz, end - (p + sz));
+  ::madvise(p, sz, MADV_HUGEPAGE);
+  return p;
+}
+void Zone::Free::operator()(char* p) const {
+  if (huge) ::munmap(p, huge);
+  else std::free(p);
+}
 
 // the OCaml unit a port file belongs to: its basename, a split of a large
 // module (typecore_exp.cpp, ctype_unify.cpp ...) counting as that module
@@ -279,17 +298,21 @@ struct Change {
     Ctype, Ccompress, Clevel, Cscope, Cname, Crow, Ckind, Ccommu, Cuniv, Cuident
   };
   Kind kind;
-  TypeExpr* ty = nullptr;
-  const TypeDesc* desc = nullptr;   // Ctype / Ccompress (old)
-  const TypeDesc* desc2 = nullptr;  // Ccompress (new)
-  long n = 0;                       // Clevel / Cscope
-  NameRef* name = nullptr;          // Cname
-  const PathArgs* name_old = nullptr;
-  RowFieldCell* row = nullptr;      // Crow
-  FieldKind* kind_ = nullptr;       // Ckind
-  Commutable* commu = nullptr;      // Ccommu
-  TyOptRef* univ = nullptr;         // Cuniv
-  TypeExpr* univ_old = nullptr;
+  TypeExpr* ty = nullptr;           // Ctype / Ccompress / Clevel / Cscope
+  union {                           // one per kind (the trail is long: keep it small)
+    const TypeDesc* desc = nullptr;  // Ctype / Ccompress (old)
+    long n;                          // Clevel / Cscope
+    NameRef* name;                   // Cname
+    RowFieldCell* row;               // Crow
+    FieldKind* kind_;                // Ckind
+    Commutable* commu;               // Ccommu
+    TyOptRef* univ;                  // Cuniv
+  };
+  union {
+    const TypeDesc* desc2 = nullptr;  // Ccompress (new)
+    const PathArgs* name_old;         // Cname
+    TypeExpr* univ_old;               // Cuniv
+  };
   ident::Unscoped::Change uident{};  // Cuident
 };
 
@@ -306,14 +329,32 @@ struct Changes {
 static const Changes g_unchanged{Changes::Kind::Unchanged};
 static const Changes g_invalid{Changes::Kind::Invalid};
 
+// The trail's entries live in their own zone: OCaml's GC reclaims those no
+// snapshot reaches; here, when the last live snapshot dies and the trail has
+// grown, its zone is dropped and the trail starts afresh (nothing can reach
+// the old entries: only the trail and the snapshots point into the zone).
+static std::unique_ptr<Zone> g_trail_zone = std::make_unique<Zone>();
+static std::size_t g_trail_entries = 0;
+
 // `trail = Local_store.s_table ref Unchanged`: a ref holding the current ref.
-static ChangesRef* g_trail = make<ChangesRef>(&g_unchanged);
+static ChangesRef* g_trail = g_trail_zone->make<ChangesRef>(&g_unchanged);
 
 static void log_change(const Change& ch) {
-  ChangesRef* r2 = make<ChangesRef>(&g_unchanged);
-  const Change* c = make<Change>(ch);
-  g_trail->contents = make<Changes>(Changes::Kind::Change, c, r2);
+  // no live snapshot: no backtrack nor undo_compress can reach this entry
+  if (Snapshot::live() == 0) return;
+  ChangesRef* r2 = g_trail_zone->make<ChangesRef>(&g_unchanged);
+  const Change* c = g_trail_zone->make<Change>(ch);
+  g_trail->contents = g_trail_zone->make<Changes>(Changes::Kind::Change, c, r2);
   g_trail = r2;
+  ++g_trail_entries;
+}
+
+Snapshot::~Snapshot() {
+  if (--live() == 0 && g_trail_entries > 4096) {
+    g_trail_zone = std::make_unique<Zone>();
+    g_trail = g_trail_zone->make<ChangesRef>(&g_unchanged);
+    g_trail_entries = 0;
+  }
 }
 
 static void log_uident(const ident::Unscoped::Change& c) {

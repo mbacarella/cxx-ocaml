@@ -578,9 +578,19 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
   auto t0 = clk::now();
   auto lap = [&](const char* what, clk::time_point& prev) {
     auto now = clk::now();
-    if (prof)
+    if (prof) {
       std::cerr << "  " << what << ": "
                 << std::chrono::duration<double, std::milli>(now - prev).count() << " ms\n";
+      // resident set and zone storage after the phase (not an "ms" line:
+      // bench.sh's phase sums skip it)
+      long pages = 0, resident = 0;
+      if (std::FILE* f = std::fopen("/proc/self/statm", "r")) {
+        if (std::fscanf(f, "%ld %ld", &pages, &resident) != 2) resident = 0;
+        std::fclose(f);
+      }
+      std::cerr << "  mem after " << what << ": rss " << resident * ::sysconf(_SC_PAGESIZE) / (1 << 20)
+                << " MB, zones " << cppcaml::typing::Zone::block_bytes() / (1 << 20) << " MB\n";
+    }
     prev = now;
   };
   // Compile_common.implementation's end: Builtin_attributes.warn_unused ();
@@ -616,6 +626,9 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
                                        // string of their own (Pparse's preprocessed input)
                                        std::string_view pos_name = cf::preprocessor ? ty::zstr(in_path) : src_name;
                                        ty::parsetree::Structure st = ty::parsetree::of_ast(structure, pos_name, dirfiles);
+                                       // the C++ parser's tree is not read again (Parsetree's is a
+                                       // copy in the zone): free it before typing
+                                       decltype(structure)().swap(structure);
                                        ty::cmt_format::set_comments(
                                            ty::parsetree::comments_of_ast(cppcaml::ast::last_comments(), pos_name, dirfiles));
                                        // an .ml without .mli: its .cmi is written here (Typemod)
@@ -1011,6 +1024,14 @@ void big_stack_entry() {
 // run_main on a kStackSize stack; falls back to the normal stack when the
 // reservation fails (e.g. a tight ulimit -v)
 int run_main_big_stack(int argc, char** argv) {
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+  // AddressSanitizer does not follow a swapcontext'd stack (it reports the
+  // deep recursions there as stack errors): run on the thread's own stack
+  // (`ulimit -s unlimited` for the deep ones)
+  return run_main(argc, argv);
+#endif
+#endif
   g_args = MainArgs{argc, argv, 0};
   void* mem = ::mmap(nullptr, kGuardSize + kStackSize, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);

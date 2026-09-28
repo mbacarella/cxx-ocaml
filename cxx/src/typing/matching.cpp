@@ -207,8 +207,35 @@ struct Head {
 };
 using HeadP = const Head*;
 
+// Heads are the pattern-match compiler's temporaries (the GC reclaims them
+// in ocamlc): each public entry point below opens a scratch zone for them,
+// dropped when the outermost one returns.  Nothing the compilation returns
+// points into a head (Lambda copies what it takes from one); Head.omega is
+// a process-long constant outside it.
+Zone* g_head_zone = nullptr;  // the scratch zone while an entry point runs
+struct HeadScope {
+  bool outer = false;
+  HeadScope() {
+    static Zone scratch;
+    if (!g_head_zone) {
+      g_head_zone = &scratch;
+      outer = true;
+    }
+  }
+  ~HeadScope() {
+    if (outer) {
+      g_head_zone->clear();
+      g_head_zone = nullptr;
+    }
+  }
+  HeadScope(const HeadScope&) = delete;
+  HeadScope& operator=(const HeadScope&) = delete;
+};
+bool g_head_permanent = false;  // Head.omega's creation: a process-long head
+Zone& head_zone() { return g_head_zone && !g_head_permanent ? *g_head_zone : zone(); }
+
 Head* head_of(Pat q, HK k) {
-  Head* h = make<Head>();
+  Head* h = head_zone().make<Head>();
   h->kind = k;
   h->pat_loc = q->pat_loc;
   h->pat_extra = q->pat_extra;
@@ -221,7 +248,10 @@ Head* head_of(Pat q, HK k) {
 HeadP head_omega() {
   static HeadP h = [] {
     ZoneScope perm(permanent_zone());
-    return head_of(omega(), HK::Any);
+    g_head_permanent = true;
+    HeadP r = head_of(omega(), HK::Any);
+    g_head_permanent = false;
+    return r;
   }();
   return h;
 }
@@ -370,7 +400,7 @@ std::vector<tt::RecordPatField> all_record_args(Slice<tt::RecordPatField> lbls) 
 HeadP expand_record_head(HeadP h) {
   if (h->kind != HK::Record) return h;
   if (h->lbls.empty()) fatal_error("Matching.expand_record_head");
-  Head* r = make<Head>(*h);
+  Head* r = head_zone().make<Head>(*h);
   auto lbl_all = h->lbls[0]->lbl_all;
   r->lbls.assign(lbl_all.begin(), lbl_all.end());
   return r;
@@ -3558,28 +3588,33 @@ lam do_for_multiple_match(scopes sc, const Location& loc, const std::vector<Iden
 
 lam for_function(scopes sc, const Location& loc, L::IntRef* repr, lam param, Slice<PatAction> pat_act_list,
                  typedtree::Partial partial) {
+  HeadScope heads;
   return compile_matching(sc, loc, Failer{Failer::K::Raise_match_failure, {}}, repr, param, pat_act_list, partial);
 }
 
 // In the following two cases, exhaustiveness info is not available!
 lam for_trywith(scopes sc, const Location& loc, lam param, Slice<PatAction> pat_act_list) {
+  HeadScope heads;
   // the failure action reraises without location information
   return compile_matching(sc, loc, Failer{Failer::K::Reraise_noloc, {param}}, nullptr, param, pat_act_list,
                           Partial::Partial);
 }
 
 lam for_handler(scopes sc, const Location& loc, lam param, lam cont, Slice<PatAction> pat_act_list) {
+  HeadScope heads;
   return compile_matching(sc, loc, Failer{Failer::K::Reperform_noloc, {param, cont}}, nullptr, param, pat_act_list,
                           Partial::Partial);
 }
 
 lam for_let(scopes sc, const Location& loc, lam param, const typedtree::Pattern* pat, lam body) {
+  HeadScope heads;
   return for_let_(sc, loc, param, pat, body);
 }
 
 // Easy case since variables are available
 lam for_tupled_function(scopes sc, const Location& loc, Slice<Ident::t> paraml, Slice<PatsAction> pats_act_list,
                         typedtree::Partial partial) {
+  HeadScope heads;
   Args args;
   for (Ident::t id : paraml) args.push_back(root_arg(L::lvar(id), LetKind::Strict));
   std::vector<InitialClause> rows;
@@ -3592,6 +3627,7 @@ lam for_tupled_function(scopes sc, const Location& loc, Slice<Ident::t> paraml, 
 }
 
 std::vector<const typedtree::Pattern*> flatten_pattern(long size, const typedtree::Pattern* p) {
+  HeadScope heads;
   if (auto* t = as<tt::Tpat_tuple>(p->pat_desc)) {
     Pats ps;
     for (auto& x : t->pats) ps.push_back(x.pat);
@@ -3605,6 +3641,7 @@ std::vector<const typedtree::Pattern*> flatten_pattern(long size, const typedtre
 // effect free.
 lam for_multiple_match(scopes sc, const Location& loc, Slice<lam> paraml, Slice<PatAction> pat_act_list,
                        typedtree::Partial partial) {
+  HeadScope heads;
   // param_to_var, List.map: left to right
   std::vector<std::pair<Ident::t, lam>> v_paraml;
   for (lam param : paraml) {
@@ -3621,6 +3658,7 @@ lam for_multiple_match(scopes sc, const Location& loc, Slice<lam> paraml, Slice<
 
 lam for_optional_arg_default(scopes sc, const Location& loc, const typedtree::Pattern* pat, lam default_arg,
                              Ident::t param, lam body) {
+  HeadScope heads;
   lam if_some = lprim(pfield(0, L::ImmediateOrPointer::Pointer, MutableFlag::Immutable), {L::lvar(param)},
                       loc_unknown());
   lam supplied_or_default = transl_match_on_option(L::lvar(param), loc_unknown(), if_some, default_arg);

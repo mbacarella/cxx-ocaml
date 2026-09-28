@@ -101,8 +101,34 @@ struct Head {
     return v->row;
   }
 };
+// Heads are temporaries (the GC reclaims them in ocamlc): the public entry
+// points below open a scratch zone for them, cleared when the outermost one
+// returns.  What the functions return is built in the current zone and
+// copies what it takes from a head; Head.omega is process-long.
+Zone* g_head_zone = nullptr;
+bool g_head_permanent = false;
+struct HeadScope {
+  bool outer = false;
+  HeadScope() {
+    static Zone scratch;
+    if (!g_head_zone) {
+      g_head_zone = &scratch;
+      outer = true;
+    }
+  }
+  ~HeadScope() {
+    if (outer) {
+      g_head_zone->clear();
+      g_head_zone = nullptr;
+    }
+  }
+  HeadScope(const HeadScope&) = delete;
+  HeadScope& operator=(const HeadScope&) = delete;
+};
+Zone& head_zone() { return g_head_zone && !g_head_permanent ? *g_head_zone : zone(); }
+
 Head* head_of(const tt::Pattern* q, HK k) {
-  Head* h = make<Head>();
+  Head* h = head_zone().make<Head>();
   h->kind = k;
   h->pat_loc = q->pat_loc;
   h->pat_extra = q->pat_extra;
@@ -114,7 +140,10 @@ Head* head_of(const tt::Pattern* q, HK k) {
 const Head* head_omega() {
   static const Head* h = [] {
     ZoneScope perm(permanent_zone());
-    return head_of(omega(), HK::Any);
+    g_head_permanent = true;
+    const Head* r = head_of(omega(), HK::Any);
+    g_head_permanent = false;
+    return r;
   }();
   return h;
 }
@@ -387,6 +416,7 @@ static bool compats_with(const std::function<bool(const ConstructorDescription*,
 }
 bool compat_with(const std::function<bool(const ConstructorDescription*, const ConstructorDescription*)>& equal,
                  const tt::Pattern* p, const tt::Pattern* q) {
+  HeadScope heads;
   const tt::PatternDesc* pd = p->pat_desc;
   const tt::PatternDesc* qd = q->pat_desc;
   // Variables match any value
@@ -568,7 +598,7 @@ const Head* discr_pat(const tt::Pattern* q0, const SMatrix<R>& pss) {
             if (l->lbl_pos == lbl->lbl_pos) present = true;
           if (!present) fields.insert(fields.begin(), lbl);
         }
-        Head* d = make<Head>(*head);
+        Head* d = head_zone().make<Head>(*head);
         d->lbls = fields;
         acc = d;
         continue;
@@ -589,6 +619,7 @@ std::pair<Pats, Pats> read_args(std::size_t n, const Pats& r) {
 }  // namespace
 
 Pats set_args(const tt::Pattern* q, const Pats& r) {
+  HeadScope heads;
   const tt::PatternDesc* d = q->pat_desc;
   auto cons = [](const tt::Pattern* p, const Pats& rest) {
     Pats out{p};
@@ -879,6 +910,7 @@ const tt::Pattern* pat_of_constrs(const Head* ex_pat0, const std::vector<const C
 }  // namespace
 
 std::vector<const tt::Pattern*> pats_of_type(env::t env, TypeExpr* ty) {
+  HeadScope heads;
   ctype::TypedeclExtraction te = ctype::extract_concrete_typedecl(env, ty);
   using TE = ctype::TypedeclExtraction::Kind;
   using TK = TypeKind::Kind;
@@ -933,6 +965,7 @@ std::vector<const ConstructorDescription*> get_variant_constructors(env::t env, 
 // Sends back a pattern that complements the given constructors used_constrs
 std::vector<const ConstructorDescription*> complete_constrs(
     env::t pat_env, const ConstructorDescription* c, const std::vector<const ConstructorDescription*>& used_constrs) {
+  HeadScope heads;
   std::vector<const ConstructorDescription*> constrs = get_variant_constructors(pat_env, c->cstr_res);
   // ConstructorSet: constructors compared by name
   auto used = [&](const ConstructorDescription* cnstr) {
@@ -1620,6 +1653,7 @@ Answer every_both(const std::vector<URow>& pss, const URow& qs, const tt::Patter
 
 // le_pat p q  means, forall V,  V matches q implies V matches p
 bool le_pat(const tt::Pattern* p, const tt::Pattern* q) {
+  HeadScope heads;
   const tt::PatternDesc* pd = p->pat_desc;
   const tt::PatternDesc* qd = q->pat_desc;
   if (pd->kind == PK::Tpat_var || pd->kind == PK::Tpat_any) return true;
@@ -1668,6 +1702,7 @@ bool le_pat(const tt::Pattern* p, const tt::Pattern* q) {
 }
 
 bool le_pats(const Pats& ps, const Pats& qs) {
+  HeadScope heads;
   for (std::size_t k = 0; k < ps.size() && k < qs.size(); ++k)
     if (!le_pat(ps[k], qs[k])) return false;
   return true;
@@ -1699,6 +1734,7 @@ std::vector<T> get_mins(const Le& le, const std::vector<T>& ps) {
 // raise Empty, when p and q are not compatible
 const tt::Pattern* lub(const tt::Pattern* p, const tt::Pattern* q);
 Pats lubs(const Pats& ps, const Pats& qs) {
+  HeadScope heads;
   Pats out;
   for (std::size_t k = 0; k < ps.size() && k < qs.size(); ++k) out.push_back(lub(ps[k], qs[k]));
   return out;
@@ -1718,6 +1754,7 @@ static const tt::Pattern* orlub(const tt::Pattern* p1, const tt::Pattern* p2, co
   }
 }
 const tt::Pattern* lub(const tt::Pattern* p, const tt::Pattern* q) {
+  HeadScope heads;
   const tt::PatternDesc* pd = p->pat_desc;
   const tt::PatternDesc* qd = q->pat_desc;
   if (auto* a = as<tt::Tpat_alias>(pd)) return lub(a->pat, q);
@@ -1805,6 +1842,7 @@ const tt::Pattern* lub(const tt::Pattern* p, const tt::Pattern* q) {
 
 // ---- exported variant closing ------------------------------------------------------------
 void pressure_variants(env::t env, const std::vector<const tt::Pattern*>& pats) {
+  HeadScope heads;
   std::vector<Pats> pss;
   for (auto* p : pats) pss.push_back({p, omega()});
   pressure_variants_(env, pss);
@@ -1923,6 +1961,7 @@ tt::Partial do_check_partial(const std::function<const tt::Pattern*(const tt::Pa
 // Exported unused clause check
 void check_unused(const std::function<const tt::Pattern*(bool refute, const tt::Pattern*)>& pred,
                   const std::vector<TypedCase>& casel) {
+  HeadScope heads;
   bool any_refute = false;
   for (auto& vc : casel) any_refute = any_refute || vc.needs_refute;
   if (!(warnings::is_active(warnings::Redundant_case) || any_refute)) return;
@@ -2093,6 +2132,7 @@ static void do_check_fragile(const Location& loc, const std::vector<TypedCase>& 
 
 tt::Partial check_partial(const std::function<const tt::Pattern*(const tt::Pattern*)>& pred, const Location& loc,
                           const std::vector<TypedCase>& casel) {
+  HeadScope heads;
   std::vector<Pats> pss = initial_matrix(casel);
   pss = get_mins<Pats>([](const Pats& a, const Pats& b) { return le_pats(a, b); }, pss);
   tt::Partial total = do_check_partial(pred, loc, casel, pss);
@@ -2427,6 +2467,7 @@ struct RhsIdents {
 }  // namespace
 
 void check_ambiguous_bindings(const std::vector<const tt::Case*>& cases) {
+  HeadScope heads;
   if (!warnings::is_active(57)) return;
   std::vector<Pats> ns;  // head first
   for (const tt::Case* c : cases) {

@@ -2753,7 +2753,7 @@ static std::pair<Path::t, ModuleComponents*> lookup_module_components(bool error
       return {path, data->mda_components};
     }
     case Longident::Kind::Ldot: {
-      auto [path, data] = lookup_dot_module(errors, use, loc, lid->l1, lid->l1_loc, lid->s, env);
+      auto [path, data] = lookup_dot_module(errors, use, loc, lid->l1, lid->l1_loc(), lid->s, env);
       return {path, data->mda_components};
     }
     case Longident::Kind::Lapply: {
@@ -2779,8 +2779,8 @@ static ApplyResult lookup_apply(bool errors, bool use, const Location& loc, Long
   std::vector<ArgInfo> args0;
   Longident::t f0_lid = lid0;
   while (f0_lid->kind == Longident::Kind::Lapply) {
-    auto [arg_path, arg_md] = lookup_module_(errors, use, f0_lid->l2_loc, f0_lid->l2, env);
-    args0.insert(args0.begin(), ArgInfo{f0_lid->l1, f0_lid->l1_loc, arg_path, arg_md->md_type});
+    auto [arg_path, arg_md] = lookup_module_(errors, use, f0_lid->l2_loc(), f0_lid->l2, env);
+    args0.insert(args0.begin(), ArgInfo{f0_lid->l1, f0_lid->l1_loc(), arg_path, arg_md->md_type});
     f0_lid = f0_lid->l1;
   }
   std::vector<std::pair<Path::t, const ModuleType*>> args_for_errors;
@@ -2812,7 +2812,7 @@ static std::pair<Path::t, const ModuleDeclaration*> lookup_module_(bool errors, 
       return {path, lz::force_module_decl(data->mda_declaration)};
     }
     case Longident::Kind::Ldot: {
-      auto [path, data] = lookup_dot_module(errors, use, loc, lid->l1, lid->l1_loc, lid->s, env);
+      auto [path, data] = lookup_dot_module(errors, use, loc, lid->l1, lid->l1_loc(), lid->s, env);
       return {path, lz::force_module_decl(data->mda_declaration)};
     }
     case Longident::Kind::Lapply: {
@@ -2846,7 +2846,7 @@ template <class X, class F>
 static std::pair<Path::t, X> lookup_dot_generic(bool errors, bool use, const Location& loc,
                                                 Longident::t lid, t env, F&& proj,
                                                 LookupError::Kind unbound) {
-  auto [p, comps] = lookup_structure_components(errors, use, lid->l1, lid->l1_loc, env);
+  auto [p, comps] = lookup_structure_components(errors, use, lid->l1, lid->l1_loc(), env);
   if (auto* x = proj(comps).find_opt(lid->s)) return {Path::pdot(p, lid->s), *x};
   may_lookup_error(errors, loc, env, lerr(unbound, lid));
 }
@@ -2858,7 +2858,7 @@ static Path::t lookup_module_path_(bool errors, bool use, const Location& loc, b
     case Longident::Kind::Lident:
       return lookup_ident_module(!(no_alias_deps && !load), errors, use, loc, lid->s, env).first;
     case Longident::Kind::Ldot:
-      return lookup_dot_module(errors, use, loc, lid->l1, lid->l1_loc, lid->s, env).first;
+      return lookup_dot_module(errors, use, loc, lid->l1, lid->l1_loc(), lid->s, env).first;
     case Longident::Kind::Lapply: {
       ApplyResult a = lookup_apply(errors, use, loc, lid, env);
       return Path::papply(a.f_path, a.arg);
@@ -2872,7 +2872,7 @@ static std::pair<Path::t, const ValueDescription*> lookup_value_(bool errors, bo
                                                                  Longident::t lid, t env) {
   if (lid->kind == Longident::Kind::Lident) return lookup_ident_value(errors, use, loc, lid->s, env);
   if (lid->kind == Longident::Kind::Ldot) {
-    auto [p, comps] = lookup_structure_components(errors, use, lid->l1, lid->l1_loc, env);
+    auto [p, comps] = lookup_structure_components(errors, use, lid->l1, lid->l1_loc(), env);
     if (auto* vda = comps->comp_values.find_opt(lid->s)) {
       Path::t path = Path::pdot(p, lid->s);
       use_value(use, loc, path, (*vda)->vda_description);
@@ -2955,7 +2955,7 @@ static std::vector<std::pair<const LabelDescription*, std::function<void()>>> lo
   if (lid->kind == Longident::Kind::Lident)
     return lookup_all_ident_labels(errors, use, loc, usage, lid->s, env);
   if (lid->kind == Longident::Kind::Ldot) {
-    auto [p, comps] = lookup_structure_components(errors, use, lid->l1, lid->l1_loc, env);
+    auto [p, comps] = lookup_structure_components(errors, use, lid->l1, lid->l1_loc(), env);
     const Slice<LabelData>* lbls = comps->comp_labels.find_opt(lid->s);
     if (!lbls || lbls->empty())
       may_lookup_error(errors, loc, env, lerr(LookupError::Kind::Unbound_label, lid));
@@ -2974,8 +2974,8 @@ lookup_all_constructors_(bool errors, bool use, const Location& loc, Constructor
   if (lid->kind == Longident::Kind::Ldot) {
     if (lid->l1->kind == Longident::Kind::Lident && lid->l1->s == "*predef*")
       // Hack to support compilation of default arguments
-      return lookup_all_ident_constructors(errors, use, lid->s_loc, usage, lid->s, initial());
-    auto [p, comps] = lookup_structure_components(errors, use, lid->l1, lid->l1_loc, env);
+      return lookup_all_ident_constructors(errors, use, lid->s_loc(), usage, lid->s, initial());
+    auto [p, comps] = lookup_structure_components(errors, use, lid->l1, lid->l1_loc(), env);
     const Slice<const ConstructorData*>* cstrs = comps->comp_constrs.find_opt(lid->s);
     if (!cstrs || cstrs->empty())
       may_lookup_error(errors, loc, env, lerr(LookupError::Kind::Unbound_constructor, lid));

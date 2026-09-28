@@ -671,9 +671,21 @@ void reset();
 
 // ---- backtracking ---------------------------------------------------------
 struct ChangesRef;
+// A snapshot of the trail.  The live ones are counted: OCaml's GC reclaims
+// the trail's entries no snapshot can reach, and with no snapshot live no
+// entry can ever be undone or walked -- the port then records none and
+// drops the trail's storage (types.cpp, log_change).
 struct Snapshot {
   ChangesRef* changes;
   long old;
+  Snapshot(ChangesRef* c, long o) : changes(c), old(o) { ++live(); }
+  Snapshot(const Snapshot& s) : changes(s.changes), old(s.old) { ++live(); }
+  Snapshot& operator=(const Snapshot& s) = default;
+  ~Snapshot();
+  static long& live() {
+    static long n = 0;
+    return n;
+  }
 };
 Snapshot snapshot();
 void backtrack(FnRef<void()> cleanup, Snapshot s);

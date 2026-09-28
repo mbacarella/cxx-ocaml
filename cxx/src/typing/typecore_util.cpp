@@ -1603,7 +1603,7 @@ std::vector<const LabelDescription*> disambiguate_lid_list(
   for (auto& lid : lids)
     if (lid.txt->kind == Longident::Kind::Ldot) {
       qual = lid.txt->l1;
-      qual_loc = lid.txt->l1_loc;
+      qual_loc = lid.txt->l1_loc();
       break;
     }
   std::vector<const LabelDescription*> out;

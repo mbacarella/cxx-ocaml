@@ -96,9 +96,9 @@ V lident(Longident::t l) {
   switch (l->kind) {
     case Longident::Kind::Lident: return B(0, {S(l->s)});
     case Longident::Kind::Ldot:
-      return B(1, {B(0, {lident(l->l1), loc(l->l1_loc)}), B(0, {S(l->s), loc(l->s_loc)})});
+      return B(1, {B(0, {lident(l->l1), loc(l->l1_loc())}), B(0, {S(l->s), loc(l->s_loc())})});
     case Longident::Kind::Lapply:
-      return B(2, {B(0, {lident(l->l1), loc(l->l1_loc)}), B(0, {lident(l->l2), loc(l->l2_loc)})});
+      return B(2, {B(0, {lident(l->l1), loc(l->l1_loc())}), B(0, {lident(l->l2), loc(l->l2_loc())})});
   }
   return I(0);
 }

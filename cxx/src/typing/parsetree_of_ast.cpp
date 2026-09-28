@@ -137,7 +137,7 @@ struct Conv {
     std::string_view m = l->l1->s;
     if (m != "Array" && m != "String") return l;
     std::string_view f = l->s == "get" || l->s == "set" ? ocaml_literal("parsing/parser.mly", l->s) : l->s;
-    return Longident::ldot(Longident::lident(ocaml_literal("parsing/parser.mly", m)), l->l1_loc, f, l->s_loc);
+    return Longident::ldot(Longident::lident(ocaml_literal("parsing/parser.mly", m)), l->l1_loc(), f, l->s_loc());
   }
   static std::string_view name(std::string_view s) {
     static const std::string_view lits[] = {"()", "[]", "::", "false", "true", "+", "+.", "+=", "-", "-.", "*",

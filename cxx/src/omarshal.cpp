@@ -1,8 +1,9 @@
 #include <cstdlib>
 #include "cppcaml/omarshal.hpp"
 
+#include <cstdint>
 #include <cstring>
-#include <unordered_map>
+#include <new>
 
 namespace cppcaml::omarshal {
 
@@ -14,6 +15,31 @@ namespace cppcaml::omarshal {
 // what a linked executable is compared on.
 constexpr std::uint32_t hdr_color() { return 3u << 8; }
 
+// ---- the values' arena ------------------------------------------------------
+void* arena_alloc(std::size_t n, std::size_t align) {
+  static char* cur = nullptr;
+  static std::size_t left = 0;
+  constexpr std::size_t kBlock = 1 << 20;
+  std::size_t pad = (align - reinterpret_cast<std::uintptr_t>(cur) % align) % align;
+  if (!cur || pad + n > left) {
+    std::size_t sz = n + align > kBlock ? n + align : kBlock;
+    cur = static_cast<char*>(std::malloc(sz));
+    if (!cur) throw std::bad_alloc();
+    left = sz;
+    pad = (align - reinterpret_cast<std::uintptr_t>(cur) % align) % align;
+  }
+  char* p = cur + pad;
+  cur = p + n;
+  left -= pad + n;
+  return p;
+}
+
+static Value* new_value(Value::K k) {
+  Value* v = new (arena_alloc(sizeof(Value), alignof(Value))) Value;
+  v->k = k;
+  return v;
+}
+
 // An int is an immediate, never shared: the small ones are allocated once.
 ValPtr vint(long long n) {
   constexpr long long lo = -256, hi = 4096;
@@ -21,31 +47,56 @@ ValPtr vint(long long n) {
     std::vector<ValPtr> v;
     v.reserve(hi - lo);
     for (long long k = lo; k < hi; ++k) {
-      auto x = std::make_shared<Value>();
-      x->k = Value::Int;
+      Value* x = new_value(Value::Int);
       x->i = k;
-      v.push_back(std::move(x));
+      v.push_back(ValPtr(x));
     }
     return v;
   }();
   if (n >= lo && n < hi) return small[static_cast<std::size_t>(n - lo)];
-  auto v = std::make_shared<Value>(); v->k = Value::Int; v->i = n; return v;
+  Value* v = new_value(Value::Int);
+  v->i = n;
+  return ValPtr(v);
 }
-ValPtr vstr(std::string s) { auto v = std::make_shared<Value>(); v->k = Value::Str; v->s = std::move(s); return v; }
-ValPtr vdbl(double d) { auto v = std::make_shared<Value>(); v->k = Value::Dbl; v->d = d; return v; }
+ValPtr vstr(std::string s) {
+  Value* v = new_value(Value::Str);
+  v->s = std::move(s);
+  return ValPtr(v);
+}
+ValPtr vdbl(double d) {
+  Value* v = new_value(Value::Dbl);
+  v->d = d;
+  return ValPtr(v);
+}
 ValPtr vblock(int tag, std::vector<ValPtr> f) {
-  auto v = std::make_shared<Value>(); v->k = Value::Block; v->tag = tag; v->fields = std::move(f); return v;
+  Value* v = new_value(Value::Block);
+  v->tag = tag;
+  v->fields = f;
+  return ValPtr(v);
+}
+ValPtr vblock(int tag, std::initializer_list<ValPtr> f) {
+  Value* v = new_value(Value::Block);
+  v->tag = tag;
+  v->fields = f;
+  return ValPtr(v);
 }
 ValPtr vdblarr(std::vector<double> ds) {
-  auto v = std::make_shared<Value>(); v->k = Value::DblArr; v->darr = std::move(ds); return v;
+  Value* v = new_value(Value::DblArr);
+  v->darr = ds;
+  return ValPtr(v);
 }
 ValPtr vcustom(std::string raw, long long data_bytes) {
-  auto v = std::make_shared<Value>(); v->k = Value::Custom; v->s = std::move(raw);
-  v->custom_bytes = data_bytes; return v;
+  Value* v = new_value(Value::Custom);
+  v->s = std::move(raw);
+  v->custom_bytes = data_bytes;
+  return ValPtr(v);
 }
 ValPtr vcustom2(std::string raw, long long bytes32, long long bytes64) {
-  auto v = std::make_shared<Value>(); v->k = Value::Custom; v->s = std::move(raw);
-  v->custom_bytes = bytes64; v->custom_bytes32 = bytes32; return v;
+  Value* v = new_value(Value::Custom);
+  v->s = std::move(raw);
+  v->custom_bytes = bytes64;
+  v->custom_bytes32 = bytes32;
+  return ValPtr(v);
 }
 ValPtr vlist(const std::vector<ValPtr>& xs) {
   ValPtr acc = vint(0);  // []
@@ -63,7 +114,8 @@ struct Marshaler {
   // type_expr graphs in a signature (otherwise type vars duplicate or recursive
   // types loop forever).  Registration happens BEFORE a block's fields so a
   // field may point back at the block itself (cycles).
-  std::unordered_map<const Value*, long long> seen;
+  // (the index lives in the object itself, stamped with this session)
+  std::uint32_t session;
   void byte(int b) { body.push_back((std::uint8_t)b); }
   void bytes(const std::string& s) { body.insert(body.end(), s.begin(), s.end()); }
   void be32(std::uint32_t n) { byte(n >> 24); byte(n >> 16); byte(n >> 8); byte(n); }
@@ -100,12 +152,14 @@ struct Marshaler {
       return;
     }
     // a sharable object already serialized -> a back-reference (objs[nobjs-dist])
-    if (auto it = seen.find(v.get()); it != seen.end()) { emit_shared(nobjs - it->second); return; }
+    if (v->seen_session == session) { emit_shared(nobjs - v->seen_index); return; }
     // An Int is an IMMEDIATE: it takes no object slot, so registering it would
     // file the NEXT object's index under it and a second use of the same
     // ValPtr would emit a back-reference to the wrong object.
-    if (v->k != Value::Int)
-      seen[v.get()] = nobjs;  // index assigned before this object's own nobjs++
+    if (v->k != Value::Int) {  // index assigned before this object's own nobjs++
+      v->seen_session = session;
+      v->seen_index = nobjs;
+    }
     switch (v->k) {
       case Value::Int: emit_int(v->i); return;
       case Value::Str: emit_str(v->s); return;
@@ -150,7 +204,9 @@ struct Marshaler {
 }  // namespace
 
 std::vector<std::uint8_t> marshal(const ValPtr& root) {
+  static std::uint32_t sessions = 0;
   Marshaler m;
+  m.session = ++sessions;
   m.emit(root);
   std::vector<std::uint8_t> out;
   auto be = [&](std::uint32_t n) { out.push_back(n >> 24); out.push_back(n >> 16); out.push_back(n >> 8); out.push_back(n); };

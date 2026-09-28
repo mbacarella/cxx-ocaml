@@ -1,6 +1,8 @@
 // Port of parsing/longident.ml for the typer.  See longident.hpp.
 #include "cppcaml/typing/longident.hpp"
 
+#include <new>
+
 namespace cppcaml::typing {
 
 using K = Longident::Kind;
@@ -8,10 +10,16 @@ using K = Longident::Kind;
 Longident::t Longident::lident(std::string_view s) { return make<Longident>(K::Lident, zborrow(s)); }
 Longident::t Longident::ldot(t prefix, const Location& prefix_loc, std::string_view s,
                              const Location& s_loc) {
-  return make<Longident>(K::Ldot, zborrow(s), s_loc, prefix, prefix_loc);
+  Location* locs = static_cast<Location*>(zone().alloc(2 * sizeof(Location), alignof(Location)));
+  new (locs) Location(prefix_loc);
+  new (locs + 1) Location(s_loc);
+  return make<Longident>(K::Ldot, zborrow(s), prefix, nullptr, locs);
 }
 Longident::t Longident::lapply(t f, const Location& f_loc, t a, const Location& a_loc) {
-  return make<Longident>(K::Lapply, std::string_view{}, Location{}, f, f_loc, a, a_loc);
+  Location* locs = static_cast<Location*>(zone().alloc(2 * sizeof(Location), alignof(Location)));
+  new (locs) Location(f_loc);
+  new (locs + 1) Location(a_loc);
+  return make<Longident>(K::Lapply, std::string_view{}, f, a, locs);
 }
 
 namespace longident {
@@ -88,14 +96,14 @@ int compare_poly(t a, t b) {
     case K::Lident: return cmp_str(a->s, b->s);
     case K::Ldot:
       if (int c = compare_poly(a->l1, b->l1)) return c;
-      if (int c = compare_location(a->l1_loc, b->l1_loc)) return c;
+      if (int c = compare_location(a->l1_loc(), b->l1_loc())) return c;
       if (int c = cmp_str(a->s, b->s)) return c;
-      return compare_location(a->s_loc, b->s_loc);
+      return compare_location(a->s_loc(), b->s_loc());
     case K::Lapply:
       if (int c = compare_poly(a->l1, b->l1)) return c;
-      if (int c = compare_location(a->l1_loc, b->l1_loc)) return c;
+      if (int c = compare_location(a->l1_loc(), b->l1_loc())) return c;
       if (int c = compare_poly(a->l2, b->l2)) return c;
-      return compare_location(a->l2_loc, b->l2_loc);
+      return compare_location(a->l2_loc(), b->l2_loc());
   }
   return 0;
 }

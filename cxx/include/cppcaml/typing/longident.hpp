@@ -19,11 +19,18 @@ struct Longident {
   enum class Kind : std::uint8_t { Lident, Ldot, Lapply };
   Kind kind;
   std::string_view s;               // Lident name / Ldot component
-  Location s_loc;                   // Ldot: the component's location
   const Longident* l1 = nullptr;    // Ldot prefix / Lapply functor
-  Location l1_loc;
   const Longident* l2 = nullptr;    // Lapply argument
-  Location l2_loc;
+  // The components' locations, out of line (an Lident has none): Ldot
+  // [l1_loc; s_loc], Lapply [l1_loc; l2_loc].
+  const Location* locs = nullptr;
+  const Location& s_loc() const { return kind == Kind::Ldot ? locs[1] : no_loc(); }  // Ldot
+  const Location& l1_loc() const { return locs ? locs[0] : no_loc(); }
+  const Location& l2_loc() const { return kind == Kind::Lapply ? locs[1] : no_loc(); }  // Lapply
+  static const Location& no_loc() {
+    static const Location l{};
+    return l;
+  }
 
   using t = const Longident*;
   static t lident(std::string_view s);

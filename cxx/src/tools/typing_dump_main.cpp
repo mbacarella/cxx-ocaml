@@ -834,10 +834,10 @@ void lid(Longident::t l) {
   switch (l->kind) {
     case Longident::Kind::Lident: s("Lident "); q(l->s); break;
     case Longident::Kind::Ldot:
-      s("Ldot("); lid(l->l1); s(" "); loc(l->l1_loc); s(" "); q(l->s); s(" "); loc(l->s_loc); s(")");
+      s("Ldot("); lid(l->l1); s(" "); loc(l->l1_loc()); s(" "); q(l->s); s(" "); loc(l->s_loc()); s(")");
       break;
     case Longident::Kind::Lapply:
-      s("Lapply("); lid(l->l1); s(" "); loc(l->l1_loc); s(" "); lid(l->l2); s(" "); loc(l->l2_loc);
+      s("Lapply("); lid(l->l1); s(" "); loc(l->l1_loc()); s(" "); lid(l->l2); s(" "); loc(l->l2_loc());
       s(")");
       break;
   }

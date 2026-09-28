@@ -11,6 +11,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -30,6 +31,9 @@ class Zone {
   ~Zone() {
     for (auto it = dtors_.rbegin(); it != dtors_.rend(); ++it) it->second(it->first);
   }
+  // 2 MiB-aligned storage straight from the kernel, advised for
+  // transparent huge pages (Free unmaps it)
+  static char* huge_block(std::size_t sz);
 
   void* alloc(std::size_t n, std::size_t align) {
     // new char[] storage is aligned for any fundamental type, so a fresh
@@ -37,9 +41,16 @@ class Zone {
     static_assert(alignof(std::max_align_t) >= 8);
     std::size_t off = (off_ + align - 1) & ~(align - 1);
     if (!cur_ || off + n > cap_) {
-      std::size_t sz = n > kBlock ? n : kBlock;
-      blocks_.emplace_back(new char[sz]);
-      cur_ = blocks_.back().get();
+      // a zone that has grown takes big blocks backed by huge pages (the
+      // typing data's TLB misses); a small one stays in small blocks
+      bool big = blocks_.size() >= kSmallBlocks;
+      std::size_t unit = big ? kBigBlock : kBlock;
+      std::size_t sz = n > unit ? n : unit;
+      block_bytes() += sz;
+      char* blk = big ? huge_block(sz) : static_cast<char*>(std::malloc(sz));
+      if (!blk) throw std::bad_alloc();
+      blocks_.emplace_back(blk, Free{big ? sz : 0});
+      cur_ = blk;
       ranges_.emplace(cur_, sz);
       cap_ = sz;
       off = 0;
@@ -56,6 +67,28 @@ class Zone {
     if constexpr (!std::is_trivially_destructible_v<T>)
       dtors_.emplace_back(t, [](void* q) { static_cast<T*>(q)->~T(); });
     return t;
+  }
+
+  // bytes of block storage all zones have allocated (CPPCAML_PROFILE)
+  static std::size_t& block_bytes() {
+    static std::size_t n = 0;
+    return n;
+  }
+
+  // Drop everything the zone holds (running the destructors) but keep its
+  // first block for the next allocations: a scratch zone reused phase after
+  // phase touches the same memory again instead of fresh blocks.
+  void clear() {
+    for (auto it = dtors_.rbegin(); it != dtors_.rend(); ++it) it->second(it->first);
+    dtors_.clear();
+    if (blocks_.empty()) return;
+    blocks_.resize(1);
+    cur_ = blocks_[0].get();
+    std::size_t first = ranges_.at(cur_);
+    ranges_.clear();
+    ranges_.emplace(cur_, first);
+    cap_ = first;
+    off_ = 0;
   }
 
   // whether [p] points into this zone's storage
@@ -77,7 +110,13 @@ class Zone {
 
  private:
   static constexpr std::size_t kBlock = 1 << 20;
-  std::vector<std::unique_ptr<char[]>> blocks_;
+  static constexpr std::size_t kBigBlock = 8 << 20;
+  static constexpr std::size_t kSmallBlocks = 8;
+  struct Free {  // a huge block (size > 0) is the kernel's mapping
+    std::size_t huge = 0;
+    void operator()(char* p) const;
+  };
+  std::vector<std::unique_ptr<char, Free>> blocks_;
   std::map<const char*, std::size_t> ranges_;  // block start -> size
   char* cur_ = nullptr;
   std::size_t cap_ = 0, off_ = 0;
