@@ -13,6 +13,7 @@
 // The uid -> declaration index is then built as Cmt_format.index_
 // declarations does (Tast_iterator's order, into a Uid.Tbl whose bucket
 // layout comes from Hashtbl.hash, ported: caml_hash).
+#include "cppcaml/flat_map.hpp"
 #include "cppcaml/typing/cmt_format.hpp"
 #include "cppcaml/typing/location.hpp"
 
@@ -1641,9 +1642,9 @@ class TreeWriter {
   env::t last_env_ = nullptr;
   V last_v_;
   V empty_tbl_;
-  std::unordered_map<const void*, V> memo_;
-  std::unordered_map<const void*, V> decls_;
-  std::map<std::pair<int, int>, V> var_inj_;
+  FlatMap<const void*, V> memo_;
+  FlatMap<const void*, V> decls_;
+  FlatMap<std::pair<int, int>, V> var_inj_;
 };
 
 // ---- index_declarations: Tast_iterator's walk, calling item_declaration --------
@@ -2265,7 +2266,7 @@ class ShapeWriter {
     return w_.i(0);
   }
   Writer& w_;
-  std::unordered_map<shape::t, V> memo_;
+  FlatMap<shape::t, V> memo_;
 };
 
 // ---- index_occurrences: iter_on_occurrences over Tast_iterator's walk --------------
@@ -3173,8 +3174,8 @@ class OccWriter {
   }
   Writer& w_;
   ShapeWriter& sw_;
-  std::map<std::pair<const void*, int>, V> recs_;
-  std::unordered_map<Longident::t, V> lids_;
+  FlatMap<std::pair<const void*, int>, V> recs_;
+  FlatMap<Longident::t, V> lids_;
 };
 
 using location::rewrite_absolute_path;

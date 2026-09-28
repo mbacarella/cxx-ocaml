@@ -571,15 +571,21 @@ bool is_commu_ok(const Commutable* c);
 Commutable* commu_ok();
 Commutable* commu_var();
 
-// representative
-TypeExpr* repr(TypeExpr* t);
-const TypeDesc* get_desc(TypeExpr* t);
-long get_level(TypeExpr* t);
-long get_scope(TypeExpr* t);
-long get_id(TypeExpr* t);
+// representative: a node whose desc is not a link, an expansion or a field
+// is its own (inline); the rest follows the chain (repr_slow)
+TypeExpr* repr_slow(TypeExpr* t);
+inline TypeExpr* repr(TypeExpr* t) {
+  DescKind k = t->desc->kind;
+  if (k != DescKind::Tlink && k != DescKind::Texpand && k != DescKind::Tfield) return t;
+  return repr_slow(t);
+}
+inline constexpr long scope_mask = (1L << 27) - 1;
+inline const TypeDesc* get_desc(TypeExpr* t) { return repr(t)->desc; }
+inline long get_level(TypeExpr* t) { return repr(t)->level; }
+inline long get_scope(TypeExpr* t) { return repr(t)->scope & scope_mask; }
+inline long get_id(TypeExpr* t) { return repr(t)->id; }
 
 // marks
-inline constexpr long scope_mask = (1L << 27) - 1;
 inline constexpr long marks_mask = ~scope_mask;
 struct TypeMark;
 void with_type_mark(FnRef<void(TypeMark&)> f);
@@ -607,7 +613,7 @@ inline TypeExpr* coerce(TypeExpr* ty) { return ty; }
 TypeExpr* create_expr(const TypeDesc* desc, long level, long scope, long id);
 TypeExpr* proto_newty3(long level, long scope, const TypeDesc* desc);
 
-bool eq_type(TypeExpr* a, TypeExpr* b);
+inline bool eq_type(TypeExpr* a, TypeExpr* b) { return a == b || repr(a) == repr(b); }
 int compare_type(TypeExpr* a, TypeExpr* b);
 
 // rows

@@ -69,14 +69,50 @@ namespace ident {
 using t = Ident::t;
 
 ident::Unscoped* find_unscoped(t id);
-std::string_view name(t id);
+// name / same / stamp: inline, the identifier tables call them per node
+inline std::string_view name(t id) {
+  if (id->kind == Ident::Kind::Unscoped) return Unscoped::name_of(id->us);
+  return id->name_;
+}
 t rename(t id);
 std::string unique_name(t id);
 std::string unique_toplevel_name(t id);
 bool persistent(t id);
 bool equal(t a, t b);
-bool same(t a, t b);
-int stamp(t id);
+inline bool same(t a, t b) {
+  if (a->kind != b->kind) return false;
+  switch (a->kind) {
+    case Ident::Kind::Local:
+    case Ident::Kind::Scoped:
+    case Ident::Kind::Predef:
+      return a->stamp_ == b->stamp_;
+    case Ident::Kind::Unscoped:
+      return Unscoped::same(a->us, b->us);
+    case Ident::Kind::Global:
+      return a->name_ == b->name_;
+  }
+  return false;
+}
+inline int stamp(t id) {
+  switch (id->kind) {
+    case Ident::Kind::Local:
+    case Ident::Kind::Scoped:
+      return id->stamp_;
+    case Ident::Kind::Unscoped:
+      return Unscoped::stamp_of(id->us);
+    default:
+      return 0;
+  }
+}
+// OCaml's string comparison (bytes unsigned, then lengths): the sign of
+// a.compare(b), but a name compared with its own storage (a lookup by the
+// ident a table holds) or differing in its first byte skips memcmp
+inline int compare_names(std::string_view a, std::string_view b) {
+  if (a.data() == b.data() && a.size() == b.size()) return 0;
+  if (!a.empty() && !b.empty() && a[0] != b[0])
+    return static_cast<unsigned char>(a[0]) < static_cast<unsigned char>(b[0]) ? -1 : 1;
+  return a.compare(b);
+}
 int compare_stamp(t a, t b);
 int scope(t id);
 void reinit();
@@ -132,7 +168,7 @@ class Tbl {
   const A* find_same_opt(Ident::t id) const {
     std::string_view n = name(id);
     for (const Node* x = t_; x;) {
-      int c = n.compare(x->d->name);
+      int c = compare_names(n, x->d->name);
       if (c == 0) {
         for (const TblData<A>* k = x->d; k; k = k->previous)
           if (same(id, k->ident)) return &get_data(k);
@@ -151,7 +187,7 @@ class Tbl {
   // find_name, {nullptr, nullptr} when the name is unbound
   std::pair<Ident::t, const A*> find_name_opt(std::string_view n) const {
     for (const Node* x = t_; x;) {
-      int c = n.compare(x->d->name);
+      int c = compare_names(n, x->d->name);
       if (c == 0) return {x->d->ident, &get_data(x->d)};
       x = c < 0 ? x->l : x->r;
     }
@@ -161,7 +197,7 @@ class Tbl {
   std::vector<std::pair<Ident::t, const A*>> find_all(std::string_view n) const {
     std::vector<std::pair<Ident::t, const A*>> out;
     for (const Node* x = t_; x;) {
-      int c = n.compare(x->d->name);
+      int c = compare_names(n, x->d->name);
       if (c == 0) {
         for (const TblData<A>* k = x->d; k; k = k->previous)
           out.emplace_back(k->ident, &get_data(k));
@@ -214,7 +250,7 @@ class Tbl {
     std::string_view n = name(id);
     if (!t)
       return make<Node>(nullptr, make<TblData<A>>(id, n, stamp(id), data, nullptr), nullptr, 1);
-    int c = n.compare(t->d->name);
+    int c = compare_names(n, t->d->name);
     if (c == 0)
       return make<Node>(t->l, make<TblData<A>>(id, n, stamp(id), data, t->d), t->r, t->h);
     if (c < 0) return balance(add_(id, data, t->l), t->d, t->r);
@@ -235,7 +271,7 @@ class Tbl {
   }
   static const Node* remove_(Ident::t id, const Node* m) {
     if (!m) return nullptr;
-    int c = name(id).compare(m->d->name);
+    int c = compare_names(name(id), m->d->name);
     if (c == 0) {
       if (!m->d->previous) return merge(m->l, m->r);
       return make<Node>(m->l, m->d->previous, m->r, m->h);

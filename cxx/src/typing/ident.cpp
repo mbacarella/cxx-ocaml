@@ -97,10 +97,6 @@ Unscoped* find_unscoped(t id) {
   return id->kind == K::Unscoped ? id->us : nullptr;
 }
 
-std::string_view name(t id) {
-  if (id->kind == K::Unscoped) return Unscoped::name_of(id->us);
-  return id->name_;
-}
 
 t rename(t id) {
   switch (id->kind) {
@@ -163,32 +159,7 @@ bool equal(t a, t b) {
   return false;
 }
 
-bool same(t a, t b) {
-  if (a->kind != b->kind) return false;
-  switch (a->kind) {
-    case K::Local:
-    case K::Scoped:
-    case K::Predef:
-      return a->stamp_ == b->stamp_;
-    case K::Unscoped:
-      return Unscoped::same(a->us, b->us);
-    case K::Global:
-      return a->name_ == b->name_;
-  }
-  return false;
-}
 
-int stamp(t id) {
-  switch (id->kind) {
-    case K::Local:
-    case K::Scoped:
-      return id->stamp_;
-    case K::Unscoped:
-      return Unscoped::stamp_of(id->us);
-    default:
-      return 0;
-  }
-}
 
 int compare_stamp(t a, t b) {
   int x = stamp(a), y = stamp(b);
@@ -214,7 +185,7 @@ bool is_unscoped(t id) { return id->kind == K::Unscoped; }
 
 static int cmp_int(int a, int b) { return a < b ? -1 : a > b ? 1 : 0; }
 static int cmp_str(std::string_view a, std::string_view b) {
-  int c = a.compare(b);
+  int c = compare_names(a, b);
   return c < 0 ? -1 : c > 0 ? 1 : 0;
 }
 

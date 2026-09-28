@@ -11,9 +11,11 @@
 //
 // Deviations: Clflags.bytecode_compatible_32 (-compat-32) and to_memory
 // (the toplevel's) are not ported.
+#include "cppcaml/flat_map.hpp"
 #include "cppcaml/typing/emitcode.hpp"
 #include "cppcaml/typing/location.hpp"
 
+#include <optional>
 #include <unistd.h>
 
 #include <cstdlib>
@@ -115,10 +117,14 @@ std::string concat(const std::string& dirname, const std::string& filename) {
   return dirname + "/" + filename;
 }
 
-std::string getcwd_() {
-  std::vector<char> buf(4096);
-  while (!::getcwd(buf.data(), buf.size())) buf.resize(buf.size() * 2);
-  return buf.data();
+// Sys.getcwd: read once (c++ocamlc never changes its directory)
+const std::string& getcwd_() {
+  static const std::string cwd = [] {
+    std::vector<char> buf(4096);
+    while (!::getcwd(buf.data(), buf.size())) buf.resize(buf.size() * 2);
+    return std::string(buf.data());
+  }();
+  return cwd;
 }
 
 std::string absolute_path(const std::string& s0) {
@@ -340,9 +346,9 @@ class Values {
     return o::vcustom2(raw, 4, 8);
   }
 
-  std::map<std::pair<const char*, std::size_t>, V> strs_;
-  std::unordered_map<const void*, V> boxed_;
-  std::unordered_map<const void*, V> objs_;
+  FlatMap<std::pair<const char*, std::size_t>, V> strs_;
+  FlatMap<const void*, V> boxed_;
+  FlatMap<const void*, V> objs_;
   V boxedint_kinds_[3];
 };
 
@@ -472,13 +478,25 @@ class Emitter {
 
   // ---- debugging events, hints ----
   void record_event(DebugEvent* ev) {
-    std::string path(ev->ev_loc.loc_start.pos_fname);
-    std::string abspath = absolute_path(path);
-    debug_dirs.insert(generic_dirname(abspath));
-    if (is_relative(path)) debug_dirs.insert(location::rewrite_absolute_path(getcwd_()));
+    // the directories are pure functions of the event's file name (and the
+    // fixed cwd): computed once per name -- a unit's events share one
+    std::string_view fname = ev->ev_loc.loc_start.pos_fname;
+    if (!last_dirs_ || fname != last_fname_) {
+      std::string path(fname);
+      last_fname_ = path;
+      last_dir_ = generic_dirname(absolute_path(path));
+      last_cwd_ = is_relative(path) ? std::optional<std::string>(location::rewrite_absolute_path(getcwd_()))
+                                    : std::nullopt;
+      last_dirs_ = true;
+    }
+    debug_dirs.insert(last_dir_);
+    if (last_cwd_) debug_dirs.insert(*last_cwd_);
     ev->ev_pos = out_position;
     events.push_back(ev);
   }
+  bool last_dirs_ = false;
+  std::string last_fname_, last_dir_;
+  std::optional<std::string> last_cwd_;
   void record_hint(const RecordedHint& h) { hints.emplace_back(out_position, h); }
   static RecordedHint hint(OptimizationHint::K k) {
     RecordedHint h{};

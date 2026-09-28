@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdlib>
 #include "cppcaml/omarshal.hpp"
 
@@ -106,8 +107,17 @@ ValPtr vlist(const std::vector<ValPtr>& xs) {
 
 namespace {
 struct Marshaler {
-  std::vector<std::uint8_t> body;
+  // the output, the 20-byte header's room first (filled in at the end)
+  std::vector<std::uint8_t> out = std::vector<std::uint8_t>(kHeader);
+  std::size_t len = kHeader;
+  static constexpr std::size_t kHeader = 20;
   long long nobjs = 0, w32 = 0, w64 = 0;
+  std::uint8_t* room(std::size_t n) {  // n bytes at the end
+    if (len + n > out.size()) out.resize(std::max(out.size() * 2, len + n));
+    std::uint8_t* p = out.data() + len;
+    len += n;
+    return p;
+  }
   // Each sharable object (block size>0 / string / double / dblarr / custom) is
   // assigned its emit-order index in `seen` so a repeat emits a CODE_SHARED
   // back-reference instead of re-serializing -- required for the shared / cyclic
@@ -116,9 +126,14 @@ struct Marshaler {
   // field may point back at the block itself (cycles).
   // (the index lives in the object itself, stamped with this session)
   std::uint32_t session;
-  void byte(int b) { body.push_back((std::uint8_t)b); }
-  void bytes(const std::string& s) { body.insert(body.end(), s.begin(), s.end()); }
-  void be32(std::uint32_t n) { byte(n >> 24); byte(n >> 16); byte(n >> 8); byte(n); }
+  void byte(int b) { *room(1) = static_cast<std::uint8_t>(b); }
+  void bytes(const std::string& s) {
+    if (!s.empty()) std::memcpy(room(s.size()), s.data(), s.size());
+  }
+  void be32(std::uint32_t n) {
+    std::uint8_t* p = room(4);
+    p[0] = n >> 24; p[1] = n >> 16; p[2] = n >> 8; p[3] = n;
+  }
   void emit_shared(long long dist) {  // back-distance to the target object
     if (dist < 0x100) { byte(0x4); byte((int)dist); }                  // CODE_SHARED8
     else if (dist < 0x10000) { byte(0x5); byte(dist >> 8); byte(dist); }  // SHARED16
@@ -208,14 +223,15 @@ std::vector<std::uint8_t> marshal(const ValPtr& root) {
   Marshaler m;
   m.session = ++sessions;
   m.emit(root);
-  std::vector<std::uint8_t> out;
-  auto be = [&](std::uint32_t n) { out.push_back(n >> 24); out.push_back(n >> 16); out.push_back(n >> 8); out.push_back(n); };
+  std::vector<std::uint8_t> out = std::move(m.out);
+  out.resize(m.len);
+  std::uint8_t* h = out.data();
+  auto be = [&](std::uint32_t n) { h[0] = n >> 24; h[1] = n >> 16; h[2] = n >> 8; h[3] = n; h += 4; };
   be(0x8495A6BE);
-  be((std::uint32_t)m.body.size());
-  be((std::uint32_t)m.nobjs);
-  be((std::uint32_t)m.w32);
-  be((std::uint32_t)m.w64);
-  out.insert(out.end(), m.body.begin(), m.body.end());
+  be(static_cast<std::uint32_t>(m.len - Marshaler::kHeader));
+  be(static_cast<std::uint32_t>(m.nobjs));
+  be(static_cast<std::uint32_t>(m.w32));
+  be(static_cast<std::uint32_t>(m.w64));
   return out;
 }
 

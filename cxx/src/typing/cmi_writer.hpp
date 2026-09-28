@@ -8,6 +8,8 @@
 #include <tuple>
 #include <unordered_map>
 
+#include "cppcaml/flat_map.hpp"
+
 #include "cppcaml/omarshal.hpp"
 #include "cppcaml/typing/env.hpp"
 #include "cppcaml/typing/instruct.hpp"
@@ -101,7 +103,7 @@ class Writer {
   }
   // a block registered under [key] before its fields are filled
   template <class K>
-  V shared(std::unordered_map<const void*, V>& memo, const K* key, int tag,
+  V shared(FlatMap<const void*, V>& memo, const K* key, int tag,
            const std::function<std::vector<V>()>& fields) {
     if (auto it = memo.find(key); it != memo.end()) return it->second;
     V v = o::vblock(tag, {});
@@ -772,27 +774,27 @@ class Writer {
   }
 
  private:
-  std::unordered_map<const void*, V> memo_;
-  std::map<std::string, V> fnames_;
+  FlatMap<const void*, V> memo_;
+  FlatMap<std::string, V> fnames_;
   std::string current_unit_;
   V current_unit_name_;
   bool current_unit_by_identity_ = false;
   std::string_view current_unit_view_;
-  std::map<std::pair<const char*, std::size_t>, V> strs_;
-  std::map<std::pair<const void*, std::size_t>, V> lists_;
-  std::unordered_map<const void*, V> mprivate_;
-  std::map<std::tuple<int, const char*, std::size_t>, V> labels_;
-  std::map<std::tuple<const void*, long, long, long>, V> poss_;
-  std::map<std::tuple<const void*, const void*, bool>, V> locs_;
-  std::unordered_map<const void*, V> self_meths_;  // Val_self's self_meths blocks
-  std::unordered_map<const void*, V> pos_objs_, loc_objs_;
-  std::unordered_map<const void*, V> somes_;
-  std::unordered_map<std::uint64_t, V> some_toks_;
-  std::unordered_map<const void*, V> val_prims_;
-  std::unordered_map<const void*, V> prim_descs_;
-  std::unordered_map<const void*, V> sig_items_;
-  std::unordered_map<const void*, V> by_obj_;
-  std::map<std::pair<const void*, const void*>, V> attr_names_;
+  FlatMap<std::pair<const char*, std::size_t>, V> strs_;
+  FlatMap<std::pair<const void*, std::size_t>, V> lists_;
+  FlatMap<const void*, V> mprivate_;
+  FlatMap<std::tuple<int, const char*, std::size_t>, V> labels_;
+  FlatMap<std::tuple<const void*, long, long, long>, V> poss_;
+  FlatMap<std::tuple<const void*, const void*, bool>, V> locs_;
+  FlatMap<const void*, V> self_meths_;  // Val_self's self_meths blocks
+  FlatMap<const void*, V> pos_objs_, loc_objs_;
+  FlatMap<const void*, V> somes_;
+  FlatMap<std::uint64_t, V> some_toks_;
+  FlatMap<const void*, V> val_prims_;
+  FlatMap<const void*, V> prim_descs_;
+  FlatMap<const void*, V> sig_items_;
+  FlatMap<const void*, V> by_obj_;
+  FlatMap<std::pair<const void*, const void*>, V> attr_names_;
 };
 
 // ---- the debugging events of a .cmo (Emitcode.to_file with -g) ------------
@@ -938,9 +940,9 @@ class EventWriter {
 
  private:
   Writer& w_;
-  std::unordered_map<const void*, V> memo_;
-  std::map<std::pair<const void*, long>, V> closures_;
-  std::map<std::tuple<const void*, bool, const void*, long>, V> envs_;
+  FlatMap<const void*, V> memo_;
+  FlatMap<std::pair<const void*, long>, V> closures_;
+  FlatMap<std::tuple<const void*, bool, const void*, long>, V> envs_;
   V identity_;
 };
 

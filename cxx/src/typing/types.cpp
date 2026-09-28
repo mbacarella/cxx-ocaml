@@ -446,7 +446,7 @@ static TypeExpr* repr_link(bool update, TypeExpr* t_orig, TypeExpr* t) {
   }
 }
 
-TypeExpr* repr(TypeExpr* t) {
+TypeExpr* repr_slow(TypeExpr* t) {
   const TypeDesc* d = t->desc;
   if (auto* l = as<Tlink>(d)) return repr_link(false, t, l->ty);
   if (auto* e = as<Texpand>(d)) return repr_expand(false, t, e->ty, e->path, e->args);
@@ -454,10 +454,6 @@ TypeExpr* repr(TypeExpr* t) {
   return t;
 }
 
-const TypeDesc* get_desc(TypeExpr* t) { return repr(t)->desc; }
-long get_level(TypeExpr* t) { return repr(t)->level; }
-long get_scope(TypeExpr* t) { return repr(t)->scope & scope_mask; }
-long get_id(TypeExpr* t) { return repr(t)->id; }
 
 // ---- marks -------------------------------------------------------------------
 struct TypeMark {
@@ -549,7 +545,6 @@ void set_scope(TypeExpr* ty, long sc) {
 }
 }  // namespace transient_expr
 
-bool eq_type(TypeExpr* a, TypeExpr* b) { return a == b || repr(a) == repr(b); }
 int compare_type(TypeExpr* a, TypeExpr* b) {
   long x = get_id(a), y = get_id(b);
   return x < y ? -1 : x > y ? 1 : 0;
