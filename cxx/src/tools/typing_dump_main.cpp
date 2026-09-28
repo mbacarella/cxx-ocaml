@@ -2167,20 +2167,20 @@ int run_core(const std::string& dirs, const std::string& file) {
       }
       e = res.env;
     } else if (auto* te = parsetree::as<parsetree::Pstr_typext>(it->pstr_desc)) {
-      std::pair<const typedtree::TTypeExtension*, env::t> res;
+      typedecl::TranslTypeExtension res{};
       if (!attempt([&] { res = typedecl::transl_type_extension(true, e, it->pstr_loc, te->ext); })) return 0;
-      for (auto* c : res.first->tyext_constructors) {
+      for (auto* c : res.tyext->tyext_constructors) {
         reset_numbering();
         s("ext "); s(ident::name(c->ext_id)); s(" : "); ext_constr(c->ext_type); s("\n");
       }
-      e = res.second;
+      e = res.env;
     } else if (auto* ex = parsetree::as<parsetree::Pstr_exception>(it->pstr_desc)) {
-      std::pair<const typedtree::TTypeException*, env::t> res;
+      typedecl::TranslTypeException res{};
       if (!attempt([&] { res = typedecl::transl_type_exception(e, ex->exn); })) return 0;
       reset_numbering();
-      s("exn "); s(ident::name(res.first->tyexn_constructor->ext_id)); s(" : ");
-      ext_constr(res.first->tyexn_constructor->ext_type); s("\n");
-      e = res.second;
+      s("exn "); s(ident::name(res.tyexn->tyexn_constructor->ext_id)); s(" : ");
+      ext_constr(res.tyexn->tyexn_constructor->ext_type); s("\n");
+      e = res.env;
     } else if (auto* pr = parsetree::as<parsetree::Pstr_primitive>(it->pstr_desc)) {
       std::pair<const typedtree::TPrimitiveDescription*, env::t> res;
       if (!attempt([&] { res = typedecl::transl_prim_desc(e, it->pstr_loc, pr->pd); })) return 0;

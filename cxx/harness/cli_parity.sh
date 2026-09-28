@@ -9,10 +9,7 @@
 #
 # Usage: cli_parity.sh [case-name-substring]   (V=1: show the diffs)
 #
-# KNOWN differences (counted apart):
-#   config    -config's standard_library_default: c++ocamlc is not
-#             installed; its default is the stdlib next to it
-#   bin-annot -bin-annot's .cmt (Cmt_format is not ported yet)
+# KNOWN differences (counted apart): none left (KNOWN_CASES below).
 set -u
 SELF="$(readlink -f "$0")"
 ROOT="${ROOT:-$(cd "$(dirname "$SELF")/../.." && pwd)}"
@@ -67,7 +64,7 @@ EOF
   cp c.ml sfx.ml
 }
 
-KNOWN_CASES=" config bin-annot "
+KNOWN_CASES=" "
 N=0; SAME=0; DIFF=0; KNOWN=0
 declare -a DIFFS=()
 # run NAME ARGS...  (ENV=... before the call sets the environment)

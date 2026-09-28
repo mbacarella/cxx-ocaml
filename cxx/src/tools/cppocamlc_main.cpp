@@ -768,14 +768,18 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
 
 // The default standard library: next to the executable (<repo>/cxx/build/
 // c++ocamlc -> <repo>/stdlib), as c++ocamlc is not installed
-static std::string default_standard_library() {
+// Config.standard_library without $OCAMLLIB / $CAMLLIB: the configured
+// default, or -- c++ocamlc running from its build tree, the configured
+// directory holding no stdlib -- the tree's stdlib next to the executable
+static std::string default_standard_library(const std::string& configured) {
   std::error_code ec;
+  if (fs::exists(fs::path(configured) / "stdlib.cmi", ec)) return configured;
   fs::path exe = fs::read_symlink("/proc/self/exe", ec);
   if (!ec) {
     fs::path cand = exe.parent_path().parent_path().parent_path() / "stdlib";
     if (fs::exists(cand / "stdlib.cmi")) return cand.string();
   }
-  return "/usr/local/lib/ocaml";
+  return configured;
 }
 
 // Location.report_exception on Format.err_formatter; false when no reporter
@@ -826,10 +830,10 @@ static int run_main(int argc, char** argv) {
   }
   ce::add_arguments(ty::main_args::cppcaml_extensions());
   // Config.standard_library: $OCAMLLIB, else $CAMLLIB, else the default
-  ty::config::standard_library_default = default_standard_library();
+  ty::config::standard_library_default = ty::config::configured_standard_library_default();
   if (const char* e = std::getenv("OCAMLLIB")) ty::config::standard_library = e;
   else if (const char* e2 = std::getenv("CAMLLIB")) ty::config::standard_library = e2;
-  else ty::config::standard_library = ty::config::standard_library_default;
+  else ty::config::standard_library = default_standard_library(ty::config::standard_library_default);
   try {
     ce::readenv(ce::Position::Before_args);
     ce::parse_arguments(args, ce::anonymous, program);

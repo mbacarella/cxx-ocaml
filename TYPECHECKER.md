@@ -88,10 +88,12 @@ actions, output prefixes, OCAMLPARAM and configuration file
 (`typing/compenv.cpp`), and Maindriver's sequence (`cppocamlc_main.cpp`).
 `cxx/harness/cli_parity.sh` runs a battery of command lines through both
 compilers (invoked as `ocamlc`, in the same directory): stdout, stderr,
-exit code and the files left behind, byte for byte -- 131/132, the
-KNOWN one being `-config`'s `standard_library_default` (c++ocamlc is not
-installed: its default is the stdlib next to it; `$OCAMLLIB` works as in
-ocamlc).
+exit code and the files left behind, byte for byte -- 150/150.
+`Config.standard_library_default` is the configured directory, as
+ocamlc's (linked programs record it); c++ocamlc running from its build
+tree, that directory holding no stdlib, takes the stdlib next to it as
+`Config.standard_library`'s last fallback (after `$OCAMLLIB`,
+`$CAMLLIB`).
 
 - **Implemented** (their effects as ocamlc's): everything the typer,
   translators, Emitcode, Bytepackager and the librarian read, and `-a`

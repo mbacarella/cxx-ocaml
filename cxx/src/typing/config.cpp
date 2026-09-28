@@ -44,6 +44,12 @@ SearchMethod search_method() {
   return SearchMethod::Disable;
 }
 
+std::string configured_standard_library_default() {
+  for (const Var& x : kVars)
+    if (std::string(x.name) == "standard_library_default") return x.value;
+  return "/usr/local/lib/ocaml";
+}
+
 const std::string& version() {
   static const std::string v = [] {
     for (const Var& x : kVars)

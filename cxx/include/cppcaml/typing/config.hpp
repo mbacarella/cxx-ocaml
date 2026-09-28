@@ -3,9 +3,10 @@
 // ocamlc's Config by cxx/harness/gen_driver_tables.sh) and the standard
 // library directory.
 //
-// c++ocamlc is not installed: its standard_library_default is the stdlib
-// it finds at run time (driver: $OCAMLLIB / $CAMLLIB / ./stdlib / next to
-// the executable), where ocamlc's is the configured install directory.
+// Config.standard_library_default is the configured install directory, as
+// ocamlc's (a linked program records it); when that directory holds no
+// stdlib, c++ocamlc (running from its build tree) takes the stdlib next to
+// the executable as Config.standard_library's last fallback.
 #pragma once
 
 #include <cstdint>
@@ -22,6 +23,8 @@ const std::string& version();
 // (standard_library is $OCAMLLIB, else $CAMLLIB, else the default)
 extern std::string standard_library_default;
 extern std::string standard_library;
+// the configured standard_library_default (config_table.inc)
+std::string configured_standard_library_default();
 // Config.interface_suffix (-intf-suffix)
 extern std::string interface_suffix;
 inline const char* default_executable_name = "a.out";
