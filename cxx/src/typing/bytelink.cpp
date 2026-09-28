@@ -437,7 +437,7 @@ bs::TocWriter write_header(bs::OutChannel& outchan) {
       outchan.output_string("#!" + runtime + "\n");  // Use the runtime directly
       return bs::init_record(outchan);
     case LaunchMethod::Shebang_bin_sh:
-      write_sh_launcher(outchan, bin_sh, config::bindir, search, runtime);
+      write_sh_launcher(outchan, bin_sh, config::resolved_bindir(), search, runtime);
       return bs::init_record(outchan);
     case LaunchMethod::Executable: {
       // Use the executable stub launcher
@@ -449,7 +449,7 @@ bs::TocWriter write_header(bs::OutChannel& outchan) {
       } else {
         if (search == config::SearchMethod::Fallback)
           // Ensure bindir does _not_ end up with a separator
-          outchan.output_string(filename::dirname(filename::concat(config::bindir, filename::current_dir_name)));
+          outchan.output_string(filename::dirname(filename::concat(config::resolved_bindir(), filename::current_dir_name)));
         outchan.output_char('\0');
         outchan.output_string(runtime);
       }
