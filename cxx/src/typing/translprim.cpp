@@ -6,6 +6,9 @@
 #include "cppcaml/typing/translprim.hpp"
 #include "cppcaml/typing/location.hpp"
 
+#include <algorithm>
+#include <stdexcept>
+
 #include <cstdio>
 #include <string>
 #include <string_view>
@@ -14,6 +17,7 @@
 #include <vector>
 
 #include "cppcaml/typing/clflags.hpp"
+#include "cppcaml/typing/hashtbl.hpp"
 #include "cppcaml/typing/matching.hpp"
 #include "cppcaml/typing/predef.hpp"
 #include "cppcaml/typing/typeopt.hpp"
@@ -220,17 +224,122 @@ const PrimitiveDescription* simple(std::string_view name, long arity, bool alloc
       PrimitiveDescription{zstr(name), arity, alloc, zstr(""), slice(reprs), NativeRepr{}});
 }
 
-// used_primitives: path -> loc, first binding kept
-std::vector<Path::t> used_primitives;
+// used_primitives = Hashtbl.create 7 : (Path.t, Location.t) Hashtbl.t.
+// Its fold order reaches output: Translmod.required_globals adds the paths'
+// heads to an Ident.Set in that order, the set keeping the first of equal
+// idents -- whose name string the .cmo's cu_required_compunits carries.
+// So the table is OCaml's (hashtbl.hpp), keyed by Hashtbl.hash on the path
+// value (caml_hash 10 100 0 over Path.t / Ident.t's block layout) and
+// compared structurally (compare p p' = 0).
+struct PathKey {
+  Path::t p;
+  bool operator==(const PathKey& o) const { return path::compare(p, o.p) == 0; }
+};
+struct HashPath {
+  // a block's header as caml_hash mixes it (Cleanhd_hd: wosize lsl 10 lor tag)
+  static std::uint32_t mix_header(std::uint32_t h, std::uint32_t wosize, std::uint32_t tag) {
+    return hashtbl::detail::mix_uint32(h, (wosize << 10) | tag);
+  }
+  long operator()(const PathKey& k) const {
+    namespace d = hashtbl::detail;
+    // the queue of caml_hash: a path, an ident, a string, an int, or an
+    // extra_ty's Pcstr_ty block
+    struct Item {
+      enum class K : std::uint8_t { Path, Ident, Str, Int, Cstr } k;
+      const void* x = nullptr;
+      std::string_view s;
+      long i = 0;
+    };
+    std::vector<Item> q;
+    q.reserve(16);
+    q.push_back({Item::K::Path, k.p});
+    const std::size_t sz = 100;
+    long num = 10;
+    std::uint32_t h = 0;
+    auto push = [&](Item it) {
+      if (q.size() < sz) q.push_back(it);
+    };
+    for (std::size_t rd = 0; rd < q.size() && num > 0; ++rd) {
+      Item it = q[rd];
+      switch (it.k) {
+        case Item::K::Int:
+          h = d::mix_intnat(h, 2 * static_cast<std::int64_t>(it.i) + 1);  // Val_long
+          --num;
+          break;
+        case Item::K::Str:
+          h = d::mix_string(h, std::string(it.s));
+          --num;
+          break;
+        case Item::K::Cstr:  // Pcstr_ty of string
+          h = mix_header(h, 1, 0);
+          push({Item::K::Str, nullptr, it.s});
+          break;
+        case Item::K::Path: {
+          auto* p = static_cast<Path::t>(it.x);
+          switch (p->kind) {
+            case Path::Kind::Pident:
+              h = mix_header(h, 1, 0);
+              push({Item::K::Ident, p->id});
+              break;
+            case Path::Kind::Pdot:
+              h = mix_header(h, 2, 1);
+              push({Item::K::Path, p->p1});
+              push({Item::K::Str, nullptr, p->s});
+              break;
+            case Path::Kind::Papply:
+              h = mix_header(h, 2, 2);
+              push({Item::K::Path, p->p1});
+              push({Item::K::Path, p->p2});
+              break;
+            case Path::Kind::Pextra_ty:
+              h = mix_header(h, 2, 3);
+              push({Item::K::Path, p->p1});
+              if (p->extra == Path::Extra::Pcstr_ty) push({Item::K::Cstr, nullptr, p->s});
+              else push({Item::K::Int, nullptr, {}, 0});  // Pext_ty
+              break;
+          }
+          break;
+        }
+        case Item::K::Ident: {
+          auto* id = static_cast<Ident::t>(it.x);
+          switch (id->kind) {
+            case Ident::Kind::Local:  // Local of { name; stamp }
+              h = mix_header(h, 2, 0);
+              push({Item::K::Str, nullptr, id->name_});
+              push({Item::K::Int, nullptr, {}, id->stamp_});
+              break;
+            case Ident::Kind::Scoped:  // Scoped of { name; stamp; scope }
+              h = mix_header(h, 3, 1);
+              push({Item::K::Str, nullptr, id->name_});
+              push({Item::K::Int, nullptr, {}, id->stamp_});
+              push({Item::K::Int, nullptr, {}, id->scope_});
+              break;
+            case Ident::Kind::Global:  // Global of string
+              h = mix_header(h, 1, 2);
+              push({Item::K::Str, nullptr, id->name_});
+              break;
+            case Ident::Kind::Predef:  // Predef of { name; stamp }
+              h = mix_header(h, 2, 3);
+              push({Item::K::Str, nullptr, id->name_});
+              push({Item::K::Int, nullptr, {}, id->stamp_});
+              break;
+            case Ident::Kind::Unscoped:  // not a path head a primitive reaches
+              throw std::logic_error("Translprim.used_primitives: Unscoped ident");
+          }
+          break;
+        }
+      }
+    }
+    return d::final_mix(h);
+  }
+};
+hashtbl::Hashtbl<PathKey, Location, HashPath> used_primitives{7};
 
 void add_used_primitive(const Location& loc, env::t env, Path::t path) {
   if (!path || path->kind != Path::Kind::Pdot) return;
   Path::t p = env::normalize_value_path(&loc, env, path);
   Ident::t unit = path::head(p);
-  if (!ident::global(unit)) return;
-  for (Path::t q : used_primitives)
-    if (path::compare(q, p) == 0) return;
-  used_primitives.push_back(p);
+  if (ident::global(unit) && !used_primitives.mem(PathKey{p})) used_primitives.add(PathKey{p}, loc);
 }
 
 const ArrayKind gen_array_kind = config_flat_float_array ? ArrayKind::Pgenarray : ArrayKind::Paddrarray;
@@ -964,10 +1073,13 @@ void add_exception_ident(Ident::t id) { try_ids.insert(id); }
 void remove_exception_ident(Ident::t id) { try_ids.erase(id); }
 
 void clear_used_primitives() { used_primitives.clear(); }
+// Hashtbl.fold (fun path _ acc -> path :: acc) used_primitives []: the
+// buckets from index 0, each in order, consed -- the reverse of that walk
 std::vector<Path::t> get_used_primitives() {
-  // Hashtbl.fold order: the consumers (Translmod.required_globals) only
-  // collect the path heads into a set
-  return used_primitives;
+  std::vector<Path::t> r;
+  for (auto& [k, loc] : used_primitives.to_seq()) r.push_back(k.p);
+  std::reverse(r.begin(), r.end());
+  return r;
 }
 
 void check_primitive_arity(const Location& loc, const PrimitiveDescription* p) {
