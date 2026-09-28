@@ -1837,7 +1837,10 @@ class Parser {
       if (must_arrow) alabel = opt ? ArgLabel{Optional{*firstLabel}} : ArgLabel{Labelled{*firstLabel}};
       else if (firstLabel) { alabel = Labelled{*firstLabel}; labels[0] = std::nullopt; }
       CoreTypeBox dom = build_dom();
-      append_info_doc(dom->attrs, dom->loc.end.cnum);  // extra_rhs: `lab:t (** info *) -> …`
+      // extra_rhs: `lab:t (** info *) -> …`, at $endpos(param_type) -- the
+      // last token's end, a parenthesized type's `)` included (its location
+      // is the inner type's)
+      append_info_doc(dom->attrs, tokens_[idx_ - 1].end);
       expect(Kind::MINUSGREATER, "->");
       CoreTypeBox cod = parse_type_arrow();
       Location l = span(symstart, position(tokens_[idx_ - 1].end));
