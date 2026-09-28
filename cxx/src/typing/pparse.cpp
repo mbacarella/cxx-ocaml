@@ -113,9 +113,12 @@ std::pair<std::string, const OValue*> input_ast(const std::string& contents, Ast
 
 // ---- Ast_mapper.PpxContext.make, with Ast_helper's nodes (their
 // locations: !default_loc, Location.none) ----
+// ast_mapper.ml's string literals: one object per content (ocamlopt, which
+// built the reference ocamlc.opt, merges a unit's equal string constants)
+std::string_view lit(std::string_view s) { return ocaml_literal("parsing/ast_mapper.ml", s); }
 struct Ctx {
   Location none = location::none();
-  pt::LidLoc lid(std::string_view name) const { return pt::LidLoc{Longident::lident(zborrow(name)), none}; }
+  pt::LidLoc lid(std::string_view name) const { return pt::LidLoc{Longident::lident(lit(name)), none}; }
   const pt::Expression* exp(const pt::ExpressionDesc* d) const {
     return make<pt::Expression>(pt::Expression{d, none, {}, {}});
   }
@@ -145,21 +148,56 @@ struct Ctx {
     for (std::size_t k = items.size(); k-- > 0;) r = construct("::", tuple(items[k], r));
     return r;
   }
-  const pt::Expression* strings(const std::vector<std::string>& l) const {
-    return list(l, [&](const std::string& s) { return string(s); });
+  const pt::Expression* strings(const std::vector<std::string_view>& l) const {
+    return list(l, [&](std::string_view s) { return string_obj(s); });
+  }
+  // a Pconst_string of the string object [s] itself
+  const pt::Expression* string_obj(std::string_view s) const {
+    pt::Constant c{};
+    c.pconst_desc.kind = pt::ConstantDesc::Kind::Pconst_string;
+    c.pconst_desc.s = s;
+    c.pconst_desc.str_loc = none;
+    c.pconst_loc = none;
+    return exp(make<pt::Pexp_constant>(pt::Pexp_constant{{pt::ExpressionDesc::Kind::Pexp_constant}, c}));
+  }
+};
+
+// Clflags' directory lists as string objects, and Load_path's: Compmisc's
+// init_path keeps an -I / -H argument's string (Misc.expand_directory
+// returns a directory without `+` as it is), so a load path entry equal to
+// one of them is that object
+struct Dirs {
+  std::vector<std::string_view> include, hidden;
+  Dirs() {
+    for (const std::string& d : clflags::include_dirs) include.push_back(zstr(d));
+    for (const std::string& d : clflags::hidden_include_dirs) hidden.push_back(zstr(d));
+  }
+  static std::vector<std::string_view> of(const std::vector<std::string>& l,
+                                          const std::vector<std::string_view>& args) {
+    std::vector<std::string_view> r;
+    for (const std::string& d : l) {
+      std::string_view v;
+      for (std::string_view a : args)
+        if (a == d) v = a;
+      r.push_back(v.data() ? v : zstr(d));
+    }
+    return r;
   }
 };
 
 const pt::Attribute* ppx_context(std::string_view tool_name) {
   Ctx c;
   auto [visible, hidden] = load_path::get_paths();
+  Dirs dirs;
   std::vector<std::pair<pt::LidLoc, const pt::Expression*>> fields;
   auto field = [&](std::string_view name, const pt::Expression* e) { fields.push_back({c.lid(name), e}); };
   field("tool_name", c.string(tool_name));
-  field("include_dirs", c.strings(clflags::include_dirs));
-  field("hidden_include_dirs", c.strings(clflags::hidden_include_dirs));
-  field("load_path", c.tuple(c.strings(visible), c.strings(hidden)));
-  field("open_modules", c.strings(clflags::open_modules));
+  field("include_dirs", c.strings(dirs.include));
+  field("hidden_include_dirs", c.strings(dirs.hidden));
+  field("load_path", c.tuple(c.strings(Dirs::of(visible, dirs.include)), c.strings(Dirs::of(hidden, dirs.hidden))));
+  std::vector<std::string_view> opens;
+  for (const std::string& m : clflags::open_modules) opens.push_back(zstr(m));
+  field("open_modules", c.strings(opens));
   field("for_package",
         clflags::for_package ? c.construct("Some", c.string(*clflags::for_package)) : c.construct("None", nullptr));
   field("debug", c.boolean(clflags::debug));
@@ -178,7 +216,7 @@ const pt::Attribute* ppx_context(std::string_view tool_name) {
   pt::Payload p{};
   p.kind = pt::Payload::Kind::PStr;
   p.str = slice(std::vector<const pt::StructureItem*>{item});
-  return make<pt::Attribute>(pt::Attribute{pt::StrLoc{"ocaml.ppx.context", c.none}, p, c.none});
+  return make<pt::Attribute>(pt::Attribute{pt::StrLoc{lit("ocaml.ppx.context"), c.none}, p, c.none});
 }
 
 // write_ast: magic, output_value !Location.input_name, output_value ast

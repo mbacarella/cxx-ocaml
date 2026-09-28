@@ -134,13 +134,39 @@ tree, that directory holding no stdlib, takes the stdlib next to it as
   C-toolchain binaries ocamlc.opt itself does not reproduce (temporary
   file names reach them) compared on behaviour; the C-toolchain cases need
   an installed stdlib (`INST=`).
+- **Binary ASTs and `-ppx`**: `driver/pparse.ml`'s AST half
+  (`typing/pparse.cpp`) with Ast_mapper's ppx context and
+  `parsing/ast_invariants.ml` (`typing/ast_invariants.cpp`, over
+  Ast_iterator's traversal order).  A source starting with the AST magic
+  -- what a dune ppx driver hands the compiler as `-impl foo.pp.ml` -- is
+  read with input_value (`typing/parsetree_of_ovalue.cpp`: one node,
+  location record, list, string and `Some` identity per marshaled block),
+  its recorded name becoming Location.input_name and
+  Unit_info.human_source_file (messages, the .mli lookup, `-i`; the .cmt
+  keeps the input file); `-ppx` writes the parsed AST (the writers'
+  location model), runs the rewriters with Ccomp.command, checks the
+  magic and reads the result back (Pparse.Error's reports).
+  `cxx/harness/ppx_parity.sh` (Ast_mapper rewriters in `cxx/harness/ppx/`,
+  built against the tree's compiler-libs; OROOT= for a sources-only
+  worktree): the battery 26/26 (12 SAME, 14 identical error reports), and
+  over the stamp probes, the testsuite, the compiler's sources and the
+  warning corpora every `ast` / `ppx` difference is one the plain source
+  path has (`MODE=src`: the known .cmt sharing and .cmi leftovers).
+  `MODE=written` compares the AST file each compiler hands a rewriter:
+  stamp probes 5500 SAME, 518 SHARING (Marshal's sharing), 513 content --
+  the C++ parser's location gaps: `*_loc_stack` entries (ocamlc's
+  reloc_exp / reloc_pat / reloc_typ push the pre-parenthesis location; the
+  port records only `assert`'s) and locations it does not record (written
+  as its gap location).  A rewriter sees those; the compiled output does
+  not.  `-dparsetree` / `-dsource` of a binary or rewritten AST are
+  refused (Printast / Pprintast on the port's parsetree are not ported).
 - **Accepted, no effect to reproduce**: `-bin-annot-occurrences` (the
   .cmt's cmt_ident_occurrences stay [] -- Shape_reduce's occurrence
   resolution is not ported), `-dno-canonical-ids`,
   `-dparsetree-loc-ghost-invariants`, `-safe-string`.
 - **Refused where their effect would take place** (`option -X is not
   supported yet`, exit 2): when compiling a unit, `-annot` / `-dtypes`,
-  `-ppx`, `-dsource`, `-dtypedtree`, `-dshape`, `-dmatchcomp`,
+  `-dsource`, `-dtypedtree`, `-dshape`, `-dmatchcomp`,
   `-dcanonical-ids`, `-compat-32`, `-dtimings` / `-dprofile`; when linking or
   building a library, `-dtimings` / `-dprofile`; `-depend`.
   (`cli_parity.sh` checks the refusals too.)

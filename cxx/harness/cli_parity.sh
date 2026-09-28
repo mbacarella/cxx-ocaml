@@ -87,7 +87,8 @@ run() {
       done ) > "$T/out/$side.files"
   done
   # the external preprocessor's temporary file names are random
-  sed -i 's|/tmp/ocamlpp[A-Za-z0-9]*|/tmp/ocamlppXXXXXX|g' "$T/out/o.stderr" "$T/out/c.stderr"
+  sed -i -e 's|/tmp/ocamlpp[A-Za-z0-9]*|/tmp/ocamlppXXXXXX|g' -e 's|/tmp/camlppx[A-Za-z0-9]*|/tmp/camlppxXXXXXX|g' \
+    "$T/out/o.stderr" "$T/out/c.stderr"
   local ok=1 k
   for k in stdout stderr rc files; do
     cmp -s "$T/out/o.$k" "$T/out/c.$k" || ok=0
@@ -265,10 +266,14 @@ run dllib-compile -dllib -lfoo -c a.ml
 run set-runtime-default-bad -set-runtime-default foo
 run set-runtime-default-unknown -set-runtime-default foo=bar
 run launch-method-bad -launch-method bad
+# -ppx (Pparse): a rewriter that writes nothing / fails (ppx_parity.sh has
+# the working ones)
+run ppx-no-output -ppx ./pp.sh -c a.ml
+run ppx-fails -ppx false -c a.ml
+run ppx-verbose -verbose -ppx false -c a.ml
 # refused where the effect would take place
 refuse annot -annot -c a.ml
 refuse dtypes -dtypes -c a.ml
-refuse ppx -ppx ./pp.sh -c a.ml
 refuse dsource -dsource -c a.ml
 refuse dtypedtree -dtypedtree -c a.ml
 refuse dshape -dshape -c a.ml

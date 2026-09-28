@@ -15,7 +15,9 @@
 # code are compared byte for byte.
 #
 # Usage: ppx_parity.sh [file.ml|dir ...]   (JOBS=, MODE=ast|ppx|both (default
-#   both) or src (the sources themselves, no rewriter: the baseline), MAP= the mapper for named files (default id), W= the warning
+#   both) or src (the sources themselves, no rewriter: the baseline) or
+#   written (the AST file each compiler writes for a rewriter, compared:
+#   SHARING = the same tree, Marshal's sharing aside), MAP= the mapper for named files (default id), W= the warning
 #   flags (default "-w -a"), FLAGS= extra flags for both, OROOT= the built
 #   OCaml tree, default this one)
 #   no args: every cxx/harness/ppx/tests/<mapper>_*.ml with its mapper
@@ -43,6 +45,26 @@ if [ "${1:-}" == "--worker" ]; then
   mode="$2"; map="$3"; f="$4"
   b=$(basename "$f"); base=${b%.ml}; key="$mode.$map.$(echo "$f" | tr '/' '_')"
   w=$(mktemp -d); mkdir "$w/bin" "$w/x"
+  if [ "$mode" = written ]; then
+    # the AST file each compiler writes for a rewriter (a copying one)
+    for side in o c; do
+      if [ $side = o ]; then ln -sfn "$REF" "$w/bin/ocamlc"; else ln -sfn "$CPP" "$w/bin/ocamlc"; fi
+      rm -rf "${w:?}/x"; mkdir "$w/x"; cp "$f" "$w/x/"
+      ( cd "$w/x" && AST_COPY="$OUT/$key.$side.ast" timeout 120 "$w/bin/ocamlc" -nostdlib -I "$OROOT/stdlib" $W $FLAGS \
+          -ppx "$TOOLS/copy.sh" -c "$b" ) > /dev/null 2>&1
+    done
+    rm -rf "${w:?}"
+    o="$OUT/$key.o.ast"; c="$OUT/$key.c.ast"
+    if [ ! -f "$o" ] && [ ! -f "$c" ]; then printf 'BOTHFAIL %s %s %s\n' "$mode" "$map" "$f"
+    elif cmp -s "$o" "$c"; then printf 'SAME %s %s %s\n' "$mode" "$map" "$f"
+    else
+      "$OROOT/runtime/ocamlrun" "$TOOLS/asttree" "$o" > "$o.tree" 2>&1
+      "$OROOT/runtime/ocamlrun" "$TOOLS/asttree" "$c" > "$c.tree" 2>&1
+      if cmp -s "$o.tree" "$c.tree"; then printf 'SHARING %s %s %s\n' "$mode" "$map" "$f"
+      else printf 'DIFF %s %s %s ( content )\n' "$mode" "$map" "$f"; fi
+    fi
+    exit 0
+  fi
   ppx="$TOOLS/ppx.sh $map"
   arts=""
   for side in o c; do
@@ -97,16 +119,18 @@ build_tools() {
   local inc="-I $OROOT/stdlib -I $OROOT/utils -I $OROOT/parsing -I $OROOT/typing -I $OROOT/driver -I $OROOT/file_formats"
   ( cd "$TOOLS" &&
     "$OROOT/ocamlc.opt" -nostdlib $inc -w -a "$OROOT/compilerlibs/ocamlcommon.cma" ppx_tests.ml mkast.ml -o mkast &&
-    "$OROOT/ocamlc.opt" -nostdlib $inc -w -a "$OROOT/compilerlibs/ocamlcommon.cma" ppx_tests.cmo ppx_main.ml -o ppx_tests ) ||
+    "$OROOT/ocamlc.opt" -nostdlib $inc -w -a "$OROOT/compilerlibs/ocamlcommon.cma" ppx_tests.cmo ppx_main.ml -o ppx_tests &&
+    "$OROOT/ocamlc.opt" -nostdlib -I "$OROOT/stdlib" -w -a "$OROOT/stdlib/stdlib.cma" asttree.ml -o asttree ) ||
     { echo "ppx_parity.sh: cannot build the tools" >&2; exit 2; }
   printf '#!/bin/sh\nexec %s/runtime/ocamlrun %s/mkast "$@"\n' "$OROOT" "$TOOLS" > "$TOOLS/mkast.sh"
   printf '#!/bin/sh\nexec %s/runtime/ocamlrun %s/ppx_tests "$@"\n' "$OROOT" "$TOOLS" > "$TOOLS/ppx.sh"
-  chmod +x "$TOOLS/mkast.sh" "$TOOLS/ppx.sh"
+  printf '#!/bin/sh\ncp "$1" "$AST_COPY" && cp "$1" "$2"\n' > "$TOOLS/copy.sh"
+  chmod +x "$TOOLS/mkast.sh" "$TOOLS/ppx.sh" "$TOOLS/copy.sh"
 }
 build_tools
 rm -rf "$OUT"; mkdir -p "$OUT"
 modes=(ast ppx)
-case "$MODE" in ast) modes=(ast) ;; ppx) modes=(ppx) ;; src) modes=(src) ;; esac
+case "$MODE" in ast) modes=(ast) ;; ppx) modes=(ppx) ;; src) modes=(src) ;; written) modes=(written) ;; esac
 jobs=()
 if [ $# -gt 0 ]; then
   # a directory argument: its .ml files (testsuite-like trees: recursively)
@@ -128,6 +152,6 @@ fi
 ulimit -v 8000000
 res=$(printf '%s\n' "${jobs[@]}" | xargs -P "$JOBS" -L 1 bash "$SELF" --worker | sort -k4)
 printf '%s\n' "$res" > /tmp/.ppx_parity_results
-printf '%s\n' "$res" | grep -v '^SAME\|^BOTHFAIL'
-printf '%s\n' "$res" | awk '{f[$1]++} END{ printf "units %d: SAME %d  BOTHFAIL %d  DIFF %d\n", NR, f["SAME"], f["BOTHFAIL"], f["DIFF"] }'
+printf '%s\n' "$res" | grep -v '^SAME\|^BOTHFAIL\|^SHARING'
+printf '%s\n' "$res" | awk '{f[$1]++} END{ printf "units %d: SAME %d  SHARING %d  BOTHFAIL %d  DIFF %d\n", NR, f["SAME"], f["SHARING"], f["BOTHFAIL"], f["DIFF"] }'
 echo "per-unit results: /tmp/.ppx_parity_results (artifacts in $OUT)"
