@@ -3,7 +3,10 @@
 // Error_forward of Typemod / Typeclass).
 #include "cppcaml/typing/reporters.hpp"
 
+#include "cppcaml/typing/arg.hpp"
+#include "cppcaml/typing/ast_invariants.hpp"
 #include "cppcaml/typing/misc.hpp"
+#include "cppcaml/typing/pparse.hpp"
 #include "cppcaml/typing/pprintast.hpp"
 #include "cppcaml/typing/bytelibrarian.hpp"
 #include "cppcaml/typing/bytelink.hpp"
@@ -59,6 +62,22 @@ void register_misc() {
         else
           fprintf(ppf, "Attribute %a does not accept a payload", code_str(name));
       });
+    } catch (const syntaxerr::IllFormedAst& e) {
+      // Parse.prepare_error
+      return location::errorf(e.loc, "broken invariant in parsetree: %s", e.msg);
+    } catch (const pparse::Error& e) {
+      // Pparse.report_error_doc (Location.error_of_printer_file)
+      pparse::Error::Kind k = e.kind;
+      std::string cmd = e.cmd;
+      return location::error_of_printer_file([k, cmd](Formatter& ppf) {
+        if (k == pparse::Error::Kind::CannotRun)
+          fprintf(ppf, "Error while running external preprocessor@.Command line: %s@.", cmd);
+        else
+          fprintf(ppf, "External preprocessor does not produce a valid file@.Command line: %s@.", cmd);
+      });
+    } catch (const arg::SysError& e) {
+      // Location's error_of_exn for Sys_error
+      return location::errorf(location::in_file(location::input_name), "I/O error: %s", std::string(e.what()));
     } catch (const typecore::VariableInScope& e) {
       return location::errorf(e.loc, "In this scoped type, variable %a is reserved for the local type %a.",
                               misc::style::code(pprintast::tyvar, e.name), code_str(e.name));

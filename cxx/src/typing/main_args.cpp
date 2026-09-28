@@ -331,7 +331,6 @@ std::vector<arg::Option> cppcaml_extensions() {
 
 std::string unsupported_compile_option() {
   if (cf::annotations) return "-annot";
-  if (!cf::all_ppx.empty()) return "-ppx";
   if (cf::dump_source) return "-dsource";
   if (cf::dump_typedtree) return "-dtypedtree";
   if (cf::dump_shape) return "-dshape";

@@ -1362,8 +1362,10 @@ class Parser {
     // It is consumed (extending the enclosing item's span) but does not enlarge
     // the expression node's own location; callers that need the post-`;` end use
     // last_seq_end_.
+    // ($endpos: the last token consumed -- a trailing `[@attr]` on the
+    // expression does not extend its own location)
     if (cur().kind == Kind::SEMI) { last_seq_end_ = position(cur().end); advance(); }
-    else last_seq_end_ = e->loc.end;
+    else last_seq_end_ = position(tokens_[idx_ - 1].end);
     return e;
   }
 

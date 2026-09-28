@@ -59,6 +59,15 @@ std::pair<std::string, std::string> output_cmi_bytes(const CmiInfos& cmi);
 std::size_t marshaled_size(const ModuleType* a, const ModuleType* b);
 std::size_t marshaled_size(const ModtypeDeclaration* a, const ModtypeDeclaration* b);
 
+// input_value of one generic value at [off], which it advances past it
+// (Pparse's binary ASTs): an OValue graph with input_value's sharing -- one
+// OValue per marshaled block, one string per marshaled string, position
+// records with their identity (OValue::pos).  Throws marshal::Error.
+const OValue* input_ovalue(const std::uint8_t* data, std::size_t len, std::size_t& off);
+// output_value of a generic value, with the .cmi Writer's sharing (strings
+// by storage, positions and locations as it writes a typed tree's)
+std::vector<std::uint8_t> output_ovalue(const OValue* v);
+
 // The debugging events of a .cmo (Emitcode.to_file with -g): the marshaled
 // `debug_event list`, whose typing values (types, Env summaries, Subst.t)
 // go through the .cmi Writer.  (Not in cmi_format.mli.)

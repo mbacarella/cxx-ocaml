@@ -65,6 +65,9 @@ add_library(cppcaml_core
   src/typing/signature_group.cpp
   src/typing/includemod.cpp
   src/typing/parsetree_ovalue.cpp
+  src/typing/parsetree_of_ovalue.cpp
+  src/typing/ast_invariants.cpp
+  src/typing/pparse.cpp
   src/typing/typemod_util.cpp
   src/typing/error_report.cpp
   src/typing/warnings.cpp
