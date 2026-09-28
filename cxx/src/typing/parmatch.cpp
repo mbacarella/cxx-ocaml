@@ -1731,34 +1731,39 @@ std::vector<T> get_mins(const Le& le, const std::vector<T>& ps) {
 }  // namespace
 
 // lub p q is a pattern that matches all values matched by p and q; may
-// raise Empty, when p and q are not compatible
-const tt::Pattern* lub(const tt::Pattern* p, const tt::Pattern* q);
-Pats lubs(const Pats& ps, const Pats& qs) {
+// raise Empty, when p and q are not compatible.  The work is done by the
+// *_opt forms, which return nullptr (lubs_opt: false) where OCaml raises
+// Empty -- the same evaluation and allocation order, without a C++ throw
+// (Matching's contexts call it thousands of times per unit, most failing).
+static const tt::Pattern* lub_opt(const tt::Pattern* p, const tt::Pattern* q);
+bool lubs_opt(const Pats& ps, const Pats& qs, Pats& out) {
   HeadScope heads;
+  out.clear();
+  for (std::size_t k = 0; k < ps.size() && k < qs.size(); ++k) {
+    const tt::Pattern* r = lub_opt(ps[k], qs[k]);
+    if (!r) return false;
+    out.push_back(r);
+  }
+  return true;
+}
+Pats lubs(const Pats& ps, const Pats& qs) {
   Pats out;
-  for (std::size_t k = 0; k < ps.size() && k < qs.size(); ++k) out.push_back(lub(ps[k], qs[k]));
+  if (!lubs_opt(ps, qs, out)) throw Empty{};
   return out;
 }
 static const tt::Pattern* orlub(const tt::Pattern* p1, const tt::Pattern* p2, const tt::Pattern* q) {
-  const tt::Pattern* r1;
-  try {
-    r1 = lub(p1, q);
-  } catch (const Empty&) {
-    return lub(p2, q);
-  }
-  try {
-    const tt::Pattern* r2 = lub(p2, q);
-    return with_desc(q, mkd(tt::Tpat_or{{PK::Tpat_or}, r1, r2, nullptr}));
-  } catch (const Empty&) {
-    return r1;
-  }
+  const tt::Pattern* r1 = lub_opt(p1, q);
+  if (!r1) return lub_opt(p2, q);
+  const tt::Pattern* r2 = lub_opt(p2, q);
+  if (!r2) return r1;
+  return with_desc(q, mkd(tt::Tpat_or{{PK::Tpat_or}, r1, r2, nullptr}));
 }
-const tt::Pattern* lub(const tt::Pattern* p, const tt::Pattern* q) {
+static const tt::Pattern* lub_opt(const tt::Pattern* p, const tt::Pattern* q) {
   HeadScope heads;
   const tt::PatternDesc* pd = p->pat_desc;
   const tt::PatternDesc* qd = q->pat_desc;
-  if (auto* a = as<tt::Tpat_alias>(pd)) return lub(a->pat, q);
-  if (auto* a = as<tt::Tpat_alias>(qd)) return lub(p, a->pat);
+  if (auto* a = as<tt::Tpat_alias>(pd)) return lub_opt(a->pat, q);
+  if (auto* a = as<tt::Tpat_alias>(qd)) return lub_opt(p, a->pat);
   if (pd->kind == PK::Tpat_any || pd->kind == PK::Tpat_var) return q;
   if (qd->kind == PK::Tpat_any || qd->kind == PK::Tpat_var) return p;
   if (auto* o = as<tt::Tpat_or>(pd)) return orlub(o->p1, o->p2, q);
@@ -1774,15 +1779,18 @@ const tt::Pattern* lub(const tt::Pattern* p, const tt::Pattern* q) {
         std::vector<tt::LabeledPattern> rs;
         std::size_t k = 0;
         for (; k < ps.size() && k < qs.size(); ++k) {
-          if (!(ps[k].label == qs[k].label)) throw Empty{};
-          rs.push_back({ps[k].label, lub(ps[k].pat, qs[k].pat)});
+          if (!(ps[k].label == qs[k].label)) return nullptr;
+          const tt::Pattern* r = lub_opt(ps[k].pat, qs[k].pat);
+          if (!r) return nullptr;
+          rs.push_back({ps[k].label, r});
         }
-        if (ps.size() != qs.size()) throw Empty{};
+        if (ps.size() != qs.size()) return nullptr;
         return make_pat(mkd(tt::Tpat_tuple{{PK::Tpat_tuple}, slice(rs)}), p->pat_type, p->pat_env);
       }
       case PK::Tpat_lazy: {
         const tt::Pattern* ip = as<tt::Tpat_lazy>(pd)->pat;
-        const tt::Pattern* r = lub(ip, as<tt::Tpat_lazy>(qd)->pat);
+        const tt::Pattern* r = lub_opt(ip, as<tt::Tpat_lazy>(qd)->pat);
+        if (!r) return nullptr;
         // (the inner p shadows the outer one in `make_pat .. p.pat_type`)
         return make_pat(mkd(tt::Tpat_lazy{{PK::Tpat_lazy}, r}), ip->pat_type, ip->pat_env);
       }
@@ -1790,7 +1798,9 @@ const tt::Pattern* lub(const tt::Pattern* p, const tt::Pattern* q) {
         auto* c1 = as<tt::Tpat_construct>(pd);
         auto* c2 = as<tt::Tpat_construct>(qd);
         if (data_types::equal_constr(c1->cstr, c2->cstr)) {
-          Pats rs = lubs(Pats(c1->args.begin(), c1->args.end()), Pats(c2->args.begin(), c2->args.end()));
+          Pats rs;
+          if (!lubs_opt(Pats(c1->args.begin(), c1->args.end()), Pats(c2->args.begin(), c2->args.end()), rs))
+            return nullptr;
           return make_pat(mkd(tt::Tpat_construct{{PK::Tpat_construct}, c1->lid, c1->cstr, slice(rs), nullptr}),
                           p->pat_type, p->pat_env);
         }
@@ -1800,7 +1810,8 @@ const tt::Pattern* lub(const tt::Pattern* p, const tt::Pattern* q) {
         auto* v1 = as<tt::Tpat_variant>(pd);
         auto* v2 = as<tt::Tpat_variant>(qd);
         if (v1->arg && v2->arg && v1->label == v2->label) {
-          const tt::Pattern* r = lub(v1->arg, v2->arg);
+          const tt::Pattern* r = lub_opt(v1->arg, v2->arg);
+          if (!r) return nullptr;
           return make_pat(mkd(tt::Tpat_variant{{PK::Tpat_variant}, v1->label, r, v1->row}), p->pat_type, p->pat_env);
         }
         if (!v1->arg && !v2->arg && v1->label == v2->label) return p;
@@ -1818,7 +1829,9 @@ const tt::Pattern* lub(const tt::Pattern* p, const tt::Pattern* q) {
           else if (l1[i].label->lbl_pos < l2[j].label->lbl_pos) rs.push_back(l1[i++]);
           else if (l2[j].label->lbl_pos < l1[i].label->lbl_pos) rs.push_back(l2[j++]);
           else {
-            rs.push_back({l1[i].lid, l1[i].label, lub(l1[i].pat, l2[j].pat)});
+            const tt::Pattern* r = lub_opt(l1[i].pat, l2[j].pat);
+            if (!r) return nullptr;
+            rs.push_back({l1[i].lid, l1[i].label, r});
             ++i;
             ++j;
           }
@@ -1829,7 +1842,9 @@ const tt::Pattern* lub(const tt::Pattern* p, const tt::Pattern* q) {
         auto* a1 = as<tt::Tpat_array>(pd);
         auto* a2 = as<tt::Tpat_array>(qd);
         if (a1->mut == a2->mut && a1->pats.size() == a2->pats.size()) {
-          Pats rs = lubs(Pats(a1->pats.begin(), a1->pats.end()), Pats(a2->pats.begin(), a2->pats.end()));
+          Pats rs;
+          if (!lubs_opt(Pats(a1->pats.begin(), a1->pats.end()), Pats(a2->pats.begin(), a2->pats.end()), rs))
+            return nullptr;
           return make_pat(mkd(tt::Tpat_array{{PK::Tpat_array}, a1->mut, slice(rs)}), p->pat_type, p->pat_env);
         }
         break;
@@ -1837,8 +1852,14 @@ const tt::Pattern* lub(const tt::Pattern* p, const tt::Pattern* q) {
       default: break;
     }
   }
-  throw Empty{};
+  return nullptr;
 }
+const tt::Pattern* lub(const tt::Pattern* p, const tt::Pattern* q) {
+  const tt::Pattern* r = lub_opt(p, q);
+  if (!r) throw Empty{};
+  return r;
+}
+const tt::Pattern* lub_or_null(const tt::Pattern* p, const tt::Pattern* q) { return lub_opt(p, q); }
 
 // ---- exported variant closing ------------------------------------------------------------
 void pressure_variants(env::t env, const std::vector<const tt::Pattern*>& pats) {

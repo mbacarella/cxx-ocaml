@@ -792,11 +792,7 @@ Context select_columns(const Matrix& pss, const Context& ctx) {
     for (auto& r : ctx) {
       auto [transfer, right] = rev_split_at(n, r.right);
       Pats inter;
-      try {
-        inter = parmatch::lubs(transfer, ps);
-      } catch (const parmatch::Empty&) {
-        continue;
-      }
+      if (!parmatch::lubs_opt(transfer, ps, inter)) continue;
       out.push_back({append(inter, r.left), right});
     }
   return out;
@@ -806,12 +802,8 @@ Context lub(Pat p, const Context& ctx) {
   Context out;
   for (auto& r : ctx) {
     if (r.right.empty()) fatal_error("Matching.Context.lub");
-    Pat l;
-    try {
-      l = parmatch::lub(p, r.right[0]);
-    } catch (const parmatch::Empty&) {
-      continue;
-    }
+    Pat l = parmatch::lub_or_null(p, r.right[0]);
+    if (!l) continue;
     out.push_back({r.left, cons(l, Pats(r.right.begin() + 1, r.right.end()))});
   }
   return out;

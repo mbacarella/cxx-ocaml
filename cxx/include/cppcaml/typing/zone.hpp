@@ -82,12 +82,16 @@ class Zone {
     for (auto it = dtors_.rbegin(); it != dtors_.rend(); ++it) it->second(it->first);
     dtors_.clear();
     if (blocks_.empty()) return;
-    blocks_.resize(1);
-    cur_ = blocks_[0].get();
-    std::size_t first = ranges_.at(cur_);
-    ranges_.clear();
-    ranges_.emplace(cur_, first);
-    cap_ = first;
+    if (blocks_.size() > 1) {
+      blocks_.resize(1);
+      cur_ = blocks_[0].get();
+      // keep the first block's map node (a scratch zone is cleared per
+      // scope: no allocation for it)
+      auto first = ranges_.extract(cur_);
+      ranges_.clear();
+      cap_ = first.mapped();
+      ranges_.insert(std::move(first));
+    }
     off_ = 0;
   }
 

@@ -44,6 +44,10 @@ bool compats(const std::vector<const tt::Pattern*>& ps, const std::vector<const 
 const tt::Pattern* lub(const tt::Pattern* p, const tt::Pattern* q);
 std::vector<const tt::Pattern*> lubs(const std::vector<const tt::Pattern*>& ps,
                                      const std::vector<const tt::Pattern*>& qs);
+// the same without the throw: nullptr / false where lub / lubs raise Empty
+const tt::Pattern* lub_or_null(const tt::Pattern* p, const tt::Pattern* q);
+bool lubs_opt(const std::vector<const tt::Pattern*>& ps, const std::vector<const tt::Pattern*>& qs,
+              std::vector<const tt::Pattern*>& out);
 std::vector<const tt::Pattern*> set_args(const tt::Pattern* q, const std::vector<const tt::Pattern*>& r);
 const tt::Pattern* pat_of_constr(const tt::Pattern* ex_pat, const ConstructorDescription* cstr);
 // complete_constrs {pat_env; pat_desc = cstr} used_constrs

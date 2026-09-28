@@ -422,7 +422,6 @@ FunctionAttribute default_stub_attribute() {
 
 // ---- make_key ---------------------------------------------------------------
 namespace {
-struct NotSimple {};
 // Ident.make_key_generator: Local {name = ""; stamp = 1, 0, -1, ...}
 struct KeyGen {
   int c = 1;
@@ -433,21 +432,32 @@ struct KeyGen {
     return Ident::make_raw(Ident::Kind::Local, "", stamp, 0, nullptr);
   }
 };
+// OCaml's Not_simple is `bad` here: set where make_key raises, every caller
+// returning nullptr at once (the key generator is make_key's own, so giving
+// up leaves nothing behind -- as the raise does -- without a C++ throw)
 struct MakeKey {
   int count = 0;
+  bool bad = false;
   KeyGen make_key;
   static constexpr int max_raw = 32;
   using Env = IdentMap<lambda>;
 
-  std::vector<lambda> recs(const Env& env, Slice<lambda> es) {
-    std::vector<lambda> out;
-    for (lambda e : es) out.push_back(rec(env, e));
-    return out;
+  lambda not_simple() {
+    bad = true;
+    return nullptr;
+  }
+  bool recs(const Env& env, Slice<lambda> es, std::vector<lambda>& out) {
+    for (lambda e : es) {
+      lambda r = rec(env, e);
+      if (bad) return false;
+      out.push_back(r);
+    }
+    return true;
   }
   lambda opt(const Env& env, lambda e) { return e ? rec(env, e) : nullptr; }
   lambda rec(const Env& env, lambda e) {
     ++count;
-    if (count > max_raw) throw NotSimple{};
+    if (count > max_raw) return not_simple();
     switch (e->kind) {
       case LK::Lvar:
       case LK::Lmutvar: {
@@ -462,36 +472,48 @@ struct MakeKey {
         LambdaApply ap = a->ap;
         // {ap with ap_func = ..; ap_args = ..; ap_loc = Loc_unknown}: right to left
         ap.ap_loc = {};
-        ap.ap_args = slice(recs(env, a->ap.ap_args));
+        std::vector<lambda> args;
+        if (!recs(env, a->ap.ap_args, args)) return nullptr;
+        ap.ap_args = slice(args);
         ap.ap_func = rec(env, a->ap.ap_func);
+        if (bad) return nullptr;
         return lapply(ap);
       }
       case LK::Llet: {
         auto* l = as<Llet>(e);
         if (l->str == LetKind::Alias) {  // ignore aliases -> substitute
           lambda ex = rec(env, l->arg);
+          if (bad) return nullptr;
           Env env2 = env;
           env2[l->id] = ex;
           return rec(env2, l->body);
         }
         if (auto* v = as<Lvar>(l->body); v && ident::same(v->id, l->id)) return rec(env, l->arg);
         lambda ex = rec(env, l->arg);
+        if (bad) return nullptr;
         Ident::t y = make_key(l->id);
         Env env2 = env;
         env2[l->id] = lvar(y);
-        return llet(l->str, l->k, y, ex, rec(env2, l->body));
+        lambda body = rec(env2, l->body);
+        if (bad) return nullptr;
+        return llet(l->str, l->k, y, ex, body);
       }
       case LK::Lmutlet: {
         auto* l = as<Lmutlet>(e);
         lambda ex = rec(env, l->arg);
+        if (bad) return nullptr;
         Ident::t y = make_key(l->id);
         Env env2 = env;
         env2[l->id] = lmutvar(y);
-        return lmutlet(l->k, y, ex, rec(env2, l->body));
+        lambda body = rec(env2, l->body);
+        if (bad) return nullptr;
+        return lmutlet(l->k, y, ex, body);
       }
       case LK::Lprim: {
         auto* p = as<Lprim>(e);
-        return lprim(p->p, slice(recs(env, p->args)), {});
+        std::vector<lambda> args;
+        if (!recs(env, p->args, args)) return nullptr;
+        return lprim(p->p, slice(args), {});
       }
       case LK::Lswitch: {
         auto* s = as<Lswitch>(e);
@@ -499,84 +521,116 @@ struct MakeKey {
         // record fields right to left (failaction, blocks, consts)
         LambdaSwitch sw = s->sw;
         sw.sw_failaction = opt(env, s->sw.sw_failaction);
+        if (bad) return nullptr;
         std::vector<SwitchCase> blocks, consts;
-        for (auto& c : s->sw.sw_blocks) blocks.push_back({c.key, rec(env, c.action)});
-        for (auto& c : s->sw.sw_consts) consts.push_back({c.key, rec(env, c.action)});
+        for (auto& c : s->sw.sw_blocks) {
+          lambda a = rec(env, c.action);
+          if (bad) return nullptr;
+          blocks.push_back({c.key, a});
+        }
+        for (auto& c : s->sw.sw_consts) {
+          lambda a = rec(env, c.action);
+          if (bad) return nullptr;
+          consts.push_back({c.key, a});
+        }
         sw.sw_blocks = slice(blocks);
         sw.sw_consts = slice(consts);
         lambda arg = rec(env, s->arg);
+        if (bad) return nullptr;
         return lswitch(arg, sw, s->loc);
       }
       case LK::Lstringswitch: {
         auto* s = as<Lstringswitch>(e);
         lambda d = opt(env, s->def);
+        if (bad) return nullptr;
         std::vector<StringCase> cases;
-        for (auto& c : s->cases) cases.push_back({c.s, rec(env, c.action)});
+        for (auto& c : s->cases) {
+          lambda a = rec(env, c.action);
+          if (bad) return nullptr;
+          cases.push_back({c.s, a});
+        }
         lambda arg = rec(env, s->arg);
+        if (bad) return nullptr;
         return lstringswitch(arg, slice(cases), d, {});
       }
       case LK::Lstaticraise: {
         auto* r = as<Lstaticraise>(e);
-        return lstaticraise(r->i, slice(recs(env, r->args)));
+        std::vector<lambda> args;
+        if (!recs(env, r->args, args)) return nullptr;
+        return lstaticraise(r->i, slice(args));
       }
       case LK::Lstaticcatch: {
         auto* c = as<Lstaticcatch>(e);
         lambda h = rec(env, c->handler);
+        if (bad) return nullptr;
         lambda b = rec(env, c->body);
+        if (bad) return nullptr;
         return lstaticcatch(b, c->i, c->params, h);
       }
       case LK::Ltrywith: {
         auto* t = as<Ltrywith>(e);
         lambda h = rec(env, t->handler);
+        if (bad) return nullptr;
         lambda b = rec(env, t->body);
+        if (bad) return nullptr;
         return ltrywith(b, t->exn, h);
       }
       case LK::Lifthenelse: {
         auto* i = as<Lifthenelse>(e);
         lambda c3 = rec(env, i->ifnot);
+        if (bad) return nullptr;
         lambda c2 = rec(env, i->ifso);
+        if (bad) return nullptr;
         lambda c1 = rec(env, i->cond);
+        if (bad) return nullptr;
         return lifthenelse(c1, c2, c3);
       }
       case LK::Lsequence: {
         auto* s = as<Lsequence>(e);
         lambda b = rec(env, s->l2);
+        if (bad) return nullptr;
         lambda a = rec(env, s->l1);
+        if (bad) return nullptr;
         return lsequence(a, b);
       }
       case LK::Lassign: {
         auto* a = as<Lassign>(e);
-        return lassign(a->id, rec(env, a->e));
+        lambda r = rec(env, a->e);
+        if (bad) return nullptr;
+        return lassign(a->id, r);
       }
       case LK::Lsend: {
         auto* s = as<Lsend>(e);
-        std::vector<lambda> args = recs(env, s->args);
+        std::vector<lambda> args;
+        if (!recs(env, s->args, args)) return nullptr;
         lambda obj = rec(env, s->obj);
+        if (bad) return nullptr;
         lambda met = rec(env, s->met);
+        if (bad) return nullptr;
         return lsend(s->k, met, obj, slice(args), {});
       }
       case LK::Lifused: {
         auto* u = as<Lifused>(e);
-        return lifused(u->id, rec(env, u->l));
+        lambda r = rec(env, u->l);
+        if (bad) return nullptr;
+        return lifused(u->id, r);
       }
       case LK::Lletrec:
       case LK::Lfunction:
       case LK::Lfor:
       case LK::Lwhile:
-      case LK::Levent: throw NotSimple{};
+      case LK::Levent: return not_simple();
     }
-    throw NotSimple{};
+    return not_simple();
   }
 };
 }  // namespace
 
 std::optional<lambda> make_key(lambda e) {
   MakeKey mk;
-  try {
-    return mk.rec({}, e);
-  } catch (const NotSimple&) {
-    return std::nullopt;
-  }
+  lambda r = mk.rec({}, e);
+  if (mk.bad) return std::nullopt;
+  return r;
 }
 
 // ---- naming ----------------------------------------------------------------
