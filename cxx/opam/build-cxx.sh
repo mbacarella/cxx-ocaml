@@ -32,23 +32,18 @@ die() { say "error: $*"; exit 1; }
 
 zstd_libs() { sed -n 's/^ZSTD_LIBS=//p' "$root/Makefile.config"; }
 
-cmake_zstd_args() {
+cmake_zstd_args() {  # <staged bin dir>
   if [ -n "$(zstd_libs)" ]; then
-    # the SHARED library, the one the OCaml runtime loads: the same
-    # compressor code, hence the same bytes.  pkg-config if present, else
-    # wherever the C compiler finds them.
-    cc=${CC:-cc}
-    if command -v pkg-config >/dev/null && pkg-config --exists libzstd; then
-      inc=$(pkg-config --variable=includedir libzstd)
-      so="$(pkg-config --variable=libdir libzstd)/libzstd.so"
-    else
-      inc=$(printf '#include <zstd.h>\n' | "$cc" -E -x c - 2>/dev/null |
-            sed -n 's|^# [0-9]* "\(.*\)/zstd\.h".*|\1|p' | head -1)
-      so=$("$cc" -print-file-name=libzstd.so)
-    fi
+    # the very libzstd the installation's runtime loads (same compressor
+    # code, hence the same bytes), and zstd.h where the C compiler that
+    # built the runtime finds it
+    so=$(ldd "$1/ocamlrun" 2>/dev/null | sed -n 's/.*libzstd[^ ]* => \([^ ]*\).*/\1/p' | head -1)
+    [ -n "$so" ] && [ -e "$so" ] || so=$("${CC:-cc}" -print-file-name=libzstd.so)
+    inc=$(printf '#include <zstd.h>\n' | "${CC:-cc}" -E -x c - 2>/dev/null |
+          sed -n 's|^# [0-9]* "\(.*\)/zstd\.h".*|\1|p' | head -1)
     [ -n "$inc" ] && [ -f "$inc/zstd.h" ] || die "this OCaml compresses with zstd but zstd.h was not found (install libzstd's development files)"
-    [ -e "$so" ] || die "this OCaml compresses with zstd but the shared libzstd was not found"
-    echo "-DCPPCAML_ZSTD=ON -DZSTD_INCLUDE_DIR=$inc -DZSTD_LIBRARY=$so"
+    [ -e "$so" ] || die "this OCaml compresses with zstd but its shared libzstd was not found"
+    echo "-DCPPCAML_ZSTD=ON -DZSTD_INCLUDE_DIR=$inc -DZSTD_LIBRARY=$(readlink -f "$so")"
   else
     echo "-DCPPCAML_ZSTD=OFF"
   fi
@@ -88,7 +83,7 @@ do_build() {
   [ -x "$sbin/ocamlc.opt" ] || die "the staged installation has no bin/ocamlc.opt"
   # 3. c++ocamlc for this installation
   INSTALL="$sp" "$root/cxx/harness/gen_driver_tables.sh"
-  zstd_args=$(cmake_zstd_args) || exit 1
+  zstd_args=$(cmake_zstd_args "$sbin") || exit 1
   # shellcheck disable=SC2086
   cmake -S "$root/cxx" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CXX_COMPILER="$CXX" $mi_args $zstd_args >/dev/null
