@@ -88,4 +88,8 @@ void save_cmt(const std::string& filename, std::string_view modname, const std::
               const BinaryAnnots& annots, env::t initial_env, const cmi_format::CmiInfos* cmi,
               shape::t shape);
 
+// Typemod.gen_annot: Cmt2annot's walk over an implementation's annots (its
+// Env lookups; the .annot file itself, -annot, is not ported)
+void gen_annot(const BinaryAnnots& annots);
+
 }  // namespace cppcaml::typing::cmt_format

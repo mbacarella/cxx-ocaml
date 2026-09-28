@@ -2289,6 +2289,10 @@ struct OccLid {  // a `Longident.t loc` record
 class OccIndexer {
  public:
   std::vector<std::pair<OccLid, const shape_reduce::Result*>> index;  // in insertion order
+  // Cmt2annot's iterator instead of the index's hooks: the same walk, whose
+  // only effect without -annot is Env.find_value on each identifier's
+  // environment (see gen_annot below)
+  bool annot_mode = false;
 
   void structure(const tt::Structure* s) {
     for (const tt::StructureItem* it : s->str_items) structure_item(it);
@@ -2318,7 +2322,10 @@ class OccIndexer {
   static OccLid lident_of(const pt::StrLoc& s) { return {fresh_identity(), 0, Longident::lident(s.txt), s.loc}; }
 
   // ---- index_occurrences' f ----
-  void f(NS ns, env::t env, Path::t path, const OccLid& lid) { index_components(ns, env, lid, path); }
+  void f(NS ns, env::t env, Path::t path, const OccLid& lid) {
+    if (annot_mode) return;
+    index_components(ns, env, lid, path);
+  }
   void reduce_and_store(NS ns, env::t env, const OccLid& lid, Path::t path) {
     if (lid.loc.loc_ghost) return;
     shape::t path_shape;
@@ -2577,6 +2584,14 @@ class OccIndexer {
     using K = tt::ExpressionDesc::Kind;
     const tt::ExpressionDesc* d = e->exp_desc;
     env::t exp_env = e->exp_env;
+    // Cmt2annot's expr: an identifier's declaration, looked up before the
+    // children (Stypes.record keeps it only with -annot)
+    if (annot_mode && d->kind == K::Texp_ident) {
+      try {
+        (void)env::find_value(tt::as<tt::Texp_ident>(d)->path, exp_env);
+      } catch (const env::NotFound&) {
+      }
+    }
     // the hook
     switch (d->kind) {
       case K::Texp_ident: {
@@ -3356,6 +3371,23 @@ void save_cmt(const std::string& filename, std::string_view modname, const std::
     throw std::runtime_error("Cannot rename " + tmp + " to " + filename);
   }
   clear();
+}
+
+// Typemod.gen_annot (Cmt2annot.gen_annot ~use_summaries:false), run by
+// type_implementation's save_cmt after the .cmt: without -annot it writes
+// nothing (the .annot is not ported), but its walk's Env.find_value calls
+// force lazily substituted value descriptions and Env.make_copy_of_types'
+// memoized copies -- type nodes whose ids every later allocation follows
+void gen_annot(const BinaryAnnots& annots) {
+  OccIndexer walk;
+  walk.annot_mode = true;
+  switch (annots.kind) {
+    case BinaryAnnots::Kind::Implementation: walk.structure(annots.structure); break;
+    case BinaryAnnots::Kind::Partial_implementation:
+      for (saved_types_t l = annots.parts; l; l = l->next) walk.part(l->part);
+      break;
+    default: break;  // Interface, Packed, Partial_interface: nothing
+  }
 }
 
 }  // namespace cppcaml::typing::cmt_format

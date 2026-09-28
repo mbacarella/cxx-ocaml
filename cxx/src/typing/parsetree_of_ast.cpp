@@ -74,6 +74,150 @@ struct Conv {
   std::string_view fname;
   const std::vector<std::string>& dirfiles;
 
+  // Ast_helper.Typ.varify_constructors var_names t (its Variable_in_scope
+  // checks ran on the parser's own copy): new type records sharing every
+  // field but the desc; `Ptyp_constr (Lident s, [])` for a variable becomes
+  // `Ptyp_var s`
+  static const CoreType* varify_constructors(Slice<StrLoc> var_names, const CoreType* t) {
+    using TK = CoreTypeDesc::Kind;
+    auto is_var = [&](std::string_view s) {
+      for (const StrLoc& v : var_names)
+        if (v.txt == s) return true;
+      return false;
+    };
+    std::function<const CoreType*(const CoreType*)> loop;
+    auto map = [&](Slice<const CoreType*> l) {
+      std::vector<const CoreType*> out;
+      for (const CoreType* x : l) out.push_back(loop(x));
+      return slice(out);
+    };
+    auto loop_package_type = [&](const PackageType* p) {
+      auto* np = make<PackageType>(*p);
+      std::vector<std::pair<LidLoc, const CoreType*>> cs;
+      for (auto& [n, ty] : p->ppt_constraints) cs.push_back({n, loop(ty)});
+      np->ppt_constraints = slice(cs);
+      return static_cast<const PackageType*>(np);
+    };
+    loop = [&](const CoreType* t) -> const CoreType* {
+      const CoreTypeDesc* d = t->ptyp_desc;
+      const CoreTypeDesc* nd = nullptr;
+      switch (d->kind) {
+        case TK::Ptyp_any: nd = make<Ptyp_any>(TK::Ptyp_any); break;
+        case TK::Ptyp_var: nd = make<Ptyp_var>(*as<Ptyp_var>(d)); break;
+        case TK::Ptyp_arrow: {
+          auto* x = make<Ptyp_arrow>(*as<Ptyp_arrow>(d));
+          x->t1 = loop(x->t1);
+          x->t2 = loop(x->t2);
+          nd = x;
+          break;
+        }
+        case TK::Ptyp_tuple: {
+          auto* x = make<Ptyp_tuple>(*as<Ptyp_tuple>(d));
+          std::vector<LabeledCoreType> tl;
+          for (const LabeledCoreType& e : x->tl) tl.push_back({e.label, loop(e.ty)});
+          x->tl = slice(tl);
+          nd = x;
+          break;
+        }
+        case TK::Ptyp_constr: {
+          auto* c = as<Ptyp_constr>(d);
+          if (c->args.empty() && c->lid.txt->kind == Longident::Kind::Lident && is_var(c->lid.txt->s)) {
+            auto* x = make<Ptyp_var>(TK::Ptyp_var);
+            x->name = c->lid.txt->s;
+            nd = x;
+          } else {
+            auto* x = make<Ptyp_constr>(*c);
+            x->args = map(c->args);
+            nd = x;
+          }
+          break;
+        }
+        case TK::Ptyp_object: {
+          auto* x = make<Ptyp_object>(*as<Ptyp_object>(d));
+          std::vector<const ObjectField*> fs;
+          for (const ObjectField* f : x->fields) {
+            auto* nf = make<ObjectField>(*f);
+            if (auto* o = as<Otag>(f->pof_desc)) {
+              auto* no = make<Otag>(*o);
+              no->ty = loop(o->ty);
+              nf->pof_desc = no;
+            } else {
+              auto* no = make<Oinherit>(*as<Oinherit>(f->pof_desc));
+              no->ty = loop(no->ty);
+              nf->pof_desc = no;
+            }
+            fs.push_back(nf);
+          }
+          x->fields = slice(fs);
+          nd = x;
+          break;
+        }
+        case TK::Ptyp_class: {
+          auto* x = make<Ptyp_class>(*as<Ptyp_class>(d));
+          x->args = map(x->args);
+          nd = x;
+          break;
+        }
+        case TK::Ptyp_alias: {
+          auto* x = make<Ptyp_alias>(*as<Ptyp_alias>(d));
+          x->ty = loop(x->ty);
+          nd = x;
+          break;
+        }
+        case TK::Ptyp_variant: {
+          auto* x = make<Ptyp_variant>(*as<Ptyp_variant>(d));
+          std::vector<const RowField*> fs;
+          for (const RowField* f : x->fields) {
+            auto* nf = make<RowField>(*f);
+            if (auto* r = as<Rtag>(f->prf_desc)) {
+              auto* nr = make<Rtag>(*r);
+              nr->types = map(r->types);
+              nf->prf_desc = nr;
+            } else {
+              auto* nr = make<Rinherit>(*as<Rinherit>(f->prf_desc));
+              nr->ty = loop(nr->ty);
+              nf->prf_desc = nr;
+            }
+            fs.push_back(nf);
+          }
+          x->fields = slice(fs);
+          nd = x;
+          break;
+        }
+        case TK::Ptyp_poly: {
+          auto* x = make<Ptyp_poly>(*as<Ptyp_poly>(d));
+          x->ty = loop(x->ty);
+          nd = x;
+          break;
+        }
+        case TK::Ptyp_package: {
+          auto* x = make<Ptyp_package>(*as<Ptyp_package>(d));
+          x->pack = loop_package_type(x->pack);
+          nd = x;
+          break;
+        }
+        case TK::Ptyp_open: {
+          auto* x = make<Ptyp_open>(*as<Ptyp_open>(d));
+          x->ty = loop(x->ty);
+          nd = x;
+          break;
+        }
+        case TK::Ptyp_extension: nd = make<Ptyp_extension>(*as<Ptyp_extension>(d)); break;
+        case TK::Ptyp_functor: {
+          auto* x = make<Ptyp_functor>(*as<Ptyp_functor>(d));
+          x->pack = loop_package_type(x->pack);
+          x->ty = loop(x->ty);
+          nd = x;
+          break;
+        }
+      }
+      auto* nt = make<CoreType>(*t);
+      nt->ptyp_desc = nd;
+      return nt;
+    };
+    return loop(t);
+  }
+
   // ---- locations ----
   // One zone string per file name: the lexer's positions all carry the one
   // pos_fname string of their lexbuf (Location.init), which the .cmo's
@@ -726,20 +870,23 @@ struct Conv {
           } else if constexpr (std::is_same_v<T, ast::Pexp_poly>) {
             const Expression* pe = expression(*v.e);
             const CoreType* pt = v.t ? core_type(**v.t) : nullptr;
-            // wrap_type_annotation: Ptyp_poly (newtypes, _) and the
-            // Pexp_newtype chain share the newtypes' strings
+            // wrap_type_annotation (parser.mly): the method's type is typed
+            // twice -- as the body's constraint and, varified, as the
+            // Ptyp_poly -- and Typ.varify_constructors builds the second from
+            // the first, sharing its longidents, labels, locations and
+            // attributes; the Ptyp_poly's variables are the Pexp_newtype
+            // chain's records
             if (auto* ap = v.t ? std::get_if<ast::Ptyp_poly>(&(*v.t)->desc) : nullptr; ap && ap->from_newtypes) {
               std::vector<StrLoc> vars;
-              for (const Expression* x = pe; x && x->pexp_desc->kind == K::Pexp_newtype;
-                   x = as<Pexp_newtype>(x->pexp_desc)->body)
+              const Expression* x = pe;
+              for (; x && x->pexp_desc->kind == K::Pexp_newtype; x = as<Pexp_newtype>(x->pexp_desc)->body)
                 vars.push_back(as<Pexp_newtype>(x->pexp_desc)->name);
               auto* poly = as<Ptyp_poly>(pt->ptyp_desc);
-              if (vars.size() == poly->vars.size()) {
-                std::vector<StrLoc> nv(poly->vars.begin(), poly->vars.end());
-                for (std::size_t k = 0; k < nv.size(); ++k)
-                  if (nv[k].txt == vars[k].txt) nv[k].txt = vars[k].txt;
+              if (x && x->pexp_desc->kind == K::Pexp_constraint && vars.size() == poly->vars.size()) {
+                Slice<StrLoc> vs = slice(vars);
                 auto* np = make<Ptyp_poly>(*poly);
-                np->vars = slice(nv);
+                np->vars = vs;
+                np->ty = varify_constructors(vs, as<Pexp_constraint>(x->pexp_desc)->ty);
                 auto* nt = make<CoreType>(*pt);
                 nt->ptyp_desc = np;
                 pt = nt;
@@ -951,9 +1098,11 @@ struct Conv {
           } else if constexpr (std::is_same_v<T, ast::Pcl_structure>) {
             d = make<Pcl_structure>(Pcl_structure{{K::Pcl_structure}, class_structure(v.cs)});
           } else if constexpr (std::is_same_v<T, ast::Pcl_fun>) {
-            d = make<Pcl_fun>(Pcl_fun{{K::Pcl_fun}, label(v.label),
-                                      v.default_ ? expression(**v.default_) : nullptr, pattern(v.pat),
-                                      class_expr(*v.body)});
+            ArgLabel lbl = label(v.label);
+            const Expression* def = v.default_ ? expression(**v.default_) : nullptr;
+            const Pattern* pat = pattern(v.pat);
+            if (std::string_view n = v.pun ? punned_name(pat) : std::string_view{}; n.data()) lbl.name = n;
+            d = make<Pcl_fun>(Pcl_fun{{K::Pcl_fun}, lbl, def, pat, class_expr(*v.body)});
           } else if constexpr (std::is_same_v<T, ast::Pcl_apply>) {
             d = make<Pcl_apply>(Pcl_apply{{K::Pcl_apply}, class_expr(*v.ce), args(v.args)});
           } else if constexpr (std::is_same_v<T, ast::Pcl_let>) {

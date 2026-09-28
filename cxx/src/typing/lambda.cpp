@@ -1146,19 +1146,23 @@ struct Substs {
           if (!l.count(k)) keys.push_back(k);
         std::sort(keys.begin(), keys.end(), IdentLess{});
         env::t new_env = old_env;
+        // find_in_old runs inside the update, and a bound variable renamed to
+        // itself has none (the merge returns None): the lookup forces what
+        // it finds (a lazy value description, Env.make_copy_of_types' copy)
+        auto find_in_old = [&](Ident::t id) -> const ValueDescription* {
+          try {
+            return env::find_value(Path::pident(id), old_env);
+          } catch (const env::NotFound&) {
+            return nullptr;
+          }
+        };
         for (Ident::t id : keys) {
           auto bound = l.find(id);
-          const ValueDescription* vd = nullptr;
-          try {
-            vd = env::find_value(Path::pident(id), old_env);
-          } catch (const env::NotFound&) {
-            vd = nullptr;
-          }
           if (bound != l.end()) {
             if (ident::equal(id, bound->second)) continue;
-            if (vd) new_env = env::add_value(bound->second, vd, new_env);
+            if (const ValueDescription* vd = find_in_old(id)) new_env = env::add_value(bound->second, vd, new_env);
           } else {
-            if (vd) new_env = update_env(id, vd, new_env);
+            if (const ValueDescription* vd = find_in_old(id)) new_env = update_env(id, vd, new_env);
           }
         }
         auto* ev = make<LambdaEvent>(*e->ev);

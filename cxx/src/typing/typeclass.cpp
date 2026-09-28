@@ -1100,7 +1100,7 @@ const tt::ClassExpr* class_expr_aux(std::string_view cl_num, Final final, env::t
         const pt::Expression* dflt = f->default_;
         const Location& loc = dflt->pexp_loc;
         auto predef_lid = [](std::string_view n) {
-          return pt::LidLoc{Longident::ldot(Longident::lident("*predef*"), location::none(), n, location::none()),
+          return pt::LidLoc{Longident::ldot(Longident::lident(OCAML_LIT("*predef*")), location::none(), n, location::none()),
                             location::none()};
         };
         auto pat_var = [&](std::string_view n) {
@@ -1110,15 +1110,15 @@ const tt::ClassExpr* class_expr_aux(std::string_view cl_num, Final final, env::t
           return ah::exp_ident(loc, pt::LidLoc{Longident::lident(n), location::none()});
         };
         const pt::Pattern* some_pat = ah::pat_mk(
-            mkd(pt::Ppat_construct{{pt::PatternDesc::Kind::Ppat_construct}, predef_lid("Some"),
-                                   make<pt::ConstructArg>(pt::ConstructArg{{}, pat_var("*sth*")})}),
+            mkd(pt::Ppat_construct{{pt::PatternDesc::Kind::Ppat_construct}, predef_lid(OCAML_LIT("Some")),
+                                   make<pt::ConstructArg>(pt::ConstructArg{{}, pat_var(OCAML_LIT("*sth*"))})}),
             loc);
         const pt::Pattern* none_pat = ah::pat_mk(
-            mkd(pt::Ppat_construct{{pt::PatternDesc::Kind::Ppat_construct}, predef_lid("None"), nullptr}), loc);
-        std::vector<const pt::Case*> scases{make<pt::Case>(some_pat, nullptr, exp_ident("*sth*")),
+            mkd(pt::Ppat_construct{{pt::PatternDesc::Kind::Ppat_construct}, predef_lid(OCAML_LIT("None")), nullptr}), loc);
+        std::vector<const pt::Case*> scases{make<pt::Case>(some_pat, nullptr, exp_ident(OCAML_LIT("*sth*"))),
                                             make<pt::Case>(none_pat, nullptr, dflt)};
         const pt::Expression* smatch = ah::exp_mk(
-            mkd(pt::Pexp_match{{pt::ExpressionDesc::Kind::Pexp_match}, exp_ident("*opt*"), slice(scases)}), loc);
+            mkd(pt::Pexp_match{{pt::ExpressionDesc::Kind::Pexp_match}, exp_ident(OCAML_LIT("*opt*")), slice(scases)}), loc);
         std::vector<const pt::ValueBinding*> vbs{
             make<pt::ValueBinding>(spat, smatch, nullptr, pt::Attributes{}, location::none())};
         auto* slet = make<pt::ClassExpr>(
@@ -1127,7 +1127,7 @@ const tt::ClassExpr* class_expr_aux(std::string_view cl_num, Final final, env::t
         // Note: we don't put the '#default' attribute, as it is not detected
         // for class-level let bindings.  See #5975.
         auto* sfun = make<pt::ClassExpr>(
-            mkd(pt::Pcl_fun{{pt::ClassExprDesc::Kind::Pcl_fun}, f->label, nullptr, pat_var("*opt*"), slet}),
+            mkd(pt::Pcl_fun{{pt::ClassExprDesc::Kind::Pcl_fun}, f->label, nullptr, pat_var(OCAML_LIT("*opt*")), slet}),
             scl->pcl_loc, pt::Attributes{});
         return class_expr(cl_num, final, val_env, met_env, virt, self_scope, sfun);
       }
@@ -1888,8 +1888,12 @@ const pt::ClassDescription* approx_class(const pt::ClassDescription* sdecl) {
 }  // namespace
 
 // the module-initialization values of typeclass.ml, created at startup (see
-// typemod::install_forward_refs)
-void module_init() { (void)unbound_class(); }
+// typemod::install_forward_refs); var_option's type ids are module-init ids,
+// allocated before the first Types reset
+void module_init() {
+  (void)unbound_class();
+  (void)var_option();
+}
 
 std::pair<std::vector<ClassInfo<const tt::TClassDeclaration*>>, env::t> class_declarations(
     env::t env, Slice<const pt::ClassDeclaration*> cls) {

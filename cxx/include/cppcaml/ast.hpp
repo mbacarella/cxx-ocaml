@@ -513,7 +513,8 @@ struct ClassField;
 struct ClassStructure { Pattern self; std::vector<ClassField> fields; };
 struct Pcl_constr { LongidentLoc id; std::vector<CoreTypeBox> args; };
 struct Pcl_structure { ClassStructure cs; };
-struct Pcl_fun { ArgLabel label; std::optional<ExprBox> default_; Pattern pat; ClassExprBox body; };
+struct Pcl_fun { ArgLabel label; std::optional<ExprBox> default_; Pattern pat; ClassExprBox body;
+                 bool pun = false; };  // as Pparam_val's
 struct Pcl_apply { ClassExprBox ce; std::vector<std::pair<ArgLabel, ExprBox>> args; };
 struct Pcl_let { RecFlag rf; std::vector<ValueBinding> bindings; ClassExprBox body; };
 struct Pcl_constraint { ClassExprBox ce; ClassTypeBox ct; };

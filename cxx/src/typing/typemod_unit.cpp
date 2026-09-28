@@ -259,6 +259,7 @@ static tt::Implementation type_implementation_(const UnitInfo& target, env::t in
 static void save_cmt(const UnitInfo& target, const cmt_format::BinaryAnnots& annots, env::t initial_env,
                      const cmi_format::CmiInfos* cmi, shape::t shape) {
   cmt_format::save_cmt(target.prefix + ".cmt", target.modname, target.source_file, annots, initial_env, cmi, shape);
+  cmt_format::gen_annot(annots);
 }
 
 tt::Implementation type_implementation(const UnitInfo& target, env::t initial_env, pt::Structure ast) {

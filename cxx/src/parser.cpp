@@ -4824,7 +4824,7 @@ class Parser {
     // $sloc end is the body's last token (incl. a trailing `[@attr]`, which does
     // not extend the body's own loc but is part of the fun production).
     Location l = span(ps, position(tokens_[idx_ - 1].end));
-    return ClassExpr{Pcl_fun{pv.label, std::move(pv.default_), std::move(pv.pat), box(std::move(body))}, l, {}};
+    return ClassExpr{Pcl_fun{pv.label, std::move(pv.default_), std::move(pv.pat), box(std::move(body)), pv.pun}, l, {}};
   }
 
   ClassExpr parse_class_simple_expr() {
@@ -5104,7 +5104,7 @@ class Parser {
     FunctionParam fp = parse_param();
     auto& pv = std::get<Pparam_val>(fp.desc);
     ClassExpr body = parse_class_fun_binding();
-    return ClassExpr{Pcl_fun{pv.label, std::move(pv.default_), std::move(pv.pat), box(std::move(body))},
+    return ClassExpr{Pcl_fun{pv.label, std::move(pv.default_), std::move(pv.pat), box(std::move(body)), pv.pun},
                      span(ps, body.loc.end), {}};
   }
   ClassTypeDeclaration parse_one_class_type_decl(Position kw) {
