@@ -7,6 +7,8 @@
      attr    [@ocaml.warning "-26-27"] on every let binding, and an
              unknown attribute on every structure item
      ghost   every location made ghost
+     copy    every location and position a fresh record of equal value
+             (as ppxlib's AST migration copies them)
      none    every location Location.none
      bad     an ill-formed AST (a one-element tuple) for Ast_invariants *)
 
@@ -98,6 +100,9 @@ let mapper = function
   | "derive" -> derive_mapper
   | "attr" -> attr_mapper
   | "ghost" -> loc_mapper (fun l -> { l with loc_ghost = true })
+  | "copy" ->
+      let pos (p : Lexing.position) = { p with pos_lnum = p.pos_lnum } in
+      loc_mapper (fun l -> { loc_start = pos l.loc_start; loc_end = pos l.loc_end; loc_ghost = l.loc_ghost })
   | "none" -> loc_mapper (fun _ -> Location.none)
   | "bad" -> bad_mapper
   | s -> failwith ("ppx_tests: unknown mapper " ^ s)

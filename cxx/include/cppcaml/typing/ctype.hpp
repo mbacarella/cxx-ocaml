@@ -324,7 +324,7 @@ void remove_object_name(TypeExpr* ty);
 // ---- row types ------------------------------------------------------------------------
 std::vector<RowFieldEntry> sort_row_fields(std::vector<RowFieldEntry> l);
 struct MergedRowFields {
-  std::vector<RowFieldEntry> r1, r2;
+  Slice<RowFieldEntry> r1, r2;  // the inputs themselves when passed through
   struct Pair {
     std::string_view label;
     const RowField* f1;
@@ -332,9 +332,9 @@ struct MergedRowFields {
   };
   std::vector<Pair> pairs;
 };
-MergedRowFields merge_row_fields(const std::vector<RowFieldEntry>& fi1,
-                                 const std::vector<RowFieldEntry>& fi2);
-std::vector<RowFieldEntry> filter_row_fields(bool erase, const std::vector<RowFieldEntry>& fi);
+MergedRowFields merge_row_fields(Slice<RowFieldEntry> fi1,
+                                 Slice<RowFieldEntry> fi2);
+std::vector<RowFieldEntry> filter_row_fields(bool erase, Slice<RowFieldEntry> fi);
 
 // ---- genericity -------------------------------------------------------------------------
 enum class VariableKind { Row_variable, Type_variable };

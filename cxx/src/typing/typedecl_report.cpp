@@ -134,7 +134,7 @@ void explain_unbound_single(Formatter& ppf, const std::vector<TypeExpr*>& params
   if (auto* v = as<Tvariant>(d)) {
     if (types::eq_type(types::row_more(v->row), tv)) return trivial(ty);
     explain_unbound<RowFieldEntry>(
-        ppf, params, tv, types::row_fields(v->row),
+        ppf, params, tv, [&] { auto f = types::row_fields(v->row); return std::vector<RowFieldEntry>(f.begin(), f.end()); }(),
         [](const RowFieldEntry& e) -> TypeExpr* {
           types::RowFieldView f = types::row_field_repr(e.field);
           if (f.kind == types::RowFieldView::Kind::Rpresent && f.present) return f.present;

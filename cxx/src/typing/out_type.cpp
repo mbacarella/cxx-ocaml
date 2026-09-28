@@ -1381,7 +1381,7 @@ const ot::OutType* tree_of_typexp(Mode mode, TypeExpr* ty) {
           for (auto& e : row.fields)
             if (types::row_field_repr(e.field).kind != RowFieldView::Kind::Rabsent) fields.push_back(e);
         } else {
-          fields = row.fields;
+          fields.assign(row.fields.begin(), row.fields.end());
         }
         std::vector<std::string> present;
         for (auto& e : fields)

@@ -427,7 +427,10 @@ class Reader {
 
   const RowDesc* row(std::size_t id) {
     auto fields = list<RowFieldEntry>(f(id, 0), [&](std::size_t e) {
-      return RowFieldEntry{str(f(e, 0)), row_field(f(e, 1))};
+      // one identity per marshaled tuple (input_value's sharing)
+      auto [it, fresh] = entry_objs_.try_emplace(e, nullptr);
+      if (fresh) it->second = fresh_identity();
+      return RowFieldEntry{str(f(e, 0)), row_field(f(e, 1)), it->second};
     });
     TypeExpr* more = ty(f(id, 1));
     bool closed = boolean(f(id, 2));
@@ -916,6 +919,7 @@ class Reader {
   FlatMemo<RowFieldCell*, 7> cell_{slots_};
   FlatMemo<ident::Unscoped*, 8> us_{slots_};
   FlatMemo<ClassSignature*, 9> csig_{slots_};
+  std::unordered_map<std::size_t, const void*> entry_objs_;  // row fields' tuples
   FlatMemo<OValue*, 10> ov_{slots_};
   FlatMemo<std::string_view, 11> str_{slots_};
   FlatMemo<Ident::t, 12> ident_{slots_};

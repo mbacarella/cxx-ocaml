@@ -844,8 +844,8 @@ static Constraints subtype_row(env::t env, const STrace& trace, const RowDesc* r
   TypeExpr* more1 = r1d.more;
   TypeExpr* more2 = r2d.more;
   MergedRowFields m = merge_row_fields(r1d.fields, r2d.fields);
-  std::vector<RowFieldEntry> r1 = r2d.closed ? filter_row_fields(false, m.r1) : m.r1;
-  std::vector<RowFieldEntry> r2 = r1d.closed ? filter_row_fields(false, m.r2) : m.r2;
+  Slice<RowFieldEntry> r1 = r2d.closed ? slice(filter_row_fields(false, m.r1)) : m.r1;
+  Slice<RowFieldEntry> r2 = r1d.closed ? slice(filter_row_fields(false, m.r2)) : m.r2;
   const TypeDesc* md1 = get_desc(more1);
   const TypeDesc* md2 = get_desc(more2);
   auto* k1 = as<Tconstr>(md1);
@@ -1092,7 +1092,7 @@ static void normalize_type_rec(TypeMark& mark, TypeExpr* ty) {
     if (auto* v = as<Tvariant>(d)) {
       RowDescRepr r = row_repr(v->row);
       std::vector<RowFieldEntry> fields;
-      for (auto& [l, f] : r.fields) {
+      for ([[maybe_unused]] auto& [l, f, l_obj] : r.fields) {
         RowFieldView fv = row_field_repr(f);
         const RowField* nf = f;
         if (fv.kind == RK::Reither && fv.arg_types.size() >= 2) {

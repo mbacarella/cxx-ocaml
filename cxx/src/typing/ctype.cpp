@@ -395,12 +395,11 @@ std::vector<RowFieldEntry> sort_row_fields(std::vector<RowFieldEntry> l) {
   return l;
 }
 
-static bool mem_assoc(std::string_view l, const std::vector<RowFieldEntry>& fi) {
+static bool mem_assoc(std::string_view l, Slice<RowFieldEntry> fi) {
   return std::any_of(fi.begin(), fi.end(), [&](const RowFieldEntry& e) { return e.label == l; });
 }
 
-MergedRowFields merge_row_fields(const std::vector<RowFieldEntry>& fi1,
-                                 const std::vector<RowFieldEntry>& fi2) {
+MergedRowFields merge_row_fields(Slice<RowFieldEntry> fi1, Slice<RowFieldEntry> fi2) {
   MergedRowFields r;
   if (fi1.empty() || fi2.empty() ||
       (fi1.size() == 1 && !mem_assoc(fi1[0].label, fi2)) ||
@@ -410,7 +409,9 @@ MergedRowFields merge_row_fields(const std::vector<RowFieldEntry>& fi1,
     return r;
   }
   // merge_rf [] [] [] (sort fi1) (sort fi2): pairs are consed (reversed)
-  auto s1 = sort_row_fields(fi1), s2 = sort_row_fields(fi2);
+  auto s1 = sort_row_fields(std::vector<RowFieldEntry>(fi1.begin(), fi1.end()));
+  auto s2 = sort_row_fields(std::vector<RowFieldEntry>(fi2.begin(), fi2.end()));
+  std::vector<RowFieldEntry> r1, r2;
   std::size_t i = 0, j = 0;
   while (i < s1.size() && j < s2.size()) {
     if (s1[i].label == s2[j].label) {
@@ -418,20 +419,22 @@ MergedRowFields merge_row_fields(const std::vector<RowFieldEntry>& fi1,
       ++i;
       ++j;
     } else if (s1[i].label < s2[j].label) {
-      r.r1.push_back(s1[i++]);
+      r1.push_back(s1[i++]);
     } else {
-      r.r2.push_back(s2[j++]);
+      r2.push_back(s2[j++]);
     }
   }
-  for (; i < s1.size(); ++i) r.r1.push_back(s1[i]);
-  for (; j < s2.size(); ++j) r.r2.push_back(s2[j]);
+  for (; i < s1.size(); ++i) r1.push_back(s1[i]);
+  for (; j < s2.size(); ++j) r2.push_back(s2[j]);
+  r.r1 = slice(r1);
+  r.r2 = slice(r2);
   return r;
 }
 
-std::vector<RowFieldEntry> filter_row_fields(bool erase, const std::vector<RowFieldEntry>& fi) {
+std::vector<RowFieldEntry> filter_row_fields(bool erase, Slice<RowFieldEntry> fi) {
   // recursion processes the tail first
   std::vector<RowFieldEntry> out;
-  for (auto it = fi.rbegin(); it != fi.rend(); ++it) {
+  for (auto it = std::make_reverse_iterator(fi.end()); it != std::make_reverse_iterator(fi.begin()); ++it) {
     auto v = row_field_repr(it->field);
     if (v.kind == RowFieldView::Kind::Rabsent) continue;
     if (v.kind == RowFieldView::Kind::Reither && !v.matched && erase) {

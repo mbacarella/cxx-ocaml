@@ -131,7 +131,7 @@ TypeExpr* copy(CopyScope& copy_scope, TypeExpr* ty, const Partial* partial, bool
         auto not_reither = [](const RowFieldEntry& e) {
           return row_field_repr(e.field).kind != RowFieldView::Kind::Reither;
         };
-        std::vector<RowFieldEntry> fields = row_fields(row);
+        Slice<RowFieldEntry> fields = row_fields(row);
         if (row_closed(row) && !is_fixed(row) && partial->free_univars(ty).s.empty() &&
             !std::all_of(fields.begin(), fields.end(), not_reither)) {
           more2 = newvar();

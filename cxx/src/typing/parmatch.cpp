@@ -798,7 +798,7 @@ void close_variant(env::t env, const RowDesc* row) {
   const PathArgs* orig_name = rr.name;
   const PathArgs* name = orig_name;
   bool static_ = true;
-  for (auto& [tag, f] : rr.fields) {
+  for ([[maybe_unused]] auto& [tag, f, tag_obj] : rr.fields) {
     RowFieldView v = row_field_repr(f);
     if (v.kind == RowFieldView::Kind::Reither && !v.matched) {
       // fixed=false means that this tag is not explicitly matched
@@ -837,7 +837,7 @@ bool full_match(bool closing, const std::vector<std::pair<const Head*, std::vect
       const RowDesc* row = discr->type_row();
       if (closing && !btype::has_fixed_explanation(row)) {
         // closing=true, we are considering the variant as closed
-        for (auto& [tag, f] : row_fields(row)) {
+        for ([[maybe_unused]] auto& [tag, f, tag_obj] : row_fields(row)) {
           RowFieldView v = row_field_repr(f);
           if (v.kind == RowFieldView::Kind::Rabsent || (v.kind == RowFieldView::Kind::Reither && !v.matched)) continue;
           // m=true, do not discard matched tags, rather warn
@@ -846,7 +846,7 @@ bool full_match(bool closing, const std::vector<std::pair<const Head*, std::vect
         return true;
       }
       if (!row_closed(row)) return false;
-      for (auto& [tag, f] : row_fields(row))
+      for ([[maybe_unused]] auto& [tag, f, tag_obj] : row_fields(row))
         if (!(row_field_repr(f).kind == RowFieldView::Kind::Rabsent || mem(tag))) return false;
       return true;
     }
@@ -1032,7 +1032,7 @@ const tt::Pattern* build_other(Path::t ext, const std::vector<std::pair<const He
       };
       const RowDesc* row = d->type_row();
       Pats others;  // head first
-      for (auto& [tag, f] : row_fields(row)) {
+      for ([[maybe_unused]] auto& [tag, f, tag_obj] : row_fields(row)) {
         if (mem(tag)) continue;
         RowFieldView v = row_field_repr(f);
         // (called after erasing pattern info)

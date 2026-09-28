@@ -29,6 +29,9 @@ static et::Elt<TypeExpr*> no_tags(et::Position pos, std::vector<RowFieldEntry> t
   v.tags = std::move(tags);
   return variant_elt(v);
 }
+static et::Elt<TypeExpr*> no_tags(et::Position pos, Slice<RowFieldEntry> tags) {
+  return no_tags(pos, std::vector<RowFieldEntry>(tags.begin(), tags.end()));
+}
 static et::Elt<TypeExpr*> openness(et::Position pos) {
   et::Variant v = variant(VK::Openness);
   v.pos = pos;
@@ -275,13 +278,13 @@ static void moregen_row(TypePairs& tp, env::t env, const RowDesc* row1, const Ro
   if (eq_type(rm1, rm2)) return;
   bool may_inst = (is_Tvar(rm1) && may_instantiate(rm1)) || get_desc(rm1)->kind == DK::Tnil;
   MergedRowFields m = merge_row_fields(r1d.fields, r2d.fields);
-  std::vector<RowFieldEntry> r1 = m.r1, r2 = m.r2;
+  Slice<RowFieldEntry> r1 = m.r1, r2 = m.r2;
   if (r2d.closed) {
     // a tuple: right to left
     std::vector<RowFieldEntry> nr2 = filter_row_fields(false, r2);
     std::vector<RowFieldEntry> nr1 = filter_row_fields(may_inst, r1);
-    r1 = std::move(nr1);
-    r2 = std::move(nr2);
+    r1 = slice(nr1);
+    r2 = slice(nr2);
   }
   if (!r1.empty()) raise_for(TraceExn::Moregen, no_tags(et::Position::Second, r1));
   if (r1d.closed) {

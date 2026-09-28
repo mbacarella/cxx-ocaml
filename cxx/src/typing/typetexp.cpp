@@ -658,7 +658,7 @@ static const tt::CoreType* transl_type_aux(env::t env, const RowContext& row_con
           const PathArgs* nm = nullptr;
           if (auto* c = as<Tconstr>(get_desc(cty->ctyp_type))) nm = make<PathArgs>(c->path, c->args);
           name = hfields.empty() ? nm : nullptr;
-          std::vector<RowFieldEntry> fl;
+          Slice<RowFieldEntry> fl;
           const TypeDesc* ed = get_desc(ctype::expand_head(env, cty->ctyp_type));
           if (auto* vr = as<Tvariant>(ed); vr && static_row(vr->row)) {
             fl = row_fields(vr->row);
@@ -671,7 +671,7 @@ static const tt::CoreType* transl_type_aux(env::t env, const RowContext& row_con
             e.ty1 = ty;
             raise_(e);
           }
-          for (auto& [l, f0] : fl) {
+          for ([[maybe_unused]] auto& [l, f0, l_obj] : fl) {
             const RowField* f = f0;
             if (v->has_labels && !mem_present(l)) {
               RowFieldView fv = row_field_repr(f0);
@@ -914,7 +914,7 @@ static void make_fixed_univars_rec(TypeMark& mark, TypeExpr* ty) {
     RowDescRepr r = row_repr(row);
     if (is_Tunivar(r.more)) {
       std::vector<RowFieldEntry> fields;
-      for (auto& [s, f] : r.fields) {
+      for ([[maybe_unused]] auto& [s, f, s_obj] : r.fields) {
         RowFieldView fv = row_field_repr(f);
         if (fv.kind == RowFieldView::Kind::Reither)
           fields.push_back({s, rf_either(f, fv.constant, slice(fv.arg_types), true)});

@@ -57,17 +57,29 @@ V strlist(Slice<std::string_view> l) {
 // expression's loc as its item's (structure_item), and Docstrings builds a
 // doc attribute's constant, expression and item from one loc (loc_memo is
 // only set for those).
+// A record with an identity (same_record: read by input_value, from a
+// binary AST or a .cmi) keeps the sharing input_value gave it instead: one
+// value per record (id_memo), whatever its contents equal.
 using PosKey = std::tuple<std::string, long, long, long>;
 std::map<PosKey, V>* pos_memo = nullptr;
 std::map<std::tuple<PosKey, PosKey, bool>, V>* loc_memo = nullptr;
+std::map<const void*, V>* id_memo = nullptr;
 PosKey pos_key(const Position& p) { return {std::string(p.pos_fname), p.pos_lnum, p.pos_bol, p.pos_cnum}; }
 V position(const Position& p) {
+  if (id_memo && same_record(p)) {
+    auto [it, fresh] = id_memo->try_emplace(p.obj, nullptr);
+    if (fresh) it->second = B(0, {S(p.pos_fname), I(p.pos_lnum), I(p.pos_bol), I(p.pos_cnum)});
+    return it->second;
+  }
   if (!pos_memo) return B(0, {S(p.pos_fname), I(p.pos_lnum), I(p.pos_bol), I(p.pos_cnum)});
   auto [it, fresh] = pos_memo->try_emplace(pos_key(p), nullptr);
   if (fresh) it->second = B(0, {S(p.pos_fname), I(p.pos_lnum), I(p.pos_bol), I(p.pos_cnum)});
   return it->second;
 }
+// Whether [a] and [b] are one location record: records input_value read
+// are one exactly when they are the same record; the parser's by value.
 bool same_loc(const Location& a, const Location& b) {
+  if (same_record(a) && same_record(b)) return a.obj == b.obj;
   return pos_key(a.loc_start) == pos_key(b.loc_start) && pos_key(a.loc_end) == pos_key(b.loc_end) &&
          a.loc_ghost == b.loc_ghost;
 }
@@ -84,6 +96,15 @@ V loc(const Location& l) {
     V r = B(0, {position(l.loc_start), position(l.loc_end), boolean(l.loc_ghost)});
     const_cast<OValue*>(r)->loc_val = make<Location>(l);
     return r;
+  }
+  if (id_memo && same_record(l)) {
+    auto [it, fresh] = id_memo->try_emplace(l.obj, nullptr);
+    if (fresh) {
+      V a = position(l.loc_start);
+      V b = position(l.loc_end);
+      it->second = loc_block(l, a, b);
+    }
+    return it->second;
   }
   if (!loc_memo) return loc_block(l, position(l.loc_start), position(l.loc_end));
   auto [it, fresh] = loc_memo->try_emplace({pos_key(l.loc_start), pos_key(l.loc_end), l.loc_ghost}, nullptr);
@@ -915,13 +936,17 @@ const OValue* ovalue_of_longident(Longident::t lid) { return lident(lid); }
 const OValue* ovalue_of_payload(const Payload& p, bool docstring) {
   std::map<PosKey, V> pm;
   std::map<std::tuple<PosKey, PosKey, bool>, V> lm;
+  std::map<const void*, V> im;
   auto* sp = pos_memo;
   auto* sl = loc_memo;
+  auto* si = id_memo;
   pos_memo = &pm;
   loc_memo = docstring ? &lm : nullptr;
+  id_memo = &im;
   const OValue* r = payload(p);
   pos_memo = sp;
   loc_memo = sl;
+  id_memo = si;
   return r;
 }
 const OValue* ovalue_of_attribute(const Attribute* a) { return attribute(a); }

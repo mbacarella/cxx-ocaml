@@ -556,14 +556,14 @@ const RowDesc* create_row(Slice<RowFieldEntry> fields, TypeExpr* more, bool clos
   return make<RowDesc>(fields, more, closed, fixed, name);
 }
 
-std::vector<RowFieldEntry> row_fields(const RowDesc* row) {
-  std::vector<RowFieldEntry> out;
-  for (;;) {
-    out.insert(out.end(), row->row_fields.begin(), row->row_fields.end());
-    auto* v = as<Tvariant>(get_desc(row->row_more));
-    if (!v) return out;
-    row = v->row;
-  }
+Slice<RowFieldEntry> row_fields(const RowDesc* row) {
+  auto* v = as<Tvariant>(get_desc(row->row_more));
+  if (!v) return row->row_fields;
+  Slice<RowFieldEntry> rest = row_fields(v->row);
+  if (row->row_fields.empty()) return rest;  // [] @ l == l
+  std::vector<RowFieldEntry> out(row->row_fields.begin(), row->row_fields.end());
+  out.insert(out.end(), rest.begin(), rest.end());
+  return slice(out);
 }
 
 static const RowDesc* row_repr_no_fields(const RowDesc* row) {

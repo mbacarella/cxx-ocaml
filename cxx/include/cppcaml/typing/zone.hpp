@@ -189,6 +189,11 @@ Slice<T> slice(const std::vector<T>& v) {
   std::uninitialized_copy(v.begin(), v.end(), p);
   return {p, v.size()};
 }
+// a Slice is already the list: the same list (its identity kept)
+template <class T>
+Slice<T> slice(Slice<T> s) {
+  return s;
+}
 template <class T>
 Slice<T> slice(std::initializer_list<T> l) {
   return slice(std::vector<T>(l));

@@ -1708,7 +1708,7 @@ static void unify_row(const Uenv& uenv, const RowDesc* row1, const RowDesc* row2
     }
     return true;
   };
-  auto empty = [](const std::vector<RowFieldEntry>& fields) {
+  auto empty = [](Slice<RowFieldEntry> fields) {
     return std::all_of(fields.begin(), fields.end(), [](const RowFieldEntry& e) {
       return row_field_repr(e.field).kind == V::Rabsent;
     });
@@ -1729,15 +1729,15 @@ static void unify_row(const Uenv& uenv, const RowDesc* row1, const RowDesc* row2
     name = r2d.name;
   else
     name = nullptr;
-  auto set_more = [&](et::Position pos, const RowDesc* row, std::vector<RowFieldEntry> rest) {
-    if (closed) rest = filter_row_fields(row_closed(row), rest);
+  auto set_more = [&](et::Position pos, const RowDesc* row, Slice<RowFieldEntry> rest) {
+    if (closed) rest = slice(filter_row_fields(row_closed(row), rest));
     const FixedExplanation* fx = fixed_explanation(row);
     if (!fx) {
       if (!rest.empty() && row_closed(row)) {
         et::Variant v;
         v.kind = et::Variant::Kind::No_tags;
         v.pos = pos;
-        v.tags = rest;
+        v.tags = std::vector<RowFieldEntry>(rest.begin(), rest.end());
         raise_for(TraceExn::Unify, variant_elt(v));
       }
     } else {

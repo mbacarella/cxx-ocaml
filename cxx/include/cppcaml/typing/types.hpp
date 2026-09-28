@@ -211,6 +211,11 @@ struct FixedExplanation {
 struct RowFieldEntry {
   std::string_view label;
   const RowField* field;
+  // The (label, field) tuple's identity: a new one where an entry is built
+  // (OCaml allocates a tuple where the source writes (l, f)); a copy keeps
+  // it (a list filtered, appended or rebuilt keeps its tuples).  The .cmi
+  // Reader gives one per marshaled tuple; the writers share by it.
+  const void* obj = fresh_identity();
 };
 struct RowDesc {
   Slice<RowFieldEntry> row_fields;
@@ -619,7 +624,10 @@ int compare_type(TypeExpr* a, TypeExpr* b);
 // rows
 const RowDesc* create_row(Slice<RowFieldEntry> fields, TypeExpr* more, bool closed,
                           const FixedExplanation* fixed, const PathArgs* name);
-std::vector<RowFieldEntry> row_fields(const RowDesc* row);
+// row_fields: the row's own list when no row is chained after it (its
+// identity kept, as OCaml returns row.row_fields itself), else the lists
+// appended -- a new list, but the tail's own when the head is empty (@)
+Slice<RowFieldEntry> row_fields(const RowDesc* row);
 TypeExpr* row_more(const RowDesc* row);
 bool row_closed(const RowDesc* row);
 const FixedExplanation* row_fixed(const RowDesc* row);
@@ -629,7 +637,7 @@ const RowDesc* subst_row_name_path(const std::vector<std::pair<Ident::t, Path::t
                                    const RowDesc* row);
 const RowField* get_row_field(std::string_view tag, const RowDesc* row);
 struct RowDescRepr {
-  std::vector<RowFieldEntry> fields;
+  Slice<RowFieldEntry> fields;
   TypeExpr* more;
   bool closed;
   const FixedExplanation* fixed;

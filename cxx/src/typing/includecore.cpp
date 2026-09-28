@@ -452,7 +452,7 @@ std::optional<PrivateVariantMismatch> private_variant(env::t env, const RowDesc*
       return e;
     }
   }
-  for (auto& [s, f] : m.r2)
+  for ([[maybe_unused]] auto& [s, f, s_obj] : m.r2)
     if (row_field_repr(f).kind == RF::Rpresent) {
       PV e{PV::Kind::Missing};
       e.pos = Position::First;

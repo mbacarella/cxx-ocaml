@@ -401,7 +401,11 @@ class Writer {
   }
   V row(const RowDesc* r) {
     return shared(memo_, r, 0, [&]() -> std::vector<V> {
-      return {list(r->row_fields, [&](const RowFieldEntry& e) { return o::vblock(0, {str(e.label), row_field(e.field)}); }),
+      return {list(r->row_fields,
+                   [&](const RowFieldEntry& e) {
+                     return shared(memo_, e.obj, 0,
+                                   [&]() -> std::vector<V> { return {str(e.label), row_field(e.field)}; });
+                   }),
               ty(r->row_more), b(r->row_closed),
               // the options are passed on with the row's other fields
               // (create_row ~fixed:(row_fixed row) ~name:(row_name row)):

@@ -1160,7 +1160,7 @@ std::pair<Path::t, const tt::Pattern*> build_or_pat(env::t env, const Location& 
   }
   std::vector<std::pair<std::string_view, const tt::Pattern*>> pats;  // head first
   std::vector<RowFieldEntry> fields;                                   // head first
-  for (auto& [l, f] : row_fields(row0)) {
+  for ([[maybe_unused]] auto& [l, f, l_obj] : row_fields(row0)) {
     RowFieldView fv = row_field_repr(f);
     if (fv.kind != RowFieldView::Kind::Rpresent) continue;
     if (!fv.present) {
@@ -1177,7 +1177,9 @@ std::pair<Path::t, const tt::Pattern*> build_or_pat(env::t env, const Location& 
   }
   std::reverse(fields.begin(), fields.end());
   const PathArgs* name = make<PathArgs>(path, slice(tyl));
-  auto make_row = [&](TypeExpr* more) { return create_row(slice(fields), more, false, nullptr, name); };
+  // make_row closes over one [fields] list: both rows share it
+  Slice<RowFieldEntry> fields_list = slice(fields);
+  auto make_row = [&](TypeExpr* more) { return create_row(fields_list, more, false, nullptr, name); };
   TypeExpr* ty = ctype::newty(tvariant(make_row(ctype::newvar())));
   Location gloc = loc;
   gloc.loc_ghost = true;
