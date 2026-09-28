@@ -67,7 +67,7 @@ class Zone {
     for (auto it = dtors_.rbegin(); it != dtors_.rend(); ++it) it->second(it->first);
     dtors_.clear();
     if (blocks_.empty()) return;
-    if (blocks_.size() > 1) {
+    if (blocks_.size() > 1 || ranges_.size() > 1) {
       blocks_.resize(1);
       cur_ = blocks_[0].get();
       // keep the first block's map node (a scratch zone is cleared per
