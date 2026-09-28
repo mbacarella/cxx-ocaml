@@ -742,8 +742,10 @@ lam_t lambda_of_loc(LocKind kind, const ScopedLocation& sloc) {
     case LocKind::Loc_MODULE: {
       std::string filename = filename_basename(std::string(file));
       std::string name = env::get_current_unit_name();
-      std::string module_name = name.empty() ? "//" + filename + "//" : name;
-      return lconst(const_immstring(module_name));
+      // Env.get_current_unit_name () is Unit_info's modname string itself,
+      // which the .cmo's cu_name shares
+      if (!name.empty()) return lconst(const_immstring(uid::unit_name_string(name)));
+      return lconst(const_immstring("//" + filename + "//"));
     }
     case LocKind::Loc_LOC: {
       std::string s = "File \"" + string_escaped(file) + "\", line " + std::to_string(lnum) + ", characters " +
