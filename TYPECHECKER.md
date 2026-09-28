@@ -224,16 +224,33 @@ recovery (`-typing-recovery`).
 `cxx/harness/bench.sh` times c++ocamlc against ocamlc.opt unit by unit
 (interleaved, median of REPS, peak RSS); `BASELINE=cxx/harness/bench_baseline.tsv`
 compares a run with the committed baseline, `MAXRATIO=1.0` fails a corpus
-slower than ocamlc.opt.  Baseline (2026-09-28, release build with mimalloc,
-REPS=3), c++ocamlc / ocamlc.opt total time: startup 0.85, small 0.84,
-compiler 0.85, stdlib 0.85 -- peak RSS 2-4x ocamlc.opt's (one allocation zone
-per unit holds every phase's data).  The release build must link mimalloc
+slower than ocamlc.opt; `CPPCAML_PROFILE=1` prints each phase's time and the
+resident set / zone storage after it.  Baseline (2026-09-28, release build
+with mimalloc, REPS=3), c++ocamlc / ocamlc.opt: startup 0.87x (31 vs 16 MB
+peak RSS), small 0.84x (48 vs 21 MB), compiler 0.81x (240 vs 92 MB), stdlib
+0.81x (160 vs 61 MB).  The release build must link mimalloc
 (`CPPCAML_MIMALLOC`, on by default; the nix dev shell sets
 `CMAKE_PREFIX_PATH` for it -- outside it, point CMAKE_PREFIX_PATH at the
 mimalloc and mimalloc-dev store paths): with glibc's malloc the compiler
-corpus is ~1.1x.  The ported code keeps OCaml's `try ... with Not_found`
-off the C++ exception path on hot lookups (a throw costs microseconds; the
-first port threw 1.4 M exceptions compiling typecore.ml).
+corpus is ~1.1x.  mimalloc's arenas on transparent huge pages are part of
+the speed and most of the small units' extra RSS (without eager commit a
+trivial unit peaks at 14 MB, below ocamlc.opt's 15, but the compiler corpus
+takes ~0.93x).
+
+Memory: OCaml's GC reclaims what a phase leaves behind; the zones keep
+everything to the end, so the port reclaims explicitly where OCaml's
+garbage is well delimited -- the trail (logged only while a snapshot is
+live, in a zone dropped with the last one), Matching's and Parmatch's
+pattern heads and the copy scopes' Tsubst descs (scratch zones cleared by
+the outermost entry point / scope), the C++ parser's tree once converted --
+and keeps the long records small (Types.change, Longident's locations out of
+line, Bytegen's instructions with their per-kind payloads overlaid, the
+omarshal values in an arena).  A zone that grows takes 8 MiB blocks mapped
+from the kernel and advised for huge pages.  Lifetime changes are checked
+with an AddressSanitizer build (sanitizer builds run on the thread's own
+stack) over the probes, the compiler and the testsuite.  The ported code
+also keeps OCaml's `try ... with Not_found` off the C++ exception path on
+hot lookups (the first port threw 1.4 M exceptions compiling typecore.ml).
 
 ## What counts as progress
 

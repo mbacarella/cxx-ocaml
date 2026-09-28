@@ -185,6 +185,9 @@ struct CopyScope {
   std::vector<std::pair<TypeExpr*, const TypeDesc*>> saved_desc;
 };
 void redirect_desc(CopyScope& scope, TypeExpr* ty, const TypeDesc* desc);
+// Tsubst (t, row) for redirect_desc inside a copy scope (a temporary: see
+// btype.cpp); outside any scope, types::tsubst
+const TypeDesc* scoped_tsubst(TypeExpr* a, TypeExpr* row);
 void with_copy_scope(FnRef<void(CopyScope&)> f);
 
 // ---- memorization of abbreviation expansion --------------------------------

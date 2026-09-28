@@ -131,23 +131,29 @@ struct ClosureLabel {  // label * closure_hint
 //   m: Kappterm (slot size), Kclosure (the free-variable count), Kmakeblock (tag)
 struct Instruction {
   IK k;
+  MutableFlag mut = MutableFlag::Immutable;                            // Kmakeblock / Kmakefloatblock
+  lambda::ArrayKind array = lambda::ArrayKind::Pgenarray;              // Kvectlength
+  lambda::RaiseKind raise = lambda::RaiseKind::Raise_regular;          // Kraise
+  lambda::IntegerComparison icmp = lambda::IntegerComparison::Ceq;     // Kintcomp
+  lambda::PhysicalComparison pcmp = lambda::PhysicalComparison::CPeq;  // Kphyscomp
   long n = 0;
   long m = 0;
-  MutableFlag mut = MutableFlag::Immutable;         // Kmakeblock / Kmakefloatblock
-  const ClosureHint* closure_hint = nullptr;                        // Kclosure
-  Slice<ClosureLabel> closures;                                     // Kclosurerec
-  Ident::t id = nullptr;                                            // Kgetglobal / Ksetglobal
-  const lambda::StructuredConstant* cst = nullptr;                  // Kconst
-  lambda::ArrayKind array = lambda::ArrayKind::Pgenarray;           // Kvectlength
-  Slice<label> sw_consts, sw_blocks;                                // Kswitch
-  lambda::RaiseKind raise = lambda::RaiseKind::Raise_regular;       // Kraise
-  std::string_view prim;                                            // Kccall
-  const CcallHint* ccall_hint = nullptr;                            // Kccall (option)
-  lambda::IntegerComparison icmp = lambda::IntegerComparison::Ceq;  // Kintcomp
-  lambda::PhysicalComparison pcmp = lambda::PhysicalComparison::CPeq;  // Kphyscomp
-  DebugEvent* event = nullptr;                                      // Kevent
+  // The payloads of one kind each, overlaid (a Bytegen instruction list is
+  // long): a field is read only for its instruction's kind.
+  union {
+    Slice<label> sw_consts{};       // Kswitch
+    Slice<ClosureLabel> closures;   // Kclosurerec
+    std::string_view prim;          // Kccall
+  };
+  union {
+    Slice<label> sw_blocks{};                // Kswitch
+    const ClosureHint* closure_hint;         // Kclosure
+    Ident::t id;                             // Kgetglobal / Ksetglobal
+    const lambda::StructuredConstant* cst;   // Kconst
+    const CcallHint* ccall_hint;             // Kccall (option: nullptr = None)
+    DebugEvent* event;                       // Kevent
+  };
 };
-
 // instruction list: a persistent cons list in the zone (Bytegen inspects the
 // head of its continuations and prepends; the tail is shared).
 struct Cell {

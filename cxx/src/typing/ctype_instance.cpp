@@ -74,7 +74,7 @@ TypeExpr* copy(CopyScope& copy_scope, TypeExpr* ty, const Partial* partial, bool
   long ty_scope = scope ? std::max(*scope, get_scope(ty)) : get_scope(ty);
   const PathArgs* ty_expand = get_abbrev(ty);
   TypeExpr* t = newstub(ty_scope);
-  redirect_desc(copy_scope, ty, tsubst(t, nullptr));
+  redirect_desc(copy_scope, ty, btype::scoped_tsubst(t, nullptr));
   const TypeDesc* desc2 = nullptr;
   switch (desc->kind) {
     case DescKind::Tconstr: {
@@ -108,7 +108,7 @@ TypeExpr* copy(CopyScope& copy_scope, TypeExpr* ty, const Partial* partial, bool
       auto* ms = as<Tsubst>(mored);
       if (ms && ms->row) {
         // This variant type has been already copied
-        redirect_desc(copy_scope, ty, tsubst(ms->row, nullptr));
+        redirect_desc(copy_scope, ty, btype::scoped_tsubst(ms->row, nullptr));
         desc2 = tlink(ms->row);
         break;
       }
@@ -142,7 +142,7 @@ TypeExpr* copy(CopyScope& copy_scope, TypeExpr* ty, const Partial* partial, bool
         }
       }
       // Register new type first for recursion
-      redirect_desc(copy_scope, more, tsubst(more2, t));
+      redirect_desc(copy_scope, more, btype::scoped_tsubst(more2, t));
       // Return a new copy
       row = subst_row_name_path(unscoped.map, row);
       desc2 = tvariant(copy_row(copy_, true, row, keep, more2));

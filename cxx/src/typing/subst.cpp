@@ -169,21 +169,21 @@ static TypeExpr* apply_type_function(Slice<TypeExpr*> params, Slice<TypeExpr*> a
   TypeExpr* result = nullptr;
   with_copy_scope([&](CopyScope& copy_scope) {
     for (std::size_t k = 0; k < params.size() && k < args.size(); ++k)
-      redirect_desc(copy_scope, params[k], tsubst(args[k], nullptr));
+      redirect_desc(copy_scope, params[k], btype::scoped_tsubst(args[k], nullptr));
     std::function<TypeExpr*(TypeExpr*)> copy = [&](TypeExpr* ty) -> TypeExpr* {
       const TypeDesc* d = get_desc(ty);
       if (auto* x = as<Tsubst>(d)) return x->ty;
       if (auto* v = as<Tvariant>(d)) {
         const RowDesc* row = v->row;
         TypeExpr* t = newgenstub(get_scope(ty));
-        redirect_desc(copy_scope, ty, tsubst(t, nullptr));
+        redirect_desc(copy_scope, ty, btype::scoped_tsubst(t, nullptr));
         TypeExpr* more = row_more(row);
         const TypeDesc* mored = get_desc(more);
         const TypeDesc* desc2;
         auto* ms = as<Tsubst>(mored);
         if (ms && ms->row) {
           // This variant type has been already copied
-          redirect_desc(copy_scope, ty, tsubst(ms->row, nullptr));
+          redirect_desc(copy_scope, ty, btype::scoped_tsubst(ms->row, nullptr));
           desc2 = tlink(ms->row);
         } else {
           TypeExpr* more2;
@@ -202,7 +202,7 @@ static TypeExpr* apply_type_function(Slice<TypeExpr*> params, Slice<TypeExpr*> a
                              r.name);
           }
           // Register new type first for recursion
-          redirect_desc(copy_scope, more, tsubst(more2, t));
+          redirect_desc(copy_scope, more, btype::scoped_tsubst(more2, t));
           desc2 = tvariant(copy_row(copy, true, row, false, more2));
         }
         transient_expr::set_stub_desc(t, desc2);
@@ -210,7 +210,7 @@ static TypeExpr* apply_type_function(Slice<TypeExpr*> params, Slice<TypeExpr*> a
       }
       if (auto* f = as<Tfunctor>(d)) {
         TypeExpr* t = newgenstub(get_scope(ty));
-        redirect_desc(copy_scope, ty, tsubst(t, nullptr));
+        redirect_desc(copy_scope, ty, btype::scoped_tsubst(t, nullptr));
         std::vector<PackConstraint> cs;
         for (auto& c : f->pack->pack_constraints) cs.push_back({c.path, copy(c.ty)});
         const Package* pack2 = make<Package>(f->pack->pack_path, slice(cs));
@@ -219,7 +219,7 @@ static TypeExpr* apply_type_function(Slice<TypeExpr*> params, Slice<TypeExpr*> a
         return t;
       }
       TypeExpr* t = newgenstub(get_scope(ty));
-      redirect_desc(copy_scope, ty, tsubst(t, nullptr));
+      redirect_desc(copy_scope, ty, btype::scoped_tsubst(t, nullptr));
       const TypeDesc* desc2 = copy_type_desc(copy, d);
       transient_expr::set_stub_desc(t, desc2);
       return t;
@@ -239,7 +239,7 @@ static TypeExpr* typexp(CopyScope& copy_scope, t s, TypeExpr* ty) {
     case DescKind::Tunivar:
       if (s->for_saving || get_id(ty) < 0) {
         TypeExpr* ty2 = s->for_saving ? newpersty(norm(desc)) : newty2(get_level(ty), desc);
-        redirect_desc(copy_scope, ty, tsubst(ty2, nullptr));
+        redirect_desc(copy_scope, ty, btype::scoped_tsubst(ty2, nullptr));
         return ty2;
       }
       return ty;
@@ -256,7 +256,7 @@ static TypeExpr* typexp(CopyScope& copy_scope, t s, TypeExpr* ty) {
   bool has_fixed_row = !is_Tconstr(ty) && is_constr_row(false, tm);
   // Make a stub
   TypeExpr* ty2 = s->for_saving ? newpersty(tvar_none()) : newgenstub(get_scope(ty));
-  if (get_desc(ty) == desc) redirect_desc(copy_scope, ty, tsubst(ty2, nullptr));
+  if (get_desc(ty) == desc) redirect_desc(copy_scope, ty, btype::scoped_tsubst(ty2, nullptr));
   auto rec = [&](TypeExpr* x) { return typexp(copy_scope, s, x); };
   const TypeDesc* desc2;
   if (has_fixed_row) {
@@ -313,7 +313,7 @@ static TypeExpr* typexp(CopyScope& copy_scope, t s, TypeExpr* ty) {
         auto* ms = as<Tsubst>(mored);
         if (ms && ms->row) {
           // This variant type has been already copied
-          redirect_desc(copy_scope, ty, tsubst(ms->row, nullptr));
+          redirect_desc(copy_scope, ty, btype::scoped_tsubst(ms->row, nullptr));
           desc2 = tlink(ms->row);
           break;
         }
@@ -331,7 +331,7 @@ static TypeExpr* typexp(CopyScope& copy_scope, t s, TypeExpr* ty) {
           throw std::logic_error("Subst.typexp: row_more");
         }
         // Register new type first for recursion
-        redirect_desc(copy_scope, more, tsubst(more2, ty2));
+        redirect_desc(copy_scope, more, btype::scoped_tsubst(more2, ty2));
         const RowDesc* row2 = copy_row(rec, true, row, !dup, more2);
         if (const PathArgs* nm = row_name(row2)) {
           const PathArgs* name =

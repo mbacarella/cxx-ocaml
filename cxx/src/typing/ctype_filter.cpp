@@ -547,7 +547,7 @@ static TypeExpr* copy_spine_rec(const UnscopedMapping& unscoped, CopyScope& copy
   long level = get_level(ty);
   if (unscoped.closed(ty) && (level < current_level || level == generic_level)) return ty;
   TypeExpr* t = newgenstub(get_scope(ty));
-  redirect_desc(copy_scope, ty, tsubst(t, nullptr));
+  redirect_desc(copy_scope, ty, btype::scoped_tsubst(t, nullptr));
   auto copy_rec = [&](TypeExpr* x) { return copy_spine_rec(unscoped, copy_scope, x); };
   auto psubst = [&](Path::t p) { return path::subst(unscoped.map, p); };
   const TypeDesc* desc2;

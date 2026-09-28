@@ -608,7 +608,22 @@ void redirect_desc(CopyScope& scope, TypeExpr* ty, const TypeDesc* desc) {
 // saved_desc buffers of finished copy scopes, reused (the scopes nest)
 static std::vector<std::vector<std::pair<TypeExpr*, const TypeDesc*>>> g_saved_desc_free;
 
+// The Tsubst descs of the copies in progress: redirect_desc places them and
+// the scope's cleanup restores every redirected desc, so none outlives the
+// outermost scope (ocamlc's GC reclaims them) -- they live in a scratch zone
+// cleared when that scope ends.
+static int g_copy_depth = 0;
+static Zone& tsubst_zone() {
+  static Zone z;
+  return z;
+}
+const TypeDesc* scoped_tsubst(TypeExpr* a, TypeExpr* row) {
+  if (g_copy_depth == 0) return types::tsubst(a, row);
+  return tsubst_zone().make<Tsubst>(TypeDesc{DescKind::Tsubst}, a, row);
+}
+
 void with_copy_scope(FnRef<void(CopyScope&)> f) {
+  ++g_copy_depth;
   CopyScope scope;
   if (!g_saved_desc_free.empty()) {
     scope.saved_desc = std::move(g_saved_desc_free.back());
@@ -622,6 +637,7 @@ void with_copy_scope(FnRef<void(CopyScope&)> f) {
         transient_expr::set_desc(it->first, it->second);
       s.saved_desc.clear();
       g_saved_desc_free.push_back(std::move(s.saved_desc));
+      if (--g_copy_depth == 0) tsubst_zone().clear();
     }
   } cleanup{scope};
   f(scope);

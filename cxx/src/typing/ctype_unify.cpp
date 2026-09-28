@@ -532,7 +532,7 @@ std::pair<TypeExpr*, std::vector<TypeExpr*>> polyfy(env::t env, TypeExpr* ty,
       const TypeDesc* d = get_desc(t);
       if (auto* v = as<Tvar>(d); v && get_level(t) == generic_level) {
         TypeExpr* u = newty(tunivar(v->name));
-        redirect_desc(copy_scope, t, tsubst(u, nullptr));
+        redirect_desc(copy_scope, t, btype::scoped_tsubst(u, nullptr));
         vars2.push_back(u);
       } else if (auto* s = as<Tsubst>(d)) {
         err.push_back(s->ty);
