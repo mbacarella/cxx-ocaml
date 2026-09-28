@@ -193,6 +193,22 @@ unit's name string (`uid::unit_name_string`).  Not ported:
 `-bin-annot-occurrences`' index (cmt_ident_occurrences is []), typing
 recovery (`-typing-recovery`).
 
+## Performance
+
+`cxx/harness/bench.sh` times c++ocamlc against ocamlc.opt unit by unit
+(interleaved, median of REPS, peak RSS); `BASELINE=cxx/harness/bench_baseline.tsv`
+compares a run with the committed baseline, `MAXRATIO=1.0` fails a corpus
+slower than ocamlc.opt.  Baseline (2026-09-28, release build with mimalloc,
+REPS=3), c++ocamlc / ocamlc.opt total time: startup 0.85, small 0.84,
+compiler 0.85, stdlib 0.85 -- peak RSS 2-4x ocamlc.opt's (one allocation zone
+per unit holds every phase's data).  The release build must link mimalloc
+(`CPPCAML_MIMALLOC`, on by default; the nix dev shell sets
+`CMAKE_PREFIX_PATH` for it -- outside it, point CMAKE_PREFIX_PATH at the
+mimalloc and mimalloc-dev store paths): with glibc's malloc the compiler
+corpus is ~1.1x.  The ported code keeps OCaml's `try ... with Not_found`
+off the C++ exception path on hot lookups (a throw costs microseconds; the
+first port threw 1.4 M exceptions compiling typecore.ml).
+
 ## What counts as progress
 
 Parity with ocamlc, stage by stage, each with an oracle:
