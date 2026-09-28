@@ -25,6 +25,8 @@
           packages = [
             # --- C++ / build tooling (clang comes from the stdenv) ---
             llvm.lld
+            llvm.llvm           # llvm-profdata for cxx/tools/pgo_build.sh
+            llvm.compiler-rt    # the profile runtime for its instrumented build
             pkgs.clang-tools    # clangd, clang-format, clang-tidy
             pkgs.cmake
             pkgs.ninja

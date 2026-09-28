@@ -12,6 +12,33 @@ endif()
 
 add_compile_options(-Wall -Wextra -Wpedantic -Wno-unused-parameter)
 
+# Whole-program optimisation for the shipped compiler (cxx/tools/pgo_build.sh
+# drives the profile-guided build): ThinLTO, linked with lld; fat LTO objects
+# keep the static library indexable by any `ar`.
+option(CPPCAML_LTO "ThinLTO (needs lld)" OFF)
+if(CPPCAML_LTO)
+  add_compile_options(-flto=thin -ffat-lto-objects)
+  add_link_options(-flto=thin -fuse-ld=lld)
+endif()
+# Profile-guided optimisation: GENERATE instruments for collection (runs
+# must not _exit: CPPCAML_NO_FASTEXIT=1); PROFILE optimises with a merged
+# .profdata from the same sources (a stale one only loses some benefit).
+option(CPPCAML_PGO_GENERATE "Instrument for profile collection" OFF)
+set(CPPCAML_PGO_PROFILE "" CACHE FILEPATH "Merged llvm .profdata to optimise with")
+if(CPPCAML_PGO_GENERATE)
+  add_compile_options(-fprofile-instr-generate)
+  add_link_options(-fprofile-instr-generate)
+  # nixpkgs' clang wrapper does not carry compiler-rt's profile runtime
+  find_library(CLANG_RT_PROFILE NAMES clang_rt.profile-x86_64 clang_rt.profile
+               PATH_SUFFIXES linux DOC "compiler-rt's profile runtime")
+  if(CLANG_RT_PROFILE)
+    link_libraries(${CLANG_RT_PROFILE})
+  endif()
+elseif(CPPCAML_PGO_PROFILE)
+  add_compile_options(-fprofile-instr-use=${CPPCAML_PGO_PROFILE}
+                      -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date)
+endif()
+
 # Core compiler library (grows one pipeline stage at a time).
 add_library(cppcaml_core
   src/token.cpp
