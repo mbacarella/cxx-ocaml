@@ -96,7 +96,6 @@
     {"-set-runtime-default", K::String, {}, "<param>=<value>  Set the default for runtime parameter <param> to <value> (see the manual for further details)"},
     {"-shared", K::Unit, {}, " Produce a dynlinkable plugin"},
     {"-short-paths", K::Unit, {}, " Shorten paths in types"},
-    {"-typing-recovery", K::Unit, {}, " Enable typing recovery"},
     {"-strict-sequence", K::Unit, {}, " Left-hand part of a sequence must have type unit"},
     {"-no-strict-sequence", K::Unit, {}, " Left-hand part of a sequence need not have type unit (default)"},
     {"-strict-formats", K::Unit, {}, " Reject invalid formats accepted by legacy implementations (default)\n     (Warning: Invalid formats may behave differently from\n      previous OCaml versions, and will become always-rejected\n      in future OCaml versions. You should always use this flag\n      to detect invalid formats so you can fix them.)"},
