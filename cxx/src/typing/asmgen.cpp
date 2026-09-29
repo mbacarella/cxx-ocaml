@@ -8,6 +8,8 @@
 
 #include "cppcaml/typing/ccomp.hpp"
 #include "cppcaml/typing/clflags.hpp"
+#include "cppcaml/typing/cmm_helpers.hpp"
+#include "cppcaml/typing/cmmgen.hpp"
 #include "cppcaml/typing/emit.hpp"
 #include "cppcaml/typing/filename.hpp"
 #include "cppcaml/typing/linear.hpp"
@@ -15,6 +17,7 @@
 #include "cppcaml/typing/misc.hpp"
 #include "cppcaml/typing/printcmm.hpp"
 #include "cppcaml/typing/selection.hpp"
+#include "cppcaml/typing/translmod.hpp"
 
 namespace cppcaml::typing::asmgen {
 namespace cf = clflags;
@@ -135,6 +138,23 @@ void compile_unit(const std::string& asm_filename, bool keep_asm, const std::str
     std::remove(obj_filename.c_str());
     throw;
   }
+}
+
+std::string end_gen_implementation(format::Formatter& dump, const closure_middle_end::WithConstants& clambda) {
+  if (should_emit()) emit::begin_assembly();
+  std::vector<cmm::Phrase> phrases = cmmgen::compunit(clambda);
+  compile_phrases(dump, phrases);
+  // We add explicit references to external primitive symbols.  This is to
+  // ensure that the object files that define these symbols, when part of a
+  // C library, won't be discarded by the linker.  This is important if a
+  // module that uses such a symbol is later dynlinked.
+  std::vector<std::string_view> prims;
+  for (const PrimitiveDescription* p : translmod::primitive_declarations) {
+    std::string_view name = p->prim_native_name.empty() ? p->prim_name : p->prim_native_name;
+    if (!name.empty() && name[0] != '%') prims.push_back(name);
+  }
+  compile_phrase(dump, cmm_helpers::reference_symbols(prims));
+  return should_emit() ? emit::end_assembly() : std::string();
 }
 
 std::string asm_filename(const std::string& output_prefix) {

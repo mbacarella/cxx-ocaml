@@ -26,6 +26,8 @@ struct Error : std::runtime_error {
 std::string error_message(const Error& e);
 void report_error_doc(format_doc::Formatter& ppf, const Error& e);
 
+// symbol_separator (not MSVC)
+inline constexpr char symbol_separator = '.';
 cmx_format::UnitInfos& current_unit();
 void reset(const std::optional<std::string>& packname, std::string_view name);
 std::string_view current_unit_name();
@@ -36,6 +38,8 @@ std::string_view make_symbol(std::optional<std::string_view> idopt);
 std::string_view make_symbol_in(std::string_view unitname, std::optional<std::string_view> idopt);
 
 const cmx_format::UnitInfos* get_global_info(Ident::t global_ident);
+// cache_unit_info ui (Asmpackager: the members' infos)
+void cache_unit_info(const cmx_format::UnitInfos* ui);
 void require_global(Ident::t global_ident);
 const clambda::ValueApproximation* global_approx(Ident::t id);
 Ident::t stdlib_symbol_name();

@@ -53,7 +53,6 @@ std::set<std::string_view>& exported_constants() {
 }
 
 // linuxlike_mangling
-constexpr char symbol_separator = '.';
 
 std::string symbolname_for_pack(const std::optional<std::string>& pack, std::string_view name) {
   if (!pack) return std::string(name);
@@ -289,6 +288,8 @@ std::string error_message(const Error& e) {
   }
   return {};
 }
+
+void cache_unit_info(const UnitInfos* ui) { global_infos_table()[std::string(ui->ui_name)] = ui; }
 
 void report_error_doc(format_doc::Formatter& ppf, const Error& e) {
   namespace fd = format_doc;

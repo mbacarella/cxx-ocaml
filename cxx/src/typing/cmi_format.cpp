@@ -5,6 +5,11 @@
 // ones are blocks tagged in declaration order, records and inline records are
 // blocks of their fields in order, `option` is 0 | Some = block tag 0.
 #include "cppcaml/typing/cmi_format.hpp"
+
+#include <cerrno>
+#include <cstring>
+
+#include "cppcaml/typing/arg.hpp"
 #include "cppcaml/typing/config.hpp"
 
 #include <fstream>
@@ -1113,7 +1118,8 @@ CmiInfos read_cmi(const std::string& filename) {
   std::vector<std::uint8_t> bytes;
   {
     std::FILE* f = std::fopen(filename.c_str(), "rb");
-    if (!f) throw std::runtime_error("Cannot open " + filename);
+    // open_in_bin's Sys_error
+    if (!f) throw arg::SysError(filename + ": " + std::strerror(errno));
     struct Close {
       std::FILE* f;
       ~Close() { std::fclose(f); }

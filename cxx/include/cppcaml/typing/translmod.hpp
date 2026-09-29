@@ -22,6 +22,9 @@ lambda::Program transl_store_implementation(std::string_view module_name, const 
                                             const typedtree::ModuleCoercion* restr);
 lambda::lambda transl_package(Slice<Ident::t> component_names,  // Ident.t option list: nullptr = None
                               Ident::t target_name, const typedtree::ModuleCoercion* coercion);
+// transl_store_package component_names target_name coercion (native -pack)
+std::pair<long, lambda::lambda> transl_store_package(Slice<Ident::t> component_names, Ident::t target_name,
+                                                     const typedtree::ModuleCoercion* coercion);
 std::string toplevel_name(Ident::t id);
 
 extern std::vector<const PrimitiveDescription*> primitive_declarations;

@@ -12,6 +12,7 @@
 #include "cppcaml/typing/compilenv.hpp"
 #include "cppcaml/typing/asmlibrarian.hpp"
 #include "cppcaml/typing/asmlink.hpp"
+#include "cppcaml/typing/asmpackager.hpp"
 #include "cppcaml/typing/bytelibrarian.hpp"
 #include "cppcaml/typing/bytelink.hpp"
 #include "cppcaml/typing/bytepackager.hpp"
@@ -163,6 +164,9 @@ void register_misc() {
     } catch (const asmlink::Error& e) {
       asmlink::Error err = e;
       return location::error_of_printer_file([err](Formatter& ppf) { asmlink::report_error_doc(ppf, err); });
+    } catch (const asmpackager::Error& e) {
+      asmpackager::Error err = e;
+      return location::error_of_printer_file([err](Formatter& ppf) { asmpackager::report_error_doc(ppf, err); });
     } catch (const asmlibrarian::Error& e) {
       asmlibrarian::Error err = e;
       return location::error_of_printer_file([err](Formatter& ppf) { asmlibrarian::report_error_doc(ppf, err); });

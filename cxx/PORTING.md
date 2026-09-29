@@ -210,15 +210,16 @@ ported.  `native_link_parity.sh` compares the kept startup assembly
 link in one run) 6529 + the 2 known .cmi gaps (`-dlinear`, and `-g`),
 696/697 testsuite files (`privrowsabate_ok`, above).
 `native_link_scenarios.sh`: libraries (`-a`, `-linkall`, C options),
-`-output-obj`, `-output-complete-obj`, `-verbose` and the link errors --
-15/15 identical.  `c++ocamlopt -a` rebuilds the tree's stdlib.cmxa and
+`-output-obj`, `-output-complete-obj`, `-shared` (Asmlink.link_shared,
+the marshaled plugin header), `-pack` (Asmpackager, with
+Translmod.transl_store_package: nested packs, a packed .mli, `-S`, `-g`,
+one-step) and the link and pack errors -- 30/30 identical.  `c++ocamlopt -a` rebuilds the tree's stdlib.cmxa and
 stdlib.a identically, and `c++cmxinfo --roundtrip` reads and rewrites
 the tree's 11 .cmxa files identically.  A link-only run first creates the
 idents ocamlopt's modules create while they initialize (their stamps
 reach `-dcmm`).
 
-Next: `-shared` (.cmxs: Asmlink.link_shared and the plugin header) and
-Asmpackager (`-pack`).
+Next: build the compiler itself with c++ocamlopt and compare the binaries.
 
 ## Oracles and gates
 

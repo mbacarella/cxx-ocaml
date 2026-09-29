@@ -51,19 +51,21 @@ std::vector<std::string_view> g_interfaces;
 std::map<std::string, std::string, std::less<>> g_crc_interface_objs;
 Consistbl g_crc_implementations;
 std::vector<std::string_view> g_implementations;
+std::map<std::string, std::string, std::less<>> g_crc_implementation_objs;
 std::vector<std::string> g_cmx_required;
 
-// extract_crc_interfaces (): Consistbl.extract !interfaces crc_interfaces
-std::vector<std::pair<std::string_view, std::optional<std::string>>> extract_crc_interfaces() {
-  std::vector<std::string_view> l = list_sort::sort_uniq(g_interfaces, [](std::string_view a, std::string_view b) {
+// Consistbl.extract l tbl: the names sorted (List.sort_uniq's choice among
+// equal names is the object the result carries), then consed
+cmx_format::Crcs extract(const std::vector<std::string_view>& names,
+                         const std::map<std::string, std::string, std::less<>>& crcs) {
+  std::vector<std::string_view> l = list_sort::sort_uniq(names, [](std::string_view a, std::string_view b) {
     int c = a.compare(b);
     return c < 0 ? -1 : c > 0 ? 1 : 0;
   });
-  std::vector<std::pair<std::string_view, std::optional<std::string>>> assc;
+  cmx_format::Crcs assc;
   for (std::string_view name : l) {
-    auto it = g_crc_interface_objs.find(name);
-    assc.insert(assc.begin(), {name, it == g_crc_interface_objs.end() ? std::nullopt
-                                                                        : std::optional<std::string>(it->second)});
+    auto it = crcs.find(name);
+    assc.insert(assc.begin(), {name, it == crcs.end() ? std::nullopt : std::optional<std::string>(it->second)});
   }
   return assc;
 }
@@ -266,6 +268,52 @@ std::string make_startup_file(format::Formatter& dump, const std::vector<ToLink>
   return emit ? emit::end_assembly() : std::string();
 }
 
+// Cmm_helpers.plugin_header units: the marshaled Cmxs_format.dynheader
+std::string plugin_header(const std::vector<std::pair<const UnitInfos*, std::string>>& units) {
+  std::map<std::pair<const char*, std::size_t>, o::ValPtr> strs;
+  auto str = [&](std::string_view s) {
+    if (!s.data()) return o::vstr(std::string(s));
+    auto [it, fresh] = strs.try_emplace({s.data(), s.size()}, nullptr);
+    if (fresh) it->second = o::vstr(std::string(s));
+    return it->second;
+  };
+  auto crcs = [&](const cmx_format::Crcs& l) {
+    std::vector<o::ValPtr> v;
+    for (auto& [name, crc] : l) v.push_back(o::vblock(0, {str(name), crc ? o::vblock(0, {o::vstr(*crc)}) : o::vint(0)}));
+    return o::vlist(v);
+  };
+  std::vector<o::ValPtr> dynunits;
+  for (auto& [ui, crc] : units) {
+    std::vector<o::ValPtr> defines;
+    for (std::string_view d : ui->ui_defines) defines.push_back(str(d));
+    dynunits.push_back(o::vblock(
+        0, {str(ui->ui_name), o::vstr(crc), crcs(ui->ui_imports_cmi), crcs(ui->ui_imports_cmx), o::vlist(defines)}));
+  }
+  o::ValPtr header = o::vblock(0, {o::vstr(*config::config_var("cmxs_magic_number")), o::vlist(dynunits)});
+  std::vector<std::uint8_t> bytes = o::marshal(header);
+  return std::string(bytes.begin(), bytes.end());
+}
+
+std::string make_shared_startup_file(format::Formatter& dump,
+                                     const std::vector<std::pair<const UnitInfos*, std::string>>& units) {
+  location::input_name = "caml_startup";
+  compilenv::reset(std::nullopt, "_shared_startup");
+  bool emit = asmgen::should_emit();
+  if (emit) emit::begin_assembly();
+  std::vector<const UnitInfos*> uis;
+  for (auto& [ui, _] : units) uis.push_back(ui);
+  for (const cmm::Phrase& p : cmm_helpers::emit_preallocated_blocks({}, cmm_helpers::generic_functions(true, uis)))
+    compile_phrase(dump, p);
+  compile_phrase(dump, cmm_helpers::global_data("caml_plugin_header", zstr(plugin_header(units))));
+  std::vector<std::string_view> symbols;
+  for (auto& [ui, _] : units) symbols.push_back(ui->ui_symbol);
+  compile_phrase(dump, cmm_helpers::global_table(symbols));
+  if (cf::output_complete_object) force_linking_of_startup(dump);
+  // this is to force a reference to all units, otherwise the linker might
+  // drop some of them (in case of libraries)
+  return emit ? emit::end_assembly() : std::string();
+}
+
 void call_linker(const std::vector<std::string>& file_list, const std::string& startup_file,
                  const std::string& output_name) {
   bool main_dll = cf::output_c_object && ends_with(output_name, config::ext_dll);
@@ -314,6 +362,7 @@ void check_consistency(const std::string& file_name, const UnitInfos& unit, cons
           if (r == name) fail(Error::Kind::Missing_cmx, file_name, std::string(name));
       } else {
         g_crc_implementations.check(std::string(name), *crco, file_name);
+        g_crc_implementation_objs.emplace(std::string(name), *crco);
       }
     }
   } catch (const Consistbl::Inconsistency& e) {
@@ -321,6 +370,7 @@ void check_consistency(const std::string& file_name, const UnitInfos& unit, cons
   }
   g_implementations.insert(g_implementations.begin(), unit.ui_name);
   g_crc_implementations.check(std::string(unit.ui_name), crc, file_name);
+  g_crc_implementation_objs.emplace(std::string(unit.ui_name), crc);
   if (unit.ui_symbol != unit.ui_name) g_cmx_required.insert(g_cmx_required.begin(), std::string(unit.ui_name));
 }
 
@@ -349,7 +399,7 @@ void link(std::ostream& ppf_dump, const std::vector<std::string>& objfiles0, con
     throw err;
   }
   for (const ToLink& u : units_tolink) check_consistency(u.file_name, *u.info, u.crc);
-  auto crc_interfaces = extract_crc_interfaces();
+  cmx_format::Crcs crc_interfaces = extract_crc_interfaces();
   cf::ccobjs.insert(cf::ccobjs.end(), g_lib_ccobjs.begin(), g_lib_ccobjs.end());
   std::vector<std::string> opts = g_lib_ccopts;  // put user's opts first
   opts.insert(opts.end(), cf::all_ccopts.begin(), cf::all_ccopts.end());
@@ -377,6 +427,57 @@ void link(std::ostream& ppf_dump, const std::vector<std::string>& objfiles0, con
   }
   std::remove(startup_obj.c_str());
 }
+
+void link_shared(std::ostream& ppf_dump, const std::vector<std::string>& objfiles, const std::string& output_name) {
+  std::vector<File> obj_infos;
+  for (const std::string& f : objfiles) obj_infos.push_back(read_file(f));
+  linkdeps::T ldeps(false);
+  std::vector<ToLink> units_tolink;
+  for (auto it = obj_infos.rbegin(); it != obj_infos.rend(); ++it) scan_file(ldeps, *it, units_tolink);
+  if (std::optional<linkdeps::Error> e = ldeps.check()) {
+    Error err{};
+    err.kind = Error::Kind::Link_error;
+    err.link = *e;
+    throw err;
+  }
+  for (const ToLink& u : units_tolink) check_consistency(u.file_name, *u.info, u.crc);
+  cf::ccobjs.insert(cf::ccobjs.end(), g_lib_ccobjs.begin(), g_lib_ccobjs.end());
+  std::vector<std::string> opts = g_lib_ccopts;
+  opts.insert(opts.end(), cf::all_ccopts.begin(), cf::all_ccopts.end());
+  cf::all_ccopts = std::move(opts);
+  // List.rev (List.filter_map object_file_name_of_file obj_infos) @ List.rev !Clflags.ccobjs
+  std::vector<std::string> objs;
+  for (auto it = obj_infos.rbegin(); it != obj_infos.rend(); ++it)
+    if (auto o = object_file_name_of_file(*it)) objs.push_back(*o);
+  objs.insert(objs.end(), cf::ccobjs.rbegin(), cf::ccobjs.rend());
+  std::string startup = cf::keep_startup_file ? output_name + ".startup" + ".s" : filename::temp_file("camlstartup", ".s");
+  std::string startup_obj = output_name + ".startup" + config::ext_obj;
+  std::vector<std::pair<const UnitInfos*, std::string>> units;
+  for (const ToLink& u : units_tolink) units.emplace_back(u.info, u.crc);
+  format::Formatter dump;
+  try {
+    asmgen::compile_unit(startup, cf::keep_startup_file, startup_obj,
+                         [&] { return make_shared_startup_file(dump, units); });
+  } catch (...) {
+    ppf_dump << dump.contents();
+    throw;
+  }
+  ppf_dump << dump.contents();
+  ppf_dump.flush();
+  std::vector<std::string> files{startup_obj};
+  files.insert(files.end(), objs.begin(), objs.end());
+  int exitcode = ccomp::call_linker(ccomp::LinkMode::Dll, output_name, files, "");
+  if (exitcode != 0) {
+    Error e{};
+    e.kind = Error::Kind::Linking_error;
+    e.exitcode = exitcode;
+    throw e;
+  }
+  std::remove(startup_obj.c_str());
+}
+
+cmx_format::Crcs extract_crc_interfaces() { return extract(g_interfaces, g_crc_interface_objs); }
+cmx_format::Crcs extract_crc_implementations() { return extract(g_implementations, g_crc_implementation_objs); }
 
 void report_error_doc(format_doc::Formatter& ppf, const Error& e) {
   namespace fd = format_doc;
@@ -412,6 +513,7 @@ void reset() {
   g_crc_interfaces.clear();
   g_crc_interface_objs.clear();
   g_crc_implementations.clear();
+  g_crc_implementation_objs.clear();
   g_cmx_required.clear();
   g_interfaces.clear();
   g_implementations.clear();

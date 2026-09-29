@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Native link scenarios (cxx/PORTING.md): libraries (-a, -linkall, C
-# options), -output-obj / -output-complete-obj, one-step builds, -verbose
+# options), -output-obj / -output-complete-obj, -shared, -pack, one-step builds, -verbose
 # and the link errors -- each run by ocamlopt.opt and by c++ocamlopt in the
 # same directory; every file left behind (and the output, exit code
 # included) compared byte for byte.  V=1 shows the output diffs.
@@ -51,4 +51,19 @@ scen onestep-multi 'C=$C; $C -dstartup -o m.exe a.ml b.ml main.ml && ./m.exe'
 scen onestep-g 'C=$C; $C -g -dstartup -o m.exe a.ml b.ml main.ml && ./m.exe'
 scen default-aout 'C=$C; $C a.ml b.ml main.ml && ./a.out'
 scen verbose 'C=$C; $C -c a.ml b.ml main.ml && $C -verbose -o m.exe a.cmx b.cmx main.cmx 2>&1 | sed -E "s/camlstartup[a-f0-9]+/camlstartupX/g"'
+scen shared 'C=$C; $C -c a.ml b.ml && $C -shared -dstartup -o ab.cmxs a.cmx b.cmx'
+scen shared-lib 'C=$C; $C -c a.ml b.ml && $C -a -o ab.cmxa a.cmx b.cmx -cclib -lm && $C -shared -linkall -o ab.cmxs ab.cmxa'
+scen shared-onestep 'C=$C; $C -shared -dstartup -o ab.cmxs a.ml b.ml'
+scen shared-missing 'C=$C; $C -c a.ml b.ml && $C -shared -o b.cmxs b.cmx'
+scen pack 'C=$C; $C -for-pack P -c a.ml b.ml && $C -pack -o p.cmx a.cmx b.cmx && echo "let () = print_int (P.B.g 3)" > u.ml && $C -c u.ml && $C -dstartup -o m.exe p.cmx u.cmx && ./m.exe'
+scen pack-mli 'C=$C; echo "module A : sig val x : int end module B : sig val g : int -> int end" > p.mli && $C -c p.mli && $C -for-pack P -c a.ml b.ml && $C -pack -o p.cmx a.cmx b.cmx && echo "let () = print_int (P.B.g 3)" > u.ml && $C -c u.ml && $C -o m.exe p.cmx u.cmx && ./m.exe'
+scen pack-S 'C=$C; $C -for-pack P -c a.ml b.ml && $C -S -pack -o p.cmx a.cmx b.cmx'
+scen pack-g 'C=$C; $C -g -for-pack P -c a.ml b.ml && $C -g -pack -o p.cmx a.cmx b.cmx'
+scen pack-onestep 'C=$C; $C -for-pack P -pack -o p.cmx a.ml b.ml'
+scen pack-nested 'C=$C; $C -for-pack Q.P -c a.ml b.ml && $C -for-pack Q -pack -o p.cmx a.cmx b.cmx && $C -pack -o q.cmx p.cmx && echo "let () = print_int (Q.P.B.g 3)" > u.ml && $C -c u.ml && $C -o m.exe q.cmx u.cmx && ./m.exe'
+scen pack-lib 'C=$C; $C -for-pack P -c a.ml b.ml && $C -pack -o p.cmx a.cmx b.cmx && $C -a -o p.cmxa p.cmx'
+scen pack-forward 'C=$C; $C -for-pack P -c a.ml b.ml && $C -pack -o p.cmx b.cmx a.cmx'
+scen pack-wrong-for-pack 'C=$C; $C -c a.ml b.ml && $C -pack -o p.cmx a.cmx b.cmx'
+scen pack-renamed 'C=$C; $C -for-pack P -c a.ml && cp a.cmx z.cmx && cp a.o z.o && $C -pack -o p.cmx z.cmx'
+scen pack-not-found 'C=$C; $C -pack -o p.cmx nothere.cmx'
 rm -rf $W

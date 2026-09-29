@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "cppcaml/typing/closure.hpp"
 #include "cppcaml/typing/cmm.hpp"
 #include "cppcaml/typing/format.hpp"
 
@@ -27,6 +28,10 @@ void compile_phrase(format::Formatter& dump, const cmm::Phrase& p);
 // assembled into obj_filename (raises Error)
 void compile_unit(const std::string& asm_filename, bool keep_asm, const std::string& obj_filename,
                   const std::function<std::string()>& gen);
+// end_gen_implementation ~ppf_dump clambda: Cmmgen.compunit, the phrases
+// compiled, then the references to the external primitives' symbols
+// (Translmod.primitive_declarations); the assembly text
+std::string end_gen_implementation(format::Formatter& dump, const closure_middle_end::WithConstants& clambda);
 // asm_filename output_prefix: prefix.s with -S, else a temporary file
 std::string asm_filename(const std::string& output_prefix);
 

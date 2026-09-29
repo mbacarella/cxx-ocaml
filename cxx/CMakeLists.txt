@@ -118,6 +118,7 @@ add_library(cppcaml_core
     src/typing/asmgen.cpp
     src/typing/asmlink.cpp
     src/typing/asmlibrarian.cpp
+    src/typing/asmpackager.cpp
   src/typing/format.cpp
   src/typing/printlambda.cpp
   src/typing/format_doc.cpp

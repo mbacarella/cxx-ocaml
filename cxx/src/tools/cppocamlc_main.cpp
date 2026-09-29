@@ -50,6 +50,7 @@
 #include "cppcaml/typing/asmgen.hpp"
 #include "cppcaml/typing/asmlibrarian.hpp"
 #include "cppcaml/typing/asmlink.hpp"
+#include "cppcaml/typing/asmpackager.hpp"
 #include "cppcaml/typing/cmm_helpers.hpp"
 #include "cppcaml/typing/translmod.hpp"
 #include "cppcaml/typing/compilenv.hpp"
@@ -750,18 +751,8 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
         // -S, else a temporary file), assembled into the object file
         std::string prefix = remove_extension(cmo_out);
         try {
-          ty::asmgen::compile_unit(ty::asmgen::asm_filename(prefix), cf::keep_asm_file, prefix + ".o", [&] {
-            if (ty::asmgen::should_emit()) ty::emit::begin_assembly();
-            std::vector<ty::cmm::Phrase> phrases = ty::cmmgen::compunit(clambda);
-            ty::asmgen::compile_phrases(dump, phrases);
-            std::vector<std::string_view> prims;
-            for (const ty::PrimitiveDescription* p : ty::translmod::primitive_declarations) {
-              std::string_view name = p->prim_native_name.empty() ? p->prim_name : p->prim_native_name;
-              if (!name.empty() && name[0] != '%') prims.push_back(name);
-            }
-            ty::asmgen::compile_phrase(dump, ty::cmm_helpers::reference_symbols(prims));
-            return ty::asmgen::should_emit() ? ty::emit::end_assembly() : std::string();
-          });
+          ty::asmgen::compile_unit(ty::asmgen::asm_filename(prefix), cf::keep_asm_file, prefix + ".o",
+                                   [&] { return ty::asmgen::end_gen_implementation(dump, clambda); });
         } catch (const ty::polling::PollError& e) {
           // Location.error_of_printer_file Polling.report_error
           ppf_dump.out() << dump.contents();
@@ -1122,8 +1113,22 @@ static int run_main(int argc, char** argv) {
         std::string target = ce::extract_output(cf::output_name);
         ty::asmlibrarian::create_archive(ce::get_objfiles(false), target);
         ty::warnings::check_fatal();
-      } else if (cf::make_package || cf::shared) {
-        ce::fatal(CPPCAML_SELF ": the native packager and -shared are not supported yet");
+      } else if (cf::make_package) {
+        init_path();
+        std::string target = ce::extract_output(cf::output_name);
+        install_typing();
+        PpfDump d;
+        open_ppf_dump(d, target);
+        ty::asmpackager::package_files(d.out(), initial_env(), ce::get_objfiles(false), target);
+        ty::warnings::check_fatal();
+      } else if (cf::shared) {
+        init_path();
+        std::string target = ce::extract_output(cf::output_name);
+        install_typing();
+        PpfDump d;
+        open_ppf_dump(d, target);
+        ty::asmlink::link_shared(d.out(), ce::get_objfiles(false), target);
+        ty::warnings::check_fatal();
       } else if (!ce::stop_early && (!cf::objfiles.empty() || ce::has_linker_inputs)) {
         std::string target;
         if (cf::output_c_object) {

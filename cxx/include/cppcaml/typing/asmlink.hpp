@@ -27,8 +27,13 @@ struct Error {
 // link ~ppf_dump objfiles output_name (the -dcmm... dumps of the startup
 // module on ppf_dump)
 void link(std::ostream& ppf_dump, const std::vector<std::string>& objfiles, const std::string& output_name);
+// link_shared ~ppf_dump objfiles output_name (-shared: a .cmxs plugin)
+void link_shared(std::ostream& ppf_dump, const std::vector<std::string>& objfiles, const std::string& output_name);
 // check_consistency file_name unit crc (Asmlibrarian's too)
 void check_consistency(const std::string& file_name, const cmx_format::UnitInfos& unit, const std::string& crc);
+// extract_crc_interfaces () / extract_crc_implementations () (Asmpackager)
+cmx_format::Crcs extract_crc_interfaces();
+cmx_format::Crcs extract_crc_implementations();
 void report_error_doc(format_doc::Formatter& ppf, const Error& e);
 void reset();
 

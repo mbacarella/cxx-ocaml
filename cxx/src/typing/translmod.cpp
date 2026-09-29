@@ -1560,6 +1560,42 @@ Lam transl_package(Slice<Ident::t> component_names, Ident::t target_name, const 
                   ScopedLocation{});
 }
 
+// transl_store_package component_names target_name coercion (the native
+// -pack): the block size and the code storing the components
+std::pair<long, Lam> transl_store_package(Slice<Ident::t> component_names, Ident::t target_name, const MC* coercion) {
+  auto get_component = [](Ident::t id) {
+    return id ? L::lprim(pglobal(Primitive::K::Pgetglobal, id), {}, ScopedLocation{}) : L::lconst(L::const_unit());
+  };
+  auto setfield = [&](long pos, Lam v) {
+    Primitive p = L::prim(Primitive::K::Psetfield);
+    p.n = pos;
+    p.ptr = L::ImmediateOrPointer::Pointer;
+    p.init = L::InitializationOrAssignment::Root_initialization;
+    return L::lprim(p, slice<Lam>({L::lprim(pglobal(Primitive::K::Pgetglobal, target_name), {}, ScopedLocation{}), v}),
+                    ScopedLocation{});
+  };
+  // make_sequence fn 0 l
+  auto make_sequence = [](std::size_t n, const std::function<Lam(long)>& fn) {
+    Lam r = L::lambda_unit();
+    for (std::size_t k = n; k-- > 0;) r = L::lsequence(fn(static_cast<long>(k)), r);
+    return r;
+  };
+  if (coercion->kind == MC::Kind::Tcoerce_none)
+    return {static_cast<long>(component_names.size()),
+            make_sequence(component_names.size(),
+                          [&](long pos) { return setfield(pos, get_component(component_names[static_cast<std::size_t>(pos)])); })};
+  if (coercion->kind != MC::Kind::Tcoerce_structure) fatal_error("Translmod.transl_store_package");
+  std::vector<Lam> cs;
+  for (Ident::t id : component_names) cs.push_back(get_component(id));
+  Lam components = L::lprim(pmakeblock(0, MutableFlag::Immutable), slice(cs), ScopedLocation{});
+  Ident::t blk = Ident::create_local("block");
+  Lam def = apply_coercion(ScopedLocation{}, LetKind::Strict, coercion, components);
+  Lam body = make_sequence(coercion->pos_cc.size(), [&](long pos) {
+    return setfield(pos, L::lprim(pfield(pos), slice<Lam>({L::lvar(blk)}), ScopedLocation{}));
+  });
+  return {static_cast<long>(coercion->pos_cc.size()), L::llet(LetKind::Strict, VK::gen(), blk, def, body)};
+}
+
 void reset() {
   primitive_declarations.clear();
   transl_store_subst.clear();
