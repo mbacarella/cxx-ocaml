@@ -161,11 +161,19 @@ ocamlopt's: Proc's 29 hard registers first (so a function's first
 pseudo-register is 29), then every `Reg.create`/`at_location` in
 Selectgen's order.
 
-Next, in order: the Mach passes (`-dcombine` ... `-dreload`: Comballoc,
-CSE, Liveness, Deadcode, Spill, Split, Interf, Coloring, Reload),
-Linearize and Emit (`-dlinear`, then `-S` byte for byte), then the
-.cmx/.cmxa writers and Asmlink.  Until the back end exists, c++ocamlopt
-stops with an error after Selection and does not write the .cmx.
+The Mach passes are ported (`mach_passes.cpp`: Comballoc, CSE,
+Liveness, Deadcode, Spill, Split, Interf, Coloring, Reload, with the
+regalloc loop in the driver): `DUMP=dcombine` / `dcse` / `dlive` /
+`dspill` / `dsplit` / `dinterf` / `dprefer` / `dalloc` / `dreload` --
+6550/6550 probes each (and `-dreload` with `-g`, `-unsafe -inline 200`,
+`-compact`), 208/208 compiler sources (`dreload`, `dlive`, `dinterf`),
+787/787 testsuite files.  Record updates and constructors evaluate their
+fields right to left; CSE and Reload create registers inside them.
+
+Next, in order: Linearize and Emit (`-dlinear`, then `-S` byte for
+byte), then the .cmx/.cmxa writers and Asmlink.  Until the back end
+exists, c++ocamlopt stops with an error after register allocation and
+does not write the .cmx.
 
 ## Oracles and gates
 

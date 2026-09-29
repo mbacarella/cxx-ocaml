@@ -19,8 +19,8 @@ namespace reg {
 
 namespace {
 long currstamp = 0;
-std::vector<Reg*> reg_list;     // newest first
-std::vector<Reg*> hw_reg_list;  // newest first
+std::vector<Reg*> reg_list;     // the oldest first (Reg.reg_list reversed)
+std::vector<Reg*> hw_reg_list;
 long visit_generation = 1;
 constexpr long unvisited = 0;
 long first_virtual_reg_stamp = -1;
@@ -31,7 +31,7 @@ Reg* create(cmm::MachtypeComponent ty) {
   r->stamp = currstamp;
   r->typ = ty;
   r->visited = unvisited;
-  reg_list.insert(reg_list.begin(), r);
+  reg_list.push_back(r);
   ++currstamp;
   return r;
 }
@@ -64,7 +64,7 @@ Reg* at_location(cmm::MachtypeComponent ty, Location loc) {
   r->typ = ty;
   r->loc = loc;
   r->visited = unvisited;
-  hw_reg_list.insert(hw_reg_list.begin(), r);
+  hw_reg_list.push_back(r);
   ++currstamp;
   return r;
 }
@@ -112,7 +112,22 @@ void reset() {
   for (Reg* r : hw_reg_list) r->visited = unvisited;
 }
 
-const std::vector<Reg*>& all_registers() { return reg_list; }
+void reinit() {
+  for (Reg* r : reg_list) {
+    r->loc = Location{};
+    r->interf.clear();
+    r->prefer.clear();
+    r->degree = 0;
+    // Preserve the very high spill costs introduced by the reloading pass
+    r->spill_cost = r->spill_cost >= 100000 ? 100000 : 0;
+  }
+}
+
+void mark_visited(Reg* r) { r->visited = visit_generation; }
+bool is_visited(const Reg* r) { return r->visited == visit_generation; }
+void clear_visited_marks() { ++visit_generation; }
+
+std::vector<Reg*> all_registers() { return std::vector<Reg*>(reg_list.rbegin(), reg_list.rend()); }
 long num_registers() { return currstamp; }
 
 }  // namespace reg
@@ -343,7 +358,90 @@ std::pair<std::vector<Regs>, long> loc_external_arguments(const std::vector<cmm:
 }
 Reg* loc_exn_bucket() { return phys_reg(0); }
 
-void init() {}  // num_available_registers: 13 without frame pointers
+long num_available_registers[num_register_classes] = {13, 16};
+const long first_available_register[num_register_classes] = {0, 100};
+
+// Config.with_frame_pointers = false: init keeps 13 integer registers
+void init() { num_available_registers[0] = 13; }
+
+long register_class(const Reg* r) { return r->typ == MC::Float ? 1 : 0; }
+
+namespace {
+Regs regs_of(std::initializer_list<long> ns) {
+  Regs r;
+  for (long n : ns) r.push_back(phys_reg(n));
+  return r;
+}
+Regs all_phys_regs() {
+  init_hard_regs();
+  Regs r = hard_int_reg;
+  r.insert(r.end(), hard_float_reg.begin(), hard_float_reg.end());
+  return r;
+}
+// X86_proc.use_plt: evaluated at module initialization, while
+// Clflags.dlcode still has its default (true)
+Regs destroyed_at_alloc_or_poll() { return regs_of({10, 11}); }
+Regs destroyed_at_c_call() {
+  // Unix: r12-r15 preserved
+  return regs_of({0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112,
+                  113, 114, 115});
+}
+}  // namespace
+
+Regs destroyed_at_oper(const mach::Instruction& i) {
+  using K = mach::Operation::K;
+  using IO = mach::IntegerOperation;
+  if (i.desc == mach::Instruction::K::Iswitch) return regs_of({0, 4});
+  if (i.desc == mach::Instruction::K::Itrywith) return regs_of({11});
+  if (i.desc != mach::Instruction::K::Iop) return {};
+  const mach::Operation& op = i.op;
+  switch (op.k) {
+    case K::Icall_ind:
+    case K::Icall_imm: return all_phys_regs();
+    case K::Iextcall:
+      if (op.alloc || op.stack_ofs > 0) return all_phys_regs();
+      return destroyed_at_c_call();
+    case K::Iintop:
+    case K::Iintop_imm:
+      if (op.intop.op == IO::Idiv || op.intop.op == IO::Imod) return regs_of({0, 4});
+      if (op.intop.op == IO::Icomp || (op.k == K::Iintop && op.intop.op == IO::Imulh)) return regs_of({0});
+      return {};
+    case K::Istore:
+      if (op.chunk == cmm::MemoryChunk::Single) return regs_of({115});
+      return {};
+    case K::Ialloc:
+    case K::Ipoll: return destroyed_at_alloc_or_poll();
+    default: return {};
+  }
+}
+
+Regs destroyed_at_raise() { return all_phys_regs(); }
+
+// Maximal register pressure (no frame pointers, Unix)
+std::vector<long> max_register_pressure(const mach::Operation& op) {
+  using K = mach::Operation::K;
+  using IO = mach::IntegerOperation;
+  auto consumes = [](long i, long f) { return std::vector<long>{13 - i, 16 - f}; };
+  switch (op.k) {
+    case K::Iextcall: return consumes(9, 16);
+    case K::Iintop:
+    case K::Iintop_imm:
+      if (op.intop.op == IO::Idiv || op.intop.op == IO::Imod) return consumes(2, 0);
+      if (op.intop.op == IO::Icomp) return consumes(1, 0);
+      return consumes(0, 0);
+    case K::Ialloc:
+    case K::Ipoll: return consumes(1 + 2, 0);
+    case K::Istore:
+      if (op.chunk == cmm::MemoryChunk::Single) return consumes(0, 1);
+      return consumes(0, 0);
+    case K::Icompf: return consumes(0, 1);
+    default: return consumes(0, 0);
+  }
+}
+
+long safe_register_pressure(const mach::Operation& op) {
+  return op.k == mach::Operation::K::Iextcall ? 0 : 11;
+}
 
 }  // namespace proc
 
@@ -645,6 +743,26 @@ void fundecl(Formatter& ppf, const Fundecl& f) {
 
 void phase(Formatter& ppf, const std::string& msg, const Fundecl& f) {
   fprintf(ppf, "*** %s@.%a@.", msg, pr(fundecl, f));
+}
+
+void interferences(Formatter& ppf) {
+  fprintf(ppf, "*** Interferences@.");
+  for (reg::Reg* r : reg::all_registers()) {
+    auto interf = [r](Formatter& f) {
+      for (reg::Reg* x : r->interf) fprintf(f, "@ %a", pr(reg, x));
+    };
+    fprintf(ppf, "@[<2>%a:%t@]@.", pr(reg, r), interf);
+  }
+}
+
+void preferences(Formatter& ppf) {
+  fprintf(ppf, "*** Preferences@.");
+  for (reg::Reg* r : reg::all_registers()) {
+    auto prefs = [r](Formatter& f) {
+      for (auto& [x, w] : r->prefer) fprintf(f, "@ %a weight %i", pr(reg, x), w);
+    };
+    fprintf(ppf, "@[<2>%a: %t@]@.", pr(reg, r), prefs);
+  }
 }
 
 }  // namespace printmach

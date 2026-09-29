@@ -44,6 +44,7 @@
 #include "cppcaml/typing/cmmgen.hpp"
 #include "cppcaml/typing/printcmm.hpp"
 #include "cppcaml/typing/selection.hpp"
+#include "cppcaml/typing/mach_passes.hpp"
 #include "cppcaml/typing/translmod.hpp"
 #include "cppcaml/typing/compilenv.hpp"
 #include "cppcaml/typing/misc.hpp"
@@ -757,6 +758,37 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
             ty::reg::reset();
             ty::mach::Fundecl fd = ty::polling::instrument_fundecl(ty::selection::fundecl(funcnames, *p.fn));
             if (cf::dump_selection) ty::printmach::phase(dump, "After instruction selection", fd);
+            namespace mp = ty::mach_passes;
+            fd = mp::comballoc(fd);
+            if (cf::dump_combine) ty::printmach::phase(dump, "After allocation combining", fd);
+            fd = mp::cse(fd);
+            if (cf::dump_cse) ty::printmach::phase(dump, "After CSE", fd);
+            mp::liveness(fd);
+            fd = mp::deadcode(fd);
+            if (cf::dump_live) ty::printmach::phase(dump, "Liveness analysis", fd);
+            fd = mp::spill(fd);
+            mp::liveness(fd);
+            if (cf::dump_spill) ty::printmach::phase(dump, "After spilling", fd);
+            fd = mp::split(fd);
+            if (cf::dump_split) ty::printmach::phase(dump, "After live range splitting", fd);
+            mp::liveness(fd);
+            // regalloc (graph coloring)
+            for (long round = 1;; ++round) {
+              if (round > 50) throw std::runtime_error(std::string(fd.fun_name) +
+                                                       ": function too complex, cannot complete register allocation");
+              if (cf::dump_live) ty::printmach::phase(dump, "Liveness analysis", fd);
+              mp::interf_build_graph(fd);
+              if (cf::dump_interf) ty::printmach::interferences(dump);
+              if (cf::dump_prefer) ty::printmach::preferences(dump);
+              std::vector<long> num_stack_slots = mp::coloring_allocate_registers();
+              if (cf::dump_regalloc) ty::printmach::phase(dump, "After register allocation", fd);
+              auto [newfd, redo_regalloc] = mp::reload(fd, num_stack_slots);
+              if (cf::dump_reload) ty::printmach::phase(dump, "After insertion of reloading code", newfd);
+              fd = newfd;
+              if (!redo_regalloc) break;
+              ty::reg::reinit();
+              mp::liveness(fd);
+            }
             funcnames.erase(p.fn->fun_name);
           }
         };
@@ -777,7 +809,7 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
         ppf_dump.out() << dump.contents();
         ppf_dump.out().flush();
         lap("selection", tp);
-        throw std::runtime_error("the native back end (Comballoc) is not supported yet");
+        throw std::runtime_error("the native back end (Linearize) is not supported yet");
       }
       return finish();
     }

@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <deque>
 #include <optional>
 #include <set>
 #include <string>
@@ -41,8 +42,8 @@ struct Reg {
   Location loc;
   bool spill = false;
   std::optional<long> part;
-  std::vector<Reg*> interf;
-  std::vector<std::pair<Reg*, long>> prefer;
+  std::deque<Reg*> interf;                  // list order: the newest first
+  std::deque<std::pair<Reg*, long>> prefer;  // list order: the newest first
   long degree = 0;
   long spill_cost = 0;
   long visited = 0;
@@ -61,7 +62,11 @@ std::vector<cmm::MachtypeComponent> typv(const Regs& rv);
 bool anonymous(const Reg* r);
 std::string name(const Reg* r);
 void reset();
-const std::vector<Reg*>& all_registers();  // newest first
+void reinit();
+void mark_visited(Reg* r);
+bool is_visited(const Reg* r);
+void clear_visited_marks();
+std::vector<Reg*> all_registers();  // Reg.all_registers: the newest first
 long num_registers();
 
 }  // namespace reg
@@ -212,6 +217,14 @@ Regs loc_external_results(const std::vector<cmm::MachtypeComponent>& res);
 std::pair<std::vector<Regs>, long> loc_external_arguments(const std::vector<cmm::Exttype>& ty_args);
 Reg* loc_exn_bucket();
 void init();
+long register_class(const Reg* r);
+extern long num_available_registers[num_register_classes];
+extern const long first_available_register[num_register_classes];
+constexpr bool rotate_registers = false;
+Regs destroyed_at_oper(const mach::Instruction& i);
+Regs destroyed_at_raise();
+std::vector<long> max_register_pressure(const mach::Operation& op);
+long safe_register_pressure(const mach::Operation& op);
 }  // namespace proc
 
 // ---- Printmach ---------------------------------------------------------------------------------
@@ -219,6 +232,8 @@ namespace printmach {
 void reg(format::Formatter& ppf, const reg::Reg* r);
 void fundecl(format::Formatter& ppf, const mach::Fundecl& f);
 void phase(format::Formatter& ppf, const std::string& msg, const mach::Fundecl& f);
+void interferences(format::Formatter& ppf);
+void preferences(format::Formatter& ppf);
 }  // namespace printmach
 
 }  // namespace cppcaml::typing
