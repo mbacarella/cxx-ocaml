@@ -1,0 +1,7 @@
+module Simple = struct
+module type S = sig val v : int end
+module Register (D:S) = struct let x = D.v end
+module M = struct let v = 1 end
+end
+module EM = Simple.Register(Simple.M)
+module EM2 = Simple.Register(Simple.M)

@@ -1,0 +1,5 @@
+corpus	units	ref_ms	cpp_ms	ratio	geomean	ref_rss_max_kb	cpp_rss_max_kb
+startup	50	236.7	156.8	0.663	0.659	15768	23076
+small	408	2373.1	1487.0	0.627	0.619	21072	40356
+compiler	284	6863.9	3941.1	0.574	0.582	92224	247636
+stdlib	144	1673.9	1096.5	0.655	0.644	61240	148688

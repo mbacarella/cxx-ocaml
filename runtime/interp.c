@@ -38,6 +38,7 @@
 #include "caml/globroots.h"
 #include "caml/startup.h"
 #include "caml/startup_aux.h"
+#include "caml/cppcaml_debug.h"
 
 /* Registers for the abstract machine:
         pc         the code pointer
@@ -296,6 +297,8 @@ value caml_bytecode_interpreter(code_t prog, asize_t prog_size,
     static opcode_t raise_unhandled_effect_code[] = { ACC, 0, RAISE };
     value raise_unhandled_effect_closure;
 
+    caml_cppcaml_debug_init();   /* c++caml: arm the field-read crash dump */
+
     caml_register_code_fragment(
       (char *) raise_unhandled_effect_code,
       (char *) raise_unhandled_effect_code +
@@ -472,12 +475,14 @@ value caml_bytecode_interpreter(code_t prog, asize_t prog_size,
       Next;
     }
     Instruct(APPLY): {
+      Cppcaml_apply(pc - 1, accu, *pc);
       extra_args = *pc - 1;
       pc = Code_val(accu);
       env = accu;
       goto check_stacks;
     }
     Instruct(APPLY1): {
+      Cppcaml_apply(pc - 1, accu, 1);
       value arg1 = sp[0];
       sp -= 3;
       sp[0] = arg1;
@@ -490,6 +495,7 @@ value caml_bytecode_interpreter(code_t prog, asize_t prog_size,
       goto check_stacks;
     }
     Instruct(APPLY2): {
+      Cppcaml_apply(pc - 1, accu, 2);
       value arg1 = sp[0];
       value arg2 = sp[1];
       sp -= 3;
@@ -504,6 +510,7 @@ value caml_bytecode_interpreter(code_t prog, asize_t prog_size,
       goto check_stacks;
     }
     Instruct(APPLY3): {
+      Cppcaml_apply(pc - 1, accu, 3);
       value arg1 = sp[0];
       value arg2 = sp[1];
       value arg3 = sp[2];
@@ -522,6 +529,7 @@ value caml_bytecode_interpreter(code_t prog, asize_t prog_size,
 
     Instruct(APPTERM): {
       int nargs = *pc++;
+      Cppcaml_apply(pc - 2, accu, nargs);
       int slotsize = *pc;
       value * newsp;
       /* Slide the nargs bottom words of the current frame to the top
@@ -535,6 +543,7 @@ value caml_bytecode_interpreter(code_t prog, asize_t prog_size,
       goto check_stacks;
     }
     Instruct(APPTERM1): {
+      Cppcaml_apply(pc - 1, accu, 1);
       value arg1 = sp[0];
       sp = sp + *pc - 1;
       sp[0] = arg1;
@@ -543,6 +552,7 @@ value caml_bytecode_interpreter(code_t prog, asize_t prog_size,
       goto check_stacks;
     }
     Instruct(APPTERM2): {
+      Cppcaml_apply(pc - 1, accu, 2);
       value arg1 = sp[0];
       value arg2 = sp[1];
       sp = sp + *pc - 2;
@@ -554,6 +564,7 @@ value caml_bytecode_interpreter(code_t prog, asize_t prog_size,
       goto check_stacks;
     }
     Instruct(APPTERM3): {
+      Cppcaml_apply(pc - 1, accu, 3);
       value arg1 = sp[0];
       value arg2 = sp[1];
       value arg3 = sp[2];
@@ -824,14 +835,19 @@ value caml_bytecode_interpreter(code_t prog, asize_t prog_size,
 /* Access to components of blocks */
 
     Instruct(GETFIELD0):
+      Cppcaml_field_read(pc - 1, accu, sp, env, 0);
       accu = Field(accu, 0); Next;
     Instruct(GETFIELD1):
+      Cppcaml_field_read(pc - 1, accu, sp, env, 1);
       accu = Field(accu, 1); Next;
     Instruct(GETFIELD2):
+      Cppcaml_field_read(pc - 1, accu, sp, env, 2);
       accu = Field(accu, 2); Next;
     Instruct(GETFIELD3):
+      Cppcaml_field_read(pc - 1, accu, sp, env, 3);
       accu = Field(accu, 3); Next;
     Instruct(GETFIELD):
+      Cppcaml_field_read(pc - 1, accu, sp, env, (int)*pc);
       accu = Field(accu, *pc); pc++; Next;
     Instruct(GETFLOATFIELD): {
       double d = Double_flat_field(accu, *pc++);

@@ -1,0 +1,8 @@
+# The image bakes in only the toolchain -- the repo is bind-mounted at run time
+# (see Dockerfile). So the build context needs nothing but the flake files that
+# pin the toolchain. Excluding everything else keeps the context tiny (no .git,
+# no build artifacts) and makes the intent explicit.
+*
+!flake.nix
+!flake.lock
+!docker-entrypoint.sh

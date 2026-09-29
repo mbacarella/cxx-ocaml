@@ -26,6 +26,14 @@ open Printf
 let print_banners = ref true
 let print_locations = ref true
 let print_reloc_info = ref false
+(* effective-identity mode: emit a canonical disassembly for comparing two
+   .cmo produced by different compilers.  Branch/switch/closure targets are
+   printed as the RAW displacement stored in the bytecode (relative to the
+   instruction) rather than as an absolute offset, and the per-instruction
+   address column, debug events and optimization hints are suppressed.  Two
+   modules with identical code then produce byte-identical output; genuine
+   codegen divergences (and only those) show up as a diff. *)
+let effid = ref false
 
 (* Read signed and unsigned integers *)
 
@@ -410,7 +418,7 @@ let print_event ev =
 let print_instr ic =
   let pos = currpos ic in
   List.iter print_event (Hashtbl.find_all event_table pos);
-  printf "%8d  " (pos / 4);
+  if not !effid then printf "%8d  " (pos / 4);
   let op = inputu ic in
   if op >= Array.length names_of_instructions || op < 0
   then (print_string "*** unknown opcode : "; print_int op)
@@ -423,13 +431,16 @@ let print_instr ic =
     | Sint -> print_int (inputs ic)
     | Uint_Uint
        -> print_int (inputu ic); print_string ", "; print_int (inputu ic)
-    | Disp -> let p = currpc ic in print_int (p + inputs ic)
+    | Disp -> let p = currpc ic in let d = inputs ic in
+              print_int (if !effid then d else p + d)
     | Uint_Disp
        -> print_int (inputu ic); print_string ", ";
-          let p = currpc ic in print_int (p + inputs ic)
+          let p = currpc ic in let d = inputs ic in
+          print_int (if !effid then d else p + d)
     | Sint_Disp
        -> print_int (inputs ic); print_string ", ";
-          let p = currpc ic in print_int (p + inputs ic)
+          let p = currpc ic in let d = inputs ic in
+          print_int (if !effid then d else p + d)
     | Getglobal -> print_getglobal_name ic
     | Getglobal_Uint
        -> print_getglobal_name ic; print_string ", "; print_int (inputu ic)
@@ -442,11 +453,11 @@ let print_instr ic =
           let orig = currpc ic in
           for i = 0 to (n land 0xFFFF) - 1 do
             print_string "\n        int "; print_int i; print_string " -> ";
-            print_int(orig + inputs ic);
+            let d = inputs ic in print_int (if !effid then d else orig + d);
           done;
           for i = 0 to (n lsr 16) - 1 do
             print_string "\n        tag "; print_int i; print_string " -> ";
-            print_int(orig + inputs ic);
+            let d = inputs ic in print_int (if !effid then d else orig + d);
           done;
     | Closurerec
        -> let nfuncs = inputu ic in
@@ -455,7 +466,7 @@ let print_instr ic =
           print_int nvars;
           for _i = 0 to nfuncs - 1 do
             print_string ", ";
-            print_int (orig + inputs ic);
+            let d = inputs ic in print_int (if !effid then d else orig + d);
           done;
     | Pubmet
        -> let tag = inputs ic in
@@ -545,6 +556,9 @@ let arg_list = [
   "-nobanners", Arg.Clear print_banners, " : don't print banners";
   "-noloc", Arg.Clear print_locations, " : don't print source information";
   "-reloc", Arg.Set print_reloc_info, " : print relocation information";
+  "-effid", Arg.Unit (fun () ->
+      effid := true; print_banners := false; print_locations := false),
+     " : canonical disassembly (relative targets, no offsets/events/hints)";
   "-args", Arg.Expand Arg.read_arg,
      "<file> Read additional newline separated command line arguments \n\
      \      from <file>";

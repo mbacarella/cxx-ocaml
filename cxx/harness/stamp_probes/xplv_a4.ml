@@ -1,0 +1,5 @@
+(* S570: an or-pattern binds the same names on both sides; each keeps the
+   argument type of the alternative that gave it *)
+type t = A of (int * int * int) | B of int * int
+let (A (a, _, b) | B (b, a)) = A (1, 2, 3)
+let () = print_int a; print_int b

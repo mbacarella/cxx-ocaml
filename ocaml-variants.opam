@@ -110,6 +110,8 @@ build: [
   ]
   [make "-j%{jobs}%"]
   [make "INSTALL_MODE=opam" "install"]
+  # c++ocamlc as the switch's ocamlc (cxx/INSTALL.md)
+  ["sh" "cxx/opam/build-cxx.sh" prefix jobs] {ocaml-option-cxx:installed}
 ]
 install: ["sh" "./%{name}%-fixup.sh" prefix]
 depopts: [
@@ -125,4 +127,11 @@ depopts: [
   "ocaml-option-address-sanitizer"
   "ocaml-option-static"
   "ocaml-option-tsan"
+  "ocaml-option-cxx"
 ]
+# mimalloc's allocator override, statically linked into c++ocamlc
+# (ocaml-option-cxx; unused otherwise)
+extra-source "mimalloc-v3.4.5.tar.gz" {
+  src: "https://github.com/microsoft/mimalloc/archive/refs/tags/v3.4.5.tar.gz"
+  checksum: "sha256=19a43af0645c57d348e729d5b31e23e912582911bb1047f795790834d3416221"
+}

@@ -1,0 +1,3 @@
+module Str = struct type t = string end
+module A = struct module Make (M : sig end) = struct
+include (struct type t = string end) end end

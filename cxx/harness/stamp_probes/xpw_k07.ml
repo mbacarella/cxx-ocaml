@@ -1,0 +1,4 @@
+module type S = sig type t end
+type 'a arg_t = 'at constraint 'a = (module S with type t = 'at)
+type t = (module S with type t = unit)
+let f : t arg_t -> unit = fun x -> ()

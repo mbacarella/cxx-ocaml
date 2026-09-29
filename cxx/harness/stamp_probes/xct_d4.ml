@@ -1,0 +1,4 @@
+module F (X : sig end) = struct class type t = object end class c = object end
+end;; module M1 = struct end;; module G (X : sig end) = struct class
+type ['a] t = object method m : 'a end end;; class
+type u = [int] G(M1).t;; class type v = [int] G(M1).t;;

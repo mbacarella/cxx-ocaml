@@ -1,0 +1,22 @@
+opam-version: "2.0"
+synopsis: "Install c++ocamlc and c++ocamlopt (the C++ port) as the switch's ocamlc and ocamlopt"
+description: """
+With this option, ocaml-variants built from this repository also builds
+c++ocamlc and c++ocamlopt (cxx/) and installs them as bin/ocamlc.opt and
+bin/ocamlopt.opt -- bin/ocamlc and bin/ocamlopt point at them -- keeping
+the stock compilers as bin/ocamlc.stock and bin/ocamlopt.stock.  Every
+package of the switch is then compiled by the C++ port.  See
+cxx/INSTALL.md."""
+maintainer: "Michael Bacarella <michael.bacarella@gmail.com>"
+authors: "Michael Bacarella <michael.bacarella@gmail.com>"
+license: "LGPL-2.1-or-later WITH OCaml-LGPL-linking-exception"
+homepage: "https://github.com/mbacarella/cxx-ocaml"
+bug-reports: "https://github.com/mbacarella/cxx-ocaml/issues"
+depends: [
+  "ocaml-variants" {post & >= "5.6.0~"}
+]
+depexts: [
+  ["clang" "cmake" "ninja-build" "libzstd-dev" "pkg-config"] {os-family = "debian"}
+  ["clang" "cmake" "ninja-build" "libzstd-devel" "pkgconf-pkg-config"] {os-family = "fedora"}
+]
+flags: compiler

@@ -1,0 +1,8 @@
+module type ORD = sig type t end
+module type SET = sig type elt type t val iter : (elt -> unit) -> t -> unit
+  end
+module F (X : ORD) : SET = struct type elt = int type t = int let iter _ _ =
+  () end
+module B (Elt : ORD) = struct
+  module Z = F(Elt)
+end

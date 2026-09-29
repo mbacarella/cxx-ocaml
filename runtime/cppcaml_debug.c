@@ -1,0 +1,182 @@
+/**************************************************************************/
+/*                                                                        */
+/*   c++caml development aid (not part of upstream OCaml).                 */
+/*                                                                        */
+/**************************************************************************/
+
+/* See caml/cppcaml_debug.h.  Implements the CPPCAML_FIELDTRACE crash dump for
+   wild block-field reads. */
+
+#define CAML_INTERNALS
+
+#include <stdlib.h>
+#include <string.h>
+#include <signal.h>
+#include <unistd.h>
+
+#include "caml/cppcaml_debug.h"
+#include "caml/domain.h"
+#include "caml/fiber.h"
+
+int caml_cppcaml_fieldtrace = 0;
+
+#define CPPCAML_RING 64  /* power of two */
+struct cppcaml_entry { long pc_off; value accu; value *sp; value env; int field; };
+static struct cppcaml_entry cppcaml_ring[CPPCAML_RING];
+static unsigned cppcaml_pos = 0;
+static int cppcaml_installed = 0;
+
+struct cppcaml_apply_entry { long call_off; value accu; long code_off; int nargs; };
+static struct cppcaml_apply_entry cppcaml_aring[CPPCAML_RING];
+static unsigned cppcaml_apos = 0;
+
+void caml_cppcaml_apply(code_t call_pc, value accu, int nargs)
+{
+  unsigned i = cppcaml_apos & (CPPCAML_RING - 1);
+  cppcaml_aring[i].call_off = (long)(call_pc - caml_start_code);
+  cppcaml_aring[i].accu = accu;
+  cppcaml_aring[i].nargs = nargs;
+  cppcaml_aring[i].code_off = -2;   /* "not computed" until the deref below */
+  cppcaml_apos++;
+  /* Deref Code_val LAST: a wild accu faults here exactly as the APPLY would,
+     but the entry (accu, call site) is already recorded for the dump. */
+  if (accu != 0 && (accu & 1) == 0) {
+    code_t cp = (code_t)Field(accu, 0);
+    if (cp >= caml_start_code &&
+        (value)cp < (value)caml_start_code + caml_code_size)
+      cppcaml_aring[i].code_off = (long)(cp - caml_start_code);
+    else
+      cppcaml_aring[i].code_off = -1;   /* not a code pointer: a non-closure call */
+  }
+}
+
+void caml_cppcaml_field_read(code_t opcode_pc, value accu, value *sp, value env,
+                             int field)
+{
+  struct cppcaml_entry *e = &cppcaml_ring[cppcaml_pos & (CPPCAML_RING - 1)];
+  e->pc_off = (long)(opcode_pc - caml_start_code);
+  e->accu = accu;
+  e->sp = sp;
+  e->env = env;
+  e->field = field;
+  cppcaml_pos++;
+}
+
+/* The code-segment entry offset of a closure (its function's first opcode), or
+   -1 when env is not a heap closure. */
+static long cppcaml_fn_entry(value env)
+{
+  if (env == 0 || (env & 1)) return -1;
+  code_t cp = (code_t)Field(env, 0);   /* Code_val */
+  if (cp >= caml_start_code &&
+      (value)cp < (value)caml_start_code + caml_code_size)
+    return (long)(cp - caml_start_code);
+  return -1;
+}
+
+/* Async-signal-safe output: only write(), no malloc / stdio. */
+static void put(const char *s) { if (write(2, s, strlen(s)) < 0) { /* ignore */ } }
+
+static void put_long(long v)
+{
+  char b[24]; int i = (int)sizeof(b) - 1; b[i--] = 0;
+  int neg = v < 0;
+  unsigned long u = neg ? -(unsigned long)v : (unsigned long)v;
+  if (u == 0) b[i--] = '0';
+  while (u) { b[i--] = (char)('0' + u % 10); u /= 10; }
+  if (neg) b[i--] = '-';
+  put(b + i + 1);
+}
+
+static void put_hex(unsigned long v)
+{
+  char b[19]; int i = (int)sizeof(b) - 1; b[i--] = 0;
+  if (v == 0) b[i--] = '0';
+  while (v) { int d = (int)(v & 0xf); b[i--] = (char)(d < 10 ? '0' + d : 'a' + d - 10); v >>= 4; }
+  b[i--] = 'x'; b[i--] = '0';
+  put(b + i + 1);
+}
+
+/* Decode the accumulator without dereferencing it (the pointer may be wild):
+   an immediate prints its int value; a pointer prints its hex and -- when its
+   own 8 bytes are printable ASCII -- that text, which is the tell-tale sign of a
+   string's contents being read as a block pointer. */
+static void dump_accu(value v)
+{
+  if (v & 1) { put("int "); put_long((long)(((intnat)v) >> 1)); return; }
+  put("ptr "); put_hex((unsigned long)v);
+  unsigned char *b = (unsigned char *)&v;
+  int printable = 1;
+  for (int i = 0; i < 8; i++)
+    if (b[i] != 0 && (b[i] < 32 || b[i] > 126)) { printable = 0; break; }
+  if (printable) {
+    char a[9];
+    for (int i = 0; i < 8; i++) a[i] = b[i] ? (char)b[i] : '.';
+    a[8] = 0;
+    put(" ascii='"); put(a); put("'");
+  }
+}
+
+static void cppcaml_segv(int sig)
+{
+  put("\n=== CPPCAML field-read crash dump (most recent first) ===\n");
+  for (unsigned k = 0; k < 16 && k < cppcaml_pos; k++) {
+    struct cppcaml_entry *e =
+      &cppcaml_ring[(cppcaml_pos - 1 - k) & (CPPCAML_RING - 1)];
+    put("  getfield pc="); put_long(e->pc_off);
+    put(" fn@"); put_long(cppcaml_fn_entry(e->env));
+    put(" field="); put_long(e->field);
+    put(" accu="); dump_accu(e->accu); put("\n");
+  }
+  /* The recently-entered functions: the most recent apply is the call that
+     entered the crashing function; fn@ is its callee entry (Code_val).  fn@-1 =
+     a NON-closure was called; a clean chain ending at the crash function's entry
+     means the function was entered correctly (so the corruption is in its data,
+     not the call). */
+  put("--- recent applies (most recent first): call_site -> fn@entry (closure) ---\n");
+  for (unsigned k = 0; k < 16 && k < cppcaml_apos; k++) {
+    struct cppcaml_apply_entry *e =
+      &cppcaml_aring[(cppcaml_apos - 1 - k) & (CPPCAML_RING - 1)];
+    put("  apply call="); put_long(e->call_off);
+    put(" -> fn@"); put_long(e->code_off);
+    put(" nargs="); put_long(e->nargs);
+    put(" closure="); dump_accu(e->accu); put("\n");
+  }
+  /* A bytecode backtrace from the most recent read's stack pointer: stack slots
+     that point into the code segment are saved return addresses. */
+  if (cppcaml_pos > 0) {
+    struct cppcaml_entry *last =
+      &cppcaml_ring[(cppcaml_pos - 1) & (CPPCAML_RING - 1)];
+    caml_domain_state *d = Caml_state;
+    value *sp = last->sp;
+    if (sp && d && d->current_stack) {
+      value *hi = Stack_high(d->current_stack);
+      int n = 0;
+      put("--- bytecode backtrace (caller return pcs) ---\n");
+      for (value *s = sp; s < hi && n < 24; s++) {
+        value w = *s;
+        if (w >= (value)caml_start_code &&
+            w < (value)caml_start_code + caml_code_size && (w & 3) == 0) {
+          put("  retpc "); put_long((long)(((code_t)w) - caml_start_code)); put("\n");
+          n++;
+        }
+      }
+    }
+  }
+  put("=== map pc/retpc offsets to modules: c++link CPPCAML_LINKMAP=1 "
+      "(tools/cppcaml-resolve.sh) ===\n");
+  signal(sig, SIG_DFL);
+  raise(sig);
+}
+
+void caml_cppcaml_debug_init(void)
+{
+  if (cppcaml_installed) return;
+  cppcaml_installed = 1;
+  caml_cppcaml_fieldtrace = getenv("CPPCAML_FIELDTRACE") != NULL;
+  if (caml_cppcaml_fieldtrace) {
+    memset(cppcaml_ring, 0, sizeof cppcaml_ring);
+    memset(cppcaml_aring, 0, sizeof cppcaml_aring);
+    signal(SIGSEGV, cppcaml_segv);
+  }
+}

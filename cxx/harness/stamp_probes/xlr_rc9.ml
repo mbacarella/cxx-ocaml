@@ -1,0 +1,5 @@
+module type ORDERED = sig type t val leq: t -> t -> bool end module type HEAP =
+  sig module Elem: ORDERED type heap val empty: heap end module I = struct type
+  t = int let leq = (<=) end module F (X : ORDERED) = struct module rec P : sig
+  module Elem : sig type t type u end type heap end = struct module Elem =
+  struct type t = int type u = int end type heap = int end end

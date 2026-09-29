@@ -1,0 +1,3 @@
+(ocamllex lexer)
+(ocamlyacc parser)
+(executable (name calc) (modes byte))
