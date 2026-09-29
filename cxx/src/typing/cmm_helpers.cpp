@@ -2319,3 +2319,403 @@ std::vector<Phrase> emit_preallocated_blocks(const std::vector<clambda::Prealloc
 }
 
 }  // namespace cppcaml::typing::cmm_helpers
+
+// ---- The startup module ------------------------------------------------------------------------
+namespace cppcaml::typing::cmm_helpers {
+using namespace cmm;
+namespace {
+using DK = DataItem::K;
+constexpr MutableFlag Mut = MutableFlag::Mutable;
+std::string_view zcat(const std::string& s) { return zstr(s); }
+Phrase function_phrase(std::string_view name, std::vector<CatchParam> args, expression body,
+                       std::vector<CodegenOption> opts = {}) {
+  auto* fd = make<Fundecl>();
+  fd->fun_name = name;
+  fd->fun_args = slice(args);
+  fd->fun_body = body;
+  fd->fun_codegen_options = slice(opts);
+  fd->fun_poll = L::PollAttribute::Default_poll;
+  Phrase p;
+  p.fn = fd;
+  return p;
+}
+CatchParam param(Var v, Machtype ty) { return {vpc(v), ty}; }
+
+//   while (li < hi) { // no need to check the 1st time
+//     mi = ((li+hi) >> 1) | 1;
+//     if (tag < Field(meths,mi)) hi = mi-2;
+//     else li = mi;
+//   }
+//   *cache = (li-3)*sizeof(value)+1;
+//   return Field (meths, li-1);
+expression cache_public_method(expression meths, expression tag, expression cache, const Dbg& dbg) {
+  long raise_num = L::next_raise_count();
+  auto ci = [&](long i) { return cconst_int(i, dbg); };
+  Var li = Ident::create_local("*li*");
+  Var hi = Ident::create_local("*hi*");
+  Var mi = Ident::create_local("*mi*");
+  Var tagged = Ident::create_local("*tagged*");
+  expression loop_body = clet(
+      vpc(mi),
+      cop(O(OK::Cor), {cop(O(OK::Clsr), {cop(O(OK::Caddi), {cvar_mut(li), cvar_mut(hi)}, dbg), ci(1)}, dbg), ci(1)},
+          dbg),
+      csequence(cifthenelse(cop(ccmpi(IntegerComparison::Clt),
+                                {tag, cop(mk_load_mut_op(MC::Word_int),
+                                          {cop(O(OK::Cadda), {meths, lsl_const(cvar(mi), log2_size_addr, dbg)}, dbg)},
+                                          dbg)},
+                                dbg),
+                            dbg, cassign(hi, cop(O(OK::Csubi), {cvar(mi), ci(2)}, dbg)), dbg, cassign(li, cvar(mi)),
+                            dbg),
+                cifthenelse(cop(ccmpi(IntegerComparison::Cge), {cvar_mut(li), cvar_mut(hi)}, dbg), dbg,
+                            cexit(raise_num, {}), dbg, ctuple({}), dbg)));
+  expression search = ccatch(raise_num, {}, create_loop(loop_body, dbg), ctuple({}), dbg);
+  expression result = clet(
+      vpc(tagged),
+      cop(O(OK::Caddi), {lsl_const(cvar_mut(li), log2_size_addr, dbg), ci(1 - 3 * size_addr)}, dbg),
+      csequence(cop(cstore(MC::Word_int, L::InitializationOrAssignment::Assignment), {cache, cvar(tagged)}, dbg),
+                cvar(tagged)));
+  return clet_mut(vpc(li), typ_int(), ci(3),
+                  clet_mut(vpc(hi), typ_int(), cop(mk_load_mut_op(MC::Word_int), {meths}, dbg),
+                           csequence(search, result)));
+}
+
+// Generate an application function:
+//   (defun caml_applyN (a1 ... aN clos)
+//     (if (= clos.arity N)
+//       (app clos.direct a1 ... aN clos)
+//       (let (clos1 (app clos.code a1 clos)
+//             clos2 (app clos1.code a2 clos)
+//             ...
+//             closN-1 (app closN-2.code aN-1 closN-2))
+//         (app closN-1.code aN closN-1))))
+struct ApplyBody {
+  std::vector<Var> args;
+  Var clos;
+  expression body;
+};
+ApplyBody apply_function_body(long arity) {
+  Dbg dbg;
+  std::vector<Var> arg(static_cast<std::size_t>(arity), Ident::create_local("arg"));
+  for (long i = 1; i < arity; ++i) arg[static_cast<std::size_t>(i)] = Ident::create_local("arg");
+  Var clos = Ident::create_local("clos");
+  std::function<expression(Var, long)> app_fun = [&](Var clos, long n) -> expression {
+    expression call = cop(capply(typ_val()),
+                          {get_field_codepointer(Mut, cvar(clos), 0, dbg), cvar(arg[static_cast<std::size_t>(n)]),
+                           cvar(clos)},
+                          dbg);
+    if (n == arity - 1) return call;
+    Var newclos = Ident::create_local("clos");
+    expression rest = app_fun(newclos, n + 1);
+    return clet(vpc(newclos), call, rest);
+  };
+  if (arity == 1) return {arg, clos, app_fun(clos, 0)};
+  expression slow = app_fun(clos, 0);
+  std::vector<expression> direct{get_field_codepointer(Mut, cvar(clos), 2, dbg)};
+  for (Var a : arg) direct.push_back(cvar(a));
+  direct.push_back(cvar(clos));
+  expression body = cifthenelse(
+      cop(ccmpi(IntegerComparison::Ceq),
+          {cop(O(OK::Casr), {get_field_gen(Mut, cvar(clos), 1, dbg), cconst_int(pos_arity_in_closinfo, dbg)}, dbg),
+           cconst_int(arity, dbg)},
+          dbg),
+      dbg, cop(capply(typ_val()), slice(direct), dbg), dbg, slow, dbg);
+  return {arg, clos, body};
+}
+
+Phrase send_function(long arity) {
+  Dbg dbg;
+  auto ci = [&](long i) { return cconst_int(i, dbg); };
+  ApplyBody ab = apply_function_body(1 + arity);
+  Var cache = Ident::create_local("cache");
+  Var obj = ab.args.front();
+  Var tag = Ident::create_local("tag");
+  Var meths = Ident::create_local("meths");
+  Var cached = Ident::create_local("cached");
+  Var real = Ident::create_local("real");
+  expression mask = get_field_gen(Mut, cvar(meths), 1, dbg);
+  expression cached_pos = cvar(cached);
+  expression tag_pos =
+      cop(O(OK::Cadda), {cop(O(OK::Cadda), {cached_pos, cvar(meths)}, dbg), ci(3 * size_addr - 1)}, dbg);
+  expression tag_ = cop(mk_load_mut_op(MC::Word_int), {tag_pos}, dbg);
+  expression lookup = cache_public_method(cvar(meths), cvar(tag), cvar(cache), dbg);
+  expression clos = clet(
+      vpc(meths), cop(mk_load_mut_op(MC::Word_val), {cvar(obj)}, dbg),
+      clet(vpc(cached),
+           cop(O(OK::Cand), {cop(mk_load_mut_op(MC::Word_int), {cvar(cache)}, dbg), mask}, dbg),
+           clet(vpc(real),
+                cifthenelse(cop(ccmpa(IntegerComparison::Cne), {tag_, cvar(tag)}, dbg), dbg, lookup, dbg,
+                            cached_pos, dbg),
+                cop(mk_load_mut_op(MC::Word_val),
+                    {cop(O(OK::Cadda), {cop(O(OK::Cadda), {cvar(real), cvar(meths)}, dbg), ci(2 * size_addr - 1)},
+                         dbg)},
+                    dbg))));
+  expression body = clet(vpc(ab.clos), clos, ab.body);
+  std::vector<CatchParam> args{param(obj, typ_val()), param(tag, typ_int()), param(cache, typ_addr())};
+  for (std::size_t i = 1; i < ab.args.size(); ++i) args.push_back(param(ab.args[i], typ_val()));
+  return function_phrase(zcat("caml_send" + std::to_string(arity)), std::move(args), body);
+}
+
+Phrase apply_function(long arity) {
+  ApplyBody ab = apply_function_body(arity);
+  std::vector<CatchParam> args;
+  for (Var a : ab.args) args.push_back(param(a, typ_val()));
+  args.push_back(param(ab.clos, typ_val()));
+  return function_phrase(zcat("caml_apply" + std::to_string(arity)), std::move(args), ab.body);
+}
+
+// Generate tuplifying functions:
+//    (defun caml_tuplifyN (arg clos)
+//      (app clos.direct #0(arg) ... #N-1(arg) clos))
+Phrase tuplify_function(long arity) {
+  Dbg dbg;
+  Var arg = Ident::create_local("arg");
+  Var clos = Ident::create_local("clos");
+  std::vector<expression> a{get_field_codepointer(Mut, cvar(clos), 2, dbg)};
+  for (long i = 0; i < arity; ++i) a.push_back(get_field_gen(Mut, cvar(arg), i, dbg));
+  a.push_back(cvar(clos));
+  return function_phrase(zcat("caml_tuplify" + std::to_string(arity)),
+                         {param(arg, typ_val()), param(clos, typ_val())}, cop(capply(typ_val()), slice(a), dbg));
+}
+
+// Generate currying functions (see cmm_helpers.ml); the "_app" shortcuts
+// only below max_arity_optimized (PR#5933)
+constexpr long max_arity_optimized = 15;
+Phrase final_curry_function(long arity) {
+  Dbg dbg;
+  Var last_arg = Ident::create_local("arg");
+  Var last_clos = Ident::create_local("clos");
+  std::function<expression(std::vector<expression>, Var, long)> curry_fun =
+      [&](std::vector<expression> args, Var clos, long n) -> expression {
+    if (n == 0) {
+      std::vector<expression> a{get_field_codepointer(Mut, cvar(clos), 2, dbg)};
+      a.insert(a.end(), args.begin(), args.end());
+      a.push_back(cvar(last_arg));
+      a.push_back(cvar(clos));
+      return cop(capply(typ_val()), slice(a), dbg);
+    }
+    bool last = n == arity - 1 || arity > max_arity_optimized;
+    Var newclos = Ident::create_local("clos");
+    args.insert(args.begin(), get_field_gen(Mut, cvar(clos), last ? 2 : 3, dbg));
+    expression rest = curry_fun(std::move(args), newclos, n - 1);
+    return clet(vpc(newclos), get_field_gen(Mut, cvar(clos), last ? 3 : 4, dbg), rest);
+  };
+  return function_phrase(zcat("caml_curry" + std::to_string(arity) + "_" + std::to_string(arity - 1)),
+                         {param(last_arg, typ_val()), param(last_clos, typ_val())},
+                         curry_fun({}, last_clos, arity - 1));
+}
+
+void intermediate_curry_functions(long arity, long num, std::vector<Phrase>& out) {
+  Dbg dbg;
+  if (num == arity - 1) {
+    out.push_back(final_curry_function(arity));
+    return;
+  }
+  std::string name1 = "caml_curry" + std::to_string(arity);
+  std::string name2 = num == 0 ? name1 : name1 + "_" + std::to_string(num);
+  Var arg = Ident::create_local("arg");
+  Var clos = Ident::create_local("clos");
+  std::string next = name1 + "_" + std::to_string(num + 1);
+  expression body;
+  if (arity - num > 2 && arity <= max_arity_optimized)
+    body = cop(O(OK::Calloc),
+               {alloc_closure_header(5, dbg), cconst_symbol(zcat(next), dbg),
+                alloc_closure_info(arity - num - 1, 3, dbg), cconst_symbol(zcat(next + "_app"), dbg), cvar(arg),
+                cvar(clos)},
+               dbg);
+  else
+    body = cop(O(OK::Calloc),
+               {alloc_closure_header(4, dbg), cconst_symbol(zcat(next), dbg), alloc_closure_info(1, 2, dbg),
+                cvar(arg), cvar(clos)},
+               dbg);
+  out.push_back(function_phrase(zcat(name2), {param(arg, typ_val()), param(clos, typ_val())}, body));
+  if (arity <= max_arity_optimized && arity - num > 2) {
+    std::vector<Var> direct_args;
+    for (long i = num + 2; i <= arity; ++i) direct_args.push_back(Ident::create_local(zcat("arg" + std::to_string(i))));
+    std::function<expression(long, std::vector<expression>, Var)> iter = [&](long i, std::vector<expression> args,
+                                                                            Var clos) -> expression {
+      if (i == 0) {
+        std::vector<expression> a{get_field_codepointer(Mut, cvar(clos), 2, dbg)};
+        a.insert(a.end(), args.begin(), args.end());
+        a.push_back(cvar(clos));
+        return cop(capply(typ_val()), slice(a), dbg);
+      }
+      Var newclos = Ident::create_local("clos");
+      args.insert(args.begin(), get_field_gen(Mut, cvar(clos), 3, dbg));
+      expression rest = iter(i - 1, std::move(args), newclos);
+      return clet(vpc(newclos), get_field_gen(Mut, cvar(clos), 4, dbg), rest);
+    };
+    std::vector<CatchParam> fun_args;
+    std::vector<expression> dargs;
+    for (Var a : direct_args) {
+      fun_args.push_back(param(a, typ_val()));
+      dargs.push_back(cvar(a));
+    }
+    fun_args.push_back(param(clos, typ_val()));
+    expression b = iter(num + 1, dargs, clos);
+    out.push_back(function_phrase(zcat(next + "_app"), std::move(fun_args), b));
+  }
+  intermediate_curry_functions(arity, num + 1, out);
+}
+
+std::vector<Phrase> curry_function(long arity) {
+  if (arity == 0) fatal("Cmm_helpers.curry_function");
+  std::vector<Phrase> r;
+  if (arity > 0) intermediate_curry_functions(arity, 0, r);
+  else r.push_back(tuplify_function(-arity));
+  return r;
+}
+
+std::vector<DataItem> symbols_table(std::string_view symbol, const std::vector<std::string_view>& namelist,
+                                    const char* id) {
+  std::vector<DataItem> r{data_sym(DK::Cglobal_symbol, symbol), data_sym(DK::Cdefine_symbol, symbol)};
+  for (std::string_view name : namelist) r.push_back(data_sym(DK::Csymbol_address, compilenv::make_symbol_in(name, id)));
+  r.push_back(data_int(DK::Cint, 0));
+  return r;
+}
+
+Phrase segment_table(const std::vector<std::string_view>& namelist, std::string_view symbol, const char* begname,
+                     const char* endname) {
+  Phrase p;
+  p.data = {data_sym(DK::Cglobal_symbol, symbol), data_sym(DK::Cdefine_symbol, symbol)};
+  for (std::string_view name : namelist) {
+    p.data.push_back(data_sym(DK::Csymbol_address, compilenv::make_symbol_in(name, begname)));
+    p.data.push_back(data_sym(DK::Csymbol_address, compilenv::make_symbol_in(name, endname)));
+  }
+  p.data.push_back(data_int(DK::Cint, 0));
+  return p;
+}
+}  // namespace
+
+const std::vector<std::string_view> builtin_exceptions = {
+    "Out_of_memory",  "Sys_error",      "Failure",        "Invalid_argument", "End_of_file",
+    "Division_by_zero", "Not_found",    "Match_failure",  "Stack_overflow",   "Sys_blocked_io",
+    "Assert_failure", "Undefined_recursive_module", "Todo"};
+
+// These apply funs are always present in the main program because the
+// run-time system needs them (cf. runtime/<arch>.S)
+std::vector<Phrase> generic_functions(bool shared, const std::vector<const cmx_format::UnitInfos*>& units) {
+  std::set<long> apply, send, curry;
+  for (const cmx_format::UnitInfos* ui : units) {
+    apply.insert(ui->ui_apply_fun.begin(), ui->ui_apply_fun.end());
+    send.insert(ui->ui_send_fun.begin(), ui->ui_send_fun.end());
+    curry.insert(ui->ui_curry_fun.begin(), ui->ui_curry_fun.end());
+  }
+  if (!shared) apply.insert({2, 3});
+  // Int.Set.fold, each consed on the accumulator
+  std::vector<Phrase> accu;
+  for (long n : apply) accu.insert(accu.begin(), apply_function(n));
+  for (long n : send) accu.insert(accu.begin(), send_function(n));
+  for (long n : curry) {
+    std::vector<Phrase> c = curry_function(n);
+    accu.insert(accu.begin(), c.begin(), c.end());
+  }
+  return accu;
+}
+
+// Generate the entry point:
+//   CAMLprim value caml_program()
+//   {
+//     int id = 0;
+//     while (true) {
+//       if (id == len_caml_globals_entry_functions) goto out;
+//       caml_globals_entry_functions[id]();
+//       caml_globals_inited += 1;
+//       id += 1;
+//     }
+//     out:
+//     return 1;
+//   }
+std::vector<Phrase> entry_point(const std::vector<std::string_view>& namelist) {
+  Dbg dbg;
+  auto ci = [&](long i) { return cconst_int(i, dbg); };
+  auto incr_global_inited = [&] {
+    return cop(cstore(MC::Word_int, L::InitializationOrAssignment::Assignment),
+               {cconst_symbol("caml_globals_inited", dbg),
+                cop(O(OK::Caddi),
+                    {cop(mk_load_mut_op(MC::Word_int), {cconst_symbol("caml_globals_inited", dbg)}, dbg), ci(1)},
+                    dbg)},
+               dbg);
+  };
+  std::string_view table_symbol = compilenv::make_symbol(std::string_view("caml_globals_entry_functions"));
+  auto call = [&](expression i) {
+    // address of caml_globals_entry_functions[i]
+    expression entry_slot = cop(O(OK::Cadda),
+                                {cconst_symbol(table_symbol, dbg),
+                                 cop(O(OK::Clsl), {i, ci(log2(size_addr))}, dbg)},
+                                dbg);
+    return csequence(cop(capply(typ_void()), {cop(mk_load_immut(MC::Word_int), {entry_slot}, dbg)}, dbg),
+                     incr_global_inited());
+  };
+  Phrase data;
+  data.data.push_back(data_sym(DK::Cdefine_symbol, table_symbol));
+  for (std::string_view name : namelist)
+    data.data.push_back(data_sym(DK::Csymbol_address, compilenv::make_symbol_in(name, "entry")));
+  long raise_num = L::next_raise_count();
+  Var id = Ident::create_local("*id*");
+  expression var_id = cvar(id);
+  expression high = ci(static_cast<long>(namelist.size()));
+  expression next_iteration = cexit(raise_num, slice(std::vector<expression>{cop(O(OK::Caddi), {var_id, ci(1)}, dbg)}));
+  Handler h{raise_num, slice(std::vector<CatchParam>{param(id, typ_int())}),
+            cifthenelse(cop(ccmpi(IntegerComparison::Ceq), {var_id, high}, dbg), dbg, ctuple({}), dbg,
+                        csequence(call(var_id), next_iteration), dbg),
+            dbg};
+  expression body = ccatch_node(cmm::RecFlag::Recursive, slice(std::vector<Handler>{h}),
+                                cexit(raise_num, slice(std::vector<expression>{ci(0)})));
+  std::vector<Phrase> r{std::move(data)};
+  r.push_back(function_phrase("caml_program", {}, csequence(body, ci(1)), {CodegenOption::Reduce_code_size}));
+  return r;
+}
+
+// Generate the table of globals
+Phrase global_table(const std::vector<std::string_view>& namelist) {
+  Phrase p;
+  p.data = symbols_table("caml_globals", namelist, "gc_roots");
+  return p;
+}
+
+Phrase reference_symbols(const std::vector<std::string_view>& namelist) {
+  Phrase p;
+  for (std::string_view name : namelist) p.data.push_back(data_sym(DK::Csymbol_address, name));
+  return p;
+}
+
+Phrase global_data(std::string_view name, std::string_view marshaled) {
+  Phrase p;
+  p.data = emit_string_constant({name, cmmgen_state::IsGlobal::Global}, marshaled, {});
+  return p;
+}
+
+// Generate the master table of frame descriptors
+Phrase frame_table(const std::vector<std::string_view>& namelist) {
+  Phrase p;
+  p.data = symbols_table("caml_frametable", namelist, "frametable");
+  return p;
+}
+
+// Generate the table of module data and code segments
+Phrase data_segment_table(const std::vector<std::string_view>& namelist) {
+  return segment_table(namelist, "caml_data_segments", "data_begin", "data_end");
+}
+Phrase code_segment_table(const std::vector<std::string_view>& namelist) {
+  return segment_table(namelist, "caml_code_segments", "code_begin", "code_end");
+}
+
+// Initialize a predefined exception
+Phrase predef_exception(long i, std::string_view name) {
+  std::string_view name_sym = compilenv::new_const_symbol();
+  std::vector<DataItem> fields{data_sym(DK::Csymbol_address, name_sym), cint_const(-i - 1)};
+  std::vector<DataItem> data_items = emit_string_constant({name_sym, cmmgen_state::IsGlobal::Local}, name, {});
+  fields.insert(fields.end(), data_items.begin(), data_items.end());
+  Phrase p;
+  p.data = emit_block({zcat("caml_exn_" + std::string(name)), cmmgen_state::IsGlobal::Global},
+                      block_header(object_tag, 2), fields);
+  return p;
+}
+
+Phrase emit_global_string_constant(std::string_view name, std::string_view value) {
+  Phrase p;
+  p.data = emit_string_constant({name, cmmgen_state::IsGlobal::Global}, value, {});
+  return p;
+}
+
+}  // namespace cppcaml::typing::cmm_helpers

@@ -16,6 +16,7 @@
 namespace cppcaml::typing::cmx_format {
 
 inline constexpr const char* cmx_magic_number = "Caml1999Y038";
+inline constexpr const char* cmxa_magic_number = "Caml1999Z038";
 
 using Crcs = std::vector<std::pair<std::string_view, std::optional<std::string>>>;
 
@@ -47,5 +48,17 @@ std::pair<UnitInfos*, std::string> read_unit_info(const std::string& filename);
 // Compilenv.write_unit_info: the .cmx file's bytes (magic, the marshaled
 // unit infos, their BLAKE128 digest)
 std::string write_unit_info(const UnitInfos& ui);
+
+struct LibraryInfos {
+  std::vector<std::pair<UnitInfos*, std::string>> lib_units;  // unit infos w/ CRCs
+  // reversed with respect to how they end up being used on the command line
+  std::vector<std::string> lib_ccobjs;  // C object files needed
+  std::vector<std::string> lib_ccopts;  // extra opts to C compiler
+};
+// Compilenv.read_library_info filename (raises Error)
+LibraryInfos read_library_info(const std::string& filename);
+// Asmlibrarian's .cmxa: cmxa_magic_number, output_value of the infos, each
+// unit's export info the one static `Clambda Value_unknown` block
+std::string write_library_info(const LibraryInfos& l);
 
 }  // namespace cppcaml::typing::cmx_format

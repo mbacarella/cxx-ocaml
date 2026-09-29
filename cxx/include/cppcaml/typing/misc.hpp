@@ -110,6 +110,7 @@ struct RuntimeID {
   // make_zinc () / make_bytecode (), with the Config / Sys defaults
   static RuntimeID make_zinc();
   static RuntimeID make_bytecode();
+  static RuntimeID make_native();
   bool is_zinc() const;
   bool is_bytecode() const;
   std::string to_string() const;
@@ -119,6 +120,8 @@ struct RuntimeID {
 };
 // RuntimeID.shared_runtime Sys.Bytecode (~prefix:"-l", ~host:Config.target)
 std::string shared_runtime_bytecode();
+// RuntimeID.shared_runtime Sys.Native
+std::string shared_runtime_native();
 // RuntimeID.stubslib name (~runtime_id:(make_bytecode ()), ~host:Config.target)
 std::string stubslib(const std::string& name);
 

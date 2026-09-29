@@ -11,6 +11,7 @@
 
 #include "cppcaml/typing/clambda.hpp"
 #include "cppcaml/typing/cmx_format.hpp"
+#include "cppcaml/typing/format_doc.hpp"
 
 namespace cppcaml::typing::compilenv {
 
@@ -23,6 +24,7 @@ struct Error : std::runtime_error {
 };
 // report_error (the plain text of report_error_doc)
 std::string error_message(const Error& e);
+void report_error_doc(format_doc::Formatter& ppf, const Error& e);
 
 cmx_format::UnitInfos& current_unit();
 void reset(const std::optional<std::string>& packname, std::string_view name);

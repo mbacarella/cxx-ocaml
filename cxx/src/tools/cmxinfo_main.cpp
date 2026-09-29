@@ -18,6 +18,16 @@ void print_name_crc(const std::pair<std::string_view, std::optional<std::string>
 }  // namespace
 
 int main(int argc, char** argv) {
+  // --roundtrip in.cmxa out.cmxa: read a library and write it again (the
+  // oracle for the .cmxa writer: the bytes are ocamlopt -a's)
+  if (argc == 4 && std::string(argv[1]) == "--roundtrip") {
+    std::string bytes = cmx_format::write_library_info(cmx_format::read_library_info(argv[2]));
+    std::FILE* fp = std::fopen(argv[3], "wb");
+    if (!fp) return 2;
+    std::fwrite(bytes.data(), 1, bytes.size(), fp);
+    std::fclose(fp);
+    return 0;
+  }
   for (int i = 1; i < argc; ++i) {
     std::printf("File %s\n", argv[i]);
     try {

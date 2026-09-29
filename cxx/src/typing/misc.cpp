@@ -285,6 +285,8 @@ RuntimeID RuntimeID::make_bytecode() {
   return t;
 }
 
+RuntimeID RuntimeID::make_native() { return make_default(); }
+
 bool RuntimeID::is_zinc() const { return reserved == 0 && !fp && !tsan && !ansi; }
 bool RuntimeID::is_bytecode() const { return !fp && !tsan; }
 
@@ -329,6 +331,10 @@ std::string RuntimeID::ocamlrun(const std::string& variant) const {
 
 std::string shared_runtime_bytecode() {
   return "-lcamlrun-" + config::target + "-" + RuntimeID::make_bytecode().to_string();
+}
+
+std::string shared_runtime_native() {
+  return "-lasmrun-" + config::target + "-" + RuntimeID::make_native().to_string();
 }
 
 std::string stubslib(const std::string& name) {

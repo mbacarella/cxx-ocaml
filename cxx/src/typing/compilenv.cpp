@@ -9,6 +9,7 @@
 #include "cppcaml/typing/clflags.hpp"
 #include "cppcaml/typing/env.hpp"
 #include "cppcaml/typing/location.hpp"
+#include "cppcaml/typing/misc.hpp"
 #include "cppcaml/typing/persistent_env.hpp"
 #include "cppcaml/typing/warnings.hpp"
 
@@ -287,6 +288,30 @@ std::string error_message(const Error& e) {
              e.current_unit + "\" is built with \"-for-pack " + *e.pack_2 + "\"";
   }
   return {};
+}
+
+void report_error_doc(format_doc::Formatter& ppf, const Error& e) {
+  namespace fd = format_doc;
+  auto qf = [](const std::string& f) { return [f](fd::Formatter& ff) { location::doc::quoted_filename(ff, f); }; };
+  using misc::style::code_str;
+  switch (e.kind) {
+    case Error::Kind::Not_a_unit_info: fd::fprintf(ppf, "%a@ is not a compilation unit description.", qf(e.filename)); break;
+    case Error::Kind::Corrupted_unit_info:
+      fd::fprintf(ppf, "Corrupted compilation unit description@ %a", qf(e.filename));
+      break;
+    case Error::Kind::Illegal_renaming:
+      fd::fprintf(ppf, "%a@ contains the description for unit@ %a when %a was expected", qf(e.filename),
+                  code_str(e.name), code_str(e.modname));
+      break;
+    case Error::Kind::Mismatching_for_pack:
+      if (!e.pack_2)
+        fd::fprintf(ppf, "%a@ was built with %a, but the @ current unit %a is not", qf(e.filename),
+                    code_str("-for-pack " + e.pack_1), code_str(e.current_unit));
+      else
+        fd::fprintf(ppf, "%a@ was built with %a, but the @ current unit %a is built with %a", qf(e.filename),
+                    code_str("-for-pack " + e.pack_1), code_str(e.current_unit), code_str("-for-pack " + *e.pack_2));
+      break;
+  }
 }
 
 }  // namespace cppcaml::typing::compilenv

@@ -199,8 +199,26 @@ are singletons, constants and primitives carry identity tokens, and
 debuginfo lists keep their shared tails.  `c++ocamlopt -c` now writes the
 `.s`, `.o` and `.cmx`.
 
-Next: Asmlibrarian (.cmxa), Asmpackager and Asmlink (the startup module,
-caml_curry/apply/send, the C linker).
+Asmgen (`asmgen.cpp`: compile_phrases, compile_unit and the assembler
+command), Asmlink (`asmlink.cpp`: the startup module -- Cmm_helpers'
+generic functions, `caml_program`, the global, frame and segment tables,
+the marshaled `caml_globals_map` -- and the C link) and Asmlibrarian
+(`asmlibrarian.cpp`, the .cmxa reader/writer in `cmi_format.cpp`) are
+ported.  `native_link_parity.sh` compares the kept startup assembly
+(`-dstartup`), a `-d` dump of the link and the executable's bytes:
+6531/6531 linkable probes (`-dcmm`), and with `MODE=onestep` (compile and
+link in one run) 6529 + the 2 known .cmi gaps (`-dlinear`, and `-g`),
+696/697 testsuite files (`privrowsabate_ok`, above).
+`native_link_scenarios.sh`: libraries (`-a`, `-linkall`, C options),
+`-output-obj`, `-output-complete-obj`, `-verbose` and the link errors --
+15/15 identical.  `c++ocamlopt -a` rebuilds the tree's stdlib.cmxa and
+stdlib.a identically, and `c++cmxinfo --roundtrip` reads and rewrites
+the tree's 11 .cmxa files identically.  A link-only run first creates the
+idents ocamlopt's modules create while they initialize (their stamps
+reach `-dcmm`).
+
+Next: `-shared` (.cmxs: Asmlink.link_shared and the plugin header) and
+Asmpackager (`-pack`).
 
 ## Oracles and gates
 

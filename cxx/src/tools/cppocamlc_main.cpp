@@ -47,6 +47,10 @@
 #include "cppcaml/typing/mach_passes.hpp"
 #include "cppcaml/typing/linear.hpp"
 #include "cppcaml/typing/emit.hpp"
+#include "cppcaml/typing/asmgen.hpp"
+#include "cppcaml/typing/asmlibrarian.hpp"
+#include "cppcaml/typing/asmlink.hpp"
+#include "cppcaml/typing/cmm_helpers.hpp"
 #include "cppcaml/typing/translmod.hpp"
 #include "cppcaml/typing/compilenv.hpp"
 #include "cppcaml/typing/misc.hpp"
@@ -740,80 +744,24 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
         ty::format::Formatter dump;
         ty::closure_middle_end::WithConstants clambda = ty::closure_middle_end::lambda_to_clambda(dump, prog, lam);
         lap("clambda", tp);
-        // end_gen_implementation: Cmmgen.compunit, compile_phrases (the
-        // -dcmm dump of each phrase), then the references to the external
-        // primitives' symbols
-        // Asmgen.should_emit: not stopping after scheduling
-        bool should_emit = !cf::should_stop_after(cf::Pass::Scheduling);
-        if (should_emit) ty::emit::begin_assembly();
-        std::vector<ty::cmm::Phrase> phrases = ty::cmmgen::compunit(clambda);
-        ty::cmm::Phrase refs;
-        for (const ty::PrimitiveDescription* p : ty::translmod::primitive_declarations) {
-          std::string_view name = p->prim_native_name.empty() ? p->prim_name : p->prim_native_name;
-          if (!name.empty() && name[0] != '%')
-            refs.data.push_back(ty::cmm::data_sym(ty::cmm::DataItem::K::Csymbol_address, name));
-        }
-        // compile_phrases: each function selected (Proc.init, Reg.reset,
-        // Selection.fundecl ~future_funcnames, Polling), -dsel
-        auto compile_phrases = [&](const std::vector<ty::cmm::Phrase>& ps) {
-          ty::selection::FuncNames funcnames;
-          for (const ty::cmm::Phrase& p : ps)
-            if (p.fn) funcnames.insert(p.fn->fun_name);
-          for (const ty::cmm::Phrase& p : ps) {
-            if (cf::dump_cmm) ty::format::fprintf(dump, "%a@.", ty::format::pr(ty::printcmm::phrase, p));
-            if (!p.fn) {
-              if (should_emit) ty::emit::data(p.data);
-              continue;
-            }
-            ty::proc::init();
-            ty::reg::reset();
-            ty::mach::Fundecl fd = ty::polling::instrument_fundecl(ty::selection::fundecl(funcnames, *p.fn));
-            if (cf::dump_selection) ty::printmach::phase(dump, "After instruction selection", fd);
-            namespace mp = ty::mach_passes;
-            fd = mp::comballoc(fd);
-            if (cf::dump_combine) ty::printmach::phase(dump, "After allocation combining", fd);
-            fd = mp::cse(fd);
-            if (cf::dump_cse) ty::printmach::phase(dump, "After CSE", fd);
-            mp::liveness(fd);
-            fd = mp::deadcode(fd);
-            if (cf::dump_live) ty::printmach::phase(dump, "Liveness analysis", fd);
-            fd = mp::spill(fd);
-            mp::liveness(fd);
-            if (cf::dump_spill) ty::printmach::phase(dump, "After spilling", fd);
-            fd = mp::split(fd);
-            if (cf::dump_split) ty::printmach::phase(dump, "After live range splitting", fd);
-            mp::liveness(fd);
-            // regalloc (graph coloring)
-            for (long round = 1;; ++round) {
-              if (round > 50) throw std::runtime_error(std::string(fd.fun_name) +
-                                                       ": function too complex, cannot complete register allocation");
-              if (cf::dump_live) ty::printmach::phase(dump, "Liveness analysis", fd);
-              mp::interf_build_graph(fd);
-              if (cf::dump_interf) ty::printmach::interferences(dump);
-              if (cf::dump_prefer) ty::printmach::preferences(dump);
-              std::vector<long> num_stack_slots = mp::coloring_allocate_registers();
-              if (cf::dump_regalloc) ty::printmach::phase(dump, "After register allocation", fd);
-              auto [newfd, redo_regalloc] = mp::reload(fd, num_stack_slots);
-              if (cf::dump_reload) ty::printmach::phase(dump, "After insertion of reloading code", newfd);
-              fd = newfd;
-              if (!redo_regalloc) break;
-              ty::reg::reinit();
-              mp::liveness(fd);
-            }
-            ty::linear::Fundecl lf = ty::linear::linearize(fd);
-            if (cf::dump_linear)
-              ty::format::fprintf(dump, "*** %s@.%a@.", "Linearized code", ty::format::pr(ty::linear::print_fundecl, lf));
-            // Scheduling (amd64): the identity
-            if (cf::dump_scheduling)
-              ty::format::fprintf(dump, "*** %s@.%a@.", "After instruction scheduling",
-                                  ty::format::pr(ty::linear::print_fundecl, lf));
-            if (should_emit) ty::emit::fundecl(lf);
-            funcnames.erase(p.fn->fun_name);
-          }
-        };
+        // Asmgen.compile_unit: end_gen_implementation (Cmmgen.compunit,
+        // compile_phrases with the -d dumps, then the references to the
+        // external primitives' symbols) into the assembly file (kept with
+        // -S, else a temporary file), assembled into the object file
+        std::string prefix = remove_extension(cmo_out);
         try {
-          compile_phrases(phrases);
-          compile_phrases({std::move(refs)});
+          ty::asmgen::compile_unit(ty::asmgen::asm_filename(prefix), cf::keep_asm_file, prefix + ".o", [&] {
+            if (ty::asmgen::should_emit()) ty::emit::begin_assembly();
+            std::vector<ty::cmm::Phrase> phrases = ty::cmmgen::compunit(clambda);
+            ty::asmgen::compile_phrases(dump, phrases);
+            std::vector<std::string_view> prims;
+            for (const ty::PrimitiveDescription* p : ty::translmod::primitive_declarations) {
+              std::string_view name = p->prim_native_name.empty() ? p->prim_name : p->prim_native_name;
+              if (!name.empty() && name[0] != '%') prims.push_back(name);
+            }
+            ty::asmgen::compile_phrase(dump, ty::cmm_helpers::reference_symbols(prims));
+            return ty::asmgen::should_emit() ? ty::emit::end_assembly() : std::string();
+          });
         } catch (const ty::polling::PollError& e) {
           // Location.error_of_printer_file Polling.report_error
           ppf_dump.out() << dump.contents();
@@ -824,36 +772,15 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
           ty::location::err_flush();
           std::remove(cmo_out.c_str());
           return 2;
+        } catch (const ty::asmgen::Error& e) {
+          ppf_dump.out() << dump.contents();
+          ppf_dump.out().flush();
+          std::cerr << "Error: Assembler error, input left in file " << e.file << "\n";
+          return 2;
         }
         ppf_dump.out() << dump.contents();
         ppf_dump.out().flush();
         lap("emit", tp);
-        if (should_emit) {
-          // compile_unit: the assembly file (kept with -S, else a temporary
-          // file), assembled into the object file
-          std::string prefix = remove_extension(cmo_out);
-          std::string asm_text = ty::emit::end_assembly();
-          std::string asm_filename = prefix + ".s";
-          if (!cf::keep_asm_file) {
-            char tmpl[] = "/tmp/camlasmXXXXXX.s";
-            int fd = mkstemps(tmpl, 2);
-            if (fd < 0) throw std::runtime_error("cannot create a temporary assembly file");
-            close(fd);
-            asm_filename = tmpl;
-          }
-          {
-            std::ofstream os(asm_filename, std::ios::binary);
-            os << asm_text;
-          }
-          std::string cmd = "as -o " + filename_quote(prefix + ".o") + " " + filename_quote(asm_filename);
-          int rc = std::system(cmd.c_str());
-          if (!cf::keep_asm_file) std::remove(asm_filename.c_str());
-          if (rc != 0) {
-            std::remove((prefix + ".o").c_str());
-            std::cerr << "Error: Assembler error, input left in file " << asm_filename << "\n";
-            return 2;
-          }
-        }
         // Compilenv.save_unit_info (the .cmx)
         {
           ty::cmx_format::UnitInfos& cu = ty::compilenv::current_unit();
@@ -1190,9 +1117,33 @@ static int run_main(int argc, char** argv) {
         ce::fatal("Options -i and -stop-after (parsing|typing|lambda|scheduling|emit) are  incompatible with -pack, "
                   "-a, -shared, -output-obj");
       }
-      if (cf::make_archive || cf::make_package || cf::shared ||
-          (!ce::stop_early && (!cf::objfiles.empty() || ce::has_linker_inputs)))
-        ce::fatal(CPPCAML_SELF ": the native linker, librarian and packager are not supported yet");
+      if (cf::make_archive) {
+        init_path();
+        std::string target = ce::extract_output(cf::output_name);
+        ty::asmlibrarian::create_archive(ce::get_objfiles(false), target);
+        ty::warnings::check_fatal();
+      } else if (cf::make_package || cf::shared) {
+        ce::fatal(CPPCAML_SELF ": the native packager and -shared are not supported yet");
+      } else if (!ce::stop_early && (!cf::objfiles.empty() || ce::has_linker_inputs)) {
+        std::string target;
+        if (cf::output_c_object) {
+          std::string s = ce::extract_output(cf::output_name);
+          if (!(ends_with(s, ty::config::ext_obj) || ends_with(s, ty::config::ext_dll)))
+            ce::fatal(std::string("The extension of the output file must be ") + ty::config::ext_obj + " or " +
+                      ty::config::ext_dll);
+          target = s;
+        } else {
+          target = ce::default_output(cf::output_name);
+        }
+        init_path();
+        // (the compiler's modules initialized: their idents' stamps)
+        install_typing();
+        PpfDump d;
+        open_ppf_dump(d, target);
+        std::vector<std::string> objs = ce::get_objfiles(true);
+        ty::asmlink::link(d.out(), objs, target);
+        ty::warnings::check_fatal();
+      }
       profile_dump();
       return 0;
     }

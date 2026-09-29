@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "cppcaml/typing/cmm.hpp"
+#include "cppcaml/typing/cmx_format.hpp"
 
 namespace cppcaml::typing::cmmgen_state {
 
@@ -201,6 +202,23 @@ std::vector<cmm::DataItem> emit_constant_closure(const Symb& symb, Slice<const c
 // emit_preallocated_blocks blocks cont: the phrases prepended to cont
 std::vector<cmm::Phrase> emit_preallocated_blocks(const std::vector<clambda::PreallocatedBlock>& blocks,
                                                   std::vector<cmm::Phrase> cont);
+
+// ---- The startup module (Asmlink) ----------------------------------------
+// Runtimedef.builtin_exceptions
+extern const std::vector<std::string_view> builtin_exceptions;
+// generic_functions shared units: caml_applyN, caml_sendN, caml_curryN...
+std::vector<cmm::Phrase> generic_functions(bool shared, const std::vector<const cmx_format::UnitInfos*>& units);
+// entry_point namelist: the table of entry functions and caml_program
+std::vector<cmm::Phrase> entry_point(const std::vector<std::string_view>& namelist);
+cmm::Phrase global_table(const std::vector<std::string_view>& namelist);
+cmm::Phrase reference_symbols(const std::vector<std::string_view>& namelist);
+// global_data name v, v already marshaled (Marshal.to_string v [])
+cmm::Phrase global_data(std::string_view name, std::string_view marshaled);
+cmm::Phrase frame_table(const std::vector<std::string_view>& namelist);
+cmm::Phrase data_segment_table(const std::vector<std::string_view>& namelist);
+cmm::Phrase code_segment_table(const std::vector<std::string_view>& namelist);
+cmm::Phrase predef_exception(long i, std::string_view name);
+cmm::Phrase emit_global_string_constant(std::string_view name, std::string_view value);
 
 // Misc's overflow checks on OCaml's 63-bit ints
 bool no_overflow_add(long a, long b);

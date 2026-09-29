@@ -1605,15 +1605,47 @@ class CmxReader : public Reader {
 
 namespace cppcaml::typing::cmx_format {
 
-std::pair<UnitInfos*, std::string> read_unit_info(const std::string& filename) {
+namespace {
+std::vector<std::uint8_t> read_bytes(const std::string& filename) {
   std::vector<std::uint8_t> bytes;
-  {
-    std::FILE* fp = std::fopen(filename.c_str(), "rb");
-    if (!fp) throw std::runtime_error("Cannot open " + filename);
-    std::uint8_t chunk[65536];
-    for (std::size_t k; (k = std::fread(chunk, 1, sizeof chunk, fp)) > 0;) bytes.insert(bytes.end(), chunk, chunk + k);
-    std::fclose(fp);
+  std::FILE* fp = std::fopen(filename.c_str(), "rb");
+  if (!fp) throw std::runtime_error(filename + ": No such file or directory");
+  std::uint8_t chunk[65536];
+  for (std::size_t k; (k = std::fread(chunk, 1, sizeof chunk, fp)) > 0;) bytes.insert(bytes.end(), chunk, chunk + k);
+  std::fclose(fp);
+  return bytes;
+}
+}  // namespace
+
+LibraryInfos read_library_info(const std::string& filename) {
+  std::vector<std::uint8_t> bytes = read_bytes(filename);
+  const std::string magic = cmxa_magic_number;
+  if (bytes.size() < magic.size() || std::string(bytes.begin(), bytes.begin() + magic.size()) != magic)
+    throw Error(Error::Kind::Not_a_unit_info, filename);
+  try {
+    cmi_marshal::Graph graph;
+    std::size_t off = magic.size();
+    std::size_t root = cmi_marshal::read_value(bytes.data(), bytes.size(), off, graph);
+    cmi_format::CmxReader r(graph);
+    LibraryInfos l;
+    l.lib_units = r.list_vec<std::pair<UnitInfos*, std::string>>(r.f(root, 0), [&](std::size_t e) {
+      return std::pair<UnitInfos*, std::string>(r.unit_infos(r.f(e, 0)), std::string(r.str(r.f(e, 1))));
+    });
+    auto strs = [&](std::size_t id) {
+      return r.list_vec<std::string>(id, [&](std::size_t x) { return std::string(r.str(x)); });
+    };
+    l.lib_ccobjs = strs(r.f(root, 1));
+    l.lib_ccopts = strs(r.f(root, 2));
+    return l;
+  } catch (const cmi_format::Corrupt&) {
+    throw Error(Error::Kind::Corrupted_unit_info, filename);
+  } catch (const cppcaml::marshal::Error&) {
+    throw Error(Error::Kind::Corrupted_unit_info, filename);
   }
+}
+
+std::pair<UnitInfos*, std::string> read_unit_info(const std::string& filename) {
+  std::vector<std::uint8_t> bytes = read_bytes(filename);
   const std::string magic = cmx_magic_number;
   if (bytes.size() < magic.size()) throw Error(Error::Kind::Corrupted_unit_info, filename);
   if (std::string(bytes.begin(), bytes.begin() + magic.size()) != magic)
@@ -2020,19 +2052,44 @@ class CmxWriter {
 
 }  // namespace
 
+namespace {
+V unit_infos(CmxWriter& cw, const UnitInfos& ui, const V& export_info) {
+  auto& w = cw.w;
+  return o::vblock(0, {w.str(ui.ui_name), w.str(ui.ui_symbol),
+                       w.list(ui.ui_defines, [&](std::string_view s) { return w.str(s); }), cw.crcs(ui.ui_imports_cmi),
+                       cw.crcs(ui.ui_imports_cmx), cw.ints(ui.ui_curry_fun), cw.ints(ui.ui_apply_fun),
+                       cw.ints(ui.ui_send_fun), export_info, w.b(ui.ui_force_link),
+                       ui.ui_for_pack ? w.some(w.str(*ui.ui_for_pack)) : w.none(), w.b(ui.ui_need_stdlib)});
+}
+}  // namespace
+
 std::string write_unit_info(const UnitInfos& ui) {
   CmxWriter cw;
-  auto& w = cw.w;
-  V info = o::vblock(0, {w.str(ui.ui_name), w.str(ui.ui_symbol),
-                         w.list(ui.ui_defines, [&](std::string_view s) { return w.str(s); }), cw.crcs(ui.ui_imports_cmi),
-                         cw.crcs(ui.ui_imports_cmx), cw.ints(ui.ui_curry_fun), cw.ints(ui.ui_apply_fun),
-                         cw.ints(ui.ui_send_fun), o::vblock(0, {cw.approx(ui.ui_export_info)}), w.b(ui.ui_force_link),
-                         ui.ui_for_pack ? w.some(w.str(*ui.ui_for_pack)) : w.none(), w.b(ui.ui_need_stdlib)});
+  V info = unit_infos(cw, ui, o::vblock(0, {cw.approx(ui.ui_export_info)}));
   std::vector<std::uint8_t> bytes = o::marshal(info);
   std::string file = cmx_magic_number;
   file.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
   // Digest.BLAKE128.file filename, after the flush
   file += blake2::blake128(reinterpret_cast<const unsigned char*>(file.data()), file.size());
+  return file;
+}
+
+std::string write_library_info(const LibraryInfos& l) {
+  CmxWriter cw;
+  auto& w = cw.w;
+  V default_export_info = o::vblock(0, {w.i(0)});  // Clambda Value_unknown
+  std::vector<V> units;
+  for (auto& [ui, crc] : l.lib_units)
+    units.push_back(o::vblock(0, {unit_infos(cw, *ui, default_export_info), o::vstr(crc)}));
+  auto strs = [&](const std::vector<std::string>& xs) {
+    std::vector<V> v;
+    for (auto& x : xs) v.push_back(o::vstr(x));
+    return o::vlist(v);
+  };
+  V infos = o::vblock(0, {o::vlist(units), strs(l.lib_ccobjs), strs(l.lib_ccopts)});
+  std::vector<std::uint8_t> bytes = o::marshal(infos);
+  std::string file = cmxa_magic_number;
+  file.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
   return file;
 }
 

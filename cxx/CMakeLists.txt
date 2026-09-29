@@ -115,6 +115,9 @@ add_library(cppcaml_core
   src/typing/mach_passes.cpp
   src/typing/linearize.cpp
   src/typing/emit.cpp
+    src/typing/asmgen.cpp
+    src/typing/asmlink.cpp
+    src/typing/asmlibrarian.cpp
   src/typing/format.cpp
   src/typing/printlambda.cpp
   src/typing/format_doc.cpp

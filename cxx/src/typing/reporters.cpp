@@ -8,6 +8,10 @@
 #include "cppcaml/typing/misc.hpp"
 #include "cppcaml/typing/pparse.hpp"
 #include "cppcaml/typing/pprintast.hpp"
+#include "cppcaml/typing/asmgen.hpp"
+#include "cppcaml/typing/compilenv.hpp"
+#include "cppcaml/typing/asmlibrarian.hpp"
+#include "cppcaml/typing/asmlink.hpp"
 #include "cppcaml/typing/bytelibrarian.hpp"
 #include "cppcaml/typing/bytelink.hpp"
 #include "cppcaml/typing/bytepackager.hpp"
@@ -146,6 +150,28 @@ void register_misc() {
     } catch (const bytelink::Error& e) {
       bytelink::Error err = e;
       return location::error_of_printer_file([err](Formatter& ppf) { bytelink::report_error_doc(ppf, err); });
+    } catch (const compilenv::Error& e) {
+      compilenv::Error err = e;
+      return location::error_of_printer_file([err](Formatter& ppf) { compilenv::report_error_doc(ppf, err); });
+    } catch (const cmx_format::Error& e) {
+      // (the reader's errors are Compilenv.Error's)
+      compilenv::Error err(e.kind == cmx_format::Error::Kind::Not_a_unit_info
+                               ? compilenv::Error::Kind::Not_a_unit_info
+                               : compilenv::Error::Kind::Corrupted_unit_info);
+      err.filename = e.filename;
+      return location::error_of_printer_file([err](Formatter& ppf) { compilenv::report_error_doc(ppf, err); });
+    } catch (const asmlink::Error& e) {
+      asmlink::Error err = e;
+      return location::error_of_printer_file([err](Formatter& ppf) { asmlink::report_error_doc(ppf, err); });
+    } catch (const asmlibrarian::Error& e) {
+      asmlibrarian::Error err = e;
+      return location::error_of_printer_file([err](Formatter& ppf) { asmlibrarian::report_error_doc(ppf, err); });
+    } catch (const asmgen::Error& e) {
+      std::string file = e.file;
+      return location::error_of_printer_file([file](Formatter& ppf) {
+        fprintf(ppf, "Assembler error, input left in file %a",
+                [file](Formatter& ff) { location::doc::quoted_filename(ff, file); });
+      });
     } catch (const bytelibrarian::Error& e) {
       bytelibrarian::Error err = e;
       return location::error_of_printer_file([err](Formatter& ppf) { bytelibrarian::report_error_doc(ppf, err); });
