@@ -401,7 +401,7 @@ static Longident::t simple_module_path(const std::string& m) {
       report_lexer_error_hook(fname, m, *lx.pending_error());
       throw location::AlreadyDisplayed();
     }
-    Location l{Position{zfname, 1, 0, static_cast<long>(t.start)}, Position{zfname, 1, 0, static_cast<long>(t.end)}};
+    Location l{mkpos(zfname, 1, 0, static_cast<long>(t.start)), mkpos(zfname, 1, 0, static_cast<long>(t.end))};
     throw location::Error(location::errorf(l, "Syntax error"));
   };
   using K = cppcaml::Kind;

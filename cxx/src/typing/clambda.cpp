@@ -35,8 +35,8 @@ Location to_location(const t& dbg) {
   const Item& d = dbg[0];
   Location l;
   l.loc_ghost = false;
-  l.loc_start = Position{d.dinfo_file, d.dinfo_line, d.dinfo_start_bol, d.dinfo_start_bol + d.dinfo_char_start};
-  l.loc_end = Position{d.dinfo_file, d.dinfo_end_line, d.dinfo_end_bol, d.dinfo_start_bol + d.dinfo_char_end};
+  l.loc_start = mkpos(d.dinfo_file, d.dinfo_line, d.dinfo_start_bol, d.dinfo_start_bol + d.dinfo_char_start);
+  l.loc_end = mkpos(d.dinfo_file, d.dinfo_end_line, d.dinfo_end_bol, d.dinfo_start_bol + d.dinfo_char_end);
   return l;
 }
 

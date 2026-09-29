@@ -407,7 +407,7 @@ static cppcaml::typing::Location span_loc(const std::string& path, const std::st
         ++lnum;
         bol = static_cast<long>(i + 1);
       }
-    return ty::Position{ty::zborrow(path), lnum, bol, static_cast<long>(off)};
+    return ty::mkpos(ty::zborrow(path), lnum, bol, static_cast<long>(off));
   };
   return ty::Location{pos(a), pos(b), false};
 }

@@ -4,6 +4,9 @@
 // calling conventions.
 #pragma once
 
+#include <algorithm>
+#include <iterator>
+
 #include <cstdint>
 #include <deque>
 #include <optional>
@@ -33,7 +36,85 @@ struct Reg;
 struct RegLess {
   bool operator()(const Reg* a, const Reg* b) const;  // RegOrder: by stamp
 };
-using Set = std::set<Reg*, RegLess>;
+// Reg.Set: the registers ordered by stamp.  A sorted vector (a liveness set
+// is stored in every instruction: a node per element, as std::set has,
+// costs five times the memory), with the std::set operations the passes use.
+class Set {
+ public:
+  using value_type = Reg*;
+  using const_iterator = std::vector<Reg*>::const_iterator;
+  using iterator = const_iterator;
+  Set() = default;
+  template <class It>
+  Set(It first, It last) {
+    insert(first, last);
+  }
+  Set(std::initializer_list<Reg*> l) { insert(l.begin(), l.end()); }
+  std::pair<iterator, bool> insert(Reg* r) {
+    auto it = std::lower_bound(v_.begin(), v_.end(), r, RegLess{});
+    if (it != v_.end() && !RegLess{}(r, *it)) return {it, false};
+    it = v_.insert(it, r);
+    return {it, true};
+  }
+  template <class It>
+  void insert(It first, It last) {
+    for (; first != last; ++first) insert(*first);
+  }
+  std::size_t erase(Reg* r) {
+    auto it = std::lower_bound(v_.begin(), v_.end(), r, RegLess{});
+    if (it == v_.end() || RegLess{}(r, *it)) return 0;
+    v_.erase(it);
+    return 1;
+  }
+  iterator find(Reg* r) const {
+    auto it = std::lower_bound(v_.begin(), v_.end(), r, RegLess{});
+    return it != v_.end() && !RegLess{}(r, *it) ? it : v_.end();
+  }
+  std::size_t count(Reg* r) const { return find(r) != v_.end() ? 1 : 0; }
+  bool contains(Reg* r) const { return count(r) != 0; }
+  iterator begin() const { return v_.begin(); }
+  iterator end() const { return v_.end(); }
+  std::size_t size() const { return v_.size(); }
+  bool empty() const { return v_.empty(); }
+  void clear() { v_.clear(); }
+  // union / difference / intersection by merging (linear)
+  static Set set_union(const Set& a, const Set& b) {
+    Set r;
+    r.v_.reserve(a.size() + b.size());
+    std::set_union(a.v_.begin(), a.v_.end(), b.v_.begin(), b.v_.end(), std::back_inserter(r.v_), RegLess{});
+    return r;
+  }
+  static Set set_difference(const Set& a, const Set& b) {
+    Set r;
+    std::set_difference(a.v_.begin(), a.v_.end(), b.v_.begin(), b.v_.end(), std::back_inserter(r.v_), RegLess{});
+    return r;
+  }
+  static bool includes(const Set& a, const Set& b) {  // b is a subset of a
+    return std::includes(a.v_.begin(), a.v_.end(), b.v_.begin(), b.v_.end(), RegLess{});
+  }
+  friend bool operator==(const Set& a, const Set& b) { return a.v_ == b.v_; }
+  friend bool operator!=(const Set& a, const Set& b) { return a.v_ != b.v_; }
+
+ private:
+  std::vector<Reg*> v_;
+};
+
+// An OCaml list built by consing (the newest first): push_front appends to
+// a vector, iteration runs backwards (a std::deque allocates a chunk and a
+// map for each register, even an empty one)
+template <class T>
+class NewestFirst {
+ public:
+  void push_front(T x) { v_.push_back(std::move(x)); }
+  void clear() { v_.clear(); }
+  auto begin() const { return v_.rbegin(); }
+  auto end() const { return v_.rend(); }
+  std::size_t size() const { return v_.size(); }
+  bool empty() const { return v_.empty(); }
+
+ private:
+  std::vector<T> v_;
+};
 
 struct Reg {
   RawName raw_name;
@@ -42,8 +123,8 @@ struct Reg {
   Location loc;
   bool spill = false;
   std::optional<long> part;
-  std::deque<Reg*> interf;                  // list order: the newest first
-  std::deque<std::pair<Reg*, long>> prefer;  // list order: the newest first
+  NewestFirst<Reg*> interf;                  // list order: the newest first
+  NewestFirst<std::pair<Reg*, long>> prefer;  // list order: the newest first
   long degree = 0;
   long spill_cost = 0;
   long visited = 0;

@@ -13,25 +13,56 @@
 namespace cppcaml::typing {
 
 // ---- Lexing.position / Location.t ----------------------------------------
+// A position's file name: the string (its identity kept: the writers share
+// equal names as the OCaml heap does) through an 8-byte handle, interned by
+// that identity -- a location is in every node of the trees, and a
+// string_view twice per location cost a sixth of their memory.  The handle
+// is permanent, or in the .cmi image being recorded.
+class Fname {
+ public:
+  Fname() = default;
+  Fname(std::string_view s) : p_(intern(s)) {}
+  Fname(const char* s) : Fname(std::string_view(s)) {}
+  operator std::string_view() const { return p_ ? *p_ : std::string_view(); }
+  std::string_view view() const { return *this; }
+  const char* data() const { return p_ ? p_->data() : nullptr; }
+  std::size_t size() const { return p_ ? p_->size() : 0; }
+  bool empty() const { return size() == 0; }
+  int compare(std::string_view o) const { return view().compare(o); }
+  friend bool operator<(const Fname& a, const Fname& b) { return a.view() < b.view(); }
+  friend bool operator==(const Fname& a, const Fname& b) { return a.view() == b.view(); }
+  friend bool operator==(const Fname& a, std::string_view b) { return a.view() == b; }
+  friend bool operator==(const Fname& a, const char* b) { return a.view() == std::string_view(b); }
+
+ private:
+  static const std::string_view* intern(std::string_view s);
+  const std::string_view* p_ = nullptr;
+};
+
 struct Position {
-  std::string_view pos_fname;
-  long pos_lnum = 0;
-  long pos_bol = 0;
-  long pos_cnum = 0;
+  Fname pos_fname;
+  // (32-bit: a source is smaller than 2 GiB)
+  std::int32_t pos_lnum = 0;
+  std::int32_t pos_bol = 0;
+  std::int32_t pos_cnum = 0;
   // The record's identity where it has one the writers must keep: the
   // Reader's (one per marshaled record of a .cmi -- input_value's sharing).
   // It points at the record's contents as read; a copy whose contents were
   // changed since is a different record (same_record says whether it holds).
   const Position* obj = nullptr;
 };
+// Position{fname, lnum, bol, cnum} from wider integers
+inline Position mkpos(Fname f, long lnum, long bol, long cnum) {
+  return Position{f, static_cast<std::int32_t>(lnum), static_cast<std::int32_t>(bol), static_cast<std::int32_t>(cnum)};
+}
 struct Location {
   Position loc_start;
   Position loc_end;
   bool loc_ghost = false;
-  const Location* obj = nullptr;  // as Position::obj
   // [obj] is a parser record distinct from the equal-valued ones: the
   // parser's second `make_loc` of one span (location::distinct_record)
   bool distinct = false;
+  const Location* obj = nullptr;  // as Position::obj
 };
 // [x] is still the record [x.obj] identifies
 bool same_record(const Position& x);

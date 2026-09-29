@@ -1,3 +1,4 @@
+#include <unordered_map>
 #include <sys/mman.h>
 // Port of typing/types.ml.  See types.hpp.
 #include "cppcaml/typing/types.hpp"
@@ -19,6 +20,18 @@ void set_zone(Zone* z) { g_zone = z ? z : &g_default_zone; }
 ZoneScope::ZoneScope(Zone& z) : saved(g_zone) { g_zone = &z; }
 ZoneScope::~ZoneScope() { g_zone = saved; }
 const void* fresh_identity() { return zone().alloc(1, 1); }
+
+const std::string_view* Fname::intern(std::string_view s) {
+  if (!s.data()) return nullptr;
+  // a .cmi image being recorded holds its own handles (its positions are
+  // read by other processes); the others are interned, permanent
+  if (zone().is_fixed()) return zone().make<std::string_view>(s);
+  static std::unordered_map<std::uint64_t, std::unordered_map<std::size_t, const std::string_view*>> handles;
+  auto& byp = handles[reinterpret_cast<std::uintptr_t>(s.data())];
+  auto [it, fresh] = byp.try_emplace(s.size(), nullptr);
+  if (fresh) it->second = permanent_zone().make<std::string_view>(s);
+  return it->second;
+}
 
 char* Zone::huge_block(std::size_t sz) {
   constexpr std::size_t huge = 2 << 20;

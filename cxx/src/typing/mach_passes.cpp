@@ -40,14 +40,8 @@ using RegMap = PMap<Reg*, V, RegCmp>;
 using RegSet = reg::Set;
 
 RegSet set_of_array(const Regs& v) { return RegSet(v.begin(), v.end()); }
-RegSet add_set_array(RegSet s, const Regs& v) {
-  s.insert(v.begin(), v.end());
-  return s;
-}
-RegSet diff_set_array(RegSet s, const Regs& v) {
-  for (Reg* r : v) s.erase(r);
-  return s;
-}
+RegSet add_set_array(const RegSet& s, const Regs& v) { return RegSet::set_union(s, set_of_array(v)); }
+RegSet diff_set_array(const RegSet& s, const Regs& v) { return RegSet::set_difference(s, set_of_array(v)); }
 RegSet inter_set_array(const RegSet& s, const Regs& v) {
   RegSet r;
   for (Reg* x : v)
@@ -59,22 +53,9 @@ bool disjoint_set_array(const RegSet& s, const Regs& v) {
     if (s.count(x)) return false;
   return true;
 }
-RegSet set_union(const RegSet& a, const RegSet& b) {
-  RegSet r = a;
-  r.insert(b.begin(), b.end());
-  return r;
-}
-RegSet set_diff(const RegSet& a, const RegSet& b) {
-  RegSet r;
-  for (Reg* x : a)
-    if (!b.count(x)) r.insert(x);
-  return r;
-}
-bool set_subset(const RegSet& a, const RegSet& b) {
-  for (Reg* x : a)
-    if (!b.count(x)) return false;
-  return true;
-}
+RegSet set_union(const RegSet& a, const RegSet& b) { return RegSet::set_union(a, b); }
+RegSet set_diff(const RegSet& a, const RegSet& b) { return RegSet::set_difference(a, b); }
+bool set_subset(const RegSet& a, const RegSet& b) { return RegSet::includes(b, a); }
 
 Instr cons(const Instruction& d, const Regs& a, const Regs& r, Instr n) { return instr_cons(d, a, r, n); }
 

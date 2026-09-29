@@ -259,7 +259,7 @@ class Reader {
   // one record per marshaled block, with its identity (support.hpp)
   Position position(std::size_t id) {
     if (const Position* mv; pos_.get(id, mv)) return *mv;
-    auto* p = make<Position>(Position{str(f(id, 0)), ival(f(id, 1)), ival(f(id, 2)), ival(f(id, 3))});
+    auto* p = make<Position>(mkpos(str(f(id, 0)), ival(f(id, 1)), ival(f(id, 2)), ival(f(id, 3))));
     p->obj = p;
     pos_.put(id, p);
     return *p;

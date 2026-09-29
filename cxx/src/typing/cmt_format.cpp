@@ -1600,7 +1600,7 @@ class TreeWriter {
   }
   static Position position_of(const OValue* x) {
     if (x->pos) return *x->pos;
-    return Position{x->fields[0]->s, x->fields[1]->i, x->fields[2]->i, x->fields[3]->i};
+    return mkpos(x->fields[0]->s, x->fields[1]->i, x->fields[2]->i, x->fields[3]->i);
   }
   // a boxed integer (custom block): the constant's box, one per literal
   V boxed(const tt::Constant& c, int bytes) {

@@ -85,7 +85,7 @@ class Decoder {
   Position position(V x) {
     if (x->pos) return *x->pos;  // the Reader's record (its identity)
     if (auto it = poss_.find(x); it != poss_.end()) return *it->second;
-    auto* p = make<Position>(Position{str(f(x, 0)), ival(f(x, 1)), ival(f(x, 2)), ival(f(x, 3))});
+    auto* p = make<Position>(mkpos(str(f(x, 0)), ival(f(x, 1)), ival(f(x, 2)), ival(f(x, 3))));
     p->obj = p;
     poss_[x] = p;
     return *p;

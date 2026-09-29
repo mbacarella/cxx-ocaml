@@ -272,7 +272,7 @@ class Writer {
             x->fields[0]->kind == OValue::Kind::String && x->fields[1]->kind == OValue::Kind::Int &&
             x->fields[2]->kind == OValue::Kind::Int && x->fields[3]->kind == OValue::Kind::Int)
           return x->pos ? position(*x->pos)
-                        : position(Position{x->fields[0]->s, x->fields[1]->i, x->fields[2]->i, x->fields[3]->i});
+                        : position(mkpos(x->fields[0]->s, x->fields[1]->i, x->fields[2]->i, x->fields[3]->i));
         // a parsetree location record: that record's one value (loc())
         if (x->loc_rec) {
           Location l = *x->loc_rec;

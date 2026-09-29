@@ -96,6 +96,7 @@ class Zone {
   void adopt(const char* base, std::size_t n) { ranges_.emplace(base, n); }
 
   // whether [p] points into this zone's storage
+  bool is_fixed() const { return fixed_; }
   bool owns(const char* p) const {
     auto it = ranges_.upper_bound(p);
     if (it == ranges_.begin()) return false;
