@@ -19,6 +19,11 @@
 #   STARTUP_N=50      runs of the trivial unit
 #   CPP=, REF=        the compilers (default: cxx/build-release/c++ocamlc,
 #                     ./ocamlc.opt)
+#   NATIVE=1          c++ocamlopt against ocamlopt.opt: .cmx outputs, the
+#                     compiler corpus with the native back end's sources
+#                     (middle_end, asmcomp, the opt drivers), and the
+#                     "link" corpus (every SMALL_STEP-th probe compiled,
+#                     then only its link timed)
 #   OUT=/tmp/bench    per-unit TSVs, summary.tsv
 #   PHASES=1          also sum c++ocamlc's CPPCAML_PROFILE phase timers
 #   BASELINE=<file>   a previous summary.tsv: print the ratio change
@@ -31,8 +36,16 @@ set -u
 SELF="$(readlink -f "$0")"
 ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 cd "$ROOT" || exit 1
-CPP="${CPP:-$ROOT/cxx/build-release/c++ocamlc}"
-REF="${REF:-$ROOT/ocamlc.opt}"
+NATIVE="${NATIVE:-}"
+if [ -n "$NATIVE" ]; then
+  CPP="${CPP:-$ROOT/cxx/build-release/c++ocamlopt}"
+  REF="${REF:-$ROOT/ocamlopt.opt}"
+  OBJ=cmx
+else
+  CPP="${CPP:-$ROOT/cxx/build-release/c++ocamlc}"
+  REF="${REF:-$ROOT/ocamlc.opt}"
+  OBJ=cmo
+fi
 REPS="${REPS:-3}"
 SMALL_STEP="${SMALL_STEP:-16}"
 STARTUP_N="${STARTUP_N:-50}"
@@ -42,7 +55,7 @@ BASELINE="${BASELINE:-}"
 MAXRATIO="${MAXRATIO:-}"
 TIME=/usr/bin/time
 [ -x "$TIME" ] || { echo "bench.sh: needs $TIME (GNU time) for the peak RSS" >&2; exit 2; }
-if [ $# -gt 0 ]; then corpora=("$@"); else corpora=(startup small compiler stdlib); fi
+if [ $# -gt 0 ]; then corpora=("$@"); elif [ -n "${NATIVE:-}" ]; then corpora=(startup small compiler stdlib link); else corpora=(startup small compiler stdlib); fi
 rm -rf "$OUT"; mkdir -p "$OUT"
 W=$(mktemp -d)
 trap 'rm -rf "${W:?}"' EXIT
@@ -109,14 +122,29 @@ corpus_small() {
   done
 }
 
+corpus_link() {
+  local f b r c
+  local i=0
+  for f in cxx/harness/stamp_probes/*.ml; do
+    i=$((i + 1)); [ $((i % SMALL_STEP)) -eq 0 ] || continue
+    b=$(basename "$f"); r="$W/li/r"; c="$W/li/c"
+    fresh "$r"; fresh "$c"; cp "$f" "$r/"; cp "$f" "$c/"
+    # both link the same object, compiled once by the reference (untimed)
+    ( cd "$r" && "$REF" -nostdlib -I "$ROOT/stdlib" -w -a -c "$b" ) >/dev/null 2>&1 || continue
+    cp "$r/${b%.ml}".* "$c/"
+    bench_unit link "$b" "$r" "$c" -o a.out "${b%.ml}.$OBJ"
+  done
+}
+
 corpus_compiler() {
-  local inc="" d f b r c
-  for d in utils parsing typing bytecomp file_formats lambda middle_end driver toplevel; do inc="$inc -I $ROOT/$d"; done
+  local inc="" d f b r c dirs="utils parsing typing bytecomp file_formats lambda driver"
+  [ -n "$NATIVE" ] && dirs="$dirs middle_end middle_end/closure asmcomp"
+  for d in utils parsing typing bytecomp file_formats lambda middle_end middle_end/closure asmcomp driver toplevel; do inc="$inc -I $ROOT/$d"; done
   # the compiler's own flags (Makefile.build_config OC_COMMON_COMPFLAGS)
   # without -bin-annot and -warn-error
   local fl="-g -strict-sequence -principal -absname -w +a-4-9-40-41-42-44-45-48 -alert @ocaml_deprecated_cli -strict-formats"
-  for f in utils/*.ml parsing/*.ml typing/*.ml bytecomp/*.ml file_formats/*.ml lambda/*.ml driver/*.ml; do
-    case "$f" in *_native*|*/optmain*|*/optcompile*|*/optmaindriver*|*/opterrors*) continue ;; esac
+  for f in $(for d in $dirs; do ls $d/*.ml; done); do
+    [ -z "$NATIVE" ] && case "$f" in *_native*|*/optmain*|*/optcompile*|*/optmaindriver*|*/opterrors*) continue ;; esac
     b=$(basename "$f"); r="$W/co/r"; c="$W/co/c"
     # a unit ocamlc can't compile alone here (missing native-only deps) is skipped
     fresh "$r"; cp "$f" "$r/"
@@ -153,14 +181,14 @@ corpus_stdlib() {
       cp "stdlib/$base.mli" "$r/"; cp "stdlib/$base.mli" "$c/"
       eval "bench_unit stdlib $base.mli $r $c $comp $iflags -o $tgt.cmi -c $base.mli"
     fi
-    eval "bench_unit stdlib $m $r $c $comp $cflags -o $tgt.cmo -c $m"
+    eval "bench_unit stdlib $m $r $c $comp $cflags -o $tgt.$OBJ -c $m"
   done
 }
 
 export AWK=awk
 for c in "${corpora[@]}"; do
   case "$c" in
-    startup|small|compiler|stdlib) ;;
+    startup|small|compiler|stdlib|link) ;;
     *) echo "bench.sh: unknown corpus $c" >&2; exit 2 ;;
   esac
   printf 'unit\tref_ms\tcpp_ms\tref_rss_kb\tcpp_rss_kb\tref_rc\tcpp_rc\n' > "$OUT/$c.tsv"
@@ -185,7 +213,7 @@ column -t -s $'\t' "$OUT/summary.tsv"
 for c in "${corpora[@]}"; do
   bad=$(awk -F'\t' 'NR > 1 && $6 != $7' "$OUT/$c.tsv" | wc -l)
   [ "$bad" -gt 0 ] && echo "$c: $bad unit(s) where the compilers' exit codes differ (not counted)"
-  echo "$c: slowest relative to ocamlc.opt:"
+  echo "$c: slowest relative to $(basename "$REF"):"
   awk -F'\t' 'NR > 1 && $6 == 0 && $7 == 0 && $2 >= 5 { printf "  %6.2fx  %8.1f ms  %8.1f ms  %s\n", $3 / $2, $2, $3, $1 }' \
     "$OUT/$c.tsv" | sort -rn | head -5
 done
