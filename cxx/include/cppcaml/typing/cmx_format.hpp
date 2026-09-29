@@ -15,9 +15,6 @@
 
 namespace cppcaml::typing::cmx_format {
 
-inline constexpr const char* cmx_magic_number = "Caml1999Y038";
-inline constexpr const char* cmxa_magic_number = "Caml1999Z038";
-
 using Crcs = std::vector<std::pair<std::string_view, std::optional<std::string>>>;
 
 struct UnitInfos {

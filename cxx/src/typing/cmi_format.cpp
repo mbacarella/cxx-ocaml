@@ -1026,7 +1026,7 @@ std::pair<std::string, std::string> output_cmi_bytes(const CmiInfos& cmi) {
   o::ValPtr name = w.unit_name(cmi.cmi_name);
   o::ValPtr header = o::vblock(0, {name, w.signature(cmi.cmi_sign)});
   std::vector<std::uint8_t> hbytes = o::marshal(header, config::compression_supported);  // Compression.output_value
-  std::string prefix(cmi_magic_number);
+  std::string prefix(config::cmi_magic_number);
   prefix.append(reinterpret_cast<const char*>(hbytes.data()), hbytes.size());
   // Digest.BLAKE128.file filename, after the flush: the magic and the header
   std::string crc = blake2::blake128(reinterpret_cast<const unsigned char*>(prefix.data()), prefix.size());
@@ -1135,7 +1135,7 @@ CmiInfos read_cmi(const std::string& filename) {
     std::uint8_t chunk[65536];
     for (std::size_t k; (k = std::fread(chunk, 1, sizeof chunk, f)) > 0;) bytes.insert(bytes.end(), chunk, chunk + k);
   }
-  const std::string magic = cmi_magic_number;
+  const std::string magic = config::cmi_magic_number;
   if (bytes.size() < magic.size())
     throw Error(Error::Kind::Corrupted_interface, filename);
   std::string buffer(bytes.begin(), bytes.begin() + magic.size());
@@ -1625,7 +1625,7 @@ std::vector<std::uint8_t> read_bytes(const std::string& filename) {
 
 LibraryInfos read_library_info(const std::string& filename) {
   std::vector<std::uint8_t> bytes = read_bytes(filename);
-  const std::string magic = cmxa_magic_number;
+  const std::string magic = config::cmxa_magic_number;
   if (bytes.size() < magic.size() || std::string(bytes.begin(), bytes.begin() + magic.size()) != magic)
     throw Error(Error::Kind::Not_a_unit_info, filename);
   try {
@@ -1652,7 +1652,7 @@ LibraryInfos read_library_info(const std::string& filename) {
 
 std::pair<UnitInfos*, std::string> read_unit_info(const std::string& filename) {
   std::vector<std::uint8_t> bytes = read_bytes(filename);
-  const std::string magic = cmx_magic_number;
+  const std::string magic = config::cmx_magic_number;
   if (bytes.size() < magic.size()) throw Error(Error::Kind::Corrupted_unit_info, filename);
   if (std::string(bytes.begin(), bytes.begin() + magic.size()) != magic)
     throw Error(Error::Kind::Not_a_unit_info, filename);
@@ -2073,7 +2073,7 @@ std::string write_unit_info(const UnitInfos& ui) {
   CmxWriter cw;
   V info = unit_infos(cw, ui, o::vblock(0, {cw.approx(ui.ui_export_info)}));
   std::vector<std::uint8_t> bytes = o::marshal(info);
-  std::string file = cmx_magic_number;
+  std::string file = config::cmx_magic_number;
   file.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
   // Digest.BLAKE128.file filename, after the flush
   file += blake2::blake128(reinterpret_cast<const unsigned char*>(file.data()), file.size());
@@ -2094,7 +2094,7 @@ std::string write_library_info(const LibraryInfos& l) {
   };
   V infos = o::vblock(0, {o::vlist(units), strs(l.lib_ccobjs), strs(l.lib_ccopts)});
   std::vector<std::uint8_t> bytes = o::marshal(infos);
-  std::string file = cmxa_magic_number;
+  std::string file = config::cmxa_magic_number;
   file.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
   return file;
 }

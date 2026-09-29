@@ -48,7 +48,6 @@ using cmi_format::writer::EventWriter;
 using cmi_format::writer::Writer;
 using V = o::ValPtr;
 
-inline constexpr const char* cmt_magic_number = "Caml1999T038";
 
 namespace {
 
@@ -3360,7 +3359,7 @@ void save_cmt(const std::string& filename, std::string_view modname, const std::
                            shape_v,                                                  // cmt_impl_shape
                            occurrences_v,                                            // cmt_ident_occurrences
                        });
-  out += cmt_magic_number;
+  out += config::cmt_magic_number;
   std::vector<std::uint8_t> bytes = o::marshal(cmt, config::compression_supported);  // Compression.output_value
   out.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
   // Misc.output_to_file_via_temporary

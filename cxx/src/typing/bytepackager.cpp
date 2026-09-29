@@ -39,7 +39,6 @@ namespace m = cppcaml::marshal;
 namespace o = cppcaml::omarshal;
 using V = o::ValPtr;
 
-constexpr const char* cmo_magic_number = "Caml1999O038";
 
 // compilation_unit fields (Cmo_format)
 enum CuField {
@@ -140,8 +139,8 @@ Member read_member_info(std::string_view targetname, const std::string& file) {
     mb.intf = true;
   } else {
     mb.bytes = read_file(file);
-    std::size_t n = std::strlen(cmo_magic_number);
-    if (mb.bytes.size() < n + 4 || std::memcmp(mb.bytes.data(), cmo_magic_number, n) != 0) {
+    std::size_t n = config::cmo_magic_number.size();
+    if (mb.bytes.size() < n + 4 || std::memcmp(mb.bytes.data(), config::cmo_magic_number.data(), n) != 0) {
       Error e(Error::Kind::Not_an_object_file);
       e.file = file;
       throw e;
@@ -546,7 +545,7 @@ void package_object_files(std::vector<std::string>& files, const std::string& ta
       required.try_emplace(a[*it].str(), (*mit->reader)(*it));
   }
   emitcode::ValueContext w, hw;
-  std::string oc(cmo_magic_number);
+  std::string oc(config::cmo_magic_number);
   long pos_depl = static_cast<long>(oc.size());
   output_binary_int(oc, 0);
   long pos_code = static_cast<long>(oc.size());

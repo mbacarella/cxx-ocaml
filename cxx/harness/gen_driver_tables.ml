@@ -117,6 +117,8 @@ let () =
       str "exec_magic_number" Config.exec_magic_number;
       str "cmo_magic_number" Config.cmo_magic_number;
       str "cma_magic_number" Config.cma_magic_number;
+      str "cmi_magic_number" Config.cmi_magic_number;
+      str "cmt_magic_number" Config.cmt_magic_number;
       (* the native compiler's *)
       bool "flambda" Config.flambda;
       bool "with_cmm_invariants" Config.with_cmm_invariants;
