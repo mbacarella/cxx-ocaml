@@ -149,7 +149,7 @@ builds while a chain runs; cap memory (`ulimit -v`).  Results as of the
 | `typing_parse_parity.sh` | Parsetree dumps (compiler-libs vs port) | 2040/2040 |
 | `dune_parity.sh` | dune builds, artifact by artifact | 0 DIFF (73 .cmt sharing) |
 | `effid.sh` | the compiler's .cmo, compiled by c++ocamlc | 140/140 bytes |
-| `ddc.sh` + `stdlib_ddc.sh` | diverse double-compiling | PASS |
+| `ddc.sh` + `stdlib_ddc.sh` | diverse double-compiling (`cxx/DDC.md`) | PASS: 271 .cmo + 355 .cmi (bytecode and native compiler sources) |
 | `testsuite_delta.sh` | ocamltest with c++ocamlc as ocamlc | the delta (below) |
 
 Also: `false_accept.sh` / `valid_reject.sh` (through `port_check.sh`),

@@ -14,7 +14,8 @@
 # Thompson trusting-trust trojan could not hide, because a from-scratch C++
 # reimplementation reproduces the exact compiler bytecode.
 #
-# SCOPE (be honest): this covers the compiler-source -> bytecode step only.  The
+# SCOPE (be honest): this covers the compiler-source -> bytecode step only
+# (the bytecode compiler, and the native compiler's sources compiled to bytecode).  The
 # stdlib is shared between both builds (not yet diversely rebuilt) and the C
 # runtime (ocamlrun) executing S1/S2 is the official one.  See the DDC plan in
 # the project notes for closing those gaps.
@@ -37,6 +38,163 @@ CPPC=$ROOT/cxx/build/c++ocamlc   # links too (-nopervasives -use-runtime)
 DEPSORT=$ROOT/tools/ocamldep.opt
 BOOTSTRAP=$ROOT/cxx/harness/ocamlc_bootstrap.sh
 FLAGS="-strict-sequence -strict-formats -w +a-4-9-40-41-42-44-45-48-70"
+
+# The native compiler's own sources (Makefile: ocamloptcomp_SOURCES =
+# ocamlmiddleend + asmcomp, ocamlopt_SOURCES; the flambda middle end is compiled
+# in every configuration), cmx_format.mli, and the interface-only modules the
+# Makefile builds through .depend alone (emitenv, branch_relaxation_intf).  Compiled to BYTECODE by both
+# compilers, they extend the DDC to the step that builds ocamlopt.byte (then
+# ocamlopt.opt): an official compiler that miscompiled asmcomp/ alone would
+# otherwise go unseen.  asmcomp's architecture files are the configured tree's
+# (arch.ml, emit.ml, ... as the build links / generates them).
+CL_OPT="middle_end/internal_variable_names.mli middle_end/internal_variable_names.ml
+middle_end/linkage_name.mli middle_end/linkage_name.ml
+middle_end/compilation_unit.mli middle_end/compilation_unit.ml
+middle_end/variable.mli middle_end/variable.ml
+middle_end/flambda/base_types/closure_element.mli
+middle_end/flambda/base_types/closure_element.ml
+middle_end/flambda/base_types/closure_id.mli
+middle_end/flambda/base_types/closure_id.ml middle_end/symbol.mli
+middle_end/symbol.ml middle_end/backend_var.mli middle_end/backend_var.ml
+middle_end/clambda_primitives.mli middle_end/clambda_primitives.ml
+middle_end/printclambda_primitives.mli middle_end/printclambda_primitives.ml
+middle_end/clambda.mli middle_end/clambda.ml middle_end/printclambda.mli
+middle_end/printclambda.ml middle_end/semantics_of_primitives.mli
+middle_end/semantics_of_primitives.ml middle_end/convert_primitives.mli
+middle_end/convert_primitives.ml middle_end/flambda/base_types/id_types.mli
+middle_end/flambda/base_types/id_types.ml
+middle_end/flambda/base_types/export_id.mli
+middle_end/flambda/base_types/export_id.ml
+middle_end/flambda/base_types/tag.mli middle_end/flambda/base_types/tag.ml
+middle_end/flambda/base_types/mutable_variable.mli
+middle_end/flambda/base_types/mutable_variable.ml
+middle_end/flambda/base_types/set_of_closures_id.mli
+middle_end/flambda/base_types/set_of_closures_id.ml
+middle_end/flambda/base_types/set_of_closures_origin.mli
+middle_end/flambda/base_types/set_of_closures_origin.ml
+middle_end/flambda/base_types/closure_origin.mli
+middle_end/flambda/base_types/closure_origin.ml
+middle_end/flambda/base_types/var_within_closure.mli
+middle_end/flambda/base_types/var_within_closure.ml
+middle_end/flambda/base_types/static_exception.mli
+middle_end/flambda/base_types/static_exception.ml
+middle_end/flambda/pass_wrapper.mli middle_end/flambda/pass_wrapper.ml
+middle_end/flambda/allocated_const.mli middle_end/flambda/allocated_const.ml
+middle_end/flambda/parameter.mli middle_end/flambda/parameter.ml
+middle_end/flambda/projection.mli middle_end/flambda/projection.ml
+middle_end/flambda/flambda.mli middle_end/flambda/flambda.ml
+middle_end/flambda/flambda_iterators.mli
+middle_end/flambda/flambda_iterators.ml middle_end/flambda/flambda_utils.mli
+middle_end/flambda/flambda_utils.ml middle_end/flambda/freshening.mli
+middle_end/flambda/freshening.ml middle_end/flambda/effect_analysis.mli
+middle_end/flambda/effect_analysis.ml middle_end/flambda/inlining_cost.mli
+middle_end/flambda/inlining_cost.ml middle_end/flambda/simple_value_approx.mli
+middle_end/flambda/simple_value_approx.ml middle_end/flambda/export_info.mli
+middle_end/flambda/export_info.ml middle_end/flambda/export_info_for_pack.mli
+middle_end/flambda/export_info_for_pack.ml middle_end/compilenv.mli
+middle_end/compilenv.ml middle_end/backend_intf.mli
+middle_end/closure/closure.mli middle_end/closure/closure.ml
+middle_end/closure/closure_middle_end.mli
+middle_end/closure/closure_middle_end.ml middle_end/flambda/import_approx.mli
+middle_end/flambda/import_approx.ml middle_end/flambda/lift_code.mli
+middle_end/flambda/lift_code.ml middle_end/flambda/closure_conversion_aux.mli
+middle_end/flambda/closure_conversion_aux.ml
+middle_end/flambda/closure_conversion.mli
+middle_end/flambda/closure_conversion.ml
+middle_end/flambda/initialize_symbol_to_let_symbol.mli
+middle_end/flambda/initialize_symbol_to_let_symbol.ml
+middle_end/flambda/lift_let_to_initialize_symbol.mli
+middle_end/flambda/lift_let_to_initialize_symbol.ml
+middle_end/flambda/find_recursive_functions.mli
+middle_end/flambda/find_recursive_functions.ml
+middle_end/flambda/invariant_params.mli middle_end/flambda/invariant_params.ml
+middle_end/flambda/inconstant_idents.mli
+middle_end/flambda/inconstant_idents.ml middle_end/flambda/alias_analysis.mli
+middle_end/flambda/alias_analysis.ml middle_end/flambda/lift_constants.mli
+middle_end/flambda/lift_constants.ml middle_end/flambda/share_constants.mli
+middle_end/flambda/share_constants.ml middle_end/flambda/simplify_common.mli
+middle_end/flambda/simplify_common.ml
+middle_end/flambda/remove_unused_arguments.mli
+middle_end/flambda/remove_unused_arguments.ml
+middle_end/flambda/remove_unused_closure_vars.mli
+middle_end/flambda/remove_unused_closure_vars.ml
+middle_end/flambda/remove_unused_program_constructs.mli
+middle_end/flambda/remove_unused_program_constructs.ml
+middle_end/flambda/simplify_boxed_integer_ops.mli
+middle_end/flambda/simplify_boxed_integer_ops.ml
+middle_end/flambda/simplify_primitives.mli
+middle_end/flambda/simplify_primitives.ml
+middle_end/flambda/inlining_stats_types.mli
+middle_end/flambda/inlining_stats_types.ml
+middle_end/flambda/inlining_stats.mli middle_end/flambda/inlining_stats.ml
+middle_end/flambda/inline_and_simplify_aux.mli
+middle_end/flambda/inline_and_simplify_aux.ml
+middle_end/flambda/inlining_decision_intf.mli
+middle_end/flambda/remove_free_vars_equal_to_args.mli
+middle_end/flambda/remove_free_vars_equal_to_args.ml
+middle_end/flambda/extract_projections.mli
+middle_end/flambda/extract_projections.ml
+middle_end/flambda/augment_specialised_args.mli
+middle_end/flambda/augment_specialised_args.ml
+middle_end/flambda/unbox_free_vars_of_closures.mli
+middle_end/flambda/unbox_free_vars_of_closures.ml
+middle_end/flambda/unbox_specialised_args.mli
+middle_end/flambda/unbox_specialised_args.ml
+middle_end/flambda/unbox_closures.mli middle_end/flambda/unbox_closures.ml
+middle_end/flambda/inlining_transforms.mli
+middle_end/flambda/inlining_transforms.ml
+middle_end/flambda/inlining_decision.mli
+middle_end/flambda/inlining_decision.ml
+middle_end/flambda/inline_and_simplify.mli
+middle_end/flambda/inline_and_simplify.ml
+middle_end/flambda/ref_to_variables.mli middle_end/flambda/ref_to_variables.ml
+middle_end/flambda/flambda_invariants.mli
+middle_end/flambda/flambda_invariants.ml
+middle_end/flambda/traverse_for_exported_symbols.mli
+middle_end/flambda/traverse_for_exported_symbols.ml
+middle_end/flambda/build_export_info.mli
+middle_end/flambda/build_export_info.ml middle_end/flambda/closure_offsets.mli
+middle_end/flambda/closure_offsets.ml middle_end/flambda/un_anf.mli
+middle_end/flambda/un_anf.ml middle_end/flambda/flambda_to_clambda.mli
+middle_end/flambda/flambda_to_clambda.ml
+middle_end/flambda/flambda_middle_end.mli
+middle_end/flambda/flambda_middle_end.ml
+middle_end/flambda/simplify_boxed_integer_ops_intf.mli asmcomp/x86_ast.mli
+asmcomp/x86_proc.mli asmcomp/x86_proc.ml asmcomp/x86_dsl.mli
+asmcomp/x86_dsl.ml asmcomp/x86_gas.mli asmcomp/x86_gas.ml asmcomp/x86_masm.mli
+asmcomp/x86_masm.ml asmcomp/arch.mli asmcomp/arch.ml asmcomp/cmm.mli
+asmcomp/cmm.ml asmcomp/printcmm.mli asmcomp/printcmm.ml asmcomp/reg.mli
+asmcomp/reg.ml asmcomp/mach.mli asmcomp/mach.ml asmcomp/proc.mli
+asmcomp/proc.ml asmcomp/strmatch.mli asmcomp/strmatch.ml
+asmcomp/cmmgen_state.mli asmcomp/cmmgen_state.ml asmcomp/cmm_helpers.mli
+asmcomp/cmm_helpers.ml asmcomp/afl_instrument.mli asmcomp/afl_instrument.ml
+asmcomp/thread_sanitizer.mli asmcomp/thread_sanitizer.ml asmcomp/cmmgen.mli
+asmcomp/cmmgen.ml asmcomp/cmm_invariants.mli asmcomp/cmm_invariants.ml
+asmcomp/interval.mli asmcomp/interval.ml asmcomp/printmach.mli
+asmcomp/printmach.ml asmcomp/dataflow.mli asmcomp/dataflow.ml
+asmcomp/polling.mli asmcomp/polling.ml asmcomp/selectgen.mli
+asmcomp/selectgen.ml asmcomp/selection.mli asmcomp/selection.ml
+asmcomp/comballoc.mli asmcomp/comballoc.ml asmcomp/CSEgen.mli
+asmcomp/CSEgen.ml asmcomp/CSE.mli asmcomp/CSE.ml asmcomp/liveness.mli
+asmcomp/liveness.ml asmcomp/spill.mli asmcomp/spill.ml asmcomp/split.mli
+asmcomp/split.ml asmcomp/interf.mli asmcomp/interf.ml asmcomp/coloring.mli
+asmcomp/coloring.ml asmcomp/linscan.mli asmcomp/linscan.ml
+asmcomp/reloadgen.mli asmcomp/reloadgen.ml asmcomp/reload.mli
+asmcomp/reload.ml asmcomp/deadcode.mli asmcomp/deadcode.ml
+asmcomp/stackframegen.mli asmcomp/stackframegen.ml asmcomp/stackframe.mli
+asmcomp/stackframe.ml asmcomp/linear.mli asmcomp/linear.ml
+asmcomp/printlinear.mli asmcomp/printlinear.ml asmcomp/linearize.mli
+asmcomp/linearize.ml file_formats/linear_format.mli
+file_formats/linear_format.ml asmcomp/schedgen.mli asmcomp/schedgen.ml
+asmcomp/scheduling.mli asmcomp/scheduling.ml asmcomp/branch_relaxation.mli
+asmcomp/branch_relaxation.ml asmcomp/emitaux.mli asmcomp/emitaux.ml
+asmcomp/emit.mli asmcomp/emit.ml asmcomp/asmgen.mli asmcomp/asmgen.ml
+asmcomp/asmlink.mli asmcomp/asmlink.ml asmcomp/asmlibrarian.mli
+asmcomp/asmlibrarian.ml asmcomp/asmpackager.mli asmcomp/asmpackager.ml
+driver/opterrors.mli driver/opterrors.ml driver/optcompile.mli
+driver/optcompile.ml driver/optmaindriver.mli driver/optmaindriver.ml
+driver/optmain.mli driver/optmain.ml file_formats/cmx_format.mli
+asmcomp/emitenv.mli asmcomp/branch_relaxation_intf.mli"
 
 die() { echo "FATAL: $*" >&2; exit 1; }
 
@@ -83,6 +241,11 @@ ORDER=$( cd "$STAGE" && "$DEPSORT" -sort ./*.mli ./*.ml 2>/dev/null | sed 's|^\.
 [ -n "$ORDER" ] || die "ocamldep -sort produced no order"
 # how many bytecode .ml modules must produce a matching .cmo (the pass threshold)
 NMODS=$(extract_cl | grep -c '\.ml$')
+OSTAGE=$(mktemp -d /tmp/ddc_ostage.XXXXXX)
+for f in $CL_OPT; do cp "$ROOT/$f" "$OSTAGE/$(basename "$f")"; done
+OORDER=$( cd "$OSTAGE" && "$DEPSORT" -sort ./*.mli ./*.ml 2>/dev/null | sed 's|^\./||' )
+[ -n "$OORDER" ] || die "ocamldep -sort produced no native order"
+NOMODS=$(printf '%s\n' $CL_OPT | grep -c '\.ml$')
 
 # ---------------------------------------------------------------------------
 # 2. Build S2 = S1 recompiling the compiler, then linking.
@@ -145,6 +308,15 @@ ddc_build() {   # $1 = "compiler invocation"  $2 = out dir  $3 = label
     fi
   done
   echo "  $tag: build fails=$fails${first:+ (first=$first)}"
+  # the native compiler's sources, over the compiler's interfaces just built
+  fails=0; first=""
+  for base in $OORDER; do
+    cp "$OSTAGE/$base" "$O/$base"; rm -f "$O/${base%.*}.cmo"
+    if ! ( cd "$O" && $CC -nostdlib -I "$O" $FLAGS -c "$base" ) >>"$O/log" 2>&1; then
+      fails=$((fails+1)); [ -z "$first" ] && first="$base: $(tail -1 "$O/log")"
+    fi
+  done
+  echo "  $tag: native sources build fails=$fails${first:+ (first=$first)}"
 }
 
 REF=$(mktemp -d /tmp/ddc_ref.XXXXXX); DIV=$(mktemp -d /tmp/ddc_div.XXXXXX)
@@ -152,7 +324,6 @@ echo "== DDC build =="
 ddc_build "$OPT"            "$REF" "REF (ocamlc.opt)"
 ddc_build "$RUN $S2/ocamlc" "$DIV" "DIV (diverse S2)"
 
-# The only expected failure is cmx_format.mli (native/Clambda), identical in both.
 cis=0 cid=0 cos=0 cod=0 cidl="" codl=""
 for a in "$REF"/*.cmi; do b=$(basename "$a"); [ -f "$DIV/$b" ] || continue
   if cmp -s "$a" "$DIV/$b"; then cis=$((cis+1)); else cid=$((cid+1)); cidl="$cidl $b"; fi; done
@@ -167,11 +338,12 @@ echo "  artifacts: REF=$REF DIV=$DIV  (S1=$WD S2=$S2)"
 echo "=============================================================="
 # A meaningful pass requires ALL bytecode modules compared identical -- not a
 # vacuous 0==0 from a build that produced nothing.
-if [ "$cid" -eq 0 ] && [ "$cod" -eq 0 ] && [ "$cos" -ge "$NMODS" ]; then
+NALL=$((NMODS + NOMODS))
+if [ "$cid" -eq 0 ] && [ "$cod" -eq 0 ] && [ "$cos" -ge "$NALL" ]; then
   echo "PASS: diverse and official compilers produce bit-identical bytecode"
-  echo "      ($cos/$NMODS bytecode .cmo + $cis .cmi, 0 diffs)."
+  echo "      ($cos/$NALL .cmo -- $NMODS bytecode compiler + $NOMODS native compiler -- + $cis .cmi, 0 diffs)."
   exit 0
 else
-  echo "FAIL: divergence or incomplete build (cmo matched $cos/$NMODS; diffs cmi=$cid cmo=$cod)."
+  echo "FAIL: divergence or incomplete build (cmo matched $cos/$NALL; diffs cmi=$cid cmo=$cod)."
   exit 1
 fi
