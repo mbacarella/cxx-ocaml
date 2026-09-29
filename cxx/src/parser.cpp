@@ -2172,6 +2172,23 @@ class Parser {
       StringLoc nm = parse_alias_name();
       Location l = span(p.loc.start, nm.loc.end);
       p = Pattern{Ppat_alias{box(std::move(p)), nm}, l};
+      // `pattern AS val_ident` reduces to a pattern (AS has the lowest
+      // precedence: `a | b as x` aliases the or, `a, b as x` the tuple,
+      // `a :: b as x` the cons); a following `::`, `,` or `|` continues with
+      // it as the left operand, by precedence (`a as x :: l, y | z` is
+      // `(((a as x) :: l), y) | z`)
+      while (cur().kind == Kind::LBRACKETAT) {  // `self attribute`
+        advance();
+        p.attrs.push_back(parse_attribute_body());
+      }
+      if (cur().kind == Kind::COLONCOLON) p = parse_pat_cons_rest(std::move(p));
+      if (cur().kind == Kind::COMMA) p = parse_pat_tuple_rest(std::move(p), {std::nullopt, false});
+      while (cur().kind == Kind::BAR) {
+        advance();
+        Pattern r = parse_pat_or_operand();
+        Location lo = span(p.loc.start, r.loc.end);
+        p = Pattern{Ppat_or{box(std::move(p)), box(std::move(r))}, lo};
+      }
     }
     return p;
   }
@@ -2195,15 +2212,6 @@ class Parser {
   Pattern parse_pat_or() {
     Pattern p = parse_pat_or_operand();
     for (;;) {
-      // `operand as x | …` : the alias binds to this operand and the or continues
-      // (whereas a trailing `… as x` with no following `|` aliases the whole or).
-      if (cur().kind == Kind::AS && peek(1).kind == Kind::LIDENT &&
-          peek(2).kind == Kind::BAR) {
-        advance();
-        const Token& nm = cur(); advance();
-        Location l = span(p.loc.start, position(nm.end));
-        p = Pattern{Ppat_alias{box(std::move(p)), StringLoc{nm.text, tokloc(nm)}}, l};
-      }
       if (cur().kind != Kind::BAR) break;
       advance();
       Pattern r = parse_pat_or_operand();
@@ -2242,32 +2250,27 @@ class Parser {
       elem_pun_ = true;
       return {id.text, Pattern{Ppat_constraint{box(std::move(var)), std::move(ty)}, cl}};
     }
-    Pattern p = parse_pat_cons();
-    // A (possibly chained) `as id` binds to *this* tuple element only when another
-    // element follows (a comma after the whole alias chain); a trailing alias binds
-    // the whole tuple instead (handled above parse_pat_tuple).
-    int k = 0;
-    while (peek(k).kind == Kind::AS && peek(k + 1).kind == Kind::LIDENT) k += 2;
-    if (k > 0 && peek(k).kind == Kind::COMMA)
-      for (int j = 0; j < k; j += 2) {
-        advance(); const Token& id = cur(); advance();
-        Location l = span(p.loc.start, position(id.end));
-        p = Pattern{Ppat_alias{box(std::move(p)), StringLoc{id.text, tokloc(id)}}, l};
-      }
-    return {std::nullopt, std::move(p)};
+    // (an `as` ends the tuple: parse_pat_alias aliases the whole of it)
+    return {std::nullopt, parse_pat_cons()};
   }
   Pattern parse_pat_tuple() {
     Position s = position(cur().start);
     elem_pun_ = false;
     auto first = parse_labeled_pat_elem();
     if (cur().kind != Kind::COMMA) return std::move(first.second);
+    return parse_pat_tuple_rest(std::move(first.second), {first.first, elem_pun_}, s);
+  }
+  // the rest of a tuple (at a `,`) whose first element is `first`
+  Pattern parse_pat_tuple_rest(Pattern first, std::pair<std::optional<std::string>, bool> first_label,
+                               std::optional<Position> start = std::nullopt) {
+    Position s = start ? *start : first.loc.start;
     std::vector<PatBox> elems;
     std::vector<std::optional<std::string>> labels;
     std::vector<bool> puns;
     ClosedFlag closed = ClosedFlag::Closed;
-    elems.push_back(box(std::move(first.second)));
-    labels.push_back(first.first);
-    puns.push_back(elem_pun_);
+    elems.push_back(box(std::move(first)));
+    labels.push_back(first_label.first);
+    puns.push_back(first_label.second);
     while (cur().kind == Kind::COMMA) {
       advance();
       if (cur().kind == Kind::DOTDOT) { advance(); closed = ClosedFlag::Open; break; }  // (.., ..)
@@ -2306,18 +2309,11 @@ class Parser {
         for (auto& a : opattrs) p.attrs.push_back(std::move(a));
       else idx_ = save; undo_docs(dsave);
     }
-    // `(p) as x :: rest`: OCaml's `::` has higher precedence than `as`, so the LR
-    // parser shifts the `::` -- the alias binds to this cons OPERAND. We mirror
-    // that only when a `::` follows the alias; a trailing `as x` (no `::`) belongs
-    // to the whole pattern (parse_pat_alias), keeping `a::b as x` == `(a::b) as x`.
-    if (cur().kind == Kind::AS && peek(1).kind == Kind::LIDENT &&
-        peek(2).kind == Kind::COLONCOLON) {
-      advance();
-      StringLoc nm = parse_alias_name();
-      Location al = span(p.loc.start, nm.loc.end);
-      p = Pattern{Ppat_alias{box(std::move(p)), nm}, al};
-    }
     if (cur().kind != Kind::COLONCOLON) return p;
+    return parse_pat_cons_rest(std::move(p));
+  }
+  // `p :: rest`, at the `::`
+  Pattern parse_pat_cons_rest(Pattern p) {
     const Token& optok = cur();
     advance();
     Pattern r = parse_pat_cons_core();  // right-assoc; trailing attr handled by the caller
