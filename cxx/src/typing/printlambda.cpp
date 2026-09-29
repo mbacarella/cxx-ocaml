@@ -216,6 +216,8 @@ void print_boxed_integer(std::string_view name, Formatter& ppf, BoxedInteger bi)
   fprintf(ppf, "%s", boxed_integer_mark(name, bi));
 }
 
+}  // namespace
+
 void print_bigarray(std::string_view name, bool unsafe, BigarrayKind kind, Formatter& ppf, BigarrayLayout layout) {
   std::string_view k;
   switch (kind) {
@@ -243,6 +245,8 @@ void print_bigarray(std::string_view name, bool unsafe, BigarrayKind kind, Forma
   std::string n = unsafe ? "unsafe_" + std::string(name) : std::string(name);
   fprintf(ppf, "Bigarray.%s[%s,%s]", n, k, l);
 }
+
+namespace {
 
 void physical_comparison(Formatter& ppf, PhysicalComparison c) {
   switch (c) {

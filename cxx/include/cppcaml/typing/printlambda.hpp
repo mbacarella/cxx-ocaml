@@ -20,6 +20,8 @@ std::string name_of_primitive(const lambda::Primitive& p);
 void value_kind(format::Formatter& ppf, const lambda::ValueKind& k);
 void block_shape(format::Formatter& ppf, const lambda::BlockShape& s);
 void record_rep(format::Formatter& ppf, const RecordRepresentation& r);
+void print_bigarray(std::string_view name, bool unsafe, lambda::BigarrayKind kind, format::Formatter& ppf,
+                    lambda::BigarrayLayout layout);
 
 // ---- additions (not in printlambda.mli) ----
 // Clflags read by the printer, with ocamlc's defaults (-d(no-)locations,
