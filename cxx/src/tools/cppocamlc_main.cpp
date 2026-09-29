@@ -776,10 +776,14 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
         {
           ty::cmx_format::UnitInfos& cu = ty::compilenv::current_unit();
           cu.ui_imports_cmi.clear();
-          // the current unit's entry holds its modname string (ui_name's)
+          // the current unit's entry holds its modname string (ui_name's) --
+          // unless -cmi-file named the interface (Unit_info.Artifact.
+          // from_filename makes a fresh modname, which Env.read_signature
+          // added), as Emitcode's
           for (auto& [name, crc] : ty::env::imports())
           {
-            std::string_view n = name == cu.ui_name ? cu.ui_name : ty::env::import_name(name);
+            std::string_view n =
+                name == cu.ui_name && !cf::cmi_file ? cu.ui_name : ty::env::import_name(name);
             cu.ui_imports_cmi.push_back({n.data() ? n : ty::zstr(name), crc});
           }
           std::string bytes = ty::cmx_format::write_unit_info(cu);

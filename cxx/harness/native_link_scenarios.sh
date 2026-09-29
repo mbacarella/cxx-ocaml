@@ -66,4 +66,5 @@ scen pack-forward 'C=$C; $C -for-pack P -c a.ml b.ml && $C -pack -o p.cmx b.cmx 
 scen pack-wrong-for-pack 'C=$C; $C -c a.ml b.ml && $C -pack -o p.cmx a.cmx b.cmx'
 scen pack-renamed 'C=$C; $C -for-pack P -c a.ml && cp a.cmx z.cmx && cp a.o z.o && $C -pack -o p.cmx z.cmx'
 scen pack-not-found 'C=$C; $C -pack -o p.cmx nothere.cmx'
+scen cmi-file 'C=$C; $B/ocamlc.opt -nostdlib -I $B/stdlib -c a.ml && rm a.cmo && $C -cmi-file a.cmi -c a.ml'
 rm -rf $W
