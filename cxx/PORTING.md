@@ -123,7 +123,7 @@ Tast_mapper rebuild (called in the mapper's evaluation order),
 and the shape reduced by `Shape_reduce.local_reduce`.  A failed
 implementation writes the partial .cmt from Cmt_format's saved types.
 
-## The native compiler (in progress)
+## The native compiler
 
 `c++ocamlopt` is the same driver built with `CPPCAML_OCAMLOPT`
 (Optmaindriver / Optcompile): `native_code` set before the arguments,
@@ -219,7 +219,12 @@ the tree's 11 .cmxa files identically.  A link-only run first creates the
 idents ocamlopt's modules create while they initialize (their stamps
 reach `-dcmm`).
 
-Next: build the compiler itself with c++ocamlopt and compare the binaries.
+`native_self_build.sh` runs the tree's own build commands for
+ocamlopt.opt (`make -n -W utils/misc.ml ocamlopt.opt`: 260 compiles with
+`-g -absname -bin-annot -function-sections`, ocamlcommon.cmxa and
+ocamloptcomp.cmxa, the link) once with ocamlopt.opt and once with
+c++ocamlopt: all 845 artifacts (.cmx, .o, .cmi, .cmxa, .a) and the
+ocamlopt.opt executable are byte-identical.
 
 ## Oracles and gates
 
