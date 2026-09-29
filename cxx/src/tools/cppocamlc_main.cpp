@@ -48,6 +48,7 @@
 #include "cppcaml/typing/linear.hpp"
 #include "cppcaml/typing/emit.hpp"
 #include "cppcaml/typing/asmgen.hpp"
+#include "cppcaml/typing/evacuate.hpp"
 #include "cppcaml/typing/asmlibrarian.hpp"
 #include "cppcaml/typing/asmlink.hpp"
 #include "cppcaml/typing/asmpackager.hpp"
@@ -603,6 +604,9 @@ static void init_lexer() {
   cppcaml::set_keyword_edition(version, std::vector<std::string>(parts.begin() + 1, parts.end()));
 }
 
+// the source files the invocation has yet to compile (the current one
+// included)
+static long g_sources_left = 0;
 static int compile_ml_(const std::string& in_path, const std::string& cmo_out, bool prof);
 static int compile_ml(const std::string& in_path, const std::string& cmo_out, bool prof) {
   if (refuse_unsupported_compile_option()) return 2;
@@ -629,6 +633,21 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
   if (!ast_file) cppcaml::typing::location::input_source = src;
   // Unit_info.modname: from the output prefix (-o stdlib__Arg.cmo -> Stdlib__Arg)
   std::string mod = module_name(cmo_out);
+  // c++ocamlopt: the typing phase (the trees, the types, the environments)
+  // in a zone of its own, dropped once the unit is in Lambda and what the
+  // back end needs of it is copied out (evacuate.hpp).  CPPCAML_ZONE_PROTECT:
+  // its storage made inaccessible instead of freed (a later use faults).
+  // Only when nothing type-checks after this unit: the typer's caches (as
+  // Ctype's memorized abbreviations) outlive a unit, in the zone of the
+  // unit that filled them -- a later source file of the invocation, or
+  // -pack's Typemod.package_units, would read them.
+  const bool zone_protect = std::getenv("CPPCAML_ZONE_PROTECT") != nullptr;
+  std::unique_ptr<ty::Zone> typing_zone;
+  std::optional<ty::ZoneScope> in_typing_zone;
+  if (kNative && g_sources_left <= 1 && !cf::make_package) {
+    typing_zone = std::make_unique<ty::Zone>(zone_protect);
+    in_typing_zone.emplace(*typing_zone);
+  }
   using clk = std::chrono::steady_clock;
   auto t0 = clk::now();
   auto lap = [&](const char* what, clk::time_point& prev) {
@@ -756,6 +775,44 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
       ppf_dump.out().flush();
       lap("lambda", tp);
       if (!cf::should_stop_after(cf::Pass::Lambda)) {
+        ty::cmx_format::UnitInfos& cu = ty::compilenv::current_unit();
+        // Compilenv.save_unit_info's Env.imports (): the back end reads no
+        // .cmi, so the list is complete here.  The current unit's entry
+        // holds its modname string (ui_name's) -- unless -cmi-file named
+        // the interface (Unit_info.Artifact.from_filename makes a fresh
+        // modname, which Env.read_signature added), as Emitcode's
+        cu.ui_imports_cmi.clear();
+        for (auto& [name, crc] : ty::env::imports()) {
+          std::string_view n = name == cu.ui_name && !cf::cmi_file ? cu.ui_name : ty::env::import_name(name);
+          cu.ui_imports_cmi.push_back({n.data() ? n : ty::zstr(name), crc});
+        }
+        // the typing zone dropped: the Lambda program's references into it,
+        // Translmod's primitive declarations, the unit's symbol strings and
+        // the file names copied out first
+        in_typing_zone.reset();
+        if (typing_zone) {
+          ty::evacuate::Evacuator ev(*typing_zone);
+          prog.module_ident = ev.ident(prog.module_ident);
+          ty::lambda::IdentSet globals;
+          for (ty::Ident::t id : prog.required_globals) globals.insert(ev.ident(id));
+          prog.required_globals = std::move(globals);
+          prog.code = lam;
+          ev.lambda(lam);
+          for (const ty::PrimitiveDescription*& p : ty::translmod::primitive_declarations) p = ev.prim_desc(p);
+          cu.ui_name = ev.str(cu.ui_name);
+          cu.ui_symbol = ev.str(cu.ui_symbol);
+          for (std::string_view& d : cu.ui_defines) d = ev.str(d);
+          if (cu.ui_for_pack) cu.ui_for_pack = ev.str(*cu.ui_for_pack);
+          for (auto& [n, crc] : cu.ui_imports_cmi) n = ev.str(n);
+          ty::Fname::relocate(
+              *typing_zone,
+              [](void* e, std::string_view s) { return static_cast<ty::evacuate::Evacuator*>(e)->str(s); }, &ev);
+          if (zone_protect)
+            for (const std::string& x : ev.leftovers(lam)) std::cerr << "evacuation leftover: " << x << "\n";
+          impl.reset();
+          if (zone_protect) typing_zone->drop_protected();
+          else typing_zone.reset();
+        }
         // Asmgen.compile_implementation: Compilenv.require_global on the
         // required globals, the middle end (Closure_middle_end)
         for (ty::Ident::t id : prog.required_globals) ty::compilenv::require_global(id);
@@ -793,18 +850,6 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
         lap("emit", tp);
         // Compilenv.save_unit_info (the .cmx)
         {
-          ty::cmx_format::UnitInfos& cu = ty::compilenv::current_unit();
-          cu.ui_imports_cmi.clear();
-          // the current unit's entry holds its modname string (ui_name's) --
-          // unless -cmi-file named the interface (Unit_info.Artifact.
-          // from_filename makes a fresh modname, which Env.read_signature
-          // added), as Emitcode's
-          for (auto& [name, crc] : ty::env::imports())
-          {
-            std::string_view n =
-                name == cu.ui_name && !cf::cmi_file ? cu.ui_name : ty::env::import_name(name);
-            cu.ui_imports_cmi.push_back({n.data() ? n : ty::zstr(name), crc});
-          }
           std::string bytes = ty::cmx_format::write_unit_info(cu);
           std::ofstream os(cmo_out, std::ios::binary);
           os << bytes;
@@ -1140,11 +1185,16 @@ static int run_main(int argc, char** argv) {
       ctx.compile_implementation = [&](cf::Pass start_from, const std::string& source_file,
                                        const std::string& output_prefix) -> int {
         (void)start_from;  // (only Parsing reaches here: .cmir-linear is refused)
-        return compile_ml(source_file, output_prefix + (kNative ? ".cmx" : ".cmo"), prof);
+        int rc = compile_ml(source_file, output_prefix + (kNative ? ".cmx" : ".cmo"), prof);
+        --g_sources_left;
+        return rc;
       };
       ctx.compile_interface = [](const std::string& source_file, const std::string& output_prefix) {
-        return compile_mli(source_file, output_prefix + ".cmi");
+        int rc = compile_mli(source_file, output_prefix + ".cmi");
+        --g_sources_left;
+        return rc;
       };
+      g_sources_left = ce::source_actions();
       ctx.ocaml_mod_ext = kNative ? ".cmx" : ".cmo";
       ctx.ocaml_lib_ext = kNative ? ".cmxa" : ".cma";
       ce::process_deferred_actions(ctx);

@@ -33,6 +33,10 @@ class Fname {
   friend bool operator==(const Fname& a, const Fname& b) { return a.view() == b.view(); }
   friend bool operator==(const Fname& a, std::string_view b) { return a.view() == b; }
   friend bool operator==(const Fname& a, const char* b) { return a.view() == std::string_view(b); }
+  // the handles whose string [dying] holds point to [copy]'s copy of it
+  // from now on (the zone is being dropped: evacuate.hpp -- the evacuator's
+  // copy, which the other references to the string share)
+  static void relocate(const Zone& dying, std::string_view (*copy)(void*, std::string_view), void* ctx);
 
  private:
   static const std::string_view* intern(std::string_view s);

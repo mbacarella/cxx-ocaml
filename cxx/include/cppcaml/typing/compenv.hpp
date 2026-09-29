@@ -64,6 +64,9 @@ struct ActionContext {
   std::string ocaml_lib_ext;
 };
 void process_deferred_actions(const ActionContext& env);
+// the source files (implementations and interfaces) the deferred actions
+// compile
+long source_actions();
 
 // Clflags.arg_spec (Clflags.add_arguments / print_arguments)
 std::vector<arg::Option>& arg_spec();

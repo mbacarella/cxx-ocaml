@@ -28,6 +28,9 @@ namespace cppcaml::typing {
 class Zone {
  public:
   Zone() = default;
+  // mmap_all: every block from the kernel (drop_protected can then make the
+  // storage inaccessible)
+  explicit Zone(bool mmap_all) : mmap_all_(mmap_all) {}
   Zone(const Zone&) = delete;
   Zone& operator=(const Zone&) = delete;
   ~Zone() {
@@ -82,6 +85,10 @@ class Zone {
     off_ = 0;
   }
 
+  // (a check) drop everything, making the storage inaccessible instead of
+  // freeing it: a later use of it faults (the zone must be mmap_all)
+  void drop_protected();
+
   // A zone allocating only from [base, base + cap) (a .cmi image being
   // recorded, cmi_image.hpp): past it, alloc throws RegionFull.
   struct RegionFull {};
@@ -130,9 +137,10 @@ class Zone {
     std::size_t unit = big ? kBigBlock : kBlock;
     std::size_t sz = n > unit ? n : unit;
     block_bytes() += sz;
-    char* blk = big ? huge_block(sz) : static_cast<char*>(std::malloc(sz));
+    bool mapped = big || mmap_all_;
+    char* blk = mapped ? huge_block(sz) : static_cast<char*>(std::malloc(sz));
     if (!blk) throw std::bad_alloc();
-    blocks_.emplace_back(blk, Free{big ? sz : 0});
+    blocks_.emplace_back(blk, Free{mapped ? sz : 0});
     cur_ = blk;
     ranges_.emplace(cur_, sz);
     cap_ = sz;
@@ -151,6 +159,7 @@ class Zone {
   char* cur_ = nullptr;
   std::size_t cap_ = 0, off_ = 0;
   bool fixed_ = false;
+  bool mmap_all_ = false;
   std::vector<std::pair<void*, void (*)(void*)>> dtors_;
 };
 

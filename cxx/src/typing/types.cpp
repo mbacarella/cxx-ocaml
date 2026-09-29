@@ -21,12 +21,16 @@ ZoneScope::ZoneScope(Zone& z) : saved(g_zone) { g_zone = &z; }
 ZoneScope::~ZoneScope() { g_zone = saved; }
 const void* fresh_identity() { return zone().alloc(1, 1); }
 
+static std::unordered_map<std::uint64_t, std::unordered_map<std::size_t, const std::string_view*>>& fname_handles() {
+  static std::unordered_map<std::uint64_t, std::unordered_map<std::size_t, const std::string_view*>> h;
+  return h;
+}
 const std::string_view* Fname::intern(std::string_view s) {
   if (!s.data()) return nullptr;
   // a .cmi image being recorded holds its own handles (its positions are
   // read by other processes); the others are interned, permanent
   if (zone().is_fixed()) return zone().make<std::string_view>(s);
-  static std::unordered_map<std::uint64_t, std::unordered_map<std::size_t, const std::string_view*>> handles;
+  auto& handles = fname_handles();
   auto& byp = handles[reinterpret_cast<std::uintptr_t>(s.data())];
   auto [it, fresh] = byp.try_emplace(s.size(), nullptr);
   if (fresh) it->second = permanent_zone().make<std::string_view>(s);
@@ -45,6 +49,35 @@ char* Zone::huge_block(std::size_t sz) {
   if (end > p + sz) ::munmap(p + sz, end - (p + sz));
   ::madvise(p, sz, MADV_HUGEPAGE);
   return p;
+}
+void Fname::relocate(const Zone& dying, std::string_view (*copy_of)(void*, std::string_view), void* ctx) {
+  auto& handles = fname_handles();
+  std::vector<std::pair<std::uint64_t, std::size_t>> moved;
+  for (auto& [ptr, bysize] : handles)
+    for (auto& [size, h] : bysize)
+      if (dying.owns(h->data())) moved.emplace_back(ptr, size);
+  for (auto [ptr, size] : moved) {
+    auto& bysize = handles[ptr];
+    const std::string_view* h = bysize.at(size);
+    bysize.erase(size);
+    if (bysize.empty()) handles.erase(ptr);
+    std::string_view copy = copy_of(ctx, *h);
+    *const_cast<std::string_view*>(h) = copy;
+    handles[reinterpret_cast<std::uintptr_t>(copy.data())][size] = h;
+  }
+}
+
+void Zone::drop_protected() {
+  for (auto it = dtors_.rbegin(); it != dtors_.rend(); ++it) it->second(it->first);
+  dtors_.clear();
+  for (auto& b : blocks_) {
+    char* p = b.release();
+    ::mprotect(p, ranges_.at(p), PROT_NONE);
+  }
+  blocks_.clear();
+  ranges_.clear();
+  cur_ = nullptr;
+  cap_ = off_ = 0;
 }
 void Zone::Free::operator()(char* p) const {
   if (huge) ::munmap(p, huge);

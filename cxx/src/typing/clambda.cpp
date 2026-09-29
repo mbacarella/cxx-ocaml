@@ -278,6 +278,7 @@ ulambda uunreachable() { return node<Uunreachable>(); }
 
 const ValueApproximation* value_unknown() {
   static const ValueApproximation* u = [] {
+    ZoneScope perm(permanent_zone());
     auto* a = make<ValueApproximation>();
     a->kind = ValueApproximation::Kind::Value_unknown;
     return a;

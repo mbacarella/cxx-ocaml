@@ -34,7 +34,14 @@ descs, paths, idents and persistent maps are never freed one by one; OCaml
 lists inside immutable values become zone `Slice`s.  Where OCaml's garbage
 is well delimited the port reclaims explicitly (the trail's zone, Matching's
 and Parmatch's scratch zones, the copy scopes' Tsubst descs, the C++
-parser's tree once converted).  Hot lookups keep OCaml's `try ... with
+parser's tree once converted).  c++ocamlopt types a unit in a zone of its
+own and drops it once the unit is in Lambda (the OCaml GC reclaims the
+typed tree then): `typing/evacuate.hpp` first copies out what the back end
+reads, one copy per object so that the writers' sharing is kept, and
+`CPPCAML_ZONE_PROTECT=1` makes the dropped zone fault on any later use (the
+check for a missed reference).  Not when a later source file of the
+invocation or `-pack` types again: the typer's caches live on in the zone
+that filled them.  Hot lookups keep OCaml's `try ... with
 Not_found` off the C++ exception path.  Lifetime changes are checked with an
 AddressSanitizer build over the probes, the compiler and the testsuite.
 

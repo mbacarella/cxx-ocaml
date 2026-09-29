@@ -116,6 +116,7 @@ add_library(cppcaml_core
   src/typing/linearize.cpp
   src/typing/emit.cpp
     src/typing/asmgen.cpp
+    src/typing/evacuate.cpp
     src/typing/asmlink.cpp
     src/typing/asmlibrarian.cpp
     src/typing/asmpackager.cpp

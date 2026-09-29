@@ -661,6 +661,13 @@ void impl(const std::string& filename) {
 }
 void intf(const std::string& filename) { defer({DeferredAction::K::ProcessInterface, filename, {}, false}); }
 
+long source_actions() {
+  long n = 0;
+  for (const DeferredAction& a : deferred_actions)
+    if (a.k == DeferredAction::K::ProcessImplementation || a.k == DeferredAction::K::ProcessInterface) ++n;
+  return n;
+}
+
 void process_deferred_actions(const ActionContext& env) {
   namespace cf = clflags;
   using K = DeferredAction::K;
