@@ -843,6 +843,7 @@ class Parser {
             Position colonPos = position(cur().start);
             advance();
             CoreTypeBox fty = parse_poly_type(/*ghost=*/false);
+            Position ftyend = position(tokens_[idx_ - 1].end);  // (incl. a parenthesized type's `)`)
             if (cur().kind == Kind::EQUAL) {  // `{ f : ty = e }` -> f = (e : ty)
               advance();
               ExprBox v = parse_expr_no_seq();
@@ -853,7 +854,7 @@ class Parser {
               glbl.loc.ghost = true;
               LongidentLoc vid{{Lident{lid_last_name(lbl.txt)}}, lbl.loc};
               ExprBox id = E({Pexp_ident{.id = std::move(vid)}, lbl.loc});
-              Location cl{lbl.loc.start, fty->loc.end, false};
+              Location cl{lbl.loc.start, ftyend, false};
               fields.emplace_back(glbl, E({Pexp_constraint{std::move(id), std::move(fty)}, cl}));
             }
           } else if (cur().kind == Kind::EQUAL) {
@@ -1075,6 +1076,11 @@ class Parser {
   }
 
   ExprBox parse_unary() {
+    if (injected_left_) {
+      ExprBox e = std::move(*injected_left_);
+      injected_left_.reset();
+      return e;
+    }
     const Token& t = cur();
     // A keyword-led expression (match/function/fun/try/if/let) appearing in
     // operand position (e.g. the RHS of an infix operator) extends to the right
@@ -1082,7 +1088,7 @@ class Parser {
     switch (t.kind) {
       case Kind::MATCH: case Kind::FUNCTION: case Kind::FUN:
       case Kind::TRY: case Kind::IF: case Kind::LET: case Kind::LETOP:
-        return parse_expr_no_seq();
+        return parse_expr_no_seq_core();
       default: break;
     }
     // Unary sign: subtractive {- -.} and additive {+ +.}.  Folds literals into a
@@ -1271,7 +1277,7 @@ class Parser {
     return p;
   }
   ExprBox parse_tuple() {
-    Position s = position(cur().start);
+    Position s = injected_left_ ? (*injected_left_)->loc.start : position(cur().start);
     elem_punned_constr_ = false;
     elem_pun_ = false;
     auto first = parse_labeled_tuple_elem();
@@ -1300,16 +1306,12 @@ class Parser {
     ExprBox tup = E({Pexp_tuple{std::move(elems), std::move(labels), std::move(puns)}, l});
     // A labeled tuple's element values are simple_expr, so a trailing `::` conses
     // the *whole* tuple as the head (`(~a:x, ~b:y) :: l`).
-    if (labeled && cur().kind == Kind::COLONCOLON) {
-      const Token& optok = cur(); advance();
-      ExprBox right = parse_binop(6);
-      Position ls = tup->loc.start, re = right->loc.end;
-      Location gl = gloc(ls, re);
-      std::vector<ExprBox> ct;
-      ct.push_back(std::move(tup));
-      ct.push_back(std::move(right));
-      ExprBox consarg = E({Pexp_tuple{std::move(ct)}, gl});
-      return mk_construct(lid0("::", tokloc(optok)), std::move(consarg), Location{ls, re, false});
+    // A labeled element's value is a simple_expr: when the last element is
+    // labeled, a following infix operator or `::` takes the whole tuple as its
+    // left operand (`~a:x, ~b:y |> f` is `(~a:x, ~b:y) |> f`)
+    if (labeled && (infix_op(cur()) || cur().kind == Kind::COLONCOLON)) {
+      injected_left_ = std::move(tup);
+      return parse_tuple();
     }
     return tup;
   }
@@ -1317,10 +1319,11 @@ class Parser {
   static bool expr_starts(Kind k) {
     if (is_atom_start(k)) return true;
     switch (k) {
-      case Kind::LET: case Kind::IF: case Kind::MATCH: case Kind::FUNCTION:
+      case Kind::LET: case Kind::LETOP: case Kind::IF: case Kind::MATCH: case Kind::FUNCTION:
       case Kind::TRY: case Kind::FUN: case Kind::WHILE: case Kind::FOR:
       case Kind::ASSERT: case Kind::LAZY: case Kind::MINUS: case Kind::MINUSDOT:
       case Kind::PLUS: case Kind::PLUSDOT:
+      case Kind::LABEL: case Kind::TILDE:  // a labeled tuple (`~l:e, …`, `~x, …`)
         return true;
       default: return false;
     }
@@ -1417,7 +1420,28 @@ class Parser {
     ep.str.push_back(StructureItem{Pstr_eval{std::move(e)}, gl});
     return E({Pexp_extension{std::move(*ext), std::move(ep)}, outer});
   }
+  // An open-ended expression (let, match, fun, try -- not function: its last part is a
+  // seq_expr) whose body ended with a trailing `;` has been reduced by the
+  // LR parser when the next token cannot continue the sequence: an infix
+  // operator, `::`, `,`, `:=` or `<-` then takes the whole of it as its left
+  // operand (`let x = e in a; |> ignore` is `(let x = e in a) |> ignore`).
+  // (In operand position -- parse_unary -- the enclosing operator's loop
+  // continues instead, by precedence.)
   ExprBox parse_expr_no_seq() {
+    Kind k = cur().kind;
+    bool open_ended = k == Kind::LET || k == Kind::LETOP || k == Kind::MATCH ||
+                      k == Kind::FUN || k == Kind::TRY;
+    ExprBox e = parse_expr_no_seq_core();
+    if (open_ended && idx_ > 0 && tokens_[idx_ - 1].kind == Kind::SEMI &&
+        (infix_op(cur()) || cur().kind == Kind::COLONCOLON || cur().kind == Kind::COMMA ||
+         cur().kind == Kind::COLONEQUAL || cur().kind == Kind::LESSMINUS)) {
+      injected_left_ = std::move(e);
+      return parse_assign();  // (the first operand: injected_left_)
+    }
+    return e;
+  }
+  std::optional<ExprBox> injected_left_;  // a left operand already parsed (above)
+  ExprBox parse_expr_no_seq_core() {
     const Token& t = cur();
     switch (t.kind) {
       case Kind::LET: {
@@ -2525,11 +2549,12 @@ class Parser {
         if (cur().kind == Kind::COLON) {
           advance();
           CoreTypeBox ty = parse_poly_type(/*ghost=*/false);  // (pat : 'a. t) poly constraint
+          Position tyend = position(tokens_[idx_ - 1].end);
           const Token& c = cur(); expect_closing(Kind::RPAREN, ")", t, "(");
           // a poly-type constraint takes the inner pat..type span; a plain type
           // takes the parenthesised span.
           Location l = std::holds_alternative<Ptyp_poly>(ty->desc)
-                           ? span(p.loc.start, ty->loc.end)
+                           ? span(p.loc.start, tyend)
                            : span(position(t.start), position(c.end));
           return {Ppat_constraint{box(std::move(p)), std::move(ty)}, l};
         }
@@ -2593,6 +2618,7 @@ class Parser {
             Position colonPos = position(cur().start);
             advance();
             CoreTypeBox fty = parse_poly_type(/*ghost=*/false);
+            Position ftyend = position(tokens_[idx_ - 1].end);  // (incl. a parenthesized type's `)`)
             if (cur().kind == Kind::EQUAL) {  // `{ f : ty = p }` -> f = (p : ty)
               advance();
               PatBox p = box(parse_pattern());
@@ -2602,7 +2628,7 @@ class Parser {
               LongidentLoc glbl = lbl;
               glbl.loc.ghost = true;
               PatBox var = box(Pattern{Ppat_var{StringLoc{lid_last_name(lbl.txt), lbl.loc}}, lbl.loc});
-              Location cl{lbl.loc.start, fty->loc.end, false};
+              Location cl{lbl.loc.start, ftyend, false};
               fields.emplace_back(glbl, box(Pattern{Ppat_constraint{std::move(var), std::move(fty)}, cl}));
             }
           } else if (cur().kind == Kind::EQUAL) {
@@ -2648,6 +2674,7 @@ class Parser {
       if (cur().kind == Kind::SEMI) {
         endp = position(cur().end); advance(); more = true;
         while (cur().kind == Kind::LBRACKETAT) { advance(); fattrs.push_back(parse_attribute_body()); }
+        endp = position(tokens_[idx_ - 1].end);  // (label_declaration_semi: SEMI attributes)
         // `field : t ; (** doc *)`  -> the doc after the `;` is the field's info doc
         // (label_declaration_semi: rhs_info before semi, else symbol_info after).
         if (!got_doc) append_info_doc(fattrs, tokens_[idx_ - 1].end);
@@ -2706,14 +2733,14 @@ class Parser {
       if (cur().kind == Kind::LBRACE) {  // A : { fields } -> tres  (inline record)
         args = Pcstr_record{parse_label_decls()};
         expect(Kind::MINUSGREATER, "->");
-        res = parse_core_type();
+        res = parse_type_app();  // atomic_type (a trailing [@attr] is the constructor's)
       } else {
         std::vector<CoreTypeBox> ts;
         ts.push_back(parse_type_app());
         while (cur().kind == Kind::STAR) { advance(); ts.push_back(parse_type_app()); }
         if (cur().kind == Kind::MINUSGREATER) {
           advance();
-          res = parse_core_type();
+          res = parse_type_app();
           args = Pcstr_tuple{std::move(ts)};
         } else {
           res = std::move(ts[0]);  // no arrow: the lone type is the result, no args
@@ -2834,12 +2861,12 @@ class Parser {
         if (cur().kind == Kind::LBRACE) {  // C : { fields } -> tres
           args = Pcstr_record{parse_label_decls()};
           expect(Kind::MINUSGREATER, "->");
-          res = parse_core_type();
+          res = parse_type_app();
         } else {
           std::vector<CoreTypeBox> ts;
           ts.push_back(parse_type_app());
           while (cur().kind == Kind::STAR) { advance(); ts.push_back(parse_type_app()); }
-          if (cur().kind == Kind::MINUSGREATER) { advance(); res = parse_core_type(); args = Pcstr_tuple{std::move(ts)}; }
+          if (cur().kind == Kind::MINUSGREATER) { advance(); res = parse_type_app(); args = Pcstr_tuple{std::move(ts)}; }
           else res = std::move(ts[0]);
         }
         endp = position(tokens_[idx_ - 1].end);
@@ -2990,9 +3017,10 @@ class Parser {
       const Token& id = cur(); advance();
       expect(Kind::COLON, ":");
       CoreTypeBox ty = parse_poly_type(/*ghost=*/false);
+      Position tyend = position(tokens_[idx_ - 1].end);  // (a parenthesized type's `)` included)
       const Token& c = cur(); expect(Kind::RPAREN, ")");
       Pattern var{Ppat_var{StringLoc{id.text, tokloc(id)}}, tokloc(id)};
-      Location pl = span(position(id.start), ty->loc.end);  // inner: x..type
+      Location pl = span(position(id.start), tyend);  // inner: x..type
       Pattern p{Ppat_constraint{box(std::move(var)), std::move(ty)}, pl};
       Location loc = span(position(t.start), position(c.end));  // ~..)
       return FunctionParam{Pparam_val{loc, Labelled{id.text}, std::nullopt, std::move(p), true}};
@@ -3019,7 +3047,7 @@ class Parser {
         Pattern p = parse_pattern();
         if (cur().kind == Kind::COLON) {
           advance(); CoreTypeBox ty = parse_poly_type(/*ghost=*/false);
-          Location pl = span(p.loc.start, ty->loc.end);  // inner: pat..type
+          Location pl = span(p.loc.start, position(tokens_[idx_ - 1].end));  // inner: pat..type
           p = Pattern{Ppat_constraint{box(std::move(p)), std::move(ty)}, pl};
         }
         std::optional<ExprBox> def;
@@ -3041,7 +3069,7 @@ class Parser {
       Pattern p{Ppat_var{StringLoc{id.text, tokloc(id)}}, tokloc(id)};
       if (cur().kind == Kind::COLON) {
         advance(); CoreTypeBox ty = parse_poly_type(/*ghost=*/false);
-        Location pl = span(p.loc.start, ty->loc.end);  // inner: x..type
+        Location pl = span(p.loc.start, position(tokens_[idx_ - 1].end));  // inner: x..type
         p = Pattern{Ppat_constraint{box(std::move(p)), std::move(ty)}, pl};
       }
       std::optional<ExprBox> def;
@@ -3284,6 +3312,8 @@ class Parser {
     expect(Kind::LET, "let");
     let_ext_ = std::nullopt;
     if (cur().kind == Kind::PERCENT) { advance(); let_ext_ = parse_ext_name(); }  // let%ext
+    // (this let's extension: a let nested in the bindings resets let_ext_)
+    std::optional<ExtName> this_ext = let_ext_;
     bool saved_pun = letext_pun_;
     letext_pun_ = let_ext_.has_value();  // `let%ext` bindings may pun (`let%ext x` = `x = x`)
     Attributes letattrs;  // `let[@attr] …`  -> attached to the first binding
@@ -3311,6 +3341,7 @@ class Parser {
       binds.push_back(std::move(vb));
     }
     letext_pun_ = saved_pun;
+    let_ext_ = std::move(this_ext);
     return {rf, std::move(binds)};
   }
 
