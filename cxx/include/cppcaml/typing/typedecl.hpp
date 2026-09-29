@@ -19,12 +19,10 @@ namespace et = errortrace;
 
 enum class NativeReprKind { Unboxed, Untagged };
 struct ReachingTypeStep {  // Expands_to | Contains | Parameter
-  enum class Kind { Expands_to, Contains, Parameter, Considered_abstract };
+  enum class Kind { Expands_to, Contains };
   Kind kind;
   TypeExpr* t1 = nullptr;
   TypeExpr* t2 = nullptr;
-  Path::t path = nullptr;  // Parameter / Considered_abstract
-  long n = 0;
 };
 using ReachingTypePath = std::vector<ReachingTypeStep>;
 
@@ -34,10 +32,10 @@ struct Error : std::runtime_error {
     Cycle_in_def, Definition_mismatch, Constraint_failed, Inconsistent_constraint, Type_clash, Non_regular,
     Null_arity_external, Missing_native_external, Unbound_type_var, Cannot_extend_private_type,
     Not_extensible_type, Extension_mismatch, Rebind_wrong_type, Rebind_mismatch, Rebind_private, Variance,
-    Unavailable_type_constructor, Multiple_native_repr_attributes, Cannot_unbox_or_untag_type,
-    Deep_unbox_or_untag_attribute, Type_cannot_be_external, Immediacy, Separability, Bad_unboxed_attribute,
-    Boxed_and_unboxed, Nonrec_gadt, Invalid_private_row_declaration, Atomic_field_must_be_mutable,
-    External_with_non_syntactic_arity, Primitive_alias_does_not_refer_to_primitive, Primitive_type_mismatch
+    Unavailable_type_constructor, Unbound_type_var_ext, Val_in_structure, Multiple_native_repr_attributes,
+    Cannot_unbox_or_untag_type, Deep_unbox_or_untag_attribute, Type_cannot_be_external, Immediacy, Separability,
+    Bad_unboxed_attribute, Boxed_and_unboxed, Nonrec_gadt, Invalid_private_row_declaration,
+    Atomic_field_must_be_mutable, External_with_non_syntactic_arity
   };
   Location loc;
   Kind kind;
@@ -52,11 +50,10 @@ struct Error : std::runtime_error {
   Path::t path = nullptr;
   Path::t path2 = nullptr;
   Longident::t lid = nullptr;
-  std::vector<TypeExpr*> params;        // Unbound_type_var
   const TypeDeclaration* decl = nullptr;  // Unbound_type_var
+  const ExtensionConstructor* ext = nullptr;  // Unbound_type_var_ext
   std::optional<typedecl_variance::Error> variance;
   NativeReprKind repr = NativeReprKind::Unboxed;
-  ValueKind value_kind{};
   // Immediacy / Separability errors are recorded by kind only
   int sub = 0;
   Error(const Location& l, Kind k) : std::runtime_error("Typedecl.Error"), loc(l), kind(k) {}
@@ -95,8 +92,6 @@ TranslTypeExtension transl_type_extension(bool extend, env::t env, const Locatio
                                           const pt::TypeExtension* styext);
 std::pair<const tt::TValueDescription*, env::t> transl_value_decl(env::t env, const Location& loc,
                                                                   const pt::ValueDescription* valdecl);
-std::pair<const tt::TPrimitiveDescription*, env::t> transl_prim_desc(env::t env, const Location& loc,
-                                                                     const pt::PrimitiveDescription* primdecl);
 // the parsetree type_declaration should satisfy [is_fixed_type] when
 // fixed_row_path is set
 const tt::TTypeDeclaration* transl_with_constraint(Ident::t id, Path::t fixed_row_path, env::t sig_env,
@@ -106,8 +101,8 @@ const TypeDeclaration* transl_package_constraint(const Location& loc, env::t env
 const TypeDeclaration* abstract_type_decl(bool injective, TypeOrigin explanation, long arity);
 std::vector<std::pair<Ident::t, const TypeDeclaration*>> approx_type_decl(TypeOrigin explanation,
                                                                           Slice<const pt::TypeDeclaration*> sdecls);
-void check_well_founded_decl(env::t abs_env, env::t final_env, const std::function<bool(Path::t)>& is_decl_path,
-                             const Location& loc, Path::t path, const TypeDeclaration* decl);
+void check_well_founded_decl(env::t abs_env, env::t env, const Location& loc, Path::t path,
+                             const TypeDeclaration* decl, const std::function<bool(Path::t)>& to_check);
 void check_recmod_typedecl(env::t abs_env, env::t env, const Location& loc, const std::vector<Ident::t>& recmod_ids,
                            Path::t path, const TypeDeclaration* decl);
 void check_coherence(env::t env, const Location& loc, Path::t path, const TypeDeclaration* decl);

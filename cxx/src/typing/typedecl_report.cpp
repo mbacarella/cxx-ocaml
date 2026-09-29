@@ -48,8 +48,6 @@ void add_to_preparation(const typedecl::ReachingTypePath& path) {
         out_type::add_type_to_preparation(s.t1);
         out_type::add_type_to_preparation(s.t2);
         break;
-      case SK::Parameter: out_type::add_type_to_preparation(s.t1); break;
-      case SK::Considered_abstract: break;
     }
 }
 
@@ -60,17 +58,6 @@ void pp_reaching_path(Formatter& ppf, const typedecl::ReachingTypePath& path) {
     switch (s.kind) {
       case SK::Expands_to: fprintf(f, "%a = %a", prepared(s.t1), prepared(s.t2)); break;
       case SK::Contains: fprintf(f, "%a contains %a", prepared(s.t1), prepared(s.t2)); break;
-      case SK::Parameter: {
-        long i = s.n + 1;
-        fprintf(f, "the %i%s type parameter of %a is constrained to %a", i, misc::ordinal_suffix(i),
-                code_str(path::name(s.path)), [&](Formatter& ff) {
-                  printtyp::type_expansion(Mode::Type, ff, out_type::prepare_expansion({s.t1, s.t1}));
-                });
-        break;
-      }
-      case SK::Considered_abstract:
-        fprintf(f, "the type %a is considered abstract", code_str(path::name(s.path)));
-        break;
     }
   };
   fd::pp_print_list(ppf, pp_step, path, fd::comma);
@@ -333,7 +320,14 @@ Report report_error(const Location& loc, const typedecl::Error& err) {
                               "         for native-code compilation");
     case EK::Unbound_type_var:
       return location::errorf(loc, "A type variable is unbound in this type declaration%t",
-                              [&](Formatter& f) { explain_unbounded(err.params, err.ty, err.decl, f); });
+                              [&](Formatter& f) { explain_unbounded({}, err.ty, err.decl, f); });
+    case EK::Unbound_type_var_ext:
+      return location::errorf(loc, "A type variable is unbound in this extension constructor%t", [&](Formatter& f) {
+        std::vector<TypeExpr*> args;
+        btype::iter_type_expr_cstr_args([&](TypeExpr* t) { args.push_back(t); }, err.ext->ext_args);
+        explain_unbound<TypeExpr*>(f, {}, err.ty, args, [](TypeExpr* const& x) { return x; }, "type",
+                                   [](TypeExpr* const&) { return std::string(); });
+      });
     case EK::Cannot_extend_private_type:
       return location::errorf(loc, "Cannot extend private type definition@ %a", fd::pr(printtyp::path, err.path));
     case EK::Not_extensible_type:
@@ -380,6 +374,7 @@ Report report_error(const Location& loc, const typedecl::Error& err) {
     case EK::Unavailable_type_constructor:
       return location::errorf(loc, "The definition of type %a@ is unavailable",
                               misc::style::code(printtyp::path, err.path));
+    case EK::Val_in_structure: return location::errorf(loc, "Value declarations are only allowed in signatures");
     case EK::Multiple_native_repr_attributes:
       return location::errorf(loc, "Too many %a/%a attributes", code_str("[@@unboxed]"), code_str("[@@untagged]"));
     case EK::Cannot_unbox_or_untag_type:
@@ -443,24 +438,6 @@ Report report_error(const Location& loc, const typedecl::Error& err) {
       return location::errorf(loc,
                               "This external declaration has a non-syntactic arity,@ its arity is greater than its "
                               "syntactic arity.");
-    case EK::Primitive_alias_does_not_refer_to_primitive: {
-      const char* what = "";
-      switch (err.value_kind.kind) {
-        case ValueKind::Kind::Val_reg: what = "a regular value"; break;
-        case ValueKind::Kind::Val_ivar: what = "an instance variable"; break;
-        case ValueKind::Kind::Val_self: what = "the self object"; break;
-        case ValueKind::Kind::Val_anc: what = "an ancestor object"; break;
-        case ValueKind::Kind::Val_prim: throw std::logic_error("Typedecl.report_error: value is a primitive");
-      }
-      return location::errorf(loc, "@[This@ identifier@ should@ be@ a@ primitive,@ but@ it@ is@ bound@ to@ %s.@]",
-                              what);
-    }
-    case EK::Primitive_type_mismatch:
-      return location::errorf(loc, "@[<v>The type of this alias does not match that of the aliased primitive.@,%t@]",
-                              [&](Formatter& ppf) {
-                                errortrace_report::unification(ppf, err.env, err.trace, doc_printf("Type"),
-                                                               doc_printf("is not compatible with type"));
-                              });
   }
   return location::errorf(loc, "?");
 }

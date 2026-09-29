@@ -228,7 +228,6 @@ Report report_error(const Location& loc, env::t, const typemod::Error& err) {
                               "The module type@ %a@ is not a valid type for a packed module:@ it is defined as a "
                               "local substitution (temporary name)@ for an anonymous module type.@ %a",
                               code_str(path::name(err.path)), [](Formatter& f) { misc::print_see_manual(f, {12, 7, 3}); });
-    case EK::Val_in_structure: return location::errorf(loc, "Value declarations are only allowed in signatures");
   }
   return location::errorf(loc, "?");
 }

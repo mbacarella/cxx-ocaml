@@ -195,6 +195,14 @@ TranslTypeExtension transl_type_extension(bool extend, env::t env, const Locatio
       }
       return R{ttype_params, constructors, shapes};
     });
+    // Check that all type variables are closed
+    for (auto* ext : r.constructors)
+      if (TypeExpr* ty = ctype::closed_extension_constructor(ext->ext_type)) {
+        Error e(ext->ext_loc, EK::Unbound_type_var_ext);
+        e.ty = ty;
+        e.ext = ext->ext_type;
+        raise_error(e);
+      }
     // Check variances are correct ([loc] is the location of the extension)
     for (auto* ext : r.constructors) {
       try {
@@ -224,6 +232,13 @@ TranslException transl_exception(env::t env, const pt::ExtensionConstructor* sex
     return transl_extension_constructor(scope, env, predef::paths().exn, {}, {}, PrivateFlag::Public, sext);
   });
   shape::t shape = ext_shape(ext);
+  // Check that all type variables are closed
+  if (TypeExpr* ty = ctype::closed_extension_constructor(ext->ext_type)) {
+    Error e(ext->ext_loc, EK::Unbound_type_var_ext);
+    e.ty = ty;
+    e.ext = ext->ext_type;
+    raise_error(e);
+  }
   env::t newenv = env::add_extension(true, is_rebind(ext), ext->ext_id, ext->ext_type, env, shape);
   return {ext, newenv, shape};
 }
@@ -404,76 +419,36 @@ std::pair<const tt::TValueDescription*, env::t> transl_value_decl(env::t env, co
                                                                   const pt::ValueDescription* valdecl) {
   return builtin_attributes::warning_scope(valdecl->pval_attributes, [&] {
     const tt::CoreType* cty = typetexp::transl_type_scheme(env, valdecl->pval_type);
-    auto* v = make<ValueDescription>(cty->ctyp_type, ValueKind{}, loc,
-                                     parsetree::types_attributes(valdecl->pval_attributes),
-                                     uid::mk(env::get_current_unit()));
-    auto [id, newenv] = env::enter_value(valdecl->pval_name.txt, v, env, [](std::string s) { return warnings::Warning::with_s(warnings::Warning::K::Unused_value_declaration, s); });
-    auto* desc = make<tt::TValueDescription>(id, valdecl->pval_name, cty, v, valdecl->pval_loc, valdecl->pval_attributes);
-    return std::make_pair(static_cast<const tt::TValueDescription*>(desc), newenv);
-  });
-}
-
-// Translate a primitive description
-std::pair<const tt::TPrimitiveDescription*, env::t> transl_prim_desc(env::t env, const Location& loc,
-                                                                     const pt::PrimitiveDescription* primdesc) {
-  return builtin_attributes::warning_scope(primdesc->pprim_attributes, [&]() -> std::pair<const tt::TPrimitiveDescription*, env::t> {
-    const pt::PrimitiveKind& pk = primdesc->pprim_kind;
-    if (pk.kind == pt::PrimitiveKind::Kind::Pprim_decl) {
-      const pt::CoreType* pprim_type = pk.ty;
-      const tt::CoreType* cty = typetexp::transl_type_scheme(env, pprim_type);
-      TypeExpr* ty = cty->ctyp_type;
+    TypeExpr* ty = cty->ctyp_type;
+    ValueDescription* v;
+    if (valdecl->pval_prim.empty()) {
+      if (!env::is_in_signature(env)) raise_error(Error(valdecl->pval_loc, EK::Val_in_structure));
+      v = make<ValueDescription>(ty, ValueKind{}, loc, parsetree::types_attributes(valdecl->pval_attributes),
+                                 uid::mk(env::get_current_unit()));
+    } else {
       std::optional<NativeReprKind> global_repr;
-      NativeReprAttribute g = get_native_repr_attribute(primdesc->pprim_attributes, std::nullopt);
+      NativeReprAttribute g = get_native_repr_attribute(valdecl->pval_attributes, std::nullopt);
       if (g.present) global_repr = g.kind;
-      auto [native_repr_args, native_repr_res] = parse_native_repr_attributes(env, pprim_type, ty, global_repr);
+      auto [native_repr_args, native_repr_res] =
+          parse_native_repr_attributes(env, valdecl->pval_type, ty, global_repr);
       const PrimitiveDescription* prim = primitive::parse_description(
-          native_repr_args, native_repr_res, pk.prims, primdesc->pprim_attributes, primdesc->pprim_loc);
+          native_repr_args, native_repr_res, valdecl->pval_prim, valdecl->pval_attributes, valdecl->pval_loc);
       if (prim->prim_arity == 0 && (prim->prim_name.empty() || prim->prim_name[0] != '%'))
-        raise_error(Error(pprim_type->ptyp_loc, EK::Null_arity_external));
+        raise_error(Error(valdecl->pval_type->ptyp_loc, EK::Null_arity_external));
       if (clflags::native_code && prim->prim_arity > 5 && prim->prim_native_name.empty())
-        raise_error(Error(pprim_type->ptyp_loc, EK::Missing_native_external));
+        raise_error(Error(valdecl->pval_type->ptyp_loc, EK::Missing_native_external));
       check_unboxable(env, ty);
       ValueKind vk{ValueKind::Kind::Val_prim};
       vk.prim = prim;
-      auto* v = make<ValueDescription>(ty, vk, loc, parsetree::types_attributes(primdesc->pprim_attributes),
-                                       uid::mk(env::get_current_unit()));
-      auto [id, newenv] = env::enter_value(primdesc->pprim_name.txt, v, env, [](std::string s) { return warnings::Warning::with_s(warnings::Warning::K::Unused_value_declaration, s); });
-      tt::PrimitiveKind tk{tt::PrimitiveKind::Kind::Tprim_decl, cty, pk.prims};
-      return {make<tt::TPrimitiveDescription>(id, primdesc->pprim_name, tk, v, primdesc->pprim_loc,
-                                              primdesc->pprim_attributes),
-              newenv};
+      v = make<ValueDescription>(ty, vk, loc, parsetree::types_attributes(valdecl->pval_attributes),
+                                 uid::mk(env::get_current_unit()));
     }
-    const pt::LidLoc& pprim_ident = pk.alias;
-    auto [path, v0] = env::lookup_value(true, pprim_ident.loc, pprim_ident.txt, env);
-    if (v0->val_kind.kind != ValueKind::Kind::Val_prim) {
-      Error e(pprim_ident.loc, EK::Primitive_alias_does_not_refer_to_primitive);
-      e.value_kind = v0->val_kind;
-      raise_error(e);
-    }
-    const tt::CoreType* cty = nullptr;
-    const ValueDescription* v = v0;
-    if (pk.ty) {
-      cty = typetexp::transl_type_scheme(env, pk.ty);
-      // When the alias has a type ascription, we check that it is no more
-      // general than the type of the aliased declaration.
-      try {
-        ctype::matches(true, env, cty->ctyp_type, v0->val_type);
-      } catch (const ctype::MatchesFailure& m) {
-        Error e(cty->ctyp_loc, EK::Primitive_type_mismatch);
-        e.env = m.env;
-        e.trace = m.err;
-        raise_error(e);
-      }
-      auto* v2 = make<ValueDescription>(*v0);
-      v2->val_type = cty->ctyp_type;
-      v2->val_loc = loc;
-      v = v2;
-    }
-    auto [id, newenv] = env::enter_value(primdesc->pprim_name.txt, v, env, [](std::string s) { return warnings::Warning::with_s(warnings::Warning::K::Unused_value_declaration, s); });
-    tt::PrimitiveKind tk{tt::PrimitiveKind::Kind::Tprim_alias, cty, {}, path, pprim_ident};
-    return {make<tt::TPrimitiveDescription>(id, primdesc->pprim_name, tk, v, primdesc->pprim_loc,
-                                            primdesc->pprim_attributes),
-            newenv};
+    auto [id, newenv] = env::enter_value(valdecl->pval_name.txt, v, env, [](std::string s) {
+      return warnings::Warning::with_s(warnings::Warning::K::Unused_value_declaration, s);
+    });
+    auto* desc = make<tt::TValueDescription>(id, valdecl->pval_name, cty, v, valdecl->pval_prim, valdecl->pval_loc,
+                                             valdecl->pval_attributes);
+    return std::make_pair(static_cast<const tt::TValueDescription*>(desc), newenv);
   });
 }
 
@@ -567,7 +542,6 @@ const tt::TTypeDeclaration* transl_with_constraint(Ident::t id, Path::t fixed_ro
     if (TypeExpr* var = ctype::closed_type_decl(new_sig_decl)) {
       Error e(loc, EK::Unbound_type_var);
       e.ty = var;
-      e.params = params;
       e.decl = new_sig_decl;
       raise_error(e);
     }

@@ -168,6 +168,8 @@ extern const char* const td_error_names[] = {
     "Rebind_private",
     "Variance",
     "Unavailable_type_constructor",
+    "Unbound_type_var_ext",
+    "Val_in_structure",
     "Multiple_native_repr_attributes",
     "Cannot_unbox_or_untag_type",
     "Deep_unbox_or_untag_attribute",
@@ -179,9 +181,7 @@ extern const char* const td_error_names[] = {
     "Nonrec_gadt",
     "Invalid_private_row_declaration",
     "Atomic_field_must_be_mutable",
-    "External_with_non_syntactic_arity",
-    "Primitive_alias_does_not_refer_to_primitive",
-    "Primitive_type_mismatch"};
+    "External_with_non_syntactic_arity"};
 extern const char* const tm_error_names[] = {
     "Cannot_apply",
     "Not_included",
@@ -213,8 +213,7 @@ extern const char* const tm_error_names[] = {
     "Invalid_type_subst_rhs",
     "Non_packable_local_modtype_subst",
     "With_cannot_remove_packed_modtype",
-    "Cannot_alias",
-    "Val_in_structure"};
+    "Cannot_alias"};
 extern const char* const tcl_error_names[] = {
     "Unconsistent_constraint",
     "Field_type_mismatch",

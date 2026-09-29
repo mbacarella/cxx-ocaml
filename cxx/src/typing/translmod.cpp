@@ -829,7 +829,7 @@ Lam transl_struct_item(scopes sc, Fields fields, Path::t rootpath, const tt::Str
       return mk_lam_let(body);
     }
     case K::Tstr_primitive:
-      record_primitive(tt::as<tt::Tstr_primitive>(d)->pd->prim_val);
+      record_primitive(tt::as<tt::Tstr_primitive>(d)->vd->val_val);
       return next(fields);
     case K::Tstr_type:
       return next(fields);
@@ -1207,7 +1207,7 @@ struct StoreCtx {
         return L::lsequence(lambda_subst(subst, lam), r);
       }
       case K::Tstr_primitive:
-        record_primitive(tt::as<tt::Tstr_primitive>(d)->pd->prim_val);
+        record_primitive(tt::as<tt::Tstr_primitive>(d)->vd->val_val);
         return rest(subst);
       case K::Tstr_type:
         return rest(subst);

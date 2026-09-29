@@ -828,7 +828,7 @@ class Parser {
         std::optional<ExprBox> base;
         if (is_atom_start(cur().kind) && cur().kind != Kind::RBRACE) {
           size_t save = idx_, dsave = ds_journal_.size();
-          ExprBox e = parse_app();  // the `{ e with … }` base may be an application (`f ()`)
+          ExprBox e = parse_atom_postfix();
           if (cur().kind == Kind::WITH) { advance(); base = std::move(e); }
           else idx_ = save; undo_docs(dsave);  // it was the first field label, not a base
         }
@@ -3133,28 +3133,7 @@ class Parser {
     return StringLoc{nm.text, tokloc(nm)};
   }
   // `external f [: t] = path` alias target: a value path printed as a dotted string.
-  std::optional<LongidentLoc> last_prim_alias_lid_;  // set by parse_prim_alias
-  StringLoc parse_prim_alias() {
-    last_prim_alias_lid_.reset();
-    if (auto op = try_paren_operator()) return std::move(*op);  // ( + )
-    const Token& first = cur();
-    if (first.kind != Kind::LIDENT && first.kind != Kind::UIDENT)
-      throw ParseError("expected value identifier", first.start);
-    advance();
-    std::string s = first.text;
-    const Token* last = &first;
-    Longident lid{Lident{first.text}};
-    while (last->kind == Kind::UIDENT && cur().kind == Kind::DOT &&
-           (peek(1).kind == Kind::LIDENT || peek(1).kind == Kind::UIDENT)) {
-      advance(); const Token& nm = cur(); advance();
-      lid = Longident{Ldot{std::make_shared<Longident>(std::move(lid)), nm.text,
-                           span(position(first.start), position(last->end)), tokloc(nm)}};
-      s += "." + nm.text; last = &nm;
-    }
-    Location l = span(position(first.start), position(last->end));
-    last_prim_alias_lid_ = LongidentLoc{std::move(lid), l};
-    return StringLoc{s, l};
-  }
+
   ValueBinding parse_value_binding_core() {
     // val_ident form (`let f p.. = e` / `let (+) p.. = e`) vs pattern form.
     std::optional<StringLoc> opname = try_paren_operator();  // consumes `( op )` on success
@@ -3568,22 +3547,17 @@ class Parser {
       std::optional<ExtName> ext_ext = take_ext();  // `external%ext …`
       Attributes pattrs = take_attrs();  // `external%ext[@attr] …` (item attrs, prefix)
       StringLoc ename = parse_value_name();  // LIDENT or ( op )
-      CoreTypeBox ty;  // optional: absent in `external f = g`
-      if (cur().kind == Kind::COLON) { advance(); ty = parse_poly_type(/*ghost=*/false); }
+      expect(Kind::COLON, ":");
+      CoreTypeBox ty = parse_poly_type(/*ghost=*/false);  // external f : 'a. t = …
       expect(Kind::EQUAL, "=");
       std::vector<std::string> prims;
-      std::optional<StringLoc> alias;
-      if (cur().kind == Kind::STRING)
-        while (cur().kind == Kind::STRING) { prims.push_back(cur().text); advance(); }
-      else
-        alias = parse_prim_alias();  // `external f [: t] = path`  (Pprim_alias)
-      if (prims.empty() && !alias) throw ParseError("expected primitive string", cur().start);
+      while (cur().kind == Kind::STRING) { prims.push_back(cur().text); advance(); }
+      if (prims.empty()) throw ParseError("expected primitive string", cur().start);
       while (cur().kind == Kind::LBRACKETATAT) { advance(); pattrs.push_back(parse_attribute_body()); }
       Location l = span(position(t.start), position(tokens_[idx_ - 1].end));
       attach_docs(pattrs, l.start.cnum, l.end.cnum);
       PrimitiveDescription pd{std::move(ename), std::move(ty), std::move(prims), l,
-                              std::move(pattrs), std::move(alias)};
-      if (pd.alias) pd.alias_lid = std::move(last_prim_alias_lid_);
+                              std::move(pattrs)};
       StructureItem item{Pstr_primitive{std::move(pd)}, l};
       if (ext_ext) {  // `external%ext …` wraps the (ghost) Pstr_primitive in a Pstr_extension
         item.loc.ghost = true;
@@ -3831,7 +3805,12 @@ class Parser {
 
   Location none_loc() const { return Location{Position{0, 0, -1}, Position{0, 0, -1}, true}; }
 
-  ModuleType parse_module_type() {
+  // anon_arrow = false: the right-hand side of `with module type T = mty`
+  // (not `:=`),
+  // which parser.mly gives %prec below_MINUSGREATER -- a following `->`
+  // closes the whole `with` type (`S with module type T = S -> S` is
+  // `(S with module type T = S) -> S`)
+  ModuleType parse_module_type(bool anon_arrow = true) {
     Position symstart = position(cur().start);  // $sloc start (the `(` of a paren'd domain)
     // leading functor params with no `functor` keyword: `() -> R`, `(X : S) -> R`
     auto is_fparam_start = [&] {
@@ -3855,7 +3834,7 @@ class Parser {
       return cod;
     }
     ModuleType mt = parse_module_type_with();
-    if (cur().kind == Kind::MINUSGREATER) {  // mt -> mt2  (anonymous functor sugar)
+    if (anon_arrow && cur().kind == Kind::MINUSGREATER) {  // mt -> mt2  (anonymous functor sugar)
       advance();
       Position s = symstart;
       ModuleType cod = parse_module_type();
@@ -3927,7 +3906,10 @@ class Parser {
       LongidentLoc lid = parse_longident_path();
       bool subst = cur().kind == Kind::COLONEQUAL;
       if (subst) advance(); else expect(Kind::EQUAL, "=");
-      ModuleType mty = parse_module_type();
+      // only `=` stops at `->`: menhir's precedence resolves a conflict the
+      // `:=` form doesn't have (`S with module type T := S -> S` keeps its
+      // arrow inside)
+      ModuleType mty = parse_module_type(/*anon_arrow=*/subst);
       if (subst) return Pwith_modtypesubst{std::move(lid), box(std::move(mty))};
       return Pwith_modtype{std::move(lid), box(std::move(mty))};
     }
@@ -4079,22 +4061,17 @@ class Parser {
       advance();
       std::optional<ExtName> ext = take_ext(); Attributes attrs = take_attrs();  // external%ext[@attr]
       StringLoc ename = parse_value_name();  // LIDENT or ( op )
-      CoreTypeBox ty;  // optional: absent in `external f = g`
-      if (cur().kind == Kind::COLON) { advance(); ty = parse_poly_type(/*ghost=*/false); }
+      expect(Kind::COLON, ":");
+      CoreTypeBox ty = parse_poly_type(/*ghost=*/false);
       expect(Kind::EQUAL, "=");
       std::vector<std::string> prims;
-      std::optional<StringLoc> alias;
-      if (cur().kind == Kind::STRING)
-        while (cur().kind == Kind::STRING) { prims.push_back(cur().text); advance(); }
-      else
-        alias = parse_prim_alias();
-      if (prims.empty() && !alias) throw ParseError("expected primitive string", cur().start);
+      while (cur().kind == Kind::STRING) { prims.push_back(cur().text); advance(); }
+      if (prims.empty()) throw ParseError("expected primitive string", cur().start);
       while (cur().kind == Kind::LBRACKETATAT) { advance(); attrs.push_back(parse_attribute_body()); }
       Location l = here();
       attach_docs(attrs, l.start.cnum, l.end.cnum);
       PrimitiveDescription pd{std::move(ename), std::move(ty), std::move(prims), l,
-                              std::move(attrs), std::move(alias)};
-      if (pd.alias) pd.alias_lid = std::move(last_prim_alias_lid_);
+                              std::move(attrs)};
       return wrap_sig_ext(SignatureItem{Psig_primitive{std::move(pd)}, l}, std::move(ext));
     }
     if (t.kind == Kind::TYPE) {

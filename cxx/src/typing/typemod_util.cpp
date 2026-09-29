@@ -177,39 +177,10 @@ Classified classify_signature_item(const SignatureItem* it) {
 }
 
 // ---- additional validity checks on type definitions arising from recursive modules ------
-static const TypeDeclaration* abstractify_type(const TypeDeclaration* ty) {
-  long arity = ty->type_arity;
-  auto* d = make<TypeDeclaration>(*ty);
-  std::vector<TypeExpr*> params;
-  for (std::size_t k = 0; k < ty->type_params.size(); ++k) params.push_back(btype::newgenvar());
-  d->type_params = slice(params);
-  d->type_kind = TYPE_ABSTRACT_LIT(Rec_check_regularity);
-  d->type_manifest = nullptr;
-  d->type_variance = slice(variance::unknown_signature(false, arity));
-  d->type_separability =
-      slice(std::vector<Separability>(static_cast<std::size_t>(arity > 0 ? arity : 0), Separability::Deepsep));
-  d->type_is_newtype = false;
-  d->type_expansion_scope = btype::lowest_level;
-  d->type_immediate = TypeImmediacy::Unknown;
-  d->type_unboxed_default = false;
-  return d;
-}
-
-struct PathLess {
-  bool operator()(Path::t a, Path::t b) const { return path::compare(a, b) < 0; }
-};
-
-void check_recmod_typedecls(env::t env, const std::vector<std::pair<Ident::t, const ModuleDeclaration*>>& decls) {
+void check_recmod_typedecls(env::t abs_env, env::t env,
+                            const std::vector<std::pair<Ident::t, const ModuleDeclaration*>>& decls) {
   std::vector<Ident::t> recmod_ids;
   for (auto& d : decls) recmod_ids.push_back(d.first);
-  std::map<Path::t, const TypeDeclaration*, PathLess> type_to_abstract;
-  for (auto& [id, md] : decls)
-    for (Path::t path : mtype::type_paths(env, Path::pident(id), md->md_type)) {
-      const TypeDeclaration* ty = env::find_type(path, env);
-      type_to_abstract[path] = abstractify_type(ty);
-    }
-  env::t abs_env = env;
-  for (auto& [path, ty] : type_to_abstract) abs_env = env::add_local_constraint(path, ty, abs_env);
   for (auto& [id, md] : decls)
     for (Path::t path : mtype::type_paths(env, Path::pident(id), md->md_type))
       typedecl::check_recmod_typedecl(abs_env, env, md->md_loc, recmod_ids, path, env::find_type(path, env));
@@ -233,10 +204,6 @@ static void check_type_decl(env::t env, Signature sg, const Location& loc, Ident
   env = env::add_type(false, fresh_id, newdecl, env);
   if (fresh_row_id) env = env::add_type(false, fresh_row_id, newdecl, env);
   env = env::add_signature(slice(sg2), env);
-  env::t abs_env = env::add_local_constraint(path, abstractify_type(newdecl), env);
-  // The type declarations input to the inclusion check must be
-  // well-founded; otherwise the inclusion check may loop.
-  typedecl::check_well_founded_decl(abs_env, env, [&](Path::t p) { return path::same(path, p); }, loc, path, newdecl);
   includemod::type_declarations(loc, env, true, fresh_id, newdecl, decl);
   typedecl::check_coherence(env, loc, path, newdecl);
 }
@@ -453,7 +420,7 @@ void check_well_formed_module(env::t env0, const Location& loc, const std::strin
           env::t forced_env = env->force();
           std::vector<std::pair<Ident::t, const ModuleDeclaration*>> decls{{it->id, it->md}};
           decls.insert(decls.end(), id_mty_l.begin(), id_mty_l.end());
-          check_recmod_typedecls(forced_env, decls);
+          check_recmod_typedecls(forced_env, forced_env, decls);
         } catch (const typedecl::Error& te) {
           Error e = err(loc, env->force(), EK::Badly_formed_signature);
           e.name = context;

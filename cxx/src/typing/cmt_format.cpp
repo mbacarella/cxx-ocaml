@@ -461,11 +461,8 @@ class TreeWriter {
   V case_(const tt::Case* c) {  // { c_lhs; c_cont; c_guard; c_rhs }: right to left
     V rhs = expr(c->c_rhs);
     V guard = opt(c->c_guard != nullptr, [&] { return expr(c->c_guard); });
-    // { cont_id; cont_loc; cont_type; cont_uid }
-    V cont = opt(c->c_cont != nullptr, [&] {
-      const tt::ContDesc* k = c->c_cont;
-      return o::vblock(0, {w_.ident(k->cont_id), loc(k->cont_loc), w_.ty(k->cont_type), w_.uid(k->cont_uid)});
-    });
+    // c_cont: the Ident.t option, copied as is
+    V cont = opt(c->c_cont != nullptr, [&] { return w_.ident(c->c_cont); });
     V lhs = pat(c->c_lhs);
     return o::vblock(0, {lhs, cont, guard, rhs});
   }
@@ -879,25 +876,9 @@ class TreeWriter {
     V name = str_loc(v->val_name);
     V desc = typ(v->val_desc);
     V attrs = attributes(v->val_attributes);
-    V r = o::vblock(0, {w_.ident(v->val_id), name, desc, w_.value_desc(v->val_val), l, attrs});
+    V prims = w_.list(v->val_prim, [&](std::string_view s) { return w_.str(s); });
+    V r = o::vblock(0, {w_.ident(v->val_id), name, desc, w_.value_desc(v->val_val), prims, l, attrs});
     decls_[v] = r;
-    return r;
-  }
-  V primitive_description(const tt::TPrimitiveDescription* p) {
-    V l = loc(p->prim_loc);
-    V name = str_loc(p->prim_name);
-    V kind;
-    if (p->prim_kind.kind == tt::PrimitiveKind::Kind::Tprim_decl) {
-      V t = typ(p->prim_kind.cty);
-      kind = o::vblock(0, {t, w_.list(p->prim_kind.prims, [&](std::string_view s) { return w_.str(s); })});
-    } else {  // (Option.map typ, path, map_loc_lid): right to left
-      V l2 = lid_loc(p->prim_kind.lid);
-      V t = opt(p->prim_kind.cty != nullptr, [&] { return typ(p->prim_kind.cty); });
-      kind = o::vblock(1, {t, w_.path(p->prim_kind.path), l2});
-    }
-    V attrs = attributes(p->prim_attributes);
-    V r = o::vblock(0, {w_.ident(p->prim_id), name, kind, w_.value_desc(p->prim_val), l, attrs});
-    decls_[p] = r;
     return r;
   }
   V label_decl(const tt::TLabelDeclaration* ld) {
@@ -1153,7 +1134,7 @@ class TreeWriter {
         auto* x = tt::as<tt::Tstr_value>(d);
         return o::vblock(1, {flag(static_cast<long>(x->rec)), value_bindings(x->vbs)});
       }
-      case K::Tstr_primitive: return o::vblock(2, {primitive_description(tt::as<tt::Tstr_primitive>(d)->pd)});
+      case K::Tstr_primitive: return o::vblock(2, {value_description(tt::as<tt::Tstr_primitive>(d)->vd)});
       case K::Tstr_type: {
         auto* x = tt::as<tt::Tstr_type>(d);
         return o::vblock(3, {flag(static_cast<long>(x->rec)), type_declarations(x->decls)});
@@ -1278,40 +1259,39 @@ class TreeWriter {
     using K = tt::SignatureItemDesc::Kind;
     switch (d->kind) {
       case K::Tsig_value: return o::vblock(0, {value_description(tt::as<tt::Tsig_value>(d)->vd)});
-      case K::Tsig_primitive: return o::vblock(1, {primitive_description(tt::as<tt::Tsig_primitive>(d)->pd)});
       case K::Tsig_type: {
         auto* x = tt::as<tt::Tsig_type>(d);
-        return o::vblock(2, {flag(static_cast<long>(x->rec)), type_declarations(x->decls)});
+        return o::vblock(1, {flag(static_cast<long>(x->rec)), type_declarations(x->decls)});
       }
-      case K::Tsig_typesubst: return o::vblock(3, {type_declarations(tt::as<tt::Tsig_typesubst>(d)->decls)});
-      case K::Tsig_typext: return o::vblock(4, {type_extension(tt::as<tt::Tsig_typext>(d)->ext)});
-      case K::Tsig_exception: return o::vblock(5, {type_exception(tt::as<tt::Tsig_exception>(d)->exn)});
-      case K::Tsig_module: return o::vblock(6, {module_declaration(tt::as<tt::Tsig_module>(d)->md)});
-      case K::Tsig_modsubst: return o::vblock(7, {module_substitution(tt::as<tt::Tsig_modsubst>(d)->ms)});
+      case K::Tsig_typesubst: return o::vblock(2, {type_declarations(tt::as<tt::Tsig_typesubst>(d)->decls)});
+      case K::Tsig_typext: return o::vblock(3, {type_extension(tt::as<tt::Tsig_typext>(d)->ext)});
+      case K::Tsig_exception: return o::vblock(4, {type_exception(tt::as<tt::Tsig_exception>(d)->exn)});
+      case K::Tsig_module: return o::vblock(5, {module_declaration(tt::as<tt::Tsig_module>(d)->md)});
+      case K::Tsig_modsubst: return o::vblock(6, {module_substitution(tt::as<tt::Tsig_modsubst>(d)->ms)});
       case K::Tsig_recmodule: {
         std::vector<V> xs;
         for (const tt::TModuleDeclaration* md : tt::as<tt::Tsig_recmodule>(d)->mds) xs.push_back(module_declaration(md));
-        return o::vblock(8, {o::vlist(xs)});
+        return o::vblock(7, {o::vlist(xs)});
       }
-      case K::Tsig_modtype: return o::vblock(9, {module_type_declaration(tt::as<tt::Tsig_modtype>(d)->mtd)});
+      case K::Tsig_modtype: return o::vblock(8, {module_type_declaration(tt::as<tt::Tsig_modtype>(d)->mtd)});
       case K::Tsig_modtypesubst:
-        return o::vblock(10, {module_type_declaration(tt::as<tt::Tsig_modtypesubst>(d)->mtd)});
-      case K::Tsig_open: return o::vblock(11, {open_description(tt::as<tt::Tsig_open>(d)->od)});
+        return o::vblock(9, {module_type_declaration(tt::as<tt::Tsig_modtypesubst>(d)->mtd)});
+      case K::Tsig_open: return o::vblock(10, {open_description(tt::as<tt::Tsig_open>(d)->od)});
       case K::Tsig_include:
-        return o::vblock(12, {include_infos(tt::as<tt::Tsig_include>(d)->incl,
+        return o::vblock(11, {include_infos(tt::as<tt::Tsig_include>(d)->incl,
                                             [&](const tt::ModuleType* mt) { return module_type(mt); })});
       case K::Tsig_class: {
         std::vector<V> xs;
         for (const tt::TClassDescription* c : tt::as<tt::Tsig_class>(d)->classes) xs.push_back(class_description(c));
-        return o::vblock(13, {o::vlist(xs)});
+        return o::vblock(12, {o::vlist(xs)});
       }
       case K::Tsig_class_type: {
         std::vector<V> xs;
         for (const tt::TClassTypeDeclaration* c : tt::as<tt::Tsig_class_type>(d)->classes)
           xs.push_back(class_type_declaration(c));
-        return o::vblock(14, {o::vlist(xs)});
+        return o::vblock(13, {o::vlist(xs)});
       }
-      case K::Tsig_attribute: return o::vblock(15, {attribute(tt::as<tt::Tsig_attribute>(d)->attr)});
+      case K::Tsig_attribute: return o::vblock(14, {attribute(tt::as<tt::Tsig_attribute>(d)->attr)});
     }
     return w_.i(0);
   }
@@ -1683,7 +1663,7 @@ class DeclIndexer {
   // value binding's uids share the one passed in
   void item(int tag, const void* node, const Uid& uid) { tbl_.add(w_.uid(uid), o::vblock(tag, {tw_.decl(node)})); }
   enum Tag {
-    Value, Primitive, Value_binding, Type, Constructor, Extension_constructor, Label, Module, Module_substitution,
+    Value, Value_binding, Type, Constructor, Extension_constructor, Label, Module, Module_substitution,
     Module_binding, Module_type, Class, Class_type
   };
 
@@ -1695,7 +1675,12 @@ class DeclIndexer {
       case K::Tstr_value:
         for (const tt::ValueBinding* vb : tt::as<tt::Tstr_value>(d)->vbs) value_binding(vb);
         break;
-      case K::Tstr_primitive: primitive_description(tt::as<tt::Tstr_primitive>(d)->pd); break;
+      case K::Tstr_primitive: {
+        const tt::TValueDescription* vd = tt::as<tt::Tstr_primitive>(d)->vd;
+        item(Value, vd, vd->val_val->val_uid);
+        typ(vd->val_desc);
+        break;
+      }
       case K::Tstr_type:
         for (const tt::TTypeDeclaration* td : tt::as<tt::Tstr_type>(d)->decls) type_declaration(td);
         break;
@@ -1731,7 +1716,6 @@ class DeclIndexer {
         typ(vd->val_desc);
         break;
       }
-      case K::Tsig_primitive: primitive_description(tt::as<tt::Tsig_primitive>(d)->pd); break;
       case K::Tsig_type:
         for (const tt::TTypeDeclaration* td : tt::as<tt::Tsig_type>(d)->decls) type_declaration(td);
         break;
@@ -1777,11 +1761,6 @@ class DeclIndexer {
     for (const tt::BoundIdent& b : tt::let_bound_idents_full(slice({vb}))) tbl_.add(w_.uid(b.uid), d);
     pat(vb->vb_pat);
     expr(vb->vb_expr);
-  }
-  void primitive_description(const tt::TPrimitiveDescription* pd) {
-    item(Primitive, pd, pd->prim_val->val_uid);
-    if (pd->prim_kind.kind == tt::PrimitiveKind::Kind::Tprim_decl) typ(pd->prim_kind.cty);
-    else if (pd->prim_kind.cty) typ(pd->prim_kind.cty);
   }
   void label_decl(const tt::TLabelDeclaration* ld) {
     item(Label, ld, ld->ld_uid);
@@ -2432,7 +2411,7 @@ class OccIndexer {
       case K::Tstr_value:
         for (const tt::ValueBinding* vb : tt::as<tt::Tstr_value>(d)->vbs) value_binding(vb);
         break;
-      case K::Tstr_primitive: primitive_description(tt::as<tt::Tstr_primitive>(d)->pd); break;
+      case K::Tstr_primitive: value_description(tt::as<tt::Tstr_primitive>(d)->vd); break;
       case K::Tstr_type:
         for (const tt::TTypeDeclaration* td : tt::as<tt::Tstr_type>(d)->decls) type_declaration(td);
         break;
@@ -2456,9 +2435,6 @@ class OccIndexer {
     }
   }
   void value_description(const tt::TValueDescription* x) { typ(x->val_desc); }
-  void primitive_description(const tt::TPrimitiveDescription* x) {
-    if (x->prim_kind.cty) typ(x->prim_kind.cty);  // Tprim_decl's, or Tprim_alias's option
-  }
   void label_decl(const tt::TLabelDeclaration* ld) { typ(ld->ld_type); }
   void constructor_args(const tt::TConstructorArguments& a) {
     if (!a.is_record) {
@@ -2804,18 +2780,11 @@ class OccIndexer {
         f(NS::Type, sig_env, te->tyext_path, of(te->tyext_txt));
         break;
       }
-      case K::Tsig_primitive: {
-        auto* pd = tt::as<tt::Tsig_primitive>(d)->pd;
-        if (pd->prim_kind.kind == tt::PrimitiveKind::Kind::Tprim_alias)
-          f(NS::Value, sig_env, pd->prim_kind.path, of(pd->prim_kind.lid));
-        break;
-      }
       default: break;
     }
     // default_iterator.signature_item
     switch (d->kind) {
       case K::Tsig_value: value_description(tt::as<tt::Tsig_value>(d)->vd); break;
-      case K::Tsig_primitive: primitive_description(tt::as<tt::Tsig_primitive>(d)->pd); break;
       case K::Tsig_type:
         for (const tt::TTypeDeclaration* td : tt::as<tt::Tsig_type>(d)->decls) type_declaration(td);
         break;

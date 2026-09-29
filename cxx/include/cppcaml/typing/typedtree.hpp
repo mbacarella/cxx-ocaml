@@ -189,15 +189,9 @@ struct Meth {  // Tmeth_name | Tmeth_val | Tmeth_ancestor
   Ident::t id = nullptr;       // Tmeth_val / Tmeth_ancestor
   Path::t path = nullptr;      // Tmeth_ancestor
 };
-struct ContDesc {  // cont_desc
-  Ident::t cont_id;
-  Location cont_loc;
-  TypeExpr* cont_type;
-  Uid cont_uid;
-};
 struct Case {  // 'k case
   const Pattern* c_lhs;
-  const ContDesc* c_cont;       // option
+  Ident::t c_cont;              // option
   const Expression* c_guard;    // option
   const Expression* c_rhs;
 };
@@ -440,24 +434,9 @@ struct TValueDescription {
   StrLoc val_name;
   const CoreType* val_desc;
   const ValueDescription* val_val;
+  Slice<std::string_view> val_prim;
   Location val_loc;
   Attributes val_attributes;
-};
-struct PrimitiveKind {
-  enum class Kind : std::uint8_t { Tprim_decl, Tprim_alias };
-  Kind kind;
-  const CoreType* cty;            // Tprim_decl; Tprim_alias: option
-  Slice<std::string_view> prims;  // Tprim_decl
-  Path::t path = nullptr;         // Tprim_alias
-  LidLoc lid;                     // Tprim_alias
-};
-struct TPrimitiveDescription {
-  Ident::t prim_id;
-  StrLoc prim_name;
-  PrimitiveKind prim_kind;
-  const ValueDescription* prim_val;
-  Location prim_loc;
-  Attributes prim_attributes;
 };
 struct TLabelDeclaration {
   Ident::t ld_id;
@@ -728,7 +707,7 @@ struct ClassField {
 
 TT_CTOR(StructureItemDesc, Tstr_eval) const Expression* exp; Attributes attrs; TT_END
 TT_CTOR(StructureItemDesc, Tstr_value) RecFlag rec; Slice<const ValueBinding*> vbs; TT_END
-TT_CTOR(StructureItemDesc, Tstr_primitive) const TPrimitiveDescription* pd; TT_END
+TT_CTOR(StructureItemDesc, Tstr_primitive) const TValueDescription* vd; TT_END
 TT_CTOR(StructureItemDesc, Tstr_type) RecFlag rec; Slice<const TTypeDeclaration*> decls; TT_END
 TT_CTOR(StructureItemDesc, Tstr_typext) const TTypeExtension* ext; TT_END
 TT_CTOR(StructureItemDesc, Tstr_exception) const TTypeException* exn; TT_END
@@ -915,7 +894,7 @@ TT_CTOR(StructureItemDesc, Tstr_class_type) Slice<ClassTypeDeclarationItem> clas
 // signatures
 struct SignatureItemDesc {
   enum class Kind : std::uint8_t {
-    Tsig_value, Tsig_primitive, Tsig_type, Tsig_typesubst, Tsig_typext, Tsig_exception, Tsig_module,
+    Tsig_value, Tsig_type, Tsig_typesubst, Tsig_typext, Tsig_exception, Tsig_module,
     Tsig_modsubst, Tsig_recmodule, Tsig_modtype, Tsig_modtypesubst, Tsig_open, Tsig_include,
     Tsig_class, Tsig_class_type, Tsig_attribute
   };
@@ -932,7 +911,6 @@ struct Signature {
   env::t sig_final_env;
 };
 TT_CTOR(SignatureItemDesc, Tsig_value) const TValueDescription* vd; TT_END
-TT_CTOR(SignatureItemDesc, Tsig_primitive) const TPrimitiveDescription* pd; TT_END
 TT_CTOR(SignatureItemDesc, Tsig_type) RecFlag rec; Slice<const TTypeDeclaration*> decls; TT_END
 TT_CTOR(SignatureItemDesc, Tsig_typesubst) Slice<const TTypeDeclaration*> decls; TT_END
 TT_CTOR(SignatureItemDesc, Tsig_typext) const TTypeExtension* ext; TT_END

@@ -31,7 +31,8 @@ std::pair<const tt::OpenDescription*, env::t> type_open_descr(std::shared_ptr<bo
                                                               const pt::OpenDescription* sod);
 extern std::function<std::pair<const tt::ModuleExpr*, const ModuleType*>(env::t, const pt::ModuleExpr*)>
     type_module_type_of_fwd;
-void check_recmod_typedecls(env::t env, const std::vector<std::pair<Ident::t, const ModuleDeclaration*>>& decls);
+void check_recmod_typedecls(env::t abs_env, env::t env,
+                            const std::vector<std::pair<Ident::t, const ModuleDeclaration*>>& decls);
 void check_well_formed_module(env::t env, const Location& loc, const std::string& context, const ModuleType* mty);
 std::optional<pt::LidLoc> type_decl_is_alias(const pt::TypeDeclaration* sdecl);
 

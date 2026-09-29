@@ -235,10 +235,10 @@ TranslRecmodule transl_recmodule_modtypes(env::t env, Slice<const pt::ModuleDecl
   env::t abs_env = make_env(init);
   std::vector<Cur> dcl1 = warnings::without_warnings([&] { return transition(abs_env, init); });
   env::t env1 = make_env(dcl1);
-  check_recmod_typedecls(env1, map_mtys(dcl1));
+  check_recmod_typedecls(abs_env, env1, map_mtys(dcl1));
   std::vector<Cur> dcl2 = transition(env1, dcl1);
   env::t env2 = make_env(dcl2);
-  check_recmod_typedecls(env2, map_mtys(dcl2));
+  check_recmod_typedecls(abs_env, env2, map_mtys(dcl2));
   std::vector<const tt::TModuleDeclaration*> out;
   for (std::size_t k = 0; k < sdecls.size(); ++k)
     out.push_back(make<tt::TModuleDeclaration>(dcl2[k].id, dcl2[k].id_loc, dcl2[k].md->md_uid,
@@ -264,13 +264,6 @@ const tt::Signature* transl_signature_(env::t env0, pt::Signature ssg) {
         check_value(names, tdesc->val_loc, tdesc->val_id);
         return {mksig(mkd(tt::Tsig_value{{TSK::Tsig_value}, tdesc}), env, loc),
                 {sig_value(tdesc->val_id, tdesc->val_val, Visibility::Exported)},
-                newenv};
-      }
-      case K::Psig_primitive: {
-        auto [tdesc, newenv] = typedecl::transl_prim_desc(env, item->psig_loc, as<pt::Psig_primitive>(d)->pd);
-        check_value(names, tdesc->prim_loc, tdesc->prim_id);
-        return {mksig(mkd(tt::Tsig_primitive{{TSK::Tsig_primitive}, tdesc}), env, loc),
-                {sig_value(tdesc->prim_id, tdesc->prim_val, Visibility::Exported)},
                 newenv};
       }
       case K::Psig_type: {

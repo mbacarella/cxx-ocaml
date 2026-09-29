@@ -1010,24 +1010,13 @@ struct Conv {
     return make<TypeException>(c, c->pext_loc, attrs(x.attrs));
   }
   const ValueDescription* value_description(const ast::ValueDescription& v) const {
-    return make<ValueDescription>(str(v.name), core_type(*v.type), attrs(v.attrs), loc(v.loc));
+    return make<ValueDescription>(str(v.name), core_type(*v.type), Slice<std::string_view>{}, attrs(v.attrs),
+                                  loc(v.loc));
   }
-  const PrimitiveDescription* primitive(const ast::PrimitiveDescription& p) const {
-    PrimitiveKind k{};
-    if (p.alias) {
-      k.kind = PrimitiveKind::Kind::Pprim_alias;
-      k.ty = p.type ? core_type(*p.type) : nullptr;
-      if (p.alias_lid) {
-        k.alias = lidloc(*p.alias_lid);
-      } else {  // `( op )`: an operator name
-        k.alias = LidLoc{Longident::lident(p.alias->txt), loc(p.alias->loc), fresh_identity()};
-      }
-    } else {
-      k.kind = PrimitiveKind::Kind::Pprim_decl;
-      k.ty = core_type(*p.type);
-      k.prims = map_slice<std::string_view>(p.prims, [](const std::string& s) { return zborrow(s); });
-    }
-    return make<PrimitiveDescription>(str(p.name), k, attrs(p.attrs), loc(p.loc));
+  // an `external`: a value description with its primitive names
+  const ValueDescription* primitive(const ast::PrimitiveDescription& p) const {
+    auto prims = map_slice<std::string_view>(p.prims, [](const std::string& s) { return zborrow(s); });
+    return make<ValueDescription>(str(p.name), core_type(*p.type), prims, attrs(p.attrs), loc(p.loc));
   }
 
   // ---- class language ----
@@ -1285,7 +1274,7 @@ struct Conv {
           if constexpr (std::is_same_v<T, ast::Psig_value>) {
             d = make<Psig_value>(Psig_value{{K::Psig_value}, value_description(v.vd)});
           } else if constexpr (std::is_same_v<T, ast::Psig_primitive>) {
-            d = make<Psig_primitive>(Psig_primitive{{K::Psig_primitive}, primitive(v.pd)});
+            d = make<Psig_value>(Psig_value{{K::Psig_value}, primitive(v.pd)});
           } else if constexpr (std::is_same_v<T, ast::Psig_type>) {
             d = make<Psig_type>(Psig_type{{K::Psig_type}, rec(v.rf), type_declarations(v.decls)});
           } else if constexpr (std::is_same_v<T, ast::Psig_typesubst>) {
@@ -1362,7 +1351,7 @@ struct Conv {
           } else if constexpr (std::is_same_v<T, ast::Pstr_value>) {
             d = make<Pstr_value>(Pstr_value{{K::Pstr_value}, rec(v.rf), value_bindings(v.bindings, &l)});
           } else if constexpr (std::is_same_v<T, ast::Pstr_val>) {
-            d = make<Pstr_val>(Pstr_val{{K::Pstr_val}, value_description(v.vd)});
+            d = make<Pstr_primitive>(Pstr_primitive{{K::Pstr_primitive}, value_description(v.vd)});
           } else if constexpr (std::is_same_v<T, ast::Pstr_primitive>) {
             d = make<Pstr_primitive>(Pstr_primitive{{K::Pstr_primitive}, primitive(v.prim)});
           } else if constexpr (std::is_same_v<T, ast::Pstr_type>) {

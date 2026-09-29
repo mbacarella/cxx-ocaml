@@ -719,13 +719,12 @@ static ItemTyped type_str_item(SignatureNames* names, bool toplevel, bool funct_
       }
       return mk(mkd(tt::Tstr_value{{STK::Tstr_value}, v->rec, defs}), items, shape_map, r.env);
     }
-    case K::Pstr_val: raise_error(err(as<pt::Pstr_val>(d)->vd->pval_loc, env, EK::Val_in_structure));
     case K::Pstr_primitive: {
-      auto [desc, newenv] = typedecl::transl_prim_desc(env, loc, as<pt::Pstr_primitive>(d)->pd);
-      check_value(names, desc->prim_loc, desc->prim_id);
-      shape_map = shape::map::add_value(shape_map, desc->prim_id, desc->prim_val->val_uid);
+      auto [desc, newenv] = typedecl::transl_value_decl(env, loc, as<pt::Pstr_primitive>(d)->vd);
+      check_value(names, desc->val_loc, desc->val_id);
+      shape_map = shape::map::add_value(shape_map, desc->val_id, desc->val_val->val_uid);
       return mk(mkd(tt::Tstr_primitive{{STK::Tstr_primitive}, desc}),
-                {sig_value(desc->prim_id, desc->prim_val, Visibility::Exported)}, shape_map, newenv);
+                {sig_value(desc->val_id, desc->val_val, Visibility::Exported)}, shape_map, newenv);
     }
     case K::Pstr_type: {
       auto* t = as<pt::Pstr_type>(d);

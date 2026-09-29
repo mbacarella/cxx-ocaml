@@ -731,8 +731,6 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
                                              cppcaml::ast::last_comments(), pos_name, dirfiles));
                                        }
                                        st = ty::pparse::apply_rewriters_str(st, kTool);
-                                       // Compile_common.Parse_result.update_unit_info
-                                       target.human_source_file = ty::location::input_name;
                                        if (cf::should_stop_after(cf::Pass::Parsing)) {
                                          stopped = true;
                                          return;
@@ -982,7 +980,6 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
                 ty::parsetree::comments_of_ast(cppcaml::ast::last_comments(), pos_name, dirfiles));
           }
           sg = ty::pparse::apply_rewriters_sig(sg, kTool);
-          target.human_source_file = ty::location::input_name;  // update_unit_info
           if (cf::should_stop_after(cf::Pass::Parsing)) return;
           // Compile_common.typecheck_intf
           const ty::typedtree::Signature* tsg = ty::typemod::type_interface(target, env0, sg);

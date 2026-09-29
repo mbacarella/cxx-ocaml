@@ -374,25 +374,14 @@ PT_CTOR(ExpressionDesc, Pexp_letop) const Letop* letop; PT_END
 PT_CTOR(ExpressionDesc, Pexp_extension) const Extension* ext; PT_END
 PT_CTOR(ExpressionDesc, Pexp_unreachable) PT_END
 
-// ---- value / primitive descriptions -------------------------------------------------------
+// ---- value descriptions -------------------------------------------------------------------
+// [val x: T] (pval_prim = []) or [external x: T = "s1" ... "sn"]
 struct ValueDescription {
   StrLoc pval_name;
   const CoreType* pval_type;
+  Slice<std::string_view> pval_prim;
   Attributes pval_attributes;
   Location pval_loc;
-};
-struct PrimitiveKind {
-  enum class Kind : std::uint8_t { Pprim_decl, Pprim_alias };
-  Kind kind;
-  const CoreType* ty;               // Pprim_decl; Pprim_alias: option
-  Slice<std::string_view> prims;    // Pprim_decl
-  LidLoc alias;                     // Pprim_alias
-};
-struct PrimitiveDescription {
-  StrLoc pprim_name;
-  PrimitiveKind pprim_kind;
-  Attributes pprim_attributes;
-  Location pprim_loc;
 };
 
 // ---- type declarations -------------------------------------------------------------------
@@ -682,7 +671,7 @@ struct ModuleTypeDeclaration {
 
 struct SignatureItemDesc {
   enum class Kind : std::uint8_t {
-    Psig_value, Psig_primitive, Psig_type, Psig_typesubst, Psig_typext, Psig_exception,
+    Psig_value, Psig_type, Psig_typesubst, Psig_typext, Psig_exception,
     Psig_module, Psig_modsubst, Psig_recmodule, Psig_modtype, Psig_modtypesubst, Psig_open,
     Psig_include, Psig_class, Psig_class_type, Psig_attribute, Psig_extension
   };
@@ -693,7 +682,6 @@ struct SignatureItem {
   Location psig_loc;
 };
 PT_CTOR(SignatureItemDesc, Psig_value) const ValueDescription* vd; PT_END
-PT_CTOR(SignatureItemDesc, Psig_primitive) const PrimitiveDescription* pd; PT_END
 PT_CTOR(SignatureItemDesc, Psig_type) RecFlag rec; Slice<const TypeDeclaration*> decls; PT_END
 PT_CTOR(SignatureItemDesc, Psig_typesubst) Slice<const TypeDeclaration*> decls; PT_END
 PT_CTOR(SignatureItemDesc, Psig_typext) const TypeExtension* ext; PT_END
@@ -755,7 +743,7 @@ struct ModuleBinding {
 
 struct StructureItemDesc {
   enum class Kind : std::uint8_t {
-    Pstr_eval, Pstr_value, Pstr_val, Pstr_primitive, Pstr_type, Pstr_typext, Pstr_exception,
+    Pstr_eval, Pstr_value, Pstr_primitive, Pstr_type, Pstr_typext, Pstr_exception,
     Pstr_module, Pstr_recmodule, Pstr_modtype, Pstr_open, Pstr_class, Pstr_class_type,
     Pstr_include, Pstr_attribute, Pstr_extension
   };
@@ -767,8 +755,7 @@ struct StructureItem {
 };
 PT_CTOR(StructureItemDesc, Pstr_eval) const Expression* exp; Attributes attrs; PT_END
 PT_CTOR(StructureItemDesc, Pstr_value) RecFlag rec; Slice<const ValueBinding*> vbs; PT_END
-PT_CTOR(StructureItemDesc, Pstr_val) const ValueDescription* vd; PT_END
-PT_CTOR(StructureItemDesc, Pstr_primitive) const PrimitiveDescription* pd; PT_END
+PT_CTOR(StructureItemDesc, Pstr_primitive) const ValueDescription* vd; PT_END
 PT_CTOR(StructureItemDesc, Pstr_type) RecFlag rec; Slice<const TypeDeclaration*> decls; PT_END
 PT_CTOR(StructureItemDesc, Pstr_typext) const TypeExtension* ext; PT_END
 PT_CTOR(StructureItemDesc, Pstr_exception) const TypeException* exn; PT_END

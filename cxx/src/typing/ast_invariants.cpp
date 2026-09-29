@@ -14,7 +14,6 @@ using namespace parsetree;
 // (the parsetree's, not the Types records' of support.hpp)
 using parsetree::Attribute;
 using parsetree::Attributes;
-using parsetree::PrimitiveDescription;
 
 [[noreturn]] void err(const Location& loc, const char* s) { throw syntaxerr::IllFormedAst(loc, s); }
 
@@ -276,14 +275,6 @@ class Iterator {
     typ(vd->pval_type);
     attributes(vd->pval_attributes);
   }
-  void primitive_description(const PrimitiveDescription* pd) {
-    if (pd->pprim_kind.kind == PrimitiveKind::Kind::Pprim_decl) {
-      typ(pd->pprim_kind.ty);
-    } else if (pd->pprim_kind.ty) {
-      typ(pd->pprim_kind.ty);
-    }
-    attributes(pd->pprim_attributes);
-  }
 
   // ---- classes ----
   void class_type(const ClassType* ct) {
@@ -506,8 +497,7 @@ class Iterator {
       case K::Pstr_value:
         for (const ValueBinding* vb : as<Pstr_value>(d)->vbs) value_binding(vb);
         break;
-      case K::Pstr_val: value_description(as<Pstr_val>(d)->vd); break;
-      case K::Pstr_primitive: primitive_description(as<Pstr_primitive>(d)->pd); break;
+      case K::Pstr_primitive: value_description(as<Pstr_primitive>(d)->vd); break;
       case K::Pstr_type:
         for (const TypeDeclaration* td : as<Pstr_type>(d)->decls) type_declaration(td);
         break;
@@ -559,7 +549,6 @@ class Iterator {
     using K = SignatureItemDesc::Kind;
     switch (d->kind) {
       case K::Psig_value: value_description(as<Psig_value>(d)->vd); break;
-      case K::Psig_primitive: primitive_description(as<Psig_primitive>(d)->pd); break;
       case K::Psig_type:
         for (const TypeDeclaration* td : as<Psig_type>(d)->decls) type_declaration(td);
         break;

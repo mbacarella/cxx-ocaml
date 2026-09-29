@@ -571,16 +571,9 @@ V type_exception(const TypeException* t) {
   return B(0, {extension_constructor(t->ptyexn_constructor), loc(t->ptyexn_loc), attrs(t->ptyexn_attributes)});
 }
 V value_description(const ValueDescription* v) {
-  return B(0, {strloc(v->pval_name), core_type(v->pval_type), attrs(v->pval_attributes), loc(v->pval_loc)});
+  return B(0, {strloc(v->pval_name), core_type(v->pval_type), strlist(v->pval_prim), attrs(v->pval_attributes),
+               loc(v->pval_loc)});
 }
-V primitive_description(const PrimitiveDescription* p) {
-  V kind;
-  if (p->pprim_kind.kind == PrimitiveKind::Kind::Pprim_decl)
-    kind = B(0, {core_type(p->pprim_kind.ty), strlist(p->pprim_kind.prims)});
-  else kind = B(1, {opt_ty(p->pprim_kind.ty), lidloc(p->pprim_kind.alias)});
-  return B(0, {strloc(p->pprim_name), kind, attrs(p->pprim_attributes), loc(p->pprim_loc)});
-}
-
 // ---- classes ------------------------------------------------------------------------------
 template <class A, class F>
 V open_infos(const OpenInfos<A>* o, F&& f) {
@@ -821,43 +814,42 @@ V signature_item(const SignatureItem* it) {
   V desc = I(0);
   switch (d->kind) {
     case K::Psig_value: desc = B(0, {value_description(as<Psig_value>(d)->vd)}); break;
-    case K::Psig_primitive: desc = B(1, {primitive_description(as<Psig_primitive>(d)->pd)}); break;
     case K::Psig_type: {
       auto* t = as<Psig_type>(d);
-      desc = B(2, {flag(t->rec), type_declarations(t->decls)});
+      desc = B(1, {flag(t->rec), type_declarations(t->decls)});
       break;
     }
-    case K::Psig_typesubst: desc = B(3, {type_declarations(as<Psig_typesubst>(d)->decls)}); break;
-    case K::Psig_typext: desc = B(4, {type_extension(as<Psig_typext>(d)->ext)}); break;
-    case K::Psig_exception: desc = B(5, {type_exception(as<Psig_exception>(d)->exn)}); break;
-    case K::Psig_module: desc = B(6, {module_declaration(as<Psig_module>(d)->md)}); break;
+    case K::Psig_typesubst: desc = B(2, {type_declarations(as<Psig_typesubst>(d)->decls)}); break;
+    case K::Psig_typext: desc = B(3, {type_extension(as<Psig_typext>(d)->ext)}); break;
+    case K::Psig_exception: desc = B(4, {type_exception(as<Psig_exception>(d)->exn)}); break;
+    case K::Psig_module: desc = B(5, {module_declaration(as<Psig_module>(d)->md)}); break;
     case K::Psig_modsubst: {
       const ModuleSubstitution* ms = as<Psig_modsubst>(d)->ms;
-      desc = B(7, {B(0, {strloc(ms->pms_name), lidloc(ms->pms_manifest), attrs(ms->pms_attributes), loc(ms->pms_loc)})});
+      desc = B(6, {B(0, {strloc(ms->pms_name), lidloc(ms->pms_manifest), attrs(ms->pms_attributes), loc(ms->pms_loc)})});
       break;
     }
     case K::Psig_recmodule:
-      desc = B(8, {list(as<Psig_recmodule>(d)->mds, [](const ModuleDeclaration* m) { return module_declaration(m); })});
+      desc = B(7, {list(as<Psig_recmodule>(d)->mds, [](const ModuleDeclaration* m) { return module_declaration(m); })});
       break;
-    case K::Psig_modtype: desc = B(9, {module_type_declaration(as<Psig_modtype>(d)->mtd)}); break;
-    case K::Psig_modtypesubst: desc = B(10, {module_type_declaration(as<Psig_modtypesubst>(d)->mtd)}); break;
-    case K::Psig_open: desc = B(11, {open_description(as<Psig_open>(d)->od)}); break;
+    case K::Psig_modtype: desc = B(8, {module_type_declaration(as<Psig_modtype>(d)->mtd)}); break;
+    case K::Psig_modtypesubst: desc = B(9, {module_type_declaration(as<Psig_modtypesubst>(d)->mtd)}); break;
+    case K::Psig_open: desc = B(10, {open_description(as<Psig_open>(d)->od)}); break;
     case K::Psig_include: {
       const IncludeDescription* i = as<Psig_include>(d)->incl;
-      desc = B(12, {B(0, {module_type(i->pincl_mod), loc(i->pincl_loc), attrs(i->pincl_attributes)})});
+      desc = B(11, {B(0, {module_type(i->pincl_mod), loc(i->pincl_loc), attrs(i->pincl_attributes)})});
       break;
     }
     case K::Psig_class:
-      desc = B(13, {list(as<Psig_class>(d)->decls, [](const ClassDescription* c) { return class_type_infos(c); })});
+      desc = B(12, {list(as<Psig_class>(d)->decls, [](const ClassDescription* c) { return class_type_infos(c); })});
       break;
     case K::Psig_class_type:
-      desc = B(14, {list(as<Psig_class_type>(d)->decls,
+      desc = B(13, {list(as<Psig_class_type>(d)->decls,
                          [](const ClassTypeDeclaration* c) { return class_type_infos(c); })});
       break;
-    case K::Psig_attribute: desc = B(15, {attribute(as<Psig_attribute>(d)->attr)}); break;
+    case K::Psig_attribute: desc = B(14, {attribute(as<Psig_attribute>(d)->attr)}); break;
     case K::Psig_extension: {
       auto* e = as<Psig_extension>(d);
-      desc = B(16, {extension(e->ext), attrs(e->attrs)});
+      desc = B(15, {extension(e->ext), attrs(e->attrs)});
       break;
     }
   }
@@ -885,41 +877,40 @@ V structure_item(const StructureItem* it) {
       desc = B(1, {flag(v->rec), value_bindings(v->vbs)});
       break;
     }
-    case K::Pstr_val: desc = B(2, {value_description(as<Pstr_val>(d)->vd)}); break;
-    case K::Pstr_primitive: desc = B(3, {primitive_description(as<Pstr_primitive>(d)->pd)}); break;
+    case K::Pstr_primitive: desc = B(2, {value_description(as<Pstr_primitive>(d)->vd)}); break;
     case K::Pstr_type: {
       auto* t = as<Pstr_type>(d);
-      desc = B(4, {flag(t->rec), type_declarations(t->decls)});
+      desc = B(3, {flag(t->rec), type_declarations(t->decls)});
       break;
     }
-    case K::Pstr_typext: desc = B(5, {type_extension(as<Pstr_typext>(d)->ext)}); break;
-    case K::Pstr_exception: desc = B(6, {type_exception(as<Pstr_exception>(d)->exn)}); break;
-    case K::Pstr_module: desc = B(7, {module_binding(as<Pstr_module>(d)->mb)}); break;
+    case K::Pstr_typext: desc = B(4, {type_extension(as<Pstr_typext>(d)->ext)}); break;
+    case K::Pstr_exception: desc = B(5, {type_exception(as<Pstr_exception>(d)->exn)}); break;
+    case K::Pstr_module: desc = B(6, {module_binding(as<Pstr_module>(d)->mb)}); break;
     case K::Pstr_recmodule:
-      desc = B(8, {list(as<Pstr_recmodule>(d)->mbs, [](const ModuleBinding* m) { return module_binding(m); })});
+      desc = B(7, {list(as<Pstr_recmodule>(d)->mbs, [](const ModuleBinding* m) { return module_binding(m); })});
       break;
-    case K::Pstr_modtype: desc = B(9, {module_type_declaration(as<Pstr_modtype>(d)->mtd)}); break;
+    case K::Pstr_modtype: desc = B(8, {module_type_declaration(as<Pstr_modtype>(d)->mtd)}); break;
     case K::Pstr_open:
-      desc = B(10, {open_infos(as<Pstr_open>(d)->od, [](const ModuleExpr* m) { return module_expr(m); })});
+      desc = B(9, {open_infos(as<Pstr_open>(d)->od, [](const ModuleExpr* m) { return module_expr(m); })});
       break;
     case K::Pstr_class:
-      desc = B(11, {list(as<Pstr_class>(d)->decls, [](const ClassDeclaration* c) {
+      desc = B(10, {list(as<Pstr_class>(d)->decls, [](const ClassDeclaration* c) {
                  return class_infos(c, [](const ClassExpr* e) { return class_expr(e); });
                })});
       break;
     case K::Pstr_class_type:
-      desc = B(12, {list(as<Pstr_class_type>(d)->decls,
+      desc = B(11, {list(as<Pstr_class_type>(d)->decls,
                          [](const ClassTypeDeclaration* c) { return class_type_infos(c); })});
       break;
     case K::Pstr_include: {
       const IncludeDeclaration* i = as<Pstr_include>(d)->incl;
-      desc = B(13, {B(0, {module_expr(i->pincl_mod), loc(i->pincl_loc), attrs(i->pincl_attributes)})});
+      desc = B(12, {B(0, {module_expr(i->pincl_mod), loc(i->pincl_loc), attrs(i->pincl_attributes)})});
       break;
     }
-    case K::Pstr_attribute: desc = B(14, {attribute(as<Pstr_attribute>(d)->attr)}); break;
+    case K::Pstr_attribute: desc = B(13, {attribute(as<Pstr_attribute>(d)->attr)}); break;
     case K::Pstr_extension: {
       auto* e = as<Pstr_extension>(d);
-      desc = B(15, {extension(e->ext), attrs(e->attrs)});
+      desc = B(14, {extension(e->ext), attrs(e->attrs)});
       break;
     }
   }

@@ -559,6 +559,7 @@ void unify_uenv(const Uenv& uenv, TypeExpr* t1, TypeExpr* t2);  // raises Unify
 void unify_pairs(env::t env, TypeExpr* t1, TypeExpr* t2, std::vector<UnivarPair> pairs);
 btype::TypePairs* unify_gadt(PatternEnv* penv, TypeExpr* pat, TypeExpr* expected);
 void unify_var(env::t env, TypeExpr* t1, TypeExpr* t2);
+void enforce_current_level(env::t env, TypeExpr* ty);
 void unify_var_uenv(const Uenv& uenv, TypeExpr* t1, TypeExpr* t2);
 TypeExpr* expand_head_trace(env::t env, TypeExpr* t);
 

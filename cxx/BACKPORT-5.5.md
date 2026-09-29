@@ -30,7 +30,7 @@ Lines = changed lines in the upstream diff.
 - [ ] typing/typetexp.ml (130)
 - [ ] lambda/value_rec_compiler.ml (129)
 - [ ] typing/rawprinttyp.ml (122)
-- [ ] parsing/parser.mly (118)
+- [x] parsing/parser.mly (118)
 - [ ] typing/typing_recovery_state.ml (111)
 - [ ] typing/typing_recovery.ml (105)
 - [ ] lambda/translprim.ml (84)
@@ -40,9 +40,9 @@ Lines = changed lines in the upstream diff.
 - [ ] asmcomp/cmm_helpers.ml (68)
 - [ ] parsing/lexer.mll (65)
 - [ ] parsing/pprintast.ml (55)
-- [ ] driver/compile_common.ml (54)
+- [x] driver/compile_common.ml (54)
 - [ ] asmcomp/arm64/arch.ml (52)
-- [ ] parsing/unit_info.ml (47)
+- [x] parsing/unit_info.ml (47)
 - [ ] lambda/translmod.ml (46)
 - [ ] bytecomp/bytepackager.ml (45)
 - [ ] typing/value_rec_check.ml (39)
@@ -54,7 +54,7 @@ Lines = changed lines in the upstream diff.
 - [ ] middle_end/flambda/inlining_decision.ml (35)
 - [x] typing/errortrace.ml (33)
 - [ ] asmcomp/emitaux.ml (33)
-- [ ] typing/typedtree.ml (32)
+- [x] typing/typedtree.ml (32)
 - [ ] parsing/ast_mapper.ml (30)
 - [ ] asmcomp/thread_sanitizer.ml (30)
 - [ ] asmcomp/riscv/proc.ml (30)
@@ -65,11 +65,11 @@ Lines = changed lines in the upstream diff.
 - [ ] asmcomp/asmlink.ml (25)
 - [ ] typing/primitive.ml (23)
 - [ ] typing/untypeast.ml (22)
-- [ ] typing/tast_mapper.ml (22)
-- [ ] file_formats/cmt_format.ml (22)
+- [x] typing/tast_mapper.ml (22)
+- [x] file_formats/cmt_format.ml (22)
 - [ ] bytecomp/bytelink.ml (22)
 - [ ] parsing/ast_iterator.ml (21)
-- [ ] typing/tast_iterator.ml (20)
+- [x] typing/tast_iterator.ml (20)
 - [x] typing/subst.ml (20)
 - [ ] asmcomp/amd64/selection.ml (19)
 - [x] typing/printpat.ml (18)
@@ -141,10 +141,19 @@ Lines = changed lines in the upstream diff.
 Notes (open items noticed while porting):
 - ctype: PatternEnv::save/reset and arrow_spine/arrow_labels are trunk
   additions kept for their callers in typecore; remove with typecore.
-- enforce_current_level (trunk #14995) callers in typecore/typedecl get
-  5.5.1's code with those files.
+- enforce_current_level: 5.5.1's is unify_var env (newvar ()) ty (restored).
 - set_object_name takes an Ident (5.5.1): typeclass callers.
 - typedecl: try_expand_once_gen_nolink belongs to trunk's well-foundedness
   rewrite (#11648); typedecl gets 5.5.1's check.
 - errortrace: Kind_differ and the three First_class_module constructors are
   trunk-only; the C++ Obj/FirstClassModule kinds still have them.
+- typedecl: 5.5.1's check_well_founded (TypeMap/parents, deep type_iterators
+  check, check_well_founded_manifest), no Subst copies in transl_type_decl,
+  Unbound_type_var_ext / Val_in_structure back; typemod check_type_decl has
+  no well-foundedness check and check_recmod_typedecls takes abs_env.
+  typedecl.ml: rest of the diff (native repr, with_constraint, approx) TODO.
+- parser: holes reverted (d107b293f7), external aliases and `{f x with}`
+  removed, `with module type T = S -> S` stops at the arrow; lexer `~_:`
+  stays (5.5.1 lexes it the same).
+- parse tree / binary AST: value_description with pval_prim, no
+  Psig_primitive / Pstr_val; typed tree: val_prim, c_cont Ident option.

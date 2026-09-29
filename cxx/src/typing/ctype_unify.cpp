@@ -2001,6 +2001,9 @@ void unify_var(env::t env, TypeExpr* t1, TypeExpr* t2) {
   unify_var_uenv(Uenv::expression(env), t1, t2);
 }
 
+// Lower the level of a type to the current level
+void enforce_current_level(env::t env, TypeExpr* ty) { unify_var(env, newvar(), ty); }
+
 void unify_pairs(env::t env, TypeExpr* t1, TypeExpr* t2, std::vector<UnivarPair> pairs) {
   with_univar_pairs(std::move(pairs), [&] {
     unify_uenv(Uenv::expression(env), t1, t2);

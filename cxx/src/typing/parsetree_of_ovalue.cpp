@@ -605,23 +605,10 @@ class Decoder {
   }
   const ValueDescription* value_description(V x) {
     return node<ValueDescription>(x, [&] {
-      return make<ValueDescription>(ValueDescription{strloc(f(x, 0)), core_type(f(x, 1)), attrs(f(x, 2)), loc(f(x, 3))});
-    });
-  }
-  const PrimitiveDescription* primitive_description(V x) {
-    return node<PrimitiveDescription>(x, [&] {
-      PrimitiveKind k{};
-      V kv = f(x, 1);
-      if (tag(kv) == 0) {
-        k.kind = PrimitiveKind::Kind::Pprim_decl;
-        k.ty = core_type(f(kv, 0));
-        k.prims = strlist(f(kv, 1));
-      } else {
-        k.kind = PrimitiveKind::Kind::Pprim_alias;
-        k.ty = opt_ty(f(kv, 0));
-        k.alias = lidloc(f(kv, 1));
-      }
-      return make<PrimitiveDescription>(PrimitiveDescription{strloc(f(x, 0)), k, attrs(f(x, 2)), loc(f(x, 3))});
+      StrLoc name = strloc(f(x, 0));
+      const CoreType* ty = core_type(f(x, 1));
+      Slice<std::string_view> prims = strlist(f(x, 2));
+      return make<ValueDescription>(ValueDescription{name, ty, prims, attrs(f(x, 3)), loc(f(x, 4))});
     });
   }
 
@@ -845,13 +832,12 @@ class Decoder {
       const SignatureItemDesc* desc = nullptr;
       switch (tag(d)) {
         case 0: desc = mk<Psig_value>(value_description(f(d, 0))); break;
-        case 1: desc = mk<Psig_primitive>(primitive_description(f(d, 0))); break;
-        case 2: desc = mk<Psig_type>(flag<RecFlag>(f(d, 0)), type_declarations(f(d, 1))); break;
-        case 3: desc = mk<Psig_typesubst>(type_declarations(f(d, 0))); break;
-        case 4: desc = mk<Psig_typext>(type_extension(f(d, 0))); break;
-        case 5: desc = mk<Psig_exception>(type_exception(f(d, 0))); break;
-        case 6: desc = mk<Psig_module>(module_declaration(f(d, 0))); break;
-        case 7: {
+        case 1: desc = mk<Psig_type>(flag<RecFlag>(f(d, 0)), type_declarations(f(d, 1))); break;
+        case 2: desc = mk<Psig_typesubst>(type_declarations(f(d, 0))); break;
+        case 3: desc = mk<Psig_typext>(type_extension(f(d, 0))); break;
+        case 4: desc = mk<Psig_exception>(type_exception(f(d, 0))); break;
+        case 5: desc = mk<Psig_module>(module_declaration(f(d, 0))); break;
+        case 6: {
           V m = f(d, 0);
           const ModuleSubstitution* ms = node<ModuleSubstitution>(m, [&] {
             return make<ModuleSubstitution>(
@@ -860,14 +846,14 @@ class Decoder {
           desc = mk<Psig_modsubst>(ms);
           break;
         }
-        case 8:
+        case 7:
           desc = mk<Psig_recmodule>(
               list<const ModuleDeclaration*>(f(d, 0), [&](V m) { return module_declaration(m); }));
           break;
-        case 9: desc = mk<Psig_modtype>(module_type_declaration(f(d, 0))); break;
-        case 10: desc = mk<Psig_modtypesubst>(module_type_declaration(f(d, 0))); break;
-        case 11: desc = mk<Psig_open>(open_description(f(d, 0))); break;
-        case 12: {
+        case 8: desc = mk<Psig_modtype>(module_type_declaration(f(d, 0))); break;
+        case 9: desc = mk<Psig_modtypesubst>(module_type_declaration(f(d, 0))); break;
+        case 10: desc = mk<Psig_open>(open_description(f(d, 0))); break;
+        case 11: {
           V i = f(d, 0);
           const IncludeDescription* incl = node<IncludeDescription>(i, [&] {
             return make<IncludeDescription>(IncludeDescription{module_type(f(i, 0)), loc(f(i, 1)), attrs(f(i, 2))});
@@ -875,16 +861,16 @@ class Decoder {
           desc = mk<Psig_include>(incl);
           break;
         }
-        case 13:
+        case 12:
           desc = mk<Psig_class>(
               list<const ClassDescription*>(f(d, 0), [&](V c) { return class_type_infos(c); }));
           break;
-        case 14:
+        case 13:
           desc = mk<Psig_class_type>(
               list<const ClassTypeDeclaration*>(f(d, 0), [&](V c) { return class_type_infos(c); }));
           break;
-        case 15: desc = mk<Psig_attribute>(attribute(f(d, 0))); break;
-        case 16: desc = mk<Psig_extension>(extension(f(d, 0)), attrs(f(d, 1))); break;
+        case 14: desc = mk<Psig_attribute>(attribute(f(d, 0))); break;
+        case 15: desc = mk<Psig_extension>(extension(f(d, 0)), attrs(f(d, 1))); break;
         default: throw Corrupt{};
       }
       return make<SignatureItem>(SignatureItem{desc, loc(f(x, 1))});
@@ -901,17 +887,16 @@ class Decoder {
       switch (tag(d)) {
         case 0: desc = mk<Pstr_eval>(expression(f(d, 0)), attrs(f(d, 1))); break;
         case 1: desc = mk<Pstr_value>(flag<RecFlag>(f(d, 0)), value_bindings(f(d, 1))); break;
-        case 2: desc = mk<Pstr_val>(value_description(f(d, 0))); break;
-        case 3: desc = mk<Pstr_primitive>(primitive_description(f(d, 0))); break;
-        case 4: desc = mk<Pstr_type>(flag<RecFlag>(f(d, 0)), type_declarations(f(d, 1))); break;
-        case 5: desc = mk<Pstr_typext>(type_extension(f(d, 0))); break;
-        case 6: desc = mk<Pstr_exception>(type_exception(f(d, 0))); break;
-        case 7: desc = mk<Pstr_module>(module_binding(f(d, 0))); break;
-        case 8:
+        case 2: desc = mk<Pstr_primitive>(value_description(f(d, 0))); break;
+        case 3: desc = mk<Pstr_type>(flag<RecFlag>(f(d, 0)), type_declarations(f(d, 1))); break;
+        case 4: desc = mk<Pstr_typext>(type_extension(f(d, 0))); break;
+        case 5: desc = mk<Pstr_exception>(type_exception(f(d, 0))); break;
+        case 6: desc = mk<Pstr_module>(module_binding(f(d, 0))); break;
+        case 7:
           desc = mk<Pstr_recmodule>(list<const ModuleBinding*>(f(d, 0), [&](V m) { return module_binding(m); }));
           break;
-        case 9: desc = mk<Pstr_modtype>(module_type_declaration(f(d, 0))); break;
-        case 10: {
+        case 8: desc = mk<Pstr_modtype>(module_type_declaration(f(d, 0))); break;
+        case 9: {
           V o = f(d, 0);
           const OpenDeclaration* od = node<OpenDeclaration>(o, [&] {
             return make<OpenDeclaration>(
@@ -920,7 +905,7 @@ class Decoder {
           desc = mk<Pstr_open>(od);
           break;
         }
-        case 11:
+        case 10:
           desc = mk<Pstr_class>(list<const ClassDeclaration*>(f(d, 0), [&](V c) {
             return node<ClassDeclaration>(c, [&] {
               return make<ClassDeclaration>(ClassDeclaration{flag<VirtualFlag>(f(c, 0)), type_params(f(c, 1)),
@@ -929,11 +914,11 @@ class Decoder {
             });
           }));
           break;
-        case 12:
+        case 11:
           desc = mk<Pstr_class_type>(
               list<const ClassTypeDeclaration*>(f(d, 0), [&](V c) { return class_type_infos(c); }));
           break;
-        case 13: {
+        case 12: {
           V i = f(d, 0);
           const IncludeDeclaration* incl = node<IncludeDeclaration>(i, [&] {
             return make<IncludeDeclaration>(IncludeDeclaration{module_expr(f(i, 0)), loc(f(i, 1)), attrs(f(i, 2))});
@@ -941,8 +926,8 @@ class Decoder {
           desc = mk<Pstr_include>(incl);
           break;
         }
-        case 14: desc = mk<Pstr_attribute>(attribute(f(d, 0))); break;
-        case 15: desc = mk<Pstr_extension>(extension(f(d, 0)), attrs(f(d, 1))); break;
+        case 13: desc = mk<Pstr_attribute>(attribute(f(d, 0))); break;
+        case 14: desc = mk<Pstr_extension>(extension(f(d, 0)), attrs(f(d, 1))); break;
         default: throw Corrupt{};
       }
       return make<StructureItem>(StructureItem{desc, loc(f(x, 1))});

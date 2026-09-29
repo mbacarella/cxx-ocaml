@@ -508,7 +508,7 @@ struct TypeSet {  // Btype.TypeSet, by the id of the representative
 static void check_constraints_rec(env::t env, const Location& loc, TypeSet& visited, TypeExpr* ty) {
   if (visited.mem(ty)) return;
   visited.add(ty);
-  const TypeDesc* d = btype::get_constr_desc(ty);
+  const TypeDesc* d = get_desc(ty);
   if (auto* tc = as<Tconstr>(d)) {
     const TypeDeclaration* decl;
     try {
@@ -603,7 +603,7 @@ void check_coherence(env::t env, const Location& loc, Path::t dpath, const TypeD
         decl->type_manifest))
     return;
   TypeExpr* ty = decl->type_manifest;
-  auto* tc = as<Tconstr>(btype::get_constr_desc(ty));
+  auto* tc = as<Tconstr>(get_desc(ty));
   if (!tc) {
     Error e(loc, EK::Definition_mismatch);
     e.ty = ty;
@@ -662,165 +662,116 @@ static ReachingTypeStep contains(TypeExpr* a, TypeExpr* b) {
   return {ReachingTypeStep::Kind::Contains, a, b};
 }
 
-namespace {
-struct Reach {
-  env::t abs_env, final_env;
-  const std::function<bool(Path::t)>& is_decl_path;
-  const Location& loc;
-  Path::t ty_path;
-  TypeSet visited;
-  std::vector<std::pair<Path::t, std::vector<TypeExpr*>>> visited_paths;  // Path.Map, lists head first
+// Well-foundedness: a TypeSet (by the representative's id, as ctype.ml's
+// TypeSet) of the parents already on the path to a node, and the TypeMap of
+// each visited node to the parents it was checked under.
+using IdSet = std::set<long>;
+using WfVisited = std::map<long, IdSet>;
 
-  [[noreturn]] void raise_error_(const Trace& trace) {
-    Path::t path = ty_path;
-    bool rec_abbrev = false;
-    if (!trace.empty() && trace.back().kind == ReachingTypeStep::Kind::Expands_to) {
-      auto* tc = as<Tconstr>(btype::get_constr_desc(trace.back().t1));
-      rec_abbrev = tc && path::same(tc->path, path);
-    }
-    Error e(loc, rec_abbrev ? EK::Recursive_abbrev : EK::Cycle_in_def);
-    e.name = path::name(path);
-    e.env = abs_env;
-    e.reaching_path = trace;
-    raise_error(e);
-  }
-  void unguarded(const Trace& trace, TypeExpr* ty2) {
-    if (visited.mem(ty2)) return;
-    auto* tc = as<Tconstr>(btype::get_constr_desc(ty2));
-    if (tc) {
-      for (auto& [p, tys] : visited_paths)
-        if (path::same(p, tc->path)) {
-          for (TypeExpr* ty3 : tys) {
-            std::vector<TypeExpr*> a{ty2}, b{ty3};
-            if (ctype::is_equal(abs_env, false, slice(a), slice(b))) return;
-          }
-          break;
+static void check_well_founded(env::t abs_env, env::t env, const Location& loc, Path::t path,
+                               const std::function<bool(Path::t)>& to_check, WfVisited& visited, TypeExpr* ty0) {
+  std::function<void(const IdSet&, const Trace&, TypeExpr*)> check;
+  auto check_subtype = [&](const IdSet& parents, const Trace& trace, TypeExpr* outer_ty, TypeExpr* inner_ty) {
+    check(parents, cons_trace(trace, contains(outer_ty, inner_ty)), inner_ty);
+  };
+  check = [&](const IdSet& parents0, const Trace& trace, TypeExpr* ty) {
+    long id = get_id(ty);
+    if (parents0.count(id)) {
+      // The reaching trace is accumulated in reverse order, we reverse it to
+      // get a reaching path.
+      if (trace.empty()) throw std::logic_error("Typedecl.check_well_founded");
+      bool rec_abbrev = false;
+      Trace reaching_path = trace;
+      if (trace.back().kind == ReachingTypeStep::Kind::Expands_to) {
+        auto* tc = as<Tconstr>(get_desc(trace.back().t1));
+        if (tc && path::same(tc->path, path)) {
+          rec_abbrev = true;
+          reaching_path.pop_back();
         }
+      }
+      Error e(loc, rec_abbrev ? EK::Recursive_abbrev : EK::Cycle_in_def);
+      e.name = path::name(path);
+      e.env = abs_env;
+      e.reaching_path = reaching_path;
+      raise_error(e);
     }
-    if (tc && path::same(tc->path, ty_path)) raise_error_(trace);
-    unguarded_no_self(trace, ty2);
-  }
-  void unguarded_no_self(const Trace& trace, TypeExpr* ty2) {
-    visited.add(ty2);
-    if (auto* tc = as<Tconstr>(btype::get_constr_desc(ty2)); tc && is_decl_path(tc->path)) {
-      bool found = false;
-      for (auto& [p, tys] : visited_paths)
-        if (path::same(p, tc->path)) {
-          tys.insert(tys.begin(), ty2);
-          found = true;
-          break;
-        }
-      if (!found) visited_paths.push_back({tc->path, {ty2}});
+    IdSet parents = parents0;
+    // Map each node to the set of its already checked parents
+    auto it = visited.find(id);
+    if (it != visited.end()) {
+      const IdSet& prev = it->second;
+      if (std::includes(prev.begin(), prev.end(), parents.begin(), parents.end())) return;
+      parents.insert(prev.begin(), prev.end());
+      it->second = parents;
+    } else {
+      visited[id] = parents;
     }
-    reachable(trace, ty2);
-  }
-  void rectypes_guarded(const Trace& trace, TypeExpr* ty2) {
-    if (clflags::recursive_types) return;
-    unguarded(trace, ty2);
-  }
-  ctype::FindTypeExpansion restrict_type_expansion(Path::t root_path_to_expand) {
-    return [this, root_path_to_expand](Path::t path, env::t) {
-      bool idp = is_decl_path(path);
-      bool should_not_expand = path::same(path, ty_path) || (idp && !path::same(path, root_path_to_expand));
-      // Always expand private abbreviations
-      if (should_not_expand) return env::find_type_expansion(path, abs_env);
-      return env::find_type_expansion_opt(path, final_env);
-    };
-  }
-  // We must use get_desc here (not get_constr_desc).
-  void reachable(const Trace& trace, TypeExpr* ty) {
     const TypeDesc* d = get_desc(ty);
-    switch (d->kind) {
-      case DescKind::Tobject:
-      case DescKind::Tfield:
-      case DescKind::Tnil:
-      case DescKind::Tvariant:
-      case DescKind::Tvar:
-      case DescKind::Tunivar: return;
-      case DescKind::Tarrow: {
-        auto* a = as<Tarrow>(d);
-        rectypes_guarded(cons_trace(trace, contains(ty, a->t1)), a->t1);
-        rectypes_guarded(cons_trace(trace, contains(ty, a->t2)), a->t2);
-        return;
+    bool rec_ok;
+    if (auto* tc = as<Tconstr>(d)) rec_ok = clflags::recursive_types && ctype::is_contractive(env, tc->path);
+    else if (d->kind == DescKind::Tobject || d->kind == DescKind::Tvariant) rec_ok = true;
+    else rec_ok = clflags::recursive_types;
+    if (rec_ok) return;
+    parents.insert(id);
+    if (auto* tc = as<Tconstr>(get_desc(ty))) {
+      bool tc_check = to_check(tc->path);
+      if (tc_check)
+        for (TypeExpr* t : tc->args) check_subtype(parents, trace, ty, t);
+      TypeExpr* ty2 = nullptr;
+      try {
+        ty2 = ctype::try_expand_once_opt(env, ty);
+      } catch (const ctype::CannotExpand&) {
       }
-      case DescKind::Ttuple:
-        for (auto& x : as<Ttuple>(d)->elems) rectypes_guarded(cons_trace(trace, contains(ty, x.ty)), x.ty);
-        return;
-      case DescKind::Tconstr: {
-        auto* tc = as<Tconstr>(d);
-        if (ctype::is_contractive(final_env, tc->path)) {
-          for (TypeExpr* t : tc->args) rectypes_guarded(cons_trace(trace, contains(ty, t)), t);
-          return;
-        }
-        TypeExpr* ty2;
-        try {
-          // Expansion can trigger unification, so we need to use an
-          // abstract environment to avoid any cycles.
-          ty2 = ctype::try_expand_once_gen_nolink(restrict_type_expansion(tc->path), abs_env, ty);
-        } catch (const ctype::CannotExpand&) {
-          // Abstract
-          ReachingTypeStep ca{ReachingTypeStep::Kind::Considered_abstract};
-          ca.path = tc->path;
-          Trace t2 = cons_trace(trace, ca);
-          for (TypeExpr* t : tc->args) unguarded(cons_trace(t2, contains(ty, t)), t);
-          return;
-        }
-        unguarded(cons_trace(trace, {ReachingTypeStep::Kind::Expands_to, ty, ty2}), ty2);
-        return;
+      if (ty2) {
+        check(parents, cons_trace(trace, {ReachingTypeStep::Kind::Expands_to, ty, ty2}), ty2);
+      } else if (!tc_check) {
+        for (TypeExpr* t : tc->args) check_subtype(parents, trace, ty, t);
       }
-      case DescKind::Tpoly: {
-        TypeExpr* t = as<Tpoly>(d)->body;
-        unguarded(cons_trace(trace, contains(ty, t)), t);
-        return;
-      }
-      case DescKind::Tfunctor: {
-        auto* f = as<Tfunctor>(d);
-        rectypes_guarded(cons_trace(trace, contains(ty, f->body)), f->body);
-        for (auto& c : f->pack->pack_constraints) rectypes_guarded(cons_trace(trace, contains(ty, c.ty)), c.ty);
-        return;
-      }
-      case DescKind::Tpackage:
-        for (auto& c : as<Tpackage>(d)->pack->pack_constraints)
-          rectypes_guarded(cons_trace(trace, contains(ty, c.ty)), c.ty);
-        return;
-      default: throw std::runtime_error("Tsubst");  // failwith "Tsubst"
+      return;
     }
-  }
-};
-}  // namespace
-
-static void is_reachable(const Trace& trace, const std::function<bool(Path::t)>& is_decl_path, env::t abs_env,
-                         env::t final_env, const Location& loc, TypeExpr* from_ty, Path::t ty_path) {
+    btype::iter_type_expr([&](TypeExpr* t) { check_subtype(parents, trace, ty, t); }, ty);
+  };
   Snapshot snap = btype::snapshot();
   try {
-    ctype::wrap_trace_gadt_instances(final_env, [&] {
-      Reach r{abs_env, final_env, is_decl_path, loc, ty_path, {}, {}};
-      r.unguarded(trace, from_ty);
-    });
+    ctype::wrap_trace_gadt_instances(env, [&] { check({}, {}, ty0); });
   } catch (const ctype::Escape&) {
     // Will be detected by check_regularity
     btype::backtrack(snap);
   }
 }
 
-// Given a new type declaration, we check that accepting the declaration
-// does not introduce ill-founded types (no cycle through the "root" of the
-// declaration).
-void check_well_founded_decl(env::t abs_env, env::t final_env, const std::function<bool(Path::t)>& is_decl_path,
-                             const Location& loc, Path::t path, const TypeDeclaration* decl) {
-  const TypeDeclaration* declaration = ctype::generic_instance_declaration(decl);
-  for (std::size_t i = 0; i < declaration->type_params.size(); ++i) {
-    TypeExpr* from_ty = declaration->type_params[i];
-    ReachingTypeStep s{ReachingTypeStep::Kind::Parameter, from_ty};
-    s.path = path;
-    s.n = static_cast<long>(i);
-    is_reachable({s}, is_decl_path, abs_env, final_env, loc, from_ty, path);
-  }
-  if (TypeExpr* from_ty = declaration->type_manifest) {
-    TypeExpr* ty = ctype::newconstr(path, declaration->type_params);
-    is_reachable({ReachingTypeStep{ReachingTypeStep::Kind::Expands_to, ty, from_ty}}, is_decl_path, abs_env,
-                 final_env, loc, from_ty, path);
-  }
+static void check_well_founded_manifest(env::t abs_env, env::t env, const Location& loc, Path::t path,
+                                        const TypeDeclaration* decl) {
+  if (!decl->type_manifest) return;
+  std::vector<TypeExpr*> args;
+  for (std::size_t k = 0; k < decl->type_params.size(); ++k) args.push_back(ctype::newvar());
+  WfVisited visited;
+  std::function<bool(Path::t)> same_path = [&](Path::t p) { return path::same(path, p); };
+  check_well_founded(abs_env, env, loc, path, same_path, visited, ctype::newconstr(path, slice(args)));
+}
+
+// Given a new type declaration [type t = ...] (potentially mutually
+// recursive), we check that accepting the declaration does not introduce
+// ill-founded types: no cycle going through the "root" of the declaration,
+// and also (out of caution) every type sub-expression reachable from the
+// root is itself well-founded.
+void check_well_founded_decl(env::t abs_env, env::t env, const Location& loc, Path::t path,
+                             const TypeDeclaration* decl, const std::function<bool(Path::t)>& to_check) {
+  // We iterate on all subexpressions of the declaration to check "in
+  // depth" that no ill-founded type exists.
+  types::with_type_mark([&](types::TypeMark& mark) {
+    btype::TypeIterators super = btype::type_iterators(mark);
+    // [visited] remembers the inner visits performed by
+    // [check_well_founded] on each type expression reachable from this
+    // declaration.
+    WfVisited visited;
+    btype::TypeIterators it = super;
+    it.it_do_type_expr = [&](btype::TypeIterators& self, TypeExpr* ty) {
+      check_well_founded(abs_env, env, loc, path, to_check, visited, ty);
+      super.it_do_type_expr(self, ty);
+    };
+    it.it_type_declaration(it, ctype::generic_instance_declaration(decl));
+  });
 }
 
 // Check for non-regular abbreviations
@@ -839,7 +790,7 @@ static void check_regularity(env::t abs_env, env::t env, const Location& loc, Pa
                       TypeExpr* ty) {
     if (visited.mem(ty)) return;
     visited.add(ty);
-    const TypeDesc* d = btype::get_constr_desc(ty);
+    const TypeDesc* d = get_desc(ty);
     if (auto* tc = as<Tconstr>(d)) {
       if (path::same(path, tc->path)) {
         if (!ctype::is_equal(abs_env, false, slice(args), tc->args)) {
@@ -1009,7 +960,10 @@ TranslTypeDeclResult transl_type_decl(env::t env, RecFlag rec_flag, Slice<const 
   // abbreviations expand to a generic type variable.
   struct R {
     std::vector<const tt::TTypeDeclaration*> tdecls;
+    std::vector<std::pair<Ident::t, const TypeDeclaration*>> decls;
+    std::vector<shape::t> shapes;
     env::t temp_env;
+    env::t new_env;
   };
   R r = ctype::with_local_level_generalize([&] {
     // Enter types.
@@ -1049,25 +1003,23 @@ TranslTypeDeclResult transl_type_decl(env::t env, RecFlag rec_flag, Slice<const 
         return transl_declaration(temp_env, sdecl_list[k], ids_list[k].first, ids_list[k].second);
       }));
     }
+    std::vector<std::pair<Ident::t, const TypeDeclaration*>> decls;
+    std::vector<shape::t> shapes;  // (transl_declaration returned each with its typ_shape)
+    for (auto* td : tdecls) {
+      decls.push_back({td->typ_id, td->typ_type});
+      shapes.push_back(typ_shape(td));
+    }
     *current_slot = nullptr;
     // Check for duplicates
     check_duplicates(sdecl_list);
-    return R{tdecls, temp_env};
+    // Build the final env.
+    env::t new_env = add_types_to_env(decls, shapes, env);
+    return R{tdecls, decls, shapes, temp_env, new_env};
   });
-  // Copy the type declarations to remove spurious expansions
-  std::vector<const tt::TTypeDeclaration*> tdecls;
-  std::vector<std::pair<Ident::t, const TypeDeclaration*>> decls;
-  std::vector<shape::t> shapes;  // (transl_declaration returned each with its typ_shape)
-  for (auto* td : r.tdecls) shapes.push_back(typ_shape(td));
-  for (auto* td : r.tdecls) {
-    const TypeDeclaration* decl = subst::type_declaration(subst::identity(), td->typ_type);
-    auto* t2 = make<tt::TTypeDeclaration>(*td);
-    t2->typ_type = decl;
-    tdecls.push_back(t2);
-    decls.push_back({td->typ_id, decl});
-  }
-  // Build the final env.
-  env::t new_env = add_types_to_env(decls, shapes, env);
+  const std::vector<const tt::TTypeDeclaration*>& tdecls = r.tdecls;
+  std::vector<std::pair<Ident::t, const TypeDeclaration*>> decls = r.decls;
+  const std::vector<shape::t>& shapes = r.shapes;
+  env::t new_env = r.new_env;
   // Check for ill-formed abbrevs
   std::vector<std::pair<Ident::t, Location>> id_loc_list;
   for (std::size_t k = 0; k < ids_list.size(); ++k) id_loc_list.push_back({ids_list[k].first, sdecl_list[k]->ptype_loc});
@@ -1091,7 +1043,8 @@ TranslTypeDeclResult transl_type_decl(env::t env, RecFlag rec_flag, Slice<const 
       if (ident::same(i, p->id)) return true;
     return false;
   };
-  for (auto& [id, decl] : decls) check_well_founded_decl(abs_env, new_env, to_check, assoc(id), Path::pident(id), decl);
+  for (auto& [id, decl] : decls) check_well_founded_manifest(abs_env, new_env, assoc(id), Path::pident(id), decl);
+  for (auto& [id, decl] : decls) check_well_founded_decl(abs_env, new_env, assoc(id), Path::pident(id), decl, to_check);
   for (auto* td : tdecls)  // check_abbrev_regularity
     check_regularity(abs_env, new_env, assoc(td->typ_id), Path::pident(td->typ_id), td->typ_type, to_check);
   // Update temporary definitions (for well-founded recursive types)
@@ -1101,12 +1054,9 @@ TranslTypeDeclResult transl_type_decl(env::t env, RecFlag rec_flag, Slice<const 
   // Check that all type variables are closed
   for (std::size_t k = 0; k < sdecl_list.size(); ++k) {
     const TypeDeclaration* decl = tdecls[k]->typ_type;
-    if (TypeExpr* var = ctype::closed_type_decl(decl)) {
-      // (Typing_recovery.erroneous_type_check is for merlin)
+    if (TypeExpr* ty = ctype::closed_type_decl(decl)) {
       Error e(sdecl_list[k]->ptype_loc, EK::Unbound_type_var);
-      e.ty = var;
-      std::vector<tt::TypeParam> ps(tdecls[k]->typ_params.begin(), tdecls[k]->typ_params.end());
-      e.params = param_types(ps);
+      e.ty = ty;
       e.decl = decl;
       raise_error(e);
     }
@@ -1143,8 +1093,7 @@ TranslTypeDeclResult transl_type_decl(env::t env, RecFlag rec_flag, Slice<const 
   std::vector<const tt::TTypeDeclaration*> final_decls;
   for (std::size_t k = 0; k < tdecls.size(); ++k) {
     auto* t2 = make<tt::TTypeDeclaration>(*tdecls[k]);
-    // Using [Subst] reverts expansions
-    t2->typ_type = subst::type_declaration(subst::identity(), decls[k].second);
+    t2->typ_type = decls[k].second;
     final_decls.push_back(t2);
   }
   return {final_decls, final_env, shapes};
@@ -1156,7 +1105,7 @@ void check_recmod_typedecl(env::t abs_env, env::t env, const Location& loc, cons
                            Path::t path, const TypeDeclaration* decl) {
   // recmod_ids is the list of recursively-defined module idents.
   std::function<bool(Path::t)> to_check = [&](Path::t p) { return path::exists_free(recmod_ids, p); };
-  check_well_founded_decl(abs_env, env, to_check, loc, path, decl);
+  check_well_founded_decl(abs_env, env, loc, path, decl, to_check);
   check_regularity(abs_env, env, loc, path, decl, to_check);
   // additional coherence check, as one might build an incoherent signature,
   // and use it to build an incoherent module, cf. #7851
