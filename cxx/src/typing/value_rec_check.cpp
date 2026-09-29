@@ -157,7 +157,9 @@ static Sd classify_expression(const SizeEnv& env, const tt::Expression* e) {
         if (is_abstracted_arg(arg)) return Sd::Static;
       return Sd::Dynamic;
     }
-    case XK::Texp_array: return Sd::Static;
+    case XK::Texp_array:
+      if (typeopt::array_kind(e) == lambda::ArrayKind::Pgenarray) return Sd::Dynamic;
+      return Sd::Static;
     case XK::Texp_pack: return classify_module_expression(env, as<tt::Texp_pack>(d)->me);
     case XK::Texp_function: return Sd::Static;
     case XK::Texp_lazy: {

@@ -530,6 +530,8 @@ bool is_nonexpansive(const tt::Expression* exp) {
       for (auto* c : m->comp_cases)
         if (!(is_nonexpansive_opt(c->c_guard) && is_nonexpansive(c->c_rhs) && !contains_exception_pat(c->c_lhs)))
           return false;
+      for (auto* c : m->eff_cases)
+        if (!(is_nonexpansive_opt(c->c_guard) && is_nonexpansive(c->c_rhs))) return false;
       return true;
     }
     case XK::Texp_tuple:

@@ -1007,7 +1007,7 @@ void Lexer::scan_comment() {
 Token Lexer::scan_label_or_tilde(size_t start) {
   // '~' (lowercase identchar*) ':' -> LABEL ;  '~' symbolchar_or_hash+ -> PREFIXOP ; else TILDE
   size_t p = pos_ + 1;
-  if (is_lower(p < src_.size() ? src_[p] : '\0') && src_[p] != '_') {
+  if (is_lower(p < src_.size() ? src_[p] : '\0')) {
     // tentatively read identstart identchar*
     size_t q = p + 1;
     while (q < src_.size() && is_identchar(src_[q])) q++;

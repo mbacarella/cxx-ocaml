@@ -448,6 +448,18 @@ class Reader {
     return make<Package>(p, cs);
   }
 
+  // an abbrev record {abbr_path; abbr_args; mutable abbr_level}: one per
+  // marshaled block (input_value's sharing; the level is mutable)
+  Abbrev* abbrev(std::size_t id) {
+    auto [it, fresh] = abbrevs_.try_emplace(id, nullptr);
+    if (fresh) {
+      Path::t p = path(f(id, 0));
+      Slice<TypeExpr*> args = tys(f(id, 1));
+      it->second = make<Abbrev>(Abbrev{p, args, ival(f(id, 2))});
+    }
+    return it->second;
+  }
+
   Slice<TypeExpr*> tys(std::size_t id) {
     return list<TypeExpr*>(id, [&](std::size_t t) { return ty(t); });
   }
@@ -504,8 +516,7 @@ class Reader {
       }
       case 11: {
         TypeExpr* a = ty(f(id, 0));
-        Path::t p = path(f(id, 1));
-        d = types::texpand(a, p, tys(f(id, 2)));
+        d = types::texpand(a, abbrev(f(id, 1)));
         break;
       }
       case 12: d = types::tlink(ty(f(id, 0))); break;
@@ -919,6 +930,7 @@ class Reader {
   FlatMemo<RowFieldCell*, 7> cell_{slots_};
   FlatMemo<ident::Unscoped*, 8> us_{slots_};
   FlatMemo<ClassSignature*, 9> csig_{slots_};
+  std::unordered_map<std::size_t, Abbrev*> abbrevs_;
   std::unordered_map<std::size_t, const void*> entry_objs_;  // row fields' tuples
   FlatMemo<OValue*, 10> ov_{slots_};
   FlatMemo<std::string_view, 11> str_{slots_};

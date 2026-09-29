@@ -463,7 +463,9 @@ class Writer {
         }
         case DescKind::Texpand: {
           auto* e = as<Texpand>(d);
-          return {ty(e->ty), path(e->path), tys(e->args)};
+          return {ty(e->ty), shared(memo_, e->abbrev, 0, [&]() -> std::vector<V> {
+                    return {path(e->abbrev->path), tys(e->abbrev->args), i(e->abbrev->level)};
+                  })};
         }
         case DescKind::Tlink: return {ty(as<Tlink>(d)->ty)};
         case DescKind::Tsubst: {

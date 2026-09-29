@@ -91,7 +91,7 @@ TypeOrigin type_origin(const TypeDeclaration* decl) {
 }
 
 const TypeDesc* get_constr_desc(TypeExpr* ty) {
-  if (const PathArgs* a = get_abbrev(ty))
+  if (const Abbrev* a = get_abbrev(ty))
     return tconstr(a->path, a->args, make<MemoRef>(mnil()));
   return get_desc(ty);
 }
@@ -830,8 +830,8 @@ static void deep_occur_rec(TypeMark& mark, TypeExpr* t0, TypeExpr* ty) {
     if (eq_type(ty, t0)) throw Occur{};
     iter_type_expr([&](TypeExpr* t) { deep_occur_rec(mark, t0, t); }, ty);
     iter_abbrev(
-        [&](Path::t, Slice<TypeExpr*> tyl) {
-          for (TypeExpr* t : tyl) deep_occur_rec(mark, t0, t);
+        [&](Abbrev* abbr) {
+          for (TypeExpr* t : abbr->args) deep_occur_rec(mark, t0, t);
         },
         ty);
   }
@@ -861,7 +861,7 @@ const TypeDesc* get_folded_desc(bool keep_Tvar, TypeExpr* ty) {
   const TypeDesc* desc = get_desc(ty);
   if (desc->kind == DescKind::Tsubst) return desc;
   if (desc->kind == DescKind::Tvar && keep_Tvar) return desc;
-  if (const PathArgs* a = get_abbrev(ty)) {
+  if (const Abbrev* a = get_abbrev(ty)) {
     std::vector<TypeExpr*> args(a->args.begin(), a->args.end());
     if (!(path::contains_unscoped_ident(a->path) || deep_occur_list(ty, args)))
       return tconstr(a->path, a->args, make<MemoRef>(mnil()));

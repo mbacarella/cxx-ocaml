@@ -21,6 +21,8 @@ struct BigarrayKindLayout {
 };
 BigarrayKindLayout bigarray_type_kind_and_layout(env::t env, TypeExpr* ty);
 lambda::ValueKind value_kind(env::t env, TypeExpr* ty);
+// [local_equations]: nullptr = None
+lambda::ValueKind pattern_kind(const env::LocalEquations* local_equations, const typedtree::Pattern* pat);
 lambda::ValueKind value_kind_union(const lambda::ValueKind& a, const lambda::ValueKind& b);
 
 TypeExpr* scrape_ty(env::t env, TypeExpr* ty);  // nullptr = None

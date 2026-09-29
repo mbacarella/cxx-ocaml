@@ -269,8 +269,9 @@ and ty (t : type_expr) =
      | Tfunctor (l, u, p, a) ->
          s "Tfunctor("; arg_label l; s " "; unscoped u; s " "; package p;
          s " "; ty a; s ")"
-     | Texpand (a, p, tl) ->
-         s "Texpand("; ty a; s " "; path p; s " "; list ty tl; s ")"
+     | Texpand (a, ab) ->
+         s "Texpand("; ty a; s " "; path ab.abbr_path; s " ";
+         list ty ab.abbr_args; s " "; i ab.abbr_level; s ")"
      | Tlink a -> s "Tlink "; ty a
      | Tsubst (a, o) -> s "Tsubst("; ty a; s " "; opt ty o; s ")");
     s "}"

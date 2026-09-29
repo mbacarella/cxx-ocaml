@@ -15,7 +15,7 @@ set -u
 SELF="$(readlink -f "$0")"
 cd "$(dirname "$SELF")/../.." || exit 1
 ROOT=$PWD
-CPP="${CPP:-$ROOT/cxx/build/c++ocamlc}"
+CPP="${CPP:-$ROOT/cxx/build-release/c++ocamlc}"
 RUN=$ROOT/runtime/ocamlrun
 JOBS="${JOBS:-4}"
 TIMEOUT="${CPP_TIMEOUT:-10}"

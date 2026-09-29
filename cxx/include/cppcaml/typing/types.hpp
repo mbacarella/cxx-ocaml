@@ -171,11 +171,17 @@ struct Tfunctor : TypeDesc {
   const Package* pack;
   TypeExpr* body;
 };
+// types.mli's abbrev: an expanded abbreviation kept in a Texpand, with the
+// level its arguments were last checked at (Ctype.update_level)
+struct Abbrev {
+  Path::t path;            // abbr_path
+  Slice<TypeExpr*> args;   // abbr_args
+  long level;              // mutable abbr_level
+};
 struct Texpand : TypeDesc {
   static constexpr DescKind K = DescKind::Texpand;
   TypeExpr* ty;
-  Path::t path;
-  Slice<TypeExpr*> args;
+  Abbrev* abbrev;
 };
 struct Tlink : TypeDesc {
   static constexpr DescKind K = DescKind::Tlink;
@@ -559,7 +565,7 @@ const TypeDesc* tunivar(OptStr name);
 const TypeDesc* tpoly(TypeExpr* a, Slice<TypeExpr*> vars);
 const TypeDesc* tpackage(const Package* p);
 const TypeDesc* tfunctor(ArgLabel l, ident::Unscoped* id, const Package* p, TypeExpr* a);
-const TypeDesc* texpand(TypeExpr* a, Path::t p, Slice<TypeExpr*> args);
+const TypeDesc* texpand(TypeExpr* a, Abbrev* abbrev);
 const TypeDesc* tlink(TypeExpr* a);
 const TypeDesc* tsubst(TypeExpr* a, TypeExpr* row);
 
@@ -598,8 +604,9 @@ bool not_marked_node(TypeMark& mark, TypeExpr* t);
 bool try_mark_node(TypeMark& mark, TypeExpr* t);
 
 // kept abbreviations
-const PathArgs* get_abbrev(TypeExpr* t);  // (path, args) option
-void iter_abbrev(FnRef<void(Path::t, Slice<TypeExpr*>)> f, TypeExpr* t);
+Abbrev* get_abbrev(TypeExpr* t);  // abbrev option
+void iter_abbrev(FnRef<void(Abbrev*)> f, TypeExpr* t);
+void set_abbrev_level(Abbrev* abbrev, long level);
 TypeExpr* ignore_abbrev(TypeExpr* t);
 void forget_abbrev(TypeExpr* t);
 

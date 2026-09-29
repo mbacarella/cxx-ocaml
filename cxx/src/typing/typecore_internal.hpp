@@ -111,8 +111,7 @@ bool check_poly_constraint(const pt::Pattern* spat, env::t env, const ArgLabel& 
 
 // ---- unification helpers ------------------------------------------------------------
 struct ContinuationVar {
-  Ident::t id;
-  const ValueDescription* desc;
+  const tt::ContDesc* desc;
 };
 std::optional<ContinuationVar> type_continuation_pat(env::t env, TypeExpr* expected_ty,
                                                      const pt::Pattern* sp);

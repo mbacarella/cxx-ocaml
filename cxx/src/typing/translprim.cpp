@@ -356,10 +356,6 @@ const PrimitiveDescription* prim_atomic_cas() {
   static const PrimitiveDescription* d = simple("caml_atomic_cas_field", 4, false);
   return d;
 }
-const PrimitiveDescription* prim_atomic_fetch_add() {
-  static const PrimitiveDescription* d = simple("caml_atomic_fetch_add_field", 3, false);
-  return d;
-}
 
 const std::unordered_map<std::string_view, Prim>& primitives_table() {
   using IP = ImmediateOrPointer;
@@ -880,7 +876,7 @@ lam_t lambda_of_atomic(std::string_view prim_name, const ScopedLocation& loc, At
   Primitive prim = op == AtomicOp::Load       ? pr(PK::Patomic_load)
                    : op == AtomicOp::Exchange ? pccall(prim_atomic_exchange())
                    : op == AtomicOp::Cas      ? pccall(prim_atomic_cas())
-                                              : pccall(prim_atomic_fetch_add());
+                                              : pr(PK::Patomic_fetch_add);
   std::vector<lam_t> rest(args.begin() + 1, args.end());
   switch (kind) {
     case AtomicKind::Ref: {

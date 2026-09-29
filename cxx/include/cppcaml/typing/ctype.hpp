@@ -287,8 +287,8 @@ env::t get_env(const Uenv& u);
 bool in_pattern_mode(const Uenv& u);
 
 // ---- checks for type definitions ----------------------------------------------------
-bool in_current_module(Path::t p);
-bool in_pervasives(Path::t p);
+bool quick_eq_type_path(bool normalize, env::t env, Path::t p1, Path::t p2);
+bool eq_expanded_type_path(env::t env, Path::t p1, Path::t p2);
 bool is_datatype(const TypeDeclaration* decl);
 
 // ---- object types ---------------------------------------------------------------------
@@ -444,7 +444,7 @@ struct InstancedLabel {
 InstancedLabel instance_label(bool fixed, const LabelDescription* lbl);
 
 // NB: raises Unify (the error), set by the unification section
-extern std::function<void(const Uenv&, TypeExpr*, TypeExpr*)> unify_var_ref;
+extern std::function<void(bool, const Uenv&, TypeExpr*, TypeExpr*)> unify_var_ref;
 TypeExpr* subst(env::t env, long level, PrivateFlag priv, MemoRef* abbrev, TypeExpr* oty,
                 Slice<TypeExpr*> params, Slice<TypeExpr*> args, TypeExpr* body,
                 std::optional<long> scope = std::nullopt);
@@ -563,7 +563,7 @@ void unify_uenv(const Uenv& uenv, TypeExpr* t1, TypeExpr* t2);  // raises Unify
 void unify_pairs(env::t env, TypeExpr* t1, TypeExpr* t2, std::vector<UnivarPair> pairs);
 btype::TypePairs* unify_gadt(PatternEnv* penv, TypeExpr* pat, TypeExpr* expected);
 void unify_var(env::t env, TypeExpr* t1, TypeExpr* t2);
-void unify_var_uenv(const Uenv& uenv, TypeExpr* t1, TypeExpr* t2);
+void unify_var_uenv(bool check_occur, const Uenv& uenv, TypeExpr* t1, TypeExpr* t2);
 void enforce_current_level(env::t env, TypeExpr* ty);
 TypeExpr* expand_head_trace(env::t env, TypeExpr* t);
 

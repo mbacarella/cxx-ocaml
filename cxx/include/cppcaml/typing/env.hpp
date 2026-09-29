@@ -398,6 +398,9 @@ t add_module(Ident::t id, ModulePresence presence, const ModuleType* mty, t env,
 t add_module_lazy(bool update_summary, Ident::t id, ModulePresence presence,
                   const subst::lazy::Modtype* mty, t env);
 t add_local_constraint(Path::t path, const TypeDeclaration* info, t env);
+using LocalEquations = PathMap<const TypeDeclaration*>;
+LocalEquations freeze_local_equations(t env);
+t restrict_local_equations(const LocalEquations& local_constraints, t env);
 t add_persistent_structure(Ident::t id, t env);
 t add_signature(Signature sg, t env);
 t mark_not_aliasable(Ident::t id, t env);
@@ -593,6 +596,9 @@ std::function<t(t)> make_copy_of_types(t env0);
 t with_pairs(Slice<std::pair<ident::Unscoped*, ident::Unscoped*>> id_pairs, t env);
 Slice<std::pair<ident::Unscoped*, ident::Unscoped*>> get_pairs(t env);
 bool path_equiv(t env, Path::t p1, Path::t p2);
+// Equivalence of (mod)type paths modulo path normalization.
+bool type_path_equiv_modulo(t env, Path::t p1, Path::t p2);
+bool modtype_path_equiv_modulo(t env, Path::t p1, Path::t p2);
 
 // persistent structures
 Signature read_signature(const std::string& modname, const std::string& filename);

@@ -131,6 +131,7 @@ struct Primitive {
     Pbswap16, Pbbswap,
     Pint_as_pointer,
     Patomic_load,
+    Patomic_fetch_add,
     Popaque,
     Pdls_get,
     Ppoll

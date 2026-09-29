@@ -341,7 +341,7 @@ fd::Doc message(const Warning& w) {
           fd::fprintf(ppf, "variable %a appears in@ different@ places@ in@ different@ or-pattern@ alternatives.",
                       code(vars[0]));
         else
-          fd::fprintf(ppf, "variables %a appears in@ different@ places@ in@ different@ or-pattern@ alternatives.",
+          fd::fprintf(ppf, "variables %a appear in@ different@ places@ in@ different@ or-pattern@ alternatives.",
                       comma_inline_list(vars));
       };
       return doc_printf(

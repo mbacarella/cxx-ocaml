@@ -277,6 +277,10 @@ void report_extension_constructor_mismatch(std::string_view first, std::string_v
     fprintf(ppf, "Private extension constructor(s) would be revealed.");
     return;
   }
+  if (err.kind == ExtensionConstructorMismatch::Kind::Constructor_arity) {
+    fprintf(ppf, "They have a different number of type parameters.");
+    return;
+  }
   Ident::t id = err.id;
   auto constructor = [id](const ExtensionConstructor* e) {
     return misc::style::code([id](Formatter& f, const ExtensionConstructor* x) { printtyp::extension_only_constructor(id, f, x); },

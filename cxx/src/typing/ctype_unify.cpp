@@ -130,16 +130,14 @@ void occur_univar_or_unscoped(env::t env0, TypeExpr* root, bool inj_only) {
         iter_type_expr([&](TypeExpr* t) { occur_rec(env, bound_uv, bound_id, t); }, ty);
       }
     };
-    // (as in ctype.ml, this sets and re-examines the ROOT type [ty] of
-    // occur_univar_or_unscoped, the only [ty] in scope there)
     auto occur_normalize_modtype_path = [&](env::t env, const TypeSet& bound_uv,
                                             const path::UnscopedSet& bound_id, ident::Unscoped* us,
-                                            Path::t p,
+                                            Path::t p, TypeExpr* ty,
                                             const std::function<const TypeDesc*(Path::t)>& f) {
       Path::t p2 = env::try_normalize_modtype_path(env, p);
       if (!p2) raise_escape(EscK::Module, nullptr, Ident::of_unscoped(us));
-      set_type_desc(root, f(p2));
-      occur_desc(env, bound_uv, bound_id, root);
+      set_type_desc(ty, f(p2));
+      occur_desc(env, bound_uv, bound_id, ty);
     };
     occur_desc = [&](env::t env, const TypeSet& bound_uv, const path::UnscopedSet& bound_id,
                      TypeExpr* ty) {
@@ -201,7 +199,7 @@ void occur_univar_or_unscoped(env::t env0, TypeExpr* root, bool inj_only) {
         case DescKind::Tpackage: {
           const Package* pk = as<Tpackage>(d)->pack;
           if (ident::Unscoped* i = path::check_for_unbound_unscoped_idents(bound_id, pk->pack_path)) {
-            occur_normalize_modtype_path(env, bound_uv, bound_id, i, pk->pack_path,
+            occur_normalize_modtype_path(env, bound_uv, bound_id, i, pk->pack_path, ty,
                                          [pk](Path::t pp) {
                                            return tpackage(make<Package>(pp, pk->pack_constraints));
                                          });
@@ -214,8 +212,9 @@ void occur_univar_or_unscoped(env::t env0, TypeExpr* root, bool inj_only) {
           auto* fu = as<Tfunctor>(d);
           if (ident::Unscoped* i =
                   path::check_for_unbound_unscoped_idents(bound_id, fu->pack->pack_path)) {
+            // (as in ctype.ml, [ty] is the functor's body here)
             occur_normalize_modtype_path(
-                env, bound_uv, bound_id, i, fu->pack->pack_path, [fu](Path::t pp) {
+                env, bound_uv, bound_id, i, fu->pack->pack_path, fu->body, [fu](Path::t pp) {
                   return tfunctor(fu->label, fu->id,
                                   make<Package>(pp, fu->pack->pack_constraints), fu->body);
                 });
@@ -371,15 +370,13 @@ void identifier_escape(env::t env, const std::vector<ident::Unscoped*>& idl0, Ty
         iter_type_expr([&](TypeExpr* t) { occ(idl, t, false); }, ty);
       }
     };
-    // (as in ctype.ml: sets and re-examines the ROOT type of
-    // identifier_escape)
     auto occur_normalize_modtype_path = [&](const std::vector<Ident::t>& idl, Path::t p,
-                                            Ident::t id,
+                                            Ident::t id, TypeExpr* ty,
                                             const std::function<const TypeDesc*(Path::t)>& f) {
       Path::t p2 = env::try_normalize_modtype_path(env, p);
       if (!p2) raise_escape(EscK::Module, nullptr, id);
-      set_type_desc(root, f(p2));
-      occ(idl, root, true);
+      set_type_desc(ty, f(p2));
+      occ(idl, ty, true);
     };
     occ = [&](const std::vector<Ident::t>& idl, TypeExpr* ty, bool ignore_mark) {
       if (!(try_mark_node(mark, ty) || ignore_mark)) return;
@@ -394,7 +391,7 @@ void identifier_escape(env::t env, const std::vector<ident::Unscoped*>& idl0, Ty
         case DescKind::Tpackage: {
           const Package* pk = as<Tpackage>(d)->pack;
           if (auto i = path::find_free_opt(idl, pk->pack_path))
-            occur_normalize_modtype_path(idl, pk->pack_path, *i, [pk](Path::t pp) {
+            occur_normalize_modtype_path(idl, pk->pack_path, *i, ty, [pk](Path::t pp) {
               return tpackage(make<Package>(pp, pk->pack_constraints));
             });
           else
@@ -424,7 +421,7 @@ void identifier_escape(env::t env, const std::vector<ident::Unscoped*>& idl0, Ty
           auto* fu = as<Tfunctor>(d);
           if (auto i = path::find_free_opt(idl, fu->pack->pack_path)) {
             // (as in ctype.ml, the rebuilt functor's body is [ty], the node)
-            occur_normalize_modtype_path(idl, fu->pack->pack_path, *i, [fu, ty](Path::t pp) {
+            occur_normalize_modtype_path(idl, fu->pack->pack_path, *i, ty, [fu, ty](Path::t pp) {
               return tfunctor(fu->label, fu->id, make<Package>(pp, fu->pack->pack_constraints), ty);
             });
             return;
@@ -553,6 +550,14 @@ TypeExpr* reify_univars(env::t env, TypeExpr* ty) {
 }
 
 // ---- unification ---------------------------------------------------------------------
+static bool has_cached_expansion(Path::t p, const AbbrevMemo* m);
+
+static bool quick_eq_type_path_nocache(bool normalize, env::t env, Path::t p1, const MemoRef* a1,
+                                       Path::t p2, const MemoRef* a2) {
+  return quick_eq_type_path(normalize, env, p1, p2) &&
+         !(has_cached_expansion(p1, a1->contents) || has_cached_expansion(p2, a2->contents));
+}
+
 static bool has_cached_expansion(Path::t p, const AbbrevMemo* m) {
   for (;;) {
     switch (m->kind) {
@@ -782,7 +787,7 @@ static void mcomp_type_decl(TypePairs& tp, env::t env, Path::t p1, Path::t p2,
   try {
     const TypeDeclaration* decl = env::find_type(p1, env);
     const TypeDeclaration* decl2 = env::find_type(p2, env);
-    if (env::path_equiv(env, p1, p2)) {
+    if (quick_eq_type_path(true, env, p1, p2)) {
       std::vector<bool> inj;
       try {
         for (variance::t v : env::find_type(p1, env)->type_variance)
@@ -893,7 +898,7 @@ static void mcomp_rec(TypePairs& type_pairs, env::t env, TypeExpr* t1, TypeExpr*
   if (d1->kind == DescKind::Tvar || d2->kind == DescKind::Tvar) return;
   if (auto* c1 = as<Tconstr>(d1))
     if (auto* c2 = as<Tconstr>(d2))
-      if (c1->args.empty() && c2->args.empty() && env::path_equiv(env, c1->path, c2->path)) return;
+      if (c1->args.empty() && c2->args.empty() && quick_eq_type_path(false, env, c1->path, c2->path)) return;
   TypeExpr* t1e = expand_head_opt(env, t1);
   TypeExpr* t2e = expand_head_opt(env, t2);
   // Expansion may have changed the representative of the types...
@@ -1041,12 +1046,6 @@ static void add_gadt_equation(const Uenv& uenv, Path::t source, TypeExpr* destin
     uenv.penv->add_local_constraint(source, decl);
     cleanup_abbrev_memo();
   }
-}
-
-bool eq_package_path(env::t env, Path::t p1, Path::t p2) {
-  return env::path_equiv(env, p1, p2) ||
-         env::path_equiv(env, env::normalize_modtype_path(env, p1),
-                         env::normalize_modtype_path(env, p2));
 }
 
 std::function<TypeExpr*(env::t, const std::vector<Ident::t>&, TypeExpr*)> nondep_type_ref;
@@ -1247,14 +1246,12 @@ static void unify_rec(const Uenv& uenv, TypeExpr* t1, TypeExpr* t2) {
       const TypeDesc* d4 = get_constr_desc(t2);
       auto c3 = as<Tconstr>(d3);
       auto c4 = as<Tconstr>(d4);
-      if (c3 && c4 && c3->args.empty() && c4->args.empty() &&
-          env::path_equiv(get_env(uenv), c3->path, c4->path) &&
+      if (c3 && c4 && c3->args.empty() && c4->args.empty() && (d1 == d3 || d2 == d4) &&
+          quick_eq_type_path_nocache(true, get_env(uenv), c3->path, c3->memo, c4->path, c4->memo)
           // This optimization assumes that t1 does not expand to t2 (and
           // conversely), so we fall back to the general case when any of
           // the types has a cached expansion.
-          !(has_cached_expansion(c3->path, c3->memo->contents) ||
-            has_cached_expansion(c4->path, c4->memo->contents)) &&
-          (d1 == d3 || d2 == d4)) {
+      ) {
         auto unify1_constr = [&](TypeExpr* a, TypeExpr* b) {
           update_level_for(TraceExn::Unify, get_env(uenv), get_level(a), b);
           update_scope_for(TraceExn::Unify, get_scope(a), b);
@@ -1283,10 +1280,8 @@ static void unify2_rec(const Uenv& uenv, TypeExpr* t1, TypeExpr* t2) {
     auto* c1 = as<Tconstr>(get_desc(t1));
     auto* c2 = as<Tconstr>(get_desc(t2));
     if (!(c1 && c2)) throw CannotExpand{};
-    if (env::path_equiv(get_env(uenv), c1->path, c2->path) && c1->args.empty() &&
-        c2->args.empty() &&
-        !(has_cached_expansion(c1->path, c1->memo->contents) ||
-          has_cached_expansion(c2->path, c2->memo->contents))) {
+    if (c1->args.empty() && c2->args.empty() &&
+        quick_eq_type_path_nocache(false, get_env(uenv), c1->path, c1->memo, c2->path, c2->memo)) {
       update_level_for(TraceExn::Unify, get_env(uenv), get_level(t1), t2);
       update_scope_for(TraceExn::Unify, get_scope(t1), t2);
       link_type(t1, t2);
@@ -1433,7 +1428,7 @@ static void unify3(const Uenv& uenv, TypeExpr* t1p, TypeExpr* t2p) {
       if (!is_commu_ok(a1->commu)) set_commu_ok(a1->commu);
     } else if (d1->kind == DK::Ttuple && d2->kind == DK::Ttuple) {
       unify_labeled_list(uenv, as<Ttuple>(d1)->elems, as<Ttuple>(d2)->elems);
-    } else if (c1 && c2 && env::path_equiv(get_env(uenv), c1->path, c2->path)) {
+    } else if (c1 && c2 && quick_eq_type_path(true, get_env(uenv), c1->path, c2->path)) {
       Slice<TypeExpr*> tl1 = c1->args, tl2 = c2->args;
       if (!pm) {
         unify_list(uenv, tl1, tl2);
@@ -1442,18 +1437,16 @@ static void unify3(const Uenv& uenv, TypeExpr* t1p, TypeExpr* t2p) {
         u2.assume_injective = false;  // without_assume_injective
         unify_list(u2, tl1, tl2);
       } else {
-        bool datatype = in_current_module(c1->path);  // || in_pervasives p1
-        if (!datatype) {
-          std::vector<Path::t> ps;
-          if (const PathArgs* a = get_abbrev(t1p)) ps.push_back(a->path);
-          if (const PathArgs* a = get_abbrev(t2p)) ps.push_back(a->path);
-          ps.push_back(c1->path);
-          for (Path::t p : ps)
-            if (expands_to_datatype(get_env(uenv), p)) {
-              datatype = true;
-              break;
-            }
-        }
+        bool datatype = false;
+        std::vector<Path::t> ps;
+        if (const Abbrev* a = get_abbrev(t1p)) ps.push_back(a->path);
+        if (const Abbrev* a = get_abbrev(t2p)) ps.push_back(a->path);
+        ps.push_back(c1->path);
+        for (Path::t p : ps)
+          if (expands_to_datatype(get_env(uenv), p)) {
+            datatype = true;
+            break;
+          }
         if (datatype) {
           unify_list(uenv, tl1, tl2);
         } else {
@@ -1992,11 +1985,11 @@ btype::TypePairs* unify_gadt(PatternEnv* penv, TypeExpr* ty1, TypeExpr* ty2) {
   }
 }
 
-void unify_var_uenv(const Uenv& uenv, TypeExpr* t1, TypeExpr* t2) {
+void unify_var_uenv(bool check_occur, const Uenv& uenv, TypeExpr* t1, TypeExpr* t2) {
   if (eq_type(t1, t2)) return;
   const TypeDesc* d1 = get_desc(t1);
   const TypeDesc* d2 = get_desc(t2);
-  if (d1->kind == DescKind::Tvar && d2->kind == DescKind::Tconstr && deep_occur(t1, t2)) {
+  if (d1->kind == DescKind::Tvar && d2->kind == DescKind::Tconstr && check_occur && deep_occur(t1, t2)) {
     unify_uenv(uenv, t1, t2);
     return;
   }
@@ -2004,7 +1997,7 @@ void unify_var_uenv(const Uenv& uenv, TypeExpr* t1, TypeExpr* t2) {
     env::t env = get_env(uenv);
     bool reset_tracing = check_trace_gadt_instances(env);
     try {
-      occur_for(TraceExn::Unify, uenv, t1, t2);
+      if (check_occur) occur_for(TraceExn::Unify, uenv, t1, t2);
       update_level_for(TraceExn::Unify, env, get_level(t1), t2);
       update_scope_for(TraceExn::Unify, get_scope(t1), t2);
       link_type(t1, t2);
@@ -2020,7 +2013,7 @@ void unify_var_uenv(const Uenv& uenv, TypeExpr* t1, TypeExpr* t2) {
 
 // the final versions of unification functions
 void unify_var(env::t env, TypeExpr* t1, TypeExpr* t2) {
-  unify_var_uenv(Uenv::expression(env), t1, t2);
+  unify_var_uenv(true, Uenv::expression(env), t1, t2);
 }
 
 void unify_pairs(env::t env, TypeExpr* t1, TypeExpr* t2, std::vector<UnivarPair> pairs) {
@@ -2032,8 +2025,6 @@ void unify_pairs(env::t env, TypeExpr* t1, TypeExpr* t2, std::vector<UnivarPair>
 
 void unify(env::t env, TypeExpr* t1, TypeExpr* t2) { unify_pairs(env, t1, t2, {}); }
 
-// Lower the level of a type to the current level
-void enforce_current_level(env::t env, TypeExpr* ty) { unify_var(env, newvar(), ty); }
 
 TypeExpr* expand_head_trace(env::t env, TypeExpr* t) {
   bool reset_tracing = check_trace_gadt_instances(env);

@@ -462,8 +462,13 @@ class TreeWriter {
   V case_(const tt::Case* c) {  // { c_lhs; c_cont; c_guard; c_rhs }: right to left
     V rhs = expr(c->c_rhs);
     V guard = opt(c->c_guard != nullptr, [&] { return expr(c->c_guard); });
+    // { cont_id; cont_loc; cont_type; cont_uid }
+    V cont = opt(c->c_cont != nullptr, [&] {
+      const tt::ContDesc* k = c->c_cont;
+      return o::vblock(0, {w_.ident(k->cont_id), loc(k->cont_loc), w_.ty(k->cont_type), w_.uid(k->cont_uid)});
+    });
     V lhs = pat(c->c_lhs);
-    return o::vblock(0, {lhs, ident_opt(c->c_cont), guard, rhs});
+    return o::vblock(0, {lhs, cont, guard, rhs});
   }
   V cases(const Slice<const tt::Case*>& cs) {
     std::vector<V> xs;

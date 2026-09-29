@@ -732,6 +732,8 @@ std::optional<ExtensionConstructorMismatch> extension_constructors(const Locatio
         ext2->ext_private == PrivateFlag::Public ? env::ConstructorUsage::Exported : env::ConstructorUsage::Exported_private;
     env::mark_extension_used(usage, ext1->ext_uid);
   }
+  if (ext1->ext_type_params.size() != ext2->ext_type_params.size())
+    return ExtensionConstructorMismatch{ExtensionConstructorMismatch::Kind::Constructor_arity};
   TypeExpr* ty1 = newgenty(tconstr(ext1->ext_type_path, ext1->ext_type_params, make<MemoRef>(mnil())));
   TypeExpr* ty2 = newgenty(tconstr(ext2->ext_type_path, ext2->ext_type_params, make<MemoRef>(mnil())));
   auto tl1 = cat({ty1}, vec(ext1->ext_type_params));

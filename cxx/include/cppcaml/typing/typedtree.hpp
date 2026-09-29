@@ -189,9 +189,15 @@ struct Meth {  // Tmeth_name | Tmeth_val | Tmeth_ancestor
   Ident::t id = nullptr;       // Tmeth_val / Tmeth_ancestor
   Path::t path = nullptr;      // Tmeth_ancestor
 };
+struct ContDesc {  // cont_desc
+  Ident::t cont_id;
+  Location cont_loc;
+  TypeExpr* cont_type;
+  Uid cont_uid;
+};
 struct Case {  // 'k case
   const Pattern* c_lhs;
-  Ident::t c_cont;              // option
+  const ContDesc* c_cont;       // option
   const Expression* c_guard;    // option
   const Expression* c_rhs;
 };

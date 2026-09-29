@@ -531,6 +531,7 @@ void primitive(Formatter& ppf, const Primitive& p) {
     case K::Pbbswap: pbi("bswap"); return;
     case K::Pint_as_pointer: fprintf(ppf, "int_as_pointer"); return;
     case K::Patomic_load: fprintf(ppf, "atomic_load"); return;
+    case K::Patomic_fetch_add: fprintf(ppf, "atomic_fetch_add"); return;
     case K::Popaque: fprintf(ppf, "opaque"); return;
     case K::Pdls_get: fprintf(ppf, "dls_get"); return;
     case K::Ppoll: fprintf(ppf, "poll"); return;
@@ -644,6 +645,7 @@ std::string name_of_primitive(const Primitive& p) {
     case K::Pbbswap: return "Pbbswap";
     case K::Pint_as_pointer: return "Pint_as_pointer";
     case K::Patomic_load: return "Patomic_load";
+    case K::Patomic_fetch_add: return "Patomic_fetch_add";
     case K::Popaque: return "Popaque";
     case K::Prunstack: return "Prunstack";
     case K::Presume: return "Presume";

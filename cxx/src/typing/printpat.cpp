@@ -1,6 +1,8 @@
 // Port of typing/printpat.ml (TYPECHECKER.md stage 9).
 #include "cppcaml/typing/printpat.hpp"
 
+#include <algorithm>
+
 #include "cppcaml/typing/datarepr.hpp"
 #include "cppcaml/typing/printlambda.hpp"
 
@@ -112,6 +114,19 @@ std::string pretty_const(const tt::Constant& c) {
   return "";
 }
 
+static bool is_underscore(const tt::Pattern* v) {
+  switch (v->pat_desc->kind) {
+    case PK::Tpat_any: return true;
+    case PK::Tpat_record: {
+      auto* r = static_cast<const tt::Tpat_record*>(v->pat_desc);
+      for (const auto& f : r->fields)
+        if (!is_underscore(f.pat)) return false;
+      return true;
+    }
+    default: return false;
+  }
+}
+
 void pretty_val(Formatter& ppf, const tt::Pattern* v) {
   if (!v->pat_extra.empty()) {
     const tt::PatExtraItem& extra = v->pat_extra[0];
@@ -165,7 +180,10 @@ void pretty_val(Formatter& ppf, const tt::Pattern* v) {
       } else if (name == "::" && c->args.size() == 2 && !c->annot) {
         fprintf(ppf, "@[%a::@,%a@]", pr(pretty_car, c->args[0]), pr(pretty_cdr, c->args[1]));
       } else if (!c->annot) {
-        fprintf(ppf, "@[<2>%s@ @[(%a)@]@]", name, [&](Formatter& f) { pretty_vals(",", f, vec(c->args)); });
+        if (std::all_of(c->args.begin(), c->args.end(), is_underscore))
+          fprintf(ppf, "@[<2>%s _@]", name);
+        else
+          fprintf(ppf, "@[<2>%s@ @[(%a)@]@]", name, [&](Formatter& f) { pretty_vals(",", f, vec(c->args)); });
       } else if (c->annot->vars.empty()) {
         fprintf(ppf, "@[<2>%s@ @[(%a : _)@]@]", name, [&](Formatter& f) { pretty_vals(",", f, vec(c->args)); });
       } else {
@@ -191,7 +209,7 @@ void pretty_val(Formatter& ppf, const tt::Pattern* v) {
       auto* r = static_cast<const tt::Tpat_record*>(d);
       std::vector<const tt::RecordPatField*> filtered;
       for (const auto& f : r->fields)
-        if (f.pat->pat_desc->kind != PK::Tpat_any) filtered.push_back(&f);  // do not show lbl=_
+        if (!is_underscore(f.pat)) filtered.push_back(&f);  // do not show lbl=_
       if (filtered.empty()) {
         fprintf(ppf, "{ _ }");
         break;

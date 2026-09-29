@@ -26,7 +26,7 @@ std::pair<Slice<const tt::Case*>, tt::Partial> type_cases(
   TypeBody<const pt::Case*, const tt::Case*> tb =
       [&](const pt::Case* const& c, const tt::Pattern* pat, env::t when_env, env::t ext_env,
           const std::optional<ContinuationVar>& cont, TypeExpr* ty_expected, TypeExpr* ty_infer, bool) {
-        Ident::t c_cont = cont ? cont->id : nullptr;
+        const tt::ContDesc* c_cont = cont ? cont->desc : nullptr;
         const tt::Expression* guard = nullptr;
         if (c->pc_guard)
           // The continuation is made inaccessible in the `when' expression

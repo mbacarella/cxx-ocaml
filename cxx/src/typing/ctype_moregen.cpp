@@ -135,7 +135,7 @@ static void moregen_rec(TypePairs& type_pairs, env::t env, TypeExpr* t1, TypeExp
       return;
     }
     if (c1 && c2 && c1->args.empty() && c2->args.empty() &&
-        env::path_equiv(env, c1->path, c2->path))
+        quick_eq_type_path(false, env, c1->path, c2->path))
       return;
     TypeExpr* t1p = expand_head(env, t1);
     TypeExpr* t2p = expand_head(env, t2);
@@ -188,7 +188,7 @@ static void moregen_rec(TypePairs& type_pairs, env::t env, TypeExpr* t1, TypeExp
       moregen_rec(type_pairs, env, f1->body, a2->t2);
     } else if (e1->kind == DK::Ttuple && e2->kind == DK::Ttuple) {
       moregen_labeled_list(type_pairs, env, as<Ttuple>(e1)->elems, as<Ttuple>(e2)->elems);
-    } else if (k1 && k2 && env::path_equiv(env, k1->path, k2->path)) {
+    } else if (k1 && k2 && eq_expanded_type_path(env, k1->path, k2->path)) {
       moregen_list(type_pairs, env, k1->args, k2->args);
     } else if (e1->kind == DK::Tpackage && e2->kind == DK::Tpackage) {
       moregen_package(type_pairs, env, get_level(t1p), as<Tpackage>(e1)->pack, get_level(t2p),
@@ -552,7 +552,7 @@ static void eqtype_rec(bool rename, TypePairs& type_pairs, Subst& subst, env::t 
       return;
     }
     if (c1 && c2 && c1->args.empty() && c2->args.empty() &&
-        env::path_equiv(env, c1->path, c2->path))
+        quick_eq_type_path(false, env, c1->path, c2->path))
       return;
     TypeExpr* t1p = expand_head_rigid(env, t1);
     TypeExpr* t2p = expand_head_rigid(env, t2);
@@ -603,7 +603,7 @@ static void eqtype_rec(bool rename, TypePairs& type_pairs, Subst& subst, env::t 
     } else if (e1->kind == DK::Ttuple && e2->kind == DK::Ttuple) {
       eqtype_labeled_list(rename, type_pairs, subst, env, as<Ttuple>(e1)->elems,
                           as<Ttuple>(e2)->elems);
-    } else if (k1 && k2 && env::path_equiv(env, k1->path, k2->path)) {
+    } else if (k1 && k2 && quick_eq_type_path(true, env, k1->path, k2->path)) {
       eqtype_list_same_length_rec(rename, type_pairs, subst, env, k1->args, k2->args);
     } else if (e1->kind == DK::Tpackage && e2->kind == DK::Tpackage) {
       eqtype_package(rename, type_pairs, subst, env, get_level(t1p), as<Tpackage>(e1)->pack,
@@ -793,7 +793,10 @@ void eqtype(bool rename, TypePairs& type_pairs, Subst& subst, env::t env, TypeEx
 
 // Two modes: with or without renaming of variables
 void equal(env::t env, bool rename, Slice<TypeExpr*> tyl1, Slice<TypeExpr*> tyl2) {
-  if (tyl1.size() != tyl2.size()) raise_unexplained_for(TraceExn::Equality);
+  // In practice, `Equality` is not a good error to report to users and thus
+  // callers of this function ought to raise their own error when the
+  // lengths differ.
+  if (tyl1.size() != tyl2.size()) throw std::logic_error("Ctype.equal");
   bool all_eq = true;
   for (std::size_t k = 0; k < tyl1.size(); ++k)
     if (!eq_type(tyl1[k], tyl2[k])) {

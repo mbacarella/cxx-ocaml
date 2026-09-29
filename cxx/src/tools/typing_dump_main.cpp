@@ -366,7 +366,8 @@ void ty(TypeExpr* t) {
     }
     case DescKind::Texpand: {
       auto* e = as<Texpand>(d);
-      s("Texpand("); ty(e->ty); s(" "); path_(e->path); s(" "); tylist(e->args); s(")");
+      s("Texpand("); ty(e->ty); s(" "); path_(e->abbrev->path); s(" "); tylist(e->abbrev->args);
+      s(" "); s(std::to_string(e->abbrev->level)); s(")");
       break;
     }
     case DescKind::Tlink: s("Tlink "); ty(as<Tlink>(d)->ty); break;

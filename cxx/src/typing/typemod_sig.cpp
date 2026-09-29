@@ -350,10 +350,16 @@ const tt::Signature* transl_signature_(env::t env0, pt::Signature ssg) {
         long scope = ctype::create_scope();
         auto [path, md0] = env::lookup_module(true, pms->pms_manifest.loc, pms->pms_manifest.txt, env);
         bool aliasable = env::is_aliasable(path, env);
-        const ModuleDeclaration* md = md0;
-        if (aliasable)
+        const ModuleDeclaration* md;
+        if (!aliasable) {
+          auto* m2 = make<ModuleDeclaration>(*md0);
+          m2->md_loc = pms->pms_loc;
+          m2->md_uid = uid::mk(env::get_current_unit());
+          md = m2;
+        } else {
           md = make<ModuleDeclaration>(mty_alias(path), parsetree::types_attributes(pms->pms_attributes), pms->pms_loc,
                                        uid::mk(env::get_current_unit()));
+        }
         ModulePresence pres =
             md->md_type->kind == ModuleType::Kind::Mty_alias ? ModulePresence::Mp_absent : ModulePresence::Mp_present;
         auto [id, newenv] = env::enter_module_declaration(static_cast<int>(scope), pms->pms_name.txt, pres, md, env);

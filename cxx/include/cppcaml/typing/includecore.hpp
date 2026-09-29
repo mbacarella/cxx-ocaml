@@ -69,7 +69,7 @@ struct ConstructorMismatch {
 using VariantChange =
     diffing::KeyedChange<const ConstructorDeclaration*, const ConstructorDeclaration*, ConstructorMismatch>;
 struct ExtensionConstructorMismatch {  // Constructor_privacy | Constructor_mismatch of Ident.t * ..
-  enum class Kind { Constructor_privacy, Constructor_mismatch };
+  enum class Kind { Constructor_privacy, Constructor_mismatch, Constructor_arity };
   Kind kind;
   Ident::t id = nullptr;
   const ExtensionConstructor* ext1 = nullptr;

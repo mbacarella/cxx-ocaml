@@ -379,9 +379,8 @@ std::optional<ContinuationVar> type_continuation_pat(env::t env, TypeExpr* expec
   if (d->kind == pt::PatternDesc::Kind::Ppat_any) return std::nullopt;
   if (auto* v = as<pt::Ppat_var>(d)) {
     Ident::t id = Ident::create_local(v->name.txt);
-    auto* desc = make<ValueDescription>(ValueDescription{expected_ty, ValueKind{}, loc, Attributes{},
-                                                         uid::mk(env::get_current_unit())});
-    return ContinuationVar{id, desc};
+    auto* desc = make<tt::ContDesc>(tt::ContDesc{id, loc, expected_ty, uid::mk(env::get_current_unit())});
+    return ContinuationVar{desc};
   }
   if (auto* x = as<pt::Ppat_extension>(d)) throw ErrorForward(x->ext);
   raise_error(err(loc, env, EK::Invalid_continuation_pattern));
@@ -518,8 +517,8 @@ void finalize_variants(const tt::Pattern* p) {
 // ---- pattern variables -------------------------------------------------------------------
 static std::vector<PatternVariable> continuation_variable(const std::optional<ContinuationVar>& c) {
   if (!c) return {};
-  return {PatternVariable{c->id, c->desc->val_type, c->desc->val_loc,
-                          PatternVariableKind::Continuation_var, pt::Attributes{}, c->desc->val_uid}};
+  return {PatternVariable{c->desc->cont_id, c->desc->cont_type, c->desc->cont_loc,
+                          PatternVariableKind::Continuation_var, pt::Attributes{}, c->desc->cont_uid}};
 }
 
 std::shared_ptr<TypePatState> create_type_pat_state(const std::optional<ContinuationVar>& cont,
@@ -1226,7 +1225,11 @@ Path::t expand_path(env::t env, Path::t p) {
 }
 
 bool compare_type_path(env::t env, Path::t tpath1, Path::t tpath2) {
-  return path::same(expand_path(env, tpath1), expand_path(env, tpath2));
+  // Path.same's arguments right to left: expanding may force components,
+  // which creates type nodes
+  Path::t p2 = expand_path(env, tpath2);
+  Path::t p1 = expand_path(env, tpath1);
+  return path::same(p1, p2);
 }
 
 Path::t get_constr_type_path(TypeExpr* ty) {

@@ -2430,7 +2430,7 @@ ExpansionDiff trees_of_type_expansion(Mode mode, const ExpansionPair& e) {
   TypeExpr* t = e.ty;
   TypeExpr* t2 = e.expanded;
   const ot::OutType* manifest = nullptr;
-  if (const PathArgs* ab = types::get_abbrev(t)) {
+  if (const Abbrev* ab = types::get_abbrev(t)) {
     Path::t tconstr = ab->path;
     std::vector<TypeExpr*> params = slice_vec(ab->args);
     bool should_use_manifest = true;

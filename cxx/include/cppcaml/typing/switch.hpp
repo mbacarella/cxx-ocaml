@@ -665,7 +665,8 @@ struct Make {
   static act do_zyva(const loc_t& loc, std::pair<long, long> lh, arg_t arg, const Cases& cases,
                      std::vector<act> actions) {
     bool old_ok = ok_inter;
-    ok_inter = iabs(lh.first) <= inter_limit && iabs(lh.second) <= inter_limit;
+    // both [inter_limit] and [high] are strictly greater than [min_int]
+    ok_inter = lh.first >= -inter_limit && lh.first <= inter_limit && iabs(lh.second) <= inter_limit;
     if (ok_inter != old_ok) t.clear();
     Inter<act> s{cases, std::make_shared<const std::vector<act>>(std::move(actions))};
     auto [n_clusters, k] = comp_clusters(s.cases);

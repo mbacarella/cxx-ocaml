@@ -349,7 +349,10 @@ c, b, a).  `let .. and ..` and `List.map` run left to right, and `let`
 sequences explicitly (all verified with ocamlc).  Where those arguments have effects (fresh
 type ids, levels, the trail, marks, warnings), the port evaluates them in
 the same order, spelled out with locals.  Otherwise fresh ids, and with them
-variable naming and set orders, drift from ocamlc.
+variable naming and set orders, drift from ocamlc.  Env lookups count as
+effects: forcing a module's components copies its signature (fresh ids), so
+`Path.same (expand_path env p1) (expand_path env p2)` expands `p2` first
+(`compare_type_path`; found by the trunk catch-up's printlambda.cmt).
 
 **Loading cmis.**  `typing/cmi_format` decodes the marshal arena
 (`marshal.hpp`, which already reconstructs sharing and cycles) straight
@@ -642,3 +645,34 @@ from the port.  The two must be identical on every .cmi in the tree
    types), and a `match (a, b, c)` scrutinee's components evaluating left
    to right (only a tuple value is right to left).  Left: the `-g` tail
    above.
+
+## Following trunk
+
+The port tracks upstream trunk (the next release, 5.6).  A catch-up merges
+upstream, then ports every commit that touches `parsing/`, `typing/`,
+`lambda/`, `bytecomp/`, `utils/` or `driver/` (`git diff <old-base>
+<new-base> -- ...`, commit by commit, reviewed against the C++ sources).
+The generated tables are regenerated: `gen_driver_tables.sh` writes its
+.inc files in place; `gen_builtin_prims.sh` prints to stdout (redirect it to
+`include/cppcaml/builtin_prims.hpp`).  `ocamlc_bootstrap.sh`'s module lists
+(DDC, effid) follow the Makefile's `COMPILERLIBS`.  Harness caches built
+by the old tree are deleted.  New and modified upstream tests: file-based
+ones are covered by `exec_parity.sh` and `testsuite_delta.sh`; expect tests
+are split into standalone probes (one per phrase, with the phrases ocamlc
+accepted before it), run through every parity gate, and the new tests'
+probes join `stamp_probes/` (accepted) or `error_probes/` (rejected).
+
+2026-09-28 catch-up (upstream `b9dac8cc84`): holes (`Pexp_hole`,
+`Pmod_hole`, `~_`/`?_` arguments), `with module type` precedence, the
+abbreviation level in `Texpand` (the .cmi/.cmt/-g event records), path
+equivalence modulo normalization (`Env.type_path_equiv_modulo`,
+`Ctype.quick_eq_type_path`), no occurs check for first generalizable
+parameters in `Ctype.subst`, `enforce_current_level` through
+`update_level`, injectivity/contractivity of local abstract types,
+`arrow_labels` backtracking, the typedtree's `cont_desc`, `type_package`'s
+`lower_nongen`, modsubst locations/uids, `Patomic_fetch_add`, frozen GADT
+equations for function parameter kinds, `Value_rec_compiler` inlining of
+pure definitions and dynamic generic arrays, Switch's `min_int` guard,
+`Constructor_arity`, Printpat's `C _`.  The new tests also exposed an old lexer
+slip: `~_:` is a LABEL (upstream's `lowercase` includes `_`).
+

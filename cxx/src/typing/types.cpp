@@ -299,8 +299,8 @@ const TypeDesc* tpackage(const Package* p) {
 const TypeDesc* tfunctor(ArgLabel l, ident::Unscoped* id, const Package* p, TypeExpr* a) {
   return make<Tfunctor>(TypeDesc{DescKind::Tfunctor}, l, id, p, a);
 }
-const TypeDesc* texpand(TypeExpr* a, Path::t p, Slice<TypeExpr*> args) {
-  return make<Texpand>(TypeDesc{DescKind::Texpand}, a, p, args);
+const TypeDesc* texpand(TypeExpr* a, Abbrev* abbrev) {
+  return make<Texpand>(TypeDesc{DescKind::Texpand}, a, abbrev);
 }
 const TypeDesc* tlink(TypeExpr* a) { return make<Tlink>(TypeDesc{DescKind::Tlink}, a); }
 const TypeDesc* tsubst(TypeExpr* a, TypeExpr* row) {
@@ -310,7 +310,7 @@ const TypeDesc* tsubst(TypeExpr* a, TypeExpr* row) {
 // ---- trail (types.ml "Definitions for backtracking") ----------------------
 struct Change {
   enum class Kind : std::uint8_t {
-    Ctype, Ccompress, Clevel, Cscope, Cname, Crow, Ckind, Ccommu, Cuniv, Cuident
+    Ctype, Ccompress, Clevel, Cscope, Cname, Crow, Ckind, Ccommu, Cuniv, Cuident, Cabbr_level
   };
   Kind kind;
   TypeExpr* ty = nullptr;           // Ctype / Ccompress / Clevel / Cscope
@@ -322,11 +322,13 @@ struct Change {
     FieldKind* kind_;                // Ckind
     Commutable* commu;               // Ccommu
     TyOptRef* univ;                  // Cuniv
+    Abbrev* abbr;                    // Cabbr_level
   };
   union {
     const TypeDesc* desc2 = nullptr;  // Ccompress (new)
     const PathArgs* name_old;         // Cname
     TypeExpr* univ_old;               // Cuniv
+    long abbr_level_old;              // Cabbr_level
   };
   ident::Unscoped::Change uident{};  // Cuident
 };
@@ -423,14 +425,13 @@ static bool absent_field(const TypeDesc* d) {
   return f && field_kind_internal_repr(f->kind_)->kind == FieldKind::Kind::FKabsent;
 }
 
-static TypeExpr* repr_expand(bool update, TypeExpr* t_orig, TypeExpr* t, Path::t path,
-                             Slice<TypeExpr*> args) {
+static TypeExpr* repr_expand(bool update, TypeExpr* t_orig, TypeExpr* t, Abbrev* abbrev) {
   for (;;) {
     const TypeDesc* d = t->desc;
     if (auto* l = as<Tlink>(d)) { update = true; t = l->ty; continue; }
     if (auto* e = as<Texpand>(d)) { update = true; t = e->ty; continue; }
     if (absent_field(d)) { update = true; t = as<Tfield>(d)->rest; continue; }
-    if (update) repr_update(t_orig, texpand(t, path, args));
+    if (update) repr_update(t_orig, texpand(t, abbrev));  // the same abbrev record
     return t;
   }
 }
@@ -439,7 +440,7 @@ static TypeExpr* repr_link(bool update, TypeExpr* t_orig, TypeExpr* t) {
   for (;;) {
     const TypeDesc* d = t->desc;
     if (auto* l = as<Tlink>(d)) { update = true; t = l->ty; continue; }
-    if (auto* e = as<Texpand>(d)) return repr_expand(true, t_orig, e->ty, e->path, e->args);
+    if (auto* e = as<Texpand>(d)) return repr_expand(true, t_orig, e->ty, e->abbrev);
     if (absent_field(d)) { update = true; t = as<Tfield>(d)->rest; continue; }
     if (update) repr_update(t_orig, tlink(t));
     return t;
@@ -449,7 +450,7 @@ static TypeExpr* repr_link(bool update, TypeExpr* t_orig, TypeExpr* t) {
 TypeExpr* repr_slow(TypeExpr* t) {
   const TypeDesc* d = t->desc;
   if (auto* l = as<Tlink>(d)) return repr_link(false, t, l->ty);
-  if (auto* e = as<Texpand>(d)) return repr_expand(false, t, e->ty, e->path, e->args);
+  if (auto* e = as<Texpand>(d)) return repr_expand(false, t, e->ty, e->abbrev);
   if (absent_field(d)) return repr_link(true, t, as<Tfield>(d)->rest);
   return t;
 }
@@ -514,14 +515,14 @@ static bool try_mark_transient(TypeMark& mark, TypeExpr* ty) {
 bool try_mark_node(TypeMark& mark, TypeExpr* t) { return try_mark_transient(mark, repr(t)); }
 
 // ---- kept abbreviations ------------------------------------------------------
-const PathArgs* get_abbrev(TypeExpr* t) {
+Abbrev* get_abbrev(TypeExpr* t) {
   repr(t);
-  if (auto* e = as<Texpand>(t->desc)) return make<PathArgs>(e->path, e->args);
+  if (auto* e = as<Texpand>(t->desc)) return e->abbrev;
   return nullptr;
 }
-void iter_abbrev(FnRef<void(Path::t, Slice<TypeExpr*>)> f, TypeExpr* t) {
+void iter_abbrev(FnRef<void(Abbrev*)> f, TypeExpr* t) {
   repr(t);
-  if (auto* e = as<Texpand>(t->desc)) f(e->path, e->args);
+  if (auto* e = as<Texpand>(t->desc)) f(e->abbrev);
 }
 TypeExpr* ignore_abbrev(TypeExpr* t) { return repr(t); }
 
@@ -783,6 +784,9 @@ static void undo_change(const Change& c) {
     case Change::Kind::Cuident:
       ident::Unscoped::undo_change(c.uident);
       break;
+    case Change::Kind::Cabbr_level:
+      c.abbr->level = c.abbr_level_old;
+      break;
   }
 }
 
@@ -804,7 +808,7 @@ void link_expand(TypeExpr* ty, TypeExpr* ty2) {
   auto* c = as<Tconstr>(ty->desc);
   if (!c) throw std::logic_error("Types.link_expand");
   log_type(ty);
-  transient_expr::set_desc(ty, texpand(ty2, c->path, c->args));
+  transient_expr::set_desc(ty, texpand(ty2, make<Abbrev>(Abbrev{c->path, c->args, ty->level})));
 }
 
 void forget_abbrev(TypeExpr* ty) {
@@ -846,6 +850,14 @@ void set_type_desc(TypeExpr* ty, const TypeDesc* td) {
     log_type(ty);
     transient_expr::set_desc(ty, td);
   }
+}
+
+void set_abbrev_level(Abbrev* abbrev, long level) {
+  Change ch{Change::Kind::Cabbr_level};
+  ch.abbr = abbrev;
+  ch.abbr_level_old = abbrev->level;
+  log_change(ch);
+  abbrev->level = level;
 }
 
 void set_level(TypeExpr* ty, long level) {

@@ -120,6 +120,7 @@ static Longident::t unflatten(const std::vector<std::string_view>& l) {
 
 static std::pair<const tt::ModuleExpr*, const Package*> type_package(env::t env, const pt::ModuleExpr* m,
                                                                      const Package* pack) {
+  long outer_scope = ctype::get_current_level();
   // type the module and create a scope in a raised level
   auto [modl, scope] = typetexp::ty_var_env::with_local_scope([&] {
     return ctype::with_local_level([&] {
@@ -128,6 +129,7 @@ static std::pair<const tt::ModuleExpr*, const Package*> type_package(env::t env,
       return std::make_pair(me, sc);
     });
   });
+  mtype::lower_nongen(outer_scope, modl->mod_type);
   std::vector<PackConstraint> fl2;
   if (!pack->pack_constraints.empty()) {
     std::function<Path::t(Longident::t)> type_path;

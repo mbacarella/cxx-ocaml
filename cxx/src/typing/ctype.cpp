@@ -7,6 +7,7 @@
 #include <unordered_map>
 
 #include "cppcaml/typing/datarepr.hpp"
+#include "cppcaml/typing/misc.hpp"
 #include "cppcaml/typing/subst.hpp"
 
 namespace cppcaml::typing::ctype {
@@ -257,31 +258,28 @@ void PatternEnv::with_mty(Slice<std::pair<ident::Unscoped*, ident::Unscoped*>> i
   f();
 }
 
+// [quick_eq_type_path] is used in fast-paths that check if two type
+// paths are "clearly the same", it can under-approximate path
+// equivalence to gain speed.  If [normalize] is [true], we also check
+// quick-equivalence modulo normalization.
+bool quick_eq_type_path(bool normalize, env::t env, Path::t p1, Path::t p2) {
+  if (normalize) return env::type_path_equiv_modulo(env, p1, p2);
+  return env::path_equiv(env, p1, p2);
+}
+
+// Check that [p1] and [p2] are equivalent, assuming that [p1] and [p2]
+// have been normalized.
+bool eq_expanded_type_path(env::t env, Path::t p1, Path::t p2) { return env::path_equiv(env, p1, p2); }
+
+bool eq_package_path(env::t env, Path::t p1, Path::t p2) {
+  return env::path_equiv(env, p1, p2) || env::modtype_path_equiv_modulo(env, p1, p2);
+}
+
 // ---- unification mode --------------------------------------------------------------
 env::t get_env(const Uenv& u) { return u.is_pattern ? u.penv->env : u.expr_env; }
 bool in_pattern_mode(const Uenv& u) { return u.is_pattern; }
 
 // ---- checks for type definitions ----------------------------------------------------
-bool in_current_module(Path::t p) {
-  switch (p->kind) {
-    case Path::Kind::Pident: return true;
-    case Path::Kind::Pdot:
-    case Path::Kind::Papply: return false;
-    case Path::Kind::Pextra_ty: return in_current_module(p->p1);
-  }
-  return false;
-}
-
-bool in_pervasives(Path::t p) {
-  if (!in_current_module(p)) return false;
-  try {
-    env::find_type(p, env::initial());
-    return true;
-  } catch (const env::NotFound&) {
-    return false;
-  }
-}
-
 bool is_datatype(const TypeDeclaration* decl) {
   return decl->type_kind->kind != TypeKind::Kind::Type_abstract;
 }
@@ -693,8 +691,9 @@ static bool needs_expand(env::t env, long level, Path::t path, Slice<TypeExpr*> 
 // time, so that a type constructor cannot escape the scope of its definition.
 static bool check_level_type_rec(std::vector<TypeExpr*>& visited, long level, TypeExpr* ty) {
   if (get_level(ty) > level) return false;
-  const PathArgs* a = get_abbrev(ty);
+  const Abbrev* a = get_abbrev(ty);
   if (!a) return true;
+  if (a->level <= level) return true;
   if (path::scope(a->path) > level) return false;
   if (a->args.empty()) return true;
   if (std::find(visited.begin(), visited.end(), ty) != visited.end()) return true;
@@ -809,7 +808,10 @@ static void update_level_rec(env::t env, long level, bool expand, TypeExpr* ty) 
 
 static void update_level_abbrev(env::t env, long level, bool expand, TypeExpr* ty) {
   iter_abbrev(
-      [&](Path::t p, Slice<TypeExpr*> args) {
+      [&](Abbrev* abbr) {
+        const Path::t& p = abbr->path;
+        Slice<TypeExpr*> args = abbr->args;
+        if (level >= abbr->level) return;
         if (level < path::scope(p)) {
           forget_abbrev(ty);
           return;
@@ -820,11 +822,15 @@ static void update_level_abbrev(env::t env, long level, bool expand, TypeExpr* t
             all = false;
             break;
           }
-        if (all) return;
+        if (all) {
+          set_abbrev_level(abbr, level);
+          return;
+        }
         if (expand || needs_expand(env, level, p, args)) {
           forget_abbrev(ty);
           return;
         }
+        set_abbrev_level(abbr, level);
         for (TypeExpr* a : args) update_level_rec(env, level, expand, a);
       },
       ty);
@@ -848,6 +854,15 @@ void update_level_for(TraceExn tr_exn, env::t env, long level, TypeExpr* ty) {
     update_level(env, level, ty);
   } catch (const Escape& e) {
     raise_for(tr_exn, escape_elt(e.esc));
+  }
+}
+
+// Lower the level of a type to the current level
+void enforce_current_level(env::t env, TypeExpr* ty) {
+  try {
+    update_level(env, current_level, ty);
+  } catch (const Escape&) {
+    misc::fatal_error("Ctype.enforce_current_level");
   }
 }
 
@@ -1028,6 +1043,11 @@ static void inv_type(TypeHash<InvTypeExpr*>& hash, std::vector<InvTypeExpr*> pty
   }
   auto* inv = make<InvTypeExpr>(ty, pty);
   hash.add(ty, inv);
+  iter_abbrev(
+      [&](Abbrev* abbr) {
+        for (TypeExpr* t : abbr->args) inv_type(hash, {inv}, t);
+      },
+      ty);
   iter_type_expr([&](TypeExpr* t) { inv_type(hash, {inv}, t); }, ty);
 }
 
@@ -1093,7 +1113,15 @@ TypeSet type_subexpressions_with_free_occurrences(const std::vector<Ident::t>& i
     else if (auto* v = as<Tvariant>(d)) {
       if (const PathArgs* nm = row_name(v->row)) p = nm->path;
     }
-    if (p && path::exists_free(ids0, p)) add_all_parents(ids0, inv);
+    if (p && path::exists_free(ids0, p)) {
+      add_all_parents(ids0, inv);
+      continue;
+    }
+    iter_abbrev(
+        [&](Abbrev* abbr) {
+          if (path::exists_free(ids0, abbr->path)) add_all_parents(ids0, inv);
+        },
+        inv->inv_type);
   }
   return nodes;
 }

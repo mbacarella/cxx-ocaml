@@ -353,10 +353,10 @@ matching::PatAction transl_case_try(scopes sc, const tt::Case* c);
 std::vector<matching::PatAction> transl_cases_try(scopes sc, Slice<const tt::Case*> cases);
 lam_t transl_function(scopes sc, const tt::Expression* e, Slice<const tt::FunctionParam*> params,
                       const tt::FunctionBody* body);
-FunInfo transl_function_without_attributes(scopes sc, const Location& loc, L::IntRef* repr,
+FunInfo transl_function_without_attributes(scopes sc, env::t env, const Location& loc, L::IntRef* repr,
                                            const std::vector<const tt::FunctionParam*>& params,
                                            const tt::FunctionBody* body);
-FunInfo transl_curried_function(scopes sc, const Location& loc, ValueKind return_, L::IntRef* repr,
+FunInfo transl_curried_function(scopes sc, env::t env, const Location& loc, ValueKind return_, L::IntRef* repr,
                                 const std::vector<const tt::FunctionParam*>& params, const tt::FunctionBody* body);
 lam_t transl_setinstvar(scopes sc, const ScopedLocation& loc, lam_t self, lam_t var, const tt::Expression* expr);
 lam_t transl_record(scopes sc, const Location& loc, env::t env, Slice<tt::RecordField> fields,
@@ -811,7 +811,8 @@ lam_t transl_cont(Ident::t cont, Ident::t c_cont, lam_t body) {
 }
 
 matching::PatAction transl_case(scopes sc, Ident::t cont, const tt::Case* c) {
-  return {c->c_lhs, transl_cont(cont, c->c_cont, transl_guard(sc, c->c_guard, c->c_rhs))};
+  return {c->c_lhs, transl_cont(cont, c->c_cont ? c->c_cont->cont_id : nullptr,
+                                transl_guard(sc, c->c_guard, c->c_rhs))};
 }
 
 std::vector<matching::PatAction> transl_cases(scopes sc, Ident::t cont, Slice<const tt::Case*> cases) {
@@ -851,7 +852,7 @@ std::vector<std::vector<Param>> chunks_of(long n, const std::vector<Param>& l) {
 // There are two cases in function translation:
 //  - [Tupled]. It takes a tupled argument, and we can flatten it.
 //  - [Curried]. It takes each argument individually.
-FunInfo transl_tupled_function(scopes sc, const Location& loc, ValueKind return_, L::IntRef* repr,
+FunInfo transl_tupled_function(scopes sc, env::t env, const Location& loc, ValueKind return_, L::IntRef* repr,
                                const std::vector<const tt::FunctionParam*>& params, const tt::FunctionBody* body) {
   // Cases are eligible for flattening if they belong to the only param.
   std::optional<std::pair<std::vector<const tt::Case*>, tt::Partial>> eligible_cases;
@@ -876,15 +877,18 @@ FunInfo transl_tupled_function(scopes sc, const Location& loc, ValueKind return_
         std::vector<PatsExpr> pats_expr_list;
         for (const tt::Case* c : cases)
           pats_expr_list.push_back({matching::flatten_pattern(size, c->c_lhs), c->c_guard, c->c_rhs});
+        // if the match is partial, we cannot rely on GADT equations
+        std::optional<env::LocalEquations> local_equations;
+        if (eligible_cases->second == tt::Partial::Partial) local_equations = env::freeze_local_equations(env);
+        const env::LocalEquations* leq = local_equations ? &*local_equations : nullptr;
         // All the patterns might not share the same types. We must take the
         // union of the patterns types
         std::vector<ValueKind> kinds;
-        for (const tt::Pattern* pat : pats_expr_list[0].pats)
-          kinds.push_back(typeopt::value_kind(pat->pat_env, pat->pat_type));
+        for (const tt::Pattern* pat : pats_expr_list[0].pats) kinds.push_back(typeopt::pattern_kind(leq, pat));
         for (std::size_t c = 1; c < pats_expr_list.size(); c++)
           for (std::size_t i = 0; i < kinds.size(); i++) {
             const tt::Pattern* pat = pats_expr_list[c].pats[i];
-            kinds[i] = typeopt::value_kind_union(kinds[i], typeopt::value_kind(pat->pat_env, pat->pat_type));
+            kinds[i] = typeopt::value_kind_union(kinds[i], typeopt::pattern_kind(leq, pat));
           }
         std::vector<Param> tparams;
         for (const ValueKind& kind : kinds) tparams.push_back(Param{Ident::create_local(OCAML_LIT("param")), kind});
@@ -897,14 +901,14 @@ FunInfo transl_tupled_function(scopes sc, const Location& loc, ValueKind return_
         lam_t b = matching::for_tupled_function(sc, loc, slice(ps), slice(tcases), eligible_cases->second);
         return FunInfo{L::FunctionKind::Tupled, tparams, return_, b};
       } catch (const matching::CannotFlatten&) {
-        return transl_curried_function(sc, loc, return_, repr, params, body);
+        return transl_curried_function(sc, env, loc, return_, repr, params, body);
       }
     }
   }
-  return transl_curried_function(sc, loc, return_, repr, params, body);
+  return transl_curried_function(sc, env, loc, return_, repr, params, body);
 }
 
-FunInfo transl_function_without_attributes(scopes sc, const Location& loc, L::IntRef* repr,
+FunInfo transl_function_without_attributes(scopes sc, env::t env, const Location& loc, L::IntRef* repr,
                                            const std::vector<const tt::FunctionParam*>& params,
                                            const tt::FunctionBody* body) {
   ValueKind return_ = ValueKind::gen();
@@ -916,10 +920,10 @@ FunInfo transl_function_without_attributes(scopes sc, const Location& loc, L::In
   }
   // (Tfunction_cases { cases = [] }: with Camlp4/ppx, a pattern matching
   // might be empty -- Pgenval)
-  return transl_tupled_function(sc, loc, return_, repr, params, body);
+  return transl_tupled_function(sc, env, loc, return_, repr, params, body);
 }
 
-FunInfo transl_curried_function(scopes sc, const Location& loc, ValueKind return_, L::IntRef* repr,
+FunInfo transl_curried_function(scopes sc, env::t env, const Location& loc, ValueKind return_, L::IntRef* repr,
                                 const std::vector<const tt::FunctionParam*>& params, const tt::FunctionBody* fbody) {
   std::optional<Param> cases_param;
   lam_t body;
@@ -939,6 +943,24 @@ FunInfo transl_curried_function(scopes sc, const Location& loc, ValueKind return
     body = matching::for_function(sc, fbody->loc, repr, L::lvar(fbody->param), slice(cases), fbody->partial);
     cases_param = Param{fbody->param, kind};
   }
+  // We freeze local GADTs equations to the set existing before the
+  // first partial match to avoid using equations that might be only
+  // valid if a match succeeds.
+  std::vector<std::optional<env::LocalEquations>> param_equations;
+  {
+    std::optional<env::LocalEquations> local_equations;
+    env::t prev_env = env;
+    for (const tt::FunctionParam* fp : params) {
+      if (!local_equations &&
+          (fp->fp_partial == tt::Partial::Partial ||
+           // in default arguments [?(pat=exp)], [exp] can raise and
+           // thus even a [Total] pattern can fail.
+           fp->fp_kind.kind == tt::FunctionParamKind::Kind::Tparam_optional_default))
+        local_equations = env::freeze_local_equations(prev_env);
+      prev_env = fp->fp_kind.pat->pat_env;
+      param_equations.push_back(local_equations);
+    }
+  }
   // List.fold_right over the params: from the last
   std::vector<Param> lparams;  // built reversed
   if (cases_param) lparams.push_back(*cases_param);
@@ -948,7 +970,8 @@ FunInfo transl_curried_function(scopes sc, const Location& loc, ValueKind return
     const Location& param_loc = fp->fp_loc;
     if (fp->fp_kind.kind == tt::FunctionParamKind::Kind::Tparam_pat) {
       const tt::Pattern* pat = fp->fp_kind.pat;
-      ValueKind kind = typeopt::value_kind(pat->pat_env, pat->pat_type);
+      const std::optional<env::LocalEquations>& leq = param_equations[k];
+      ValueKind kind = typeopt::pattern_kind(leq ? &*leq : nullptr, pat);
       body = matching::for_function(sc, param_loc, nullptr, L::lvar(param), slice({matching::PatAction{pat, body}}),
                                     fp->fp_partial);
       lparams.push_back(Param{param, kind});
@@ -978,7 +1001,7 @@ lam_t transl_function(scopes sc, const tt::Expression* e, Slice<const tt::Functi
                       const tt::FunctionBody* body) {
   FunInfo fi = event_function(sc, e, [&](L::IntRef* repr) {
     auto [ps, b] = fuse_method_arity(params, body);
-    return transl_function_without_attributes(sc, e->exp_loc, repr, ps, b);
+    return transl_function_without_attributes(sc, e->exp_env, e->exp_loc, repr, ps, b);
   });
   FunctionAttribute attr = function_attribute_disallowing_arity_fusion();
   ScopedLocation loc = of_location(sc, e->exp_loc);
@@ -1322,7 +1345,7 @@ lam_t transl_letop(scopes sc, const Location& loc, env::t env, const tt::Binding
       fb->partial = partial;
       fb->loc = ghost_loc;
       fb->exp_extra = nullptr;
-      return transl_function_without_attributes(sc, l, repr, {}, fb);
+      return transl_function_without_attributes(sc, env, l, repr, {}, fb);
     });
     FunctionAttribute attr = function_attribute_disallowing_arity_fusion();
     ScopedLocation floc = of_location(sc, c->c_rhs->exp_loc);

@@ -671,13 +671,13 @@ static Constraints subtype_rec(env::t env, const STrace& trace, TypeExpr* t1, Ty
     return subtype_labeled_list(env, trace, as<Ttuple>(d1)->elems, as<Ttuple>(d2)->elems,
                                 std::move(constraints));
   if (c1 && c2 && c1->args.empty() && c2->args.empty() &&
-      env::path_equiv(env, c1->path, c2->path))
+      quick_eq_type_path(true, env, c1->path, c2->path))
     return constraints;
   if (c1 && generic_abbrev(env, c1->path) && safe_abbrev(env, t1))
     return subtype_rec(env, trace, expand_abbrev(false, env, t1), t2, std::move(constraints));
   if (c2 && generic_abbrev(env, c2->path) && safe_abbrev(env, t2))
     return subtype_rec(env, trace, t1, expand_abbrev(false, env, t2), std::move(constraints));
-  if (c1 && c2 && env::path_equiv(env, c1->path, c2->path)) {
+  if (c1 && c2 && quick_eq_type_path(true, env, c1->path, c2->path)) {
     try {
       const TypeDeclaration* decl = env::find_type(c1->path, env);
       if (c1->args.size() != c2->args.size()) throw std::invalid_argument("List.combine");
@@ -853,7 +853,7 @@ static Constraints subtype_row(env::t env, const STrace& trace, const RowDesc* r
   auto vcn = [](const TypeDesc* d) {
     return d->kind == DK::Tvar || d->kind == DK::Tconstr || d->kind == DK::Tnil;
   };
-  if (k1 && k2 && env::path_equiv(env, k1->path, k2->path))
+  if (k1 && k2 && quick_eq_type_path(true, env, k1->path, k2->path))
     return subtype_rec(env, scons(more1, more2, trace), more1, more2, std::move(constraints));
   if (vcn(md1) && vcn(md2) && r1d.closed && r1.empty()) {
     Constraints cs = std::move(constraints);
@@ -1157,7 +1157,6 @@ void normalize_type(TypeExpr* ty) {
 }
 
 ArrowSpine arrow_spine(env::t env, TypeExpr* ty0) {
-  Snapshot snap = btype::snapshot();
   ArrowSpine result;
   with_type_mark([&](TypeMark& mark) {
     wrap_trace_gadt_instances(env, [&] {
@@ -1182,13 +1181,14 @@ ArrowSpine arrow_spine(env::t env, TypeExpr* ty0) {
       }
     });
   });
-  btype::backtrack(snap);
   return result;
 }
 
 std::pair<std::vector<ArgLabel>, bool> arrow_labels(env::t env, TypeExpr* ty) {
+  Snapshot snap = btype::snapshot();
   ArrowSpine s = arrow_spine(env, ty);
   bool is_ret_tvar = !s.ret_cycle && is_Tvar(s.ret);
+  btype::backtrack(snap);
   std::vector<ArgLabel> labels;
   for (auto& a : s.args) labels.push_back(a.first);
   return {labels, is_ret_tvar};
@@ -1529,7 +1529,7 @@ bool same_constr(env::t env, TypeExpr* t1, TypeExpr* t2) {
   TypeExpr* b = expand_head_nolink(env, t2);
   auto* c1 = as<Tconstr>(get_desc(a));
   auto* c2 = as<Tconstr>(get_desc(b));
-  if (c1 && c2) return env::path_equiv(env, c1->path, c2->path);
+  if (c1 && c2) return eq_expanded_type_path(env, c1->path, c2->path);
   return false;
 }
 

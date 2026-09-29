@@ -592,6 +592,7 @@ Instruction comp_primitive(const StackInfo& si, const L::Primitive& p, long sz, 
     case PK::Pbytes_to_string: return kccall("caml_string_of_bytes", 1, nullptr);
     case PK::Pbytes_of_string: return kccall("caml_bytes_of_string", 1, nullptr);
     case PK::Patomic_load: return kccall("caml_atomic_load_field", 2, nullptr);
+    case PK::Patomic_fetch_add: return kccall("caml_atomic_fetch_add_field", 3, nullptr);
     case PK::Pdls_get: return kccall("caml_domain_dls_get", 1, nullptr);
     case PK::Ppoll: return kccall("caml_process_pending_actions_with_root", 1, nullptr);
     // The cases below are handled in [comp_expr] before the [comp_primitive] call

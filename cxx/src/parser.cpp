@@ -3803,12 +3803,7 @@ class Parser {
 
   Location none_loc() const { return Location{Position{0, 0, -1}, Position{0, 0, -1}, true}; }
 
-  // anon_arrow = false: the right-hand side of `with module type T = mty`
-  // (not `:=`),
-  // which parser.mly gives %prec below_MINUSGREATER -- a following `->`
-  // closes the whole `with` type (`S with module type T = S -> S` is
-  // `(S with module type T = S) -> S`)
-  ModuleType parse_module_type(bool anon_arrow = true) {
+  ModuleType parse_module_type() {
     Position symstart = position(cur().start);  // $sloc start (the `(` of a paren'd domain)
     // leading functor params with no `functor` keyword: `() -> R`, `(X : S) -> R`
     auto is_fparam_start = [&] {
@@ -3832,7 +3827,7 @@ class Parser {
       return cod;
     }
     ModuleType mt = parse_module_type_with();
-    if (anon_arrow && cur().kind == Kind::MINUSGREATER) {  // mt -> mt2  (anonymous functor sugar)
+    if (cur().kind == Kind::MINUSGREATER) {  // mt -> mt2  (anonymous functor sugar)
       advance();
       Position s = symstart;
       ModuleType cod = parse_module_type();
@@ -3904,10 +3899,10 @@ class Parser {
       LongidentLoc lid = parse_longident_path();
       bool subst = cur().kind == Kind::COLONEQUAL;
       if (subst) advance(); else expect(Kind::EQUAL, "=");
-      // only `=` stops at `->`: menhir's precedence resolves a conflict the
-      // `:=` form doesn't have (`S with module type T := S -> S` keeps its
-      // arrow inside)
-      ModuleType mty = parse_module_type(/*anon_arrow=*/subst);
+      // parser.mly's %prec below_MINUSGREATER shifts a following `->` into
+      // the right-hand side (`S with module type T = S -> S` is
+      // `S with module type T = (S -> S)`)
+      ModuleType mty = parse_module_type();
       if (subst) return Pwith_modtypesubst{std::move(lid), box(std::move(mty))};
       return Pwith_modtype{std::move(lid), box(std::move(mty))};
     }

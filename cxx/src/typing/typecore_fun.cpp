@@ -125,22 +125,22 @@ TypeFunctionResult type_function(env::t env, Slice<const pt::FunctionParam*> par
       auto raise_unerasable_optional_argument = [pat_loc] {
         prerr_warning(pat_loc, WK::Unerasable_optional_argument);
       };
-      auto only_labels_function_ret_tvar = [env](TypeExpr* ty) -> std::optional<TypeExpr*> {
-        ctype::ArrowSpine sp = ctype::arrow_spine(env, ty);
-        for (auto& a : sp.args)
-          if (a.first.kind == ArgLabel::Kind::Nolabel) return std::nullopt;
-        if (!sp.ret_cycle && is_Tvar(sp.ret)) return sp.ret;
-        return nullptr;
+      // [arrow_labels] does expansion and is potentially expensive;
+      // only call this when necessary.
+      auto only_labels_function_ret_tvar = [env](TypeExpr* ty) -> std::optional<bool> {
+        auto [labels, is_ret_tvar] = ctype::arrow_labels(env, ty);
+        for (auto& l : labels)
+          if (l.kind == ArgLabel::Kind::Nolabel) return std::nullopt;
+        return is_ret_tvar;
       };
-      std::optional<TypeExpr*> o = only_labels_function_ret_tvar(ty_ret);
-      if (o && *o) {
-        TypeExpr* ret_tvar = *o;
+      std::optional<bool> o = only_labels_function_ret_tvar(ty_ret);
+      if (o == true) {
         // We don't necessarily know [ty] is a function with only labelled
         // args since unification may change this. So we add a delayed check.
-        add_delayed_check([only_labels_function_ret_tvar, ret_tvar, raise_unerasable_optional_argument] {
-          if (only_labels_function_ret_tvar(ret_tvar)) raise_unerasable_optional_argument();
+        add_delayed_check([only_labels_function_ret_tvar, ty_ret, raise_unerasable_optional_argument] {
+          if (only_labels_function_ret_tvar(ty_ret) == false) raise_unerasable_optional_argument();
         });
-      } else if (o) {
+      } else if (o == false) {
         raise_unerasable_optional_argument();
       }
     }

@@ -388,8 +388,7 @@ const Package* extract_package_modulo_subtype(env::t env, TypeExpr* ty) {
 
 bool is_contractive(env::t env, Path::t p) {
   try {
-    const TypeDeclaration* decl = env::find_type(p, env);
-    return (in_pervasives(p) && !decl->type_manifest) || is_datatype(decl);
+    return is_datatype(env::find_type(p, env));
   } catch (const env::NotFound&) {
     return false;
   }
@@ -497,7 +496,9 @@ static void local_non_recursive_abbrev_rec(bool allow_rec, bool strict,
   if (std::find(visited.begin(), visited.end(), id) != visited.end()) return;
   const TypeDesc* d = get_desc(ty);
   if (auto* c = as<Tconstr>(d)) {
-    if (env::path_equiv(env, p, c->path)) throw Occur{};
+    // Note: p' is not necessarily normalized here,
+    // but we expand/normalize it below and retry.
+    if (eq_expanded_type_path(env, p, c->path)) throw Occur{};
     if (allow_rec && !strict && is_contractive(env, c->path)) return;
     visited.push_back(id);
     TypeExpr* expanded = nullptr;

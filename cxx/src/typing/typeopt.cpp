@@ -293,6 +293,12 @@ lambda::ValueKind value_kind(env::t env, TypeExpr* ty0) {
   return VK::gen();
 }
 
+lambda::ValueKind pattern_kind(const env::LocalEquations* local_equations, const typedtree::Pattern* pat) {
+  if (!local_equations) return value_kind(pat->pat_env, pat->pat_type);
+  env::t env = env::restrict_local_equations(*local_equations, pat->pat_env);
+  return value_kind(env, pat->pat_type);
+}
+
 lambda::ValueKind value_kind_union(const lambda::ValueKind& a, const lambda::ValueKind& b) {
   return lambda::equal_value_kind(a, b) ? a : lambda::ValueKind::gen();
 }

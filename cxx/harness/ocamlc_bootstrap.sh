@@ -96,6 +96,7 @@ echo "stdlib: built"
 CL_COMMON="utils/config.mli utils/config.ml
 utils/build_path_prefix_map.mli utils/build_path_prefix_map.ml
 utils/format_doc.mli utils/format_doc.ml
+utils/utf8_lexeme.mli utils/utf8_lexeme.ml
 utils/misc.mli utils/misc.ml
 utils/identifiable.mli utils/identifiable.ml
 utils/numbers.mli utils/numbers.ml
