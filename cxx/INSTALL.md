@@ -39,6 +39,11 @@ executable are byte-identical to the stock ocamlopt's; and has opam
 install them as `bin/ocamlc.opt` and `bin/ocamlopt.opt` through
 `ocaml-variants.install`.  A failed check fails the build.
 
+To check which compiler a switch has, run `ocamlc -cxx-version` or
+`ocamlopt -cxx-version`: the C++ port prints `c++ocamlc (the C++ port of
+ocamlc), OCaml <version>` and exits 0; the stock compilers reject the
+option (`unknown option '-cxx-version'`, exit 2).
+
 To compile with the stock compilers for a comparison, use
 `ocamlc.stock` / `ocamlopt.stock` directly; to go back for good, `opam remove
 ocaml-option-cxx` (opam rebuilds `ocaml-variants` without it).

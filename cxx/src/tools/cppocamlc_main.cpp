@@ -1053,6 +1053,19 @@ static int run_main(int argc, char** argv) {
     ce::add_arguments({depend});
   }
   ce::add_arguments(ty::main_args::cppcaml_extensions());
+  {
+    // -cxx-version (undocumented: not in -help): identifies the C++ port --
+    // the stock compilers reject it as an unknown option (exit 2)
+    ty::arg::Option cxxv;
+    cxxv.key = "-cxx-version";
+    cxxv.spec.k = ty::arg::Spec::K::Unit;
+    cxxv.spec.unit = [] {
+      std::cout << CPPCAML_SELF " (the C++ port of " << kTool << "), OCaml " << *ty::config::config_var("version") << std::endl;
+      throw ce::ExitWithStatus{0};
+    };
+    cxxv.doc = "";
+    ce::add_arguments({cxxv});
+  }
   // Config.standard_library: $OCAMLLIB, else $CAMLLIB, else the default
   ty::config::standard_library_default = ty::config::configured_standard_library_default();
   if (const char* e = std::getenv("OCAMLLIB")) ty::config::standard_library = e;
