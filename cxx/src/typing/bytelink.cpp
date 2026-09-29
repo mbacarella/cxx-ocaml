@@ -70,7 +70,7 @@ std::vector<std::string> strings_of(const V& l) {
 }
 std::vector<std::pair<bool, std::string>> dllibs_of(const V& l) {
   std::vector<std::pair<bool, std::string>> r;  // (~suffixed:bool * string)
-  for (const V& e : cmo_format::list_elems(l)) r.emplace_back(e->fields[0]->i != 0, e->fields[1]->s);
+  for (const V& e : cmo_format::list_elems(l)) r.emplace_back(e->fields[0].int_value() != 0, e->fields[1]->s);
   return r;
 }
 template <class T>
@@ -82,7 +82,7 @@ std::vector<T> append(std::vector<T> a, const std::vector<T>& b) {
 // add_ccobjs obj_name origin l
 void add_ccobjs(const std::string& obj_name, const std::string& origin, const V& l) {
   if (cf::no_auto_link) return;
-  bool lib_custom = l->fields[cmo_format::lib_custom]->i != 0;
+  bool lib_custom = l->fields[cmo_format::lib_custom].int_value() != 0;
   if (cf::use_runtime.empty() && cf::use_prims.empty()) {
     if (lib_custom) cf::custom_runtime = true;
     g_lib_ccobjs = append(strings_of(l->fields[cmo_format::lib_ccobjs]), g_lib_ccobjs);

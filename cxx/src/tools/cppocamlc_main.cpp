@@ -90,6 +90,18 @@
 
 namespace fs = std::filesystem;
 
+// Return the allocator's free memory to the system: the parser's tree and
+// tokens, freed before typing, would otherwise stay resident for the whole
+// compilation (the zones grow in blocks of their own).  mimalloc's
+// mi_collect when it is linked in (weak: absent otherwise), else glibc's
+// malloc_trim.
+extern "C" void mi_collect(bool force) __attribute__((weak));
+extern "C" int malloc_trim(size_t pad) __attribute__((weak));
+static void release_free_memory() {
+  if (mi_collect) mi_collect(true);
+  else if (malloc_trim) malloc_trim(0);
+}
+
 // The same driver builds c++ocamlc (Maindriver, Compile) and, with
 // CPPCAML_OCAMLOPT, c++ocamlopt (Optmaindriver, Optcompile).
 #ifdef CPPCAML_OCAMLOPT
@@ -697,6 +709,7 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
                                          // the C++ parser's tree is not read again (Parsetree's is a
                                          // copy in the zone): free it before typing
                                          decltype(structure)().swap(structure);
+                                         release_free_memory();
                                          ty::cmt_format::set_comments(ty::parsetree::comments_of_ast(
                                              cppcaml::ast::last_comments(), pos_name, dirfiles));
                                        }
@@ -908,6 +921,8 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
           } else {
             std::string_view pos_name = cf::preprocessor ? ty::zstr(in_path) : src_name;  // as compile_ml's
             sg = ty::parsetree::of_ast_signature(sig, pos_name, dirfiles);
+            decltype(sig)().swap(sig);  // (not read again: see the implementation's)
+            release_free_memory();
             ty::cmt_format::set_comments(
                 ty::parsetree::comments_of_ast(cppcaml::ast::last_comments(), pos_name, dirfiles));
           }

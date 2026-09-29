@@ -64,7 +64,7 @@ std::vector<V> g_lib_ccobjs, g_lib_ccopts, g_lib_dllibs;
 
 void add_ccobjs(const V& l) {
   if (cf::no_auto_link) return;
-  if (l->fields[cmo_format::lib_custom]->i != 0) cf::custom_runtime = true;
+  if (l->fields[cmo_format::lib_custom].int_value() != 0) cf::custom_runtime = true;
   for (const V& x : cmo_format::list_elems(l->fields[cmo_format::lib_ccobjs])) g_lib_ccobjs.push_back(x);
   for (const V& x : cmo_format::list_elems(l->fields[cmo_format::lib_ccopts])) g_lib_ccopts.push_back(x);
   for (const V& x : cmo_format::list_elems(l->fields[cmo_format::lib_dllibs])) g_lib_dllibs.push_back(x);

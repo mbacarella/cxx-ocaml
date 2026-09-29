@@ -39,7 +39,7 @@ struct Reloc {
 // a compilation_unit value
 struct CompUnit {
   V v;
-  long int_field(CuField f) const { return static_cast<long>(v->fields[f]->i); }
+  long int_field(CuField f) const { return static_cast<long>(v->fields[f].int_value()); }
   void set_int_field(CuField f, long n) { v->fields[f] = omarshal::vint(n); }
   std::string name() const { return v->fields[cu_name]->s; }
   std::vector<Reloc> relocs() const;
@@ -48,7 +48,7 @@ struct CompUnit {
   std::vector<std::pair<V, V>> import_objs() const;
   std::vector<std::string> required_compunits() const;
   std::vector<std::string> primitives() const;
-  bool force_link() const { return v->fields[cu_force_link]->i != 0; }
+  bool force_link() const { return v->fields[cu_force_link].int_value() != 0; }
 };
 
 // the elements of an OCaml list value

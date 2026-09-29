@@ -68,13 +68,13 @@ class CamlHash {
     std::uint32_t h = 0;
     long num = 10;          // meaningful values
     const long sz = 100;    // queue size
-    std::vector<const o::Value*> queue;
-    queue.push_back(v.get());
+    std::vector<V> queue;
+    queue.push_back(v);
     std::size_t rd = 0;
     while (rd < queue.size() && num > 0) {
-      const o::Value* x = queue[rd++];
-      switch (x->k) {
-        case o::Value::Int: h = mix_intnat(h, 2 * x->i + 1); num--; break;
+      V x = queue[rd++];
+      switch (x.kind()) {
+        case o::Value::Int: h = mix_intnat(h, 2 * x.int_value() + 1); num--; break;
         case o::Value::Str: h = mix_string(h, x->s); num--; break;
         case o::Value::Dbl: h = mix_double(h, x->d); num--; break;
         case o::Value::Block: {
@@ -82,7 +82,7 @@ class CamlHash {
           h = mix_uint32(h, static_cast<std::uint32_t>(hd));
           for (const V& f : x->fields) {
             if (static_cast<long>(queue.size()) >= sz) break;
-            queue.push_back(f.get());
+            queue.push_back(f);
           }
           break;
         }

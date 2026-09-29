@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <cstdlib>
 #include "cppcaml/omarshal.hpp"
@@ -43,28 +45,12 @@ void* arena_alloc(std::size_t n, std::size_t align) {
 
 static Value* new_value(Value::K k) {
   Value* v = new (arena_alloc(sizeof(Value), alignof(Value))) Value;
-  v->k = k;
+  v->k_ = k;
   return v;
 }
 
-// An int is an immediate, never shared: the small ones are allocated once.
-ValPtr vint(long long n) {
-  constexpr long long lo = -256, hi = 4096;
-  static const std::vector<ValPtr> small = [] {
-    std::vector<ValPtr> v;
-    v.reserve(hi - lo);
-    for (long long k = lo; k < hi; ++k) {
-      Value* x = new_value(Value::Int);
-      x->i = k;
-      v.push_back(ValPtr(x));
-    }
-    return v;
-  }();
-  if (n >= lo && n < hi) return small[static_cast<std::size_t>(n - lo)];
-  Value* v = new_value(Value::Int);
-  v->i = n;
-  return ValPtr(v);
-}
+// An int is an immediate (ValPtr), never shared, never allocated.
+ValPtr vint(long long n) { return ValPtr::immediate(n); }
 ValPtr vstr(std::string s) {
   Value* v = new_value(Value::Str);
   v->s = std::move(s);
@@ -164,11 +150,11 @@ struct Marshaler {
   }
   void emit(const ValPtr& v) {
     // immediates are never registered for sharing
-    if (v->k == Value::Int) { emit_int(v->i); return; }
+    if (v.is_int()) { emit_int(v.int_value()); return; }
     // A zero-size block is an atom: never registered for sharing.  Tags < 16 use
     // the packed small-block byte; tag >= 16 must use CODE_BLOCK32, else the tag
     // bits spill into the size nibble and the reader sees a non-empty block.
-    if (v->k == Value::Block && v->fields.empty()) {
+    if (v->k_ == Value::Block && v->fields.empty()) {
       if (v->tag < 16) byte(0x80 | v->tag);
       else { byte(0x8); be32(hdr_color() | (std::uint32_t)v->tag); }   // size 0
       return;
@@ -178,15 +164,11 @@ struct Marshaler {
       emit_shared(compressed ? v->seen_index : nobjs - v->seen_index);
       return;
     }
-    // An Int is an IMMEDIATE: it takes no object slot, so registering it would
-    // file the NEXT object's index under it and a second use of the same
-    // ValPtr would emit a back-reference to the wrong object.
-    if (v->k != Value::Int) {  // index assigned before this object's own nobjs++
-      v->seen_session = session;
-      v->seen_index = nobjs;
-    }
-    switch (v->k) {
-      case Value::Int: emit_int(v->i); return;
+    // (index assigned before this object's own nobjs++; an int returned above)
+    v->seen_session = session;
+    v->seen_index = nobjs;
+    switch (v->k_) {
+      case Value::Int: return;  // (an immediate: above)
       case Value::Str: emit_str(v->s); return;
       case Value::Dbl: {
         byte(0xC);  // CODE_DOUBLE_LITTLE

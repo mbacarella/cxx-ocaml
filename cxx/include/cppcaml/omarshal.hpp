@@ -80,29 +80,41 @@ class ArenaVec {
 
 struct Value;
 
-// A value in the arena (a plain pointer with the handful of shared_ptr
-// operations the writers use).
+// A value: an OCaml int as an immediate (tagged, like OCaml's own: an int
+// takes no object in Marshal's output, so none here), else a pointer to a
+// Value in the arena.  (The handful of shared_ptr operations the writers
+// use.)
 class ValPtr {
  public:
   ValPtr() = default;
   ValPtr(std::nullptr_t) {}
-  explicit ValPtr(Value* p) : p_(p) {}
-  Value* get() const { return p_; }
-  Value* operator->() const { return p_; }
-  Value& operator*() const { return *p_; }
-  explicit operator bool() const { return p_ != nullptr; }
-  friend bool operator==(const ValPtr& a, const ValPtr& b) { return a.p_ == b.p_; }
-  friend bool operator!=(const ValPtr& a, const ValPtr& b) { return a.p_ != b.p_; }
-  friend bool operator<(const ValPtr& a, const ValPtr& b) { return std::less<Value*>()(a.p_, b.p_); }
+  explicit ValPtr(Value* p) : b_(reinterpret_cast<std::uintptr_t>(p)) {}
+  static ValPtr immediate(long long n) {
+    ValPtr v;
+    v.b_ = (static_cast<std::uintptr_t>(n) << 1) | 1;
+    return v;
+  }
+  bool is_int() const { return (b_ & 1) != 0; }
+  long long int_value() const { return static_cast<long long>(static_cast<std::intptr_t>(b_) >> 1); }
+  // the value's kind (Int for an immediate)
+  inline int kind() const;
+  // the Value of a non-int
+  Value* get() const { return is_int() ? nullptr : reinterpret_cast<Value*>(b_); }
+  Value* operator->() const { return get(); }
+  Value& operator*() const { return *get(); }
+  explicit operator bool() const { return b_ != 0; }
+  std::uintptr_t bits() const { return b_; }
+  friend bool operator==(const ValPtr& a, const ValPtr& b) { return a.b_ == b.b_; }
+  friend bool operator!=(const ValPtr& a, const ValPtr& b) { return a.b_ != b.b_; }
+  friend bool operator<(const ValPtr& a, const ValPtr& b) { return a.b_ < b.b_; }
 
  private:
-  Value* p_ = nullptr;
+  std::uintptr_t b_ = 0;
 };
 
 struct Value {
-  enum K : std::uint8_t { Int, Str, Dbl, Block, DblArr, Custom } k = Int;
+  enum K : std::uint8_t { Int, Str, Dbl, Block, DblArr, Custom } k_ = Int;  // never Int: an immediate
   int tag = 0;
-  long long i = 0;
   double d = 0;
   // Custom: the DATA size in bytes, as the serializer wrote it.  extern.c sizes
   // a custom block as `2 + ((sz + wordsize - 1) / wordsize)` -- header + ops +
@@ -120,6 +132,7 @@ struct Value {
   std::uint32_t seen_session = 0;
   long long seen_index = 0;
 };
+inline int ValPtr::kind() const { return is_int() ? Value::Int : get()->k_; }
 
 ValPtr vint(long long n);
 ValPtr vstr(std::string s);
@@ -145,6 +158,6 @@ bool zstd_available();
 template <>
 struct std::hash<cppcaml::omarshal::ValPtr> {
   std::size_t operator()(const cppcaml::omarshal::ValPtr& v) const noexcept {
-    return std::hash<const void*>()(v.get());
+    return std::hash<std::uintptr_t>()(v.bits());
   }
 };

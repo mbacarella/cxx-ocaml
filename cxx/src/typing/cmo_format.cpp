@@ -56,7 +56,7 @@ class Reader {
 
 std::vector<V> list_elems(const V& l0) {
   std::vector<V> out;
-  for (V l = l0; l->k == omarshal::Value::Block && l->fields.size() == 2; l = l->fields[1])
+  for (V l = l0; l.kind() == omarshal::Value::Block && l->fields.size() == 2; l = l->fields[1])
     out.push_back(l->fields[0]);
   return out;
 }
@@ -66,7 +66,7 @@ std::vector<Reloc> CompUnit::relocs() const {
   for (const V& e : list_elems(v->fields[cu_reloc])) {  // (reloc_info * int)
     const V& info = e->fields[0];
     Reloc rel{};
-    rel.pos = static_cast<long>(e->fields[1]->i);
+    rel.pos = static_cast<long>(e->fields[1].int_value());
     rel.k = static_cast<Reloc::K>(info->tag);
     if (rel.k == Reloc::K::Reloc_literal) {
       rel.literal = info->fields[0];
@@ -83,7 +83,7 @@ std::vector<std::pair<std::string, std::optional<std::string>>> CompUnit::import
   std::vector<std::pair<std::string, std::optional<std::string>>> r;
   for (const V& e : list_elems(v->fields[cu_imports])) {
     const V& crc = e->fields[1];
-    if (crc->k == omarshal::Value::Block) r.emplace_back(e->fields[0]->s, crc->fields[0]->s);
+    if (crc.kind() == omarshal::Value::Block) r.emplace_back(e->fields[0]->s, crc->fields[0]->s);
     else r.emplace_back(e->fields[0]->s, std::nullopt);
   }
   return r;
@@ -93,7 +93,7 @@ std::vector<std::pair<V, V>> CompUnit::import_objs() const {
   std::vector<std::pair<V, V>> r;
   for (const V& e : list_elems(v->fields[cu_imports])) {
     const V& crc = e->fields[1];
-    r.emplace_back(e->fields[0], crc->k == omarshal::Value::Block ? crc->fields[0] : nullptr);
+    r.emplace_back(e->fields[0], crc.kind() == omarshal::Value::Block ? crc->fields[0] : nullptr);
   }
   return r;
 }

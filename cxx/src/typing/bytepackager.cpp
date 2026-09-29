@@ -341,7 +341,7 @@ struct State {
 // map.ml's Map.add over values: keys are Pident (Global name), compared by
 // name (Ident.compare on Globals)
 struct PathMap {
-  static long height(const V& m) { return m->k == o::Value::Int ? 0 : m->fields[4]->i; }
+  static long height(const V& m) { return m.is_int() ? 0 : m->fields[4].int_value(); }
   static const std::string& key_name(const V& m) {
     return m->fields[1]->fields[0]->fields[0]->s;  // Pident (Global name)
   }
@@ -364,7 +364,7 @@ struct PathMap {
     return o::vblock(0, {l, x, d, r, o::vint(hl >= hr ? hl + 1 : hr + 1)});
   }
   static V add(const V& x, const std::string& xname, const V& data, const V& m) {
-    if (m->k == o::Value::Int) return o::vblock(0, {o::vint(0), x, data, o::vint(0), o::vint(1)});
+    if (m.is_int()) return o::vblock(0, {o::vint(0), x, data, o::vint(0), o::vint(1)});
     const V &l = m->fields[0], &v = m->fields[1], &d = m->fields[2], &r = m->fields[3];
     int c = xname.compare(key_name(m));
     if (c == 0) return d == data ? m : o::vblock(0, {l, x, data, r, m->fields[4]});
