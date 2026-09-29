@@ -46,11 +46,15 @@ c++ocamlc keeps pre-decoded images of the `.cmi` files it reads in
 each image's bytes (a few percent slower).
 
 Packages for this development version: ppxlib's release does not know
-OCaml 5.6's syntax tree; pin its main branch before it gained `Pexp_hole`
-(commit b9646cc):
-`opam pin add ppxlib 'git+https://github.com/ocaml-ppx/ppxlib#b9646cc'`.
+OCaml 5.6's syntax tree; pin its main branch:
+`opam pin add ppxlib 'git+https://github.com/ocaml-ppx/ppxlib#main'`.
+Trunk's runtime defines `caml_int_clz` / `caml_int_ctz`, which
+ocaml_intrinsics_kernel v0.17's C stubs define too, so native executables
+linking it (the Jane Street ppx drivers) fail to link -- with the stock
+compiler as well.  Until it is fixed upstream, pin a copy of its `v0.17`
+branch with those two stubs renamed (in `src/int_stubs.c` and `src/int.ml`).
 
-Tested (2026-09-28): a switch created this way, ctypes, ppx_inline_test
+Tested (2026-09-28, trunk b9dac8cc84): a switch created this way, ctypes, ppx_inline_test
 and their dependencies (base, ppxlib, the Jane Street ppx stack, integers,
 dune-configurator, ...) installed, and mbacarella/mpg123 (C stubs, dune's
 ctypes stanza, inline tests) built with its tests passing.  Its build
