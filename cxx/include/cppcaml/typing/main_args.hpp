@@ -14,6 +14,8 @@ namespace cppcaml::typing::main_args {
 
 // Make_bytecomp_options (Default.Main).list
 std::vector<arg::Option> bytecomp_options();
+// Make_optcomp_options (Default.Optmain).list (optmain_args_table.inc)
+std::vector<arg::Option> optcomp_options();
 
 // the options c++ocamlc accepts beyond ocamlc's (undocumented: not in
 // -help): -stdlib <dir> sets Config.standard_library

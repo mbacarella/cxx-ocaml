@@ -1,8 +1,9 @@
 (* Emit c++ocamlc's driver tables from ocamlc's own compiler-libs values:
    Main_args.Make_bytecomp_options's option list (keys, Arg kinds, Symbol
-   choices, docs, in ocamlc's order), Config.print_config's variables, and
+   choices, docs, in ocamlc's order) and Make_optcomp_options' (ocamlopt's), Config.print_config's variables, and
    Warnings.descriptions (for -warn-help).  See gen_driver_tables.sh. *)
 module O = Main_args.Make_bytecomp_options (Main_args.Default.Main)
+module Opt = Main_args.Make_optcomp_options (Main_args.Default.Optmain)
 
 let esc s =
   let b = Buffer.create (String.length s + 8) in
@@ -27,14 +28,14 @@ let kind = function
 
 let () =
   match Sys.argv with
-  | [| _; "options" |] ->
+  | [| _; ("options" | "optoptions" as which) |] ->
       List.iter (fun (k, spec, doc) ->
         let syms = match spec with Arg.Symbol (l, _) -> l | _ -> [] in
         Printf.printf "    {\"%s\", K::%s, {%s}, \"%s\"},\n" (esc k) (kind spec)
           (String.concat ", "
              (List.map (fun s -> "\"" ^ esc s ^ "\"") syms))
           (esc doc))
-        O.list
+        (if which = "options" then O.list else Opt.list)
   | [| _; "config" |] ->
       let file = Filename.temp_file "config" "" in
       let oc = open_out_bin file in
@@ -116,6 +117,18 @@ let () =
       str "exec_magic_number" Config.exec_magic_number;
       str "cmo_magic_number" Config.cmo_magic_number;
       str "cma_magic_number" Config.cma_magic_number;
+      (* the native compiler's *)
+      bool "flambda" Config.flambda;
+      bool "with_cmm_invariants" Config.with_cmm_invariants;
+      bool "with_codegen_invariants" Config.with_codegen_invariants;
+      bool "function_sections" Config.function_sections;
+      bool "afl_instrument" Config.afl_instrument;
+      str "architecture" Config.architecture;
+      str "model" Config.model;
+      str "asm_" Config.asm;  (* (asm: a C++ keyword) *)
+      bool "asm_cfi_supported" Config.asm_cfi_supported;
+      str "cmx_magic_number" Config.cmx_magic_number;
+      str "cmxa_magic_number" Config.cmxa_magic_number;
       (match Config.launch_method with
        | Config.Executable -> str "launch_method_raw" "exe"
        | Config.Shebang None -> str "launch_method_raw" "sh"

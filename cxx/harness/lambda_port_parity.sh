@@ -7,6 +7,9 @@
 # c++ocamlc's new translation path (CPPCAML_NEWLAMBDA=1).
 #
 # DUMP=dinstr compares Bytegen's instructions (Printinstr) the same way.
+# NATIVE=1: the native compiler's Lambda (Translmod.transl_store_implementation
+# and native_code's branches) -- ocamlopt.opt against c++ocamlopt, both
+# stopped after lambda.
 #
 # Usage: lambda_port_parity.sh [file.ml ...]   (JOBS=, DUMP=drawlambda|dlambda|dinstr,
 #   FLAGS= extra flags for both compilers, e.g. absolute -I dirs)
@@ -23,8 +26,15 @@ STOP="-stop-after lambda"
 DFLAG="-$DUMP"
 [ "$DUMP" = dinstr ] && STOP=""
 [ "$DUMP" = cmo ] && { STOP=""; DFLAG=""; }  # compare the .cmo files' bytes
-export DUMP FLAGS STOP DFLAG
-CPP="${CPP:-$ROOT/cxx/build-release/c++ocamlc}"
+NATIVE="${NATIVE:-0}"
+if [ "$NATIVE" = 1 ]; then
+  REFC="$ROOT/ocamlopt.opt"; OSTOP="$STOP"
+  CPP="${CPP:-$ROOT/cxx/build-release/c++ocamlopt}"
+else
+  REFC="$ROOT/ocamlc.opt"; OSTOP=""
+  CPP="${CPP:-$ROOT/cxx/build-release/c++ocamlc}"
+fi
+export DUMP FLAGS STOP DFLAG NATIVE REFC OSTOP
 OUT=/tmp/lambda_port_parity
 
 if [ "${1:-}" == "--worker" ]; then
@@ -36,9 +46,9 @@ if [ "${1:-}" == "--worker" ]; then
   prep() { rm -rf "${w:?}/x"; mkdir "$w/x"; cp "$f" "$w/x/"; [ -f "$i" ] && cp "$i" "$w/x/"; }
   prep
   if [ -f "$i" ]; then  # a sibling interface: each compiler compiles it first
-    ( cd "$w/x" && timeout 120 "$ROOT/ocamlc.opt" -nostdlib -I "$ROOT/stdlib" -w -a $FLAGS -c "${b}i" ) >/dev/null 2>&1
+    ( cd "$w/x" && timeout 120 "$REFC" -nostdlib -I "$ROOT/stdlib" -w -a $FLAGS -c "${b}i" ) >/dev/null 2>&1
   fi
-  ( cd "$w/x" && timeout 120 "$ROOT/ocamlc.opt" -nostdlib -I "$ROOT/stdlib" -w -a $FLAGS $DFLAG -c "$b" ) \
+  ( cd "$w/x" && timeout 120 "$REFC" -nostdlib -I "$ROOT/stdlib" -w -a $FLAGS $DFLAG $OSTOP -c "$b" ) \
       >/dev/null 2>"$OUT/$key.o"; orc=$?
   if [ "$DUMP" = cmo ]; then cp "$w/x/${b%.ml}.cmo" "$OUT/$key.o" 2>/dev/null || orc=1; fi
   prep

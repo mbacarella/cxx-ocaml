@@ -1,6 +1,8 @@
 // Port of driver/compenv.ml (see compenv.hpp).
 #include "cppcaml/typing/compenv.hpp"
 
+#include "cppcaml/typing/arg_helper.hpp"
+
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -98,6 +100,7 @@ std::vector<std::string> first_ccopts, last_ccopts;
 std::vector<std::string> first_ppx, last_ppx;
 std::vector<std::string> first_objfiles, last_objfiles;
 bool stop_early = false;
+bool has_linker_inputs = false;
 
 std::vector<std::string> rev_split_words(const std::string& s) {
   std::vector<std::string> res;  // (built in the order OCaml conses: reversed)
@@ -210,11 +213,19 @@ bool check_bool(const std::string& name, const std::string& s) {
   return false;
 }
 
+// (Compiler_pass.available_pass_names ~native: scheduling and emit are the
+// native compiler's)
 std::optional<Pass> decode_compiler_pass(const std::string& v, const std::string& name) {
-  static const std::vector<std::string> passes = {"parsing", "typing", "lambda"};
+  std::vector<std::string> passes = {"parsing", "typing", "lambda"};
+  if (clflags::native_code) {
+    passes.push_back("scheduling");
+    passes.push_back("emit");
+  }
   if (v == "parsing") return Pass::Parsing;
   if (v == "typing") return Pass::Typing;
   if (v == "lambda") return Pass::Lambda;
+  if (clflags::native_code && v == "scheduling") return Pass::Scheduling;
+  if (clflags::native_code && v == "emit") return Pass::Emit;
   std::string l;
   for (std::size_t i = 0; i < passes.size(); ++i) l += (i ? ", " : "") + passes[i];
   print_error("bad value " + v + " for option \"" + name + "\" (expected one of: " + l + ")");
@@ -223,15 +234,8 @@ std::optional<Pass> decode_compiler_pass(const std::string& v, const std::string
 
 std::vector<std::string> can_discard;
 
-// the native / flambda settings OCAMLPARAM may carry: parsed (and their
-// values checked) as ocamlc does, then unused by a bytecode compiler
-struct NativeOnly {
-  bool afl_instrument = false, clambda_checks = false, function_sections = false, keep_asm_file = false,
-       keep_startup_file = false, optimize_for_speed = true, dlcode = true, force_slash = false,
-       classic_inlining = false, unbox_closures = false, remove_unused_arguments = false, inlining_report = false,
-       dump_flambda_verbose = false, flambda_invariant_checks = false, cmm_invariants = false, use_linscan = false,
-       insn_sched = false, pic_code = false;
-} g_native;
+// Clflags.force_slash (ocamldep's)
+bool force_slash = false;
 
 void parse_warnings(bool error, const std::string& v) {
   if (std::optional<warnings::Alert> a = warnings::parse_options(error, v))
@@ -253,12 +257,10 @@ void read_one_param(Position position, const std::string& name, const std::strin
     (void)dummy;
   };
   namespace cf = clflags;
-  static long afl_inst_ratio = 100, unbox_closures_factor = 10;
-  static std::optional<long> simplify_rounds;
   if (name == "g") set("g", {&cf::debug});
   else if (name == "bin-annot") set("bin-annot", {&cf::binary_annotations});
-  else if (name == "afl-instrument") set("afl-instrument", {&g_native.afl_instrument});
-  else if (name == "afl-inst-ratio") int_setter("afl-inst-ratio", &afl_inst_ratio);
+  else if (name == "afl-instrument") set("afl-instrument", {&cf::afl_instrument});
+  else if (name == "afl-inst-ratio") int_setter("afl-inst-ratio", &cf::afl_inst_ratio);
   else if (name == "annot") set("annot", {&cf::annotations});
   else if (name == "absname") set("absname", {&cf::absname});
   else if (name == "compat-32") set("compat-32", {&cf::bytecode_compatible_32});
@@ -278,13 +280,13 @@ void read_one_param(Position position, const std::string& name, const std::strin
   else if (name == "unsafe") set("unsafe", {&cf::unsafe});
   else if (name == "verbose") set("verbose", {&cf::verbose});
   else if (name == "nopervasives") set("nopervasives", {&cf::nopervasives});
-  else if (name == "slash") set("slash", {&g_native.force_slash});
-  else if (name == "no-slash") clear("no-slash", {&g_native.force_slash});
+  else if (name == "slash") set("slash", {&force_slash});
+  else if (name == "no-slash") clear("no-slash", {&force_slash});
   else if (name == "keep-docs") set("keep-docs", {&cf::keep_docs});
   else if (name == "keep-locs") set("keep-locs", {&cf::keep_locs});
-  else if (name == "compact") clear("compact", {&g_native.optimize_for_speed});
+  else if (name == "compact") clear("compact", {&cf::optimize_for_speed});
   else if (name == "no-app-funct") clear("no-app-funct", {&cf::applicative_functors});
-  else if (name == "nodynlink") clear("nodynlink", {&g_native.dlcode});
+  else if (name == "nodynlink") clear("nodynlink", {&cf::dlcode});
   else if (name == "short-paths") clear("short-paths", {&cf::real_paths});
   else if (name == "typing-recovery") set("typing-recovery", {&cf::typing_recovery});
   else if (name == "no-alias-deps") set("no-alias-deps", {&cf::no_alias_deps});
@@ -295,38 +297,68 @@ void read_one_param(Position position, const std::string& name, const std::strin
   else if (name == "open") {
     for (const std::string& m : split_on_char(',', v)) cf::open_modules.insert(cf::open_modules.begin(), m);
   } else if (name == "cc") cf::c_compiler = v;
-  else if (name == "clambda-checks") set("clambda-checks", {&g_native.clambda_checks});
-  else if (name == "function-sections") set("function-sections", {&g_native.function_sections});
-  else if (name == "s") set("s", {&g_native.keep_asm_file, &g_native.keep_startup_file});
-  else if (name == "S") set("S", {&g_native.keep_asm_file});
-  else if (name == "dstartup") set("dstartup", {&g_native.keep_startup_file});
+  else if (name == "clambda-checks") set("clambda-checks", {&cf::clambda_checks});
+  else if (name == "function-sections") set("function-sections", {&cf::function_sections});
+  else if (name == "s") set("s", {&cf::keep_asm_file, &cf::keep_startup_file});
+  else if (name == "S") set("S", {&cf::keep_asm_file});
+  else if (name == "dstartup") set("dstartup", {&cf::keep_startup_file});
   else if (name == "we" || name == "warn-error") parse_warnings(true, v);
   else if (name == "w") parse_warnings(false, v);
   else if (name == "wwe") parse_warnings(false, v);
   else if (name == "alert") warnings::parse_alert_option(v);
-  // inlining: native settings (their Arg_helper syntax is not checked here)
-  else if (name == "inline" || name == "inline-toplevel" || name == "inline-max-unroll" ||
-           name == "inline-call-cost" || name == "inline-alloc-cost" || name == "inline-prim-cost" ||
-           name == "inline-branch-cost" || name == "inline-indirect-cost" || name == "inline-lifting-benefit" ||
-           name == "inline-branch-factor" || name == "inline-max-depth") {
-  } else if (name == "rounds") {
+  else if (name == "inline") {
+    if (std::optional<std::string> exn = arg_helper::parse_no_error(v, cf::inline_threshold))
+      print_error("bad syntax " + v + " for \"inline\": " + *exn);
+  } else if (name == "inline-toplevel")
+    arg_helper::parse(v, "Bad syntax in OCAMLPARAM for 'inline-toplevel'", cf::inline_toplevel_threshold);
+  else if (name == "rounds") {
     long x;
-    if (arg::int_of_string_opt(v, x)) simplify_rounds = x;
+    if (arg::int_of_string_opt(v, x)) cf::simplify_rounds = x;
     else print_error("non-integer parameter " + v + " for " + quote_S("rounds"));
-  } else if (name == "Oclassic") set("Oclassic", {&g_native.classic_inlining});
-  else if (name == "O2") (void)check_bool("O2", v);
-  else if (name == "O3") (void)check_bool("O3", v);
-  else if (name == "unbox-closures") set("unbox-closures", {&g_native.unbox_closures});
-  else if (name == "unbox-closures-factor") int_setter("unbox-closures-factor", &unbox_closures_factor);
-  else if (name == "remove-unused-arguments") set("remove-unused-arguments", {&g_native.remove_unused_arguments});
+  } else if (name == "inline-max-unroll")
+    arg_helper::parse(v, "Bad syntax in OCAMLPARAM for 'inline-max-unroll'", cf::inline_max_unroll);
+  else if (name == "inline-call-cost")
+    arg_helper::parse(v, "Bad syntax in OCAMLPARAM for 'inline-call-cost'", cf::inline_call_cost);
+  else if (name == "inline-alloc-cost")
+    arg_helper::parse(v, "Bad syntax in OCAMLPARAM for 'inline-alloc-cost'", cf::inline_alloc_cost);
+  else if (name == "inline-prim-cost")
+    arg_helper::parse(v, "Bad syntax in OCAMLPARAM for 'inline-prim-cost'", cf::inline_prim_cost);
+  else if (name == "inline-branch-cost")
+    arg_helper::parse(v, "Bad syntax in OCAMLPARAM for 'inline-branch-cost'", cf::inline_branch_cost);
+  else if (name == "inline-indirect-cost")
+    arg_helper::parse(v, "Bad syntax in OCAMLPARAM for 'inline-indirect-cost'", cf::inline_indirect_cost);
+  else if (name == "inline-lifting-benefit")
+    arg_helper::parse(v, "Bad syntax in OCAMLPARAM for 'inline-lifting-benefit'", cf::inline_lifting_benefit);
+  else if (name == "inline-branch-factor")
+    arg_helper::parse(v, "Bad syntax in OCAMLPARAM for 'inline-branch-factor'", cf::inline_branch_factor);
+  else if (name == "inline-max-depth")
+    arg_helper::parse(v, "Bad syntax in OCAMLPARAM for 'inline-max-depth'", cf::inline_max_depth);
+  else if (name == "Oclassic") set("Oclassic", {&cf::classic_inlining});
+  else if (name == "O2") {
+    if (check_bool("O2", v)) {
+      cf::default_simplify_rounds = 2;
+      cf::use_inlining_arguments_set(cf::o2_arguments);
+      cf::use_inlining_arguments_set(cf::o1_arguments, 0);
+    }
+  } else if (name == "O3") {
+    if (check_bool("O3", v)) {
+      cf::default_simplify_rounds = 3;
+      cf::use_inlining_arguments_set(cf::o3_arguments);
+      cf::use_inlining_arguments_set(cf::o2_arguments, 1);
+      cf::use_inlining_arguments_set(cf::o1_arguments, 0);
+    }
+  }
+  else if (name == "unbox-closures") set("unbox-closures", {&cf::unbox_closures});
+  else if (name == "unbox-closures-factor") int_setter("unbox-closures-factor", &cf::unbox_closures_factor);
+  else if (name == "remove-unused-arguments") set("remove-unused-arguments", {&cf::remove_unused_arguments});
   else if (name == "inlining-report") {
-    if (cf::native_code) set("inlining-report", {&g_native.inlining_report});
-  } else if (name == "flambda-verbose") set("flambda-verbose", {&g_native.dump_flambda_verbose});
-  else if (name == "flambda-invariants") set("flambda-invariants", {&g_native.flambda_invariant_checks});
-  else if (name == "cmm-invariants") set("cmm-invariants", {&g_native.cmm_invariants});
-  else if (name == "linscan") set("linscan", {&g_native.use_linscan});
-  else if (name == "insn-sched") set("insn-sched", {&g_native.insn_sched});
-  else if (name == "no-insn-sched") clear("insn-sched", {&g_native.insn_sched});
+    if (cf::native_code) set("inlining-report", {&cf::inlining_report});
+  } else if (name == "flambda-verbose") set("flambda-verbose", {&cf::dump_flambda_verbose});
+  else if (name == "flambda-invariants") set("flambda-invariants", {&cf::flambda_invariant_checks});
+  else if (name == "cmm-invariants") set("cmm-invariants", {&cf::cmm_invariants});
+  else if (name == "linscan") set("linscan", {&cf::use_linscan});
+  else if (name == "insn-sched") set("insn-sched", {&cf::insn_sched});
+  else if (name == "no-insn-sched") clear("insn-sched", {&cf::insn_sched});
   else if (name == "color") {
     if (v == "auto") cf::color = cf::Color::Auto;
     else if (v == "always") cf::color = cf::Color::Always;
@@ -362,7 +394,7 @@ void read_one_param(Position position, const std::string& name, const std::strin
       else last_objfiles.insert(last_objfiles.begin(), v);
     }
   } else if (name == "pic") {
-    if (cf::native_code) set("pic", {&g_native.pic_code});
+    if (cf::native_code) set("pic", {&cf::pic_code});
   } else if (name == "can-discard") {
     can_discard.insert(can_discard.begin(), v);
   } else if (name == "timings" || name == "profile") {
@@ -599,6 +631,7 @@ void process_action(const ActionContext& ctx, const DeferredAction& action) {
       } else if (check_suffix(name, ".cmi") && cf::make_package) {
         cf::objfiles.insert(cf::objfiles.begin(), name);
       } else if (check_suffix(name, config::ext_obj) || check_suffix(name, config::ext_lib)) {
+        has_linker_inputs = true;
         cf::ccobjs.insert(cf::ccobjs.begin(), name);
       } else if (!cf::native_code && check_suffix(name, config::ext_dll)) {
         cf::dllibs.insert(cf::dllibs.begin(), {false, name});

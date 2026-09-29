@@ -1,7 +1,8 @@
 // Port of lambda/translmod.ml (cxx/PORTING.md stage 10): the bytecode
-// paths.  See translmod.hpp.  (The native entry points -- transl_store_*,
-// the *_flambda wrappers other than the one transl_implementation calls, and
-// the toplevel's transl_toplevel_* -- are not ported.)
+// paths and the native compiler's transl_store_implementation.  See
+// translmod.hpp.  (transl_store_phrases / transl_store_package, the
+// *_flambda wrappers other than the one transl_implementation calls, and the
+// toplevel's transl_toplevel_* are not ported.)
 //
 // Evaluation order follows OCaml's: a constructor's (or tuple's) arguments
 // right to left, so where translmod.ml writes `Llet (..., transl_x, body)`
@@ -974,6 +975,543 @@ L::Program transl_implementation_flambda(std::string_view module_name, const tt:
   return p;
 }
 
+// ---- the native compiler: transl_store_* -------------------------------------------------
+// A variant of transl_structure used to compile toplevel structure definitions
+// for the native-code compiler.  Store the defined values in the fields of the
+// global as soon as they are defined, in order to reduce register pressure.
+// Also rewrites the defining expressions so that they refer to earlier fields
+// of the structure through the fields of the global, not by their names.
+// "map" is a table from defined idents to (pos in global block, coercion).
+// "prim" is a list of (pos in global block, primitive declaration).
+
+std::vector<Ident::t> defined_idents(Slice<const tt::StructureItem*> items, std::size_t k = 0);
+std::vector<Ident::t> all_idents(Slice<const tt::StructureItem*> items, std::size_t k = 0);
+
+void append(std::vector<Ident::t>& v, const std::vector<Ident::t>& w) { v.insert(v.end(), w.begin(), w.end()); }
+
+std::vector<Ident::t> defined_idents(Slice<const tt::StructureItem*> items, std::size_t k) {
+  using K = tt::StructureItemDesc::Kind;
+  std::vector<Ident::t> r;
+  for (; k < items.size(); ++k) {
+    const tt::StructureItemDesc* d = items[k]->str_desc;
+    switch (d->kind) {
+      case K::Tstr_value: append(r, tt::let_bound_idents(tt::as<tt::Tstr_value>(d)->vbs)); break;
+      case K::Tstr_typext:
+        for (auto* ext : tt::as<tt::Tstr_typext>(d)->ext->tyext_constructors) r.push_back(ext->ext_id);
+        break;
+      case K::Tstr_exception: r.push_back(tt::as<tt::Tstr_exception>(d)->exn->tyexn_constructor->ext_id); break;
+      case K::Tstr_module: {
+        const tt::ModuleBinding* mb = tt::as<tt::Tstr_module>(d)->mb;
+        if (mb->mb_id && mb->mb_presence == ModulePresence::Mp_present) r.push_back(mb->mb_id);
+        break;
+      }
+      case K::Tstr_recmodule:
+        for (auto* mb : tt::as<tt::Tstr_recmodule>(d)->mbs)
+          if (mb->mb_id) r.push_back(mb->mb_id);
+        break;
+      case K::Tstr_open: append(r, types::bound_value_identifiers(tt::as<tt::Tstr_open>(d)->od->open_bound_items)); break;
+      case K::Tstr_class:
+        for (auto& ci : tt::as<tt::Tstr_class>(d)->classes) r.push_back(ci.decl->ci_id_class);
+        break;
+      case K::Tstr_include: append(r, types::bound_value_identifiers(tt::as<tt::Tstr_include>(d)->incl->incl_type)); break;
+      default: break;
+    }
+  }
+  return r;
+}
+
+// the structure of a module expression that is a structure, possibly
+// constrained (nullptr otherwise)
+const tt::Structure* structure_of(const tt::ModuleExpr* me, bool through_constraint) {
+  if (auto* st = tt::as<tt::Tmod_structure>(me->mod_desc)) return st->str;
+  if (!through_constraint) return nullptr;
+  if (auto* c = tt::as<tt::Tmod_constraint>(me->mod_desc))
+    if (auto* st = tt::as<tt::Tmod_structure>(c->me->mod_desc)) return st->str;
+  return nullptr;
+}
+
+// second level idents (module M = struct ... let id = ... end),
+// and all sub-levels idents
+std::vector<Ident::t> more_idents(Slice<const tt::StructureItem*> items, std::size_t k = 0) {
+  using K = tt::StructureItemDesc::Kind;
+  std::vector<Ident::t> r;
+  for (; k < items.size(); ++k) {
+    const tt::StructureItemDesc* d = items[k]->str_desc;
+    switch (d->kind) {
+      case K::Tstr_open:
+        if (auto* st = structure_of(tt::as<tt::Tstr_open>(d)->od->open_expr, false)) append(r, all_idents(st->str_items));
+        break;
+      case K::Tstr_include:
+        if (auto* st = structure_of(tt::as<tt::Tstr_include>(d)->incl->incl_mod, true)) append(r, all_idents(st->str_items));
+        break;
+      case K::Tstr_module: {
+        const tt::ModuleBinding* mb = tt::as<tt::Tstr_module>(d)->mb;
+        if (mb->mb_presence == ModulePresence::Mp_present)
+          if (auto* st = structure_of(mb->mb_expr, true)) append(r, all_idents(st->str_items));
+        break;
+      }
+      default: break;
+    }
+  }
+  return r;
+}
+
+std::vector<Ident::t> all_idents(Slice<const tt::StructureItem*> items, std::size_t k) {
+  using K = tt::StructureItemDesc::Kind;
+  std::vector<Ident::t> r;
+  for (; k < items.size(); ++k) {
+    const tt::StructureItemDesc* d = items[k]->str_desc;
+    switch (d->kind) {
+      case K::Tstr_value: append(r, tt::let_bound_idents(tt::as<tt::Tstr_value>(d)->vbs)); break;
+      case K::Tstr_typext:
+        for (auto* ext : tt::as<tt::Tstr_typext>(d)->ext->tyext_constructors) r.push_back(ext->ext_id);
+        break;
+      case K::Tstr_exception: r.push_back(tt::as<tt::Tstr_exception>(d)->exn->tyexn_constructor->ext_id); break;
+      case K::Tstr_recmodule:
+        for (auto* mb : tt::as<tt::Tstr_recmodule>(d)->mbs)
+          if (mb->mb_id) r.push_back(mb->mb_id);
+        break;
+      case K::Tstr_open: {
+        const tt::OpenDeclaration* od = tt::as<tt::Tstr_open>(d)->od;
+        append(r, types::bound_value_identifiers(od->open_bound_items));
+        if (auto* st = structure_of(od->open_expr, false)) append(r, all_idents(st->str_items));
+        break;
+      }
+      case K::Tstr_class:
+        for (auto& ci : tt::as<tt::Tstr_class>(d)->classes) r.push_back(ci.decl->ci_id_class);
+        break;
+      case K::Tstr_include: {
+        const tt::IncludeDeclaration* incl = tt::as<tt::Tstr_include>(d)->incl;
+        append(r, types::bound_value_identifiers(incl->incl_type));
+        if (auto* st = structure_of(incl->incl_mod, true)) append(r, all_idents(st->str_items));
+        break;
+      }
+      case K::Tstr_module: {
+        const tt::ModuleBinding* mb = tt::as<tt::Tstr_module>(d)->mb;
+        if (!mb->mb_id || mb->mb_presence != ModulePresence::Mp_present) break;
+        r.push_back(mb->mb_id);
+        if (auto* st = structure_of(mb->mb_expr, true)) append(r, all_idents(st->str_items));
+        break;
+      }
+      default: break;
+    }
+  }
+  return r;
+}
+
+// In the native toplevel, this reference is threaded through successive
+// calls of transl_store_structure
+L::IdentMap<Lam> transl_store_subst;
+
+// field_of_str loc str (pos, cc)
+std::function<Lam(const tt::PosCoercion&)> field_of_str(const ScopedLocation& loc, const tt::Structure* str) {
+  std::vector<Ident::t> ids = defined_idents(str->str_items);
+  return [loc, ids](const tt::PosCoercion& pc) -> Lam {
+    const MC* cc = pc.cc;
+    switch (cc->kind) {
+      case MC::Kind::Tcoerce_primitive:
+        return translprim::transl_primitive(loc, cc->prim->pc_desc, cc->prim->pc_env, cc->prim->pc_type, nullptr);
+      case MC::Kind::Tcoerce_alias: {
+        Lam lam = L::transl_module_path(loc, cc->alias_env, cc->alias_path);
+        return apply_coercion(loc, LetKind::Alias, cc->alias_coercion, lam);
+      }
+      default:
+        if (pc.pos < 0 || static_cast<std::size_t>(pc.pos) >= ids.size()) throw std::out_of_range("index out of bounds");
+        return apply_coercion(loc, LetKind::Strict, cc, L::lvar(ids[pc.pos]));
+    }
+  };
+}
+
+Lam lambda_subst(const L::IdentMap<Lam>& subst, Lam lam) {
+  return L::subst([](Ident::t, const ValueDescription*, env::t env) { return env; }, false, subst, lam);
+}
+
+// Ident.tbl: find_same finds the latest binding of the same ident
+struct IdentTbl {
+  std::vector<std::pair<Ident::t, std::pair<long, const MC*>>> v;
+  const std::pair<long, const MC*>* find_same(Ident::t id) const {
+    for (auto it = v.rbegin(); it != v.rend(); ++it)
+      if (ident::same(it->first, id)) return &it->second;
+    return nullptr;
+  }
+};
+struct AliasEntry {
+  long pos;
+  env::t env;
+  Path::t path;
+  const MC* cc;
+};
+
+struct StoreCtx {
+  Ident::t glob;
+  const IdentTbl& map;
+
+  Primitive getglobal() const { return pglobal(Primitive::K::Pgetglobal, glob); }
+
+  Lam store_ident(const ScopedLocation& loc, Ident::t id) const {
+    const std::pair<long, const MC*>* e = map.find_same(id);
+    if (!e) fatal_error("Translmod.store_ident");
+    Lam init_val = apply_coercion(loc, LetKind::Alias, e->second, L::lvar(id));
+    Primitive p = L::prim(Primitive::K::Psetfield);
+    p.n = e->first;
+    p.ptr = L::ImmediateOrPointer::Pointer;
+    p.init = L::InitializationOrAssignment::Root_initialization;
+    return L::lprim(p, slice<Lam>({L::lprim(getglobal(), {}, loc), init_val}), loc);
+  }
+  Lam store_idents(const ScopedLocation& loc, const std::vector<Ident::t>& ids) const {
+    return L::make_sequence([&](Ident::t id) { return store_ident(loc, id); }, ids);
+  }
+  L::IdentMap<Lam> add_ident(bool may_coerce, Ident::t id, L::IdentMap<Lam> subst) const {
+    const std::pair<long, const MC*>* e = map.find_same(id);
+    if (!e) fatal_error("Translmod.add_ident: assert false");
+    if (e->second->kind == MC::Kind::Tcoerce_none) {
+      Primitive f = L::prim(Primitive::K::Pfield);
+      f.n = e->first;
+      f.ptr = L::ImmediateOrPointer::Pointer;
+      f.mut = MutableFlag::Immutable;
+      subst[id] = L::lprim(f, slice<Lam>({L::lprim(getglobal(), {}, ScopedLocation{})}), ScopedLocation{});
+      return subst;
+    }
+    if (may_coerce) return subst;
+    fatal_error("Translmod.add_ident: assert false");
+  }
+  // List.fold_right (add_ident may_coerce) idlist subst
+  L::IdentMap<Lam> add_idents(bool may_coerce, const std::vector<Ident::t>& ids, L::IdentMap<Lam> subst) const {
+    for (std::size_t k = ids.size(); k-- > 0;) subst = add_ident(may_coerce, ids[k], std::move(subst));
+    return subst;
+  }
+
+  // transl_store ~scopes rootpath subst cont items[k..]
+  Lam transl_store(scopes sc, Path::t rootpath, const L::IdentMap<Lam>& subst, Lam cont,
+                   Slice<const tt::StructureItem*> items, std::size_t k) const {
+    if (k == items.size()) {
+      transl_store_subst = subst;
+      return lambda_subst(subst, cont);
+    }
+    const tt::StructureItem* item = items[k];
+    const tt::StructureItemDesc* d = item->str_desc;
+    using K = tt::StructureItemDesc::Kind;
+    auto rest = [&](const L::IdentMap<Lam>& s) { return transl_store(sc, rootpath, s, cont, items, k + 1); };
+    switch (d->kind) {
+      case K::Tstr_eval: {
+        // Lsequence (lambda_subst subst (transl_exp expr), transl_store rem): right to left
+        Lam r = rest(subst);
+        return L::lsequence(lambda_subst(subst, translcore::transl_exp(sc, tt::as<tt::Tstr_eval>(d)->exp)), r);
+      }
+      case K::Tstr_value: {
+        auto* x = tt::as<tt::Tstr_value>(d);
+        std::vector<Ident::t> ids = tt::let_bound_idents(x->vbs);
+        Lam body = store_idents(ScopedLocation{}, ids);
+        Lam lam = translcore::transl_let(sc, true, x->rec, x->vbs)(body);
+        Lam r = rest(add_idents(false, ids, subst));
+        return L::lsequence(lambda_subst(subst, lam), r);
+      }
+      case K::Tstr_primitive:
+        record_primitive(tt::as<tt::Tstr_primitive>(d)->pd->prim_val);
+        return rest(subst);
+      case K::Tstr_type:
+        return rest(subst);
+      case K::Tstr_typext: {
+        const tt::TTypeExtension* tyext = tt::as<tt::Tstr_typext>(d)->ext;
+        std::vector<Ident::t> ids;
+        for (auto* ext : tyext->tyext_constructors) ids.push_back(ext->ext_id);
+        Lam body = store_idents(ScopedLocation{}, ids);
+        Lam lam = transl_type_extension(sc, item->str_env, rootpath, tyext, body);
+        Lam r = rest(add_idents(false, ids, subst));
+        return L::lsequence(lambda_subst(subst, lam), r);
+      }
+      case K::Tstr_exception: {
+        const tt::TExtensionConstructor* ext = tt::as<tt::Tstr_exception>(d)->exn->tyexn_constructor;
+        Ident::t id = ext->ext_id;
+        Path::t path = field_path(rootpath, id);
+        ScopedLocation loc = debuginfo::of_location(sc, ext->ext_loc);
+        Lam lam = translcore::transl_extension_constructor(sc, item->str_env, path, ext);
+        Lam r = rest(add_ident(false, id, subst));
+        Lam st = store_ident(loc, id);
+        return L::lsequence(L::llet(LetKind::Strict, VK::gen(), id, lambda_subst(subst, lam), st), r);
+      }
+      case K::Tstr_module: {
+        const tt::ModuleBinding* mb = tt::as<tt::Tstr_module>(d)->mb;
+        if (mb->mb_presence == ModulePresence::Mp_absent) return rest(subst);
+        Ident::t id = mb->mb_id;
+        if (!id) {
+          Lam lam = translattribute::add_inline_attribute(transl_module(sc, tt::tcoerce_none(), nullptr, mb->mb_expr),
+                                                          mb->mb_loc, mb->mb_attributes);
+          Lam r = rest(subst);
+          ScopedLocation nloc = debuginfo::of_location(sc, mb->mb_name.loc);
+          return L::lsequence(L::lprim(L::prim(Primitive::K::Pignore), slice<Lam>({lambda_subst(subst, lam)}), nloc), r);
+        }
+        const tt::ModuleExprDesc* md = mb->mb_expr->mod_desc;
+        const tt::Structure* str = nullptr;
+        const MC* map_cc = nullptr;  // the Tcoerce_structure of a constrained structure
+        if (auto* st = tt::as<tt::Tmod_structure>(md)) {
+          str = st->str;
+        } else if (auto* c = tt::as<tt::Tmod_constraint>(md)) {
+          if (auto* st2 = tt::as<tt::Tmod_structure>(c->me->mod_desc);
+              st2 && c->coercion->kind == MC::Kind::Tcoerce_structure) {
+            str = st2->str;
+            map_cc = c->coercion;
+          }
+        }
+        if (str) {
+          ScopedLocation loc = debuginfo::of_location(sc, mb->mb_loc);
+          Lam lam = transl_store(debuginfo::enter_module_definition(sc, id), field_path(rootpath, id), subst,
+                                 L::lambda_unit(), str->str_items, 0);
+          // Careful: see next case
+          L::IdentMap<Lam> subst2 = transl_store_subst;
+          Lam r = rest(add_ident(true, id, subst2));
+          Lam st = store_ident(loc, id);
+          std::vector<Lam> fields;
+          if (!map_cc) {
+            for (Ident::t fid : defined_idents(str->str_items)) fields.push_back(L::lvar(fid));
+          } else {
+            auto field = field_of_str(loc, str);
+            for (const tt::PosCoercion& pc : map_cc->pos_cc) fields.push_back(field(pc));  // List.map: left to right
+          }
+          Lam block = L::lprim(pmakeblock(0, MutableFlag::Immutable), slice(fields), loc);
+          return L::lsequence(lam, L::llet(LetKind::Strict, VK::gen(), id, lambda_subst(subst2, block), L::lsequence(st, r)));
+        }
+        Lam lam = translattribute::add_inline_attribute(
+            transl_module(debuginfo::enter_module_definition(sc, id), tt::tcoerce_none(), field_path(rootpath, id),
+                          mb->mb_expr),
+            mb->mb_loc, mb->mb_attributes);
+        // Careful: the module value stored in the global may be different
+        // from the local module value, in case a coercion is applied.  If so,
+        // keep using the local module value (id) in the remainder of the
+        // compilation unit (add_ident true returns subst unchanged).  If not,
+        // we can use the value from the global (add_ident true adds id ->
+        // Pgetglobal... to subst).
+        Lam r = rest(add_ident(true, id, subst));
+        Lam st = store_ident(debuginfo::of_location(sc, mb->mb_loc), id);
+        return L::llet(LetKind::Strict, VK::gen(), id, lambda_subst(subst, lam), L::lsequence(st, r));
+      }
+      case K::Tstr_recmodule: {
+        Slice<const tt::ModuleBinding*> bindings = tt::as<tt::Tstr_recmodule>(d)->mbs;
+        std::vector<Ident::t> ids;
+        for (auto* mb : bindings)
+          if (mb->mb_id) ids.push_back(mb->mb_id);
+        Lam r = rest(add_idents(true, ids, subst));
+        Lam c = L::lsequence(store_idents(ScopedLocation{}, ids), r);
+        return compile_recmodule(
+            sc,
+            [&](Ident::t id, const tt::ModuleExpr* modl) -> Lam {
+              if (!id) return lambda_subst(subst, transl_module(sc, tt::tcoerce_none(), nullptr, modl));
+              return lambda_subst(subst, transl_module(debuginfo::enter_module_definition(sc, id), tt::tcoerce_none(),
+                                                       field_path(rootpath, id), modl));
+            },
+            bindings, c);
+      }
+      case K::Tstr_class: {
+        auto [ids, class_bindings] = transl_class_bindings(sc, tt::as<tt::Tstr_class>(d)->classes);
+        Lam body = store_idents(ScopedLocation{}, ids);
+        Lam lam = value_rec_compiler::compile_letrec(slice(class_bindings), body);
+        Lam r = rest(add_idents(false, ids, subst));
+        return L::lsequence(lambda_subst(subst, lam), r);
+      }
+      case K::Tstr_include: {
+        const tt::IncludeDeclaration* incl = tt::as<tt::Tstr_include>(d)->incl;
+        const tt::ModuleExpr* modl = incl->incl_mod;
+        const tt::Structure* str = nullptr;
+        const MC* map_cc = nullptr;
+        if (auto* st = tt::as<tt::Tmod_structure>(modl->mod_desc)) {
+          str = st->str;
+        } else if (auto* c = tt::as<tt::Tmod_constraint>(modl->mod_desc)) {
+          if (auto* st2 = tt::as<tt::Tmod_structure>(c->me->mod_desc);
+              st2 && (c->coercion->kind == MC::Kind::Tcoerce_structure ||
+                      c->coercion->kind == MC::Kind::Tcoerce_none)) {
+            str = st2->str;
+            map_cc = c->coercion;
+          }
+        }
+        ScopedLocation loc = debuginfo::of_location(sc, incl->incl_loc);
+        if (str) {
+          // It is tempting to pass rootpath instead of None in order to give
+          // a more precise name to exceptions in the included structured, but
+          // this would introduce a difference of behavior compared to bytecode.
+          Lam lam = transl_store(sc, nullptr, subst, L::lambda_unit(), str->str_items, 0);
+          L::IdentMap<Lam> subst2 = transl_store_subst;
+          auto field = field_of_str(loc, str);
+          std::vector<Ident::t> ids0 = types::bound_value_identifiers(incl->incl_type);
+          std::vector<tt::PosCoercion> map;
+          if (map_cc && map_cc->kind == MC::Kind::Tcoerce_structure) {
+            map.assign(map_cc->pos_cc.begin(), map_cc->pos_cc.end());
+          } else {
+            for (std::size_t i = 0; i < ids0.size(); ++i) map.push_back({static_cast<long>(i), tt::tcoerce_none()});
+          }
+          if (map.size() != ids0.size()) fatal_error("Translmod.transl_store: assert false");
+          // loop ids args: the innermost first (right to left)
+          std::function<Lam(std::size_t)> loop = [&](std::size_t i) -> Lam {
+            if (i == ids0.size()) return rest(add_idents(true, ids0, subst2));
+            Lam inner = loop(i + 1);
+            Lam st = store_ident(loc, ids0[i]);
+            return L::llet(LetKind::Alias, VK::gen(), ids0[i], lambda_subst(subst2, field(map[i])), L::lsequence(st, inner));
+          };
+          return L::lsequence(lam, loop(0));
+        }
+        std::vector<Ident::t> ids = types::bound_value_identifiers(incl->incl_type);
+        Ident::t mid = Ident::create_local(OCAML_LIT("include"));
+        std::function<Lam(long)> store_idents_from = [&](long pos) -> Lam {
+          if (static_cast<std::size_t>(pos) == ids.size()) return rest(add_idents(true, ids, subst));
+          Ident::t id = ids[pos];
+          Lam inner = store_idents_from(pos + 1);
+          Lam st = store_ident(loc, id);
+          Primitive f = pfield(pos);
+          return L::llet(LetKind::Alias, VK::gen(), id, L::lprim(f, slice<Lam>({L::lvar(mid)}), loc),
+                         L::lsequence(st, inner));
+        };
+        Lam body = store_idents_from(0);
+        return L::llet(LetKind::Strict, VK::gen(), mid,
+                       lambda_subst(subst, transl_module(sc, tt::tcoerce_none(), nullptr, modl)), body);
+      }
+      case K::Tstr_open: {
+        const tt::OpenDeclaration* od = tt::as<tt::Tstr_open>(d)->od;
+        if (auto* st = tt::as<tt::Tmod_structure>(od->open_expr->mod_desc)) {
+          const tt::Structure* str = st->str;
+          Lam lam = transl_store(sc, rootpath, subst, L::lambda_unit(), str->str_items, 0);
+          ScopedLocation loc = debuginfo::of_location(sc, od->open_loc);
+          std::vector<Ident::t> ids = defined_idents(str->str_items);
+          std::vector<Ident::t> ids0 = types::bound_value_identifiers(od->open_bound_items);
+          L::IdentMap<Lam> subst2 = transl_store_subst;
+          std::function<Lam(long)> store_idents_from = [&](long pos) -> Lam {
+            if (static_cast<std::size_t>(pos) == ids0.size()) return rest(add_idents(true, ids0, subst2));
+            Ident::t id = ids0[pos];
+            Lam inner = store_idents_from(pos + 1);
+            Lam st2 = store_ident(loc, id);
+            if (static_cast<std::size_t>(pos) >= ids.size()) throw std::out_of_range("index out of bounds");
+            return L::llet(LetKind::Alias, VK::gen(), id, L::lvar(ids[pos]), L::lsequence(st2, inner));
+          };
+          return L::lsequence(lam, lambda_subst(subst2, store_idents_from(0)));
+        }
+        LetKind pure = translcore::pure_module(od->open_expr);
+        // this optimization shouldn't be needed because Simplif would
+        // actually remove the [Llet] when it's not used.  But since
+        // [scan_used_globals] runs before Simplif, we need to do it.
+        if (od->open_bound_items.empty() && pure == LetKind::Alias) return rest(subst);
+        std::vector<Ident::t> ids = types::bound_value_identifiers(od->open_bound_items);
+        Ident::t mid = Ident::create_local(OCAML_LIT("open"));
+        ScopedLocation loc = debuginfo::of_location(sc, od->open_loc);
+        std::function<Lam(long)> store_idents_from = [&](long pos) -> Lam {
+          if (static_cast<std::size_t>(pos) == ids.size()) return rest(add_idents(true, ids, subst));
+          Ident::t id = ids[pos];
+          Lam inner = store_idents_from(pos + 1);
+          Lam st = store_ident(loc, id);
+          return L::llet(LetKind::Alias, VK::gen(), id, L::lprim(pfield(pos), slice<Lam>({L::lvar(mid)}), loc),
+                         L::lsequence(st, inner));
+        };
+        Lam body = store_idents_from(0);
+        return L::llet(pure, VK::gen(), mid,
+                       lambda_subst(subst, transl_module(sc, tt::tcoerce_none(), nullptr, od->open_expr)), body);
+      }
+      case K::Tstr_modtype:
+      case K::Tstr_class_type:
+      case K::Tstr_attribute:
+        return rest(subst);
+    }
+    fatal_error("Translmod.transl_store");
+  }
+};
+
+Lam transl_store_structure(scopes sc, Ident::t glob, const IdentTbl& map,
+                           const std::vector<std::pair<long, const tt::PrimitiveCoercion*>>& prims,
+                           const std::vector<AliasEntry>& aliases, Slice<const tt::StructureItem*> str) {
+  StoreCtx ctx{glob, map};
+  auto setfield = [&](long pos, Lam v) {
+    Primitive p = L::prim(Primitive::K::Psetfield);
+    p.n = pos;
+    p.ptr = L::ImmediateOrPointer::Pointer;
+    p.init = L::InitializationOrAssignment::Root_initialization;
+    return L::lprim(p, slice<Lam>({L::lprim(ctx.getglobal(), {}, ScopedLocation{}), v}), ScopedLocation{});
+  };
+  // let aliases = make_sequence store_alias aliases
+  Lam alias_seq = L::make_sequence(
+      [&](const AliasEntry& a) {
+        Lam path_lam = L::transl_module_path(ScopedLocation{}, a.env, a.path);
+        Lam init_val = apply_coercion(ScopedLocation{}, LetKind::Strict, a.cc, path_lam);
+        return setfield(a.pos, init_val);
+      },
+      aliases);
+  // List.fold_right store_primitive prims (transl_store ...)
+  // (a copy: the [] case assigns transl_store_subst while items still hold
+  // the substitution they started from)
+  L::IdentMap<Lam> subst0 = transl_store_subst;
+  Lam acc = ctx.transl_store(sc, global_path(glob), subst0, alias_seq, str, 0);
+  for (std::size_t k = prims.size(); k-- > 0;) {
+    const tt::PrimitiveCoercion* prim = prims[k].second;
+    Lam v = translprim::transl_primitive(ScopedLocation{}, prim->pc_desc, prim->pc_env, prim->pc_type, nullptr);
+    acc = L::lsequence(setfield(prims[k].first, v), acc);
+  }
+  return acc;
+}
+
+// build_ident_map restr idlist more_ids: [id -> (pos, coercion)], the
+// exported primitives and aliases, and the size of the global block
+struct IdentMapResult {
+  IdentTbl map;
+  std::vector<std::pair<long, const tt::PrimitiveCoercion*>> prims;  // OCaml list order: newest first
+  std::vector<AliasEntry> aliases;                                   // likewise
+  long size;
+};
+IdentMapResult build_ident_map(const MC* restr, const std::vector<Ident::t>& idlist,
+                               const std::vector<Ident::t>& more_ids) {
+  IdentMapResult r;
+  auto natural_map = [&](long pos, const std::vector<Ident::t>& ids) {
+    for (Ident::t id : ids) r.map.v.push_back({id, {pos++, tt::tcoerce_none()}});
+    return pos;
+  };
+  long pos;
+  if (restr->kind == MC::Kind::Tcoerce_none) {
+    pos = natural_map(0, idlist);
+  } else if (restr->kind == MC::Kind::Tcoerce_structure) {
+    // ignore id_pos_list as the ids are already bound
+    std::vector<Ident::t> undef = idlist;
+    pos = 0;
+    for (const tt::PosCoercion& pc : restr->pos_cc) {
+      if (pc.cc->kind == MC::Kind::Tcoerce_primitive) {
+        r.prims.insert(r.prims.begin(), {pos, pc.cc->prim});
+      } else if (pc.cc->kind == MC::Kind::Tcoerce_alias) {
+        r.aliases.insert(r.aliases.begin(), AliasEntry{pos, pc.cc->alias_env, pc.cc->alias_path, pc.cc->alias_coercion});
+      } else {
+        if (pc.pos < 0 || static_cast<std::size_t>(pc.pos) >= idlist.size()) throw std::out_of_range("index out of bounds");
+        Ident::t id = idlist[pc.pos];
+        r.map.v.push_back({id, {pos, pc.cc}});
+        // Misc.list_remove id undef (structural equality)
+        for (auto it = undef.begin(); it != undef.end(); ++it)
+          if (ident::same(*it, id)) {
+            undef.erase(it);
+            break;
+          }
+      }
+      ++pos;
+    }
+    pos = natural_map(pos, undef);
+  } else {
+    fatal_error("Translmod.build_ident_map");
+  }
+  r.size = natural_map(pos, more_ids);
+  return r;
+}
+
+std::pair<long, Lam> transl_store_gen(scopes sc, std::string_view module_name, const tt::Structure* str,
+                                      const MC* restr, bool topl) {
+  translobj::reset_labels();
+  primitive_declarations.clear();
+  translprim::clear_used_primitives();
+  Ident::t module_id = Ident::create_persistent(module_name);
+  std::vector<Ident::t> more = more_idents(str->str_items);
+  std::vector<Ident::t> defined = defined_idents(str->str_items);
+  IdentMapResult m = build_ident_map(restr, defined, more);
+  auto f = [&]() -> Lam {
+    if (topl && str->str_items.size() == 1 &&
+        str->str_items[0]->str_desc->kind == tt::StructureItemDesc::Kind::Tstr_eval) {
+      if (m.size != 0) fatal_error("Translmod.transl_store_gen: assert false");
+      return lambda_subst(transl_store_subst,
+                          translcore::transl_exp(sc, tt::as<tt::Tstr_eval>(str->str_items[0]->str_desc)->exp));
+    }
+    return transl_store_structure(sc, module_id, m.map, m.prims, m.aliases, str->str_items);
+  };
+  return translobj::transl_store_label_init(module_id, m.size, f);
+}
+
 // toplevel_name: the toplevel's unique names (set_toplevel_unique_name is
 // the toplevel's; the batch compiler never adds one)
 std::vector<std::pair<Ident::t, std::string>> aliased_idents;
@@ -985,6 +1523,23 @@ L::Program transl_implementation(std::string_view module_name, const tt::Structu
   implementation.code = L::lprim(pglobal(Primitive::K::Psetglobal, implementation.module_ident),
                                  slice<Lam>({implementation.code}), ScopedLocation{});
   return implementation;
+}
+
+L::Program transl_store_implementation(std::string_view module_name, const tt::Structure* str, const MC* restr) {
+  L::IdentMap<Lam> s = transl_store_subst;
+  transl_store_subst.clear();
+  Ident::t module_ident = Ident::create_persistent(module_name);
+  scopes sc = debuginfo::enter_module_definition(debuginfo::empty_scopes, module_ident);
+  auto [i, code] = transl_store_gen(sc, module_name, str, restr, false);
+  transl_store_subst = s;
+  L::Program p;
+  p.main_module_block_size = i;
+  p.code = code;
+  // module_ident is not used by closure, but this allow to share the type
+  // with the flambda version
+  p.module_ident = module_ident;
+  p.required_globals = required_globals(true, code);
+  return p;
 }
 
 std::string toplevel_name(Ident::t id) {
@@ -1007,7 +1562,7 @@ Lam transl_package(Slice<Ident::t> component_names, Ident::t target_name, const 
 
 void reset() {
   primitive_declarations.clear();
-  // (transl_store_subst: native only)
+  transl_store_subst.clear();
   aliased_idents.clear();
   env::reset_required_globals();
   translprim::clear_used_primitives();

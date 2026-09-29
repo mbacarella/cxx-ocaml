@@ -34,6 +34,7 @@ extern std::vector<std::string> first_ccopts, last_ccopts;
 extern std::vector<std::string> first_ppx, last_ppx;
 extern std::vector<std::string> first_objfiles, last_objfiles;
 extern bool stop_early;
+extern bool has_linker_inputs;  // an .o / .a input
 
 enum class Position { Before_args, Before_compile, Before_link };
 // readenv ppf position (the formatter is Format.err_formatter)

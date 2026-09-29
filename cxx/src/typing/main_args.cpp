@@ -7,6 +7,9 @@
 #include <map>
 #include <stdexcept>
 
+#include <algorithm>
+
+#include "cppcaml/typing/arg_helper.hpp"
 #include "cppcaml/typing/clflags.hpp"
 #include "cppcaml/typing/compenv.hpp"
 #include "cppcaml/typing/config.hpp"
@@ -32,9 +35,16 @@ const std::vector<Entry>& table() {
   };
   return t;
 }
+const std::vector<Entry>& opttable() {
+  static const std::vector<Entry> t = {
+#include "optmain_args_table.inc"
+  };
+  return t;
+}
 
 // the option names that asked for an effect c++ocamlc lacks (latest last)
 std::vector<std::string> requested_profile;  // -dtimings / -dprofile
+bool requested_save_ir = false;              // -save-ir-after
 
 arg::Spec unit(std::function<void()> f) {
   arg::Spec s;
@@ -224,7 +234,12 @@ std::map<std::string, arg::Spec> actions() {
   a["-runtime-variant"] = string([](const std::string& s) { cf::runtime_variant = s; });
   a["-set-runtime-default"] = string([](const std::string& s) { compenv::parse_runtime_parameter(s); });
   a["-stop-after"] = symbol([](const std::string& p) {
-    cf::Pass pass = p == "parsing" ? cf::Pass::Parsing : p == "typing" ? cf::Pass::Typing : cf::Pass::Lambda;
+    // Compiler_pass.of_string (the Symbol's choices are the enabled passes)
+    cf::Pass pass = p == "parsing"    ? cf::Pass::Parsing
+                    : p == "typing"   ? cf::Pass::Typing
+                    : p == "lambda"   ? cf::Pass::Lambda
+                    : p == "scheduling" ? cf::Pass::Scheduling
+                                      : cf::Pass::Emit;
     if (!cf::stop_after) cf::stop_after = pass;
     else if (*cf::stop_after != pass) compenv::fatal("Please specify at most one -stop-after <pass>.");
   });
@@ -308,12 +323,130 @@ std::map<std::string, arg::Spec> actions() {
   return a;
 }
 
-}  // namespace
-
-std::vector<arg::Option> bytecomp_options() {
+// Default.Optmain = Native + Core + Compiler, then its own
+std::map<std::string, arg::Spec> optactions() {
   std::map<std::string, arg::Spec> a = actions();
+  auto int_parse = [](const std::string& help, cf::IntArg& r) {
+    return string([help, &r](const std::string& spec) { arg_helper::parse(spec, help, r); });
+  };
+  auto float_parse = [](const std::string& help, cf::FloatArg& r) {
+    return string([help, &r](const std::string& spec) { arg_helper::parse(spec, help, r); });
+  };
+  // Native
+  a["-S"] = set(cf::keep_asm_file);
+  a["-clambda-checks"] = set(cf::clambda_checks);
+  a["-Oclassic"] = set(cf::classic_inlining);
+  a["-compact"] = clear(cf::optimize_for_speed);
+  a["-dalloc"] = set(cf::dump_regalloc);
+  a["-dclambda"] = set(cf::dump_clambda);
+  a["-dcmm"] = set(cf::dump_cmm);
+  a["-dcmm-invariants"] = set(cf::cmm_invariants);
+  a["-dcombine"] = set(cf::dump_combine);
+  a["-dcse"] = set(cf::dump_cse);
+  a["-dflambda"] = set(cf::dump_flambda);
+  a["-dflambda-invariants"] = set(cf::flambda_invariant_checks);
+  a["-dflambda-let"] = int_([](long stamp) { cf::dump_flambda_let = stamp; });
+  a["-dflambda-no-invariants"] = clear(cf::flambda_invariant_checks);
+  a["-dflambda-verbose"] = unit([] {
+    cf::dump_flambda = true;
+    cf::dump_flambda_verbose = true;
+  });
+  a["-dinterval"] = set(cf::dump_interval);
+  a["-dinterf"] = set(cf::dump_interf);
+  a["-dlinear"] = set(cf::dump_linear);
+  a["-dlive"] = set(cf::dump_live);
+  a["-dprefer"] = set(cf::dump_prefer);
+  a["-drawclambda"] = set(cf::dump_rawclambda);
+  a["-drawflambda"] = set(cf::dump_rawflambda);
+  a["-dreload"] = set(cf::dump_reload);
+  a["-dscheduling"] = set(cf::dump_scheduling);
+  a["-dsel"] = set(cf::dump_selection);
+  a["-dspill"] = set(cf::dump_spill);
+  a["-dsplit"] = set(cf::dump_split);
+  a["-dstartup"] = set(cf::keep_startup_file);
+  a["-dump-pass"] = string([](const std::string& pass) {
+    // set_dumped_pass pass true: only a registered pass
+    if (std::find(cf::all_passes.begin(), cf::all_passes.end(), pass) == cf::all_passes.end()) return;
+    std::vector<std::string> l;
+    for (const std::string& x : cf::dumped_passes_list)
+      if (x != pass) l.push_back(x);
+    l.insert(l.begin(), pass);
+    cf::dumped_passes_list = l;
+  });
+  a["-inline"] = float_parse("Syntax: -inline <n> | <round>=<n>[,...]", cf::inline_threshold);
+  a["-inline-alloc-cost"] =
+      int_parse("Syntax: -inline-alloc-cost <n> | <round>=<n>[,...]", cf::inline_alloc_cost);
+  a["-inline-branch-cost"] =
+      int_parse("Syntax: -inline-branch-cost <n> | <round>=<n>[,...]", cf::inline_branch_cost);
+  a["-inline-branch-factor"] =
+      float_parse("Syntax: -inline-branch-factor <n> | <round>=<n>[,...]", cf::inline_branch_factor);
+  a["-inline-call-cost"] = int_parse("Syntax: -inline-call-cost <n> | <round>=<n>[,...]", cf::inline_call_cost);
+  a["-inline-indirect-cost"] =
+      int_parse("Syntax: -inline-indirect-cost <n> | <round>=<n>[,...]", cf::inline_indirect_cost);
+  a["-inline-lifting-benefit"] =
+      int_parse("Syntax: -inline-lifting-benefit <n> | <round>=<n>[,...]", cf::inline_lifting_benefit);
+  a["-inline-max-depth"] = int_parse("Syntax: -inline-max-depth <n> | <round>=<n>[,...]", cf::inline_max_depth);
+  a["-inline-max-unroll"] =
+      int_parse("Syntax: -inline-max-unroll <n> | <round>=<n>[,...]", cf::inline_max_unroll);
+  a["-inline-prim-cost"] = int_parse("Syntax: -inline-prim-cost <n> | <round>=<n>[,...]", cf::inline_prim_cost);
+  a["-inline-toplevel"] =
+      int_parse("Syntax: -inline-toplevel <n> | <round>=<n>[,...]", cf::inline_toplevel_threshold);
+  a["-inlining-report"] = unit([] { cf::inlining_report = true; });
+  a["-insn-sched"] = set(cf::insn_sched);
+  a["-no-insn-sched"] = clear(cf::insn_sched);
+  a["-linscan"] = set(cf::use_linscan);
+  a["-no-float-const-prop"] = clear(cf::float_const_prop);
+  a["-no-unbox-free-vars-of-closures"] = clear(cf::unbox_free_vars_of_closures);
+  a["-no-unbox-specialised-args"] = clear(cf::unbox_specialised_args);
+  a["-O2"] = unit([] {
+    cf::default_simplify_rounds = 2;
+    cf::use_inlining_arguments_set(cf::o2_arguments);
+    cf::use_inlining_arguments_set(cf::o1_arguments, 0);
+  });
+  a["-O3"] = unit([] {
+    cf::default_simplify_rounds = 3;
+    cf::use_inlining_arguments_set(cf::o3_arguments);
+    cf::use_inlining_arguments_set(cf::o2_arguments, 1);
+    cf::use_inlining_arguments_set(cf::o1_arguments, 0);
+  });
+  a["-remove-unused-arguments"] = set(cf::remove_unused_arguments);
+  a["-rounds"] = int_([](long n) { cf::simplify_rounds = n; });
+  a["-unbox-closures"] = set(cf::unbox_closures);
+  a["-unbox-closures-factor"] = int_([](long f) { cf::unbox_closures_factor = f; });
+  a["-save-ir-after"] = symbol([](const std::string& p) {
+    // Clflags.set_save_ir_after: only scheduling can be saved; the Linear IR
+    // writer comes with the native back end
+    (void)p;
+    requested_save_ir = true;
+  });
+  // Optmain's own
+  a["-afl-inst-ratio"] = int_([](long n) { cf::afl_inst_ratio = n; });
+  a["-afl-instrument"] = set(cf::afl_instrument);
+  a["-function-sections"] = unit([] {
+    if (!config::function_sections) throw std::logic_error("Main_args._function_sections: assert false");
+    compenv::first_ccopts.insert(compenv::first_ccopts.begin(), "-ffunction-sections");
+    cf::function_sections = true;
+  });
+  a["-nodynlink"] = clear(cf::dlcode);
+  a["-output-complete-obj"] = unit([] {
+    cf::output_c_object = true;
+    cf::output_complete_object = true;
+  });
+  a["-output-obj"] = set(cf::output_c_object);
+  a["-p"] = unit([] {
+    compenv::fatal("Profiling with \"gprof\" (option `-p') is only supported up to OCaml 4.08.0");
+  });
+  a["-shared"] = unit([] {
+    cf::shared = true;
+    cf::dlcode = true;
+  });
+  a["-v"] = unit([] { compenv::print_version_and_library("native-code compiler"); });
+  return a;
+}
+
+std::vector<arg::Option> options_of(const std::vector<Entry>& t, const std::map<std::string, arg::Spec>& a) {
   std::vector<arg::Option> list;
-  for (const Entry& e : table()) {
+  for (const Entry& e : t) {
     auto it = a.find(e.key);
     if (it == a.end()) throw std::logic_error(std::string("main_args: no action for ") + e.key);
     arg::Spec spec = it->second;
@@ -323,6 +456,12 @@ std::vector<arg::Option> bytecomp_options() {
   }
   return list;
 }
+
+}  // namespace
+
+std::vector<arg::Option> optcomp_options() { return options_of(opttable(), optactions()); }
+
+std::vector<arg::Option> bytecomp_options() { return options_of(table(), actions()); }
 
 std::vector<arg::Option> cppcaml_extensions() {
   arg::Option stdlib{"-stdlib", string([](const std::string& d) { config::standard_library = d; }), ""};

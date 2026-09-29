@@ -234,6 +234,11 @@ target_link_libraries(c++parse PRIVATE cppcaml_core)
 
 add_executable(c++ocamlc src/tools/cppocamlc_main.cpp)
 target_link_libraries(c++ocamlc PRIVATE cppcaml_core)
+# c++ocamlopt: the same driver as Optmaindriver / Optcompile
+add_executable(c++ocamlopt src/tools/cppocamlc_main.cpp)
+target_compile_definitions(c++ocamlopt PRIVATE CPPCAML_OCAMLOPT=1)
+target_link_libraries(c++ocamlopt PRIVATE cppcaml_core)
+target_link_options(c++ocamlopt PRIVATE -static-libstdc++ -static-libgcc -Wl,--build-id=sha1)
 # A compiler process is short-lived and started once per unit: linking the
 # C++ runtime in saves the dynamic loader's symbol resolution (~0.3 ms of a
 # ~3 ms small-unit compile) and makes the binary self-contained.

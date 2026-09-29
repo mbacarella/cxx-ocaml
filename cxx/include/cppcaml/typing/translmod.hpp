@@ -15,6 +15,11 @@ namespace cppcaml::typing::translmod {
 // transl_implementation module_name (structure, coercion)
 lambda::Program transl_implementation(std::string_view module_name, const typedtree::Structure* str,
                                       const typedtree::ModuleCoercion* cc);
+// transl_store_implementation module_name (structure, coercion): the native
+// compiler's (the defined values stored in the global block as they are
+// defined; Clflags.native_code)
+lambda::Program transl_store_implementation(std::string_view module_name, const typedtree::Structure* str,
+                                            const typedtree::ModuleCoercion* restr);
 lambda::lambda transl_package(Slice<Ident::t> component_names,  // Ident.t option list: nullptr = None
                               Ident::t target_name, const typedtree::ModuleCoercion* coercion);
 std::string toplevel_name(Ident::t id);

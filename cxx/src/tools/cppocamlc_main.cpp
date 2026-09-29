@@ -76,6 +76,17 @@
 
 namespace fs = std::filesystem;
 
+// The same driver builds c++ocamlc (Maindriver, Compile) and, with
+// CPPCAML_OCAMLOPT, c++ocamlopt (Optmaindriver, Optcompile).
+#ifdef CPPCAML_OCAMLOPT
+constexpr bool kNative = true;
+#define CPPCAML_SELF "c++ocamlopt"
+#else
+constexpr bool kNative = false;
+#define CPPCAML_SELF "c++ocamlc"
+#endif
+constexpr const char* kTool = kNative ? "ocamlopt" : "ocamlc";  // Compile_common's tool_name
+
 
 
 // Unit_info.strict_modname_from_source: the stem, Utf8_lexeme.capitalize'd;
@@ -164,7 +175,7 @@ static bool read_source(const std::string& path, std::string& text) {
     char tmpl[] = "/tmp/ocamlppXXXXXX";
     int fd = ::mkstemp(tmpl);
     if (fd < 0) {
-      std::cerr << "c++ocamlc: cannot create a temporary file\n";
+      std::cerr << CPPCAML_SELF ": cannot create a temporary file\n";
       return false;
     }
     ::close(fd);
@@ -321,7 +332,7 @@ static PortResult port_typecheck(const std::string& in_path, const std::string& 
     body(env0, target);
     return PortResult::Typed;
   } catch (const std::bad_function_call&) {
-    std::cerr << "c++ocamlc: " << in_path << ": internal error: an unported part of typing/\n";
+    std::cerr << CPPCAML_SELF ": " << in_path << ": internal error: an unported part of typing/\n";
     return PortResult::Failed;
   } catch (...) {
     // Location.report_exception Format.err_formatter exn (Maindriver: exit 2)
@@ -341,9 +352,9 @@ static PortResult port_typecheck(const std::string& in_path, const std::string& 
       try {
         std::rethrow_exception(ep);
       } catch (const std::exception& e) {
-        std::cerr << "c++ocamlc: " << in_path << ": internal error in the type checker: " << e.what() << '\n';
+        std::cerr << CPPCAML_SELF ": " << in_path << ": internal error in the type checker: " << e.what() << '\n';
       } catch (...) {
-        std::cerr << "c++ocamlc: " << in_path << ": internal error in the type checker\n";
+        std::cerr << CPPCAML_SELF ": " << in_path << ": internal error in the type checker\n";
       }
       return PortResult::Failed;
     }
@@ -489,7 +500,7 @@ static void report_lexer_error(const std::string& path, const std::string& src, 
       return;
     case K::Other: break;
   }
-  std::cerr << "c++ocamlc: " << path << ": " << e.what() << '\n';
+  std::cerr << CPPCAML_SELF ": " << path << ": " << e.what() << '\n';
 }
 
 // Compmisc.with_ppf_dump ~file_prefix: where the -d* dumps go -- stderr,
@@ -524,7 +535,7 @@ static bool refuse_unsupported_compile_option() {
   std::string o = cppcaml::typing::main_args::unsupported_compile_option();
   if (o.empty()) return false;
   std::cout.flush();
-  std::cerr << "c++ocamlc: option " << o << " is not supported yet\n";
+  std::cerr << CPPCAML_SELF ": option " << o << " is not supported yet\n";
   return true;
 }
 
@@ -575,7 +586,7 @@ static int compile_ml(const std::string& in_path, const std::string& cmo_out, bo
 static int compile_ml_(const std::string& in_path, const std::string& cmo_out, bool prof) {
   namespace cf = cppcaml::typing::clflags;
   PpfDump ppf_dump;
-  open_ppf_dump(ppf_dump, remove_extension(cmo_out) + ".cmo");
+  open_ppf_dump(ppf_dump, remove_extension(cmo_out) + (kNative ? ".cmx" : ".cmo"));
   namespace ty = cppcaml::typing;
   std::string src;  // Pparse.parse_file: the (preprocessed) source text
   if (!read_source(in_path, src)) return 2;
@@ -647,7 +658,7 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
     const bool rewritten = ast_file || !cf::all_ppx.empty();
     if (cf::dump_parsetree && rewritten) {
       std::cout.flush();
-      std::cerr << "c++ocamlc: option -dparsetree is not supported yet with -ppx or a binary AST input\n";
+      std::cerr << CPPCAML_SELF ": option -dparsetree is not supported yet with -ppx or a binary AST input\n";
       return 2;
     }
     if (cf::dump_parsetree) cppcaml::ast::print_dparsetree(structure, in_path, ppf_dump.out(), dirfiles);
@@ -675,7 +686,7 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
                                          ty::cmt_format::set_comments(ty::parsetree::comments_of_ast(
                                              cppcaml::ast::last_comments(), pos_name, dirfiles));
                                        }
-                                       st = ty::pparse::apply_rewriters_str(st, "ocamlc");
+                                       st = ty::pparse::apply_rewriters_str(st, kTool);
                                        // Compile_common.Parse_result.update_unit_info
                                        target.human_source_file = ty::location::input_name;
                                        if (cf::should_stop_after(cf::Pass::Parsing)) {
@@ -697,6 +708,22 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
     // Unit_info.modname: one string, which Translmod's module ident,
     // Bytegen's events and Emitcode's cu_name all share
     std::string_view modname = ty::zborrow(mod);
+    if (kNative) {
+      // Optcompile.clambda: Clflags.use_inlining_arguments_set
+      // classic_arguments; Translmod.transl_store_implementation,
+      // -drawlambda, Simplif.simplify_lambda, -dlambda; the back end unless
+      // -stop-after lambda; Compilenv.save_unit_info (the .cmx)
+      cf::use_inlining_arguments_set(cf::classic_arguments);
+      ty::lambda::Program prog = ty::translmod::transl_store_implementation(modname, impl->structure, impl->coercion);
+      if (cf::dump_rawlambda) ppf_dump.out() << ty::printlambda::dump(prog.code);
+      ty::lambda::lambda lam = ty::simplif::simplify_lambda(prog.code);
+      if (cf::dump_lambda) ppf_dump.out() << ty::printlambda::dump(lam);
+      ppf_dump.out().flush();
+      lap("lambda", tp);
+      if (!cf::should_stop_after(cf::Pass::Lambda))
+        throw std::runtime_error("the native back end (Asmgen) is not supported yet");
+      return finish();
+    }
     ty::lambda::Program prog = ty::translmod::transl_implementation(modname, impl->structure, impl->coercion);
     if (cf::dump_rawlambda) ppf_dump.out() << ty::printlambda::dump(prog.code);
     ty::lambda::lambda lam = ty::simplif::simplify_lambda(prog.code);
@@ -709,7 +736,7 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
     // Compile.emit_bytecode: Emitcode.to_file, the .cmo removed on failure
     std::FILE* oc = std::fopen(cmo_out.c_str(), "wb");
     if (!oc) {
-      std::cerr << "c++ocamlc: cannot open " << cmo_out << "\n";
+      std::cerr << CPPCAML_SELF ": cannot open " << cmo_out << "\n";
       return 2;
     }
     try {
@@ -752,9 +779,9 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
     try {
       std::rethrow_exception(ep);
     } catch (const std::exception& e) {
-      std::cerr << "c++ocamlc: " << in_path << ": " << e.what() << '\n';
+      std::cerr << CPPCAML_SELF ": " << in_path << ": " << e.what() << '\n';
     } catch (...) {
-      std::cerr << "c++ocamlc: " << in_path << ": internal error\n";
+      std::cerr << CPPCAML_SELF ": " << in_path << ": internal error\n";
     }
     return 1;
   }
@@ -790,7 +817,7 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
     const bool rewritten = ast_file || !cf::all_ppx.empty();
     if (cf::dump_parsetree && rewritten) {
       std::cout.flush();
-      std::cerr << "c++ocamlc: option -dparsetree is not supported yet with -ppx or a binary AST input\n";
+      std::cerr << CPPCAML_SELF ": option -dparsetree is not supported yet with -ppx or a binary AST input\n";
       return 2;
     }
     // Compile.interface: with_info ~dump_ext:"cmi" (Compmisc.with_ppf_dump)
@@ -814,7 +841,7 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
             ty::cmt_format::set_comments(
                 ty::parsetree::comments_of_ast(cppcaml::ast::last_comments(), pos_name, dirfiles));
           }
-          sg = ty::pparse::apply_rewriters_sig(sg, "ocamlc");
+          sg = ty::pparse::apply_rewriters_sig(sg, kTool);
           target.human_source_file = ty::location::input_name;  // update_unit_info
           if (cf::should_stop_after(cf::Pass::Parsing)) return;
           // Compile_common.typecheck_intf
@@ -856,7 +883,7 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
     report_lexer_error(in_path, src, e);
     return 2;
   } catch (const std::exception& e) {
-    std::cerr << "c++ocamlc: " << in_path << ": " << e.what() << '\n';
+    std::cerr << CPPCAML_SELF ": " << in_path << ": " << e.what() << '\n';
     return 1;
   }
   return 0;
@@ -912,16 +939,31 @@ static int run_main(int argc, char** argv) {
   namespace ty = cppcaml::typing;
   namespace cf = ty::clflags;
   namespace ce = ty::compenv;
-  const std::string program = "ocamlc";
+  const std::string program = kTool;
+  // Optmaindriver.main: native_code := true, before the arguments
+  if (kNative) cf::native_code = true;
   const bool prof = std::getenv("CPPCAML_PROFILE") != nullptr;
   std::vector<std::string> args(argv, argv + argc);
-  ce::add_arguments(ty::main_args::bytecomp_options());
+  if (kNative) {
+    // Arch.command_line_options (amd64's) @ Options.list
+    ty::arg::Option fpic{"-fPIC", ty::arg::Spec{}, " Generate position-independent machine code (default)"};
+    fpic.spec.k = ty::arg::Spec::K::Unit;
+    fpic.spec.unit = [] { cf::pic_code = true; };
+    ty::arg::Option fnopic{"-fno-PIC", ty::arg::Spec{}, " Generate position-dependent machine code"};
+    fnopic.spec.k = ty::arg::Spec::K::Unit;
+    fnopic.spec.unit = [] { cf::pic_code = false; };
+    ce::add_arguments({fpic, fnopic});
+    ce::add_arguments(ty::main_args::optcomp_options());
+  } else {
+    ce::add_arguments(ty::main_args::bytecomp_options());
+  }
   {
     ty::arg::Option depend;
     depend.key = "-depend";
     depend.spec.k = ty::arg::Spec::K::Unit;
-    depend.spec.unit = [] { ce::fatal("c++ocamlc: option -depend is not supported yet"); };
-    depend.doc = "<options> Compute dependencies (use 'ocamlc -depend -help' for details)";
+    depend.spec.unit = [] { ce::fatal(CPPCAML_SELF ": option -depend is not supported yet"); };
+    depend.doc = kNative ? "<options> Compute dependencies (use 'ocamlopt -depend -help' for details)"
+                         : "<options> Compute dependencies (use 'ocamlc -depend -help' for details)";
     ce::add_arguments({depend});
   }
   ce::add_arguments(ty::main_args::cppcaml_extensions());
@@ -972,13 +1014,13 @@ static int run_main(int argc, char** argv) {
       ctx.compile_implementation = [&](cf::Pass start_from, const std::string& source_file,
                                        const std::string& output_prefix) -> int {
         (void)start_from;  // (only Parsing reaches here: .cmir-linear is refused)
-        return compile_ml(source_file, output_prefix + ".cmo", prof);
+        return compile_ml(source_file, output_prefix + (kNative ? ".cmx" : ".cmo"), prof);
       };
       ctx.compile_interface = [](const std::string& source_file, const std::string& output_prefix) {
         return compile_mli(source_file, output_prefix + ".cmi");
       };
-      ctx.ocaml_mod_ext = ".cmo";
-      ctx.ocaml_lib_ext = ".cma";
+      ctx.ocaml_mod_ext = kNative ? ".cmx" : ".cmo";
+      ctx.ocaml_lib_ext = kNative ? ".cmxa" : ".cma";
       ce::process_deferred_actions(ctx);
     } catch (const ty::arg::Bad& b) {
       std::cout.flush();
@@ -987,11 +1029,25 @@ static int run_main(int argc, char** argv) {
       ce::print_arguments(program);
       return 2;
     }
-    if (cf::should_stop_after(cf::Pass::Lambda)) {  // Continue
+    if (!kNative && cf::should_stop_after(cf::Pass::Lambda)) {  // Continue
       profile_dump();
       return 0;
     }
     ce::readenv(ce::Position::Before_link);
+    if (kNative) {
+      if ((cf::make_package ? 1 : 0) + (cf::make_archive ? 1 : 0) + (cf::shared ? 1 : 0) +
+              (ce::stop_early ? 1 : 0) + (cf::output_c_object ? 1 : 0) >
+          1) {
+        if (!cf::stop_after) ce::fatal("Please specify at most one of -pack, -a, -shared, -c, -output-obj");
+        ce::fatal("Options -i and -stop-after (parsing|typing|lambda|scheduling|emit) are  incompatible with -pack, "
+                  "-a, -shared, -output-obj");
+      }
+      if (cf::make_archive || cf::make_package || cf::shared ||
+          (!ce::stop_early && (!cf::objfiles.empty() || ce::has_linker_inputs)))
+        ce::fatal(CPPCAML_SELF ": the native linker, librarian and packager are not supported yet");
+      profile_dump();
+      return 0;
+    }
     if ((cf::make_archive ? 1 : 0) + (cf::make_package ? 1 : 0) + (ce::stop_early ? 1 : 0) +
             (cf::output_c_object ? 1 : 0) >
         1) {
@@ -1002,7 +1058,7 @@ static int run_main(int argc, char** argv) {
       init_path();
       std::string out = ce::extract_output(cf::output_name);
       std::string o = ty::main_args::unsupported_archive_option();
-      if (!o.empty()) ce::fatal("c++ocamlc: option " + o + " is not supported yet");
+      if (!o.empty()) ce::fatal(CPPCAML_SELF ": option " + o + " is not supported yet");
       ty::bytelibrarian::create_archive(ce::get_objfiles(false), out);
       ty::warnings::check_fatal();
     } else if (cf::make_package) {
@@ -1025,7 +1081,7 @@ static int run_main(int argc, char** argv) {
       }
       init_path();
       std::string o = ty::main_args::unsupported_link_option();
-      if (!o.empty()) ce::fatal("c++ocamlc: option " + o + " is not supported yet");
+      if (!o.empty()) ce::fatal(CPPCAML_SELF ": option " + o + " is not supported yet");
       if (int rc = link(ce::get_objfiles(true), target)) return rc;
       ty::warnings::check_fatal();
     }
@@ -1048,9 +1104,9 @@ static int run_main(int argc, char** argv) {
       std::rethrow_exception(ep);
     } catch (const std::exception& e) {
       std::cout.flush();
-      std::cerr << "c++ocamlc: " << e.what() << '\n';
+      std::cerr << CPPCAML_SELF ": " << e.what() << '\n';
     } catch (...) {
-      std::cerr << "c++ocamlc: internal error\n";
+      std::cerr << CPPCAML_SELF ": internal error\n";
     }
     return 2;
   }

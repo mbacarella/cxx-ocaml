@@ -123,6 +123,22 @@ Tast_mapper rebuild (called in the mapper's evaluation order),
 and the shape reduced by `Shape_reduce.local_reduce`.  A failed
 implementation writes the partial .cmt from Cmt_format's saved types.
 
+## The native compiler (in progress)
+
+`c++ocamlopt` is the same driver built with `CPPCAML_OCAMLOPT`
+(Optmaindriver / Optcompile): `native_code` set before the arguments,
+ocamlopt's option table (`optmain_args_table.inc`, generated like the
+bytecode one) with Default.Optmain's actions and Arch's `-fPIC`/`-fno-PIC`,
+the native Clflags (dumps, inlining parameters through `arg_helper.hpp`,
+the -O2/-O3/classic argument sets), and `Translmod.transl_store_implementation`.
+Oracle: `NATIVE=1 lambda_port_parity.sh` (`-drawlambda` / `-dlambda` under
+`-stop-after lambda`, against ocamlopt.opt): 6550/6550 probes.  Next, in
+order: Closure and Compilenv (`-dclambda`, the .cmx), Cmmgen (`-dcmm`),
+Selection and the Mach passes (`-dsel` ... `-dreload`), Linearize and
+Emit (`-dlinear`, then `-S` byte for byte), then the .cmx/.cmxa writers
+and Asmlink.  Until the back end exists, c++ocamlopt stops with an error
+after Lambda and does not write the .cmx.
+
 ## Oracles and gates
 
 Every harness compares against the tree's `ocamlc.opt` (the stdlib DDC
