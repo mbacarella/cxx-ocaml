@@ -8,8 +8,8 @@ switch is then compiled to bytecode by c++ocamlc.  See cxx/INSTALL.md."""
 maintainer: "Michael Bacarella <michael.bacarella@gmail.com>"
 authors: "Michael Bacarella <michael.bacarella@gmail.com>"
 license: "LGPL-2.1-or-later WITH OCaml-LGPL-linking-exception"
-homepage: "https://github.com/ocaml/ocaml/"
-bug-reports: "https://github.com/ocaml/ocaml/issues"
+homepage: "https://github.com/mbacarella/cxx-ocaml"
+bug-reports: "https://github.com/mbacarella/cxx-ocaml/issues"
 depends: [
   "ocaml-variants" {post & >= "5.6.0~"}
 ]

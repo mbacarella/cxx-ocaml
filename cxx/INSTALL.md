@@ -9,8 +9,8 @@ stock ones.
 
 ```sh
 opam switch create cxx --empty
-opam pin add -n ocaml-variants.5.6.0+trunk 'git+file:///path/to/c++caml#cpp-rewrite'
-opam pin add -n ocaml-option-cxx.1        'git+file:///path/to/c++caml#cpp-rewrite'
+opam pin add -n ocaml-variants.5.6.0+trunk 'git+https://github.com/mbacarella/cxx-ocaml#cpp-rewrite'
+opam pin add -n ocaml-option-cxx.1        'git+https://github.com/mbacarella/cxx-ocaml#cpp-rewrite'
 opam install ocaml-option-cxx ocaml-variants
 ```
 
