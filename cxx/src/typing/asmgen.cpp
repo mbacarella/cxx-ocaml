@@ -43,6 +43,9 @@ void dump_if(format::Formatter& dump, bool flag, const char* message, const mach
   if (flag) printmach::phase(dump, message, fd);
 }
 
+void compile_fundecl_in_zone(format::Formatter& dump, const selection::FuncNames& funcnames,
+                             const cmm::Fundecl& fd_cmm);
+
 mach::Fundecl regalloc(format::Formatter& dump, long round, mach::Fundecl fd) {
   for (;; ++round) {
     if (round > 50)
@@ -64,6 +67,21 @@ mach::Fundecl regalloc(format::Formatter& dump, long round, mach::Fundecl fd) {
 }
 
 void compile_fundecl(format::Formatter& dump, const selection::FuncNames& funcnames, const cmm::Fundecl& fd_cmm) {
+  // A function's Mach and Linear code, its registers and everything the
+  // passes allocate live in a scratch zone, dropped once Emit has written
+  // the function (what the OCaml GC reclaims); what outlives it is kept
+  // elsewhere: Reg.at_location's registers and the frame descriptors'
+  // debuginfo (the permanent zone)
+  static Zone scratch;
+  {
+    ZoneScope in_scratch(scratch);
+    compile_fundecl_in_zone(dump, funcnames, fd_cmm);
+  }
+  scratch.clear();
+}
+
+void compile_fundecl_in_zone(format::Formatter& dump, const selection::FuncNames& funcnames,
+                             const cmm::Fundecl& fd_cmm) {
   proc::init();
   reg::reset();
   mach::Fundecl fd = polling::instrument_fundecl(selection::fundecl(funcnames, fd_cmm));

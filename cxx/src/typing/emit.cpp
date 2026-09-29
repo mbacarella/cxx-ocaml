@@ -456,7 +456,17 @@ struct FrameDescr {
 };
 std::vector<FrameDescr> frame_descriptors;  // list order: the newest first
 
+// a debuginfo list copied out of the function's scratch zone (Asmgen): the
+// frame table is emitted at end_assembly
+debuginfo::t keep_dbg(const debuginfo::t& d) {
+  if (d.empty()) return d;
+  ZoneScope perm(permanent_zone());
+  return slice(std::vector<debuginfo::Item>(d.begin(), d.end()));
+}
+
 void record_frame_descr(long label, long frame_size, std::vector<long> live_offset, FrameDebuginfo debuginfo) {
+  debuginfo.dbg = keep_dbg(debuginfo.dbg);
+  for (mach::AllocDbginfo& a : debuginfo.alloc) a.alloc_dbg = keep_dbg(a.alloc_dbg);
   std::sort(live_offset.begin(), live_offset.end());
   live_offset.erase(std::unique(live_offset.begin(), live_offset.end()), live_offset.end());
   frame_descriptors.insert(frame_descriptors.begin(), FrameDescr{label, frame_size, live_offset, debuginfo});

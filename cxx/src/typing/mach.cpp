@@ -58,6 +58,9 @@ Reg* clone(Reg* r) {
 }
 
 Reg* at_location(cmm::MachtypeComponent ty, Location loc) {
+  // (hw_reg_list keeps it for good -- every reset visits it -- while a
+  // function's other registers live in its scratch zone: Asmgen)
+  ZoneScope perm(permanent_zone());
   auto* r = make<Reg>();
   r->raw_name.k = RawName::K::R;
   r->stamp = currstamp;

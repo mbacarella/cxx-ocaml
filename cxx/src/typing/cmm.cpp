@@ -9,8 +9,8 @@ namespace cppcaml::typing::cmm {
 
 namespace {
 using MC = MachtypeComponent;
-Machtype one(MC c) {
-  auto* p = static_cast<MC*>(zone().alloc(sizeof(MC), alignof(MC)));
+Machtype one(MC c) {  // (the typ_* singletons: permanent, whatever zone is current)
+  auto* p = static_cast<MC*>(permanent_zone().alloc(sizeof(MC), alignof(MC)));
   *p = c;
   return Machtype{p, 1};
 }
