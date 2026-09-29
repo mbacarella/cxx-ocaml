@@ -226,6 +226,12 @@ ocamloptcomp.cmxa, the link) once with ocamlopt.opt and once with
 c++ocamlopt: all 845 artifacts (.cmx, .o, .cmi, .cmxa, .a) and the
 ocamlopt.opt executable are byte-identical.
 
+The opam switch (`cxx/INSTALL.md`) installs c++ocamlopt as `ocamlopt`:
+dune, 30 packages and mpg123 build, and every artifact is identical to the
+stock compilers' (only .cmt sharing differs).  `parse_dir_parity.sh`
+compares parse trees over any source tree (the switch's package sources
+found parser divergences the testsuite had not).
+
 ## Oracles and gates
 
 Every harness compares against the tree's `ocamlc.opt` (the stdlib DDC

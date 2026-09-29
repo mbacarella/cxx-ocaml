@@ -58,9 +58,12 @@ linking it (the Jane Street ppx drivers) fail to link -- with the stock
 compiler as well.  Until it is fixed upstream, pin a copy of its `v0.17`
 branch with those two stubs renamed (in `src/int_stubs.c` and `src/int.ml`).
 
-Tested (2026-09-28, trunk b9dac8cc84): a switch created this way, ctypes, ppx_inline_test
-and their dependencies (base, ppxlib, the Jane Street ppx stack, integers,
-dune-configurator, ...) installed, and mbacarella/mpg123 (C stubs, dune's
-ctypes stanza, inline tests) built with its tests passing.  Its build
-artifacts are identical to the stock compiler's except `.cmt` files, whose
-contents are identical but whose Marshal sharing sometimes differs.
+Tested (2026-09-29): a switch created this way (c++ocamlc and
+c++ocamlopt), dune 3.24.2 bootstrapped by c++ocamlopt, ctypes,
+ppx_inline_test and their dependencies (base, ppxlib, the Jane Street ppx
+stack, integers, dune-configurator, ...) installed, and
+mbacarella/mpg123 (C stubs, dune's ctypes stanza, inline tests run as
+bytecode and native) built with its tests passing.  Every package rebuilt
+with the stock compilers at the same paths: all 3292 .cmi, .cmo, .cma,
+.cmx, .o, .cmxa, .a, .cmxs and executables identical; 262 .cmt files have
+identical contents but a different Marshal sharing.
