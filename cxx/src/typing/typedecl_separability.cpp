@@ -60,7 +60,6 @@ TypeStructure structure(const TypeDeclaration* def) {
   switch (k->kind) {
     case TypeKind::Kind::Type_open: return {TypeStructure::Kind::Open};
     case TypeKind::Kind::Type_abstract:
-      // (the Typing_recovery.erroneous_type_check case is for merlin)
       if (!def->type_manifest) return {TypeStructure::Kind::Abstract};
       return {TypeStructure::Kind::Synonym, def->type_manifest};
     case TypeKind::Kind::Type_external: return {TypeStructure::Kind::Abstract};
@@ -204,7 +203,7 @@ Context check_type(env::t env, TypeExpr* ty, Mode m) {
     if (unsafe(ty, m, hyps0)) return worst_case(ty);
     Hyps hyps = add(ty, m, hyps0);
     const TypeDesc* d = get_desc(ty);
-    if (d->kind == DescKind::Tlink || d->kind == DescKind::Texpand || d->kind == DescKind::Tsubst)
+    if (d->kind == DescKind::Tlink || d->kind == DescKind::Tsubst)
       throw std::logic_error("check_type");
     if (m == Mode::Ind) return {};
     switch (d->kind) {

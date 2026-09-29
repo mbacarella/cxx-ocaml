@@ -422,7 +422,6 @@ std::vector<TypeExpr*> apply_subst(const ParamSubst& s1, const std::vector<TypeE
   return tyl;
 }
 
-const TypeDesc* printer_get_desc(TypeExpr* ty) { return bt::get_folded_desc(true, ty); }
 
 ParamSubst compose(const std::vector<long>& l1, const ParamSubst& s) {
   ParamSubst r;
@@ -483,7 +482,7 @@ bool uniq(const std::vector<long>& l) {
 std::pair<Path::t, ParamSubst> normalize_type_path(bool cache, env::t e, Path::t p) {
   try {
     env::TypeExpansion x = env::find_type_expansion(p, e);
-    const TypeDesc* d = printer_get_desc(x.body);
+    const TypeDesc* d = types::get_desc(x.body);
     if (auto* c = as<Tconstr>(d)) {
       bool same_params = x.params.size() == c->args.size();
       if (same_params)
@@ -653,7 +652,7 @@ std::vector<TypeExpr*> slice_vec(Slice<TypeExpr*> s) { return std::vector<TypeEx
 
 // printer_iter_type_expr: the subterms the printer prints
 void printer_iter_type_expr(const std::function<void(TypeExpr*)>& f, TypeExpr* ty) {
-  const TypeDesc* d = printer_get_desc(ty);
+  const TypeDesc* d = types::get_desc(ty);
   if (auto* c = as<Tconstr>(d)) {
     auto [p2, s] = best_type_path(c->path);
     (void)p2;
@@ -712,55 +711,51 @@ void add(Path::t p) {
     if (!name.empty() && name[0] == '$') names.insert(p->id);
   }
 }
-std::vector<std::pair<std::vector<Path::t>, Explanation>> explain(env::t e) {
-  // fold_type_origin f acc: over the recorded names, in Ident.Set order
-  auto fold_type_origin = [&](const std::function<void(Path::t, const TypeOrigin&)>& f) {
-    for (Ident::t id : names) {
-      Path::t p = Path::pident(id);
-      const TypeDeclaration* decl;
-      try {
-        decl = env::find_type(p, e);
-      } catch (const env::NotFound&) {
-        continue;
-      }
-      f(p, bt::type_origin(decl));
+void print_explanations(env::t e, Formatter& ppf) {
+  // constrs: String.Map of the constructor to its idents' trees, the most
+  // recent first (the trees made in Ident.Set order)
+  std::map<std::string, std::vector<const ot::OutIdent*>> constrs;
+  for (Ident::t id : names) {
+    Path::t p = Path::pident(id);
+    const TypeDeclaration* decl;
+    try {
+      decl = env::find_type(p, e);
+    } catch (const env::NotFound&) {
+      continue;
     }
+    TypeOrigin o = bt::type_origin(decl);
+    if (o.kind != TypeOrigin::Kind::Existential) continue;
+    auto& l = constrs[std::string(o.existential)];
+    l.insert(l.begin(), tree_of_path(p));
+  }
+  // Style.as_inline_code !Oprint.out_ident / Style.inline_code
+  auto quoted_ident = [](Formatter& f, const ot::OutIdent* x) {
+    pp_open_stag(f, "inline_code");
+    oprint::out_ident(f, x);
+    pp_close_stag(f);
   };
-  // constrs: String.Map.add_to_list constr p (the list most recent first)
-  std::map<std::string, std::vector<Path::t>> constrs;
-  fold_type_origin([&](Path::t p, const TypeOrigin& o) {
-    if (o.kind == TypeOrigin::Kind::Existential) {
-      auto& l = constrs[std::string(o.existential)];
-      l.insert(l.begin(), p);
+  auto inline_code = [](const std::string& str) {
+    return [str](Formatter& f) {
+      pp_open_stag(f, "inline_code");
+      pp_print_string(f, str);
+      pp_close_stag(f);
+    };
+  };
+  for (auto& [constr, out_idents] : constrs) {
+    if (out_idents.empty()) continue;
+    if (out_idents.size() == 1) {
+      fprintf(ppf, "@ @[<2>@{<hint>Hint@}:@ %a@ is an existential type@ bound by the constructor@ %a.@]",
+              [&](Formatter& f) { quoted_ident(f, out_idents[0]); }, inline_code(constr));
+    } else {
+      std::vector<const ot::OutIdent*> rest(out_idents.rbegin(), out_idents.rend() - 1);
+      fprintf(ppf,
+              "@ @[<2>@{<hint>Hint@}:@ %a@ and %a@ are existential types@ bound by the constructor@ %a.@]",
+              [&](Formatter& f) {
+                pp_print_list(f, quoted_ident, rest, comma);
+              },
+              [&](Formatter& f) { quoted_ident(f, out_idents[0]); }, inline_code(constr));
     }
-  });
-  std::vector<std::pair<std::vector<Path::t>, Explanation>> out;
-  for (auto& [constructor, ids] : constrs)
-    if (!ids.empty()) out.push_back({ids, Explanation{Explanation::K::Existential, constructor}});
-  // eqns: TypeMap (by id) of lhs to TypeMap of rhs to paths
-  std::map<long, std::pair<TypeExpr*, std::map<long, std::pair<TypeExpr*, std::vector<Path::t>>>>> eqns;
-  fold_type_origin([&](Path::t p, const TypeOrigin& o) {
-    if (o.kind != TypeOrigin::Kind::Equation) return;
-    TypeExpr *t1 = o.eq1, *t2 = o.eq2;
-    if (types::get_id(t1) >= types::get_id(t2)) std::swap(t1, t2);
-    auto& inner = eqns[types::get_id(t1)];
-    inner.first = t1;
-    auto& ps = inner.second[types::get_id(t2)];
-    ps.first = t2;
-    ps.second.insert(ps.second.begin(), p);
-  });
-  // from_eqns: consed while folding in increasing order -- the last first
-  std::vector<std::pair<std::vector<Path::t>, Explanation>> from_eqns;
-  for (auto& [_, lhs] : eqns)
-    for (auto& [__, rhs] : lhs.second) {
-      std::vector<Path::t> ids(rhs.second.rbegin(), rhs.second.rend());
-      Explanation x{Explanation::K::Equation, "", lhs.first, rhs.first};
-      from_eqns.insert(from_eqns.begin(), {ids, x});
-    }
-  out.insert(out.end(), from_eqns.begin(), from_eqns.end());
-  for (auto& [ids, _] : out)
-    std::stable_sort(ids.begin(), ids.end(), [](Path::t a, Path::t b) { return path::compare(a, b) < 0; });
-  return out;
+  }
 }
 }  // namespace internal_names
 
@@ -971,7 +966,7 @@ void mark_as_printed(TypeExpr* px) {
 void add_printed(bool non_gen, TypeExpr* ty) { add_printed_proxy(non_gen, proxy(ty)); }
 
 bool aliasable(TypeExpr* ty) {
-  const TypeDesc* d = printer_get_desc(ty);
+  const TypeDesc* d = types::get_desc(ty);
   switch (d->kind) {
     case DescKind::Tvar:
     case DescKind::Tunivar:
@@ -982,7 +977,7 @@ bool aliasable(TypeExpr* ty) {
 }
 
 bool should_visit_object(TypeExpr* ty) {
-  const TypeDesc* d = printer_get_desc(ty);
+  const TypeDesc* d = types::get_desc(ty);
   if (auto* v = as<Tvariant>(d)) return !bt::static_row(v->row);
   if (as<Tobject>(d)) return ctype::opened_object(ty);
   return false;
@@ -996,7 +991,7 @@ void mark_loops_rec(const std::vector<TypeExpr*>& visited0, TypeExpr* ty) {
   }
   std::vector<TypeExpr*> visited = visited0;
   visited.insert(visited.begin(), px);
-  const TypeDesc* d = printer_get_desc(ty);
+  const TypeDesc* d = types::get_desc(ty);
   auto rec = [&](TypeExpr* t) { mark_loops_rec(visited, t); };
   switch (d->kind) {
     case DescKind::Tvariant:
@@ -1245,7 +1240,7 @@ void with_labels(bool b, const std::function<void()>& f) {
 namespace {
 
 void alias_nongen_row(Mode mode, TypeExpr* px, TypeExpr* ty) {
-  const TypeDesc* d = printer_get_desc(ty);
+  const TypeDesc* d = types::get_desc(ty);
   if (d->kind == DescKind::Tvariant || d->kind == DescKind::Tobject)
     if (is_non_gen(mode, px)) aliases::add_proxy(px);
 }
@@ -1293,7 +1288,7 @@ const ot::OutType* tree_of_typexp(Mode mode, TypeExpr* ty) {
   }
   auto pr_typ = [&]() -> const ot::OutType* {
     TypeExpr* tty = types::repr(ty);
-    const TypeDesc* d = printer_get_desc(ty);
+    const TypeDesc* d = types::get_desc(ty);
     switch (d->kind) {
       case DescKind::Tvar: {
         bool non_gen = is_non_gen(mode, ty);
@@ -1310,7 +1305,7 @@ const ot::OutType* tree_of_typexp(Mode mode, TypeExpr* ty) {
         if (bt::is_optional(a->label)) {
           if (bt::tpoly_is_mono(a->t1)) {
             TypeExpr* mono = bt::tpoly_get_mono(a->t1);
-            auto* c = as<Tconstr>(printer_get_desc(mono));
+            auto* c = as<Tconstr>(types::get_desc(mono));
             if (c && c->args.size() == 1 && path::same(c->path, predef::paths().option)) {
               if (aliases::is_aliased_proxy(proxy(mono)))
                 t1 = stuff("<hidden>");
@@ -1402,6 +1397,7 @@ const ot::OutType* tree_of_typexp(Mode mode, TypeExpr* ty) {
             c->args = args;
             out_variant = c;
           }
+          if (row.closed && all_present) return out_variant;
           if (!all_present) t->tags = present;
           t->variant.is_typ = true;
           t->variant.typ = out_variant;
@@ -1418,8 +1414,7 @@ const ot::OutType* tree_of_typexp(Mode mode, TypeExpr* ty) {
       case DescKind::Tnil:
       case DescKind::Tfield: return tree_of_typobject(mode, ty, nullptr);
       case DescKind::Tsubst: return stuff("<Tsubst>");
-      case DescKind::Tlink:
-      case DescKind::Texpand: throw std::logic_error("Out_type.tree_of_typexp");
+      case DescKind::Tlink: throw std::logic_error("Out_type.tree_of_typexp");
       case DescKind::Tpoly: {
         auto* p = static_cast<const Tpoly*>(d);
         if (p->vars.empty()) return tree_of_typexp(mode, p->body);
@@ -1516,7 +1511,7 @@ std::pair<std::vector<std::pair<std::string, const ot::OutType*>>, ot::OutRow> t
     Mode mode, TypeExpr* rest, const std::vector<std::pair<std::string_view, TypeExpr*>>& l, std::size_t from) {
   if (from >= l.size()) {
     ot::OutRow row;
-    const TypeDesc* d = printer_get_desc(rest);
+    const TypeDesc* d = types::get_desc(rest);
     if (auto* c = as<Tconstr>(d)) {
       if (c->path->kind == Path::Kind::Pident && bt::is_row_name(ident::name(c->path->id)))
         row.k = ot::OutRowK::Orow_open_anonymous;
@@ -1639,7 +1634,7 @@ std::pair<TypeExpr*, std::vector<TypeExpr*>> prepare_decl(Ident::t id, const Typ
   if (decl->type_manifest) {
     TypeExpr* ty = decl->type_manifest;
     // Special hack to hide row name
-    const TypeDesc* d = printer_get_desc(ty);
+    const TypeDesc* d = types::get_desc(ty);
     if (auto* v = as<Tvariant>(d)) {
       const PathArgs* nm = types::row_name(v->row);
       if (nm && nm->path->kind == Path::Kind::Pident && ident::same(id, nm->path->id))
@@ -2407,9 +2402,9 @@ const ot::OutSigItem* tree_of_module(Ident::t id, const ModuleType* mty, RecStat
 // ---- type expansions ----
 
 bool same_path(TypeExpr* t, TypeExpr* t2) {
-  if (types::eq_type(t, t2) && !types::get_abbrev(t) && !types::get_abbrev(t2)) return true;
-  auto* c1 = as<Tconstr>(printer_get_desc(t));
-  auto* c2 = as<Tconstr>(printer_get_desc(t2));
+  if (types::eq_type(t, t2)) return true;
+  auto* c1 = as<Tconstr>(types::get_desc(t));
+  auto* c2 = as<Tconstr>(types::get_desc(t2));
   if (!c1 || !c2) return false;
   auto [p1, s1] = best_type_path(c1->path);
   auto [p2, s2] = best_type_path(c2->path);
@@ -2425,42 +2420,23 @@ bool same_path(TypeExpr* t, TypeExpr* t2) {
   return false;
 }
 
+// Same t (expanded == nullptr) | Diff (t, expanded)
 ExpansionDiff trees_of_type_expansion(Mode mode, const ExpansionPair& e) {
   TypeExpr* t = e.ty;
   TypeExpr* t2 = e.expanded;
-  const ot::OutType* manifest = nullptr;
-  if (const Abbrev* ab = types::get_abbrev(t)) {
-    Path::t tconstr = ab->path;
-    std::vector<TypeExpr*> params = slice_vec(ab->args);
-    bool should_use_manifest = true;
-    if (auto* c = as<Tconstr>(printer_get_desc(t))) {
-      bool same = path::same(c->path, tconstr) && c->args.size() == params.size();
-      if (same)
-        for (std::size_t i = 0; i < params.size(); ++i)
-          if (!types::eq_type(c->args[i], params[i])) same = false;
-      should_use_manifest = !same;
-    }
-    if (should_use_manifest) {
-      for (TypeExpr* p : params) aliases::mark_loops(p);
-      auto args = tree_of_typlist(mode, params);
-      auto* m = ot::otyp(OT::Otyp_constr);
-      m->id = tree_of_path_ns(Namespace::Type, tconstr);
-      m->args = args;
-      manifest = m;
-    }
-  }
   aliases::reset();
   aliases::mark_loops(t);
   if (same_path(t, t2)) {
     aliases::add_delayed(proxy(t));
-    return {tree_of_typexp(mode, t), nullptr, manifest};
+    return {tree_of_typexp(mode, t), nullptr};
   }
+  aliases::mark_loops(t2);
   TypeExpr* t3 = proxy(t) == proxy(t2) ? ctype::unalias(t2) : t2;
-  aliases::mark_loops(t3);
   // beware order matter due to side effect, e.g. when printing object types
   const ot::OutType* first = tree_of_typexp(mode, t);
   const ot::OutType* second = tree_of_typexp(mode, t3);
-  return {first, ot::equal(first, second) ? nullptr : second, manifest};
+  if (ot::equal(first, second)) return {first, nullptr};
+  return {first, second};
 }
 
 void pp_type(Formatter& ppf, const ot::OutType* t) {
@@ -2470,20 +2446,13 @@ void pp_type(Formatter& ppf, const ot::OutType* t) {
 }
 
 void pp_type_expansion(Formatter& ppf, const ExpansionDiff& d) {
-  if (!d.expanded && !d.manifest) {
-    pp_type(ppf, d.ty);
-  } else if (!d.expanded && d.manifest) {
-    fprintf(ppf, "@[<2>%a@ =@ %a@]", pr(pp_type, d.manifest), pr(pp_type, d.ty));
-  } else if (d.expanded && !d.manifest) {
-    fprintf(ppf, "@[<2>%a@ =@ %a@]", pr(pp_type, d.ty), pr(pp_type, d.expanded));
-  } else {
-    fprintf(ppf, "@[<2>%a@ =@ %a@ =@ %a@]", pr(pp_type, d.manifest), pr(pp_type, d.ty), pr(pp_type, d.expanded));
-  }
+  if (!d.expanded) pp_type(ppf, d.ty);
+  else fprintf(ppf, "@[<2>%a@ =@ %a@]", pr(pp_type, d.ty), pr(pp_type, d.expanded));
 }
 
 // Hide variant name and var, to force printing the expanded type
 TypeExpr* hide_variant_name(TypeExpr* t) {
-  auto* v = as<Tvariant>(printer_get_desc(t));
+  auto* v = as<Tvariant>(types::get_desc(t));
   if (!v) return t;
   RowDescRepr r = types::row_repr(v->row);
   if (!r.name) return t;

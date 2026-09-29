@@ -257,12 +257,9 @@ std::optional<Doc> explain_escape(const Doc& pre, const et::Escape<ET>& e) {
     case K::Equation: {
       TypeExpr* t = e.equation.expanded;
       out_type::reserve_names(t);
-      return doc_printf(
-          "%a@ @[<hov>This instance of %a is ambiguous:@ %s@]@,@[%a A type annotation may resolve the "
-          "ambiguity,@,either on this expression or the whole function.@]",
-          ppre, misc::style::code(out_type::type_expr_with_reserved_names, t),
-          "it would escape the scope of its equation",
-          [](Formatter& f) { misc::print_manual_hint(f, {7, 2}); });
+      return doc_printf("%a@ @[<hov>This instance of %a is ambiguous:@ %s@]", ppre,
+                        misc::style::code(out_type::type_expr_with_reserved_names, t),
+                        "it would escape the scope of its equation");
     }
     case K::Self: return doc_printf("%a@,Self type cannot escape its class", ppre);
     case K::Constraint: return std::nullopt;
@@ -280,11 +277,6 @@ std::optional<Doc> explain_object(const et::Obj& o) {
       return doc_printf("@,@[The %a object type has an abstract row, it cannot be closed@]",
                         [&](Formatter& f) { print_pos(f, o.pos); });
     case K::Self_cannot_be_closed: return doc_printf("@,Self type cannot be unified with a closed object type");
-    case K::Kind_differ:
-      return doc_printf("@,@[The method %a is %s and was expected to be %s@]",
-                        misc::style::code_str(std::string(o.name)),
-                        o.k1 == types::FieldKindView::Fpublic ? "public" : "private",
-                        o.k2 == types::FieldKindView::Fpublic ? "public" : "private");
   }
   return std::nullopt;
 }
@@ -314,15 +306,6 @@ Doc explain_label_mismatch(std::string_view missing_label_msg, const et::Diff<Ar
   return doc_printf("@,@[Labels %a@ and@ %a do not match@]", quoted_label(got), quoted_label(expected));
 }
 
-std::string concat_dot(const std::vector<std::string_view>& l) {
-  std::string r;
-  for (std::size_t i = 0; i < l.size(); ++i) {
-    if (i) r += ".";
-    r += l[i];
-  }
-  return r;
-}
-
 std::optional<Doc> explain_first_class_module(const et::FirstClassModule& fm) {
   using K = et::FirstClassModule::Kind;
   switch (fm.kind) {
@@ -330,34 +313,6 @@ std::optional<Doc> explain_first_class_module(const et::FirstClassModule& fm) {
       return doc_printf("@,@[The module alias %a could not be expanded@]", fd::pr(pp_path, fm.path));
     case K::Package_inclusion:
     case K::Package_coercion: return doc_printf("@,@[%a@]", [&](Formatter& f) { fd::pp_doc(f, fm.doc); });
-    case K::Constraint_on_missing_type: {
-      std::string name = concat_dot(fm.lhs);
-      if (fm.pos == et::Position::First)
-        return doc_printf("@,@[There is no type %a in the first module type.@]", misc::style::code_str(name));
-      return doc_printf("@,@[There is no type %a in the second module type.@]", misc::style::code_str(name));
-    }
-    case K::Constraint_with_deps: {
-      std::string name = concat_dot(fm.lhs);
-      if (fm.pos == et::Position::First)
-        return doc_printf(
-            "@,@[The type %a depends on internal types@ in@ the@ first@ module@ type.@]", misc::style::code_str(name));
-      return doc_printf(
-          "@,@[The type %a depends on internal types@ in@ the@ second@ module@ type.@]", misc::style::code_str(name));
-    }
-    case K::Constraint_on_mismatched_type: {
-      std::string name = concat_dot(fm.lhs);
-      Ident::t id = Ident::create_local(name);
-      auto decl = [&](Formatter& f) { printtyp::type_declaration(id, f, fm.decl); };
-      if (fm.pos == et::Position::First)
-        return doc_printf(
-            "@,@[The constraint on %a in the second module type@ is not compatible@ with the declaration "
-            "of@;<1 2>@[%a@]@ in the first module type.@]",
-            misc::style::code_str(name), decl);
-      return doc_printf(
-          "@,@[The constraint on %a in the first module type@ is not compatible@ with the declaration "
-          "of@;<1 2>@[%a@]@ in the second module type.@]",
-          misc::style::code_str(name), decl);
-    }
   }
   return std::nullopt;
 }
@@ -495,50 +450,6 @@ void warn_on_missing_def(env::t env, Formatter& ppf, TypeExpr* t) {
 
 void quoted_ident(Formatter& ppf, const outcometree::OutIdent* t) { misc::style::as_inline_code(oprint::out_ident, ppf, t); }
 
-template <class T, class P>
-void pp_print_list_comma_and(Formatter& ppf, P elt, const std::vector<T>& l) {
-  if (l.empty()) return;
-  if (l.size() == 1) {
-    elt(ppf, l[0]);
-    return;
-  }
-  std::vector<T> rest(l.begin(), l.end() - 1);
-  fprintf(ppf, "%a@ and %a", [&](Formatter& f) { fd::pp_print_list(f, elt, rest, fd::comma); },
-          [&](Formatter& f) { elt(f, l.back()); });
-}
-
-void explain_names(env::t env, Formatter& ppf) {
-  auto explanations = out_type::internal_names::explain(env);
-  using EK = out_type::internal_names::Explanation::K;
-  for (auto& [_, ex] : explanations)
-    if (ex.k == EK::Equation) {
-      out_type::add_type_to_preparation(ex.lhs);
-      out_type::add_type_to_preparation(ex.rhs);
-    }
-  for (auto& [paths0, ex] : explanations) {
-    std::vector<const outcometree::OutIdent*> paths;
-    for (Path::t p : paths0) paths.push_back(out_type::tree_of_path(p));
-    // pp_plural (singular, plural): a printer
-    auto plural = [&](const char* s, const char* p) {
-      const char* w = paths.size() == 1 ? s : p;
-      return [w](Formatter& f) { fd::pp_print_string(f, w); };
-    };
-    auto quoted = [](Formatter& f, const outcometree::OutIdent* t) { quoted_ident(f, t); };
-    if (ex.k == EK::Equation) {
-      const outcometree::OutType* rhseq = out_type::tree_of_typexp(Mode::Type_scheme, ex.rhs);
-      const outcometree::OutType* lhseq = out_type::tree_of_typexp(Mode::Type_scheme, ex.lhs);
-      fprintf(ppf, "@ @[<2>@{<hint>Hint@}:@ %a@ %a@ introduced in the equation@ %a = %a@]",
-              [&](Formatter& f) { pp_print_list_comma_and(f, quoted, paths); },
-              plural("is a type variable", "are type variables"), misc::style::code(oprint::out_type, lhseq),
-              misc::style::code(oprint::out_type, rhseq));
-    } else {
-      fprintf(ppf, "@ @[<2>@{<hint>Hint@}:@ %a@ %a@ bound by the constructor@ %a.@]",
-              [&](Formatter& f) { pp_print_list_comma_and(f, quoted, paths); },
-              plural("is an existential type", "are existential types"), misc::style::code_str(ex.constructor));
-    }
-  }
-}
-
 void error(TraceFormat trace_format, Mode mode, const std::vector<std::pair<TypeExpr*, TypeExpr*>>& subst,
            env::t env, const et::ErrorTrace& tr0, const Doc& txt1, Formatter& ppf, const Doc& txt2,
            const Doc& ty_expect_explanation) {
@@ -588,7 +499,7 @@ void error(TraceFormat trace_format, Mode mode, const std::vector<std::pair<Type
       warn_on_missing_def(env, ppf, head->got.ty);
       warn_on_missing_def(env, ppf, head->expected.ty);
     }
-    explain_names(env, ppf);
+    out_type::internal_names::print_explanations(env, ppf);
     out_type::ident_conflicts::err_print(ppf);
   });
 }

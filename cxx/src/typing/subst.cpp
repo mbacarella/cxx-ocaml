@@ -233,7 +233,7 @@ static const Package* package(CopyScope& cs, t s, const Package* p);
 
 // Similar to [Ctype.nondep_type_rec].
 static TypeExpr* typexp(CopyScope& copy_scope, t s, TypeExpr* ty) {
-  const TypeDesc* desc = get_folded_desc(false, ty);
+  const TypeDesc* desc = get_desc(ty);
   switch (desc->kind) {
     case DescKind::Tvar:
     case DescKind::Tunivar:
@@ -256,7 +256,7 @@ static TypeExpr* typexp(CopyScope& copy_scope, t s, TypeExpr* ty) {
   bool has_fixed_row = !is_Tconstr(ty) && is_constr_row(false, tm);
   // Make a stub
   TypeExpr* ty2 = s->for_saving ? newpersty(tvar_none()) : newgenstub(get_scope(ty));
-  if (get_desc(ty) == desc) redirect_desc(copy_scope, ty, btype::scoped_tsubst(ty2, nullptr));
+  redirect_desc(copy_scope, ty, btype::scoped_tsubst(ty2, nullptr));
   auto rec = [&](TypeExpr* x) { return typexp(copy_scope, s, x); };
   const TypeDesc* desc2;
   if (has_fixed_row) {
@@ -454,17 +454,16 @@ const TypeDeclaration* type_declaration(t s, const TypeDeclaration* d) {
 }
 
 static ClassSignature* class_signature(CopyScope& cs, t s, const ClassSignature* sign) {
-  // definition order right to left: meths, vars, dummy, self_row, self
+  // definition order right to left: meths, vars, self_row, self
   auto meths = sign->csig_meths.map([&](const MethEntry& e) {
     return MethEntry{e.priv, e.virt, typexp(cs, s, e.ty)};
   });
   auto vars = sign->csig_vars.map([&](const VarEntry& e) {
     return VarEntry{e.mut, e.virt, typexp(cs, s, e.ty)};
   });
-  FieldKind* dummy = field_kind_internal_repr(sign->csig_dummy_method);
   TypeExpr* self_row = typexp(cs, s, sign->csig_self_row);
   TypeExpr* self = typexp(cs, s, sign->csig_self);
-  return make<ClassSignature>(self, self_row, dummy, vars, meths);
+  return make<ClassSignature>(self, self_row, vars, meths);
 }
 
 static const ClassType* class_type2(CopyScope& cs, t s, const ClassType* c) {

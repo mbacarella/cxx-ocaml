@@ -72,24 +72,17 @@ struct Variant {
 
 // 'variety obj
 struct Obj {
-  enum class Kind : std::uint8_t { Missing_field, Abstract_row, Self_cannot_be_closed, Kind_differ };
+  enum class Kind : std::uint8_t { Missing_field, Abstract_row, Self_cannot_be_closed };
   Kind kind;
   Position pos = Position::First;
   std::string_view name;
-  types::FieldKindView k1 = types::FieldKindView::Fpublic, k2 = types::FieldKindView::Fpublic;
 };
 
 struct FirstClassModule {
-  enum class Kind : std::uint8_t {
-    Package_cannot_scrape, Package_inclusion, Package_coercion, Constraint_on_missing_type,
-    Constraint_with_deps, Constraint_on_mismatched_type
-  };
+  enum class Kind : std::uint8_t { Package_cannot_scrape, Package_inclusion, Package_coercion };
   Kind kind;
   Path::t path = nullptr;
   format_doc::Doc doc;  // Package_inclusion / Package_coercion
-  Position pos = Position::First;
-  std::vector<std::string_view> lhs;
-  const TypeDeclaration* decl = nullptr;
 };
 
 struct Univar {
@@ -143,8 +136,6 @@ Elt<A> swap_elt(const Elt<A>& x) {
     case K::Obj:
       if (x.obj.kind == Obj::Kind::Missing_field || x.obj.kind == Obj::Kind::Abstract_row)
         r.obj.pos = swap_position(x.obj.pos);
-      else if (x.obj.kind == Obj::Kind::Kind_differ)
-        std::swap(r.obj.k1, r.obj.k2);
       break;
     case K::Variant:
       if (x.variant.kind == Variant::Kind::Fixed_row || x.variant.kind == Variant::Kind::No_tags)
@@ -155,12 +146,6 @@ Elt<A> swap_elt(const Elt<A>& x) {
         r.univar.order = swap_order(x.univar.order);
         r.univar.diff = swap_diff(x.univar.diff);
       }
-      break;
-    case K::First_class_module:
-      if (x.fcm.kind == FirstClassModule::Kind::Constraint_on_missing_type ||
-          x.fcm.kind == FirstClassModule::Kind::Constraint_with_deps ||
-          x.fcm.kind == FirstClassModule::Kind::Constraint_on_mismatched_type)
-        r.fcm.pos = swap_position(x.fcm.pos);
       break;
     default:
       break;

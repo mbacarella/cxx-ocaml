@@ -118,10 +118,9 @@ const ot::OutSigItem* tree_of_sigitem(const SignatureItem* it);
 ot::OutFunctorParam tree_of_functor_parameter_tree(const FunctorParameter& p);
 
 // type expansions (error messages)
-struct ExpansionDiff {
+struct ExpansionDiff {  // Same ty | Diff (ty, expanded)
   const ot::OutType* ty;
-  const ot::OutType* expanded;  // option
-  const ot::OutType* manifest;  // option
+  const ot::OutType* expanded;  // nullptr: Same
 };
 struct ExpansionPair {  // Errortrace.{ty; expanded}
   TypeExpr* ty;
@@ -138,13 +137,7 @@ bool same_path(TypeExpr* t, TypeExpr* t2);
 namespace internal_names {
 void reset();
 void add(Path::t p);
-struct Explanation {
-  enum class K : std::uint8_t { Existential, Equation } k;
-  std::string constructor;
-  TypeExpr* lhs = nullptr;
-  TypeExpr* rhs = nullptr;
-};
-std::vector<std::pair<std::vector<Path::t>, Explanation>> explain(env::t env);
+void print_explanations(env::t env, format_doc::Formatter& ppf);
 }  // namespace internal_names
 
 }  // namespace cppcaml::typing::out_type
