@@ -1008,6 +1008,22 @@ static int run_main(int argc, char** argv) {
   const std::string program = kTool;
   // Optmaindriver.main: native_code := true, before the arguments
   if (kNative) cf::native_code = true;
+  if (kNative) {
+    // the native back end ported: non-flambda amd64 on Linux, as this
+    // configuration's Config says (the code generator reads these values
+    // as constants)
+    static const std::pair<const char*, const char*> supported[] = {
+        {"architecture", "amd64"}, {"system", "linux"},       {"flambda", "false"},
+        {"with_frame_pointers", "false"}, {"asm_cfi_supported", "true"}, {"tsan", "false"}};
+    for (auto& [k, v] : supported) {
+      std::optional<std::string> x = ty::config::config_var(k);
+      if (!x || *x != v) {
+        std::cerr << CPPCAML_SELF ": this OCaml's configuration is not supported (" << k << ": "
+                  << (x ? *x : "?") << ", only " << v << ")\n";
+        return 2;
+      }
+    }
+  }
   const bool prof = std::getenv("CPPCAML_PROFILE") != nullptr;
   std::vector<std::string> args(argv, argv + argc);
   if (kNative) {

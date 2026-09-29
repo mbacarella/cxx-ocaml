@@ -1,11 +1,14 @@
-# An opam switch whose `ocamlc` is c++ocamlc
+# An opam switch whose `ocamlc` and `ocamlopt` are c++ocamlc and c++ocamlopt
 
 With the `ocaml-option-cxx` option, `ocaml-variants` built from this
-repository also builds c++ocamlc and installs it as `bin/ocamlc.opt`
-(`bin/ocamlc` points at it), keeping the stock compiler as
-`bin/ocamlc.stock`.  Every package installed in the switch afterwards is
-compiled to bytecode by c++ocamlc; `ocamlopt` and the other tools are the
-stock ones.
+repository also builds c++ocamlc and c++ocamlopt and installs them as
+`bin/ocamlc.opt` and `bin/ocamlopt.opt` (`bin/ocamlc` and `bin/ocamlopt`
+point at them), keeping the stock compilers as `bin/ocamlc.stock` and
+`bin/ocamlopt.stock`.  Every package installed in the switch afterwards is
+compiled by the C++ port, to bytecode and to native code; the other tools
+(ocamldep, the toplevel, ...) are the stock ones.  c++ocamlopt's back end
+is the non-flambda amd64 one on Linux: for any other configuration the
+stock ocamlopt stays (with a warning in the build log).
 
 ```sh
 opam switch create cxx --empty
@@ -28,15 +31,16 @@ DESTDIR=`: the installation is `--with-relative-libdir`, so the stage
 resolves its standard library as the real one will); generates
 c++ocamlc's driver tables (Config, the option list, warning descriptions)
 from the staged OCaml (`cxx/harness/gen_driver_tables.sh INSTALL=`);
-builds c++ocamlc, linking the very libzstd file the runtime loads (the
-same compressor code, hence the same compressed bytes); checks in the
-stage that `ocamlc -config` is identical to the stock compiler's and that
-a program compiles and runs; and has opam install c++ocamlc as
-`bin/ocamlc.opt` through `ocaml-variants.install`.  A failed check fails
-the build.
+builds c++ocamlc and c++ocamlopt, linking the very libzstd file the
+runtime loads (the same compressor code, hence the same compressed bytes);
+checks in the stage that `-config` is identical to the stock compilers',
+that a program compiles and runs, and that c++ocamlopt's `.cmx`, `.o` and
+executable are byte-identical to the stock ocamlopt's; and has opam
+install them as `bin/ocamlc.opt` and `bin/ocamlopt.opt` through
+`ocaml-variants.install`.  A failed check fails the build.
 
-To compile with the stock compiler for a comparison, use
-`ocamlc.stock` directly; to go back for good, `opam remove
+To compile with the stock compilers for a comparison, use
+`ocamlc.stock` / `ocamlopt.stock` directly; to go back for good, `opam remove
 ocaml-option-cxx` (opam rebuilds `ocaml-variants` without it).
 
 c++ocamlc keeps pre-decoded images of the `.cmi` files it reads in

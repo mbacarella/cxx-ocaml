@@ -8,6 +8,7 @@
 
 #include "cppcaml/typing/ccomp.hpp"
 #include "cppcaml/typing/clflags.hpp"
+#include "cppcaml/typing/config.hpp"
 #include "cppcaml/typing/cmm_helpers.hpp"
 #include "cppcaml/typing/cmmgen.hpp"
 #include "cppcaml/typing/emit.hpp"
@@ -129,7 +130,7 @@ void compile_unit(const std::string& asm_filename, bool keep_asm, const std::str
     }
     if (should_emit()) {
       // Proc.assemble_file (X86_proc.assemble_file)
-      int rc = ccomp::command(std::string("as") + " " + debug_prefix_map_flags() + " -o " +
+      int rc = ccomp::command(*config::config_var("asm") + " " + debug_prefix_map_flags() + " -o " +
                               filename::quote(obj_filename) + " " + filename::quote(asm_filename));
       if (rc != 0) throw Error{asm_filename};
     }

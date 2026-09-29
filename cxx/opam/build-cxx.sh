@@ -1,6 +1,7 @@
 #!/bin/sh
-# c++ocamlc as an opam switch's ocamlc: the step ocaml-variants.opam runs
-# when ocaml-option-cxx is installed (cxx/INSTALL.md).
+# c++ocamlc and c++ocamlopt as an opam switch's ocamlc and ocamlopt: the
+# step ocaml-variants.opam runs when ocaml-option-cxx is installed
+# (cxx/INSTALL.md).
 #
 #   build-cxx.sh <prefix> <jobs>
 #     in the build stage, in the source tree after `make` and
@@ -9,17 +10,20 @@
 #     2. the tree installed into a stage (make install DESTDIR=): the
 #        installation is --with-relative-libdir, so a staged copy resolves
 #        its standard library as the real one will;
-#     3. c++ocamlc built with the host's C++ toolchain (CXX, default
+#     3. c++ocamlc and c++ocamlopt built with the host's C++ toolchain (CXX, default
 #        clang++ >= 18), its driver tables generated from the staged OCaml
 #        (Config, Main_args, warnings -- cxx/harness/gen_driver_tables.sh
 #        INSTALL=), linking the installation's shared libzstd when its OCaml
 #        compresses;
 #     4. checked in the stage: the same libzstd file as the runtime's,
-#        `-config` identical to the stock ocamlc's, a program compiled and
-#        run;
+#        `-config` identical to the stock compilers', a program compiled and
+#        run; c++ocamlopt's .cmx, .o and executable identical to the stock
+#        ocamlopt's (c++ocamlopt is installed only for the configurations
+#        its back end supports: non-flambda amd64 Linux);
 #     5. ocaml-variants.install rewritten so that opam installs c++ocamlc as
 #        bin/ocamlc.opt (bin/ocamlc points at it) and the stock compiler as
-#        bin/ocamlc.stock.
+#        bin/ocamlc.stock; likewise c++ocamlopt as bin/ocamlopt.opt, the
+#        stock one as bin/ocamlopt.stock.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
@@ -87,7 +91,20 @@ do_build() {
   # shellcheck disable=SC2086
   cmake -S "$root/cxx" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CXX_COMPILER="$CXX" $mi_args $zstd_args >/dev/null
-  ninja -C "$build" -j "$jobs" c++ocamlc
+  # the native back end: non-flambda amd64 on Linux
+  native=1
+  for kv in architecture=amd64 system=linux flambda=false with_frame_pointers=false \
+            asm_cfi_supported=true tsan=false; do
+    v=$("$sbin/ocamlopt.opt" -config-var "${kv%%=*}" 2>/dev/null || true)
+    if [ "$v" != "${kv#*=}" ]; then
+      say "warning: ${kv%%=*} is $v: c++ocamlopt supports only ${kv#*=}; keeping the stock ocamlopt"
+      native=0
+    fi
+  done
+  targets="c++ocamlc"
+  [ $native = 1 ] && targets="$targets c++ocamlopt"
+  # shellcheck disable=SC2086
+  ninja -C "$build" -j "$jobs" $targets
   new="$build/c++ocamlc"
   # 4. the checks, in the stage
   if [ -n "$(zstd_libs)" ] && command -v ldd >/dev/null; then
@@ -111,6 +128,33 @@ do_build() {
     die "c++ocamlc could not compile and run a program"
   [ "$(cat "$t/out")" = "hello from c++ocamlc" ] || die "the compiled program printed the wrong thing"
   rm -rf "$t"
+  if [ $native = 1 ]; then
+    cp "$sbin/ocamlopt.opt" "$sbin/ocamlopt.stock"
+    cp "$build/c++ocamlopt" "$sbin/ocamlopt.opt"
+    t=$(mktemp -d)
+    "$sbin/ocamlopt.stock" -config > "$t/stock.config"
+    "$sbin/ocamlopt.opt" -config > "$t/cxx.config" || die "c++ocamlopt -config failed"
+    if ! cmp -s "$t/stock.config" "$t/cxx.config"; then
+      diff "$t/stock.config" "$t/cxx.config" >&2 || true
+      die "c++ocamlopt's -config differs from the stock ocamlopt's"
+    fi
+    # the same outputs as the stock ocamlopt's, byte for byte (built one
+    # after the other in the same directory: -g records it)
+    printf 'let greet l = String.concat " " l\nlet () = Printf.printf "%%s\\n" (greet ["hello"; "from"])\n' > "$t/a.ml"
+    printf 'let () = print_endline (A.greet ["c++ocamlopt"])\n' > "$t/b.ml"
+    for c in stock opt; do
+      ( cd "$t" && rm -f ./*.cm* ./*.o hello.exe &&
+        "$sbin/ocamlopt.$c" -g -c a.ml && "$sbin/ocamlopt.$c" -g -c b.ml &&
+        "$sbin/ocamlopt.$c" -g -o hello.exe a.cmx b.cmx && ./hello.exe > out.$c &&
+        mkdir -p "$c" && cp a.cmx a.o b.cmx b.o hello.exe "$c/" ) ||
+        die "ocamlopt.$c could not compile and run a program"
+    done
+    [ "$(cat "$t/out.opt")" = "$(printf 'hello from\nc++ocamlopt')" ] || die "the native program printed the wrong thing"
+    for f in a.cmx a.o b.cmx b.o hello.exe; do
+      cmp -s "$t/stock/$f" "$t/opt/$f" || die "c++ocamlopt's $f differs from the stock ocamlopt's"
+    done
+    rm -rf "$t"
+  fi
   # 5. opam installs c++ocamlc as ocamlc.opt, the stock one as ocamlc.stock
   inst="$root/ocaml-variants.install"
   [ -f "$inst" ] || die "no ocaml-variants.install (make INSTALL_MODE=opam install must run first)"
@@ -118,6 +162,12 @@ do_build() {
   sed -i 's|^  "ocamlc.opt"$|  "cxx/_opam_build/c++ocamlc" {"ocamlc.opt"}\
   "ocamlc.opt" {"ocamlc.stock"}|' "$inst"
   say "c++ocamlc will be installed as bin/ocamlc.opt (the stock compiler as bin/ocamlc.stock)"
+  if [ $native = 1 ]; then
+    grep -q '^  "ocamlopt.opt"$' "$inst" || die "ocaml-variants.install has no bin entry for ocamlopt.opt"
+    sed -i 's|^  "ocamlopt.opt"$|  "cxx/_opam_build/c++ocamlopt" {"ocamlopt.opt"}\
+  "ocamlopt.opt" {"ocamlopt.stock"}|' "$inst"
+    say "c++ocamlopt will be installed as bin/ocamlopt.opt (the stock compiler as bin/ocamlopt.stock)"
+  fi
 }
 
 case "${1:-}" in
