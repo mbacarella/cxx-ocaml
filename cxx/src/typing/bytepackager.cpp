@@ -343,7 +343,7 @@ struct State {
 struct PathMap {
   static long height(const V& m) { return m.is_int() ? 0 : m->fields[4].int_value(); }
   static const std::string& key_name(const V& m) {
-    return m->fields[1]->fields[0]->fields[0]->s;  // Pident (Global name)
+    return m->fields[1]->fields[0]->fields[0]->str();  // Pident (Global name)
   }
   static V create(const V& l, const V& x, const V& d, const V& r) {
     long hl = height(l), hr = height(r);

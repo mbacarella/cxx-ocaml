@@ -43,6 +43,15 @@ void* arena_alloc(std::size_t n, std::size_t align) {
   return p;
 }
 
+Value::Extra& Value::extra() {
+  if (!x) x = new (arena_alloc(sizeof(Extra), alignof(Extra))) Extra;
+  return *x;
+}
+const std::string& Value::empty_str() {
+  static const std::string e;
+  return e;
+}
+
 static Value* new_value(Value::K k) {
   Value* v = new (arena_alloc(sizeof(Value), alignof(Value))) Value;
   v->k_ = k;
@@ -53,7 +62,7 @@ static Value* new_value(Value::K k) {
 ValPtr vint(long long n) { return ValPtr::immediate(n); }
 ValPtr vstr(std::string s) {
   Value* v = new_value(Value::Str);
-  v->s = std::move(s);
+  v->extra().s = std::move(s);
   return ValPtr(v);
 }
 ValPtr vdbl(double d) {
@@ -75,20 +84,20 @@ ValPtr vblock(int tag, std::initializer_list<ValPtr> f) {
 }
 ValPtr vdblarr(std::vector<double> ds) {
   Value* v = new_value(Value::DblArr);
-  v->darr = ds;
+  v->extra().darr = ds;
   return ValPtr(v);
 }
 ValPtr vcustom(std::string raw, long long data_bytes) {
   Value* v = new_value(Value::Custom);
-  v->s = std::move(raw);
+  v->extra().s = std::move(raw);
   v->custom_bytes = data_bytes;
   return ValPtr(v);
 }
 ValPtr vcustom2(std::string raw, long long bytes32, long long bytes64) {
   Value* v = new_value(Value::Custom);
-  v->s = std::move(raw);
+  v->extra().s = std::move(raw);
   v->custom_bytes = bytes64;
-  v->custom_bytes32 = bytes32;
+  v->extra().custom_bytes32 = bytes32;
   return ValPtr(v);
 }
 ValPtr vlist(const std::vector<ValPtr>& xs) {
@@ -169,7 +178,7 @@ struct Marshaler {
     v->seen_index = nobjs;
     switch (v->k_) {
       case Value::Int: return;  // (an immediate: above)
-      case Value::Str: emit_str(v->s); return;
+      case Value::Str: emit_str(v->str()); return;
       case Value::Dbl: {
         byte(0xC);  // CODE_DOUBLE_LITTLE
         std::uint64_t bits; std::memcpy(&bits, &v->d, 8);
@@ -188,10 +197,10 @@ struct Marshaler {
         return;
       }
       case Value::DblArr: {
-        std::size_t n = v->darr.size();
+        std::size_t n = v->extra().darr.size();
         if (n < 0x100) { byte(0xE); byte((int)n); }       // DOUBLE_ARRAY8_LITTLE
         else { byte(0x7); be32((std::uint32_t)n); }       // DOUBLE_ARRAY32_LITTLE
-        for (double dd : v->darr) {
+        for (double dd : v->extra().darr) {
           std::uint64_t bits; std::memcpy(&bits, &dd, 8);
           for (int s = 0; s < 64; s += 8) byte(bits >> s);
         }
@@ -199,9 +208,9 @@ struct Marshaler {
         return;
       }
       case Value::Custom: {  // verbatim on-disk custom bytes (incl. its code byte)
-        bytes(v->s);
+        bytes(v->str());
         nobjs++;                                  // extern.c:858 (header + ops)
-        w32 += 2 + (((v->custom_bytes32 >= 0 ? v->custom_bytes32 : v->custom_bytes) + 3) >> 2);
+        w32 += 2 + (((v->extra().custom_bytes32 >= 0 ? v->extra().custom_bytes32 : v->custom_bytes) + 3) >> 2);
         w64 += 2 + ((v->custom_bytes + 7) >> 3);
         return;
       }

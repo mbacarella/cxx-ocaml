@@ -75,7 +75,7 @@ class CamlHash {
       V x = queue[rd++];
       switch (x.kind()) {
         case o::Value::Int: h = mix_intnat(h, 2 * x.int_value() + 1); num--; break;
-        case o::Value::Str: h = mix_string(h, x->s); num--; break;
+        case o::Value::Str: h = mix_string(h, x->str()); num--; break;
         case o::Value::Dbl: h = mix_double(h, x->d); num--; break;
         case o::Value::Block: {
           std::uint64_t hd = (static_cast<std::uint64_t>(x->fields.size()) << 10) | static_cast<std::uint64_t>(x->tag);

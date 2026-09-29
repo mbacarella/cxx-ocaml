@@ -115,22 +115,32 @@ class ValPtr {
 struct Value {
   enum K : std::uint8_t { Int, Str, Dbl, Block, DblArr, Custom } k_ = Int;  // never Int: an immediate
   int tag = 0;
-  double d = 0;
-  // Custom: the DATA size in bytes, as the serializer wrote it.  extern.c sizes
-  // a custom block as `2 + ((sz + wordsize - 1) / wordsize)` -- header + ops +
-  // data -- and the 32- and 64-bit counts therefore differ for the same block,
-  // which a word count taken on one of them cannot express.
-  long long custom_bytes = 0;
-  // the 32-bit data size when it differs from the 64-bit one (nativeint:
-  // 4 / 8, runtime/ints.c); -1 = custom_bytes
-  long long custom_bytes32 = -1;
-  std::string s;  // Str data / Custom raw on-disk bytes (from the code byte)
-  ArenaVec<ValPtr> fields;
-  ArenaVec<double> darr;
   // the marshaling session that last serialized this object, and its index
   // in that session's object table (a repeat is a back-reference)
   std::uint32_t seen_session = 0;
-  long long seen_index = 0;
+  std::uint32_t seen_index = 0;
+  union {
+    double d = 0;  // Dbl
+    // Custom: the DATA size in bytes, as the serializer wrote it.  extern.c
+    // sizes a custom block as `2 + ((sz + wordsize - 1) / wordsize)` -- header
+    // + ops + data -- and the 32- and 64-bit counts therefore differ for the
+    // same block, which a word count taken on one of them cannot express.
+    long long custom_bytes;
+  };
+  ArenaVec<ValPtr> fields;  // Block
+  // what only a string, a float array or a custom has (the -g debug events'
+  // hundreds of thousands of blocks stay small)
+  struct Extra {
+    std::string s;  // Str data / Custom raw on-disk bytes (from the code byte)
+    ArenaVec<double> darr;
+    // the 32-bit data size when it differs from the 64-bit one (nativeint:
+    // 4 / 8, runtime/ints.c); -1 = custom_bytes
+    long long custom_bytes32 = -1;
+  };
+  Extra* x = nullptr;
+  Extra& extra();  // (created on first use, in the arena)
+  const std::string& str() const { return x ? x->s : empty_str(); }
+  static const std::string& empty_str();
 };
 inline int ValPtr::kind() const { return is_int() ? Value::Int : get()->k_; }
 

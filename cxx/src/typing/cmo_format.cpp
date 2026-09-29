@@ -71,7 +71,7 @@ std::vector<Reloc> CompUnit::relocs() const {
     if (rel.k == Reloc::K::Reloc_literal) {
       rel.literal = info->fields[0];
     } else {
-      rel.name = info->fields[0]->s;
+      rel.name = info->fields[0]->str();
       rel.name_obj = info->fields[0];
     }
     r.push_back(std::move(rel));
@@ -83,8 +83,8 @@ std::vector<std::pair<std::string, std::optional<std::string>>> CompUnit::import
   std::vector<std::pair<std::string, std::optional<std::string>>> r;
   for (const V& e : list_elems(v->fields[cu_imports])) {
     const V& crc = e->fields[1];
-    if (crc.kind() == omarshal::Value::Block) r.emplace_back(e->fields[0]->s, crc->fields[0]->s);
-    else r.emplace_back(e->fields[0]->s, std::nullopt);
+    if (crc.kind() == omarshal::Value::Block) r.emplace_back(e->fields[0]->str(), crc->fields[0]->str());
+    else r.emplace_back(e->fields[0]->str(), std::nullopt);
   }
   return r;
 }
@@ -100,13 +100,13 @@ std::vector<std::pair<V, V>> CompUnit::import_objs() const {
 
 std::vector<std::string> CompUnit::required_compunits() const {
   std::vector<std::string> r;
-  for (const V& e : list_elems(v->fields[cu_required_compunits])) r.push_back(e->s);
+  for (const V& e : list_elems(v->fields[cu_required_compunits])) r.push_back(e->str());
   return r;
 }
 
 std::vector<std::string> CompUnit::primitives() const {
   std::vector<std::string> r;
-  for (const V& e : list_elems(v->fields[cu_primitives])) r.push_back(e->s);
+  for (const V& e : list_elems(v->fields[cu_primitives])) r.push_back(e->str());
   return r;
 }
 

@@ -65,12 +65,12 @@ std::vector<std::pair<bool, std::string>> g_lib_dllibs;
 
 std::vector<std::string> strings_of(const V& l) {
   std::vector<std::string> r;
-  for (const V& e : cmo_format::list_elems(l)) r.push_back(e->s);
+  for (const V& e : cmo_format::list_elems(l)) r.push_back(e->str());
   return r;
 }
 std::vector<std::pair<bool, std::string>> dllibs_of(const V& l) {
   std::vector<std::pair<bool, std::string>> r;  // (~suffixed:bool * string)
-  for (const V& e : cmo_format::list_elems(l)) r.emplace_back(e->fields[0].int_value() != 0, e->fields[1]->s);
+  for (const V& e : cmo_format::list_elems(l)) r.emplace_back(e->fields[0].int_value() != 0, e->fields[1]->str());
   return r;
 }
 template <class T>
@@ -169,12 +169,12 @@ std::map<std::string, V> g_crc_objs;
 // the result carries), then consed
 std::vector<std::pair<V, V>> extract_crc_interfaces() {
   std::vector<V> l = list_sort::sort_uniq(g_interfaces, [](const V& a, const V& b) {
-    int c = a->s.compare(b->s);
+    int c = a->str().compare(b->str());
     return c < 0 ? -1 : c > 0 ? 1 : 0;
   });
   std::vector<std::pair<V, V>> assc;
   for (const V& name : l) {
-    auto it = g_crc_objs.find(name->s);
+    auto it = g_crc_objs.find(name->str());
     assc.insert(assc.begin(), {name, it == g_crc_objs.end() ? nullptr : it->second});
   }
   return assc;
@@ -212,7 +212,7 @@ bool link_compunit(bool accu, const OutputFun& output_fun, const CurrposFun& cur
     V debug_dirs = inchan.input_value(p);
     std::string file_path = filename::dirname(location::absolute_path(file_name));
     bool mem = false;
-    for (const V& d : cmo_format::list_elems(debug_dirs)) mem = mem || d->s == file_path;
+    for (const V& d : cmo_format::list_elems(debug_dirs)) mem = mem || d->str() == file_path;
     if (!mem) debug_dirs = o::vblock(0, {o::vstr(file_path), debug_dirs});
     g_debug_info.insert(g_debug_info.begin(), DebugInfo{currpos_fun(), debug_event_list, debug_dirs});
   }
@@ -838,8 +838,8 @@ void check_consistency(const std::string& file_name, const CompUnit& cu) {
     for (auto& [name, crco] : cu.import_objs()) {
       g_interfaces.insert(g_interfaces.begin(), name);
       if (crco) {
-        g_crc_interfaces.check(name->s, crco->s, file_name);
-        g_crc_objs.emplace(name->s, crco);  // (Consistbl.check adds the first)
+        g_crc_interfaces.check(name->str(), crco->str(), file_name);
+        g_crc_objs.emplace(name->str(), crco);  // (Consistbl.check adds the first)
       }
     }
   } catch (const Consistbl::Inconsistency& e) {

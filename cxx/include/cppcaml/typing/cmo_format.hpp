@@ -41,7 +41,7 @@ struct CompUnit {
   V v;
   long int_field(CuField f) const { return static_cast<long>(v->fields[f].int_value()); }
   void set_int_field(CuField f, long n) { v->fields[f] = omarshal::vint(n); }
-  std::string name() const { return v->fields[cu_name]->s; }
+  std::string name() const { return v->fields[cu_name]->str(); }
   std::vector<Reloc> relocs() const;
   std::vector<std::pair<std::string, std::optional<std::string>>> imports() const;
   // cu_imports as the string objects: (name, crc) with crc null for None
