@@ -45,7 +45,6 @@ using L = lambda::StructuredConstant;
 using lambda::IntegerComparison;
 using lambda::PhysicalComparison;
 
-constexpr const char* cmo_magic_number = "Caml1999O038";
 
 [[noreturn]] void fatal_error(const char* msg) { throw std::logic_error(msg); }
 
@@ -875,7 +874,7 @@ PackedFile to_packed_file(std::string& out, code c, ValueContext& w, ValueContex
 void to_file(std::FILE* outchan, std::string_view filename, std::string_view modname,
              const lambda::IdentSet& required_globals, code c) {
   Emitter em;
-  std::string buf(cmo_magic_number);
+  std::string buf(config::cmo_magic_number);
   long pos_depl = static_cast<long>(buf.size());
   output_binary_int(buf, 0);
   long pos_code = static_cast<long>(buf.size());

@@ -20,8 +20,6 @@ struct DebugEvent;
 
 namespace cppcaml::typing::cmi_format {
 
-inline constexpr const char* cmi_magic_number = "Caml1999I038";
-
 struct PersFlag {
   enum class Kind : std::uint8_t { Rectypes, Alerts, Opaque };
   Kind kind;
