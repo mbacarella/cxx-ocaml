@@ -214,6 +214,7 @@ type error =
   | Optional_poly_param of string
   | Cannot_unify_tfunctor_to_tarrow of Errortrace.unification_error
   | Cannot_omit_tfunctor_argument of Ident.Unscoped.t * type_expr
+  | Unexpected_hole
 
 
 let not_principal fmt =
@@ -230,10 +231,35 @@ module Error : sig
 end = struct
   type exn += In_context of Location.t * Env.t * error
 
-  let deep_copy_package copy {pack_path; pack_constraints} =
-    {pack_path;
+  (** Copy unscoped part of paths to freeze them in error messages *)
+  let copy_unscoped us id_map =
+    List.find_map
+      (fun (i,x) -> if Ident.Unscoped.same i us then Some x else None)
+      id_map
+
+  let rec copy_path id_map = function
+    | Path.Pdot (p,s) -> Path.Pdot (copy_path id_map p, s)
+    | Path.Papply (f,x) -> Path.Papply (copy_path id_map f, copy_path id_map x)
+    | Path.Pextra_ty (p,e) -> Path.Pextra_ty(copy_path id_map p, e)
+    | Path.Pident id as p ->
+        match Ident.find_unscoped id with
+        | None -> p
+        | Some us ->
+            match copy_unscoped us id_map with
+            | None -> p
+            | Some us' -> Path.Pident (Ident.of_unscoped us')
+
+  let copy_path id_map p =
+    match id_map with
+    | [] -> p
+    | _ ->
+        if Path.contains_unscoped_ident p then copy_path id_map p
+        else p
+
+  let deep_copy_package id_map copy {pack_path; pack_constraints} =
+    {pack_path = copy_path id_map pack_path;
      pack_constraints =
-       List.map (fun (l, tl) -> l, copy tl) pack_constraints}
+       List.map (fun (l, tl) -> l, copy id_map tl) pack_constraints}
 
   (* The goal of [deep_copy_desc/deep_copy] is to obtain a fully
      independent copy of a type, including all nested structure,
@@ -250,7 +276,9 @@ end = struct
      One could consider adapting [Btype.copy_type_desc] to avoid
      duplication. *)
 
-  let deep_copy_desc copy = function
+  let deep_copy_desc id_map copy_with_map =
+    let copy x = copy_with_map id_map x in
+    function
     | Tvar _ | Tnil | Tunivar _ as desc -> desc
     | Tvariant _ as desc ->
         (* The row_desc does contain some type exprs, but:
@@ -263,23 +291,27 @@ end = struct
     | Tarrow (l,t1,t2,c) -> Tarrow (l, copy t1, copy t2, c)
     | Ttuple tl ->
         Ttuple (List.map (fun (lbl, t) -> lbl, copy t) tl)
-    | Tconstr (p, tl, _) -> Tconstr (p, List.map copy tl, ref Mnil)
+    | Tconstr (p, tl, _) ->
+        Tconstr (copy_path id_map p, List.map copy tl, ref Mnil)
     | Tobject (t1, r) ->
         let r = match !r with
           | None -> None
-          | Some (p,tl) -> Some (p, List.map copy tl)
+          | Some (p,tl) -> Some (copy_path id_map p, List.map copy tl)
         in
         Tobject (copy t1, ref r)
     | Tfield (s,fk,t1,t2) -> Tfield (s, fk, copy t1, copy t2)
     | Tpoly (t,tl) -> Tpoly (copy t, List.map copy tl)
     | Tpackage package ->
-        Tpackage (deep_copy_package copy package)
+        Tpackage (deep_copy_package id_map copy_with_map package)
     | Tfunctor (l, id, package, type_expr) ->
-        (* TODO: Unscoped idents should probably also be copied to freeze
-           module-dependent paths *)
-        Tfunctor (l, id, deep_copy_package copy package, copy type_expr)
-    | Texpand (t, p, tl) ->
-        Texpand (copy t, p, List.map copy tl)
+        let new_id = Ident.Unscoped.refresh id in
+        let id_map = (id, new_id) :: id_map in
+        let package = deep_copy_package id_map copy_with_map package in
+        Tfunctor (l, new_id, package, copy_with_map id_map type_expr)
+    | Texpand (t, abbr) ->
+        Texpand (copy t, {abbr_path = copy_path id_map abbr.abbr_path;
+                          abbr_args = List.map copy abbr.abbr_args;
+                          abbr_level = abbr.abbr_level})
     | Tlink _ | Tsubst _ -> assert false
 
 
@@ -287,7 +319,7 @@ end = struct
      backtracking *)
   let deep_copy () =
     let table = TypeHash.create 7 in
-    let rec copy ty : type_expr =
+    let rec copy id_map ty : type_expr =
       try TypeHash.find table ty with
       | Not_found ->
           let ty' =
@@ -298,11 +330,11 @@ end = struct
             create_expr ~level ~id ~scope desc
           in
           let () = TypeHash.add table ty ty' in
-          let desc = deep_copy_desc copy (get_desc ty) in
+          let desc = deep_copy_desc id_map copy (get_desc ty) in
           Transient_expr.(set_desc (repr ty') desc);
           ty'
     in
-    copy
+    copy []
 
   let trace_copy_raw ?(copy=deep_copy ())
         (trace : Errortrace.unification Errortrace.error) =
@@ -381,13 +413,13 @@ end = struct
       Typing_recovery.log_or_raise (freeze_error (loc, env, err))
     else
       raise (In_context (loc, env, err))
-end
 
-let is_recoverable = function
-  | Error.In_context _
-  | Env.Error.In_context _
-  | Typetexp.Error.In_context _ -> true
-  | exn -> !Typing_recovery.is_typemod_recoverable_error exn
+  let () =
+    Typing_recovery.register_recoverable (function
+        | In_context _ -> true
+        | _ -> false
+      )
+end
 
 exception Error_forward of Location.error
 
@@ -655,11 +687,10 @@ let type_continuation_pat env expected_ty sp =
   | Ppat_var name ->
       let id = Ident.create_local name.txt in
       let desc =
-        { val_type = expected_ty; val_kind = Val_reg;
-          Types.val_loc = loc; val_attributes = [];
-          val_uid = Uid.mk ~current_unit:(Env.get_current_unit ()); }
+        { cont_id = id; cont_loc = loc; cont_type = expected_ty;
+          cont_uid = Uid.mk ~current_unit:(Env.get_current_unit ()); }
       in
-        Some (id, desc)
+        Some desc
   | Ppat_extension ext ->
       raise (Error_forward (Builtin_attributes.error_of_extension ext))
   | _ -> Error.log_and_raise loc env Invalid_continuation_pattern
@@ -865,13 +896,13 @@ type type_pat_state =
 
 let continuation_variable = function
   | None -> []
-  | Some (id, (desc:Types.value_description)) ->
-    [{pv_id = id;
-     pv_type = desc.val_type;
-     pv_loc = desc.val_loc;
+  | Some {cont_id; cont_loc; cont_type; cont_uid} ->
+    [{pv_id = cont_id;
+     pv_type = cont_type;
+     pv_loc = cont_loc;
      pv_kind = Continuation_var;
-     pv_attributes = desc.val_attributes;
-     pv_uid= desc.val_uid}]
+     pv_attributes = [];
+     pv_uid= cont_uid}]
 
 let create_type_pat_state ?cont allow_modules =
   let tps_module_variables =
@@ -2051,7 +2082,7 @@ let rec type_pat
     if !Clflags.typing_recovery then
       Typing_recovery_state.with_saved_types (fun () ->
           try delayed ()
-          with exn when is_recoverable exn ->
+          with exn when Typing_recovery.is_recoverable exn ->
             (* We only want to catch error, not internal exceptions
                such as [Need_backtrack], etc.
 
@@ -3521,7 +3552,7 @@ let rec is_nonexpansive exp =
       is_nonexpansive body
   | Texp_apply(e, (_,Omitted ())::el) ->
       is_nonexpansive e && List.for_all is_nonexpansive_arg (List.map snd el)
-  | Texp_match(e, cases, _, _) ->
+  | Texp_match(e, cases, eff_cases, _) ->
      (* Not sure this is necessary, if [e] is nonexpansive then we shouldn't
          care if there are exception patterns. But the previous version enforced
          that there be none, so... *)
@@ -3536,7 +3567,10 @@ let rec is_nonexpansive exp =
         (fun {c_lhs; c_guard; c_rhs} ->
            is_nonexpansive_opt c_guard && is_nonexpansive c_rhs
            && not (contains_exception_pat c_lhs)
-        ) cases
+        ) cases &&
+      List.for_all
+        (fun {c_guard; c_rhs} ->
+           is_nonexpansive_opt c_guard && is_nonexpansive c_rhs) eff_cases
   | Texp_tuple el ->
       List.for_all (fun (_, e) -> is_nonexpansive e) el
   | Texp_construct( _, _, el) ->
@@ -4493,7 +4527,8 @@ and type_expect ?recarg env sexp (ty_expected_explained : type_expected) =
         Builtin_attributes.warning_scope sexp.pexp_attributes
           (fun () ->
              type_expect_ ?recarg env sexp ty_expected_explained)
-      with exn when !Clflags.typing_recovery && is_recoverable exn ->
+      with exn when !Clflags.typing_recovery
+                 && Typing_recovery.is_recoverable exn ->
         Typing_recovery.erroneous_type_register ty_expected_explained.ty;
         let loc = sexp.pexp_loc in
         let exp =
@@ -5219,10 +5254,11 @@ and type_expect_
           exp_attributes = sexp.pexp_attributes;
           exp_env = env }
       in
-      if !Clflags.typing_recovery then
+      begin
         try suspended ()
         with Error.In_context
-            (_, _, Undefined_method (obj, _, _)) ->
+            (_, _, Undefined_method (obj, _, _)) when
+            !Clflags.typing_recovery ->
             rue {
               exp_desc = Texp_send(obj, Tmeth_name met);
               exp_loc = loc; exp_extra = [];
@@ -5230,7 +5266,7 @@ and type_expect_
               exp_attributes =
                 Typing_recovery_state.recovery_attributes sexp.pexp_attributes;
               exp_env = env }
-      else suspended ()
+      end
   | Pexp_new cl ->
       let (cl_path, cl_decl) = Env.lookup_class ~loc:cl.loc cl.txt env in
       begin match cl_decl.cty_new with
@@ -5577,6 +5613,9 @@ and type_expect_
            exp_attributes = sexp.pexp_attributes;
            exp_env = env }
 
+  | Pexp_hole ->
+      Error.log_and_raise loc env Unexpected_hole
+
   | Pexp_struct_item (si, e) ->
       let tv = newvar () in
       let delayed () =
@@ -5603,7 +5642,8 @@ and type_expect_
         }
       in
       try delayed ()
-      with exn when !Clflags.typing_recovery && is_recoverable exn ->
+      with exn when !Clflags.typing_recovery
+                 && Typing_recovery.is_recoverable exn ->
         (* The original error has been logged already, and we don't want
            spurious errors to show up on parts that are recovered, so we
            locally redirect all errors to a ref that we never read
@@ -5928,15 +5968,14 @@ and type_function
           in
           (params, body, newtypes, contains_gadt), exp_type)
       in
-      if !Clflags.typing_recovery then
+      begin
         try
           with_explanation ty_fun.explanation (fun () ->
               unify_exp_types loc env exp_type (instance ty_expected))
-        with exn when is_recoverable exn ->
+        with exn when !Clflags.typing_recovery
+                   && Typing_recovery.is_recoverable exn ->
           Typing_recovery.erroneous_type_register ty_expected
-      else
-        with_explanation ty_fun.explanation (fun () ->
-            unify_exp_types loc env exp_type (instance ty_expected));
+      end;
       exp_type, params, body, newtype :: newtypes, contains_gadt
   | { pparam_desc = Pparam_val (arg_label, None, pat); pparam_loc } :: rest
     when is_unpack pat && could_be_functor env ty_expected
@@ -6023,7 +6062,8 @@ and type_function
         try
           with_explanation ty_fun.explanation (fun () ->
               unify_exp_types loc env exp_type (instance ty_expected))
-        with exn when !Clflags.typing_recovery && is_recoverable exn ->
+        with exn when !Clflags.typing_recovery
+                   && Typing_recovery.is_recoverable exn ->
           Typing_recovery.erroneous_type_register ty_expected
       in
       (* This is quadratic, as it extracts all of the parameters from an arrow
@@ -6031,21 +6071,13 @@ and type_function
          there might be an opportunity to improve this.
       *)
       let only_labels_function_ret_tvar ty =
-        (* [arrow_spine] does expansion and is potentially expensive;
+        (* [arrow_labels] does expansion and is potentially expensive;
            only call this when necessary. *)
-        let label_tys, ret_ty_or_cycle = arrow_spine env ty in
+        let labels, ~is_ret_tvar = arrow_labels env ty in
         let is_spine_only_labels =
-          List.for_all (fun (label, _arg_ty) -> label <> Nolabel) label_tys
+          List.for_all (fun label -> label <> Nolabel) labels
         in
-        if is_spine_only_labels
-        then (
-          match ret_ty_or_cycle with
-          | Ret_cycle -> Some `Not_tvar
-          | Ret_type ty ->
-              if is_Tvar ty
-              then Some (`Tvar ty)
-              else Some `Not_tvar )
-        else None
+        if is_spine_only_labels then Some is_ret_tvar else None
       in
       (* An optional argument [?x] is only erasable if the function's return
          type eventually becomes an unlabelled arrow type ['a -> 'b].
@@ -6066,14 +6098,14 @@ and type_function
       if is_optional arg_label
       then (
         match only_labels_function_ret_tvar ty_ret with
-        | Some (`Tvar ret_tvar) ->
+        | Some true ->
           (* We don't necessarily know [ty] is a function with only labelled
              args since unification may change this. So we add
              a delayed check. *)
           add_delayed_check (fun () ->
-              if Option.is_some (only_labels_function_ret_tvar ret_tvar)
+              if only_labels_function_ret_tvar ty_ret = Some false
               then raise_unerasable_optional_argument ())
-        | Some `Not_tvar -> raise_unerasable_optional_argument ()
+        | Some false -> raise_unerasable_optional_argument ()
         | None -> ());
       let fp_kind, fp_param =
         match default_arg with
@@ -6297,7 +6329,8 @@ and type_label_access env srecord usage lid =
       wrap_disambiguate "This expression has" (mk_expected ty_exp)
         (Label.disambiguate usage lid env expected_type) labels in
     (record, label, expected_type)
-  with exn when !Clflags.typing_recovery && is_recoverable exn ->
+  with exn when !Clflags.typing_recovery
+             && Typing_recovery.is_recoverable exn ->
     Typing_recovery.erroneous_type_register ty_exp;
     let fake_label = {
       lbl_name = "";
@@ -6738,7 +6771,7 @@ and type_argument ?explanation ?recarg env sarg ty_expected' ty_expected =
   if !Clflags.typing_recovery then
     Typing_recovery_state.with_saved_types (fun () ->
         try delayed ()
-        with exn when is_recoverable exn ->
+        with exn when Typing_recovery.is_recoverable exn ->
           Typing_recovery.erroneous_type_register ty_expected;
           let loc = sarg.pexp_loc in
           let exp =
@@ -7311,7 +7344,6 @@ and type_cases
     ~type_body:begin
       fun { pc_guard; pc_rhs } pat ~when_env ~ext_env ~cont ~ty_expected
         ~ty_infer ~contains_gadt:_ ->
-        let cont = Option.map (fun (id,_) -> id) cont in
         let guard =
           match pc_guard with
           | None -> None
@@ -7369,7 +7401,8 @@ and type_function_cases_expect
     try
       unify_exp_types loc env ty_fun (instance ty_expected);
       cases, partial, ty_fun
-    with exn when !Clflags.typing_recovery && is_recoverable exn ->
+    with exn when !Clflags.typing_recovery
+               && Typing_recovery.is_recoverable exn ->
       Typing_recovery.erroneous_type_register ty_expected;
       cases, partial, ty_fun
   end
@@ -8721,6 +8754,9 @@ let report_error ~loc env =
             The module argument %a cannot be omitted in this application.@]"
             print_expanded func_ty
             Style.inline_code (Ident.Unscoped.name id_us)
+  | Unexpected_hole ->
+      Location.errorf ~loc
+        "Uninterpreted expression wildcard %a." Style.inline_code "_"
 
 let report_error ~loc env err =
   Printtyp.wrap_printing_env ~error:true env

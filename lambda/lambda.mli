@@ -164,6 +164,7 @@ type primitive =
   | Pint_as_pointer
   (* Atomic operations *)
   | Patomic_load
+  | Patomic_fetch_add
   (* Inhibition of optimisation *)
   | Popaque
   (* Fetching domain-local state *)
@@ -526,6 +527,8 @@ val make_atomic_loc : loc:scoped_location -> lambda -> lambda -> lambda
 
 (* Get a new static failure ident *)
 val next_raise_count : unit -> int
+
+val reset_raise_count : unit -> unit
 
 val staticfail : lambda (* Anticipated static failure *)
 

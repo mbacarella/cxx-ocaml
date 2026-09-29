@@ -180,7 +180,7 @@ let dummy_method = "*dummy method*"
 
 let get_constr_desc ty =
   match get_abbrev ty with
-    Some (path, tyl) -> Tconstr (path, tyl, ref Mnil)
+    Some abbr -> Tconstr (abbr.abbr_path, abbr.abbr_args, ref Mnil)
   | None -> get_desc ty
 
                   (********************************)
@@ -243,15 +243,7 @@ let static_row row =
     (fun (_,f) -> match row_field_repr f with Reither _ -> false | _ -> true)
     (row_fields row)
 
-let hash_variant s =
-  let accu = ref 0 in
-  for i = 0 to String.length s - 1 do
-    accu := 223 * !accu + Char.code s.[i]
-  done;
-  (* reduce to 31 bits *)
-  accu := !accu land (1 lsl 31 - 1);
-  (* make it signed for 64 bits architectures *)
-  if !accu > 0x3FFFFFFF then !accu - (1 lsl 31) else !accu
+let hash_variant = Obj.hash_variant
 
 let proxy ty =
   match get_desc ty with
@@ -329,10 +321,10 @@ let fold_row f init row =
   match get_desc (row_more row) with
   | Tvar _ | Tunivar _ | Tsubst _ | Tconstr _ | Tnil ->
     begin match
-      Option.map (fun (_,l) -> List.fold_left f result l) (row_name row)
+      row_name row
     with
     | None -> result
-    | Some result -> result
+    | Some (_,l) -> List.fold_left f result l
     end
   | _ -> assert false
 
@@ -376,8 +368,20 @@ let fold_type_desc f init = function
 let fold_type_expr f init ty =
   fold_type_desc f init (get_desc ty)
 
+(* Rather than creating a closure that captures [f], we pass [f] as the
+   fold accumulator. This means we avoid closure allocation in [iter_*].
+*)
 let iter_type_expr f ty =
-  fold_type_expr (fun () v -> f v) () ty
+  let (_ : type_expr -> unit) =
+    fold_type_expr (fun f v -> f v; f) f ty
+  in
+  ()
+
+let iter_type_desc f desc =
+  let (_ : type_expr -> unit) =
+    fold_type_desc (fun f v -> f v; f) f desc
+  in
+  ()
 
 let rec iter_abbrev_memo f = function
     Mnil                   -> ()
@@ -839,12 +843,24 @@ let instance_variable_type label sign =
 (* Return whether [t0] occurs in [ty]. Objects are also traversed. *)
 exception Occur
 
-let rec deep_occur_rec mark t0 ty =
-  if get_level ty >= get_level t0 && try_mark_node mark ty then begin
-    if eq_type ty t0 then raise Occur;
-    iter_type_expr (deep_occur_rec mark t0) ty;
-    iter_abbrev (fun _p tyl -> List.iter (deep_occur_rec mark t0) tyl) ty
-  end
+let deep_occur_rec mark t0 =
+  (* In order to avoid calling [repr] repeatedly on the same type, we use
+     [Transient_expr] to witness that [repr] has been called. This also
+     means we can directly access [level] and [desc]. This transformation
+     is valid as long as no type expressions are not modified during the
+     lifetime of the Transient expression. We achieve a speedup on very
+     large types between 20% and 45%. *)
+  let t0 = Transient_expr.repr t0 in
+  let rec occur ty =
+    let ty' = Transient_expr.repr ty in
+    if ty'.level >= t0.level && Transient_expr.try_mark_node mark ty' then begin
+      if Transient_expr.eq t0 ty' then raise Occur;
+      iter_type_desc occur ty'.desc;
+      iter_abbrev occur_abbrev ty
+    end
+  and occur_abbrev abbr = List.iter occur abbr.abbr_args
+  in
+  occur
 
 let deep_occur t0 ty =
   try
@@ -871,7 +887,7 @@ let get_folded_desc ~keep_Tvar ty =
       (* Only re-instate an abbreviation if there is no risk to hide
          something *)
       match get_abbrev ty with
-      | Some (path, args) when not (Path.contains_unscoped_ident path ||
-                                    deep_occur_list ty args) ->
-          Tconstr (path, args, ref Mnil)
+      | Some abbr when not (Path.contains_unscoped_ident abbr.abbr_path ||
+                            deep_occur_list ty abbr.abbr_args) ->
+          Tconstr (abbr.abbr_path, abbr.abbr_args, ref Mnil)
       | _ -> desc

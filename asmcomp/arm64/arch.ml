@@ -26,9 +26,34 @@ let freebsd = (Config.system = "freebsd")
 
 let top_bits_ignore = (Config.system = "linux")
 
+(* Store-ordering strategy for the multicore memory-model barrier that
+   precedes a non-initializing store to a mutable field or array element.
+
+   By default this is a store-release [stlr], which gives the required
+   load->store ordering in a single instruction; with FEAT_LRCPC2 it becomes
+   [stlur] (a store-release with an unscaled immediate offset, avoiding an
+   address computation).  A few old cores (e.g. Cortex-A53, Cortex-A72) are
+   slower with a release store and instead use a [dmb ishld; str] barrier.
+
+   [configure] selects the default through [Config.model]: "lrcpc2" enables
+   stlur, "arm64_barrier" selects the barrier, anything else uses stlr.  The
+   defaults can be overridden on the command line. *)
+let store_release = ref (Config.model <> "arm64_barrier")
+let lrcpc2 = ref (Config.model = "lrcpc2")
+
 (* Machine-specific command-line options *)
 
-let command_line_options = []
+let command_line_options =
+  [ "-flrcpc2", Arg.Set lrcpc2,
+    " Use FEAT_LRCPC2 store-release with unscaled offset (stlur) for \
+     assignment stores (requires an Armv8.4+ assembler)";
+    "-fno-lrcpc2", Arg.Clear lrcpc2,
+    " Do not use FEAT_LRCPC2 stlur";
+    "-fbarrier-store", Arg.Clear store_release,
+    " Use a dmb ishld; str barrier instead of a store-release for \
+     assignment stores (faster on some old cores)";
+    "-fstore-release", Arg.Set store_release,
+    " Use a store-release (stlr/stlur) for assignment stores (default)" ]
 
 (* Addressing modes *)
 
@@ -62,13 +87,22 @@ type specific_operation =
   | Imulsubf      (* floating-point multiply and subtract *)
   | Inegmulsubf   (* floating-point negate, multiply and subtract *)
   | Isqrtf        (* floating-point square root *)
+  | Iroundf of float_rounding (* floating-point round to integer *)
   | Ibswap of int (* endianness conversion *)
   | Imove32       (* 32-bit integer move *)
   | Isignext of int (* sign extension *)
+  | Iclz          (* count leading zeros *)
+  | Ictz          (* count trailing zeros *)
 
 and arith_operation =
     Ishiftadd
   | Ishiftsub
+
+and float_rounding =
+    Rnearest_away                       (* to nearest, ties away from zero *)
+  | Rtoward_zero
+  | Rtoward_pos                         (* toward positive infinity *)
+  | Rtoward_neg                         (* toward negative infinity *)
 
 (* Sizes, endianness *)
 
@@ -167,6 +201,20 @@ let print_specific_operation printreg op ppf arg =
         printreg arg.(2)
   | Isqrtf ->
       fprintf ppf "sqrtf %a"
+        printreg arg.(0)
+  | Iclz ->
+      fprintf ppf "clz %a"
+        printreg arg.(0)
+  | Ictz ->
+      fprintf ppf "ctz %a"
+        printreg arg.(0)
+  | Iroundf r ->
+      let name = match r with
+        | Rnearest_away -> "roundf"
+        | Rtoward_zero -> "truncf"
+        | Rtoward_pos -> "ceilf"
+        | Rtoward_neg -> "floorf" in
+      fprintf ppf "%s %a" name
         printreg arg.(0)
   | Ibswap n ->
       fprintf ppf "bswap%i %a" n

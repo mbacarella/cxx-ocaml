@@ -155,7 +155,7 @@ let target_windows = make
 
 let is_bsd_system s =
   match s with
-  | "bsd_elf" | "netbsd" | "freebsd" | "openbsd" -> true
+  | "bsd_elf" | "netbsd" | "freebsd" | "openbsd" | "dragonfly" -> true
   | _ -> false
 
 let bsd = make
@@ -182,6 +182,15 @@ let macosx = make
   (Actions_helpers.pass_or_skip (Ocamltest_config.system = macos_system)
     "on a MacOS system"
     "not on a MacOS system")
+
+let beos_system = "beos"
+
+let beos_haiku = make
+  ~name:"beos_haiku"
+  ~description:"Pass if running on a BeOS/Haiku system"
+  (Actions_helpers.pass_or_skip (Ocamltest_config.system = beos_system)
+    "on a BeOS/Haiku system"
+    "not on a beOS/Haiku system")
 
 let not_macos_amd64_tsan = make
   ~name:"not_macos_amd64_tsan"
@@ -434,6 +443,7 @@ let _ =
     bsd;
     linux;
     macosx;
+    beos_haiku;
     not_macos_amd64_tsan;
     has_cxx;
     arch32;

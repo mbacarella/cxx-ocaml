@@ -156,6 +156,7 @@ type primitive =
   | Pint_as_pointer
   (* Atomic operations *)
   | Patomic_load
+  | Patomic_fetch_add
   (* Inhibition of optimisation *)
   | Popaque
   (* Fetching domain-local state *)
@@ -695,6 +696,9 @@ let raise_count = ref 0
 let next_raise_count () =
   incr raise_count ;
   !raise_count
+
+let reset_raise_count () =
+  raise_count := 0
 
 (* Anticipated staticraise, for guards *)
 let staticfail = Lstaticraise (0,[])

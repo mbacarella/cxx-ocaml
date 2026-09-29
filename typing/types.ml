@@ -44,9 +44,14 @@ and type_desc =
   | Tpoly of type_expr * type_expr list
   | Tpackage of package
   | Tfunctor of arg_label * Ident.Unscoped.t * package * type_expr
-  | Texpand of type_expr * Path.t * type_expr list
+  | Texpand of type_expr * abbrev
   | Tlink of type_expr
   | Tsubst of type_expr * type_expr option
+
+and abbrev =
+    { abbr_path : Path.t;
+      abbr_args : type_expr list;
+      mutable abbr_level : int }
 
 and package =
     { pack_path : Path.t;
@@ -491,6 +496,7 @@ type change =
   | Ccommu of [`var] commutable_gen
   | Cuniv of type_expr option ref * type_expr option
   | Cuident of Ident.Unscoped.change
+  | Cabbr_level of abbrev * int
 
 type changes =
     Change of change * changes ref
@@ -545,22 +551,22 @@ let repr_update t_orig d =
   log_change (Ccompress (t_orig, t_orig.desc, d));
   t_orig.desc <- d
 
-let rec repr_expand update t_orig t path args =
+let rec repr_expand update t_orig t abbrev =
   match t.desc with
-  | Tlink t' | Texpand (t', _, _) ->
-      repr_expand true t_orig t' path args
+  | Tlink t' | Texpand (t', _) ->
+      repr_expand true t_orig t' abbrev
   | Tfield (_, k, _, t') when field_kind_internal_repr k = FKabsent ->
-      repr_expand true t_orig t' path args
+      repr_expand true t_orig t' abbrev
   | _ ->
-      if update then repr_update t_orig (Texpand (t, path, args));
+      if update then repr_update t_orig (Texpand (t, abbrev));
       t
 
 let rec repr_link update t_orig t =
   match t.desc with
   | Tlink t' ->
       repr_link true t_orig t'
-  | Texpand (t', path, args) ->
-      repr_expand true t_orig t' path args
+  | Texpand (t', abbrev) ->
+      repr_expand true t_orig t' abbrev
   | Tfield (_, k, _, t') when field_kind_internal_repr k = FKabsent ->
       repr_link true t_orig t'
   | _ ->
@@ -586,15 +592,33 @@ let rec repr_link update t_orig t =
       t -> t'
  *)
 
-let repr t =
+let repr_slow_path t =
   match t.desc with
   | Tlink t' ->
       repr_link false t t'
-  | Texpand (t', path, args) ->
-      repr_expand false t t' path args
+  | Texpand (t', abbrev) ->
+      repr_expand false t t' abbrev
   | Tfield (_, k, _, t') when field_kind_internal_repr k = FKabsent ->
       repr_link true t t'
   | _ -> t
+
+(* [repr] is called on almost every access to any type expression, so
+   we isolate and inline the simple cases. *)
+let [@inline hint] repr t =
+  match t.desc with
+  | Tvar _
+  | Tarrow _
+  | Ttuple _
+  | Tconstr _
+  | Tobject _
+  | Tnil
+  | Tvariant _
+  | Tunivar _
+  | Tpoly _
+  | Tpackage _
+  | Tfunctor _
+  | Tsubst _ -> t
+  | _ -> repr_slow_path t
 
 (* scope_field and marks *)
 
@@ -641,11 +665,15 @@ let not_marked_node mark t =
 
 let get_abbrev t =
   ignore (repr t);
-  match t.desc with Texpand (_, path, args) -> Some (path, args) | _ -> None
+  match t.desc with Texpand (_, abbrev) -> Some abbrev | _ -> None
 
-let iter_abbrev f t =
+let [@inline hint] iter_abbrev f t =
   ignore (repr t);
-  match t.desc with Texpand (_, path, args) -> f path args | _ -> ()
+  match t.desc with Texpand (_, abbrev) -> f abbrev | _ -> ()
+
+let set_abbrev_level abbrev level =
+  log_change (Cabbr_level (abbrev, abbrev.abbr_level));
+  abbrev.abbr_level <- level
 
 let ignore_abbrev ty = repr ty
 
@@ -662,7 +690,7 @@ module Transient_expr = struct
     if (sc land marks_mask <> 0) then
       invalid_arg "Types.Transient_expr.set_scope";
     ty.scope <- (ty.scope land marks_mask) lor sc
-  let try_mark_node mark ty =
+  let [@inline hint] try_mark_node mark ty =
     match mark with
     | Mark ({mark} as mk) ->
         (ty.scope land mark = 0) && (* mark type node when not marked *)
@@ -673,6 +701,7 @@ module Transient_expr = struct
   let coerce ty = ty
   let repr = repr
   let type_expr ty = ty
+  let eq ty ty' = ty == ty'
 end
 
 (* setting marks *)
@@ -838,6 +867,7 @@ let undo_change = function
   | Ccommu (Cvar r)  -> r.commu <- Cunknown
   | Cuniv  (r, v)    -> r := v
   | Cuident change    -> Ident.Unscoped.undo_change change
+  | Cabbr_level (a, l) -> a.abbr_level <- l
 
 type snapshot = changes ref * int
 let last_snapshot = Local_store.s_ref 0
@@ -852,13 +882,18 @@ let link_expand ty ty' =
   match ty.desc with
     Tconstr (path, args, _memo) ->
       log_type ty;
-      Transient_expr.set_desc ty (Texpand (ty', path, args))
+      let abbrev =
+        { abbr_path = path;
+          abbr_args = args;
+          abbr_level = ty.level }
+      in
+      Transient_expr.set_desc ty (Texpand (ty', abbrev))
   | _ -> Misc.fatal_error "Types.link_expand"
 
 let forget_abbrev ty =
   ignore (repr ty);
   match ty.desc with
-    Texpand (ty', _, _) ->
+    Texpand (ty', _) ->
       log_type ty;
       ty.desc <- Tlink ty'
   | _ -> Misc.fatal_error "Types.forget_abbrev"

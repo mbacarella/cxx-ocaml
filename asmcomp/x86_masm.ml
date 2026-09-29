@@ -119,7 +119,10 @@ let print_instr b = function
   | ADDSD (arg1, arg2) -> i2 b "addsd" arg1 arg2
   | AND (arg1, arg2) -> i2 b "and" arg1 arg2
   | ANDPD (arg1, arg2) -> i2 b "andpd" arg1 arg2
+  | BSF (arg1, arg2) -> i2 b "bsf" arg1 arg2
+  | BSR (arg1, arg2) -> i2 b "bsr" arg1 arg2
   | BSWAP arg -> i1 b "bswap" arg
+  | BTS (arg1, arg2) -> i2 b "bts" arg1 arg2
   | CALL arg  -> i1_call_jmp b "call" arg
   | CDQ -> i0 b "cdq"
   | CMOV (c, arg1, arg2) -> i2 b ("cmov" ^ string_of_condition c) arg1 arg2
@@ -210,6 +213,8 @@ let print_instr b = function
   | SUBSD (arg1, arg2) -> i2 b "subsd" arg1 arg2
   | TEST (arg1, arg2) -> i2 b "test" arg1 arg2
   | UCOMISD (arg1, arg2) -> i2 b "ucomisd" arg1 arg2
+  | LOCK_XADD (arg1, arg2) -> i2 b "lock xadd" arg1 arg2
+  | XADD (arg1, arg2) -> i2 b "xadd" arg1 arg2
   | XCHG (arg1, arg2) -> i2 b "xchg" arg1 arg2
   | XOR (arg1, arg2) -> i2 b "xor" arg1 arg2
   | XORPD (arg1, arg2) -> i2 b "xorpd" arg1 arg2

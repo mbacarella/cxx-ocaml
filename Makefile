@@ -64,6 +64,7 @@ utils_SOURCES = $(addprefix utils/, \
   config.mli config.ml \
   build_path_prefix_map.mli build_path_prefix_map.ml \
   format_doc.mli format_doc.ml \
+  utf8_lexeme.mli utf8_lexeme.ml \
   misc.mli misc.ml \
   identifiable.mli identifiable.ml \
   numbers.mli numbers.ml \
@@ -643,18 +644,10 @@ FLEXLINK_BUILD_ENV = \
   MSVC_DETECT=0 OCAML_CONFIG_FILE=../Makefile.config \
   CHAINS=$(FLEXDLL_CHAIN) ROOTDIR=..
 ifneq ($(RC),)
-FLEXLINK_BUILD_ENV += RC=$(RC)
+FLEXLINK_BUILD_ENV += RC="$(RC)"
 endif
-ifeq ($(FLEXDLL_CHAIN),cygwin64)
-FLEXLINK_BUILD_ENV += CYG64CC=$(CC)
-else ifeq ($(FLEXDLL_CHAIN),mingw)
-FLEXLINK_BUILD_ENV += MINCC=$(CC)
-else ifeq ($(FLEXDLL_CHAIN),mingw64)
-FLEXLINK_BUILD_ENV += MIN64CC=$(CC)
-else ifeq ($(FLEXDLL_CHAIN),msvc)
-FLEXLINK_BUILD_ENV += MSVCC=$(CC)
-else ifeq ($(FLEXDLL_CHAIN),msvc64)
-FLEXLINK_BUILD_ENV += MSVCC64=$(CC)
+ifneq ($(FLEXDLL_CC_VAR),)
+FLEXLINK_BUILD_ENV += $(FLEXDLL_CC_VAR)="$(CC)"
 endif
 FLEXDLL_SOURCES = \
   $(addprefix $(FLEXDLL_SOURCE_DIR)/, flexdll.c flexdll_initer.c flexdll.h) \
@@ -721,7 +714,7 @@ coldstart: boot/ocamlrun$(EXE) runtime/libcamlrun.$(A)
 	$(MAKE) -C stdlib OCAMLRUN='$$(ROOTDIR)/$<' USE_BOOT_OCAMLC=true all
 	rm -f $(addprefix boot/, libcamlrun.$(A) $(LIBFILES))
 	cp $(addprefix stdlib/, $(LIBFILES)) boot
-	cd boot; $(LN) ../runtime/libcamlrun.$(A) .
+	$(call LINK_IN, boot, ../runtime/libcamlrun.$(A))
 
 # Recompile the core system using the bootstrap compiler
 .PHONY: coreall
@@ -914,7 +907,7 @@ flexlink.opt$(EXE): \
 	  flexlink.exe
 	cp $(FLEXDLL_SOURCE_DIR)/flexlink.exe $@
 	rm -f $(OPT_BINDIR)/flexlink$(EXE)
-	cd $(OPT_BINDIR); $(LN) $(call ROOT_FROM, $(OPT_BINDIR))/$@ flexlink$(EXE)
+	cd $(OPT_BINDIR) && $(LN_S) $(call ROOT_FROM, $(OPT_BINDIR))/$@ flexlink$(EXE)
 
 else
 
@@ -1108,7 +1101,7 @@ endif
 # to add otherlibs/dynlink/native to the search path as well
 
 otherlibs/dynlink/dynlink.cmx : otherlibs/dynlink/native/dynlink.cmx
-	cd otherlibs/dynlink; $(LN) native/dynlink.cmx .
+	$(call LINK_IN, otherlibs/dynlink, native/dynlink.cmx)
 
 DYNLINK_DEPEND_DUMMY_FILES = \
   otherlibs/dynlink/dynlink.ml \
@@ -1153,28 +1146,28 @@ beforedepend:: lambda/runtimedef.ml
 # Choose the right machine-dependent files
 
 asmcomp/arch.mli: asmcomp/$(ARCH)/arch.mli
-	@cd asmcomp; $(LN) $(ARCH)/arch.mli .
+	@$(call LINK_IN, asmcomp, $(ARCH)/arch.mli)
 
 asmcomp/arch.ml: asmcomp/$(ARCH)/arch.ml
-	@cd asmcomp; $(LN) $(ARCH)/arch.ml .
+	@$(call LINK_IN, asmcomp, $(ARCH)/arch.ml)
 
 asmcomp/proc.ml: asmcomp/$(ARCH)/proc.ml
-	@cd asmcomp; $(LN) $(ARCH)/proc.ml .
+	@$(call LINK_IN, asmcomp, $(ARCH)/proc.ml)
 
 asmcomp/selection.ml: asmcomp/$(ARCH)/selection.ml
-	@cd asmcomp; $(LN) $(ARCH)/selection.ml .
+	@$(call LINK_IN, asmcomp, $(ARCH)/selection.ml)
 
 asmcomp/CSE.ml: asmcomp/$(ARCH)/CSE.ml
-	@cd asmcomp; $(LN) $(ARCH)/CSE.ml .
+	@$(call LINK_IN, asmcomp, $(ARCH)/CSE.ml)
 
 asmcomp/reload.ml: asmcomp/$(ARCH)/reload.ml
-	@cd asmcomp; $(LN) $(ARCH)/reload.ml .
+	@$(call LINK_IN, asmcomp, $(ARCH)/reload.ml)
 
 asmcomp/scheduling.ml: asmcomp/$(ARCH)/scheduling.ml
-	@cd asmcomp; $(LN) $(ARCH)/scheduling.ml .
+	@$(call LINK_IN, asmcomp, $(ARCH)/scheduling.ml)
 
 asmcomp/stackframe.ml: asmcomp/$(ARCH)/stackframe.ml
-	@cd asmcomp; $(LN) $(ARCH)/stackframe.ml .
+	@$(call LINK_IN, asmcomp, $(ARCH)/stackframe.ml)
 
 # Preprocess the code emitters
 cvt_emit = tools/cvt_emit$(EXE)
@@ -1700,7 +1693,7 @@ runtime: stdlib/libcamlrun.$(A)
 .PHONY: makeruntime
 makeruntime: runtime-all
 stdlib/libcamlrun.$(A): runtime-all
-	cd stdlib; $(LN) ../runtime/libcamlrun.$(A) .
+	$(call LINK_IN, stdlib, ../runtime/libcamlrun.$(A))
 clean::
 	rm -f $(addprefix runtime/, *.o *.obj *.a *.lib *.so *.dll)
 	rm -f $(addprefix runtime/, ocamlrun ocamlrund ocamlruni ocamlruns sak)
@@ -1721,9 +1714,9 @@ runtimeopt: stdlib/libasmrun.$(A)
 .PHONY: makeruntimeopt
 makeruntimeopt: runtime-allopt
 stdlib/libasmrun.$(A): runtime-allopt
-	cd stdlib; $(LN) ../runtime/libasmrun.$(A) .
+	$(call LINK_IN, stdlib, ../runtime/libasmrun.$(A))
 stdlib/libcomprmarsh.$(A): runtime/libcomprmarsh.$(A)
-	cd stdlib; $(LN) ../runtime/libcomprmarsh.$(A) .
+	$(call LINK_IN, stdlib, ../runtime/libcomprmarsh.$(A))
 
 clean::
 	rm -f stdlib/libasmrun.a stdlib/libasmrun.lib
@@ -2269,6 +2262,12 @@ ocamldebug_LIBRARIES = compilerlibs/ocamlcommon \
 otherlibs/unix/unix.cma: otherlibraries
 otherlibs/str/str.cma: otherlibraries
 
+# Root-directory targets depend on these .cmi/.cmx via .depend. The empty
+# recipes keep the generic %.cmi/%.cmx rules from racing with the otherlibs
+# sub-make, which records a different source path and digest in the artefacts.
+otherlibs/unix/unix.cmi otherlibs/str/str.cmi: otherlibraries ;
+otherlibs/unix/unix.cmx otherlibs/str/str.cmx: otherlibrariesopt ;
+
 debugger/%: VPATH += otherlibs/unix otherlibs/dynlink
 
 ocamldebug_COMPILER_SOURCES = $(addprefix toplevel/, \
@@ -2473,6 +2472,7 @@ ocamlprof_SOURCES = \
   config.mli config.ml \
   build_path_prefix_map.mli build_path_prefix_map.ml \
   format_doc.mli format_doc.ml \
+  utf8_lexeme.mli utf8_lexeme.ml \
   misc.mli misc.ml \
   identifiable.mli identifiable.ml \
   numbers.mli numbers.ml \
@@ -2500,8 +2500,8 @@ ocamlcp_ocamloptp_SOURCES = \
   config.mli config.ml \
   build_path_prefix_map.mli build_path_prefix_map.ml \
   format_doc.mli format_doc.ml \
+  utf8_lexeme.mli utf8_lexeme.ml \
   misc.mli misc.ml \
-  profile.mli profile.ml \
   warnings.mli warnings.ml \
   identifiable.mli identifiable.ml \
   numbers.mli numbers.ml \
@@ -2509,6 +2509,7 @@ ocamlcp_ocamloptp_SOURCES = \
   local_store.mli local_store.ml \
   load_path.mli load_path.ml \
   clflags.mli clflags.ml \
+  profile.mli profile.ml \
   terminfo.mli terminfo.ml \
   location.mli location.ml \
   ccomp.mli ccomp.ml \
@@ -2528,6 +2529,7 @@ ocamlmklib_SOURCES = \
   config.ml \
   build_path_prefix_map.ml \
   format_doc.ml \
+  utf8_lexeme.ml \
   misc.ml \
   ocamlmklib.mli ocamlmklib.ml
 
@@ -2538,6 +2540,7 @@ ocamlmktop_SOURCES = \
   config.mli config.ml \
   build_path_prefix_map.mli build_path_prefix_map.ml \
   format_doc.mli format_doc.ml \
+  utf8_lexeme.mli utf8_lexeme.ml \
   misc.mli misc.ml \
   identifiable.mli identifiable.ml \
   numbers.mli numbers.ml \

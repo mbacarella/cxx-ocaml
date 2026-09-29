@@ -728,6 +728,16 @@ let emit_instr env fallthrough i =
       I.bswap (res i 0)
   | Lop(Ispecific(Ibswap _)) ->
       assert false
+  | Lop(Ispecific Iclz) ->
+      (* The tag bit keeps bsr away from 0 and counts over Sys.int_size bits *)
+      I.bsr (arg i 0) (res i 0);
+      I.xor (int 63) (res i 0)
+  | Lop(Ispecific Ictz) ->
+      (* Bit 63 is a copy of bit 62, so setting it only changes the
+         answer for 0, where it gives Sys.int_size *)
+      if arg i 0 <> res i 0 then I.mov (arg i 0) (res i 0);
+      I.bts (int 63) (res i 0);
+      I.bsf (res i 0) (res i 0)
   | Lop(Ispecific Isqrtf) ->
       if arg i 0 <> res i 0 then
         I.xorpd (res i 0) (res i 0); (* avoid partial register stall *)
@@ -741,6 +751,23 @@ let emit_instr env fallthrough i =
       I.mov (arg32 i 0) (res32 i 0)
   | Lop (Idls_get) ->
       I.mov (domain_field Domainstate.Domain_dls_root) (res i 0)
+  | Lop (Iatomic_fetch_add) ->
+      (* res.(0) already holds the increment (selection ties res.(0) to
+         arg.(1)). On the multi-domain path lock xadd swaps in the old value,
+         on the single-domain path a plain xadd does the same. arg.(2) holds
+         &caml_num_domains_running (materialised by an Iconst_symbol in
+         selection), so reading the domain count works in dlcode too without a
+         hand-rolled GOTPCREL scratch. *)
+      let lbl_multi = new_label() in
+      let lbl_done = new_label() in
+      I.cmp (int 1) (mem64 QWORD 0 (arg64 i 2));
+      I.jne (label lbl_multi);
+      (* Single-domain fast path: xadd without the lock prefix *)
+      I.xadd (res i 0) (mem64 QWORD 0 (arg64 i 0));
+      I.jmp (label lbl_done);
+      def_label lbl_multi;
+      I.lock_xadd (res i 0) (mem64 QWORD 0 (arg64 i 0));
+      def_label lbl_done
   | Lop (Ireturn_addr) ->
       let offset = frame_size env - 8 in
       I.mov (mem64 QWORD offset RSP) (res i 0)
@@ -1019,7 +1046,8 @@ let begin_assembly() =
 
   emit_named_text_section (Compilenv.make_symbol (Some "code_begin"));
   emit_global_label "code_begin";
-  if system = S_macosx || system = S_freebsd then I.nop (); (* PR#4690 *)
+  if system = S_macosx || system = S_freebsd || system = S_dragonfly
+  then I.nop (); (* PR#4690 *)
   ()
 
 let end_assembly() =

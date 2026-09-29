@@ -15,13 +15,13 @@
 
 # Process this file with autoconf to produce a configure script.
 
-# Require Autoconf 2.71 for repeatability in CI
-AC_PREREQ([2.71])
+# Require Autoconf 2.72 for repeatability in CI
+AC_PREREQ([2.72])
 AC_INIT([OCaml],
         [OCAML__VERSION],
         [caml-list@inria.fr],
         [ocaml],
-        [http://www.ocaml.org])
+        [https://ocaml.org/])
 
 AC_MSG_NOTICE([Configuring OCaml version AC_PACKAGE_VERSION])
 
@@ -38,12 +38,10 @@ do
   case $ac_arg in
     -mandir=* | --mandir=* | --mandi=* | --mand=* | --man=* | --ma=* | --m=* | \
     -mandir | --mandir | --mandi | --mand | --man | --ma | --m)
-      mandir_given=yes
-      break ;;
+      mandir_given=yes;;
     -libdir=* | --libdir=* | --libdi=* | --libd=* | \
     -libdir   | --libdir   | --libdi   | --libd)
-      libdir_given=yes
-      break ;;
+      libdir_given=yes;;
   esac
 done
 
@@ -186,7 +184,7 @@ AC_SUBST([oc_native_cppflags])
 AC_SUBST([systhread_support])
 AC_SUBST([ocamlsrcdir])
 AC_SUBST([unix_or_win32])
-AC_SUBST([ln])
+AC_SUBST([LN_S])
 AC_SUBST([ocamlyacc_wstr_module])
 AC_SUBST([outputexe])
 AC_SUBST([outputobj])
@@ -220,6 +218,7 @@ AC_SUBST([shebangscripts])
 AC_SUBST([launch_method])
 AC_SUBST([launch_method_target])
 AC_SUBST([AR])
+AC_SUBST([ARFLAGS])
 AC_SUBST([mklib])
 AC_SUBST([supports_shared_libraries])
 AC_SUBST([natdynlink])
@@ -291,6 +290,7 @@ AC_SUBST([function_sections])
 AC_SUBST([oc_native_compflags])
 AC_SUBST([afl])
 AC_SUBST([flexdll_chain])
+AC_SUBST([flexdll_cc_var])
 AC_SUBST([PACKLD])
 AC_SUBST([build_libraries_manpages])
 AC_SUBST([compute_deps])
@@ -312,6 +312,9 @@ AC_SUBST([runtime_search])
 AC_SUBST([runtime_search_target])
 AC_SUBST([cc_extra_warnings])
 AC_SUBST([cxx_extra_warnings])
+AC_SUBST([header_cflags])
+AC_SUBST([header_ldflags])
+AC_SUBST([header_libs])
 
 ## Generated files
 
@@ -483,14 +486,15 @@ AS_CASE([$target],
 
 # Environment variables that are taken into account
 
-AC_ARG_VAR([AS], [which assembler to use])
-AC_ARG_VAR([ASPP], [which assembler (with preprocessor) to use])
+AC_ARG_VAR([AR], [archive-maintaining program])
+AC_ARG_VAR([ARFLAGS], [flags to give the archive-maintaining program])
+AC_ARG_VAR([AS], [program for compiling assembly files])
+AC_ARG_VAR([ASPP], [program for preprocessing and compiling assembly files])
 AC_ARG_VAR([PARTIALLD], [how to build partial (relocatable) object files])
-AC_ARG_VAR([RC], [which resource compiler to use])
-AC_ARG_VAR([MANIFEST_TOOL], [which manifest generator to use])
-
-AC_ARG_VAR([FLEXLINKFLAGS],
-  [Supplementary flags passed to flexlink (Windows targets)])
+AC_ARG_VAR([RC], [program for compiling Windows Resource files])
+AC_ARG_VAR([MANIFEST_TOOL], [program used to generate manifests (Windows)])
+AC_ARG_VAR([STRIP], [program used to perform stripping])
+AC_ARG_VAR([FLEXLINKFLAGS], [extra flags to give to flexlink (Windows targets)])
 
 AC_ARG_VAR([COMPILER_BYTECODE_CFLAGS],
   [CFLAGS for compiling C files to be linked with bytecode])
@@ -709,7 +713,7 @@ AC_ARG_ENABLE([force-safe-string], [],
     [AC_MSG_ERROR([Support for mutable strings was removed in OCaml 5.0.])])],
   [])
 
-AC_ARG_VAR([DEFAULT_STRING], [])
+AC_ARG_VAR([DEFAULT_STRING], [obsolete])
 AS_IF([test x"$DEFAULT_STRING" = "xunsafe"],
   [AC_MSG_ERROR([Support for mutable strings was removed in OCaml 5.0.])])
 
@@ -903,7 +907,7 @@ AS_CASE([$target],
   # In config/Makefile.mingw*, we had:
   # TARGET=i686-w64-mingw32 and x86_64-w64-mingw32
   # TOOLPREF=$(TARGET)-
-  # ARCMD=$(TOOLPREF)ar
+  # AR=$(TOOLPREF)ar
   # However autoconf and libtool seem to use ar
   # So we let them do, at the moment
   [*-pc-windows],
@@ -916,9 +920,7 @@ AS_CASE([$target],
         [machine=""])
       mklib="link -lib -nologo $machine /out:\$(1) \$(2)"
     ],
-  [
-    mklib="rm -f \$(1) && ${AR} rc \$(1) \$(2)"
-  ])
+  [mklib="rm -f \$(1) && ${AR} c${ARFLAGS:=r} \$(1) \$(2)"])
 
 ## In cross-compilation mode, can we run executables produced?
 # At the moment, it's required, but the fact is used in C99 function detection
@@ -967,7 +969,7 @@ AS_CASE([$cygwin_build_env,$host],
   [true,*-w64-mingw32*|true,*-pc-windows],
     [OCAML_CHECK_LN_ON_WINDOWS
     ocamlsrcdir="$(LC_ALL=C.UTF-8 cygpath -w -- "$srcdir_abs")"],
-  [ln='ln -sf'
+  [LN_S='ln -sf'
   ocamlsrcdir="$srcdir_abs"])
 
 # Whether ar supports @FILE arguments
@@ -1178,24 +1180,24 @@ AS_CASE([$target],
       [internal_cflags="$internal_cflags -mprfchw"], [], [$warn_error_flag])])
 
 # Enable SSE2 on x86 mingw to avoid using 80-bit registers.
-# Enable 64-bit time_t in time.h
 AS_CASE([$target],
   [i686-w64-mingw32*],
-    [internal_cflags="$internal_cflags -mfpmath=sse -msse2"
-    # This instructs _mingw.h to adopt the switch in Visual Studio 8 (2005) to
-    # make time_t a 64-bit value.
-    internal_cppflags="$internal_cppflags -D__MINGW_USE_VC2005_COMPAT"])
+    [internal_cflags="$internal_cflags -mfpmath=sse -msse2"])
 
-# Use 64-bit file offset if possible
-# See also AC_SYS_LARGEFILE
-# Problem: flags are added to CC rather than CPPFLAGS
+# Default to enabling large file support and year 2038 support on 32-bit.
 AS_CASE([$target],
-  [*-w64-mingw32*|*-pc-windows], [],
-  [common_cppflags="$common_cppflags -D_FILE_OFFSET_BITS=64"])
+  [*-pc-windows], [], # LFS and 64-bit time_t are always enabled.
+  [AC_SYS_YEAR2038_RECOMMENDED
+  AS_CASE([$ac_cv_sys_largefile_opts],
+    ["none needed"|"support not detected"], [],
+    [common_cppflags="$common_cppflags $ac_cv_sys_largefile_opts"])
+  AS_CASE([$ac_cv_sys_year2038_opts],
+    ["none needed"|"support not detected"], [],
+    [common_cppflags="$common_cppflags $ac_cv_sys_year2038_opts"])])
 
 # Require Windows 8 / Server 2012 or later
 AS_CASE([$target],
-  [*-w64-mingw32*|*-pc-windows],
+  [*-pc-cygwin|*-w64-mingw32*|*-pc-windows],
     [internal_cppflags="$internal_cppflags -D_WIN32_WINNT=0x602"])
 
 # Adjust according to target
@@ -1216,23 +1218,25 @@ AS_IF([test x"$enable_shared" = "xno"],
 # Define flexlink chain and flags correctly for the different Windows ports
 flexlink_flags=''
 AS_CASE([$target],
-  [i686-*-cygwin],
-    [flexdll_chain='cygwin'
-    flexlink_flags='-merge-manifest -stack 16777216'],
   [x86_64-*-cygwin],
     [flexdll_chain='cygwin64'
+    flexdll_cc_var='CYG64CC'
     flexlink_flags='-merge-manifest -stack 16777216'],
   [i686-w64-mingw32*],
     [flexdll_chain='mingw'
+    flexdll_cc_var='MINCC'
     flexlink_flags='-stack 16777216'],
   [x86_64-w64-mingw32*],
     [flexdll_chain='mingw64'
+    flexdll_cc_var='MIN64CC'
     flexlink_flags='-stack 33554432'],
   [i686-pc-windows],
     [flexdll_chain='msvc'
+    flexdll_cc_var='MSVCC'
     flexlink_flags='-merge-manifest -stack 16777216'],
   [x86_64-pc-windows],
     [flexdll_chain='msvc64'
+    flexdll_cc_var='MSVCC64'
     flexlink_flags='-merge-manifest -stack 33554432'],
   [flexdll_chain=''])
 
@@ -1629,6 +1633,7 @@ AS_IF([test x"$supports_shared_libraries" = 'xtrue'],
     [[i[3456]86-*-netbsd*]], [natdynlink=true],
     [x86_64-*-netbsd*], [natdynlink=true],
     [[i[3456]86-*-haiku*]], [natdynlink=true],
+    [x86_64-*-haiku*], [natdynlink=true],
     [arm*-*-linux*], [natdynlink=true],
     [arm*-*-freebsd*], [natdynlink=true],
     [earm*-*-netbsd*], [natdynlink=true],
@@ -1674,8 +1679,6 @@ AS_CASE([$target],
     [arch=i386; system=openbsd],
   [[i[3456]86-*-haiku*]],
     [arch=i386; system=beos],
-  [[i[3456]86-*-cygwin]],
-    [arch=i386; system=cygwin],
   [[i[3456]86-w64-mingw32*]],
     [arch=i386; system=mingw],
   [[i[3456]86-*-gnu*]],
@@ -1738,7 +1741,7 @@ AS_CASE([$target],
   [x86_64-*-openbsd*],
     [has_native_backend=yes; arch=amd64; system=openbsd],
   [x86_64-*-haiku*],
-    [arch=amd64; system=beos],
+    [has_native_backend=yes; arch=amd64; system=beos],
   [arm64-*-darwin*],
     [has_native_backend=yes; arch=arm64; system=macosx],
   [aarch64-*-darwin*],
@@ -1776,6 +1779,34 @@ AS_CASE([$target],
   [x86_64-*-none|x86_64-*-elf*],
     [has_native_backend=yes; arch=amd64; system=none]
 )
+
+# On arm64, choose how the multicore memory-model barrier that precedes a
+# non-initializing store to a mutable field/element is emitted (see
+# https://github.com/ocaml/ocaml/issues/13262).  The default is a
+# store-release (stlr).  If FEAT_LRCPC2 is available we use stlur (a
+# store-release with an unscaled offset, saving an address computation).  A
+# few old cores (Cortex-A53/-A57/-A72/-A73) are slower with a release store,
+# so we keep the dmb ishld; str barrier on them.  This is a build-host
+# heuristic (like the arm32 arch/fpu default) and can be overridden with
+# ocamlopt's -flrcpc2 / -fno-lrcpc2 / -fbarrier-store / -fstore-release.
+AS_IF([test x"$arch" = "xarm64"],
+  [AC_MSG_CHECKING([arm64 store for the assignment memory barrier])
+   AC_RUN_IFELSE(
+     [AC_LANG_PROGRAM([], [[
+        volatile long dst = 0;
+        long src = 1;
+        __asm__ __volatile__(".arch armv8.4-a\n\tstlur %0, [%1, #0]"
+          : : "r" (src), "r" (&dst) : "memory");
+        return dst == 1 ? 0 : 1;
+      ]])],
+     [model=lrcpc2; ocaml_arm64_store="stlur (FEAT_LRCPC2)"],
+     [AS_IF(
+        [test -r /proc/cpuinfo &&
+         grep -Eq 'CPU part.*(0xd03|0xd04|0xd07|0xd08|0xd09)' /proc/cpuinfo],
+        [model=arm64_barrier; ocaml_arm64_store="dmb ishld; str (old core)"],
+        [ocaml_arm64_store="stlr (store-release)"])],
+     [ocaml_arm64_store="stlr (store-release, cross-compiling)"])
+   AC_MSG_RESULT([$ocaml_arm64_store])])
 
 AS_CASE([$arch],
   [amd64],
@@ -1899,7 +1930,7 @@ default_as=''
 AS_CASE([$as_target,$ocaml_cc_vendor],
   [*-*-linux*,gcc-*],
     [AS_CASE([$as_cpu],
-      [x86_64|arm*|aarch64*|i[[3-6]]86|riscv*],
+      [x86_64|arm*|aarch64*|i[[3-6]]86],
         [default_as="${toolpref}as"
         as_is_cc=false])],
   [*-*-cygwin,gcc-*],
@@ -2455,27 +2486,40 @@ AC_CHECK_FUNC([putenv], [AC_DEFINE([HAS_PUTENV], [1])])
 AC_CHECK_FUNC([setenv],
   [AC_CHECK_FUNC([unsetenv], [AC_DEFINE([HAS_SETENV_UNSETENV], [1])])])
 
-## newlocale() and <locale.h>
-# Note: the detection fails on msvc so we hardcode the result
-# (should be debugged later)
-AS_CASE([$target],
-  [*-pc-windows], [AC_DEFINE([HAS_LOCALE_H], [1])],
-  [AC_CHECK_HEADER([locale.h],
-    [AC_CHECK_FUNC([newlocale],
-      [AC_CHECK_FUNC([freelocale],
-        [AC_CHECK_FUNC([uselocale], [AC_DEFINE([HAS_LOCALE_H], [1])])])])])])
+## <locale.h>
+AC_CHECK_HEADER([locale.h],
+  [AC_CHECK_FUNC([newlocale],
+    [AC_CHECK_FUNC([freelocale],
+      [AC_CHECK_FUNC([uselocale],
+        [AC_DEFINE([HAS_LOCALE_H], [1])
+         AC_DEFINE([HAS_USELOCALE], [1])])])],
+    [AC_CHECK_FUNC([_wsetlocale],
+      [AC_DEFINE([HAS_LOCALE_H], [1])
+       AC_CHECK_FUNC([_configthreadlocale],
+         [AC_DEFINE([HAS_CONFIGTHREADLOCALE], [1])])])])])
 
 AC_CHECK_HEADER([xlocale.h],
   [AC_CHECK_FUNC([newlocale],
     [AC_CHECK_FUNC([freelocale],
-      [AC_CHECK_FUNC([uselocale], [AC_DEFINE([HAS_XLOCALE_H], [1])])])])])
+      [AC_CHECK_FUNC([uselocale],
+        [AC_DEFINE([HAS_XLOCALE_H], [1])
+         AC_DEFINE([HAS_USELOCALE], [1])])])])])
 
 ## strtod_l
-# Note: not detected on MSVC so hardcoding the result
-# (should be debugged later)
-AS_CASE([$target],
-  [*-pc-windows], [AC_DEFINE([HAS_STRTOD_L], [1])],
-  [AC_CHECK_FUNC([strtod_l], [AC_DEFINE([HAS_STRTOD_L], [1])])])
+AC_CHECK_FUNC([strtod_l],
+  [AC_DEFINE([HAS_STRTOD_L], [1])
+   AC_DEFINE([STRTOD_L], [strtod_l])],
+  [AC_CHECK_FUNC([_create_locale],
+    [AC_CHECK_FUNC([_strtod_l],
+      [AC_DEFINE([HAS_STRTOD_L], [1])
+       AC_DEFINE([STRTOD_L], [_strtod_l])])])])
+
+## vsnprintf_l
+AC_CHECK_FUNC([vsnprintf_l],
+  [AC_DEFINE([HAS_VSNPRINTF_L], [1])],
+  [AC_CHECK_FUNC([_create_locale],
+    [AC_CHECK_FUNC([_vsnprintf_l],
+      [AC_DEFINE([HAS_VSNPRINTF_L], [1])])])])
 
 ## shared library support
 AS_IF([$supports_shared_libraries],
@@ -2812,8 +2856,9 @@ AS_IF([$native_compiler],
 
 AS_IF([test x"$enable_frame_pointers" = "xyes"],
   [AS_CASE([$target],
-    [x86_64-*-linux*|x86_64-*-darwin*|x86_64-*-freebsd*|aarch64-*-linux*| \
-     aarch64-*-darwin*|aarch64-*-freebsd*],
+    [x86_64-*-linux*|x86_64-*-darwin*|x86_64-*-freebsd*|x86_64-*-dragonfly*| \
+     aarch64-*-linux*|aarch64-*-darwin*|aarch64-*-freebsd*|riscv64-*-linux*| \
+     powerpc64-*-linux*|powerpc64le-*-linux*],
      [AS_CASE([$ocaml_cc_vendor],
         [clang-*|gcc-*],
          [common_cflags="$common_cflags -g  -fno-omit-frame-pointer"
@@ -2889,7 +2934,8 @@ AS_IF([$build_ocamltest],
   AC_CONFIG_LINKS([
     ocamltest/ocamltest_unix.ml:${ocamltest_unix_mod}
   ])
-  AC_CHECK_PROGS([DIFF], [patdiff diff],
+  AC_CHECK_PROGS([DIFF], [patdiff diff], [false])
+  AS_IF([test x"$DIFF" = "xfalse"],
     [AC_MSG_ERROR([ocamltest requires a diff tool])])
   AS_CASE([$DIFF], [diff], [flags_to_test='--strip-trailing-cr -u'])
   AC_CACHE_CHECK([for extra $DIFF flags],
@@ -2990,6 +3036,46 @@ AS_IF([test x"$with_afl" = "xyes"],
 # info for both C and OCaml
 AS_IF([test "$ccomp_type" != "msvc"],
   [internal_cflags="-g $internal_cflags"])
+
+# The mingw-w64 and MSVC versions of tmpheader.exe are linked with special flags
+# to reduce their size (considerably). In particular, the entry point is
+# overridden, which prevents the linking of crt0.
+AS_CASE(["$toolchain"],
+  [mingw],
+    [# mingw-w64: optimise header.o for space and remove all unused sections
+    # during linking.
+    header_cflags='-Os'
+    AS_IF([test "$system" = "mingw"],
+      [entrypoint='_wmainCRTStartup'],
+      [entrypoint='wmainCRTStartup'])
+    # Certainly for GCC, -nostdlib automatically adds -nostartfiles (clang's
+    # documentation is not explicit on this point, but it would be unusual for
+    # clang and GCC to differ). --gc-sections removes unreferenced code and data
+    # sections.
+    header_ldflags=\
+"-nostdlib -nostartfiles -Wl,--gc-sections -Wl,-e,$entrypoint"
+    header_libs='-lkernel32'],
+  [msvc],
+    [# MSVC: Optimise header.obj for space. cl doesn't have an equivalent of
+    # -nostdlib, however it also doesn't have default libraries in the same way
+    # as GCC - the equivalent of crt0.o is linked because it provides the entry
+    # point symbol, rather than by being explicitly added to the linking command
+    # line.  /GS- disables compilation of runtime security checks and
+    # /NOCOFFGRPINFO is an undocumented linker flag which removes the debug
+    # directory from the PE+ image.
+    # Prevent Clang 21 and later from synthesizing a call to wcslen when
+    # building header.obj by passing -fno-builtin-wcslen. As tmpheader.exe is
+    # solely linked with kernel32.lib but not with the CRT, wcslen isn't found
+    # and the linker errors.
+    header_cflags='/GS- /Os'
+    AS_CASE([$ocaml_cc_vendor],
+      [msvc-*-clang-*],
+        [header_cflags="$header_cflags -fno-builtin-wcslen"])
+    header_ldflags='/NOCOFFGRPINFO /subsystem:console'
+    header_libs='kernel32.lib'],
+  [header_cflags=''
+  header_ldflags=''
+  header_libs=''])
 
 oc_cflags="$common_cflags $internal_cflags"
 oc_cppflags="$common_cppflags $internal_cppflags"

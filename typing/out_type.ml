@@ -808,6 +808,7 @@ end
 
 module Variable_names : sig
   val reset_names : unit -> unit
+  val reset_weak_names : unit -> unit
 
   val add_subst : (type_expr * type_expr) list -> unit
 
@@ -848,6 +849,11 @@ end = struct
     name_counter := 0;
     named_vars := [];
     visited_for_named_vars := []
+
+  let reset_weak_names () =
+    named_weak_vars := String.Set.empty;
+    weak_var_map := TypeMap.empty;
+    weak_counter := 1
 
   let add_named_var tty =
     match tty.desc with
@@ -1068,6 +1074,8 @@ let reset_except_conflicts () =
 let reset () =
   Ident_conflicts.reset ();
   reset_except_conflicts ()
+
+let reset_weak_names () = Variable_names.reset_weak_names ()
 
 let prepare_for_printing tyl =
   reset_except_conflicts ();
@@ -1483,7 +1491,7 @@ let tree_of_type_decl id decl =
     | _ -> {ot_non_gen=false; ot_name="?"; ot_variance}
   in
   let type_defined decl =
-    let abstr =
+    let non_inferable_variance =
       match decl.type_kind with
         Type_abstract _ ->
           decl.type_manifest = None || decl.type_private = Private
@@ -1495,16 +1503,18 @@ let tree_of_type_decl id decl =
       | Type_open ->
           decl.type_manifest = None
       | Type_external _ ->
-          assert (decl.type_manifest = None); true
+          true
     in
     let vari =
       List.map2
         (fun ty v ->
           let is_var = is_Tvar ty in
-          let with_variance = !Clflags.print_variance || abstr || not is_var in
+          let with_variance =
+            !Clflags.print_variance || non_inferable_variance || not is_var
+          in
           let with_injectivity =
             !Clflags.print_variance ||
-            (abstr || not is_var) &&
+            (non_inferable_variance || not is_var) &&
             type_kind_is_abstract decl &&
             match decl.type_manifest with
             | None -> true
@@ -2042,7 +2052,7 @@ let trees_of_type_expansion mode Errortrace.{ty = t; expanded = t'} =
   let manifest =
     match get_abbrev t with
     | None -> None
-    | Some (tconstr, params) ->
+    | Some {abbr_path=tconstr; abbr_args=params} ->
         let should_use_manifest =
           match printer_get_desc t with
           | Tconstr (p, tl, _) ->

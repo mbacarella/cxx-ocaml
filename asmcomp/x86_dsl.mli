@@ -110,7 +110,10 @@ module I : sig
   val addsd: arg -> arg -> unit
   val and_: arg -> arg -> unit
   val andpd: arg -> arg -> unit
+  val bsf: arg -> arg -> unit
+  val bsr: arg -> arg -> unit
   val bswap: arg -> unit
+  val bts: arg -> arg -> unit
   val call: arg -> unit
   val cdq: unit -> unit
   val cmp: arg -> arg -> unit
@@ -196,6 +199,8 @@ module I : sig
   val subsd: arg -> arg -> unit
   val test: arg -> arg -> unit
   val ucomisd: arg -> arg -> unit
+  val lock_xadd: arg -> arg -> unit
+  val xadd: arg -> arg -> unit
   val xchg: arg -> arg -> unit
   val xor: arg -> arg -> unit
   val xorpd: arg -> arg -> unit

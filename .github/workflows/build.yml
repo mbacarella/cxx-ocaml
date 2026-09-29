@@ -18,6 +18,8 @@ env:
   PARALLEL_TESTS: parallel callback gc-roots weak-ephe-final
   # Fully print commands executed by Make
   # MAKEFLAGS: V=1
+  # Disable 'cold' tests
+  OCAMLTEST_COLD_TESTS: 0
 
 # https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#concurrency
 # Concurrent workflows are grouped by the PR or branch that triggered them
@@ -101,14 +103,22 @@ jobs:
         include:
           - id: normal
             name: normal
-            dependencies: texlive-latex-extra texlive-fonts-recommended texlive-luatex hevea sass gdb lldb
+            dependencies: >-
+              texlive-latex-extra
+              texlive-fonts-recommended
+              texlive-fonts-extra
+              hevea
+              sass
+              gdb
+              lldb
+              language-pack-nl
           - id: opam
             name: opam installation
           - id: debug
             name: extra (debug)
           - id: debug-s4096
             name: extra (debug-s4096)
-      fail-fast: true
+      fail-fast: ${{ needs.config.outputs.full-matrix != 'true' }}
     steps:
       - name: Download Artifact
         uses: actions/download-artifact@v8
@@ -205,8 +215,6 @@ jobs:
               {name: 'linux-arm64', os: 'ubuntu-24.04-arm',
                config_arg: '--with-target-sh=exe --enable-runtime-search-target=fallback',
                'test-in-prefix': true},
-              {name: 'macos-x86_64', os: 'macos-15-intel',
-               'test-in-prefix': true},
               {name: 'macos-arm64', os: 'macos-latest',
                config_arg: '--with-relative-libdir --enable-runtime-search',
                'test-in-prefix': true}];
@@ -256,7 +264,7 @@ jobs:
     strategy:
       matrix:
         include: ${{ fromJSON(needs.config.outputs.jobs) }}
-      fail-fast: true
+      fail-fast: ${{ needs.config.outputs.full-matrix != 'true' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6

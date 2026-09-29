@@ -38,6 +38,33 @@ end
 module Env_unscoped =
   Env.Unscoped[@alert "-dangerous"]
 
+(* [quick_eq_type_path] is used in fast-paths that check if two type
+   paths are "clearly the same", it can under-approximate path
+   equivalence to gain speed.
+
+   If [normalize] is [true], we also check quick-equivalence modulo
+   normalization. Callers should use [normalize:false] when the "slow
+   path" when the check fails already performs expansion/normalization
+   before re-checking equality, and [normalize:true] when the fast
+   path can save an arbitrary amount of type-checking work compared to
+   the slow path on equivalent-modulo-normalization types.
+*)
+let quick_eq_type_path ~normalize env p1 p2 =
+  if normalize
+  then Env.type_path_equiv_modulo env p1 p2
+  else Env_unscoped.path_equiv env p1 p2
+
+(* Check that [p1] and [p2] are equivalent, assuming that [p1] and
+   [p2] have been normalized. (Typically they are Tconstr paths,
+   obtained after type expansion.) If [p1] and [p2] are not normalized
+   it should under-approximate path equivalence: only return [true]
+   when they are indeed equivalent.*)
+let eq_expanded_type_path env p1 p2  =
+  Env_unscoped.path_equiv env p1 p2
+
+let eq_package_path env p1 p2 =
+  Env_unscoped.path_equiv env p1 p2 ||
+  Env.modtype_path_equiv_modulo env p1 p2
 
 (*
    General notes
@@ -531,16 +558,6 @@ let without_assume_injective uenv f =
 
 (*** Checks for type definitions ***)
 
-let rec in_current_module = function
-  | Path.Pident _ -> true
-  | Path.Pdot _ | Path.Papply _ -> false
-  | Path.Pextra_ty (p, _) -> in_current_module p
-
-let in_pervasives p =
-  in_current_module p &&
-  try ignore (Env.find_type p Env.initial); true
-  with Not_found -> false
-
 let is_datatype decl=
   match decl.type_kind with
     Type_record _ | Type_variant _ | Type_open | Type_external _ -> true
@@ -914,14 +931,17 @@ let needs_expand env level path args =
     (without this constraint, the type system would actually be unsound.)
 *)
 
+(* Check whether no internal level needs to be updated,
+   including abbreviations *)
 let rec check_level_type_rec visited level ty =
   get_level ty <= level &&
   match get_abbrev ty with
-    Some (path, args) ->
-      Path.scope path <= level &&
-      (args = [] || List.memq ty visited ||
+    Some abbr ->
+      abbr.abbr_level <= level ||
+      Path.scope abbr.abbr_path <= level &&
+      (abbr.abbr_args = [] || List.memq ty visited ||
       let visited = ty :: visited in
-      List.for_all (check_level_type_rec visited level) args)
+      List.for_all (check_level_type_rec visited level) abbr.abbr_args)
   | None -> true
 
 let check_level_type level ty = check_level_type_rec [] level ty
@@ -992,19 +1012,38 @@ let rec update_level env level expand ty =
         raise_escape_exn Self
     | _ ->
         set_level ();
-        (* XXX what about abbreviations in Tconstr ? *)
+        (* XXX what about memoized abbreviations in Tconstr ? *)
         iter_type_expr (update_level env level expand) ty;
         update_level_abbrev env level expand ty
   end
   else update_level_abbrev env level expand ty
 
+(* [update_level_abbrev] needs to be called to update levels in abbreviations
+   even if the level of the type itself (which is the level of the expanded
+   form) is already correct.
+   Namely, abbreviations are taken from nodes that are actually ancestors
+   to the expanded version of the type. And, through unification, it may
+   be the case that the same expanded type node can be accessed through
+   different ancestors, holding different abbreviations.
+   We keep an abbreviation if its scope is valid and either all the levels it
+   contains are already low enough (check_level_type) or if we can succesfully
+   update the levels in its arguments. Otherwise, we forget it as invalid.
+   To avoid checking the same abbreviation repeatedly, we store the level
+   we have checked inside it. Since path compression can copy a Texpand to
+   an ancestor node, it would be inefficient to use the level of the node
+   containing the Texpand (the level would have to be copied too). *)
 and update_level_abbrev env level expand ty =
   iter_abbrev
-    (fun p args ->
+    (function {abbr_path=p; abbr_args=args; abbr_level=l} as abbr ->
+      if level >= l then () else
       if level < Path.scope p then forget_abbrev ty else
-      if List.for_all (check_level_type level) args then () else
-      if expand || needs_expand env level p args then forget_abbrev ty else
-      List.iter (update_level env level expand) args)
+      if List.for_all (check_level_type level) args then
+        set_abbrev_level abbr level
+      else if expand || needs_expand env level p args then forget_abbrev ty
+      else begin
+        set_abbrev_level abbr level;
+        List.iter (update_level env level expand) args
+      end)
     ty
 
 let try_update_level env level ty =
@@ -1029,6 +1068,11 @@ let update_level_for tr_exn env level ty =
   try
     update_level env level ty
   with Escape e -> raise_for tr_exn (Escape e)
+
+(* Lower the level of a type to the current level *)
+let enforce_current_level env ty =
+  try update_level env !current_level ty
+  with Escape _ -> fatal_error "Ctype.enforce_current_level"
 
 (* Lower level of type variables inside contravariant branches.
 
@@ -1209,6 +1253,9 @@ let rec inv_type hash pty ty =
   with Not_found ->
     let inv = { inv_type = ty; inv_parents = pty } in
     TypeHash.add hash ty inv;
+    iter_abbrev (fun {abbr_args} ->
+      List.iter (inv_type hash [inv]) abbr_args
+    ) ty;
     iter_type_expr (inv_type hash [inv]) ty
 
 let compute_univars ty =
@@ -1261,18 +1308,30 @@ let type_subexpressions_with_free_occurrences ids ty =
         nodes := TypeSet.add inv.inv_type !nodes;
         List.iter (add_all_parents ids) inv.inv_parents
   in
-  TypeHash.iter (fun ty inv ->
+  let occurrence_in_desc inv ty =
     match get_desc ty with
     | Tconstr (p, _, _) | Tobject (_, {contents = Some (p, _)})
     | Tfunctor (_, _, {pack_path = p}, _) | Tpackage {pack_path = p}
       when Path.exists_free ids p ->
-        add_all_parents ids inv
+        add_all_parents ids inv; true
     | Tvariant row ->
       begin match row_name row with
-      | Some (p, _) when Path.exists_free ids p -> add_all_parents ids inv
-      | _ -> ()
+      | Some (p, _) when Path.exists_free ids p ->
+          add_all_parents ids inv; true
+      | _ -> false
       end
-    | _ -> ()) inverted;
+    | _ -> false
+  in
+  let occurrence_in_abbrev inv =
+    iter_abbrev
+      (fun {abbr_path} ->
+        if Path.exists_free ids abbr_path then add_all_parents ids inv)
+      inv.inv_type
+  in
+  TypeHash.iter (fun ty inv ->
+      if occurrence_in_desc inv ty then () else
+        occurrence_in_abbrev inv
+    ) inverted;
   !nodes
 
 let fully_generic ty =
@@ -1474,10 +1533,12 @@ let rec copy ?partial ?keep_names ?scope ?(unscoped = empty_unscoped_mapping)
     in
     let desc' =
       match ty_expand with
-        Some (path, args) ->
-          let args = List.map copy args in
+        Some abbr ->
+          let path = Path.subst unscoped.map abbr.abbr_path in
+          let args = List.map copy abbr.abbr_args in
           let t' = new_scoped_ty ty_scope desc' in
-          Texpand (t', path, args)
+          Texpand (t', {abbr_path = path; abbr_args = args;
+                        abbr_level = !current_level})
       | None ->
           desc'
     in
@@ -1714,7 +1775,7 @@ let copy_sep ~copy_scope ~fixed ~(visited : type_expr TypeHash.t) ~id_map sch =
       let t = newstub ~scope:(get_scope ty) in
       TypeHash.add visited ty t;
       let desc' =
-        match get_desc ty with
+        match get_folded_desc ~keep_Tvar:false ty with
         | Tvariant row ->
             let more = row_more row in
             (* We shall really check the level on the row variable *)
@@ -1831,7 +1892,7 @@ let instance_label ~fixed lbl =
 
 (* NB: since this is [unify_var], it raises [Unify], not [Unify_trace] *)
 let unify_var' = (* Forward declaration *)
-  ref (fun _env _ty1 _ty2 -> assert false)
+  ref (fun ~check_occur:_ _env _ty1 _ty2 -> assert false)
 
 let subst ~env ~level ?scope ~priv ~abbrev ?oty ~params ~args body =
   if List.length params <> List.length args then raise Cannot_subst;
@@ -1853,8 +1914,32 @@ let subst ~env ~level ?scope ~priv ~abbrev ?oty ~params ~args body =
     abbreviations := ref Mnil;
     let uenv = Expression {env; in_subst = true} in
     try
-      !unify_var' uenv body0 body';
-      List.iter2 (!unify_var' uenv) params' args;
+      !unify_var' ~check_occur:true uenv body0 body';
+      let _, first_gen_vars, others =
+        Misc.Stdlib.List.fold_left3
+          (fun (previous_gen, first_gen, others) p p' a ->
+             match get_desc p with
+             | Tvar _ when get_level p = generic_level
+                        && not (List.exists (eq_type p) previous_gen) ->
+                 p :: previous_gen, (p', a) :: first_gen, others
+             | _ ->
+                 previous_gen, first_gen, (p', a) :: others
+          )
+          ([],[],[])
+          params params' args
+      in
+      (* We can elide the occurs-check for the first occurence of parameters
+         that are a generalizable variable (and therefore will be instantiated
+         to a fresh variable).
+         This can be beneficial if the argument is a very large type, where
+         the occurs check would be expensive. Non-generalizable type variables
+         or non-variables cannot avoid the check, since we're not able to show
+         they cannot occur.
+      *)
+      Misc.Stdlib.List.rev_iter
+        (fun (p,a) -> !unify_var' uenv ~check_occur:false p a) first_gen_vars;
+      Misc.Stdlib.List.rev_iter
+        (fun (p,a) -> !unify_var' uenv ~check_occur:true p a) others;
       body'
     with Unify _ ->
       undo_abbrev ();
@@ -2173,9 +2258,7 @@ let rec extract_package_modulo_subtype env ty =
   | _ -> raise Not_found
 
 let is_contractive env p =
-  try
-    let decl = Env.find_type p env in
-    in_pervasives p && decl.type_manifest = None || is_datatype decl
+  try is_datatype (Env.find_type p env)
   with Not_found -> false
 
 
@@ -2254,7 +2337,9 @@ let rec local_non_recursive_abbrev ~allow_rec strict visited env p ty =
   if not (List.memq (get_id ty) visited) then begin
     match get_desc ty with
       Tconstr(p', args, _abbrev) ->
-        if Env_unscoped.path_equiv env p p' then raise Occur;
+        (* Note: p' is not necessarily normalized here,
+           but we expand/normalize it below and retry. *)
+        if eq_expanded_type_path env p p' then raise Occur;
         if allow_rec && not strict && is_contractive env p' then () else
         let visited = get_id ty :: visited in
         begin try
@@ -2423,7 +2508,7 @@ let occur_univar_or_unscoped ?(inj_only=false) env ty =
       | Tpackage {pack_path = p; pack_constraints} ->
           begin match Path.check_for_unbound_unscoped_idents bound_id p with
           | Some i ->
-            occur_normalize_modtype_path env bound_uv bound_id i p
+            occur_normalize_modtype_path env bound_uv bound_id i p ty
               (fun pack_path -> Tpackage {pack_path; pack_constraints})
           | None ->
               List.iter (fun (_, t) -> occur_rec env bound_uv bound_id t)
@@ -2436,6 +2521,7 @@ let occur_univar_or_unscoped ?(inj_only=false) env ty =
           match id_escape with
           | Some i ->
             occur_normalize_modtype_path env bound_uv bound_id i pack.pack_path
+              ty
               (fun pack_path -> Tfunctor (l, id, {pack with pack_path}, ty))
           | None ->
               List.iter (fun (_, t) -> occur_rec env bound_uv bound_id t)
@@ -2460,7 +2546,7 @@ let occur_univar_or_unscoped ?(inj_only=false) env ty =
         occur_desc env bound_uv bound_id ty
       end else
         iter_type_expr (occur_rec env bound_uv bound_id) ty
-    and occur_normalize_modtype_path env bound_uv bound_id us p f =
+    and occur_normalize_modtype_path env bound_uv bound_id us p ty f =
       match Env.try_normalize_modtype_path env p with
       | None -> raise_escape_exn (Module (Ident.of_unscoped us))
       | Some p' ->
@@ -2561,7 +2647,7 @@ let enter_poly_for tr_exn env t1 tl1 t2 tl2 f =
     Similar to [nondep_type], however we remove the dependency in place,
     while [nondep] does a copy of the type.
 *)
-let identifier_escape env idl ty =
+let identifier_escape env idl initial_ty =
   with_type_mark begin fun mark ->
   let rec occur ?(ignore_mark=false) idl ty =
     if try_mark_node mark ty || ignore_mark then begin
@@ -2575,7 +2661,7 @@ let identifier_escape env idl ty =
           begin match Path.find_free_opt idl pack.pack_path with
           | None -> iter_type_expr (occur idl) ty
           | Some i ->
-            occur_normalize_modtype_path env idl pack.pack_path i
+            occur_normalize_modtype_path env idl pack.pack_path i ty
               (fun pack_path -> Tpackage {pack with pack_path})
           end
       | Tobject (_, ({contents = Some (p, _)} as nm)) ->
@@ -2591,7 +2677,7 @@ let identifier_escape env idl ty =
       | Tfunctor (l, id, pack, t) ->
           begin match Path.find_free_opt idl pack.pack_path with
           | Some i ->
-              occur_normalize_modtype_path env idl pack.pack_path i
+              occur_normalize_modtype_path env idl pack.pack_path i ty
                 (fun pack_path -> Tfunctor (l, id, {pack with pack_path}, ty))
           | None ->
               List.iter (fun (_, t) -> occur idl t) pack.pack_constraints;
@@ -2616,14 +2702,14 @@ let identifier_escape env idl ty =
       occur ~ignore_mark:true idl ty
     end else
       iter_type_expr (occur idl) ty
-  and occur_normalize_modtype_path env idl p id f =
+  and occur_normalize_modtype_path env idl p id ty f =
     match Env.try_normalize_modtype_path env p with
     | None -> raise_escape_exn (Module id)
     | Some p' ->
       set_type_desc ty (f p');
       occur ~ignore_mark:true idl ty
   in
-  occur (List.map Ident.of_unscoped idl) ty
+  occur (List.map Ident.of_unscoped idl) initial_ty
   end
 
 let identifier_escape_for tr_exn env idl t =
@@ -2731,6 +2817,11 @@ let rec has_cached_expansion p abbrev =
   | Mcons { path = p'; rem; _ } ->
       Path.same_unsafe p p' || has_cached_expansion p rem
   | Mlink rem               -> has_cached_expansion p !rem
+
+let quick_eq_type_path_nocache ~normalize env p1 a1 p2 a2 =
+  quick_eq_type_path ~normalize env p1 p2
+  && not (has_cached_expansion p1 !a1
+          || has_cached_expansion p2 !a2)
 
 (**** Transform error trace ****)
 (* +++ Move it to some other place ? *)
@@ -2899,7 +2990,7 @@ let rec mcomp type_pairs env t1 t2 =
   | (_, Tvar _)  ->
       ()
   | (Tconstr (p1, [], _), Tconstr (p2, [], _))
-    when Env_unscoped.path_equiv env p1 p2 ->
+    when quick_eq_type_path ~normalize:false env p1 p2 ->
       ()
   | _ ->
       let t1' = expand_head_opt env t1 in
@@ -3040,7 +3131,7 @@ and mcomp_type_decl type_pairs env p1 p2 tl1 tl2 =
   try
     let decl = Env.find_type p1 env in
     let decl' = Env.find_type p2 env in
-    if Env_unscoped.path_equiv env p1 p2 then begin
+    if quick_eq_type_path ~normalize:true env p1 p2 then begin
       let inj =
         try List.map Variance.(mem Inj) (Env.find_type p1 env).type_variance
         with Not_found -> List.map (fun _ -> false) tl1
@@ -3140,11 +3231,6 @@ let add_gadt_equation uenv source destination =
     add_local_constraint uenv source decl;
     cleanup_abbrev_memo ()
   end
-
-let eq_package_path env p1 p2 =
-  Env_unscoped.path_equiv env p1 p2 ||
-  Env_unscoped.path_equiv env (Env.normalize_modtype_path env p1)
-             (Env.normalize_modtype_path env p2)
 
 let nondep_type' = ref (fun _ _ _ -> assert false)
 let package_subtype = ref (fun _ _ _ -> assert false)
@@ -3318,13 +3404,13 @@ let rec unify uenv t1 t2 =
         link_type t1 t2
     | (d1, d2) -> match (d1, d2, get_constr_desc t1, get_constr_desc t2) with
       (_, _, (Tconstr (p1, [], a1) as d3), (Tconstr (p2, [], a2) as d4))
-          when Env_unscoped.path_equiv (get_env uenv) p1 p2
+          when (d1 == d3 || d2 == d4)
+            && quick_eq_type_path_nocache ~normalize:true (get_env uenv)
+                 p1 a1 p2 a2
             (* This optimization assumes that t1 does not expand to t2
                (and conversely), so we fall back to the general case
                when any of the types has a cached expansion. *)
-            && not (has_cached_expansion p1 !a1
-                 || has_cached_expansion p2 !a2)
-            && (d1 == d3 || d2 == d4) ->
+          ->
         let unify1_constr t1 t2 =
           update_level_for Unify (get_env uenv) (get_level t1) t2;
           update_scope_for Unify (get_scope t1) t2;
@@ -3347,18 +3433,18 @@ and unify2 uenv t1 t2 = unify2_expand uenv t1 t2
 and unify2_rec uenv t1 t2 =
   if unify_eq uenv t1 t2 then () else
   try match (get_desc t1, get_desc t2) with
-  | (Tconstr (p1, tl1, a1), Tconstr (p2, tl2, a2)) ->
-      if Env_unscoped.path_equiv (get_env uenv) p1 p2 && tl1 = [] && tl2 = []
-      && not (has_cached_expansion p1 !a1 || has_cached_expansion p2 !a2)
-      then begin
-        update_level_for Unify (get_env uenv) (get_level t1) t2;
-        update_scope_for Unify (get_scope t1) t2;
-        link_type t1 t2
-      end else
-        let env = get_env uenv in
-        if find_expansion_scope env p1 > find_expansion_scope env p2
-        then unify2_rec uenv t1 (try_expand_safe env t2)
-        else unify2_rec uenv (try_expand_safe env t1) t2
+  | (Tconstr (p1, [], a1), Tconstr (p2, [], a2))
+    when quick_eq_type_path_nocache ~normalize:false (get_env uenv)
+           p1 a1 p2 a2
+    ->
+      update_level_for Unify (get_env uenv) (get_level t1) t2;
+      update_scope_for Unify (get_scope t1) t2;
+      link_type t1 t2
+  | (Tconstr (p1, _, _), Tconstr (p2, _, _)) ->
+      let env = get_env uenv in
+      if find_expansion_scope env p1 > find_expansion_scope env p2
+      then unify2_rec uenv t1 (try_expand_safe env t2)
+      else unify2_rec uenv (try_expand_safe env t1) t2
   | _ ->
       raise Cannot_expand
   with Cannot_expand ->
@@ -3459,17 +3545,17 @@ and unify3 uenv t1' t2' =
       | (Ttuple labeled_tl1, Ttuple labeled_tl2) ->
           unify_labeled_list uenv labeled_tl1 labeled_tl2
       | (Tconstr (p1, tl1, _), Tconstr (p2, tl2, _))
-        when Env_unscoped.path_equiv (get_env uenv) p1 p2 ->
+        when quick_eq_type_path ~normalize:true (get_env uenv) p1 p2 ->
           if not (in_pattern_mode uenv) then
             unify_list uenv tl1 tl2
           else if can_assume_injective uenv then
             without_assume_injective uenv (fun uenv -> unify_list uenv tl1 tl2)
-          else if in_current_module p1 (* || in_pervasives p1 *)
-               || List.exists
-                   (fun (p, _) -> expands_to_datatype (get_env uenv) p)
-                   (Option.to_list (get_abbrev t1') @
-                    Option.to_list (get_abbrev t2') @
-                    [p1, []])
+          else if List.exists
+                   (expands_to_datatype (get_env uenv))
+                   (List.map (fun a -> a.abbr_path)
+                      (Option.to_list (get_abbrev t1') @
+                       Option.to_list (get_abbrev t2'))
+                    @ [p1])
           then
             unify_list uenv tl1 tl2
           else
@@ -3668,10 +3754,10 @@ and unify_row uenv row1 row2 =
   let r1, r2, pairs = merge_row_fields row1_fields row2_fields in
   if r1 <> [] && r2 <> [] then begin
     let ht = Hashtbl.create (List.length r1) in
-    List.iter (fun (l,_) -> Hashtbl.add ht (hash_variant l) l) r1;
+    List.iter (fun (l,_) -> Hashtbl.add ht (Obj.hash_variant l) l) r1;
     List.iter
       (fun (l,_) ->
-        try raise (Tags(l, Hashtbl.find ht (hash_variant l)))
+        try raise (Tags(l, Hashtbl.find ht (Obj.hash_variant l)))
         with Not_found -> ())
       r2
   end;
@@ -3907,16 +3993,16 @@ let unify_gadt (penv : Pattern_env.t) ~pat:ty1 ~expected:ty2 =
     Btype.backtrack snap;
     with_univar_pairs [] do_unify_gadt
 
-let unify_var uenv t1 t2 =
+let unify_var ~check_occur uenv t1 t2 =
   if eq_type t1 t2 then () else
   match get_desc t1, get_desc t2 with
-    Tvar _, Tconstr _ when deep_occur t1 t2 ->
+    Tvar _, Tconstr _ when check_occur && deep_occur t1 t2 ->
       unify uenv t1 t2
   | Tvar _, _ ->
       let env = get_env uenv in
       let reset_tracing = check_trace_gadt_instances env in
       begin try
-        occur_for Unify uenv t1 t2;
+        if check_occur then occur_for Unify uenv t1 t2;
         update_level_for Unify env (get_level t1) t2;
         update_scope_for Unify (get_scope t1) t2;
         link_type t1 t2;
@@ -3934,7 +4020,7 @@ let _ = unify_var' := unify_var
 
 (* the final versions of unification functions *)
 let unify_var env ty1 ty2 =
-  unify_var (Expression {env; in_subst = false}) ty1 ty2
+  unify_var ~check_occur:true (Expression {env; in_subst = false}) ty1 ty2
 
 let unify_pairs env ty1 ty2 pairs =
   with_univar_pairs pairs (fun () ->
@@ -3942,9 +4028,6 @@ let unify_pairs env ty1 ty2 pairs =
 
 let unify env ty1 ty2 =
   unify_pairs env ty1 ty2 []
-
-(* Lower the level of a type to the current level *)
-let enforce_current_level env ty = unify_var env (newvar ()) ty
 
 
 (**** Special cases of unification ****)
@@ -4598,7 +4681,7 @@ let rec moregen type_pairs env t1 t2 =
         occur_for Moregen (Expression {env; in_subst = false}) t1 t2;
         link_type t1 t2
     | (Tconstr (p1, [], _), Tconstr (p2, [], _))
-      when Env_unscoped.path_equiv env p1 p2 ->
+      when quick_eq_type_path ~normalize:false env p1 p2 ->
         ()
     | _ ->
         let t1' = expand_head env t1 in
@@ -4645,7 +4728,7 @@ let rec moregen type_pairs env t1 t2 =
           | (Ttuple tl1, Ttuple tl2) ->
               moregen_labeled_list type_pairs env tl1 tl2
           | (Tconstr (p1, tl1, _), Tconstr (p2, tl2, _))
-                when Env_unscoped.path_equiv env p1 p2 ->
+                when eq_expanded_type_path env p1 p2 ->
               moregen_list type_pairs env tl1 tl2
           | (Tpackage pack1, Tpackage pack2) ->
               moregen_package type_pairs env (get_level t1') pack1
@@ -5002,7 +5085,7 @@ let rec eqtype rename type_pairs subst env t1 t2 =
       (Tvar _, Tvar _) when rename ->
         eqtype_subst type_pairs subst t1 t2
     | (Tconstr (p1, [], _), Tconstr (p2, [], _))
-      when Env_unscoped.path_equiv env p1 p2 ->
+      when quick_eq_type_path ~normalize:false env p1 p2 ->
         ()
     | _ ->
         let t1' = expand_head_rigid env t1 in
@@ -5047,7 +5130,7 @@ let rec eqtype rename type_pairs subst env t1 t2 =
           | (Ttuple tl1, Ttuple tl2) ->
               eqtype_labeled_list rename type_pairs subst env tl1 tl2
           | (Tconstr (p1, tl1, _), Tconstr (p2, tl2, _))
-                when Env_unscoped.path_equiv env p1 p2 ->
+                when quick_eq_type_path ~normalize:true env p1 p2 ->
               eqtype_list_same_length rename type_pairs subst env tl1 tl2
           | (Tpackage pack1, Tpackage pack2) ->
               eqtype_package rename type_pairs subst env
@@ -5232,8 +5315,10 @@ let eqtype rename type_pairs subst env t1 t2 =
 
 (* Two modes: with or without renaming of variables *)
 let equal env rename tyl1 tyl2 =
-  if List.length tyl1 <> List.length tyl2 then
-    raise_unexplained_for Equality;
+  (* In practice, `Equality` is not a good error to report to users and thus
+      callers of this function ought to raise their own error when
+      `List.length tyl1 <> List.length tyl2`. *)
+  assert (List.length tyl1 = List.length tyl2);
   if List.for_all2 eq_type tyl1 tyl2 then () else
   let subst = ref [] in
   try eqtype_list_same_length rename (TypePairs.create 11) subst env tyl1 tyl2
@@ -5852,7 +5937,7 @@ let rec subtype_rec env trace t1 t2 constraints =
     | (Ttuple tl1, Ttuple tl2) ->
         subtype_labeled_list env trace tl1 tl2 constraints
     | (Tconstr(p1, [], _), Tconstr(p2, [], _))
-      when Env_unscoped.path_equiv env p1 p2 ->
+      when quick_eq_type_path ~normalize:true env p1 p2 ->
         constraints
     | (Tconstr(p1, _tl1, _abbrev1), _)
       when generic_abbrev env p1 && safe_abbrev env t1 ->
@@ -5863,7 +5948,7 @@ let rec subtype_rec env trace t1 t2 constraints =
         subtype_rec env trace
           t1 (expand_abbrev ~link:false env t2) constraints
     | (Tconstr(p1, tl1, _), Tconstr(p2, tl2, _))
-      when Env_unscoped.path_equiv env p1 p2 ->
+      when quick_eq_type_path ~normalize:true env p1 p2 ->
         begin try
           let decl = Env.find_type p1 env in
           List.fold_left2
@@ -6040,7 +6125,8 @@ and subtype_row env trace row1 row2 constraints =
   let r1 = if row2_closed then filter_row_fields false r1 else r1 in
   let r2 = if row1_closed then filter_row_fields false r2 else r2 in
   match get_desc more1, get_desc more2 with
-    Tconstr(p1,_,_), Tconstr(p2,_,_) when Env_unscoped.path_equiv env p1 p2 ->
+  | Tconstr(p1,_,_), Tconstr(p2,_,_)
+    when quick_eq_type_path ~normalize:true env p1 p2 ->
       subtype_rec
         env
         (Subtype.Diff {got = more1; expected = more2} :: trace)
@@ -6352,21 +6438,18 @@ let arrow_spine env ty =
       | _ -> List.rev labels, Ret_type ty)
     else List.rev labels, Ret_cycle
   in
-  let snap = snapshot () in
-  let result =
-    with_type_mark (fun mark ->
-        wrap_trace_gadt_instances env (arrow_spine_rec ~mark []) ty)
-  in
-  backtrack snap;
-  result
+  with_type_mark (fun mark ->
+    wrap_trace_gadt_instances env (arrow_spine_rec ~mark []) ty)
 
 let arrow_labels env ty =
+  let snap = snapshot () in
   let label_tys, ret_ty_or_cycle = arrow_spine env ty in
   let is_ret_tvar =
     match ret_ty_or_cycle with
     | Ret_cycle -> false
     | Ret_type ty -> is_Tvar ty
   in
+  backtrack snap;
   List.map fst label_tys, ~is_ret_tvar
 
                               (*************************)
@@ -6699,7 +6782,8 @@ let same_constr env t1 t2 =
   let t1 = expand_head_nolink env t1 in
   let t2 = expand_head_nolink env t2 in
   match get_desc t1, get_desc t2 with
-  | Tconstr (p1, _, _), Tconstr (p2, _, _) -> Env_unscoped.path_equiv env p1 p2
+  | Tconstr (p1, _, _), Tconstr (p2, _, _) ->
+      eq_expanded_type_path env p1 p2
   | _ -> false
 
 let () =

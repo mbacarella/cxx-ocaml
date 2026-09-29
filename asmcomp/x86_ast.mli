@@ -109,7 +109,10 @@ type instruction =
   | ADDSD of arg * arg
   | AND of arg * arg
   | ANDPD of arg * arg
+  | BSF of arg * arg
+  | BSR of arg * arg
   | BSWAP of arg
+  | BTS of arg * arg
   | CALL of arg
   | CDQ
   | CMOV of condition * arg * arg
@@ -192,6 +195,8 @@ type instruction =
   | SUBSD of arg * arg
   | TEST of arg * arg
   | UCOMISD of arg * arg
+  | LOCK_XADD of arg * arg
+  | XADD of arg * arg
   | XCHG of arg * arg
   | XOR of arg * arg
   | XORPD of arg * arg

@@ -125,6 +125,11 @@ let pseudoregs_for_operation op arg res =
       let _,is_swapped = float_cond_and_need_swap cond in
       (if is_swapped then [| arg.(0); treg |] else [| treg; arg.(1) |])
     , [| res.(0); treg |]
+  (* Atomic fetch-and-add: res.(0) holds the increment then receives the old
+     value. Tying res.(0) to arg.(1) puts the increment in res.(0) directly, so
+     no separate mov is needed in emit. arg.(2) is &caml_num_domains_running. *)
+  | Iatomic_fetch_add ->
+      ([| arg.(0); res.(0); arg.(2) |], res)
   (* Other instructions are regular *)
   | _ -> raise Use_default
 
@@ -132,7 +137,8 @@ let pseudoregs_for_operation op arg res =
    [effects_of], below. *)
 let inline_ops =
   [ "sqrt"; "caml_bswap16_direct"; "caml_int32_direct_bswap";
-    "caml_int64_direct_bswap"; "caml_nativeint_direct_bswap" ]
+    "caml_int64_direct_bswap"; "caml_nativeint_direct_bswap";
+    "caml_int_clz_direct"; "caml_int_ctz_direct" ]
 
 let is_immediate n = n <= 0x7FFF_FFFF && n >= -0x8000_0000
 
@@ -241,6 +247,10 @@ method! select_operation op args dbg =
   | Cextcall("caml_int64_direct_bswap", _, _, _)
   | Cextcall("caml_nativeint_direct_bswap", _, _, _) ->
       (Ispecific (Ibswap 64), args)
+  | Cextcall("caml_int_clz_direct", _, _, _) ->
+      (Ispecific Iclz, args)
+  | Cextcall("caml_int_ctz_direct", _, _, _) ->
+      (Ispecific Ictz, args)
   (* Recognize sign extension *)
   | Casr ->
       begin match args with
@@ -258,6 +268,13 @@ method! select_operation op args dbg =
       Ispecific Izextend32, [arg]
     | _ -> super#select_operation op args dbg
     end
+  | Catomic_fetch_add ->
+      (* Materialise &caml_num_domains_running as a regalloc-managed operand
+         (an Iconst_symbol) so the single-domain fast path also works in
+         dlcode, where reading the symbol needs a GOTPCREL indirection and
+         hence a register. *)
+      (Iatomic_fetch_add,
+       args @ [Cconst_symbol ("caml_num_domains_running", dbg)])
   | _ -> super#select_operation op args dbg
 
 (* Recognize float arithmetic with mem *)
