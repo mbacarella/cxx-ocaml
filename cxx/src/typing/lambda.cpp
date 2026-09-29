@@ -77,12 +77,21 @@ static bool is_none_loc(const Location& l) {
 }
 ScopedLocation of_location(scopes s, const Location& loc) {
   if (is_none_loc(loc)) return {};
-  return ScopedLocation{true, loc, s};
+  // a location in the current zone's storage (the typed tree's) is shared:
+  // it never moves; another (a temporary) is copied -- into the permanent
+  // zone when the current one is a scratch zone, which Lambda outlives
+  Zone& z = zone();
+  if (!z.scratch && z.owns(reinterpret_cast<const char*>(&loc))) return ScopedLocation{&loc, s};
+  if (z.scratch) {
+    ZoneScope perm(permanent_zone());
+    return ScopedLocation{make<Location>(loc), s};
+  }
+  return ScopedLocation{make<Location>(loc), s};
 }
-Location to_location(const ScopedLocation& l) { return l.known ? l.loc : location::none(); }
+Location to_location(const ScopedLocation& l) { return l.known() ? l.loc() : location::none(); }
 std::string_view string_of_scoped_location(const ScopedLocation& l) {
   static const std::string_view unknown = static_literal("??");
-  return l.known ? string_of_scopes(l.sc) : unknown;
+  return l.known() ? string_of_scopes(l.sc) : unknown;
 }
 
 }  // namespace debuginfo
@@ -1508,10 +1517,10 @@ static bool equal_pos(const Position& a, const Position& b) {
   return a.pos_fname == b.pos_fname && a.pos_lnum == b.pos_lnum && a.pos_bol == b.pos_bol && a.pos_cnum == b.pos_cnum;
 }
 static bool equal_sloc(const ScopedLocation& a, const ScopedLocation& b) {
-  if (a.known != b.known) return false;
-  if (!a.known) return true;
-  if (!(equal_pos(a.loc.loc_start, b.loc.loc_start) && equal_pos(a.loc.loc_end, b.loc.loc_end) &&
-        a.loc.loc_ghost == b.loc.loc_ghost))
+  if (a.known() != b.known()) return false;
+  if (!a.known()) return true;
+  if (!(equal_pos(a.loc().loc_start, b.loc().loc_start) && equal_pos(a.loc().loc_end, b.loc().loc_end) &&
+        a.loc().loc_ghost == b.loc().loc_ghost))
     return false;
   if (a.sc == b.sc) return true;
   if (!a.sc || !b.sc) return false;

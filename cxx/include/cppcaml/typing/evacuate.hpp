@@ -53,6 +53,7 @@ class Evacuator {
 
   const Zone& dying_;
   std::unordered_map<const void*, const void*> memo_;  // old object -> its copy
+  std::unordered_map<const Location*, const Location*> locs_;  // (a location's address may be an identity)
   std::unordered_map<std::uint64_t, std::unordered_map<std::size_t, std::string_view>> strs_;
   std::unordered_set<lambda::lambda> seen_;
 };

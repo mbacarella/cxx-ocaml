@@ -244,6 +244,7 @@ struct HeadScope {
   HeadScope() {
     static Zone scratch;
     if (!g_head_zone) {
+      scratch.scratch = true;
       g_head_zone = &scratch;
       outer = true;
     }

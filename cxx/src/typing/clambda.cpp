@@ -26,8 +26,8 @@ static Item item_from_location(scopes sc, const Location& loc) {
 }
 
 t from_location(const lambda::ScopedLocation& l) {
-  if (!l.known) return {};
-  return slice<Item>({item_from_location(l.sc, l.loc)});
+  if (!l.known()) return {};
+  return slice<Item>({item_from_location(l.sc, l.loc())});
 }
 
 Location to_location(const t& dbg) {

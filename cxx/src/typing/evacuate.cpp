@@ -97,8 +97,15 @@ debuginfo::scopes Evacuator::scopes(debuginfo::scopes s) {
 
 debuginfo::ScopedLocation Evacuator::scoped_location(const debuginfo::ScopedLocation& l) {
   debuginfo::ScopedLocation r = l;
-  if (!l.known) return r;
-  r.loc = location(l.loc);
+  if (!l.known()) return r;
+  // the location copied once (it is shared) when it or an identity it
+  // holds is in the dying zone
+  const Location& o = l.loc();
+  if (owned(l.locp) || owned(o.obj) || owned(o.loc_start.obj) || owned(o.loc_end.obj)) {
+    auto [it, fresh] = locs_.try_emplace(l.locp, nullptr);
+    if (fresh) it->second = make<Location>(location(o));
+    r.locp = it->second;
+  }
   r.sc = scopes(l.sc);
   return r;
 }
@@ -317,7 +324,7 @@ std::vector<std::string> Evacuator::leftovers(L::lambda root) {
   std::unordered_set<L::lambda> seen;
   auto bad_id = [&](Ident::t id) { return owned(id) || (id && owned(id->name_.data())); };
   auto bad_loc = [&](const debuginfo::ScopedLocation& l) {
-    return l.known && (owned(l.sc) || owned(l.loc.loc_start.pos_fname.data()));
+    return l.known() && (owned(l.sc) || owned(l.locp) || owned(l.loc().loc_start.pos_fname.data()));
   };
   std::function<void(L::lambda)> go = [&](L::lambda l) {
     if (!l || !seen.insert(l).second) return;

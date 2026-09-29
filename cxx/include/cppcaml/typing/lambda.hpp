@@ -40,10 +40,14 @@ scopes enter_module_definition(scopes s, Ident::t id);
 scopes enter_class_definition(scopes s, Ident::t id);
 scopes enter_method_definition(scopes s, std::string_view label);
 
-struct ScopedLocation {  // Loc_unknown | Loc_known {loc; scopes}
-  bool known = false;
-  Location loc{};
+// Loc_unknown | Loc_known {loc; scopes}: the location shared, as OCaml's
+// Location.t record (of_location points at the tree's own where it is in
+// zone storage)
+struct ScopedLocation {
+  const Location* locp = nullptr;  // Loc_known's
   scopes sc = nullptr;
+  bool known() const { return locp != nullptr; }
+  const Location& loc() const { return *locp; }
 };
 inline ScopedLocation loc_unknown() { return {}; }
 ScopedLocation of_location(scopes s, const Location& loc);
@@ -137,16 +141,10 @@ struct Primitive {
     Ppoll
   };
   K kind;
-  Ident::t id = nullptr;                   // Pgetglobal / Psetglobal
-  long n = 0;  // Pmakeblock tag, Pfield/Psetfield/Pfloatfield/Psetfloatfield index, Pduprecord size,
-               // Poffsetint/Poffsetref delta, Pbigarrayref/set #dims, Pbigarraydim n
   MutableFlag mut = MutableFlag::Immutable;  // Pmakeblock / Pfield / Pmakearray / Pduparray
-  BlockShape shape;                          // Pmakeblock
   LazyBlockTag lazy_tag = LazyBlockTag::Lazy_tag;                    // Pmakelazyblock
   ImmediateOrPointer ptr = ImmediateOrPointer::Pointer;              // Pfield / Psetfield(_computed)
   InitializationOrAssignment init = InitializationOrAssignment::Assignment;  // Psetfield(_computed) / Psetfloatfield
-  RecordRepresentation repr;                                         // Pduprecord
-  const PrimitiveDescription* ccall = nullptr;                       // Pccall
   RaiseKind raise = RaiseKind::Raise_regular;                        // Praise
   IsSafe safe = IsSafe::Safe;                                        // Pdivint / Pmodint / Pdivbint / Pmodbint
   IntegerComparison icmp = IntegerComparison::Ceq;                   // Pintcomp / Pbintcomp
@@ -159,6 +157,13 @@ struct Primitive {
   BigarrayKind ba_kind = BigarrayKind::Pbigarray_unknown;
   BigarrayLayout ba_layout = BigarrayLayout::Pbigarray_unknown_layout;
   CompileTimeConstant ctconst = CompileTimeConstant::Big_endian;     // Pctconst
+  // (the one-byte fields first: no padding between them)
+  Ident::t id = nullptr;                   // Pgetglobal / Psetglobal
+  long n = 0;  // Pmakeblock tag, Pfield/Psetfield/Pfloatfield/Psetfloatfield index, Pduprecord size,
+               // Poffsetint/Poffsetref delta, Pbigarrayref/set #dims, Pbigarraydim n
+  BlockShape shape;                          // Pmakeblock
+  RecordRepresentation repr;                                         // Pduprecord
+  const PrimitiveDescription* ccall = nullptr;                       // Pccall
 };
 // the constant and simple constructors
 inline Primitive prim(Primitive::K k) { return Primitive{k}; }

@@ -938,10 +938,10 @@ void lam(Formatter& ppf, lambda::lambda l) {
       // -dno-locations also hides the placement of debug events
       if (!flags::locations) {
         lam(ppf, le->l);
-      } else if (!ev->lev_loc.known) {
+      } else if (!ev->lev_loc.known()) {
         fprintf(ppf, "@[<2>(%s <unknown location>@ %a)@]", kind, format::pr(lam, le->l));
       } else {
-        const Location& loc = ev->lev_loc.loc;
+        const Location& loc = ev->lev_loc.loc();
         fprintf(ppf, "@[<2>(%s %s %s(%i)%s:%i-%i@ %a)@]", kind, debuginfo::string_of_scopes(ev->lev_loc.sc),
                 loc.loc_start.pos_fname, loc.loc_start.pos_lnum, loc.loc_ghost ? "<ghost>" : "",
                 loc.loc_start.pos_cnum, loc.loc_end.pos_cnum, format::pr(lam, le->l));

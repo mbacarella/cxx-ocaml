@@ -31,6 +31,9 @@ class Zone {
   // mmap_all: every block from the kernel (drop_protected can then make the
   // storage inaccessible)
   explicit Zone(bool mmap_all) : mmap_all_(mmap_all) {}
+  // a scratch zone (Matching's, Parmatch's heads): cleared while what is
+  // built beside it lives on, so nothing may point into it
+  bool scratch = false;
   Zone(const Zone&) = delete;
   Zone& operator=(const Zone&) = delete;
   ~Zone() {
