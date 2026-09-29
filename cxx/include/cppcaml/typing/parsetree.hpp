@@ -114,7 +114,7 @@ struct CoreTypeDesc {
 };
 struct CoreType {
   const CoreTypeDesc* ptyp_desc;
-  Location ptyp_loc;
+  LocPtr ptyp_loc;
   LocationStack ptyp_loc_stack;
   Attributes ptyp_attributes;
 };
@@ -206,7 +206,7 @@ struct PatternDesc {
 };
 struct Pattern {
   const PatternDesc* ppat_desc;
-  Location ppat_loc;
+  LocPtr ppat_loc;
   LocationStack ppat_loc_stack;
   Attributes ppat_attributes;
 };
@@ -255,7 +255,7 @@ struct ExpressionDesc {
 };
 struct Expression {
   const ExpressionDesc* pexp_desc;
-  Location pexp_loc;
+  LocPtr pexp_loc;
   LocationStack pexp_loc_stack;
   Attributes pexp_attributes;
 };

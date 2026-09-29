@@ -95,6 +95,27 @@ Location none();
 Location distinct_record(Location l);
 }
 
+// A tree node's location (the parse tree's and the typed tree's nodes): the
+// record shared, as OCaml's nodes share the parser's Location.t -- a copy of
+// the 80-byte record in every node was a sixth of the typing memory.  Made
+// from a location in the current zone's storage it points at it (a zone's
+// objects never move: the parser's record, another node's); from another (a
+// temporary) it holds a copy.  Its fields are read through ->; a default
+// one is Location.none.
+class LocPtr {
+ public:
+  LocPtr() = default;
+  LocPtr(const Location& l) : p_(share(l)) {}
+  const Location& get() const { return p_ ? *p_ : none_record(); }
+  operator const Location&() const { return get(); }
+  const Location* operator->() const { return &get(); }
+
+ private:
+  static const Location* share(const Location& l);
+  static const Location& none_record();
+  const Location* p_ = nullptr;
+};
+
 // ---- Asttypes ------------------------------------------------------------
 enum class PrivateFlag : std::uint8_t { Private, Public };
 enum class MutableFlag : std::uint8_t { Immutable, Mutable };

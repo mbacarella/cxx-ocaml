@@ -86,7 +86,7 @@ struct PatternDesc {
 };
 struct Pattern {  // 'k general_pattern
   const PatternDesc* pat_desc;
-  Location pat_loc;
+  LocPtr pat_loc;
   Slice<PatExtraItem> pat_extra;
   TypeExpr* pat_type;
   env::t pat_env;
@@ -175,7 +175,7 @@ struct ExpressionDesc {
 };
 struct Expression {
   const ExpressionDesc* exp_desc;
-  Location exp_loc;
+  LocPtr exp_loc;
   Slice<ExpExtraItem> exp_extra;
   TypeExpr* exp_type;
   env::t exp_env;
@@ -361,7 +361,7 @@ struct CoreType {
   const CoreTypeDesc* ctyp_desc;  // mutable (Typeclass.declare_method)
   TypeExpr* ctyp_type;            // mutable
   env::t ctyp_env;
-  Location ctyp_loc;
+  LocPtr ctyp_loc;
   Attributes ctyp_attributes;
 };
 struct PackageType {

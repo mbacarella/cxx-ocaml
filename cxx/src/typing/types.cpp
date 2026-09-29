@@ -158,6 +158,23 @@ Location location::none() {
   return Location{p, p, true};
 }
 
+const Location* LocPtr::share(const Location& l) {
+  Zone& z = zone();
+  if (!z.scratch && z.owns(reinterpret_cast<const char*>(&l))) return &l;
+  if (z.scratch) {
+    ZoneScope perm(permanent_zone());
+    return make<Location>(l);
+  }
+  return make<Location>(l);
+}
+const Location& LocPtr::none_record() {
+  static const Location n = [] {
+    ZoneScope perm(permanent_zone());
+    return location::none();
+  }();
+  return n;
+}
+
 namespace uid {
 static long g_id = -1, g_id_param = -1;
 // a fresh record's identity

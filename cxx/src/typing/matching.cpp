@@ -225,7 +225,7 @@ struct Head {
   MutableFlag am = MutableFlag::Immutable;       // Array
   long n = 0;                                    // Array
   // pattern_data
-  Location pat_loc;
+  LocPtr pat_loc;
   Slice<tt::PatExtraItem> pat_extra;
   TypeExpr* pat_type = nullptr;
   env::t pat_env = nullptr;

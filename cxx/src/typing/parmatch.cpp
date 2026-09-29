@@ -88,7 +88,7 @@ struct Head {
   MutableFlag am = MutableFlag::Immutable;         // Array
   long n = 0;                                      // Array
   // pattern_data
-  Location pat_loc;
+  LocPtr pat_loc;
   Slice<tt::PatExtraItem> pat_extra;
   TypeExpr* pat_type = nullptr;
   env::t pat_env = nullptr;
@@ -1595,7 +1595,7 @@ Answer every_satisfiables(const std::vector<URow>& pss, const URow& qs) {
     return every_satisfiables(map_rows(pss, push_no_or), push_no_or(qs));
   }
   if (auto* o = as<tt::Tpat_or>(d)) {
-    if (o->p1->pat_loc.loc_ghost && o->p2->pat_loc.loc_ghost)
+    if (o->p1->pat_loc->loc_ghost && o->p2->pat_loc->loc_ghost)
       // syntactically generated or-pats should not be expanded
       return every_satisfiables(map_rows(pss, push_no_or), push_no_or(qs));
     // this is a real or-pattern

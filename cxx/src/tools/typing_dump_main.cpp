@@ -1275,7 +1275,7 @@ void expression(const Expression* e) {
   }
   if (d->kind == K::Pexp_assert) {
     s(" innermost ");
-    loc(e->pexp_loc_stack.empty() ? e->pexp_loc : e->pexp_loc_stack.back());
+    loc(e->pexp_loc_stack.empty() ? e->pexp_loc.get() : e->pexp_loc_stack.back());
   }
   s(")");
 }

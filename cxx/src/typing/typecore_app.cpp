@@ -62,7 +62,7 @@ static Location previous_arg_loc(const std::vector<UntypedArg>& rev_args, const 
 
 static Location beginning_function_loc(const std::vector<UntypedArg>& rev_args, const tt::Expression* funct) {
   Location prev = previous_arg_loc(rev_args, funct);
-  return Location{funct->exp_loc.loc_start, prev.loc_end, prev.loc_ghost && funct->exp_loc.loc_ghost};
+  return Location{funct->exp_loc->loc_start, prev.loc_end, prev.loc_ghost && funct->exp_loc->loc_ghost};
 }
 
 [[noreturn]] static void dependent_app_error(env::t env, const ctype::FilterArrowFailure& err_,
@@ -1286,7 +1286,7 @@ const pt::Expression* vb_exp_constraint(const pt::ValueBinding* vb) {
     return ah::exp_constraint(loc, expr, ct->typ);
   }
   Location loc = expr->pexp_loc;
-  loc.loc_start = vb->pvb_pat->ppat_loc.loc_start;
+  loc.loc_start = vb->pvb_pat->ppat_loc->loc_start;
   loc.loc_ghost = true;
   loc = location::distinct_record(loc);
   const pt::Expression* e = ah::exp_constraint(loc, expr, ct->typ);
@@ -1312,7 +1312,7 @@ std::pair<pt::Attributes, const pt::Pattern*> vb_pat_constraint(const pt::ValueB
     const pt::CoreType* varified = ah::varify_constructors(ct->locally_abstract_univars, ct->typ);
     const pt::CoreType* t = ah::typ_poly(ct->typ->ptyp_loc, ct->locally_abstract_univars, varified);
     Location loc = pat->ppat_loc;
-    loc.loc_end = ct->typ->ptyp_loc.loc_end;
+    loc.loc_end = ct->typ->ptyp_loc->loc_end;
     loc.loc_ghost = true;
     loc = location::distinct_record(loc);
     return {vb->pvb_attributes, ah::pat_constraint(loc, pat, t)};

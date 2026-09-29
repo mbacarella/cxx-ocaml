@@ -501,7 +501,7 @@ struct Conv {
       pl = loc(p.loc);
     } else {
       pl = loc(p.path.loc);
-      if (!cs.empty()) pl.loc_end = cs[cs.size() - 1].second->ptyp_loc.loc_end;
+      if (!cs.empty()) pl.loc_end = cs[cs.size() - 1].second->ptyp_loc->loc_end;
       pl.loc_ghost = false;
     }
     return make<PackageType>(lidloc(p.path), cs, pl, attrs(p.attrs));
