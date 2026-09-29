@@ -16,6 +16,7 @@
 #include <unordered_map>
 
 #include <cstdio>
+#include <cstring>
 
 #include "cppcaml/blake2.hpp"
 #include "cppcaml/marshal.hpp"
@@ -918,6 +919,9 @@ class Reader {
     return list<const SignatureItem*>(id, [&](std::size_t x) { return sig_item(x); });
   }
 
+ protected:
+  const cmi_marshal::Graph& graph() const { return g_; }
+
  private:
   const cmi_marshal::Graph& g_;
   SlotTable slots_;
@@ -1145,3 +1149,460 @@ CmiInfos read_cmi(const std::string& filename) {
 }
 
 }  // namespace cppcaml::typing::cmi_format
+
+// ---- .cmx: Compilenv.read_unit_info ------------------------------------------------------
+// The unit_infos, decoded by the .cmi Reader extended to Clambda's types
+// (one object per marshaled block where OCaml's identity matters: the
+// function descriptions -- mutable -- and the approximations, which the
+// current unit's approximation may re-export).
+#include "cppcaml/typing/cmx_format.hpp"
+
+namespace cppcaml::typing::cmi_format {
+namespace {
+
+using namespace clambda;
+
+// Clambda_primitives.primitive's constructors with arguments (numbered
+// apart from the constant ones, each in declaration order)
+bool prim_has_args(Primitive::K k) {
+  using K = Primitive::K;
+  switch (k) {
+    case K::Pread_symbol: case K::Pmakeblock: case K::Pmakelazyblock: case K::Pfield: case K::Psetfield:
+    case K::Psetfield_computed: case K::Pfloatfield: case K::Psetfloatfield: case K::Pduprecord:
+    case K::Pccall: case K::Praise: case K::Pdivint: case K::Pmodint: case K::Pintcomp:
+    case K::Pcompare_bints: case K::Poffsetint: case K::Poffsetref: case K::Pfloatcomp: case K::Pmakearray:
+    case K::Pduparray: case K::Parraylength: case K::Parrayrefu: case K::Parraysetu: case K::Parrayrefs:
+    case K::Parraysets: case K::Pbintofint: case K::Pintofbint: case K::Pcvtbint: case K::Pnegbint:
+    case K::Paddbint: case K::Psubbint: case K::Pmulbint: case K::Pdivbint: case K::Pmodbint:
+    case K::Pandbint: case K::Porbint: case K::Pxorbint: case K::Plslbint: case K::Plsrbint:
+    case K::Pasrbint: case K::Pbintcomp: case K::Pbigarrayref: case K::Pbigarrayset: case K::Pbigarraydim:
+    case K::Pstring_load: case K::Pbytes_load: case K::Pbytes_set: case K::Pbigstring_load:
+    case K::Pbigstring_set: case K::Pbbswap:
+      return true;
+    default: return false;
+  }
+}
+
+// the constructor of an immediate / a block tag
+Primitive::K prim_kind(bool block, long n) {
+  long k = 0;
+  for (int i = 0; i <= static_cast<int>(Primitive::K::Ppoll); ++i) {
+    auto kind = static_cast<Primitive::K>(i);
+    if (prim_has_args(kind) == block) {
+      if (k == n) return kind;
+      ++k;
+    }
+  }
+  throw Corrupt{};
+}
+
+class CmxReader : public Reader {
+ public:
+  using Reader::Reader;
+
+  lambda::ValueKind vk(std::size_t id) {
+    lambda::ValueKind k;
+    if (is_int(id)) {
+      switch (ival(id)) {
+        case 0: k.kind = lambda::ValueKind::Kind::Pgenval; break;
+        case 1: k.kind = lambda::ValueKind::Kind::Pfloatval; break;
+        default: k.kind = lambda::ValueKind::Kind::Pintval; break;
+      }
+    } else {
+      k.kind = lambda::ValueKind::Kind::Pboxedintval;
+      k.bi = static_cast<BoxedInteger>(ival(f(id, 0)));
+    }
+    return k;
+  }
+
+  debuginfo::scopes scopes(std::size_t id) {
+    if (is_int(id)) return nullptr;  // Empty
+    if (auto it = scopes_.find(id); it != scopes_.end()) return it->second;
+    auto* s = make<debuginfo::Scopes>(debuginfo::Scopes{static_cast<debuginfo::Scopes::Item>(ival(f(id, 0))),
+                                                         str(f(id, 1)), str(f(id, 2))});
+    scopes_[id] = s;
+    return s;
+  }
+  debuginfo::t dbg(std::size_t id) {
+    return list<debuginfo::Item>(id, [&](std::size_t x) {
+      return debuginfo::Item{str(f(x, 0)), ival(f(x, 1)), ival(f(x, 2)), ival(f(x, 3)),
+                             ival(f(x, 4)), ival(f(x, 5)), ival(f(x, 6)), scopes(f(x, 7))};
+    });
+  }
+
+  VarWithProvenance vp(std::size_t id) {
+    if (tag(id) == 0) return {ident(f(id, 0)), nullptr};
+    std::size_t pr = f(id, 1);
+    auto* p = make<Provenance>(Provenance{path(f(pr, 0)), dbg(f(pr, 1)), ident(f(pr, 2))});
+    return {ident(f(id, 0)), p};
+  }
+  UParam uparam(std::size_t id) { return {vp(f(id, 0)), vk(f(id, 1))}; }
+
+  UConstant uconstant(std::size_t id) {
+    if (tag(id) == 1) return uconst_int(ival(f(id, 0)));
+    std::size_t o = f(id, 1);
+    return uconst_ref(str(f(id, 0)), is_int(o) ? nullptr : structured(f(o, 0)));
+  }
+  const UStructuredConstant* structured(std::size_t id) {
+    if (auto it = sc_.find(id); it != sc_.end()) return it->second;
+    auto* c = make<UStructuredConstant>();
+    sc_[id] = c;
+    using K = UStructuredConstant::Kind;
+    c->kind = static_cast<K>(tag(id));
+    switch (c->kind) {
+      case K::Uconst_float: c->f = dbl(f(id, 0)); break;
+      case K::Uconst_int32:
+      case K::Uconst_int64:
+      case K::Uconst_nativeint: c->i = ival(f(id, 0)); break;
+      case K::Uconst_block:
+        c->tag = ival(f(id, 0));
+        c->fields = list<UConstant>(f(id, 1), [&](std::size_t x) { return uconstant(x); });
+        break;
+      case K::Uconst_float_array:
+        c->floats = list<double>(f(id, 0), [&](std::size_t x) { return dbl(x); });
+        break;
+      case K::Uconst_string: c->s = str(f(id, 0)); break;
+      case K::Uconst_closure:
+        c->funs = list<const UFunction*>(f(id, 0), [&](std::size_t x) { return ufunction(x); });
+        c->s = str(f(id, 1));
+        c->fields = list<UConstant>(f(id, 2), [&](std::size_t x) { return uconstant(x); });
+        break;
+    }
+    return c;
+  }
+  double dbl(std::size_t id) {
+    if (cmi_marshal::is_imm(id) || graph().node(id).kind != cmi_marshal::Kind::Double) throw Corrupt{};
+    double d;
+    std::uint64_t bits = graph().node(id).v;
+    std::memcpy(&d, &bits, sizeof d);
+    return d;
+  }
+
+  const UFunction* ufunction(std::size_t id) {
+    if (auto it = fun_.find(id); it != fun_.end()) return it->second;
+    auto* u = make<UFunction>();
+    fun_[id] = u;
+    u->label = str(f(id, 0));
+    u->arity = ival(f(id, 1));
+    u->params = list<UParam>(f(id, 2), [&](std::size_t x) { return uparam(x); });
+    u->return_ = vk(f(id, 3));
+    u->body = ulam(f(id, 4));
+    u->dbg = dbg(f(id, 5));
+    std::size_t e = f(id, 6);
+    u->env = is_int(e) ? nullptr : ident(f(e, 0));
+    u->poll = static_cast<lambda::PollAttribute>(ival(f(id, 7)));
+    return u;
+  }
+
+  RecordRepresentation record_rep(std::size_t r) {
+    using RK = RecordRepresentation::Kind;
+    RecordRepresentation rr;
+    if (is_int(r)) {
+      rr.kind = ival(r) == 0 ? RK::Record_regular : RK::Record_float;
+      return rr;
+    }
+    switch (tag(r)) {
+      case 0: rr.kind = RK::Record_unboxed; rr.unboxed_inlined = boolean(f(r, 0)); break;
+      case 1: rr.kind = RK::Record_inlined; rr.inlined_tag = ival(f(r, 0)); break;
+      default: rr.kind = RK::Record_extension; rr.extension = path(f(r, 0)); break;
+    }
+    return rr;
+  }
+  const PrimitiveDescription* prim_desc(std::size_t p) {
+    if (auto it = pd_.find(p); it != pd_.end()) return it->second;
+    auto* d = make<PrimitiveDescription>(str(f(p, 0)), ival(f(p, 1)), boolean(f(p, 2)), str(f(p, 3)),
+                                         list<NativeRepr>(f(p, 4), [&](std::size_t x) { return native_repr(x); }),
+                                         native_repr(f(p, 5)));
+    pd_[p] = d;
+    return d;
+  }
+  void sized(Primitive& p, std::size_t t) {  // (memory_access_size * is_safe)
+    p.size = static_cast<MemoryAccessSize>(ival(f(t, 0)));
+    p.safe = static_cast<lambda::IsSafe>(ival(f(t, 1)));
+  }
+
+  Primitive primitive(std::size_t id) {
+    using K = Primitive::K;
+    if (is_int(id)) return Primitive{prim_kind(false, ival(id))};
+    Primitive p{prim_kind(true, tag(id))};
+    auto I = [&](std::size_t k) { return ival(f(id, k)); };
+    switch (p.kind) {
+      case K::Pread_symbol: p.sym = str(f(id, 0)); break;
+      case K::Pmakeblock: {
+        p.n = I(0);
+        p.mut = mutable_flag(f(id, 1));
+        std::size_t sh = f(id, 2);
+        if (!is_int(sh)) {
+          p.shape.some = true;
+          p.shape.kinds = list<lambda::ValueKind>(f(sh, 0), [&](std::size_t x) { return vk(x); });
+        }
+        break;
+      }
+      case K::Pmakelazyblock: p.lazy_tag = static_cast<lambda::LazyBlockTag>(I(0)); break;
+      case K::Pfield:
+        p.n = I(0);
+        p.ptr = static_cast<lambda::ImmediateOrPointer>(I(1));
+        p.mut = mutable_flag(f(id, 2));
+        break;
+      case K::Psetfield:
+        p.n = I(0);
+        p.ptr = static_cast<lambda::ImmediateOrPointer>(I(1));
+        p.init = static_cast<lambda::InitializationOrAssignment>(I(2));
+        break;
+      case K::Psetfield_computed:
+        p.ptr = static_cast<lambda::ImmediateOrPointer>(I(0));
+        p.init = static_cast<lambda::InitializationOrAssignment>(I(1));
+        break;
+      case K::Pfloatfield: p.n = I(0); break;
+      case K::Psetfloatfield: p.n = I(0); p.init = static_cast<lambda::InitializationOrAssignment>(I(1)); break;
+      case K::Pduprecord: p.repr = record_rep(f(id, 0)); p.n = I(1); break;
+      case K::Pccall: p.ccall = prim_desc(f(id, 0)); break;
+      case K::Praise: p.raise = static_cast<lambda::RaiseKind>(I(0)); break;
+      case K::Pdivint:
+      case K::Pmodint: p.safe = static_cast<lambda::IsSafe>(I(0)); break;
+      case K::Pintcomp: p.icmp = static_cast<lambda::IntegerComparison>(I(0)); break;
+      case K::Pcompare_bints: p.bi = static_cast<BoxedInteger>(I(0)); break;
+      case K::Poffsetint:
+      case K::Poffsetref: p.n = I(0); break;
+      case K::Pfloatcomp: p.fcmp = static_cast<lambda::FloatComparison>(I(0)); break;
+      case K::Pmakearray:
+      case K::Pduparray: p.array = static_cast<lambda::ArrayKind>(I(0)); p.mut = mutable_flag(f(id, 1)); break;
+      case K::Parraylength: case K::Parrayrefu: case K::Parraysetu: case K::Parrayrefs: case K::Parraysets:
+        p.array = static_cast<lambda::ArrayKind>(I(0));
+        break;
+      case K::Pbintofint: case K::Pintofbint: case K::Pnegbint: case K::Paddbint: case K::Psubbint:
+      case K::Pmulbint: case K::Pandbint: case K::Porbint: case K::Pxorbint: case K::Plslbint: case K::Plsrbint:
+      case K::Pasrbint: case K::Pbbswap:
+        p.bi = static_cast<BoxedInteger>(I(0));
+        break;
+      case K::Pcvtbint: p.bi = static_cast<BoxedInteger>(I(0)); p.bi2 = static_cast<BoxedInteger>(I(1)); break;
+      case K::Pdivbint:
+      case K::Pmodbint:  // { size; is_safe }
+        p.bi = static_cast<BoxedInteger>(I(0));
+        p.safe = static_cast<lambda::IsSafe>(I(1));
+        break;
+      case K::Pbintcomp: p.bi = static_cast<BoxedInteger>(I(0)); p.icmp = static_cast<lambda::IntegerComparison>(I(1)); break;
+      case K::Pbigarrayref:
+      case K::Pbigarrayset:
+        p.unsafe = boolean(f(id, 0));
+        p.n = I(1);
+        p.ba_kind = static_cast<lambda::BigarrayKind>(I(2));
+        p.ba_layout = static_cast<lambda::BigarrayLayout>(I(3));
+        break;
+      case K::Pbigarraydim: p.n = I(0); break;
+      case K::Pstring_load: case K::Pbytes_load: case K::Pbytes_set: case K::Pbigstring_load:
+      case K::Pbigstring_set:
+        sized(p, f(id, 0));
+        break;
+      default: throw Corrupt{};
+    }
+    return p;
+  }
+
+  template <class T, class F>
+  Slice<T> array(std::size_t id, F&& elt) {  // an array: a block (Atom 0 when empty)
+    if (is_int(id)) return {};
+    std::size_t n = graph().node(id).n;
+    std::vector<T> v;
+    for (std::size_t k = 0; k < n; ++k) v.push_back(elt(f(id, k)));
+    return slice(v);
+  }
+
+  ulambda ulam(std::size_t id) {
+    if (is_int(id)) return uunreachable();  // the constant constructor
+    if (auto it = ul_.find(id); it != ul_.end()) return it->second;
+    ulambda r = ulam_raw(id);
+    ul_[id] = r;
+    return r;
+  }
+  Slice<ulambda> ulams(std::size_t id) { return list<ulambda>(id, [&](std::size_t x) { return ulam(x); }); }
+  ulambda ulam_raw(std::size_t id) {
+    switch (static_cast<UK>(tag(id))) {
+      case UK::Uvar: return uvar(ident(f(id, 0)));
+      case UK::Uconst: return uconst(uconstant(f(id, 0)));
+      case UK::Udirect_apply: return udirect_apply(str(f(id, 0)), ulams(f(id, 1)), dbg(f(id, 2)));
+      case UK::Ugeneric_apply: return ugeneric_apply(ulam(f(id, 0)), ulams(f(id, 1)), dbg(f(id, 2)));
+      case UK::Uclosure:
+        return uclosure(list<const UFunction*>(f(id, 0), [&](std::size_t x) { return ufunction(x); }),
+                        ulams(f(id, 1)));
+      case UK::Uoffset: return uoffset(ulam(f(id, 0)), ival(f(id, 1)));
+      case UK::Ulet:
+        return ulet(mutable_flag(f(id, 0)), vk(f(id, 1)), vp(f(id, 2)), ulam(f(id, 3)), ulam(f(id, 4)));
+      case UK::Uphantom_let: {
+        std::size_t o = f(id, 1);
+        return uphantom_let(vp(f(id, 0)), is_int(o) ? nullptr : phantom(f(o, 0)), ulam(f(id, 2)));
+      }
+      case UK::Uprim: return uprim(primitive(f(id, 0)), ulams(f(id, 1)), dbg(f(id, 2)));
+      case UK::Uswitch: {
+        std::size_t sw = f(id, 1);
+        USwitch u;
+        u.us_index_consts = array<long>(f(sw, 0), [&](std::size_t x) { return ival(x); });
+        u.us_actions_consts = array<ulambda>(f(sw, 1), [&](std::size_t x) { return ulam(x); });
+        u.us_index_blocks = array<long>(f(sw, 2), [&](std::size_t x) { return ival(x); });
+        u.us_actions_blocks = array<ulambda>(f(sw, 3), [&](std::size_t x) { return ulam(x); });
+        return uswitch(ulam(f(id, 0)), u, dbg(f(id, 2)));
+      }
+      case UK::Ustringswitch: {
+        std::size_t d = f(id, 2);
+        return ustringswitch(ulam(f(id, 0)), list<UStringCase>(f(id, 1), [&](std::size_t x) {
+                               return UStringCase{str(f(x, 0)), ulam(f(x, 1))};
+                             }),
+                             is_int(d) ? nullptr : ulam(f(d, 0)));
+      }
+      case UK::Ustaticfail: return ustaticfail(ival(f(id, 0)), ulams(f(id, 1)));
+      case UK::Ucatch:
+        return ucatch(ival(f(id, 0)), list<UParam>(f(id, 1), [&](std::size_t x) { return uparam(x); }),
+                      ulam(f(id, 2)), ulam(f(id, 3)));
+      case UK::Utrywith: return utrywith(ulam(f(id, 0)), vp(f(id, 1)), ulam(f(id, 2)));
+      case UK::Uifthenelse: return uifthenelse(ulam(f(id, 0)), ulam(f(id, 1)), ulam(f(id, 2)));
+      case UK::Usequence: return usequence(ulam(f(id, 0)), ulam(f(id, 1)));
+      case UK::Uwhile: return uwhile(ulam(f(id, 0)), ulam(f(id, 1)));
+      case UK::Ufor:
+        return ufor(vp(f(id, 0)), ulam(f(id, 1)), ulam(f(id, 2)),
+                    static_cast<parsetree::DirectionFlag>(ival(f(id, 3))), ulam(f(id, 4)));
+      case UK::Uassign: return uassign(ident(f(id, 0)), ulam(f(id, 1)));
+      case UK::Usend:
+        return usend(static_cast<lambda::MethKind>(ival(f(id, 0))), ulam(f(id, 1)), ulam(f(id, 2)), ulams(f(id, 3)),
+                     dbg(f(id, 4)));
+      default: throw Corrupt{};
+    }
+  }
+  const UPhantomDefiningExpr* phantom(std::size_t id) {
+    auto* e = make<UPhantomDefiningExpr>();
+    e->kind = static_cast<UPhantomDefiningExpr::Kind>(tag(id));
+    switch (e->kind) {
+      case UPhantomDefiningExpr::Kind::Uphantom_const: e->c = uconstant(f(id, 0)); break;
+      case UPhantomDefiningExpr::Kind::Uphantom_var: e->var = ident(f(id, 0)); break;
+      case UPhantomDefiningExpr::Kind::Uphantom_offset_var:
+      case UPhantomDefiningExpr::Kind::Uphantom_read_field: e->var = ident(f(id, 0)); e->n = ival(f(id, 1)); break;
+      case UPhantomDefiningExpr::Kind::Uphantom_read_symbol_field: e->sym = str(f(id, 0)); e->n = ival(f(id, 1)); break;
+      case UPhantomDefiningExpr::Kind::Uphantom_block:
+        e->n = ival(f(id, 0));
+        e->fields = list<Var>(f(id, 1), [&](std::size_t x) { return ident(x); });
+        break;
+    }
+    return e;
+  }
+
+  FunctionDescription* fundesc(std::size_t id) {
+    if (auto it = fd_.find(id); it != fd_.end()) return it->second;
+    auto* d = make<FunctionDescription>();
+    fd_[id] = d;
+    d->fun_label = str(f(id, 0));
+    d->fun_arity = ival(f(id, 1));
+    d->fun_closed = boolean(f(id, 2));
+    std::size_t in = f(id, 3);
+    if (!is_int(in)) {
+      std::size_t pair = f(in, 0);
+      d->has_inline = true;
+      d->inline_params = list<VarWithProvenance>(f(pair, 0), [&](std::size_t x) { return vp(x); });
+      d->inline_body = ulam(f(pair, 1));
+    }
+    d->fun_float_const_prop = boolean(f(id, 4));
+    d->fun_poll = static_cast<lambda::PollAttribute>(ival(f(id, 5)));
+    return d;
+  }
+
+  const ValueApproximation* approx(std::size_t id) {
+    using K = ValueApproximation::Kind;
+    if (is_int(id)) return value_unknown();
+    if (auto it = ap_.find(id); it != ap_.end()) return it->second;
+    auto* a = make<ValueApproximation>();
+    ap_[id] = a;
+    switch (tag(id)) {
+      case 0:
+        a->kind = K::Value_closure;
+        a->fundesc = fundesc(f(id, 0));
+        a->res = approx(f(id, 1));
+        break;
+      case 1:
+        a->kind = K::Value_tuple;
+        a->tuple = array<const ValueApproximation*>(f(id, 0), [&](std::size_t x) { return approx(x); });
+        break;
+      case 2: a->kind = K::Value_const; a->c = uconstant(f(id, 0)); break;
+      case 3: a->kind = K::Value_global_field; a->sym = str(f(id, 0)); a->field = ival(f(id, 1)); break;
+      default: throw Corrupt{};
+    }
+    return a;
+  }
+
+  cmx_format::Crcs crcs(std::size_t id) {
+    return list_vec<std::pair<std::string_view, std::optional<std::string>>>(id, [&](std::size_t e) {
+      std::pair<std::string_view, std::optional<std::string>> p;
+      p.first = str(f(e, 0));
+      std::size_t d = f(e, 1);
+      if (!is_int(d)) p.second = std::string(str(f(d, 0)));
+      return p;
+    });
+  }
+  std::vector<long> ints(std::size_t id) {
+    return list_vec<long>(id, [&](std::size_t x) { return ival(x); });
+  }
+
+  cmx_format::UnitInfos* unit_infos(std::size_t id) {
+    auto* ui = make<cmx_format::UnitInfos>();
+    ui->ui_name = str(f(id, 0));
+    ui->ui_symbol = str(f(id, 1));
+    ui->ui_defines = list_vec<std::string_view>(f(id, 2), [&](std::size_t x) { return str(x); });
+    ui->ui_imports_cmi = crcs(f(id, 3));
+    ui->ui_imports_cmx = crcs(f(id, 4));
+    ui->ui_curry_fun = ints(f(id, 5));
+    ui->ui_apply_fun = ints(f(id, 6));
+    ui->ui_send_fun = ints(f(id, 7));
+    std::size_t ei = f(id, 8);
+    if (tag(ei) != 0) throw Corrupt{};  // Flambda export info
+    ui->ui_export_info = approx(f(ei, 0));
+    ui->ui_force_link = boolean(f(id, 9));
+    std::size_t fp = f(id, 10);
+    if (!is_int(fp)) ui->ui_for_pack = str(f(fp, 0));
+    ui->ui_need_stdlib = boolean(f(id, 11));
+    return ui;
+  }
+
+ private:
+  std::unordered_map<std::size_t, debuginfo::scopes> scopes_;
+  std::unordered_map<std::size_t, const UStructuredConstant*> sc_;
+  std::unordered_map<std::size_t, const UFunction*> fun_;
+  std::unordered_map<std::size_t, ulambda> ul_;
+  std::unordered_map<std::size_t, FunctionDescription*> fd_;
+  std::unordered_map<std::size_t, const ValueApproximation*> ap_;
+  std::unordered_map<std::size_t, const PrimitiveDescription*> pd_;
+};
+
+}  // namespace
+}  // namespace cppcaml::typing::cmi_format
+
+namespace cppcaml::typing::cmx_format {
+
+std::pair<UnitInfos*, std::string> read_unit_info(const std::string& filename) {
+  std::vector<std::uint8_t> bytes;
+  {
+    std::FILE* fp = std::fopen(filename.c_str(), "rb");
+    if (!fp) throw std::runtime_error("Cannot open " + filename);
+    std::uint8_t chunk[65536];
+    for (std::size_t k; (k = std::fread(chunk, 1, sizeof chunk, fp)) > 0;) bytes.insert(bytes.end(), chunk, chunk + k);
+    std::fclose(fp);
+  }
+  const std::string magic = cmx_magic_number;
+  if (bytes.size() < magic.size()) throw Error(Error::Kind::Corrupted_unit_info, filename);
+  if (std::string(bytes.begin(), bytes.begin() + magic.size()) != magic)
+    throw Error(Error::Kind::Not_a_unit_info, filename);
+  try {
+    cmi_marshal::Graph graph;
+    std::size_t off = magic.size();
+    std::size_t root = cmi_marshal::read_value(bytes.data(), bytes.size(), off, graph);
+    cmi_format::CmxReader r(graph);
+    UnitInfos* ui = r.unit_infos(root);
+    // Digest.BLAKE128.input ic: the 16 bytes that follow
+    if (bytes.size() < off + 16) throw Error(Error::Kind::Corrupted_unit_info, filename);
+    std::string crc(bytes.begin() + static_cast<long>(off), bytes.begin() + static_cast<long>(off) + 16);
+    return {ui, crc};
+  } catch (const cmi_format::Corrupt&) {
+    throw Error(Error::Kind::Corrupted_unit_info, filename);
+  } catch (const cppcaml::marshal::Error&) {
+    throw Error(Error::Kind::Corrupted_unit_info, filename);
+  }
+}
+
+}  // namespace cppcaml::typing::cmx_format
+

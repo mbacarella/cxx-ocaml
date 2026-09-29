@@ -251,5 +251,8 @@ target_link_options(c++ocamlc PRIVATE -static-libstdc++ -static-libgcc
 
 # Stage-1 oracle for the typing/ port: dump a cmi's decoded Types graph
 # (compared against cxx/harness/typing_cmidump.ml).
+add_executable(c++cmxinfo src/tools/cmxinfo_main.cpp)
+target_link_libraries(c++cmxinfo PRIVATE cppcaml_core)
+
 add_executable(c++typing-dump src/tools/typing_dump_main.cpp)
 target_link_libraries(c++typing-dump PRIVATE cppcaml_core)
