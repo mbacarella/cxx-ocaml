@@ -37,7 +37,7 @@ typing::Attributes types_attributes(const Attributes& l) {
     // name); an explicit [@@ocaml.doc ...] is the parser's like any other
     // (not one input_value read: its sharing is the marshaled data's)
     bool doc = (a->attr_name.txt == "ocaml.doc" || a->attr_name.txt == "ocaml.text") &&
-               a->attr_name.loc.loc_start.pos_cnum == -1 && !same_record(a->attr_name.loc);
+               a->attr_name.loc->loc_start.pos_cnum == -1 && !same_record(a->attr_name.loc);
     // Docstrings's doc_loc / text_loc: one {txt; loc} record each
     static const std::string_view doc_name = ocaml_literal("parsing/docstrings.ml", "ocaml.doc"),
                                   text_name = ocaml_literal("parsing/docstrings.ml", "ocaml.text");
@@ -631,7 +631,7 @@ struct Conv {
               LidLoc id = lidloc(f.first);
               const Pattern* p = pattern(*f.second);
               // a pun (pat_of_label): the variable is Longident.last of the label
-              if (id.loc.loc_ghost) {
+              if (id.loc->loc_ghost) {
                 const Pattern* q = p;
                 if (auto* c = as<Ppat_constraint>(q->ppat_desc)) q = c->pat;
                 if (auto* var = as<Ppat_var>(q->ppat_desc); var && var->name.txt == id.txt->s) {
@@ -799,7 +799,7 @@ struct Conv {
               LidLoc id = lidloc(f.first);
               const Expression* e = expression(*f.second);
               // a pun (exp_of_longident): Lident (Longident.last label)
-              if (id.loc.loc_ghost) {
+              if (id.loc->loc_ghost) {
                 const Expression* x = e;
                 if (auto* c = as<Pexp_constraint>(x->pexp_desc)) x = c->exp;
                 if (auto* i = as<Pexp_ident>(x->pexp_desc);

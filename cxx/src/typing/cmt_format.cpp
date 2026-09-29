@@ -2514,8 +2514,8 @@ class OccIndexer {
     } else if (d->kind == K::Tpat_record) {
       for (const tt::RecordPatField& fl : tt::as<tt::Tpat_record>(d)->fields) {
         const Location& ploc = fl.pat->pat_loc;
-        OccLid lid = (!ploc.loc_ghost && same_pos(fl.lid.loc.loc_start, ploc.loc_start) &&
-                      same_pos(fl.lid.loc.loc_end, ploc.loc_end))
+        OccLid lid = (!ploc.loc_ghost && same_pos(fl.lid.loc->loc_start, ploc.loc_start) &&
+                      same_pos(fl.lid.loc->loc_end, ploc.loc_end))
                          ? unghosted(fl.lid)
                          : of(fl.lid);
         add_label(pat_env, lid, fl.label);
@@ -2633,8 +2633,8 @@ class OccIndexer {
         for (const tt::RecordField& fl : tt::as<tt::Texp_record>(d)->fields) {
           if (fl.def.kept) continue;
           const Location& eloc = fl.def.exp->exp_loc;
-          OccLid lid = (!eloc.loc_ghost && same_pos(fl.def.lid.loc.loc_start, eloc.loc_start) &&
-                        same_pos(fl.def.lid.loc.loc_end, eloc.loc_end))
+          OccLid lid = (!eloc.loc_ghost && same_pos(fl.def.lid.loc->loc_start, eloc.loc_start) &&
+                        same_pos(fl.def.lid.loc->loc_end, eloc.loc_end))
                            ? unghosted(fl.def.lid)
                            : of(fl.def.lid);
           add_label(exp_env, lid, fl.label);
