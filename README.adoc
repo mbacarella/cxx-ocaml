@@ -1,6 +1,6 @@
 = README
 
-NOTE: This repository is a fork of OCaml whose bytecode compiler is
+NOTE: This repository is a fork of OCaml whose compiler is
 reimplemented in C++ (c++ocamlc, under `cxx/`); see link:cxx/INSTALL.md[cxx/INSTALL.md].
 
 [CAUTION]
