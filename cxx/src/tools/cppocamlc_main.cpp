@@ -45,6 +45,7 @@
 #include "cppcaml/typing/printcmm.hpp"
 #include "cppcaml/typing/selection.hpp"
 #include "cppcaml/typing/mach_passes.hpp"
+#include "cppcaml/typing/linear.hpp"
 #include "cppcaml/typing/translmod.hpp"
 #include "cppcaml/typing/compilenv.hpp"
 #include "cppcaml/typing/misc.hpp"
@@ -789,6 +790,13 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
               ty::reg::reinit();
               mp::liveness(fd);
             }
+            ty::linear::Fundecl lf = ty::linear::linearize(fd);
+            if (cf::dump_linear)
+              ty::format::fprintf(dump, "*** %s@.%a@.", "Linearized code", ty::format::pr(ty::linear::print_fundecl, lf));
+            // Scheduling (amd64): the identity
+            if (cf::dump_scheduling)
+              ty::format::fprintf(dump, "*** %s@.%a@.", "After instruction scheduling",
+                                  ty::format::pr(ty::linear::print_fundecl, lf));
             funcnames.erase(p.fn->fun_name);
           }
         };
@@ -809,7 +817,7 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
         ppf_dump.out() << dump.contents();
         ppf_dump.out().flush();
         lap("selection", tp);
-        throw std::runtime_error("the native back end (Linearize) is not supported yet");
+        throw std::runtime_error("the native back end (Emit) is not supported yet");
       }
       return finish();
     }

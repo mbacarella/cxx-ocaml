@@ -745,6 +745,13 @@ void phase(Formatter& ppf, const std::string& msg, const Fundecl& f) {
   fprintf(ppf, "*** %s@.%a@.", msg, pr(fundecl, f));
 }
 
+void print_regs(Formatter& ppf, const Regs& v) { regs(ppf, v); }
+void print_regsetaddr(Formatter& ppf, const reg::Set& s) { regsetaddr(ppf, s); }
+void print_test(Formatter& ppf, const Test& t, const Regs& arg) { test(ppf, t, arg); }
+void print_operation(Formatter& ppf, const Operation& op, const Regs& arg, const Regs& res) {
+  operation(ppf, op, arg, res);
+}
+
 void interferences(Formatter& ppf) {
   fprintf(ppf, "*** Interferences@.");
   for (reg::Reg* r : reg::all_registers()) {

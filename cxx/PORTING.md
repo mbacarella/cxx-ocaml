@@ -170,10 +170,16 @@ regalloc loop in the driver): `DUMP=dcombine` / `dcse` / `dlive` /
 787/787 testsuite files.  Record updates and constructors evaluate their
 fields right to left; CSE and Reload create registers inside them.
 
-Next, in order: Linearize and Emit (`-dlinear`, then `-S` byte for
-byte), then the .cmx/.cmxa writers and Asmlink.  Until the back end
-exists, c++ocamlopt stops with an error after register allocation and
-does not write the .cmx.
+Linearize (with amd64's Stackframe analysis) is ported
+(`linearize.cpp`): `DUMP=dlinear FLAGS="-stop-after scheduling"` --
+6550/6550 probes, 208/208 compiler sources, 789/789 testsuite files.
+(Without `-stop-after scheduling` ocamlopt emits each function before
+linearizing the next, and Emit allocates labels: `-dlinear` matches only
+once Emit is ported.)
+
+Next, in order: Emit (`-S` byte for byte), then the .cmx/.cmxa writers
+and Asmlink.  Until the back end exists, c++ocamlopt stops with an error
+after Linearize and does not write the .cmx.
 
 ## Oracles and gates
 

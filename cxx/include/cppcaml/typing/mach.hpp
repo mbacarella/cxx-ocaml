@@ -233,6 +233,10 @@ void reg(format::Formatter& ppf, const reg::Reg* r);
 void fundecl(format::Formatter& ppf, const mach::Fundecl& f);
 void phase(format::Formatter& ppf, const std::string& msg, const mach::Fundecl& f);
 void interferences(format::Formatter& ppf);
+void print_regs(format::Formatter& ppf, const reg::Regs& v);
+void print_regsetaddr(format::Formatter& ppf, const reg::Set& s);
+void print_test(format::Formatter& ppf, const mach::Test& t, const reg::Regs& arg);
+void print_operation(format::Formatter& ppf, const mach::Operation& op, const reg::Regs& arg, const reg::Regs& res);
 void preferences(format::Formatter& ppf);
 }  // namespace printmach
 
