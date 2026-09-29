@@ -1061,7 +1061,7 @@ ulambda bind_args_right_to_left(const CEnv& env, Slice<ulambda> args, const Args
     if (is_substituable(env.mutable_vars, arg)) {
       prev_args_rev.push_back(arg);
     } else {
-      Var id = Ident::create_local("arg");
+      Var id = Ident::create_local(OCAML_LIT("arg"));
       ArgsFn inner = fn;
       fn = [inner, id, arg](Slice<ulambda> a) {
         return ulet(MutableFlag::Immutable, pgenval(), vp(id), arg, inner(a));
@@ -1093,7 +1093,7 @@ ulambda direct_apply(const CEnv& env, const FunctionDescription* fundesc, ulambd
     }
     return bind_args_right_to_left(env, uargs, [&](Slice<ulambda> app_args) -> ulambda {
       if (fundesc->fun_closed) return usequence(ufunct, udirect_apply(fundesc->fun_label, app_args, dbg));
-      Var clos = Ident::create_local("clos");
+      Var clos = Ident::create_local(OCAML_LIT("clos"));
       std::vector<ulambda> a = vec(app_args);
       a.push_back(uvar(clos));
       return ulet(MutableFlag::Immutable, pgenval(), vp(clos), ufunct, udirect_apply(fundesc->fun_label, sl(a), dbg));
@@ -1247,13 +1247,13 @@ UA close_apply(const CEnv& env, const L::Lapply* ap) {
     if (nargs < fundesc->fun_arity) {
       Approx fapprox = f.a;
       std::vector<std::pair<Var, ulambda>> first_args;
-      for (ulambda arg : uargs) first_args.push_back({Ident::create_local("arg"), arg});
+      for (ulambda arg : uargs) first_args.push_back({Ident::create_local(OCAML_LIT("arg")), arg});
       std::vector<Var> final_args;
-      for (long k = 0; k < fundesc->fun_arity - nargs; ++k) final_args.push_back(Ident::create_local("arg"));
+      for (long k = 0; k < fundesc->fun_arity - nargs; ++k) final_args.push_back(Ident::create_local(OCAML_LIT("arg")));
       std::vector<L::lambda> internal_args;
       for (auto& [arg1, _] : first_args) internal_args.push_back(L::lvar(arg1));
       for (Var arg : final_args) internal_args.push_back(L::lvar(arg));
-      Var funct_var = Ident::create_local("funct");
+      Var funct_var = Ident::create_local(OCAML_LIT("funct"));
       CEnv env2{env.cenv, env.fenv.add(funct_var, fapprox), env.mutable_vars};
       std::vector<L::Param> params;
       for (Var v : final_args) params.push_back({v, pgenval()});
@@ -1273,7 +1273,7 @@ UA close_apply(const CEnv& env, const L::Lapply* ap) {
     }
     if (fundesc->fun_arity > 0 && nargs > fundesc->fun_arity) {
       std::vector<std::pair<Var, ulambda>> args;
-      for (ulambda arg : uargs) args.push_back({Ident::create_local("arg"), arg});
+      for (ulambda arg : uargs) args.push_back({Ident::create_local(OCAML_LIT("arg")), arg});
       std::vector<ulambda> first_args, rem_args;
       for (std::size_t k = 0; k < args.size(); ++k)
         (static_cast<long>(k) < fundesc->fun_arity ? first_args : rem_args).push_back(uvar(args[k].first));
@@ -1299,7 +1299,7 @@ UA close(const CEnv& env, L::lambda lam) {
     case L::LK::Lmutvar: return {uvar(static_cast<const L::Lmutvar*>(lam)->id), value_unknown()};
     case L::LK::Lconst: return make_const(transl_const(static_cast<const L::Lconst*>(lam)->c));
     case L::LK::Lfunction:
-      return close_one_function(env, Ident::create_local("fun"), static_cast<const L::Lfunction*>(lam)->f);
+      return close_one_function(env, Ident::create_local(OCAML_LIT("fun")), static_cast<const L::Lfunction*>(lam)->f);
     // We convert [f a] to [let a' = a in let f' = f in fun b c -> f' a' b c]
     // when fun_arity > nargs
     case L::LK::Lapply: return close_apply(env, static_cast<const L::Lapply*>(lam));
@@ -1332,7 +1332,7 @@ UA close(const CEnv& env, L::lambda lam) {
     case L::LK::Lletrec: {
       auto* x = static_cast<const L::Lletrec*>(lam);
       auto [clos, infos] = close_functions(env, x->decl);
-      Var clos_ident = Ident::create_local("clos");
+      Var clos_ident = Ident::create_local(OCAML_LIT("clos"));
       FEnv fenv_body = env.fenv;
       for (std::size_t k = infos.size(); k-- > 0;) fenv_body = fenv_body.add(infos[k].first, infos[k].second.second);
       UA b = close(CEnv{env.cenv, fenv_body, env.mutable_vars}, x->body);
@@ -1440,7 +1440,7 @@ UA close_prim(const CEnv& env, const L::Lprim* x) {
     L::lambda arg = x->args[0];
     auto cst = [&](const UA& c) {
       ulambda uarg = close(env, arg).u;
-      Var id = Ident::create_local("dummy");
+      Var id = Ident::create_local(OCAML_LIT("dummy"));
       return UA{ulet(MutableFlag::Immutable, pgenval(), vp(id), uarg, c.u), c.a};
     };
     using CT = L::CompileTimeConstant;
@@ -1464,7 +1464,11 @@ UA close_prim(const CEnv& env, const L::Lprim* x) {
     }
   }
   if (lp.kind == LPK::Pignore && x->args.size() == 1) {
-    UA c = make_const_int(0);
+    // [make_const_int 0] is inlined when ocamlopt itself is compiled: its
+    // [Uconst_int 0] is one statically allocated block, shared by every unit
+    // (visible in the .cmx approximations)
+    static const UConstant ignore_const = uconst_int(0);
+    UA c = make_const(ignore_const);
     return {usequence(close(env, x->args[0]).u, c.u), c.a};
   }
   if ((lp.kind == LPK::Pbytes_to_string || lp.kind == LPK::Pbytes_of_string) && x->args.size() == 1)
@@ -1504,7 +1508,11 @@ UA close_prim(const CEnv& env, const L::Lprim* x) {
     r.raise = lp.raise;
     return {uprim(r, sl(std::vector<ulambda>{ulam}), dbg), value_unknown()};
   }
-  if (lp.kind == LPK::Pmakearray && x->args.empty()) return make_const_ref(sc_block(0, {}));
+  if (lp.kind == LPK::Pmakearray && x->args.empty()) {
+    // [Uconst_block (0, [])]: a constant block of ocamlopt's own code
+    static const UStructuredConstant* empty_block = sc_block(0, {});
+    return make_const_ref(empty_block);
+  }
   P p = convert_primitives::convert(lp);
   debuginfo::t dbg = debuginfo::from_location(x->loc);
   // close_list_approx: left to right
@@ -1602,7 +1610,7 @@ std::pair<ulambda, std::vector<std::pair<Ident::t, std::pair<long, Approx>>>> cl
     cenv_entries = cenv_entries.add(uncurried_defs[k].id, ClosureEntry{true, clos_offsets[k]});
   // Translate each function definition
   auto clos_fundef = [&](const UncurriedDef& d, long fenv_pos) {
-    Var env_param = Ident::create_local("env");
+    Var env_param = Ident::create_local(OCAML_LIT("env"));
     ClosureEnv cenv_body{true, cenv_entries, env_param, fenv_pos};
     UA b = close(CEnv{cenv_body, fenv_rec, env.mutable_vars}, d.body);
     if (useless_env && occurs(env_param, b.u)) throw NotClosed{};

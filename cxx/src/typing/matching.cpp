@@ -134,7 +134,7 @@ const PrimitiveDescription* primitive_simple(std::string_view name, long arity, 
   d->prim_name = zstr(name);
   d->prim_arity = arity;
   d->prim_alloc = alloc;
-  d->prim_native_name = "";
+  d->prim_native_name = empty_native_name();
   d->prim_native_repr_args = slice(std::vector<NativeRepr>(static_cast<std::size_t>(arity), NativeRepr{}));
   d->prim_native_repr_res = NativeRepr{};
   return d;

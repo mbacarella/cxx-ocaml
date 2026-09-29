@@ -907,7 +907,7 @@ code comp_expr(const StackInfo& si, const CompilationEnv& env, lambda exp, long 
               d->prim_name = "caml_obj_dup";
               d->prim_arity = 1;
               d->prim_alloc = true;
-              d->prim_native_name = "";
+              d->prim_native_name = empty_native_name();
               d->prim_native_repr_args = slice(std::vector<NativeRepr>(1, NativeRepr{}));
               d->prim_native_repr_res = NativeRepr{};
               return d;

@@ -66,10 +66,19 @@ clambda::Primitive convert(const lambda::Primitive& prim) {
     SAME(Patomic_load) SAME(Patomic_fetch_add) SAME(Popaque) SAME(Pdls_get) SAME(Ppoll)
 #undef SAME
     case LK::Pphyscomp: {
-      clambda::Primitive c{CK::Pintcomp};
-      c.icmp = prim.pcmp == lambda::PhysicalComparison::CPeq ? lambda::IntegerComparison::Ceq
-                                                             : lambda::IntegerComparison::Cne;
-      return c;
+      // [Pintcomp Ceq] / [Pintcomp Cne]: literals, one static block each in
+      // ocamlopt (a copy keeps the identity)
+      static const clambda::Primitive eq = [] {
+        clambda::Primitive c{CK::Pintcomp};
+        c.icmp = lambda::IntegerComparison::Ceq;
+        return c;
+      }();
+      static const clambda::Primitive ne = [] {
+        clambda::Primitive c{CK::Pintcomp};
+        c.icmp = lambda::IntegerComparison::Cne;
+        return c;
+      }();
+      return prim.pcmp == lambda::PhysicalComparison::CPeq ? eq : ne;
     }
     case LK::Pstring_load_16: return sized(CK::Pstring_load, S::Sixteen, prim);
     case LK::Pstring_load_32: return sized(CK::Pstring_load, S::Thirty_two, prim);

@@ -120,7 +120,7 @@ const PrimitiveDescription* prim_makearray() {
     d->prim_name = zstr("caml_array_make");
     d->prim_arity = 2;
     d->prim_alloc = true;
-    d->prim_native_name = zstr("");
+    d->prim_native_name = empty_native_name();
     d->prim_native_repr_args = slice<NativeRepr>({NativeRepr{}, NativeRepr{}});
     d->prim_native_repr_res = NativeRepr{};
     return d;

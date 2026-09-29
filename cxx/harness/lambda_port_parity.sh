@@ -29,6 +29,8 @@ DFLAG="-$DUMP"
 [ "$DUMP" = dinstr ] && STOP=""
 [ "$DUMP" = cmo ] && { STOP=""; DFLAG=""; }  # compare the .cmo files' bytes
 [ "$DUMP" = S ] && { STOP=""; DFLAG="-S"; }    # NATIVE=1: compare the .s files
+[ "$DUMP" = cmx ] && { STOP=""; DFLAG=""; }    # NATIVE=1: compare the .cmx files' bytes
+[ "$DUMP" = o ] && { STOP=""; DFLAG=""; }      # NATIVE=1: compare the .o files' bytes
 NATIVE="${NATIVE:-0}"
 if [ "$NATIVE" = 1 ]; then
   REFC="$ROOT/ocamlopt.opt"; OSTOP="$STOP"
@@ -60,6 +62,7 @@ if [ "${1:-}" == "--worker" ]; then
       >/dev/null 2>"$OUT/$key.o"; orc=$?
   if [ "$DUMP" = cmo ]; then cp "$w/x/${b%.ml}.cmo" "$OUT/$key.o" 2>/dev/null || orc=1; fi
   if [ "$DUMP" = S ]; then cp "$w/x/${b%.ml}.s" "$OUT/$key.o" 2>/dev/null || orc=1; fi
+  if [ "$DUMP" = cmx ] || [ "$DUMP" = o ]; then cp "$w/x/${b%.ml}.$DUMP" "$OUT/$key.o" 2>/dev/null || orc=1; fi
   prep
   if [ -f "$i" ]; then
     ( cd "$w/x" && timeout 120 "$CPP" -I "$ROOT/stdlib" -w -a $FLAGS -c "${b}i" ) >/dev/null 2>&1
@@ -68,6 +71,7 @@ if [ "${1:-}" == "--worker" ]; then
       >/dev/null 2>"$OUT/$key.c"; crc=$?
   if [ "$DUMP" = cmo ]; then cp "$w/x/${b%.ml}.cmo" "$OUT/$key.c" 2>/dev/null || crc=1; fi
   if [ "$DUMP" = S ]; then cp "$w/x/${b%.ml}.s" "$OUT/$key.c" 2>/dev/null || crc=1; fi
+  if [ "$DUMP" = cmx ] || [ "$DUMP" = o ]; then cp "$w/x/${b%.ml}.$DUMP" "$OUT/$key.c" 2>/dev/null || crc=1; fi
   [ "$CLAMBDA" = 1 ] && sed -i '/: the native back end (.*) is not supported yet$/d' "$OUT/$key.c"
   rm -rf "${w:?}"
   if [ $orc -ne 0 ]; then printf 'OFAIL %s\n' "$f"

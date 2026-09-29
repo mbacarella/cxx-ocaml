@@ -1248,7 +1248,7 @@ const PrimitiveDescription* default_prim(const std::string& name) {
 
 // Primitive.simple ~name ~arity ~alloc
 const PrimitiveDescription* primitive_simple(std::string_view name, long arity, bool alloc) {
-  return make<PrimitiveDescription>(name, arity, alloc, std::string_view{},
+  return make<PrimitiveDescription>(name, arity, alloc, empty_native_name(),
                                     slice(std::vector<NativeRepr>(static_cast<std::size_t>(arity), NativeRepr{})),
                                     NativeRepr{});
 }

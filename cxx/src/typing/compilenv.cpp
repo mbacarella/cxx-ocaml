@@ -99,9 +99,10 @@ void reset(const std::optional<std::string>& packname0, std::string_view name) {
     packname = p;
   }
   global_infos_table().clear();
-  std::string_view symbol = zstr(symbolname_for_pack(packname, name));
   UnitInfos& cu = current_unit();
-  cu.ui_name = zstr(name);
+  cu.ui_name = uid::unit_name_string(name);  // Unit_info.modname: the one string (__MODULE__ shares it)
+  // symbolname_for_pack None name = name: the one string
+  std::string_view symbol = packname ? zstr(symbolname_for_pack(packname, name)) : cu.ui_name;
   cu.ui_symbol = symbol;
   cu.ui_defines = {symbol};
   cu.ui_imports_cmi.clear();
@@ -173,7 +174,8 @@ const UnitInfos* get_global_info(Ident::t global_ident) {
                               warnings::Warning::with_s(warnings::Warning::K::No_cmx_file, modname));
     }
   }
-  cu.ui_imports_cmx.insert(cu.ui_imports_cmx.begin(), {zstr(modname), crc});
+  // (Ident.name global_ident, crc): the ident's own name string
+  cu.ui_imports_cmx.insert(cu.ui_imports_cmx.begin(), {ident::name(global_ident), crc});
   table.emplace(modname, infos);
   return infos;
 }

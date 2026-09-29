@@ -31,12 +31,7 @@ const PrimitiveDescription* parse_description(const std::vector<NativeRepr>& nat
                                               const parsetree::Attributes& attrs, const Location& loc) {
   long arity = static_cast<long>(native_repr_args0.size());
   if (prim.empty()) throw std::logic_error("Primitive.parse_description");
-  // primitive.ml's default native name: one "" literal
-  static const std::string_view empty_native_name = [] {
-    ZoneScope perm(permanent_zone());
-    return zborrow(std::string_view());
-  }();
-  std::string_view name = prim[0], native_name = empty_native_name;
+  std::string_view name = prim[0], native_name = empty_native_name();
   bool old_style_noalloc = false, old_style_float = false;
   auto at = [&](std::size_t k) { return k < prim.size() ? prim[k] : std::string_view(); };
   if (prim.size() >= 4 && at(1) == "noalloc" && at(3) == "float") {

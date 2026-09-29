@@ -148,6 +148,12 @@ struct PrimitiveDescription {
   Slice<NativeRepr> prim_native_repr_args;
   NativeRepr prim_native_repr_res;
 };
+// primitive.ml's "" literal: the one native name of every description built
+// there without one (Primitive.simple, parse_declaration), shared in a .cmx
+inline std::string_view empty_native_name() {
+  static constexpr char storage[1] = "";
+  return {storage, 0};
+}
 
 // ---- a generic OCaml value (Parsetree payloads, until they are needed typed)
 // A zone copy of a marshaled value: an immediate, a string, a double or a

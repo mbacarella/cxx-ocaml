@@ -722,9 +722,12 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
       // classic_arguments; Translmod.transl_store_implementation,
       // -drawlambda, Simplif.simplify_lambda, -dlambda; the back end unless
       // -stop-after lambda; Compilenv.save_unit_info (the .cmx)
-      ty::compilenv::reset(cf::for_package, modname);
+      // Unit_info.modname: the one string (the module ident's name, the
+      // unit infos' ui_name, __MODULE__)
+      std::string_view umod = ty::uid::unit_name_string(modname);
+      ty::compilenv::reset(cf::for_package, umod);
       cf::use_inlining_arguments_set(cf::classic_arguments);
-      ty::lambda::Program prog = ty::translmod::transl_store_implementation(modname, impl->structure, impl->coercion);
+      ty::lambda::Program prog = ty::translmod::transl_store_implementation(umod, impl->structure, impl->coercion);
       if (cf::dump_rawlambda) ppf_dump.out() << ty::printlambda::dump(prog.code);
       ty::lambda::lambda lam = ty::simplif::simplify_lambda(prog.code);
       if (cf::dump_lambda) ppf_dump.out() << ty::printlambda::dump(lam);
@@ -851,7 +854,21 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
             return 2;
           }
         }
-        throw std::runtime_error("the native back end (the .cmx writer) is not supported yet");
+        // Compilenv.save_unit_info (the .cmx)
+        {
+          ty::cmx_format::UnitInfos& cu = ty::compilenv::current_unit();
+          cu.ui_imports_cmi.clear();
+          // the current unit's entry holds its modname string (ui_name's)
+          for (auto& [name, crc] : ty::env::imports())
+          {
+            std::string_view n = name == cu.ui_name ? cu.ui_name : ty::env::import_name(name);
+            cu.ui_imports_cmi.push_back({n.data() ? n : ty::zstr(name), crc});
+          }
+          std::string bytes = ty::cmx_format::write_unit_info(cu);
+          std::ofstream os(cmo_out, std::ios::binary);
+          os << bytes;
+        }
+        return finish();
       }
       return finish();
     }

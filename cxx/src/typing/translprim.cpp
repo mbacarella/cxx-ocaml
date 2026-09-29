@@ -221,7 +221,7 @@ const PrimitiveDescription* simple(std::string_view name, long arity, bool alloc
   ZoneScope perm(permanent_zone());
   std::vector<NativeRepr> reprs(static_cast<std::size_t>(arity));
   return make<PrimitiveDescription>(
-      PrimitiveDescription{zstr(name), arity, alloc, zstr(""), slice(reprs), NativeRepr{}});
+      PrimitiveDescription{zstr(name), arity, alloc, empty_native_name(), slice(reprs), NativeRepr{}});
 }
 
 // used_primitives = Hashtbl.create 7 : (Path.t, Location.t) Hashtbl.t.

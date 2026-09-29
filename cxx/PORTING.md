@@ -186,10 +186,21 @@ and debug info, the X86 DSL and GAS printer; `hashtbl.hpp`'s
 testsuite files (and `-g`); `-dlinear` now matches without `-stop-after`.
 c++ocamlopt writes the `.s` (with `-S`) and assembles the `.o` with `as`.
 
-Next: the .cmx writer (Compilenv.save_unit_info: output_value of the
-unit infos with ocamlopt's sharing), then Asmlibrarian (.cmxa),
-Asmpackager and Asmlink (the startup module, caml_curry/apply/send, the
-C linker).  Until then c++ocamlopt stops with an error after the `.o`.
+The .cmx writer is ported (`cmi_format.cpp`'s `write_unit_info`:
+Compilenv.save_unit_info's output_value with ocamlopt's sharing):
+`DUMP=cmx` -- 6548/6550 probes (the 2 known .cmi gaps' crcs; also `-g`),
+208/208 compiler sources (and `-g`), 786/787 testsuite files (the other
+is `privrowsabate_ok`, whose .cmi differs: a private-row functor
+parameter's `X.term` paths share their name string in the port, not in
+ocamlc).  Sharing follows ocamlopt's heap: values ocamlopt allocates
+statically (the literals of an inlining-built compiler, such as
+primitive.ml's `""` native name, Pignore's `0`, `Pphyscomp`'s comparisons)
+are singletons, constants and primitives carry identity tokens, and
+debuginfo lists keep their shared tails.  `c++ocamlopt -c` now writes the
+`.s`, `.o` and `.cmx`.
+
+Next: Asmlibrarian (.cmxa), Asmpackager and Asmlink (the startup module,
+caml_curry/apply/send, the C linker).
 
 ## Oracles and gates
 

@@ -1,6 +1,8 @@
 // Port of middle_end/clambda.ml and the backend half of lambda/debuginfo.ml.
 #include "cppcaml/typing/clambda.hpp"
 
+#include <unordered_map>
+
 #include <cstring>
 
 namespace cppcaml::typing {
@@ -38,12 +40,50 @@ Location to_location(const t& dbg) {
   return l;
 }
 
+namespace {
+struct Shape {
+  std::vector<std::uint64_t> cells, items;
+};
+std::unordered_map<const Item*, Shape>& shapes() {
+  static std::unordered_map<const Item*, Shape> m;
+  return m;
+}
+}  // namespace
+
+std::uint64_t fresh_key() {
+  static std::uint64_t n = 0;
+  return ++n;
+}
+std::uint64_t cell_key(const t& d, std::size_t k) {
+  if (auto it = shapes().find(d.p); it != shapes().end() && k < it->second.cells.size()) return it->second.cells[k];
+  return reinterpret_cast<std::uint64_t>(d.p + k) | (std::uint64_t{1} << 63);
+}
+std::uint64_t item_key(const t& d, std::size_t k) {
+  if (auto it = shapes().find(d.p); it != shapes().end() && k < it->second.items.size()) return it->second.items[k];
+  return reinterpret_cast<std::uint64_t>(d.p + k) | (std::uint64_t{1} << 62);
+}
+void set_shape(const t& d, std::vector<std::uint64_t> cells, std::vector<std::uint64_t> items) {
+  if (!d.empty()) shapes()[d.p] = Shape{std::move(cells), std::move(items)};
+}
+bool has_shape(const t& d) { return shapes().count(d.p) != 0; }
+
+// dbg1 @ dbg2: dbg1's cells copied (its items kept), dbg2 the tail
 t inline_(const t& dbg1, const t& dbg2) {
-  if (dbg2.empty()) return dbg1;
   if (dbg1.empty()) return dbg2;
   std::vector<Item> v(dbg1.begin(), dbg1.end());
   v.insert(v.end(), dbg2.begin(), dbg2.end());
-  return slice(v);
+  t r = slice(v);
+  std::vector<std::uint64_t> cells, items;
+  for (std::size_t k = 0; k < dbg1.size(); ++k) {
+    cells.push_back(fresh_key());
+    items.push_back(item_key(dbg1, k));
+  }
+  for (std::size_t k = 0; k < dbg2.size(); ++k) {
+    cells.push_back(cell_key(dbg2, k));
+    items.push_back(item_key(dbg2, k));
+  }
+  set_shape(r, std::move(cells), std::move(items));
+  return r;
 }
 
 int compare(const t& dbg1, const t& dbg2) {
@@ -82,6 +122,11 @@ std::string to_string(const t& dbg) {
 }  // namespace debuginfo
 
 namespace clambda {
+
+unsigned long fresh_uconstant_id() {
+  static unsigned long n = 0;
+  return ++n;
+}
 
 namespace {
 template <class T>

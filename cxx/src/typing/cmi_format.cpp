@@ -1224,11 +1224,27 @@ class CmxReader : public Reader {
     return s;
   }
   debuginfo::t dbg(std::size_t id) {
-    return list<debuginfo::Item>(id, [&](std::size_t x) {
+    debuginfo::t r = list<debuginfo::Item>(id, [&](std::size_t x) {
       return debuginfo::Item{str(f(x, 0)), ival(f(x, 1)), ival(f(x, 2)), ival(f(x, 3)),
                              ival(f(x, 4)), ival(f(x, 5)), ival(f(x, 6)), scopes(f(x, 7))};
     });
+    // the cells' and items' identities (lists here share tails and items)
+    if (!r.empty() && !debuginfo::has_shape(r)) {
+      std::vector<std::uint64_t> cells, items;
+      for (std::size_t c = id; !is_int(c); c = f(c, 1)) {
+        cells.push_back(key_of(c));
+        items.push_back(key_of(f(c, 0)));
+      }
+      debuginfo::set_shape(r, std::move(cells), std::move(items));
+    }
+    return r;
   }
+  std::uint64_t key_of(std::size_t node) {
+    auto [it, fresh] = keys_.try_emplace(node, 0);
+    if (fresh) it->second = debuginfo::fresh_key();
+    return it->second;
+  }
+  std::unordered_map<std::size_t, std::uint64_t> keys_;
 
   VarWithProvenance vp(std::size_t id) {
     if (tag(id) == 0) return {ident(f(id, 0)), nullptr};
@@ -1239,10 +1255,17 @@ class CmxReader : public Reader {
   UParam uparam(std::size_t id) { return {vp(f(id, 0)), vk(f(id, 1))}; }
 
   UConstant uconstant(std::size_t id) {
-    if (tag(id) == 1) return uconst_int(ival(f(id, 0)));
-    std::size_t o = f(id, 1);
-    return uconst_ref(str(f(id, 0)), is_int(o) ? nullptr : structured(f(o, 0)));
+    if (auto it = uc_.find(id); it != uc_.end()) return it->second;
+    UConstant c;
+    if (tag(id) == 1) c = uconst_int(ival(f(id, 0)));
+    else {
+      std::size_t o = f(id, 1);
+      c = uconst_ref(str(f(id, 0)), is_int(o) ? nullptr : structured(f(o, 0)));
+    }
+    uc_[id] = c;
+    return c;
   }
+  std::unordered_map<std::size_t, UConstant> uc_;
   const UStructuredConstant* structured(std::size_t id) {
     if (auto it = sc_.find(id); it != sc_.end()) return it->second;
     auto* c = make<UStructuredConstant>();
@@ -1322,8 +1345,16 @@ class CmxReader : public Reader {
   }
 
   Primitive primitive(std::size_t id) {
-    using K = Primitive::K;
     if (is_int(id)) return Primitive{prim_kind(false, ival(id))};
+    // one identity per marshaled block
+    if (auto it = pr_.find(id); it != pr_.end()) return it->second;
+    Primitive p = primitive_(id);
+    pr_[id] = p;
+    return p;
+  }
+  std::unordered_map<std::size_t, Primitive> pr_;
+  Primitive primitive_(std::size_t id) {
+    using K = Primitive::K;
     Primitive p{prim_kind(true, tag(id))};
     auto I = [&](std::size_t k) { return ival(f(id, k)); };
     switch (p.kind) {
@@ -1606,3 +1637,403 @@ std::pair<UnitInfos*, std::string> read_unit_info(const std::string& filename) {
 
 }  // namespace cppcaml::typing::cmx_format
 
+
+// ---- .cmx: Compilenv.write_unit_info -------------------------------------------------------
+// The unit_infos marshaled with the sharing ocamlopt's values have: one
+// value per object where the port keeps OCaml's identity (strings by
+// storage, idents, paths, structured constants, ulambda nodes, functions,
+// function descriptions, approximations, debuginfo lists by storage).
+namespace cppcaml::typing::cmx_format {
+namespace {
+
+namespace o = cppcaml::omarshal;
+using V = o::ValPtr;
+using namespace clambda;
+
+class CmxWriter {
+ public:
+  cmi_format::writer::Writer w;
+
+  V vk(const lambda::ValueKind& k) {
+    switch (k.kind) {
+      case lambda::ValueKind::Kind::Pgenval: return w.i(0);
+      case lambda::ValueKind::Kind::Pfloatval: return w.i(1);
+      case lambda::ValueKind::Kind::Pintval: return w.i(2);
+      case lambda::ValueKind::Kind::Pboxedintval: {
+        // Typeopt's [Pboxedintval Pint32] (...) are literals: one static block
+        // each in ocamlopt
+        V& v = boxedint_kinds_[static_cast<int>(k.bi)];
+        if (!v) v = o::vblock(0, {w.i(static_cast<long>(k.bi))});
+        return v;
+      }
+    }
+    return w.i(0);
+  }
+  V boxedint_kinds_[3];
+
+  V scopes(debuginfo::scopes s) {
+    if (!s) return w.i(0);
+    return memo(s, [&] { return o::vblock(0, {w.i(static_cast<long>(s->item)), w.str(s->str), w.str(s->str_fun)}); });
+  }
+  // a debuginfo list with its cells' and items' identities (debuginfo::cell_key)
+  V dbg(const debuginfo::t& d) {
+    V tail = w.i(0);
+    for (std::size_t k = d.size(); k-- > 0;) {
+      std::uint64_t ck = debuginfo::cell_key(d, k);
+      if (auto it = dbg_cells_.find(ck); it != dbg_cells_.end()) {
+        tail = it->second;
+        continue;
+      }
+      std::uint64_t ik = debuginfo::item_key(d, k);
+      V item;
+      if (auto it = dbg_items_.find(ik); it != dbg_items_.end()) item = it->second;
+      else {
+        const debuginfo::Item& x = d[k];
+        item = o::vblock(0, {w.str(x.dinfo_file), w.i(x.dinfo_line), w.i(x.dinfo_char_start), w.i(x.dinfo_char_end),
+                             w.i(x.dinfo_start_bol), w.i(x.dinfo_end_bol), w.i(x.dinfo_end_line), scopes(x.dinfo_scopes)});
+        dbg_items_[ik] = item;
+      }
+      V cell = o::vblock(0, {item, tail});
+      dbg_cells_[ck] = cell;
+      tail = cell;
+    }
+    return tail;
+  }
+  std::unordered_map<std::uint64_t, V> dbg_cells_, dbg_items_;
+
+  V vp(const VarWithProvenance& v) {
+    if (!v.provenance) return o::vblock(0, {w.ident(v.var)});
+    const Provenance* p = v.provenance;
+    V pv = memo(p, [&] { return o::vblock(0, {w.path(p->module_path), dbg(p->location), w.ident(p->original_ident)}); });
+    return o::vblock(1, {w.ident(v.var), pv});
+  }
+  V uparam(const UParam& p) { return o::vblock(0, {vp(p.var), vk(p.kind)}); }
+
+  V uconstant(const UConstant& c) {
+    auto make = [&] {
+      if (c.kind == UConstant::Kind::Uconst_int) return o::vblock(1, {w.i(c.i)});
+      return o::vblock(0, {w.str(c.sym), c.sc ? w.some(structured(c.sc)) : w.none()});
+    };
+    if (!c.id) return make();
+    if (auto it = uconsts_.find(c.id); it != uconsts_.end()) return it->second;
+    V v = make();
+    uconsts_[c.id] = v;
+    return v;
+  }
+  std::unordered_map<unsigned long, V> uconsts_;
+
+  static V boxed(char k, std::int64_t n) {
+    std::string raw;
+    auto be32 = [&](std::uint32_t x) {
+      for (int s = 3; s >= 0; --s) raw.push_back(static_cast<char>((x >> (8 * s)) & 0xff));
+    };
+    auto be64 = [&](std::uint64_t x) {
+      for (int s = 7; s >= 0; --s) raw.push_back(static_cast<char>((x >> (8 * s)) & 0xff));
+    };
+    raw.push_back(static_cast<char>(0x19));  // CODE_CUSTOM_FIXED
+    if (k == 'i') {
+      raw += "_i";
+      raw.push_back('\0');
+      be32(static_cast<std::uint32_t>(n));
+      return o::vcustom2(raw, 4, 4);
+    }
+    if (k == 'j') {
+      raw += "_j";
+      raw.push_back('\0');
+      be64(static_cast<std::uint64_t>(n));
+      return o::vcustom2(raw, 8, 8);
+    }
+    raw += "_n";
+    raw.push_back('\0');
+    if (n >= INT32_MIN && n <= INT32_MAX) {
+      raw.push_back(1);
+      be32(static_cast<std::uint32_t>(n));
+    } else {
+      raw.push_back(2);
+      be64(static_cast<std::uint64_t>(n));
+    }
+    return o::vcustom2(raw, 4, 8);
+  }
+
+  V structured(const UStructuredConstant* c) {
+    using K = UStructuredConstant::Kind;
+    return memo(c, [&]() -> V {
+      int tag = static_cast<int>(c->kind);
+      switch (c->kind) {
+        case K::Uconst_float: return o::vblock(tag, {o::vdbl(c->f)});
+        case K::Uconst_int32: return o::vblock(tag, {boxed('i', c->i)});
+        case K::Uconst_int64: return o::vblock(tag, {boxed('j', c->i)});
+        case K::Uconst_nativeint: return o::vblock(tag, {boxed('n', c->i)});
+        case K::Uconst_block:
+          return o::vblock(tag, {w.i(c->tag), w.list(c->fields, [&](const UConstant& u) { return uconstant(u); })});
+        case K::Uconst_float_array:
+          return o::vblock(tag, {w.list(c->floats, [&](double d) { return o::vdbl(d); })});
+        case K::Uconst_string: return o::vblock(tag, {w.str(c->s)});
+        case K::Uconst_closure:
+          return o::vblock(tag, {w.list(c->funs, [&](const UFunction* f) { return ufunction(f); }), w.str(c->s),
+                                 w.list(c->fields, [&](const UConstant& u) { return uconstant(u); })});
+      }
+      return w.i(0);
+    });
+  }
+
+  V ufunction(const UFunction* f) {
+    return memo(f, [&] {
+      return o::vblock(0, {w.str(f->label), w.i(f->arity), w.list(f->params, [&](const UParam& p) { return uparam(p); }),
+                           vk(f->return_), ulam(f->body), dbg(f->dbg), f->env ? w.some(w.ident(f->env)) : w.none(),
+                           w.i(static_cast<long>(f->poll))});
+    });
+  }
+
+  V record_rep(const RecordRepresentation& r) {
+    using RK = RecordRepresentation::Kind;
+    switch (r.kind) {
+      case RK::Record_regular: return w.i(0);
+      case RK::Record_float: return w.i(1);
+      case RK::Record_unboxed: return o::vblock(0, {w.b(r.unboxed_inlined)});
+      case RK::Record_inlined: return o::vblock(1, {w.i(r.inlined_tag)});
+      default: return o::vblock(2, {w.path(r.extension)});
+    }
+  }
+
+  V primitive(const Primitive& p) {
+    if (auto it = prims_.find(p.id); it != prims_.end()) return it->second;
+    V v = primitive_(p);
+    prims_[p.id] = v;
+    return v;
+  }
+  std::unordered_map<unsigned long, V> prims_;
+  V primitive_(const Primitive& p) {
+    using K = Primitive::K;
+    // numbering: constant and non-constant constructors apart, in declaration order
+    auto has_args = [](K k) {
+      switch (k) {
+        case K::Pread_symbol: case K::Pmakeblock: case K::Pmakelazyblock: case K::Pfield: case K::Psetfield:
+        case K::Psetfield_computed: case K::Pfloatfield: case K::Psetfloatfield: case K::Pduprecord:
+        case K::Pccall: case K::Praise: case K::Pdivint: case K::Pmodint: case K::Pintcomp:
+        case K::Pcompare_bints: case K::Poffsetint: case K::Poffsetref: case K::Pfloatcomp: case K::Pmakearray:
+        case K::Pduparray: case K::Parraylength: case K::Parrayrefu: case K::Parraysetu: case K::Parrayrefs:
+        case K::Parraysets: case K::Pbintofint: case K::Pintofbint: case K::Pcvtbint: case K::Pnegbint:
+        case K::Paddbint: case K::Psubbint: case K::Pmulbint: case K::Pdivbint: case K::Pmodbint:
+        case K::Pandbint: case K::Porbint: case K::Pxorbint: case K::Plslbint: case K::Plsrbint:
+        case K::Pasrbint: case K::Pbintcomp: case K::Pbigarrayref: case K::Pbigarrayset: case K::Pbigarraydim:
+        case K::Pstring_load: case K::Pbytes_load: case K::Pbytes_set: case K::Pbigstring_load:
+        case K::Pbigstring_set: case K::Pbbswap:
+          return true;
+        default: return false;
+      }
+    };
+    bool block = has_args(p.kind);
+    long n = 0;
+    for (int k = 0; k < static_cast<int>(p.kind); ++k)
+      if (has_args(static_cast<K>(k)) == block) ++n;
+    if (!block) return w.i(n);
+    int tag = static_cast<int>(n);
+    auto I = [&](long x) { return w.i(x); };
+    auto sized = [&]() { return o::vblock(0, {I(static_cast<long>(p.size)), I(static_cast<long>(p.safe))}); };
+    switch (p.kind) {
+      case K::Pread_symbol: return o::vblock(tag, {w.str(p.sym)});
+      case K::Pmakeblock:
+        return o::vblock(tag, {I(p.n), w.mutable_flag(p.mut),
+                               p.shape.some ? w.some(w.list(p.shape.kinds, [&](const lambda::ValueKind& k) { return vk(k); }))
+                                            : w.none()});
+      case K::Pmakelazyblock: return o::vblock(tag, {I(static_cast<long>(p.lazy_tag))});
+      case K::Pfield: return o::vblock(tag, {I(p.n), I(static_cast<long>(p.ptr)), w.mutable_flag(p.mut)});
+      case K::Psetfield: return o::vblock(tag, {I(p.n), I(static_cast<long>(p.ptr)), I(static_cast<long>(p.init))});
+      case K::Psetfield_computed: return o::vblock(tag, {I(static_cast<long>(p.ptr)), I(static_cast<long>(p.init))});
+      case K::Pfloatfield: return o::vblock(tag, {I(p.n)});
+      case K::Psetfloatfield: return o::vblock(tag, {I(p.n), I(static_cast<long>(p.init))});
+      case K::Pduprecord: return o::vblock(tag, {record_rep(p.repr), I(p.n)});
+      case K::Pccall: return o::vblock(tag, {w.prim_desc(p.ccall)});
+      case K::Praise: return o::vblock(tag, {I(static_cast<long>(p.raise))});
+      case K::Pdivint:
+      case K::Pmodint: return o::vblock(tag, {I(static_cast<long>(p.safe))});
+      case K::Pintcomp: return o::vblock(tag, {I(static_cast<long>(p.icmp))});
+      case K::Pcompare_bints: return o::vblock(tag, {I(static_cast<long>(p.bi))});
+      case K::Poffsetint:
+      case K::Poffsetref: return o::vblock(tag, {I(p.n)});
+      case K::Pfloatcomp: return o::vblock(tag, {I(static_cast<long>(p.fcmp))});
+      case K::Pmakearray:
+      case K::Pduparray: return o::vblock(tag, {I(static_cast<long>(p.array)), w.mutable_flag(p.mut)});
+      case K::Pcvtbint: return o::vblock(tag, {I(static_cast<long>(p.bi)), I(static_cast<long>(p.bi2))});
+      case K::Pdivbint:
+      case K::Pmodbint: return o::vblock(tag, {I(static_cast<long>(p.bi)), I(static_cast<long>(p.safe))});
+      case K::Pbintcomp: return o::vblock(tag, {I(static_cast<long>(p.bi)), I(static_cast<long>(p.icmp))});
+      case K::Pbigarrayref:
+      case K::Pbigarrayset:
+        return o::vblock(tag, {w.b(p.unsafe), I(p.n), I(static_cast<long>(p.ba_kind)), I(static_cast<long>(p.ba_layout))});
+      case K::Pbigarraydim: return o::vblock(tag, {I(p.n)});
+      case K::Pstring_load: case K::Pbytes_load: case K::Pbytes_set: case K::Pbigstring_load:
+      case K::Pbigstring_set:
+        return o::vblock(tag, {sized()});
+      case K::Parraylength: case K::Parrayrefu: case K::Parraysetu: case K::Parrayrefs: case K::Parraysets:
+        return o::vblock(tag, {I(static_cast<long>(p.array))});
+      default: return o::vblock(tag, {I(static_cast<long>(p.bi))});  // the boxed-integer operations
+    }
+  }
+
+  V ulams(const Slice<ulambda>& l) { return w.list(l, [&](ulambda u) { return ulam(u); }); }
+  // an array: one value per storage (a switch's index arrays, kept by
+  // Closure's substitution)
+  template <class T, class F>
+  V array(const Slice<T>& a, F&& elt) {
+    std::vector<V> xs;
+    if (a.empty()) return o::vblock(0, xs);
+    if (auto it = arrays_.find(a.p); it != arrays_.end()) return it->second;
+    for (auto& x : a) xs.push_back(elt(x));
+    V v = o::vblock(0, xs);
+    arrays_[a.p] = v;
+    return v;
+  }
+  std::unordered_map<const void*, V> arrays_;
+
+  V ulam(ulambda u) {
+    if (u->kind == UK::Uunreachable) return w.i(0);
+    return memo(u, [&]() -> V {
+      int tag = static_cast<int>(u->kind);
+      switch (u->kind) {
+        case UK::Uvar: return o::vblock(tag, {w.ident(static_cast<const Uvar*>(u)->id)});
+        case UK::Uconst: return o::vblock(tag, {uconstant(static_cast<const Uconst*>(u)->c)});
+        case UK::Udirect_apply: {
+          auto* x = static_cast<const Udirect_apply*>(u);
+          return o::vblock(tag, {w.str(x->f), ulams(x->args), dbg(x->dbg)});
+        }
+        case UK::Ugeneric_apply: {
+          auto* x = static_cast<const Ugeneric_apply*>(u);
+          return o::vblock(tag, {ulam(x->f), ulams(x->args), dbg(x->dbg)});
+        }
+        case UK::Uclosure: {
+          auto* x = static_cast<const Uclosure*>(u);
+          return o::vblock(tag, {w.list(x->funs, [&](const UFunction* f) { return ufunction(f); }), ulams(x->fv)});
+        }
+        case UK::Uoffset: {
+          auto* x = static_cast<const Uoffset*>(u);
+          return o::vblock(tag, {ulam(x->l), w.i(x->ofs)});
+        }
+        case UK::Ulet: {
+          auto* x = static_cast<const Ulet*>(u);
+          return o::vblock(tag, {w.mutable_flag(x->mut), vk(x->k), vp(x->id), ulam(x->arg), ulam(x->body)});
+        }
+        case UK::Uprim: {
+          auto* x = static_cast<const Uprim*>(u);
+          return o::vblock(tag, {primitive(x->p), ulams(x->args), dbg(x->dbg)});
+        }
+        case UK::Uswitch: {
+          auto* x = static_cast<const Uswitch*>(u);
+          auto ints = [&](const Slice<long>& a) { return array(a, [&](long n) { return w.i(n); }); };
+          auto acts = [&](const Slice<ulambda>& a) { return array(a, [&](ulambda y) { return ulam(y); }); };
+          V sw = o::vblock(0, {ints(x->sw.us_index_consts), acts(x->sw.us_actions_consts), ints(x->sw.us_index_blocks),
+                               acts(x->sw.us_actions_blocks)});
+          return o::vblock(tag, {ulam(x->arg), sw, dbg(x->dbg)});
+        }
+        case UK::Ustringswitch: {
+          auto* x = static_cast<const Ustringswitch*>(u);
+          return o::vblock(tag, {ulam(x->arg),
+                                 w.list(x->cases, [&](const UStringCase& c) { return o::vblock(0, {w.str(c.s), ulam(c.action)}); }),
+                                 x->def ? w.some(ulam(x->def)) : w.none()});
+        }
+        case UK::Ustaticfail: {
+          auto* x = static_cast<const Ustaticfail*>(u);
+          return o::vblock(tag, {w.i(x->i), ulams(x->args)});
+        }
+        case UK::Ucatch: {
+          auto* x = static_cast<const Ucatch*>(u);
+          return o::vblock(tag, {w.i(x->i), w.list(x->vars, [&](const UParam& p) { return uparam(p); }), ulam(x->body),
+                                 ulam(x->handler)});
+        }
+        case UK::Utrywith: {
+          auto* x = static_cast<const Utrywith*>(u);
+          return o::vblock(tag, {ulam(x->body), vp(x->exn), ulam(x->handler)});
+        }
+        case UK::Uifthenelse: {
+          auto* x = static_cast<const Uifthenelse*>(u);
+          return o::vblock(tag, {ulam(x->cond), ulam(x->ifso), ulam(x->ifnot)});
+        }
+        case UK::Usequence: {
+          auto* x = static_cast<const Usequence*>(u);
+          return o::vblock(tag, {ulam(x->l1), ulam(x->l2)});
+        }
+        case UK::Uwhile: {
+          auto* x = static_cast<const Uwhile*>(u);
+          return o::vblock(tag, {ulam(x->cond), ulam(x->body)});
+        }
+        case UK::Ufor: {
+          auto* x = static_cast<const Ufor*>(u);
+          return o::vblock(tag, {vp(x->id), ulam(x->lo), ulam(x->hi), w.i(static_cast<long>(x->dir)), ulam(x->body)});
+        }
+        case UK::Uassign: {
+          auto* x = static_cast<const Uassign*>(u);
+          return o::vblock(tag, {w.ident(x->id), ulam(x->e)});
+        }
+        case UK::Usend: {
+          auto* x = static_cast<const Usend*>(u);
+          return o::vblock(tag, {w.i(static_cast<long>(x->k)), ulam(x->met), ulam(x->obj), ulams(x->args), dbg(x->dbg)});
+        }
+        default: throw std::runtime_error("Cmx writer: Uphantom_let");
+      }
+    });
+  }
+
+  V fundesc(const FunctionDescription* d) {
+    return memo(d, [&] {
+      V inl = d->has_inline
+                  ? w.some(o::vblock(0, {w.list(d->inline_params, [&](const VarWithProvenance& v) { return vp(v); }),
+                                         ulam(d->inline_body)}))
+                  : w.none();
+      return o::vblock(0, {w.str(d->fun_label), w.i(d->fun_arity), w.b(d->fun_closed), inl, w.b(d->fun_float_const_prop),
+                           w.i(static_cast<long>(d->fun_poll))});
+    });
+  }
+
+  V approx(const ValueApproximation* a) {
+    using K = ValueApproximation::Kind;
+    if (a->kind == K::Value_unknown) return w.i(0);
+    return memo(a, [&]() -> V {
+      switch (a->kind) {
+        case K::Value_closure: return o::vblock(0, {fundesc(a->fundesc), approx(a->res)});
+        case K::Value_tuple: return o::vblock(1, {array(a->tuple, [&](const ValueApproximation* x) { return approx(x); })});
+        case K::Value_const: return o::vblock(2, {uconstant(a->c)});
+        default: return o::vblock(3, {w.str(a->sym), w.i(a->field)});
+      }
+    });
+  }
+
+  V crcs(const Crcs& l) {
+    return w.list(l, [&](const std::pair<std::string_view, std::optional<std::string>>& e) {
+      return o::vblock(0, {w.str(e.first), e.second ? w.some(o::vstr(*e.second)) : w.none()});
+    });
+  }
+  V ints(const std::vector<long>& l) {
+    return w.list(l, [&](long n) { return w.i(n); });
+  }
+
+ private:
+  std::unordered_map<const void*, V> memo_;
+  template <class F>
+  V memo(const void* key, F&& make) {
+    if (auto it = memo_.find(key); it != memo_.end()) return it->second;
+    V v = make();
+    memo_[key] = v;
+    return v;
+  }
+};
+
+}  // namespace
+
+std::string write_unit_info(const UnitInfos& ui) {
+  CmxWriter cw;
+  auto& w = cw.w;
+  V info = o::vblock(0, {w.str(ui.ui_name), w.str(ui.ui_symbol),
+                         w.list(ui.ui_defines, [&](std::string_view s) { return w.str(s); }), cw.crcs(ui.ui_imports_cmi),
+                         cw.crcs(ui.ui_imports_cmx), cw.ints(ui.ui_curry_fun), cw.ints(ui.ui_apply_fun),
+                         cw.ints(ui.ui_send_fun), o::vblock(0, {cw.approx(ui.ui_export_info)}), w.b(ui.ui_force_link),
+                         ui.ui_for_pack ? w.some(w.str(*ui.ui_for_pack)) : w.none(), w.b(ui.ui_need_stdlib)});
+  std::vector<std::uint8_t> bytes = o::marshal(info);
+  std::string file = cmx_magic_number;
+  file.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+  // Digest.BLAKE128.file filename, after the flush
+  file += blake2::blake128(reinterpret_cast<const unsigned char*>(file.data()), file.size());
+  return file;
+}
+
+}  // namespace cppcaml::typing::cmx_format

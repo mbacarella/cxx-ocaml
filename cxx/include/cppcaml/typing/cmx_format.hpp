@@ -44,4 +44,8 @@ struct Error : std::runtime_error {
 // Compilenv.read_unit_info filename: the unit infos and the digest
 std::pair<UnitInfos*, std::string> read_unit_info(const std::string& filename);
 
+// Compilenv.write_unit_info: the .cmx file's bytes (magic, the marshaled
+// unit infos, their BLAKE128 digest)
+std::string write_unit_info(const UnitInfos& ui);
+
 }  // namespace cppcaml::typing::cmx_format

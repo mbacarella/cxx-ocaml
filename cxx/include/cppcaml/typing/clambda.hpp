@@ -31,6 +31,15 @@ inline bool is_none(const t& d) { return d.empty(); }
 t from_location(const lambda::ScopedLocation& l);
 Location to_location(const t& d);
 t inline_(const t& dbg1, const t& dbg2);  // Debuginfo.inline: dbg1 @ dbg2
+// The identities of a list's cells and items, where they are not one per
+// Slice element: a list read from a .cmx (whose tails and items other lists
+// share) or built by [inline_] (dbg1's items in fresh cells, then dbg2's
+// cells).  Keys: [cell_key] / [item_key] for element k of a list.
+std::uint64_t cell_key(const t& d, std::size_t k);
+std::uint64_t item_key(const t& d, std::size_t k);
+std::uint64_t fresh_key();
+void set_shape(const t& d, std::vector<std::uint64_t> cells, std::vector<std::uint64_t> items);
+bool has_shape(const t& d);
 int compare(const t& a, const t& b);
 std::string to_string(const t& d);
 }  // namespace debuginfo
@@ -51,6 +60,8 @@ struct VarWithProvenance {  // Without_provenance var | With_provenance {var; pr
   const Provenance* provenance = nullptr;
 };
 inline VarWithProvenance vp(Var v) { return {v, nullptr}; }
+
+unsigned long fresh_uconstant_id();  // a fresh block identity
 
 // ---- Clambda_primitives -----------------------------------------------------------------------
 enum class Boxed : std::uint8_t { Boxed, Unboxed };
@@ -93,6 +104,9 @@ struct Primitive {
   lambda::BigarrayKind ba_kind = lambda::BigarrayKind::Pbigarray_unknown;
   lambda::BigarrayLayout ba_layout = lambda::BigarrayLayout::Pbigarray_unknown_layout;
   MemoryAccessSize size = MemoryAccessSize::Sixteen;  // the P*_load / P*_set of (size, is_safe)
+  // the block's identity: one per construction, kept by copies (the .cmx
+  // writer shares the block as ocamlopt's values do)
+  unsigned long id = fresh_uconstant_id();
 };
 inline Primitive prim(Primitive::K k) { return Primitive{k}; }
 
@@ -105,10 +119,13 @@ struct UConstant {  // Uconst_ref of string * ustructured_constant option | Ucon
   std::string_view sym;                     // Uconst_ref
   const UStructuredConstant* sc = nullptr;  // Uconst_ref's option
   long i = 0;                               // Uconst_int
+  // the block's identity: one per construction, kept by copies (the .cmx
+  // writer shares the block as ocamlopt's values do)
+  unsigned long id = 0;
 };
-inline UConstant uconst_int(long i) { return {UConstant::Kind::Uconst_int, {}, nullptr, i}; }
+inline UConstant uconst_int(long i) { return {UConstant::Kind::Uconst_int, {}, nullptr, i, fresh_uconstant_id()}; }
 inline UConstant uconst_ref(std::string_view s, const UStructuredConstant* c) {
-  return {UConstant::Kind::Uconst_ref, s, c, 0};
+  return {UConstant::Kind::Uconst_ref, s, c, 0, fresh_uconstant_id()};
 }
 struct UFunction;
 struct UStructuredConstant {
