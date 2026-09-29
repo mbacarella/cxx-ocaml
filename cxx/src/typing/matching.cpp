@@ -149,11 +149,34 @@ constexpr long forcing_tag = 244;
 using Pat = const tt::Pattern*;
 using Pats = std::vector<Pat>;
 
+// The patterns the compiler builds (simplified, expanded, split clauses)
+// are temporaries too: while an entry point runs they go to the heads'
+// scratch zone (PatZone, around each builder) -- Lambda copies what it
+// takes from a pattern.  (Patterns.omega is process-long: g_pat_permanent.)
+extern Zone* g_head_zone;
+bool g_pat_permanent = false;
+struct PatZone {
+  Zone* saved = nullptr;
+  PatZone() {
+    if (g_head_zone && !g_pat_permanent) {
+      saved = &zone();
+      set_zone(g_head_zone);
+    }
+  }
+  ~PatZone() {
+    if (saved) set_zone(saved);
+  }
+  PatZone(const PatZone&) = delete;
+  PatZone& operator=(const PatZone&) = delete;
+};
+
 template <class D>
 const D* mkd(D d) {
+  PatZone pz;
   return make<D>(std::move(d));
 }
 Pat with_desc(Pat p, const tt::PatternDesc* d) {
+  PatZone pz;
   tt::Pattern* q = make<tt::Pattern>(*p);
   q->pat_desc = d;
   return q;
@@ -163,8 +186,11 @@ Pat with_desc(Pat p, const tt::PatternDesc* d) {
 Pat omega() {
   static Pat o = [] {
     ZoneScope perm(permanent_zone());
-    return make<tt::Pattern>(mkd(tt::Tpat_any{{PK::Tpat_any}}), location::none(), Slice<tt::PatExtraItem>{},
-                             ctype::none(), env::empty(), tt::Attributes{});
+    g_pat_permanent = true;
+    Pat o = make<tt::Pattern>(mkd(tt::Tpat_any{{PK::Tpat_any}}), location::none(), Slice<tt::PatExtraItem>{},
+                              ctype::none(), env::empty(), tt::Attributes{});
+    g_pat_permanent = false;
+    return o;
   }();
   return o;
 }
@@ -329,6 +355,7 @@ long head_arity(HeadP t) {
 }
 // reconstructs a pattern, putting wildcards as sub-patterns.
 Pat to_omega_pattern(HeadP t) {
+  PatZone pz;
   const tt::PatternDesc* pat_desc;
   switch (t->kind) {
     case HK::Any: pat_desc = mkd(tt::Tpat_any{{PK::Tpat_any}}); break;
@@ -389,12 +416,18 @@ std::vector<T> get_mins(const Le& le, const std::vector<T>& ps) {
 
 // ---- matching.ml ---------------------------------------------------------------------------
 std::vector<tt::RecordPatField> all_record_args(Slice<tt::RecordPatField> lbls) {
+  PatZone pz;
   if (lbls.empty()) fatal_error("Matching.all_record_args");
   auto lbl_all = lbls[0].label->lbl_all;
   std::vector<tt::RecordPatField> t;
   for (auto* lbl : lbl_all) t.push_back({tt::LidLoc{Longident::lident("?temp?"), location::none()}, lbl, omega()});
   for (auto& x : lbls) t[static_cast<std::size_t>(x.label->lbl_pos)] = x;
   return t;
+}
+// slice (all_record_args lbls), a pattern's: temporary (PatZone)
+Slice<tt::RecordPatField> record_args(Slice<tt::RecordPatField> lbls) {
+  PatZone pz;
+  return slice(all_record_args(lbls));
 }
 
 HeadP expand_record_head(HeadP h) {
@@ -448,6 +481,7 @@ bool is_simple_view(Pat p) {
 
 // ---- Half_simple ----
 Pat simpl_under_orpat(Pat p) {
+  PatZone pz;
   const tt::PatternDesc* d = p->pat_desc;
   switch (d->kind) {
     case PK::Tpat_any:
@@ -466,7 +500,7 @@ Pat simpl_under_orpat(Pat p) {
     }
     case PK::Tpat_record: {
       auto* r = as<tt::Tpat_record>(d);
-      return with_desc(p, mkd(tt::Tpat_record{{PK::Tpat_record}, slice(all_record_args(r->fields)), r->closed}));
+      return with_desc(p, mkd(tt::Tpat_record{{PK::Tpat_record}, record_args(r->fields), r->closed}));
     }
     default: return p;
   }
@@ -493,7 +527,7 @@ Clause half_simple_of_clause(lam arg, Clause cl) {
       case PK::Tpat_record: {
         auto* r = as<tt::Tpat_record>(d);
         if (r->fields.empty()) return cl;
-        cl.p = with_desc(p, mkd(tt::Tpat_record{{PK::Tpat_record}, slice(all_record_args(r->fields)), r->closed}));
+        cl.p = with_desc(p, mkd(tt::Tpat_record{{PK::Tpat_record}, record_args(r->fields), r->closed}));
         return cl;
       }
       case PK::Tpat_or: {
@@ -517,6 +551,7 @@ Clause half_simple_of_clause(lam arg, Clause cl) {
 HeadP simple_head(Pat p) { return deconstruct(p).head; }
 
 Pat simple_alpha(const std::vector<std::pair<Ident::t, Ident::t>>& env, Pat p) {
+  PatZone pz;
   auto alpha_pat = [&](Pat q) { return tt::alpha_pat(env, q); };
   const tt::PatternDesc* d = p->pat_desc;
   const tt::PatternDesc* pat_desc;
@@ -639,8 +674,9 @@ std::vector<PatAct> explode_or_pat(lam arg, Pat p0, const MkAction& mk_action,
 }
 
 Pat expand_record_simple(Pat p) {
+  PatZone pz;
   if (auto* r = as<tt::Tpat_record>(p->pat_desc))
-    return with_desc(p, mkd(tt::Tpat_record{{PK::Tpat_record}, slice(all_record_args(r->fields)), ClosedFlag::Closed}));
+    return with_desc(p, mkd(tt::Tpat_record{{PK::Tpat_record}, record_args(r->fields), ClosedFlag::Closed}));
   return p;
 }
 
