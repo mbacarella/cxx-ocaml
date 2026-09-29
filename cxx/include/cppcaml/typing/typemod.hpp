@@ -6,6 +6,7 @@
 // reporting comes with Printtyp.
 #pragma once
 
+#include "cppcaml/lexer.hpp"
 #include <optional>
 #include <string>
 #include <vector>
@@ -111,6 +112,9 @@ const tt::Signature* type_interface(const UnitInfo& target, env::t env, pt::Sign
 // coercion), else saved as [target_cmi]
 const tt::ModuleCoercion* package_units(env::t initial_env, const std::vector<std::string>& objfiles,
                                         const std::string& target_modname, const std::string& target_cmi);
+// the driver's Lexer.prepare_error, for the lexer errors of an -open argument
+extern std::function<void(const std::string&, const std::string&, const cppcaml::LexError&)>
+    report_lexer_error_hook;
 env::t initial_env(const Location& loc, const std::optional<std::string>& initially_opened_module,
                    const std::vector<std::string>& open_implicit_modules);
 

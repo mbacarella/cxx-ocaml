@@ -240,11 +240,9 @@ class PersistentEnv {
     return find_pers_struct(allow_hidden, f, true, name).pm;
   }
 
-  // `check`: record the weak dependency (the No_cmi_file warning check is
-  // not ported yet).
-  void check(std::string_view name) {
-    if (!persistent_structures_.count(name)) add_import(name);
-  }
+  // Hashtbl.mem penv.persistent_structures name (Persistent_env.check: the
+  // rest, the delayed No_cmi_file check, is Env's check_pers_mod)
+  bool mem(std::string_view name) const { return persistent_structures_.count(name) != 0; }
 
   std::string crc_of_unit(const std::function<PM(const PersistentSignature&)>& f,
                           const std::string& name) {

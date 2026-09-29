@@ -1,5 +1,7 @@
 // Port of typing/env.ml.  See env.hpp for the deviations (no shapes; no
 // warnings / alerts / usage tracking yet).  Sections follow env.ml.
+#include "cppcaml/typing/misc.hpp"
+#include "cppcaml/typing/utf8_lexeme.hpp"
 #include "cppcaml/typing/env.hpp"
 #include "cppcaml/typing/builtin_attributes.hpp"
 #include "cppcaml/typing/location.hpp"
@@ -490,6 +492,68 @@ static const ModuleData* sign_of_cmi(bool freshen, const persistent_env::Persist
 
 static const ModuleData* read_sign_of_cmi(const persistent_env::PersistentSignature& ps) {
   return sign_of_cmi(true, ps);
+}
+
+// Persistent_env.check_pers_struct: emits a warning if there is no valid cmi
+// for [name]
+static void check_pers_struct(bool allow_hidden, const Location& loc, const std::string& name) {
+  using W = warnings::Warning;
+  auto warn = [&](std::optional<std::string> msg) {
+    W w = W::with_s(W::K::No_cmi_file, name);
+    w.opt = std::move(msg);
+    location::prerr_warning(loc, w);
+  };
+  try {
+    g_persistent_env.find_pers_struct(allow_hidden, read_sign_of_cmi, false, name);
+  } catch (const load_path::NotFound&) {
+    warn(std::nullopt);
+  } catch (const cmi_format::Error& e) {
+    // Format.asprintf "%a" Cmi_format.report_error err
+    auto qf = [f = e.filename](format_doc::Formatter& ff) { location::doc::quoted_filename(ff, f); };
+    std::string msg;
+    switch (e.kind) {
+      case cmi_format::Error::Kind::Not_an_interface:
+        msg = format_doc::asprintf("%a@ is not a compiled interface", qf);
+        break;
+      case cmi_format::Error::Kind::Wrong_version_interface:
+        msg = format_doc::asprintf(
+            "%a@ is not a compiled interface for this version of OCaml.@.It seems to be for %s version of OCaml.",
+            qf, e.older_newer);
+        break;
+      case cmi_format::Error::Kind::Corrupted_interface:
+        msg = format_doc::asprintf("Corrupted compiled interface@ %a", qf);
+        break;
+    }
+    warn(msg);
+  } catch (const persistent_env::Error& e) {
+    using K = persistent_env::Error::Kind;
+    std::string msg;
+    switch (e.kind) {
+      case K::Illegal_renaming:  // (name, ps_name, filename)
+        msg = format_doc::asprintf(
+            " %a@ contains the compiled interface for @ %a when %a was expected",
+            [f = e.c](format_doc::Formatter& ff) { location::doc::quoted_filename(ff, f); },
+            misc::style::code_str(e.b), misc::style::code_str(e.a));
+        break;
+      case K::Inconsistent_import: throw std::logic_error("Persistent_env.check_pers_struct");
+      case K::Need_recursive_types:
+        msg = format_doc::asprintf("%a uses recursive types", misc::style::code_str(e.a));
+        break;
+    }
+    warn(msg);
+  }
+}
+
+// Env.check_pers_mod = Persistent_env.check
+static void check_pers_mod(bool allow_hidden, const Location& loc, std::string_view name) {
+  if (g_persistent_env.mem(name)) return;
+  // PR#6843: record the weak dependency ([add_import]) regardless of
+  // whether the check succeeds, to help make builds more deterministic.
+  g_persistent_env.add_import(name);
+  using W = warnings::Warning;
+  if (warnings::is_active(W::make(W::K::No_cmi_file)))
+    add_delayed_check_forward(
+        [allow_hidden, loc, n = std::string(name)] { check_pers_struct(allow_hidden, loc, n); });
 }
 
 // save_signature_with_transform cmi_transform ~alerts sg cmi_info
@@ -1503,12 +1567,7 @@ static void check_usage(const Location& loc, Ident::t id, const Uid& uid, const 
 }
 
 static void check_value_name(std::string_view name, const Location& loc) {
-  // Utf8_lexeme.starts_like_a_valid_identifier, ASCII approximation: a
-  // letter or underscore first
-  if (name.empty()) return;
-  unsigned char c0 = static_cast<unsigned char>(name[0]);
-  bool starts_ok = std::isalpha(c0) || c0 == '_' || c0 >= 0x80;
-  if (starts_ok) return;
+  if (name.empty() || utf8_lexeme::starts_like_a_valid_identifier(name)) return;
   for (std::size_t i = 1; i < name.size(); ++i)
     if (name[i] == '#') {
       Error e(Error::Kind::Illegal_value_name);
@@ -2623,7 +2682,7 @@ static std::pair<Path::t, const ModuleData*> lookup_ident_module(bool load, bool
       throw NotFound{};
     case ModuleEntry::Kind::Mod_persistent:
       if (!load) {
-        g_persistent_env.check(s);  // check_pers_mod ~allow_hidden:false
+        check_pers_mod(false, loc, s);
         return {path, nullptr};
       }
       const ModuleData* mda;

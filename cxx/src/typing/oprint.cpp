@@ -2,6 +2,8 @@
 // module types and signature items.
 #include "cppcaml/typing/oprint.hpp"
 
+#include "cppcaml/typing/utf8_lexeme.hpp"
+
 #include <functional>
 
 #include "cppcaml/typing/path.hpp"
@@ -166,52 +168,8 @@ void out_ident(Formatter& ppf, const ot::OutIdent* id) {
   }
 }
 
-namespace {
 
-// Misc.Utf8_lexeme.get_known_char's letters (Latin-9)
-bool known_char(unsigned u) {
-  if (u >= 0xc0 && u <= 0xff && u != 0xd7 && u != 0xf7) return true;
-  switch (u) {
-    case 0x160: case 0x161: case 0x17d: case 0x17e: case 0x152: case 0x153: case 0x178: case 0x1e9e: return true;
-    default: return false;
-  }
-}
-
-// String.get_utf_8_uchar: the scalar and its length (a malformed byte: U+FFFD, 1)
-std::pair<unsigned, int> utf8_decode(std::string_view s, std::size_t i) {
-  unsigned char c = static_cast<unsigned char>(s[i]);
-  auto cont = [&](std::size_t j) { return j < s.size() && (static_cast<unsigned char>(s[j]) & 0xc0) == 0x80; };
-  if (c < 0x80) return {c, 1};
-  if ((c & 0xe0) == 0xc0 && c >= 0xc2 && cont(i + 1))
-    return {((c & 0x1fu) << 6) | (static_cast<unsigned char>(s[i + 1]) & 0x3fu), 2};
-  if ((c & 0xf0) == 0xe0 && cont(i + 1) && cont(i + 2))
-    return {((c & 0x0fu) << 12) | ((static_cast<unsigned char>(s[i + 1]) & 0x3fu) << 6) |
-                (static_cast<unsigned char>(s[i + 2]) & 0x3fu),
-            3};
-  if ((c & 0xf8) == 0xf0 && cont(i + 1) && cont(i + 2) && cont(i + 3))
-    return {((c & 0x07u) << 18) | ((static_cast<unsigned char>(s[i + 1]) & 0x3fu) << 12) |
-                ((static_cast<unsigned char>(s[i + 2]) & 0x3fu) << 6) | (static_cast<unsigned char>(s[i + 3]) & 0x3fu),
-            4};
-  return {0xfffd, 1};
-}
-
-bool uchar_valid_in_identifier(unsigned c) {
-  if (c < 0x80) return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '\'';
-  return known_char(c);
-}
-
-}  // namespace
-
-bool is_valid_identifier(std::string_view s) {
-  std::size_t i = 0;
-  while (i < s.size()) {
-    auto [u, len] = utf8_decode(s, i);
-    if (!uchar_valid_in_identifier(u)) return false;
-    if (i == 0 && ((u >= '0' && u <= '9') || u == '\'')) return false;
-    i += static_cast<std::size_t>(len);
-  }
-  return true;
-}
+bool is_valid_identifier(std::string_view s) { return utf8_lexeme::is_valid_identifier(s); }
 
 bool parenthesized_ident(std::string_view name) {
   for (const char* k : {"or", "mod", "land", "lor", "lxor", "lsl", "lsr", "asr"})

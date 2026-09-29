@@ -11,6 +11,8 @@
 #include <filesystem>
 #include <set>
 
+#include "cppcaml/lexer.hpp"
+#include "cppcaml/typing/format.hpp"
 #include "cppcaml/typing/parmatch.hpp"
 #include "cppcaml/typing/printtyp.hpp"
 #include "cppcaml/typing/oprint.hpp"
@@ -382,20 +384,46 @@ static std::set<std::string> persistent_structures_of_dir(const std::vector<std:
   return out;
 }
 
+std::function<void(const std::string&, const std::string&, const cppcaml::LexError&)> report_lexer_error_hook;
+
+// Parse.simple_module_path on a lexbuf Location.init'ed to "command line
+// argument: -open %S": parser.mly's parse_mod_longident (mod_longident EOF,
+// mod_longident = UIDENT | mod_longident DOT UIDENT).  A syntax error is
+// Syntaxerr's "Syntax error" at the offending token; a lexer error is
+// reported by the driver's Lexer.prepare_error.
+static Longident::t simple_module_path(const std::string& m) {
+  std::string fname = "command line argument: -open \"" + format::string_escaped(m) + "\"";
+  cppcaml::Lexer lx(m);
+  std::vector<cppcaml::Token> toks = lx.tokenize();
+  std::string_view zfname = zborrow(fname);
+  auto error_at = [&](const cppcaml::Token& t) -> Longident::t {
+    if (t.lex_error && lx.pending_error()) {
+      report_lexer_error_hook(fname, m, *lx.pending_error());
+      throw location::AlreadyDisplayed();
+    }
+    Location l{Position{zfname, 1, 0, static_cast<long>(t.start)}, Position{zfname, 1, 0, static_cast<long>(t.end)}};
+    throw location::Error(location::errorf(l, "Syntax error"));
+  };
+  using K = cppcaml::Kind;
+  std::size_t i = 0;
+  if (toks[i].kind != K::UIDENT) return error_at(toks[i]);
+  Longident::t lid = Longident::lident(zborrow(toks[i].text));
+  ++i;
+  while (toks[i].kind == K::DOT) {
+    ++i;
+    if (toks[i].kind != K::UIDENT) return error_at(toks[i]);
+    lid = Longident::ldot(lid, location::none(), zborrow(toks[i].text), location::none());
+    ++i;
+  }
+  if (toks[i].kind != K::TEOF || toks[i].lex_error) return error_at(toks[i]);
+  return lid;
+}
+
 env::t initial_env(const Location& loc, const std::optional<std::string>& initially_opened_module,
                    const std::vector<std::string>& open_implicit_modules) {
   env::t env = env::initial();
   auto open_module = [&](env::t e, const std::string& m) {
-    // (Parse.simple_module_path of the -open argument: a dotted path)
-    Longident::t lid = nullptr;
-    std::size_t start = 0;
-    for (;;) {
-      std::size_t dot = m.find('.', start);
-      std::string_view part = zborrow(m.substr(start, dot == std::string::npos ? std::string::npos : dot - start));
-      lid = lid ? Longident::ldot(lid, location::none(), part, location::none()) : Longident::lident(part);
-      if (dot == std::string::npos) break;
-      start = dot + 1;
-    }
+    Longident::t lid = simple_module_path(m);
     return type_open_(nullptr, false, OverrideFlag::Override, e, loc, pt::LidLoc{lid, loc}).second;
   };
   auto add_units = [](env::t e, const std::set<std::string>& units) {

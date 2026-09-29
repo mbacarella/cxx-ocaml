@@ -91,7 +91,7 @@ Ast_mapper's context and Ast_invariants.
 - Implemented (their effects as ocamlc's): everything the typer, translators,
   Emitcode, Bytepackager, the linker and the librarian read; `-a`, `-i`,
   `-i-variance`, `-short-paths`, `-bin-annot`, `-config`, `-dlambda` /
-  `-drawlambda` / `-dinstr` / `-dparsetree` (implementations), `-dump-into-file`,
+  `-drawlambda` / `-dinstr` / `-dparsetree`, `-dno-locations`, `-dump-into-file`,
   `-for-pack`, `-g`, `-H`, `-keywords`, `-open`, `-pack`, `-pp`, `-ppx`,
   `-stop-after`, `-w` / `-warn-error` / `-alert`, `-color` / `-error-style`,
   the runtime-selection flags, `-args` / `-args0`, OCAMLPARAM.
@@ -136,7 +136,7 @@ builds while a chain runs; cap memory (`ulimit -v`).  Results as of the
 | `error_parity.sh` | stderr + exit, `error_probes/` + false-accept probes | 335/335 |
 | `error_parity_multi.sh` | missing/stale .cmi, inconsistent assumptions, -pack | 9/9 |
 | `warning_parity.sh` | stderr + exit, `warning_probes/` (default, `W="-w +a"`) | 66/66 |
-| `intf_parity.sh` | `-i` on `stamp_probes/` | 6554/6554 |
+| `intf_parity.sh ERR=1` | `-i` (stdout, stderr, exit) on `stamp_probes/` | 6554/6554 |
 | `lambda_port_parity.sh DUMP=cmo` | .cmo bytes (and `FLAGS=-g`) on probes | 6548 + 2 known |
 | `cmi_port_parity.sh` | compiler .mli / `--standalone` probes | 146/146, 6552 + 2 known |
 | `cmt_parity.sh --stdlib / --compiler` | .cmt bytes | 72/72, 146/146 |
@@ -150,7 +150,7 @@ builds while a chain runs; cap memory (`ulimit -v`).  Results as of the
 | `dune_parity.sh` | dune builds, artifact by artifact | 0 DIFF (73 .cmt sharing) |
 | `effid.sh` | the compiler's .cmo, compiled by c++ocamlc | 140/140 bytes |
 | `ddc.sh` + `stdlib_ddc.sh` | diverse double-compiling | PASS |
-| `testsuite_delta.sh` | ocamltest with c++ocamlc as ocamlc | the delta |
+| `testsuite_delta.sh` | ocamltest with c++ocamlc as ocamlc | the delta (below) |
 
 Also: `false_accept.sh` / `valid_reject.sh` (through `port_check.sh`),
 `typing_cmi_parity.sh` / `typing_env_parity.sh` / `typing_ctype_parity.sh` /
@@ -159,6 +159,11 @@ structural oracles, via `typing_dump.ml` and `c++typing-dump`),
 `bench.sh` (below).
 
 ## Known gaps
+
+`testsuite_delta.sh`'s regressions are all of the kinds below: the
+typing-recovery tests (`-typing-recovery` is merlin's), the refused options
+(`-annot`, `-dtypedtree`, `-dsource`, `-depend`, `-compat-32`) and the
+menhir error points.
 
 - Two stamp probes' .cmi (and so their .cmo crc): `xpay_b7` (an attribute
   payload's positions shared differently) and `xrp_d34` (a class probe where

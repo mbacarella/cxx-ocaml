@@ -68,6 +68,7 @@
 #include "cppcaml/typing/simplif.hpp"
 #include "cppcaml/typing/translmod.hpp"
 #include "cppcaml/typing/warnings.hpp"
+#include "cppcaml/typing/utf8_lexeme.hpp"
 #include "cppcaml/typing/arg.hpp"
 #include "cppcaml/typing/compenv.hpp"
 #include "cppcaml/typing/config.hpp"
@@ -77,12 +78,21 @@ namespace fs = std::filesystem;
 
 
 
+// Unit_info.strict_modname_from_source: the stem, Utf8_lexeme.capitalize'd;
+// an invalid encoding is Unit_info's Invalid_encoding error (exit 2)
 static std::string module_name(const std::string& path) {
+  namespace ty = cppcaml::typing;
   std::string base = fs::path(path).filename().string();
   size_t dot = base.find('.');
   if (dot != std::string::npos) base = base.substr(0, dot);
-  if (!base.empty()) base[0] = (char)std::toupper((unsigned char)base[0]);
-  return base;
+  ty::utf8_lexeme::Result r = ty::utf8_lexeme::capitalize(base);
+  if (!r.ok) {
+    ty::location::print_report(ty::location::err_formatter(),
+                               ty::location::errorf(ty::location::none(), "Invalid encoding of output name: %s.", base));
+    ty::location::err_flush();
+    std::exit(2);
+  }
+  return std::move(r.s);
 }
 
 // Unit_info.make's check_unit_name: Bad_module_name on the source file
@@ -778,6 +788,15 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
       emit_lex_warnings(in_path, src, static_cast<size_t>(-1));
     }
     const bool rewritten = ast_file || !cf::all_ppx.empty();
+    if (cf::dump_parsetree && rewritten) {
+      std::cout.flush();
+      std::cerr << "c++ocamlc: option -dparsetree is not supported yet with -ppx or a binary AST input\n";
+      return 2;
+    }
+    // Compile.interface: with_info ~dump_ext:"cmi" (Compmisc.with_ppf_dump)
+    PpfDump ppf_dump;
+    open_ppf_dump(ppf_dump, remove_extension(cmi_out) + ".cmi");
+    if (cf::dump_parsetree) cppcaml::ast::print_dparsetree(sig, in_path, ppf_dump.out(), dirfiles);
     if (cf::should_stop_after(cf::Pass::Parsing) && !rewritten) return 0;
     PortResult port = port_typecheck(
         in_path, module_name(cmi_out), cmi_out, /*intf=*/true,
@@ -1125,6 +1144,7 @@ int run_main_big_stack(int argc, char** argv) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  cppcaml::typing::typemod::report_lexer_error_hook = report_lexer_error;
   // Every .cmo/.cmi/executable is written through a local, RAII std::ofstream
   // that has already flushed and closed by the time run_main returns; the only
   // process-lifetime streams are std::cout/std::cerr (dumps, diagnostics).  So

@@ -41,6 +41,9 @@ const std::vector<Comment>& last_comments();
 // `dirfiles` supplies the directive filenames (file_id>0); fname is file_id 0.
 void print_dparsetree(const Structure& s, std::string_view fname, std::ostream& os,
                       const std::vector<std::string>& dirfiles = {});
+// ... and an interface (Printast.interface)
+void print_dparsetree(const Signature& s, std::string_view fname, std::ostream& os,
+                      const std::vector<std::string>& dirfiles = {});
 }  // namespace ast
 
 }  // namespace cppcaml

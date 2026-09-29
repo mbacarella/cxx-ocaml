@@ -7,17 +7,19 @@
 #include <cctype>
 #include <filesystem>
 
+#include "cppcaml/typing/utf8_lexeme.hpp"
+
 namespace cppcaml::typing {
 
 namespace fs = std::filesystem;
 
 namespace load_path {
 
+// Misc.normalized_unit_filename = Utf8_lexeme.uncapitalize (Error: nullopt)
 std::optional<std::string> normalized_unit_filename(const std::string& fn) {
-  if (fn.empty()) return fn;
-  std::string r = fn;
-  if (static_cast<unsigned char>(r[0]) < 0x80) r[0] = static_cast<char>(std::tolower(r[0]));
-  return r;
+  utf8_lexeme::Result r = utf8_lexeme::uncapitalize(fn);
+  if (!r.ok) return std::nullopt;
+  return std::move(r.s);
 }
 
 struct Dir {

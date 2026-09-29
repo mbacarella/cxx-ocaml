@@ -3,6 +3,7 @@
 // node shapes, locations (incl. ghost locs for desugared function bindings), and
 // operator precedence, validated against `ocamlc -dparsetree`.
 #include "cppcaml/parser.hpp"
+#include "cppcaml/typing/clflags.hpp"
 
 #include <cctype>
 #include <optional>
@@ -593,8 +594,8 @@ class Parser {
     Position s = e->loc.start;
     Location gl{s, end, true};
     int n = static_cast<int>(idxs.size());
-    const char* fn = n == 1 ? "Bigarray.Array1.get" : n == 2 ? "Bigarray.Array2.get"
-                   : n == 3 ? "Bigarray.Array3.get" : "Bigarray.Genarray.get";
+    std::string fn = std::string(n == 1 ? "Bigarray.Array1." : n == 2 ? "Bigarray.Array2."
+                                 : n == 3 ? "Bigarray.Array3." : "Bigarray.Genarray.") + builtin_get();
     ExprBox fnexpr = E({Pexp_ident{lid_of_dotted(fn, gl)}, gl});
     std::vector<std::pair<ArgLabel, ExprBox>> args;
     args.emplace_back(Nolabel{}, std::move(e));
@@ -605,9 +606,12 @@ class Parser {
     }
     return E({Pexp_apply{std::move(fnexpr), std::move(args)}, Location{s, end, false}});
   }
+  // parser.mly's builtin_arraylike_name: `unsafe_get` / `unsafe_set` under
+  // -unsafe
+  static const char* builtin_get() { return typing::clflags::unsafe ? "unsafe_get" : "get"; }
   ExprBox indexed_get(ExprBox e, ExprBox idx, Position end, const char* mod) {
     Position s = e->loc.start;
-    ExprBox fn = qualified_ident(mod, "get", Location{s, end, true});  // ghost ident
+    ExprBox fn = qualified_ident(mod, builtin_get(), Location{s, end, true});  // ghost ident
     std::vector<std::pair<ArgLabel, ExprBox>> args;
     args.emplace_back(Nolabel{}, std::move(e));
     args.emplace_back(Nolabel{}, std::move(idx));
@@ -1147,10 +1151,10 @@ class Parser {
         // Array.get / String.get -> .set with the rhs appended
         std::string nm;
         if (auto* dot = std::get_if<Ldot>(&id->id.txt.v)) nm = dot->name;
-        if (nm == "get") {
+        if (nm == builtin_get()) {
           // rebuild fn as Mod.set (ghost over the whole assignment), append rhs
           Longident newlid{Ldot{std::make_shared<Longident>(*std::get_if<Ldot>(&id->id.txt.v)->prefix),
-                                "set", none_loc(), none_loc()}};
+                                typing::clflags::unsafe ? "unsafe_set" : "set", none_loc(), none_loc()}};
           Location gl{l.start, l.end, true};  // ghost ident spans `a.(i) <- v`
           ExprBox fn = E({Pexp_ident{.id = LongidentLoc{std::move(newlid), gl}}, gl});
           std::vector<std::pair<ArgLabel, ExprBox>> args = std::move(ap->args);

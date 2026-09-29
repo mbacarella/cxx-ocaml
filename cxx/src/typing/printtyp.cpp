@@ -2,6 +2,8 @@
 #include "cppcaml/typing/printtyp.hpp"
 
 #include "cppcaml/typing/ident.hpp"
+#include "cppcaml/typing/location.hpp"
+#include "cppcaml/typing/warnings.hpp"
 #include "cppcaml/typing/oprint.hpp"
 #include "cppcaml/typing/pprintast.hpp"
 #include "cppcaml/typing/printlambda.hpp"
@@ -132,9 +134,15 @@ void printed_signature(const std::string& sourcefile, Formatter& ppf, Signature 
   // we are tracking any collision event for warning 63
   out_type::ident_conflicts::reset();
   auto t = out_type::tree_of_signature(sg);
-  // (Warning 63 Erroneous_printed_signature: reported with the warnings, stage 9b)
-  (void)sourcefile;
-  (void)out_type::ident_conflicts::err_msg();
+  using W = warnings::Warning;
+  if (warnings::is_active(W::with_s(W::K::Erroneous_printed_signature, ""))) {
+    if (std::optional<format_doc::Doc> msg = out_type::ident_conflicts::err_msg()) {
+      std::string conflicts = format_doc::asprintf("%a", pr(format_doc::pp_doc, *msg));
+      location::prerr_warning(location::in_file(sourcefile),
+                              W::with_s(W::K::Erroneous_printed_signature, conflicts));
+      warnings::check_fatal();
+    }
+  }
   print_signature(ppf, t);
 }
 

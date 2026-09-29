@@ -6,6 +6,7 @@
 
 #include "cppcaml/ast.hpp"
 #include "cppcaml/lexer.hpp"
+#include "cppcaml/typing/clflags.hpp"
 
 namespace cppcaml::ast {
 namespace {
@@ -62,6 +63,7 @@ struct Printer {
     return s;
   }
   std::string loc(const Location& l) const {
+    if (!typing::clflags::locations) return "";  // -dno-locations
     std::string s = '(' + pos(l.start, true) + ".." + pos(l.end, false) + ')';
     if (l.ghost) s += " ghost";
     return s;
@@ -516,7 +518,7 @@ struct Printer {
       if (v->t) { line(j, "Some"); core_type(j + 1, **v->t); }
       else line(j, "None");
     } else if (std::holds_alternative<Pexp_unreachable>(e.desc)) {
-      os << ind(j) << "Pexp_unreachable";  // printast: no trailing newline
+      line(j, "Pexp_unreachable");
     } else if (std::holds_alternative<Pexp_hole>(e.desc)) {
       line(j, "Pexp_hole");
     } else if (auto* v = std::get_if<Pexp_new>(&e.desc)) {
@@ -739,7 +741,7 @@ struct Printer {
     } else if (auto* v = std::get_if<Pmty_alias>(&m.desc)) {
       line(j, "Pmty_alias " + lid_loc(v->id));
     } else if (auto* v = std::get_if<Pmty_extension>(&m.desc)) {
-      line(j, "Pmod_extension \"" + v->name + "\"");  // printast.ml prints Pmty_extension as Pmod_extension
+      line(j, "Pmty_extension \"" + v->name + "\"");
       ext_payload(j, v->payload);
     } else if (auto* v = std::get_if<Pmty_signature>(&m.desc)) {
       line(j, "Pmty_signature");
@@ -1196,6 +1198,14 @@ void print_dparsetree(const Structure& s, std::string_view fname, std::ostream& 
   Printer p{os, std::string(fname), dirfiles};
   p.structure(s);
   os << '\n';  // driver flushes the dump with a trailing newline (@.)
+}
+
+// Printast.interface (compile_common.ml parse_intf's -dparsetree dump)
+void print_dparsetree(const Signature& s, std::string_view fname, std::ostream& os,
+                      const std::vector<std::string>& dirfiles) {
+  Printer p{os, std::string(fname), dirfiles};
+  p.signature_list(0, s);
+  os << '\n';
 }
 
 void print_payload_structure(const Structure& s, int indent, std::ostream& os,

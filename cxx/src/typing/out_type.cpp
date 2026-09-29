@@ -1,4 +1,5 @@
 // Port of typing/out_type.ml (cxx/PORTING.md stage 9).
+#include "cppcaml/typing/utf8_lexeme.hpp"
 #include "cppcaml/typing/out_type.hpp"
 
 #include "cppcaml/typing/location.hpp"
@@ -317,10 +318,8 @@ bool module_path_is_an_alias_of(env::t e, Path::t p, Path::t alias_of) {
   }
 }
 
-std::string modulize(std::string_view s) {  // Unit_info.modulize: capitalize the first letter
-  std::string r(s);
-  if (!r.empty() && r[0] >= 'a' && r[0] <= 'z') r[0] = static_cast<char>(r[0] - 'a' + 'A');
-  return r;
+std::string modulize(std::string_view s) {  // Unit_info.modulize: Ok x | Error x -> x
+  return utf8_lexeme::capitalize(s).s;
 }
 
 Path::t rewrite_double_underscore_paths_rec(env::t e, Path::t p) {
