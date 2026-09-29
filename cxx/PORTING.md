@@ -152,10 +152,20 @@ Cmmgen_state and Strmatch, `cmmgen.cpp`; amd64's Arch constants):
 switch stores are AVL maps on `compare_key` as OCaml's (the exit-sharing
 key's comparison is not an order, so lookups depend on the tree).
 
-Next, in order: Selection and the Mach passes (`-dsel` ... `-dreload`),
+Selection is ported (`mach.cpp`: Reg, Mach, amd64 Arch/Proc, Printmach;
+`selection.cpp`: Selectgen with amd64's selector folded in, Polling,
+Dataflow): `DUMP=dsel` -- 6550/6550 probes (also `-g`, `-unsafe -inline
+200`, `-nodynlink`, `-g -O3`), 787/787 testsuite files, 208/208 compiler
+sources; the `[@poll error]` reports identical.  Register stamps follow
+ocamlopt's: Proc's 29 hard registers first (so a function's first
+pseudo-register is 29), then every `Reg.create`/`at_location` in
+Selectgen's order.
+
+Next, in order: the Mach passes (`-dcombine` ... `-dreload`: Comballoc,
+CSE, Liveness, Deadcode, Spill, Split, Interf, Coloring, Reload),
 Linearize and Emit (`-dlinear`, then `-S` byte for byte), then the
 .cmx/.cmxa writers and Asmlink.  Until the back end exists, c++ocamlopt
-stops with an error after Cmm and does not write the .cmx.
+stops with an error after Selection and does not write the .cmx.
 
 ## Oracles and gates
 

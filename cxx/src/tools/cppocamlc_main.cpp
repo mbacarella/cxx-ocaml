@@ -43,6 +43,7 @@
 #include "cppcaml/typing/closure.hpp"
 #include "cppcaml/typing/cmmgen.hpp"
 #include "cppcaml/typing/printcmm.hpp"
+#include "cppcaml/typing/selection.hpp"
 #include "cppcaml/typing/translmod.hpp"
 #include "cppcaml/typing/compilenv.hpp"
 #include "cppcaml/typing/misc.hpp"
@@ -743,13 +744,40 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
           if (!name.empty() && name[0] != '%')
             refs.data.push_back(ty::cmm::data_sym(ty::cmm::DataItem::K::Csymbol_address, name));
         }
-        phrases.push_back(std::move(refs));
-        if (cf::dump_cmm)
-          for (const ty::cmm::Phrase& p : phrases) ty::format::fprintf(dump, "%a@.", ty::format::pr(ty::printcmm::phrase, p));
+        // compile_phrases: each function selected (Proc.init, Reg.reset,
+        // Selection.fundecl ~future_funcnames, Polling), -dsel
+        auto compile_phrases = [&](const std::vector<ty::cmm::Phrase>& ps) {
+          ty::selection::FuncNames funcnames;
+          for (const ty::cmm::Phrase& p : ps)
+            if (p.fn) funcnames.insert(p.fn->fun_name);
+          for (const ty::cmm::Phrase& p : ps) {
+            if (cf::dump_cmm) ty::format::fprintf(dump, "%a@.", ty::format::pr(ty::printcmm::phrase, p));
+            if (!p.fn) continue;
+            ty::proc::init();
+            ty::reg::reset();
+            ty::mach::Fundecl fd = ty::polling::instrument_fundecl(ty::selection::fundecl(funcnames, *p.fn));
+            if (cf::dump_selection) ty::printmach::phase(dump, "After instruction selection", fd);
+            funcnames.erase(p.fn->fun_name);
+          }
+        };
+        try {
+          compile_phrases(phrases);
+          compile_phrases({std::move(refs)});
+        } catch (const ty::polling::PollError& e) {
+          // Location.error_of_printer_file Polling.report_error
+          ppf_dump.out() << dump.contents();
+          ppf_dump.out().flush();
+          ty::location::print_report(ty::location::err_formatter(),
+                                     ty::location::error_of_printer_file(
+                                         [&](ty::format_doc::Formatter& f) { ty::polling::report_error(f, e); }));
+          ty::location::err_flush();
+          std::remove(cmo_out.c_str());
+          return 2;
+        }
         ppf_dump.out() << dump.contents();
         ppf_dump.out().flush();
-        lap("cmm", tp);
-        throw std::runtime_error("the native back end (Selection) is not supported yet");
+        lap("selection", tp);
+        throw std::runtime_error("the native back end (Comballoc) is not supported yet");
       }
       return finish();
     }

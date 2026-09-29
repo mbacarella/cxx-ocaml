@@ -40,7 +40,7 @@ fi
 # ocamlopt.opt compiles on, the port stops after its dump (the back end
 # past Clambda is not ported yet: its exit status is not checked)
 CLAMBDA=0
-case "$DUMP" in dclambda|drawclambda|dcmm) CLAMBDA=1; STOP=""; OSTOP="" ;; esac
+case "$DUMP" in dclambda|drawclambda|dcmm|dsel) CLAMBDA=1; STOP=""; OSTOP="" ;; esac
 export DUMP FLAGS STOP DFLAG NATIVE REFC OSTOP CLAMBDA
 OUT=/tmp/lambda_port_parity
 

@@ -1,0 +1,224 @@
+// Ports of asmcomp/reg.ml, asmcomp/mach.ml, asmcomp/amd64/arch.ml (the
+// operations) and asmcomp/amd64/proc.ml: pseudo-registers, the Mach
+// pseudo-instructions Selection produces, and the amd64 register and
+// calling conventions.
+#pragma once
+
+#include <cstdint>
+#include <optional>
+#include <set>
+#include <string>
+#include <vector>
+
+#include "cppcaml/typing/cmm.hpp"
+#include "cppcaml/typing/format.hpp"
+
+namespace cppcaml::typing {
+
+// ---- Reg ---------------------------------------------------------------------------------------
+namespace reg {
+
+struct RawName {  // Anon | R | Var of V.t
+  enum class K : std::uint8_t { Anon, R, Var } k = K::Anon;
+  Ident::t var = nullptr;
+};
+
+struct Location {  // Unknown | Reg of int | Stack of stack_location
+  enum class K : std::uint8_t { Unknown, Reg, Local, Incoming, Outgoing, Domainstate } k = K::Unknown;
+  long n = 0;  // the register number or the stack slot
+};
+
+struct Reg;
+struct RegLess {
+  bool operator()(const Reg* a, const Reg* b) const;  // RegOrder: by stamp
+};
+using Set = std::set<Reg*, RegLess>;
+
+struct Reg {
+  RawName raw_name;
+  long stamp;
+  cmm::MachtypeComponent typ;
+  Location loc;
+  bool spill = false;
+  std::optional<long> part;
+  std::vector<Reg*> interf;
+  std::vector<std::pair<Reg*, long>> prefer;
+  long degree = 0;
+  long spill_cost = 0;
+  long visited = 0;
+};
+inline bool RegLess::operator()(const Reg* a, const Reg* b) const { return a->stamp < b->stamp; }
+
+using Regs = std::vector<Reg*>;  // Reg.t array
+
+Reg* create(cmm::MachtypeComponent ty);
+Regs createv(cmm::Machtype tyv);
+Regs createv(const std::vector<cmm::MachtypeComponent>& tyv);
+Regs createv_like(const Regs& rv);
+Reg* clone(Reg* r);
+Reg* at_location(cmm::MachtypeComponent ty, Location loc);
+std::vector<cmm::MachtypeComponent> typv(const Regs& rv);
+bool anonymous(const Reg* r);
+std::string name(const Reg* r);
+void reset();
+const std::vector<Reg*>& all_registers();  // newest first
+long num_registers();
+
+}  // namespace reg
+
+// ---- Arch (amd64) ------------------------------------------------------------------------------
+namespace arch {
+
+struct AddressingMode {
+  enum class K : std::uint8_t { Ibased, Iindexed, Iindexed2, Iscaled, Iindexed2scaled } k;
+  std::string_view sym;  // Ibased
+  long scale = 0;        // Iscaled / Iindexed2scaled
+  long displ = 0;
+};
+inline AddressingMode iindexed(long n) { return {AddressingMode::K::Iindexed, {}, 0, n}; }
+AddressingMode offset_addressing(const AddressingMode& addr, long delta);
+inline AddressingMode identity_addressing() { return iindexed(0); }
+
+enum class FloatOperation : std::uint8_t { Ifloatadd, Ifloatsub, Ifloatmul, Ifloatdiv };
+struct SpecificOperation {
+  enum class K : std::uint8_t {
+    Ilea, Istore_int, Ioffset_loc, Ifloatarithmem, Ibswap, Iclz, Ictz, Isqrtf, Ifloatsqrtf, Isextend32, Izextend32
+  } k;
+  AddressingMode addr{};
+  std::int64_t n = 0;  // Istore_int's constant, Ioffset_loc's delta, Ibswap's width
+  bool is_assign = false;
+  FloatOperation fop = FloatOperation::Ifloatadd;
+};
+bool operation_is_pure(const SpecificOperation& op);
+
+}  // namespace arch
+
+// ---- Mach --------------------------------------------------------------------------------------
+namespace mach {
+
+using reg::Reg;
+using reg::Regs;
+
+struct IntegerComparison {  // Isigned of Cmm.integer_comparison | Iunsigned of ..
+  bool is_signed;
+  lambda::IntegerComparison c;
+};
+
+enum class IntegerOperation : std::uint8_t {
+  Iadd, Isub, Imul, Imulh, Idiv, Imod, Iand, Ior, Ixor, Ilsl, Ilsr, Iasr, Icomp, Icheckbound
+};
+struct IntOp {
+  IntegerOperation op;
+  IntegerComparison cmp{true, lambda::IntegerComparison::Ceq};  // Icomp
+};
+
+struct Test {
+  enum class K : std::uint8_t { Itruetest, Ifalsetest, Iinttest, Iinttest_imm, Ifloattest, Ioddtest, Ieventest } k;
+  IntegerComparison icmp{true, lambda::IntegerComparison::Ceq};
+  long n = 0;  // Iinttest_imm
+  lambda::FloatComparison fcmp = lambda::FloatComparison::CFeq;
+};
+
+struct AllocDbginfo {
+  long alloc_words;
+  debuginfo::t alloc_dbg;
+};
+
+struct Operation {
+  enum class K : std::uint8_t {
+    Imove, Ispill, Ireload, Iconst_int, Iconst_float, Iconst_symbol, Icall_ind, Icall_imm, Itailcall_ind,
+    Itailcall_imm, Iextcall, Istackoffset, Iload, Istore, Iatomic_fetch_add, Ialloc, Iintop, Iintop_imm, Icompf,
+    Inegf, Iabsf, Iaddf, Isubf, Imulf, Idivf, Ifloatofint, Iintoffloat, Iopaque, Ispecific, Ipoll, Idls_get,
+    Ireturn_addr
+  } k;
+  std::int64_t n = 0;             // Iconst_int; Iconst_float's bits; Istackoffset; Ialloc's bytes; Iintop_imm's
+  std::string_view func;          // Iconst_symbol, Icall_imm, Itailcall_imm, Iextcall
+  cmm::Machtype ty_res;           // Iextcall
+  Slice<cmm::Exttype> ty_args;    // Iextcall
+  bool alloc = false;             // Iextcall
+  long stack_ofs = 0;             // Iextcall
+  cmm::MemoryChunk chunk = cmm::MemoryChunk::Word_int;  // Iload / Istore
+  arch::AddressingMode addr{};                           // Iload / Istore
+  MutableFlag mut = MutableFlag::Immutable;              // Iload
+  bool is_atomic = false;                                // Iload
+  bool is_assign = false;                                // Istore
+  std::vector<AllocDbginfo> dbginfo;                     // Ialloc
+  IntOp intop{IntegerOperation::Iadd};                   // Iintop / Iintop_imm
+  lambda::FloatComparison fcmp = lambda::FloatComparison::CFeq;  // Icompf
+  arch::SpecificOperation spec{arch::SpecificOperation::K::Ilea};  // Ispecific
+  std::optional<long> return_label;                                // Ipoll
+};
+inline Operation mop(Operation::K k) { return Operation{k}; }
+
+struct Instruction;
+using Instr = Instruction*;
+struct Handler {
+  long n;
+  Instr body;
+};
+struct Instruction {
+  enum class K : std::uint8_t { Iend, Iop, Ireturn, Iifthenelse, Iswitch, Icatch, Iexit, Itrywith, Iraise } desc;
+  Operation op{Operation::K::Imove};  // Iop
+  Test test{Test::K::Itruetest};      // Iifthenelse
+  Instr ifso = nullptr, ifnot = nullptr;  // Iifthenelse; Itrywith's body / handler
+  Slice<long> index;                      // Iswitch
+  std::vector<Instr> cases;               // Iswitch
+  cmm::RecFlag rec = cmm::RecFlag::Nonrecursive;  // Icatch
+  std::vector<Handler> handlers;                  // Icatch
+  Instr body = nullptr;                           // Icatch
+  long nfail = 0;                                 // Iexit
+  lambda::RaiseKind raise = lambda::RaiseKind::Raise_regular;  // Iraise
+  Instr next = nullptr;
+  Regs arg;
+  Regs res;
+  debuginfo::t dbg;
+  reg::Set live;
+};
+
+Instr dummy_instr();
+Instr end_instr();
+Instr instr_cons(const Instruction& d, const Regs& a, const Regs& r, Instr n);
+Instr instr_cons_debug(const Instruction& d, const Regs& a, const Regs& r, const debuginfo::t& dbg, Instr n);
+Instr copy(Instr i);  // { i with .. }
+Instruction iop(const Operation& op);
+Instruction idesc(Instruction::K k);
+void instr_iter(const std::function<void(Instr)>& f, Instr i);
+bool operation_is_pure(const Operation& op);
+bool operation_can_raise(const Operation& op);
+
+struct Fundecl {
+  std::string_view fun_name;
+  Regs fun_args;
+  Instr fun_body;
+  Slice<cmm::CodegenOption> fun_codegen_options;
+  debuginfo::t fun_dbg;
+  lambda::PollAttribute fun_poll;
+  std::vector<long> fun_num_stack_slots;
+};
+
+}  // namespace mach
+
+// ---- Proc (amd64) ------------------------------------------------------------------------------
+namespace proc {
+using reg::Reg;
+using reg::Regs;
+constexpr long num_register_classes = 2;
+std::string_view register_name(long r);
+Reg* phys_reg(long n);
+std::pair<Regs, long> loc_arguments(const std::vector<cmm::MachtypeComponent>& arg);
+Regs loc_parameters(const std::vector<cmm::MachtypeComponent>& arg);
+Regs loc_results(const std::vector<cmm::MachtypeComponent>& res);
+Regs loc_external_results(const std::vector<cmm::MachtypeComponent>& res);
+std::pair<std::vector<Regs>, long> loc_external_arguments(const std::vector<cmm::Exttype>& ty_args);
+Reg* loc_exn_bucket();
+void init();
+}  // namespace proc
+
+// ---- Printmach ---------------------------------------------------------------------------------
+namespace printmach {
+void reg(format::Formatter& ppf, const reg::Reg* r);
+void fundecl(format::Formatter& ppf, const mach::Fundecl& f);
+void phase(format::Formatter& ppf, const std::string& msg, const mach::Fundecl& f);
+}  // namespace printmach
+
+}  // namespace cppcaml::typing
