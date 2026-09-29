@@ -535,6 +535,9 @@ void approx(Formatter& ppf, const ValueApproximation* a) {
 }
 
 void print_structured_constant(Formatter& ppf, const UStructuredConstant* c) { structured_constant(ppf, c); }
+std::string float_F(double x) { return string_F(x); }
+void print_var(Formatter& ppf, Var v) { var(ppf, v); }
+void print_vp(Formatter& ppf, const VarWithProvenance& x) { vp(ppf, x); }
 
 std::string dump(ulambda l) {
   Formatter ppf;

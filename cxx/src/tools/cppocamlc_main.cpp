@@ -41,6 +41,9 @@
 #include "cppcaml/parser.hpp"
 #include "cppcaml/lexer.hpp"
 #include "cppcaml/typing/closure.hpp"
+#include "cppcaml/typing/cmmgen.hpp"
+#include "cppcaml/typing/printcmm.hpp"
+#include "cppcaml/typing/translmod.hpp"
 #include "cppcaml/typing/compilenv.hpp"
 #include "cppcaml/typing/misc.hpp"
 #include "cppcaml/typing/pparse.hpp"
@@ -728,11 +731,25 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
         // required globals, the middle end (Closure_middle_end)
         for (ty::Ident::t id : prog.required_globals) ty::compilenv::require_global(id);
         ty::format::Formatter dump;
-        ty::closure_middle_end::lambda_to_clambda(dump, prog, lam);
+        ty::closure_middle_end::WithConstants clambda = ty::closure_middle_end::lambda_to_clambda(dump, prog, lam);
+        lap("clambda", tp);
+        // end_gen_implementation: Cmmgen.compunit, compile_phrases (the
+        // -dcmm dump of each phrase), then the references to the external
+        // primitives' symbols
+        std::vector<ty::cmm::Phrase> phrases = ty::cmmgen::compunit(clambda);
+        ty::cmm::Phrase refs;
+        for (const ty::PrimitiveDescription* p : ty::translmod::primitive_declarations) {
+          std::string_view name = p->prim_native_name.empty() ? p->prim_name : p->prim_native_name;
+          if (!name.empty() && name[0] != '%')
+            refs.data.push_back(ty::cmm::data_sym(ty::cmm::DataItem::K::Csymbol_address, name));
+        }
+        phrases.push_back(std::move(refs));
+        if (cf::dump_cmm)
+          for (const ty::cmm::Phrase& p : phrases) ty::format::fprintf(dump, "%a@.", ty::format::pr(ty::printcmm::phrase, p));
         ppf_dump.out() << dump.contents();
         ppf_dump.out().flush();
-        lap("clambda", tp);
-        throw std::runtime_error("the native back end (Cmmgen) is not supported yet");
+        lap("cmm", tp);
+        throw std::runtime_error("the native back end (Selection) is not supported yet");
       }
       return finish();
     }

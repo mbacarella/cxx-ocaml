@@ -218,12 +218,10 @@ void need_apply_fun(long n) { need(current_unit().ui_apply_fun, n); }
 void need_send_fun(long n) { need(current_unit().ui_send_fun, n); }
 void need_stdlib_location() { current_unit().ui_need_stdlib = true; }
 
-namespace {
 std::string_view new_const_symbol() {
   ++const_label;
   return make_symbol(std::string_view(std::to_string(const_label)));
 }
-}  // namespace
 
 Snapshot snapshot() { return {constants().log.size()}; }
 void backtrack(Snapshot s) {

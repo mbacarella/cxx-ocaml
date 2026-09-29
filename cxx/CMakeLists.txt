@@ -106,6 +106,10 @@ add_library(cppcaml_core
   src/typing/printclambda.cpp
   src/typing/compilenv.cpp
   src/typing/closure.cpp
+  src/typing/cmm.cpp
+  src/typing/printcmm.cpp
+  src/typing/cmm_helpers.cpp
+  src/typing/cmmgen.cpp
   src/typing/format.cpp
   src/typing/printlambda.cpp
   src/typing/format_doc.cpp

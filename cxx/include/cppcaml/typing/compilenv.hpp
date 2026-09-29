@@ -45,6 +45,8 @@ void need_apply_fun(long n);
 void need_send_fun(long n);
 void need_stdlib_location();
 
+std::string_view new_const_symbol();
+
 // the structured constants: snapshot / backtrack restore the table
 struct Snapshot {
   std::size_t log_size;

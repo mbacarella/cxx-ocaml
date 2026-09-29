@@ -40,7 +40,7 @@ fi
 # ocamlopt.opt compiles on, the port stops after its dump (the back end
 # past Clambda is not ported yet: its exit status is not checked)
 CLAMBDA=0
-case "$DUMP" in dclambda|drawclambda) CLAMBDA=1; STOP=""; OSTOP="" ;; esac
+case "$DUMP" in dclambda|drawclambda|dcmm) CLAMBDA=1; STOP=""; OSTOP="" ;; esac
 export DUMP FLAGS STOP DFLAG NATIVE REFC OSTOP CLAMBDA
 OUT=/tmp/lambda_port_parity
 
@@ -65,7 +65,7 @@ if [ "${1:-}" == "--worker" ]; then
   ( cd "$w/x" && CPPCAML_NEWLAMBDA=1 timeout 120 "$CPP" -I "$ROOT/stdlib" -w -a $FLAGS $DFLAG $STOP -c "$b" ) \
       >/dev/null 2>"$OUT/$key.c"; crc=$?
   if [ "$DUMP" = cmo ]; then cp "$w/x/${b%.ml}.cmo" "$OUT/$key.c" 2>/dev/null || crc=1; fi
-  [ "$CLAMBDA" = 1 ] && sed -i '/: the native back end (Cmmgen) is not supported yet$/d' "$OUT/$key.c"
+  [ "$CLAMBDA" = 1 ] && sed -i '/: the native back end ([A-Za-z]*) is not supported yet$/d' "$OUT/$key.c"
   rm -rf "${w:?}"
   if [ $orc -ne 0 ]; then printf 'OFAIL %s\n' "$f"
   elif { [ $crc -ne 0 ] && [ "$CLAMBDA" = 0 ]; } || [ ! -s "$OUT/$key.c" ]; then printf 'CFAIL %s\n' "$f"

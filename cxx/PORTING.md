@@ -145,10 +145,17 @@ counts and constant labels in ocamlopt's evaluation order: arguments right
 to left, except a tuple matched on at once (`match (a, b) with`), whose
 components are let-bound left to right.
 
-Next, in order: Cmmgen (`-dcmm`), Selection and the Mach passes (`-dsel`
-... `-dreload`), Linearize and Emit (`-dlinear`, then `-S` byte for byte),
-then the .cmx/.cmxa writers and Asmlink.  Until the back end exists,
-c++ocamlopt stops with an error after Clambda and does not write the .cmx.
+Cmmgen is ported (`cmm.cpp`, `printcmm.cpp`, `cmm_helpers.cpp` with
+Cmmgen_state and Strmatch, `cmmgen.cpp`; amd64's Arch constants):
+`DUMP=dcmm` -- 6550/6550 probes (also `-g`, `-unsafe -inline 200`, `-g
+-compact`), 787/787 testsuite files, 272/272 compiler sources.  The Cmm
+switch stores are AVL maps on `compare_key` as OCaml's (the exit-sharing
+key's comparison is not an order, so lookups depend on the tree).
+
+Next, in order: Selection and the Mach passes (`-dsel` ... `-dreload`),
+Linearize and Emit (`-dlinear`, then `-S` byte for byte), then the
+.cmx/.cmxa writers and Asmlink.  Until the back end exists, c++ocamlopt
+stops with an error after Cmm and does not write the .cmx.
 
 ## Oracles and gates
 
