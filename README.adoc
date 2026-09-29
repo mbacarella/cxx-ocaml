@@ -1,5 +1,8 @@
 = README
 
+NOTE: This repository is a fork of OCaml whose bytecode compiler is
+reimplemented in C++ (c++ocamlc, under `cxx/`); see link:cxx/INSTALL.md[cxx/INSTALL.md].
+
 [CAUTION]
 ====
 The developer team released OCaml 5.0.0 in December 2022. OCaml 5.x features a
