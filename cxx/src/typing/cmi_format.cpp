@@ -269,7 +269,7 @@ class Reader {
     Position a = position(f(id, 0));
     Position e = position(f(id, 1));
     auto* l = make<Location>(Location{a, e, boolean(f(id, 2))});
-    l->obj = l;
+    l->obj = loc_record(*l);
     loc_.put(id, l);
     return *l;
   }

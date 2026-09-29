@@ -85,7 +85,7 @@ bool same_loc(const Location& a, const Location& b) {
 }
 V loc_block(const Location& l, V a, V b) {
   V r = B(0, {a, b, boolean(l.loc_ghost)});
-  if (same_record(l)) const_cast<OValue*>(r)->loc_rec = l.obj;
+  if (same_record(l)) const_cast<OValue*>(r)->loc_rec = make<Location>(l);
   return r;
 }
 // Writing a whole parsetree (Pparse.write_ast): every location is written

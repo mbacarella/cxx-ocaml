@@ -29,6 +29,8 @@ class Fname {
   std::size_t size() const { return p_ ? p_->size() : 0; }
   bool empty() const { return size() == 0; }
   int compare(std::string_view o) const { return view().compare(o); }
+  // the interned handle: one per string identity (data and size)
+  const void* handle() const { return p_; }
   friend bool operator<(const Fname& a, const Fname& b) { return a.view() < b.view(); }
   friend bool operator==(const Fname& a, const Fname& b) { return a.view() == b.view(); }
   friend bool operator==(const Fname& a, std::string_view b) { return a.view() == b; }
@@ -59,6 +61,19 @@ struct Position {
 inline Position mkpos(Fname f, long lnum, long bol, long cnum) {
   return Position{f, static_cast<std::int32_t>(lnum), static_cast<std::int32_t>(bol), static_cast<std::int32_t>(cnum)};
 }
+// A location record's identity (Location::obj): what same_record needs to
+// tell a copy still equal to the record from a changed one -- the character
+// offsets and a fingerprint of the rest -- in 16 bytes (every parsed location
+// has one: a copy of the whole record was a tenth of the typing memory)
+struct LocRecord {
+  std::int32_t start_cnum = 0;
+  std::int32_t end_cnum = 0;
+  std::uint64_t fp = 0;
+};
+struct Location;
+// a new identity for [l]'s record, as its contents are now
+const LocRecord* loc_record(const Location& l);
+
 struct Location {
   Position loc_start;
   Position loc_end;
@@ -66,7 +81,7 @@ struct Location {
   // [obj] is a parser record distinct from the equal-valued ones: the
   // parser's second `make_loc` of one span (location::distinct_record)
   bool distinct = false;
-  const Location* obj = nullptr;  // as Position::obj
+  const LocRecord* obj = nullptr;  // as Position::obj
 };
 // [x] is still the record [x.obj] identifies
 bool same_record(const Position& x);
@@ -205,8 +220,9 @@ struct OValue {
   // a Lexing.position block read from a .cmi: the Reader's record for the
   // same marshaled block (one object, whichever way it is decoded)
   const Position* pos = nullptr;
-  // a Location.t block converted from a parsetree location record (its
-  // identity, Location::obj): the writers make it that record's one value
+  // a Location.t block converted from a parsetree location record (the
+  // record, with its identity Location::obj): the writers make it that
+  // record's one value
   const Location* loc_rec = nullptr;
   // a Location.t block of a whole parsetree being written (Pparse.write_ast):
   // the location itself, which the writer gives the value it gives the

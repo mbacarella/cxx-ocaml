@@ -250,7 +250,7 @@ struct Conv {
     Location r{pos(l.start), pos(l.end), l.ghost};
     // Location.none (mknoloc) is one static record: no identity of its own
     if (l.start.cnum == -1 && l.end.cnum == -1) return r;
-    r.obj = make<Location>(r);
+    r.obj = loc_record(r);
     return r;
   }
   StrLoc str(const ast::StringLoc& s) const { return {zborrow(name(s.txt)), loc(s.loc)}; }

@@ -93,7 +93,7 @@ class Decoder {
   Location loc(V x) {
     if (auto it = locs_.find(x); it != locs_.end()) return *it->second;
     auto* l = make<Location>(Location{position(f(x, 0)), position(f(x, 1)), boolean(f(x, 2))});
-    l->obj = l;
+    l->obj = loc_record(*l);
     locs_[x] = l;
     return *l;
   }

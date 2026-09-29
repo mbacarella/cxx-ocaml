@@ -79,7 +79,12 @@ Location Evacuator::location(const Location& l) {
   // the positions' file names are permanent handles; their identities go
   r.loc_start.obj = static_cast<const Position*>(identity(l.loc_start.obj));
   r.loc_end.obj = static_cast<const Position*>(identity(l.loc_end.obj));
-  r.obj = static_cast<const Location*>(identity(l.obj));
+  // (the record's identity copied: same_record reads it)
+  if (owned(l.obj)) {
+    auto [it, fresh] = memo_.try_emplace(l.obj, nullptr);
+    if (fresh) it->second = make<LocRecord>(*l.obj);
+    r.obj = static_cast<const LocRecord*>(it->second);
+  }
   return r;
 }
 

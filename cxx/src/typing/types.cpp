@@ -109,10 +109,30 @@ static bool same_contents(const Position& a, const Position& b) {
          a.pos_lnum == b.pos_lnum && a.pos_bol == b.pos_bol && a.pos_cnum == b.pos_cnum;
 }
 bool same_record(const Position& x) { return x.obj && same_contents(x, *x.obj); }
+// the fingerprint of what same_record compares but the offsets: the file
+// names (by handle: one per string identity), lines, line starts, the
+// positions' identities, loc_ghost
+static std::uint64_t loc_fingerprint(const Location& l) {
+  std::uint64_t h = 0x9e3779b97f4a7c15ull;
+  auto mix = [&](std::uint64_t v) {
+    h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+    h *= 0xff51afd7ed558ccdull;
+    h ^= h >> 33;
+  };
+  for (const Position* p : {&l.loc_start, &l.loc_end}) {
+    mix(reinterpret_cast<std::uintptr_t>(p->pos_fname.handle()));
+    mix(static_cast<std::uint32_t>(p->pos_lnum) | static_cast<std::uint64_t>(static_cast<std::uint32_t>(p->pos_bol)) << 32);
+    mix(reinterpret_cast<std::uintptr_t>(p->obj));
+  }
+  mix(l.loc_ghost);
+  return h;
+}
+const LocRecord* loc_record(const Location& l) {
+  return make<LocRecord>(LocRecord{l.loc_start.pos_cnum, l.loc_end.pos_cnum, loc_fingerprint(l)});
+}
 bool same_record(const Location& x) {
-  return x.obj && x.loc_ghost == x.obj->loc_ghost && same_contents(x.loc_start, x.obj->loc_start) &&
-         same_contents(x.loc_end, x.obj->loc_end) && x.loc_start.obj == x.obj->loc_start.obj &&
-         x.loc_end.obj == x.obj->loc_end.obj;
+  return x.obj && x.loc_start.pos_cnum == x.obj->start_cnum && x.loc_end.pos_cnum == x.obj->end_cnum &&
+         loc_fingerprint(x) == x.obj->fp;
 }
 
 std::string_view zborrow(std::string_view s) {
@@ -122,10 +142,8 @@ std::string_view zborrow(std::string_view s) {
 }
 
 Location location::distinct_record(Location l) {
-  auto* r = make<Location>(l);
-  l.obj = r;
+  l.obj = loc_record(l);
   l.distinct = true;
-  *r = l;
   return l;
 }
 

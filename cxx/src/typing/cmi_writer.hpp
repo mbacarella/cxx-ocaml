@@ -275,9 +275,7 @@ class Writer {
                         : position(mkpos(x->fields[0]->s, x->fields[1]->i, x->fields[2]->i, x->fields[3]->i));
         // a parsetree location record: that record's one value (loc())
         if (x->loc_rec) {
-          Location l = *x->loc_rec;
-          l.obj = x->loc_rec;
-          return loc(l);
+          return loc(*x->loc_rec);
         }
         if (x->loc_val) return loc(*x->loc_val);
         return shared(memo_, x, static_cast<int>(x->tag), [&]() -> std::vector<V> {
