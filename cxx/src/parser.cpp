@@ -2131,6 +2131,12 @@ class Parser {
       default: return false;
     }
   }
+  // signed_constant ({- +} {INT FLOAT}) at peek(n): a simple_pattern too
+  bool signed_constant_at(size_t n) const {
+    Kind k = peek(n).kind, k1 = peek(n + 1).kind;
+    return (k == Kind::MINUS || k == Kind::PLUS) && (k1 == Kind::INT || k1 == Kind::FLOAT);
+  }
+  bool at_simple_pattern_start() const { return is_simple_pattern_start(cur().kind) || signed_constant_at(0); }
   Pattern parse_pattern() {
     if (cur().kind == Kind::EFFECT) {  // effect P, k  (effect handler pattern)
       const Token& t = cur(); advance();
@@ -2344,7 +2350,7 @@ class Parser {
     if (cur().kind == Kind::BACKQUOTE) {
       const Token& t = cur(); advance();
       const Token& tag = cur(); advance();
-      if (is_simple_pattern_start(cur().kind)) {
+      if (at_simple_pattern_start()) {
         // `\`Tag p` arg is a full `pattern` at prec_constr_appl, so `\`Tag Some x`
         // is `\`Tag (Some x)` (mirrors the constructor-pattern arg below).
         Pattern arg = parse_pat_app();
@@ -2400,7 +2406,7 @@ class Parser {
         }
         expect(Kind::RPAREN, ")");
       }
-      if (is_simple_pattern_start(cur().kind)) {
+      if (at_simple_pattern_start()) {
         // `C p` arg is a full `pattern` at prec_constr_appl, so `Some A _` is
         // `Some (A _)`; but `C (type a) p` (vars present) restricts it to a simple pattern.
         Pattern arg = vars.empty() ? parse_pat_app() : parse_simple_pattern();
@@ -3141,7 +3147,7 @@ class Parser {
     bool val_ident = op_ident ||
                      (cur().kind == Kind::LIDENT &&
                       (peek(1).kind == Kind::EQUAL || peek(1).kind == Kind::COLON ||
-                       is_param_start(peek(1).kind)));
+                       is_param_start(peek(1).kind) || signed_constant_at(1)));
     if (!val_ident) {
       Pattern pat = parse_pattern();
       // `let <pat> : t = e`  /  `let <pat> :> t = e`  — a binding-level constraint
