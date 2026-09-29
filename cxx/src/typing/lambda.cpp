@@ -228,9 +228,15 @@ const StructuredConstant* const_unit() {
 }
 
 // ---- node constructors -----------------------------------------------------
+// The zone Lambda's nodes go to (the driver drops it once the code has been
+// translated further: the nodes are garbage then, as in the compiler); null
+// = zone().  Only the nodes: identifiers, constants, events... stay in the
+// unit's zone.
+static Zone* g_node_zone = nullptr;
+void set_node_zone(Zone* z) { g_node_zone = z; }
 template <class T>
 static T* node() {
-  T* n = make<T>();
+  T* n = g_node_zone ? g_node_zone->make<T>() : make<T>();
   n->kind = T::K;
   return n;
 }

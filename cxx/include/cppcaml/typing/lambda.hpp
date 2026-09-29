@@ -303,6 +303,9 @@ LAMBDA_CTOR(Lifused) Ident::t id; lambda l; };
 #undef LAMBDA_CTOR
 
 // constructor functions (fresh nodes)
+// the zone new Lambda nodes go to (null: the current zone), for the driver
+// to drop them once translated further
+void set_node_zone(Zone* z);
 lambda lvar(Ident::t id);
 lambda lmutvar(Ident::t id);
 lambda lconst(const StructuredConstant* c);

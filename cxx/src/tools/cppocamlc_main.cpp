@@ -745,6 +745,10 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
       std::string_view umod = ty::uid::unit_name_string(modname);
       ty::compilenv::reset(cf::for_package, umod);
       cf::use_inlining_arguments_set(cf::classic_arguments);
+      // Lambda's nodes in a zone of their own, dropped once Closure has
+      // turned them into Clambda
+      static ty::Zone lambda_nodes;
+      ty::lambda::set_node_zone(&lambda_nodes);
       ty::lambda::Program prog = ty::translmod::transl_store_implementation(umod, impl->structure, impl->coercion);
       if (cf::dump_rawlambda) ppf_dump.out() << ty::printlambda::dump(prog.code);
       ty::lambda::lambda lam = ty::simplif::simplify_lambda(prog.code);
@@ -757,6 +761,8 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
         for (ty::Ident::t id : prog.required_globals) ty::compilenv::require_global(id);
         ty::format::Formatter dump;
         ty::closure_middle_end::WithConstants clambda = ty::closure_middle_end::lambda_to_clambda(dump, prog, lam);
+        ty::lambda::set_node_zone(nullptr);
+        lambda_nodes.clear();
         lap("clambda", tp);
         // Asmgen.compile_unit: end_gen_implementation (Cmmgen.compunit,
         // compile_phrases with the -d dumps, then the references to the
@@ -807,12 +813,18 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
       }
       return finish();
     }
+    // Lambda's nodes in a zone of their own, dropped once Bytegen has turned
+    // them into instructions
+    static ty::Zone lambda_nodes;
+    ty::lambda::set_node_zone(&lambda_nodes);
     ty::lambda::Program prog = ty::translmod::transl_implementation(modname, impl->structure, impl->coercion);
     if (cf::dump_rawlambda) ppf_dump.out() << ty::printlambda::dump(prog.code);
     ty::lambda::lambda lam = ty::simplif::simplify_lambda(prog.code);
     if (cf::dump_lambda) ppf_dump.out() << ty::printlambda::dump(lam);
     lap("lambda", tp);
     ty::instruct::code bytecode = ty::bytegen::compile_implementation(modname, lam);
+    ty::lambda::set_node_zone(nullptr);
+    lambda_nodes.clear();
     if (cf::dump_instr) ppf_dump.out() << ty::printinstr::dump(bytecode);
     ppf_dump.out().flush();
     lap("bytegen", tp);
