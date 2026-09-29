@@ -10,6 +10,8 @@
 // storage (`Zone::str`).
 #pragma once
 
+#include <algorithm>
+
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -123,6 +125,8 @@ class Zone {
     // a zone that has grown takes big blocks backed by huge pages (the
     // typing data's TLB misses); a small one stays in small blocks
     bool big = blocks_.size() >= kSmallBlocks;
+    // (most zones -- a .cmi's, a function's scratch -- stay small, and the
+    // allocator keeps a block's pages resident: small blocks are small)
     std::size_t unit = big ? kBigBlock : kBlock;
     std::size_t sz = n > unit ? n : unit;
     block_bytes() += sz;
@@ -135,7 +139,7 @@ class Zone {
     off_ = n;
     return cur_;
   }
-  static constexpr std::size_t kBlock = 1 << 20;
+  static constexpr std::size_t kBlock = 64 << 10;
   static constexpr std::size_t kBigBlock = 8 << 20;
   static constexpr std::size_t kSmallBlocks = 8;
   struct Free {  // a huge block (size > 0) is the kernel's mapping
