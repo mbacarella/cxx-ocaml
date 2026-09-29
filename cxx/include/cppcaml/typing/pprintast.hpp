@@ -1,5 +1,5 @@
 // Port of the parts of parsing/pprintast.ml the message printers use
-// (TYPECHECKER.md stage 9): Pprintast.Doc's longident / identifier printers.
+// (cxx/PORTING.md stage 9): Pprintast.Doc's longident / identifier printers.
 #pragma once
 
 #include <optional>

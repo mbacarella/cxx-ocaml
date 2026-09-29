@@ -1,4 +1,4 @@
-// Arena memory for the typing/ port (see TYPECHECKER.md, "Memory").
+// Arena memory for the typing/ port (see cxx/PORTING.md, "Memory").
 //
 // OCaml's heap becomes zones: typing objects (type_expr nodes, their descs,
 // paths, idents, declarations, persistent-map nodes) are allocated in a Zone

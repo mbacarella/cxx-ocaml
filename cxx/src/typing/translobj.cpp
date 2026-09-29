@@ -1,4 +1,4 @@
-// Port of lambda/translobj.ml (TYPECHECKER.md stage 10).  See translobj.hpp.
+// Port of lambda/translobj.ml (cxx/PORTING.md stage 10).  See translobj.hpp.
 //
 // The consts table is a Hashtbl keyed by structural equality on
 // structured constants; its only observable order is the Ident.Map fold of

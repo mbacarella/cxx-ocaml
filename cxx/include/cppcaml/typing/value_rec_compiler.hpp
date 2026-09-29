@@ -1,4 +1,4 @@
-// Port of lambda/value_rec_compiler.mli (TYPECHECKER.md stage 10): the
+// Port of lambda/value_rec_compiler.mli (cxx/PORTING.md stage 10): the
 // compilation of `let rec` over values (static pre-allocation or dynamic).
 #pragma once
 

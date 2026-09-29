@@ -1,4 +1,4 @@
-// Port of typing/printpat.ml (TYPECHECKER.md stage 9).
+// Port of typing/printpat.ml (cxx/PORTING.md stage 9).
 #include "cppcaml/typing/printpat.hpp"
 
 #include <algorithm>

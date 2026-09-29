@@ -1,5 +1,5 @@
 // Ports of utils/load_path.ml, utils/consistbl.ml and
-// typing/persistent_env.ml (TYPECHECKER.md).
+// typing/persistent_env.ml (cxx/PORTING.md).
 #pragma once
 
 #include <cstdio>

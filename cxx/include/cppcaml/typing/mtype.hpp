@@ -1,4 +1,4 @@
-// Port of typing/mtype.ml (TYPECHECKER.md): operations on module types
+// Port of typing/mtype.ml (cxx/PORTING.md): operations on module types
 // (scraping, strengthening, nondep, enrich, alias removal, ...).
 #pragma once
 

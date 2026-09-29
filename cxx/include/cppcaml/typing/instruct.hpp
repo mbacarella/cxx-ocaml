@@ -1,4 +1,4 @@
-// Port of bytecomp/instruct.mli (TYPECHECKER.md stage 10): the abstract
+// Port of bytecomp/instruct.mli (cxx/PORTING.md stage 10): the abstract
 // machine's instructions, the compilation environments and the debugging
 // events, as Bytegen produces them and Emitcode / Printinstr consume them.
 #pragma once

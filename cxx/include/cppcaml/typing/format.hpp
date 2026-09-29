@@ -1,4 +1,4 @@
-// Port of the pretty-printing engine of stdlib/format.ml (TYPECHECKER.md
+// Port of the pretty-printing engine of stdlib/format.ml (cxx/PORTING.md
 // stage 10): boxes (h, v, hv, hov, b), break hints, the margin and max
 // indent, and the scan/queue algorithm that lays them out -- so printers
 // ported from the compiler (Printlambda, Printtyp) produce ocamlc's exact

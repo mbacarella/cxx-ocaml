@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stage-2 oracle for the typing/ port (TYPECHECKER.md): name every item of a
+# Stage-2 oracle for the typing/ port (cxx/PORTING.md): name every item of a
 # set of cmis (values, types, constructors, labels, modules, module types,
 # classes, one level of submodules, plus functor applications), look each up
 # with Env.find_*_by_name in Env.initial + open Stdlib, and compare the

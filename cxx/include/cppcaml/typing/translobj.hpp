@@ -1,4 +1,4 @@
-// Port of lambda/translobj.mli (TYPECHECKER.md stage 10): helpers for the
+// Port of lambda/translobj.mli (cxx/PORTING.md stage 10): helpers for the
 // object and class translation (CamlinternalOO primitives, label caches).
 #pragma once
 

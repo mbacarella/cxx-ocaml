@@ -1,4 +1,4 @@
-// Port of lambda/simplif.mli (TYPECHECKER.md stage 10): the Lambda
+// Port of lambda/simplif.mli (cxx/PORTING.md stage 10): the Lambda
 // simplification pass (let-bound references to variables, static
 // raise/catch, local functions, function arity fusion, default-argument
 // wrappers).

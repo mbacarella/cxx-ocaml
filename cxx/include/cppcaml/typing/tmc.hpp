@@ -1,4 +1,4 @@
-// Port of lambda/tmc.mli (TYPECHECKER.md stage 10): the
+// Port of lambda/tmc.mli (cxx/PORTING.md stage 10): the
 // tail-modulo-constructor transformation of [@tail_mod_cons] functions.
 #pragma once
 

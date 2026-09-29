@@ -1,4 +1,4 @@
-// Ports of typing/data_types.ml and typing/datarepr.ml (TYPECHECKER.md):
+// Ports of typing/data_types.ml and typing/datarepr.ml (cxx/PORTING.md):
 // constructor and label descriptions, computed from type declarations.
 #pragma once
 

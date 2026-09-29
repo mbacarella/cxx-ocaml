@@ -1,4 +1,4 @@
-// Port of typing/includemod_errorprinter.mli (TYPECHECKER.md stage 9): the
+// Port of typing/includemod_errorprinter.mli (cxx/PORTING.md stage 9): the
 // messages of Includemod.Error / Apply_error and of first-class module
 // coercions.
 #pragma once

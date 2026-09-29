@@ -1,4 +1,4 @@
-// Port of lambda/translmod.mli (TYPECHECKER.md stage 10): the translation
+// Port of lambda/translmod.mli (cxx/PORTING.md stage 10): the translation
 // of the module language, and of a compilation unit.  (The native-code
 // entry points -- transl_store_*, *_flambda -- and the toplevel's are not
 // ported: c++ocamlc is a bytecode compiler.)

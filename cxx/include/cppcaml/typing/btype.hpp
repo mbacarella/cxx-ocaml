@@ -1,4 +1,4 @@
-// Port of typing/btype.ml (TYPECHECKER.md): basic operations on core types.
+// Port of typing/btype.ml (cxx/PORTING.md): basic operations on core types.
 #pragma once
 
 #include "cppcaml/typing/fn_ref.hpp"

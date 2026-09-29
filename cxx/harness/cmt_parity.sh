@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# -bin-annot oracle (TYPECHECKER.md, Driver options): the .cmt / .cmti
+# -bin-annot oracle (cxx/PORTING.md, Driver options): the .cmt / .cmti
 # c++ocamlc writes against ocamlc.opt's.  cmt_args records argv (argv[0]
 # included) and cmt_builddir the working directory, so each file is
 # compiled by both compilers through the SAME path (a symlink `ocamlc` in a

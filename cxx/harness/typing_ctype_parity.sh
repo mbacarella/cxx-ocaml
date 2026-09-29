@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stage-3 oracle for the typing/ port (TYPECHECKER.md): run Ctype operations
+# Stage-3 oracle for the typing/ port (cxx/PORTING.md): run Ctype operations
 # on the types of every value and type constructor of a set of cmis, in
 # Env.initial + open Stdlib, with compiler-libs (typing_dump.ml `ctype`) and
 # with the port (c++typing-dump `ctype`), and compare the dumped results

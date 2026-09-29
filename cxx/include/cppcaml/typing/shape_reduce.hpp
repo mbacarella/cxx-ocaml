@@ -1,4 +1,4 @@
-// Port of typing/shape_reduce.mli (TYPECHECKER.md, stage 10, for the .cmt):
+// Port of typing/shape_reduce.mli (cxx/PORTING.md, stage 10, for the .cmt):
 // the strong call-by-need reduction of shapes -- Local_reduce (no unit
 // shapes are read, fuel 10): the reduction Typemod runs on a unit's shape
 // before Cmt_format saves it, and the per-occurrence reduction of

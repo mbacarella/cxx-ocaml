@@ -1,4 +1,4 @@
-// Port of lambda/lambda.mli (TYPECHECKER.md stage 10): the Lambda
+// Port of lambda/lambda.mli (cxx/PORTING.md stage 10): the Lambda
 // intermediate code, field for field, and the functions of lambda.ml.  Nodes
 // are immutable and zone-allocated; one struct per constructor, matched with
 // `as<L>(lam)` like the Types descs.  (Debuginfo.Scoped_location is here

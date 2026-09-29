@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# `CHECKER --check FILE` for the type checker (TYPECHECKER.md): runs
+# `CHECKER --check FILE` for the type checker (cxx/PORTING.md): runs
 # c++ocamlc -stop-after typing on a copy of FILE in a scratch directory (so
 # neither its neighbours' .cmi files nor its own outputs interfere).  Exit
 # status 0 = accepted, 2 = type error.  For the false_accept.sh /

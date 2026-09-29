@@ -1,5 +1,5 @@
 (* Structural dumps of the typer's data -- the oracle for the typing/ port
-   (TYPECHECKER.md).  Built against compiler-libs; the C++ side
+   (cxx/PORTING.md).  Built against compiler-libs; the C++ side
    (c++typing-dump) prints the same formats from typing::, and the two must
    be byte-identical.
 
@@ -615,7 +615,7 @@ let run_queries file env =
 (* ---- stage 4a: Parsetree ---- *)
 
 (* Locations the C++ parser does not record yet are printed through [gloc],
-   masked as "?" (TYPECHECKER.md lists them). *)
+   masked as "?" (cxx/PORTING.md lists them). *)
 let mask_gaps = ref true
 let parse_file = ref ""
 

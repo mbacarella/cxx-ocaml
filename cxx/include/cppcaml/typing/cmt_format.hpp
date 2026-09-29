@@ -1,4 +1,4 @@
-// Port of file_formats/cmt_format.ml (TYPECHECKER.md, driver options:
+// Port of file_formats/cmt_format.ml (cxx/PORTING.md, driver options:
 // -bin-annot): the .cmt / .cmti file -- the typed tree with its
 // environments reduced to their summaries (clear_env), the unit's
 // comments, command line, load path, digests, imports, the uid ->

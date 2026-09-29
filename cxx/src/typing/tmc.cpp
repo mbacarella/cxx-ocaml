@@ -1,4 +1,4 @@
-// Port of lambda/tmc.ml (TYPECHECKER.md stage 10).  See tmc.hpp.
+// Port of lambda/tmc.ml (cxx/PORTING.md stage 10).  See tmc.hpp.
 //
 // Ident stamps (Ident.create_local in declare_binding, Constr.with_placeholder,
 // Constr.delay_impure and make_dps_variant, and duplicate_function's

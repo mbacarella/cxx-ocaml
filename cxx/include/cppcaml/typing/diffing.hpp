@@ -1,4 +1,4 @@
-// Port of utils/diffing.ml and utils/diffing_with_keys.ml (TYPECHECKER.md
+// Port of utils/diffing.ml and utils/diffing_with_keys.ml (cxx/PORTING.md
 // stage 9): the Wagner-Fischer style patch computation behind the error
 // messages of record / variant definition mismatches and functor
 // applications, with states that may extend either list while diffing,

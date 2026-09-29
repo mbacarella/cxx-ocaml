@@ -1,4 +1,4 @@
-// Port of typing/typedtree.mli (TYPECHECKER.md, stage 4): the typed tree
+// Port of typing/typedtree.mli (cxx/PORTING.md, stage 4): the typed tree
 // Typetexp / Typecore / Typemod build.  Same idiom as parsetree.hpp: records
 // are structs with the OCaml field names, each variant a `*Desc` base with
 // one subclass per constructor (`as<Texp_apply>(e->exp_desc)`).  The GADT

@@ -1,4 +1,4 @@
-// Port of typing/outcometree.mli (TYPECHECKER.md stage 9): the trees the
+// Port of typing/outcometree.mli (cxx/PORTING.md stage 9): the trees the
 // printers (Oprint) lay out -- what Out_type builds from types and
 // signatures.  Nodes are zone-allocated; lists are vectors.
 #pragma once

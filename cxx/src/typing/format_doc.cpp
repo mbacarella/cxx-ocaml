@@ -1,4 +1,4 @@
-// Port of utils/format_doc.ml (TYPECHECKER.md stage 9).
+// Port of utils/format_doc.ml (cxx/PORTING.md stage 9).
 #include "cppcaml/typing/format_doc.hpp"
 #include "cppcaml/typing/misc.hpp"
 

@@ -14,7 +14,7 @@
 // stdlib Arg's parser and messages, Compenv's deferred actions and
 // Maindriver's sequence (typing/{main_args,arg,compenv}).  An option whose
 // effect c++ocamlc does not implement is refused, when that effect would
-// take place, with "option -X is not supported yet" (TYPECHECKER.md,
+// take place, with "option -X is not supported yet" (cxx/PORTING.md,
 // "Driver options").
 #include <ucontext.h>
 #include <signal.h>
@@ -265,7 +265,7 @@ static cppcaml::typing::env::t initial_env() {
       cmdline, ty::clflags::nopervasives ? std::nullopt : std::optional<std::string>("Stdlib"), opens);
 }
 
-// The type checker (the typing/ port, TYPECHECKER.md): Compmisc.init_path +
+// The type checker (the typing/ port, cxx/PORTING.md): Compmisc.init_path +
 // initial_env, then Typemod.type_implementation / type_interface, before
 // code generation as in ocamlc.  A type error is reported as ocamlc's
 // location line and the error's constructor until Printtyp is ported.  An

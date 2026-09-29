@@ -1,4 +1,4 @@
-// Port of typing/includeclass.mli (TYPECHECKER.md, stage 5): inclusion of
+// Port of typing/includeclass.mli (cxx/PORTING.md, stage 5): inclusion of
 // class types and class declarations.  Reporting comes with Printtyp.
 #pragma once
 

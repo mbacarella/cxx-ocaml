@@ -1,4 +1,4 @@
-// Port of typing/types.ml (TYPECHECKER.md): the representation of types and
+// Port of typing/types.ml (cxx/PORTING.md): the representation of types and
 // declarations, and the trail used for backtracking.
 //
 // Mapping from OCaml:

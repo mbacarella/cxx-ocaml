@@ -1,4 +1,4 @@
-// Port of typing/ctype.ml (TYPECHECKER.md): operations on core types --
+// Port of typing/ctype.ml (cxx/PORTING.md): operations on core types --
 // levels and generalization, instantiation, expansion, unification,
 // moregen / equality, subtyping, class signatures, nondep.
 //

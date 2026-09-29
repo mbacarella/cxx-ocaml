@@ -1,4 +1,4 @@
-// Port of bytecomp/bytepackager.ml (TYPECHECKER.md stage 10): -pack.
+// Port of bytecomp/bytepackager.ml (cxx/PORTING.md stage 10): -pack.
 //
 // The member units' descriptors (and debug events, hints) are read back
 // with the Marshal reader and re-marshaled as omarshal values that keep the

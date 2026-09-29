@@ -6,7 +6,7 @@
 // way parser.mly builds them where the information is there (an item's
 // span for the declarations it wraps), and otherwise set to `gap_loc()`:
 // Location.none marked with pos_cnum = -2, so the parsetree dump can print
-// them as masked.  TYPECHECKER.md lists the gaps.
+// them as masked.  cxx/PORTING.md lists the gaps.
 #include "cppcaml/typing/builtin_attributes.hpp"
 #include "cppcaml/typing/parsetree_ovalue.hpp"
 #include <stdexcept>

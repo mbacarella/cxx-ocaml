@@ -1,5 +1,5 @@
 // Port of typing/subst.ml.  See subst.hpp.  Record literals evaluate their
-// fields right to left in definition order (TYPECHECKER.md, "Evaluation
+// fields right to left in definition order (cxx/PORTING.md, "Evaluation
 // order"), so the effectful copies below are made in that order explicitly.
 #include "cppcaml/typing/subst.hpp"
 

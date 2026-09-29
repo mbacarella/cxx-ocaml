@@ -1,4 +1,4 @@
-// Port of parsing/longident.ml as the typer sees it (TYPECHECKER.md):
+// Port of parsing/longident.ml as the typer sees it (cxx/PORTING.md):
 //   t = Lident of string | Ldot of t loc * string loc | Lapply of t loc * t loc
 // Trunk keeps a location on each component; Env reports lookup errors at
 // them.  The C++ parser's ast::Longident does not carry the inner locations

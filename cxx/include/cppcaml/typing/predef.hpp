@@ -1,4 +1,4 @@
-// Port of typing/predef.ml (TYPECHECKER.md): the predefined types and
+// Port of typing/predef.ml (cxx/PORTING.md): the predefined types and
 // exceptions.  The idents are created on first use in predef.ml's order, so
 // their stamps (int = 1 ... Some) equal ocamlc's -- paths compare predef
 // idents by stamp.

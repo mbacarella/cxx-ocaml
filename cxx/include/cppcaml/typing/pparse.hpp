@@ -1,4 +1,4 @@
-// Port of driver/pparse.ml's binary-AST half (TYPECHECKER.md "Driver
+// Port of driver/pparse.ml's binary-AST half (cxx/PORTING.md "Driver
 // options"): the AST files Pparse reads in place of a source (a dune ppx
 // driver's `-impl foo.pp.ml`), and -ppx rewriters (Pparse.apply_rewriters
 // with Ast_mapper's ppx context).  The -pp half (call_external_preprocessor)

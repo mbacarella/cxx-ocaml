@@ -1,4 +1,4 @@
-// Port of lambda/translmod.ml (TYPECHECKER.md stage 10): the bytecode
+// Port of lambda/translmod.ml (cxx/PORTING.md stage 10): the bytecode
 // paths.  See translmod.hpp.  (The native entry points -- transl_store_*,
 // the *_flambda wrappers other than the one transl_implementation calls, and
 // the toplevel's transl_toplevel_* -- are not ported.)

@@ -1,4 +1,4 @@
-// Port of parsing/ast_invariants.ml (TYPECHECKER.md): the checks Pparse
+// Port of parsing/ast_invariants.ml (cxx/PORTING.md): the checks Pparse
 // runs on an AST it did not parse itself (a binary AST file, a -ppx
 // rewriter's output), over Ast_iterator.default_iterator's traversal, and
 // the registration of the attributes met outside attribute payloads

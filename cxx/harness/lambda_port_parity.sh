@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stage-10 oracle (TYPECHECKER.md): the Lambda the lambda/ port produces
+# Stage-10 oracle (cxx/PORTING.md): the Lambda the lambda/ port produces
 # against ocamlc's, as text -- `-drawlambda` (Translmod's output) and
 # `-dlambda` (after Simplif) -- byte for byte, stamps included (the
 # typing port allocates them as ocamlc does).  Each file is compiled alone

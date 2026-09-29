@@ -1,4 +1,4 @@
-// Port of typing/printtyp.mli (TYPECHECKER.md stage 9): the printers of
+// Port of typing/printtyp.mli (cxx/PORTING.md stage 9): the printers of
 // types, declarations and signatures (Printtyp.Doc: Format_doc printers),
 // over Out_type's trees and Oprint.
 #pragma once

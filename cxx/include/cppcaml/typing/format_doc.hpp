@@ -1,4 +1,4 @@
-// Port of utils/format_doc.ml (TYPECHECKER.md stage 9): documents -- lists
+// Port of utils/format_doc.ml (cxx/PORTING.md stage 9): documents -- lists
 // of formatting instructions -- built by printers and by a format-string
 // interpreter, and laid out later on a Format formatter (format.hpp).  The
 // compiler's message printers (Oprint, Out_type, Printtyp, the error

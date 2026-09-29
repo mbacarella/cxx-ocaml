@@ -1,4 +1,4 @@
-// Port of typing/path.ml (TYPECHECKER.md).  Path.t is an immutable value; here
+// Port of typing/path.ml (cxx/PORTING.md).  Path.t is an immutable value; here
 // a zone-allocated `Path` reached through `Path::t` (a const pointer).
 #pragma once
 

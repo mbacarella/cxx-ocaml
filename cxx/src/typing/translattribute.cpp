@@ -1,4 +1,4 @@
-// Port of lambda/translattribute.ml (TYPECHECKER.md stage 10).
+// Port of lambda/translattribute.ml (cxx/PORTING.md stage 10).
 //
 
 #include "cppcaml/typing/translattribute.hpp"

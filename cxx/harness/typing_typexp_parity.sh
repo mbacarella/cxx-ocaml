@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stage-4b oracle for the typing/ port (TYPECHECKER.md): Typetexp.  For
+# Stage-4b oracle for the typing/ port (cxx/PORTING.md): Typetexp.  For
 # every `val` / `external` of an interface, run transl_type_scheme in
 # Env.initial + open Stdlib + open the unit's own cmi, with compiler-libs
 # (typing_dump.ml `typexp`) and with the port (c++typing-dump `typexp`), and

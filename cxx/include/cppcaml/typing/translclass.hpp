@@ -1,4 +1,4 @@
-// Port of lambda/translclass.mli (TYPECHECKER.md stage 10): the
+// Port of lambda/translclass.mli (cxx/PORTING.md stage 10): the
 // translation of class definitions.
 #pragma once
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Driver-options oracle (TYPECHECKER.md, "Driver options"): ocamlc.opt and
+# Driver-options oracle (cxx/PORTING.md, "Driver options"): ocamlc.opt and
 # c++ocamlc on the same command lines -- stdout, stderr, the exit code and
 # the files each run leaves behind (names, and the bytes of .cmi / .cmo /
 # .cma / .dump files) -- byte for byte.  Both are invoked as `ocamlc` (a

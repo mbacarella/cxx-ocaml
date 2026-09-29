@@ -1,4 +1,4 @@
-// Port of typing/includemod.ml (TYPECHECKER.md, stage 5): inclusion between
+// Port of typing/includemod.ml (cxx/PORTING.md, stage 5): inclusion between
 // module types, signatures and compilation units, and the coercions they
 // compute.  Errors mirror includemod.mli's Error module as data; the
 // Diffing-based functor diffs (Functor_inclusion_diff, Functor_app_diff),

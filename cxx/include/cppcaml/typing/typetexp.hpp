@@ -1,4 +1,4 @@
-// Port of typing/typetexp.ml (TYPECHECKER.md, stage 4): typechecking of type
+// Port of typing/typetexp.ml (cxx/PORTING.md, stage 4): typechecking of type
 // expressions for the core language.  Errors are `typetexp::Error` (the
 // OCaml `Error.In_context`); reporting them comes with Printtyp.
 #pragma once

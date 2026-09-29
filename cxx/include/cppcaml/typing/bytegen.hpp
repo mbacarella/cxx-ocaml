@@ -1,4 +1,4 @@
-// Port of bytecomp/bytegen.mli (TYPECHECKER.md stage 10): Lambda to the
+// Port of bytecomp/bytegen.mli (cxx/PORTING.md stage 10): Lambda to the
 // abstract machine's instructions (instruct.hpp).
 #pragma once
 

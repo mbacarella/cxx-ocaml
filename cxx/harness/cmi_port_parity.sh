@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stage-8 oracle (TYPECHECKER.md): the .cmi the typing/ port writes
+# Stage-8 oracle (cxx/PORTING.md): the .cmi the typing/ port writes
 # (Env.save_signature) against ocamlc's.  Every .mli of the compiler corpus,
 # and every .ml without one, is compiled by c++ocamlc in a directory holding
 # ocamlc's .cmi of every other unit (the effid.sh staging, /tmp/effid_ref),

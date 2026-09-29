@@ -1,4 +1,4 @@
-// Port of typing/value_rec_check.ml (TYPECHECKER.md, stage 4c): the static
+// Port of typing/value_rec_check.ml (cxx/PORTING.md, stage 4c): the static
 // check of recursive definitions (`let rec x = e`), which rejects the
 // ill-formed ones (Typecore's Illegal_letrec_expr).
 #pragma once

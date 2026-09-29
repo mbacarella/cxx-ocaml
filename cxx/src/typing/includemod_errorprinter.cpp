@@ -1,4 +1,4 @@
-// Port of typing/includemod_errorprinter.ml (TYPECHECKER.md stage 9): the
+// Port of typing/includemod_errorprinter.ml (cxx/PORTING.md stage 9): the
 // linearized report of a module inclusion failure (err_msgs), of a functor
 // application failure, and the first-class module coercion messages.
 //

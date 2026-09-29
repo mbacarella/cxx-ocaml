@@ -1,4 +1,4 @@
-// Port of lambda/matching.mli (TYPECHECKER.md stage 10): the compilation of
+// Port of lambda/matching.mli (cxx/PORTING.md stage 10): the compilation of
 // pattern matching (with lambda/switch.ml, whose functor Matching
 // instantiates -- switch.hpp).
 #pragma once

@@ -1,4 +1,4 @@
-// Port of typing/typeclass.mli (TYPECHECKER.md, stage 5): typing of class
+// Port of typing/typeclass.mli (cxx/PORTING.md, stage 5): typing of class
 // declarations, class descriptions and class type declarations, and of
 // immediate objects (installed as Typecore.type_object).  Errors are
 // `typeclass::Error` (the OCaml Error.In_context); reporting comes with

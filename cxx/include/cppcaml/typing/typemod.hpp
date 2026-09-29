@@ -1,4 +1,4 @@
-// Port of typing/typemod.ml (TYPECHECKER.md, stage 5): typing of the module
+// Port of typing/typemod.ml (cxx/PORTING.md, stage 5): typing of the module
 // language (module expressions, module types, signatures, structures,
 // compilation units, packages).  Shapes are computed where they create
 // idents or uids (their counters reach the .cmi) but are not returned for

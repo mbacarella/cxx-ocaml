@@ -1,4 +1,4 @@
-// Port of the reporting half of parsing/location.ml (TYPECHECKER.md stage
+// Port of the reporting half of parsing/location.ml (cxx/PORTING.md stage
 // 9): the location printer (Location.Doc.loc), the quoting of the source
 // (highlight_quote: the "N | ..." excerpt and its carets), reports
 // (errors, warnings, alerts) and the batch-mode report printer, and the

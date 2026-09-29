@@ -48,7 +48,7 @@ add_library(cppcaml_core
   src/marshal.cpp
   src/blake2.cpp
   src/omarshal.cpp
-  # The typing/ port (TYPECHECKER.md).
+  # The typing/ port (cxx/PORTING.md).
   src/typing/ident.cpp
   src/typing/path.cpp
   src/typing/types.cpp

@@ -1,4 +1,4 @@
-// Port of typing/ident.ml (TYPECHECKER.md).  An Ident.t is an immutable value;
+// Port of typing/ident.ml (cxx/PORTING.md).  An Ident.t is an immutable value;
 // here a zone-allocated `Ident` reached through `Ident::t` (a const pointer),
 // compared with same/equal, never by pointer.
 #pragma once

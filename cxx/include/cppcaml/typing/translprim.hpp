@@ -1,4 +1,4 @@
-// Port of lambda/translprim.mli (TYPECHECKER.md stage 10): the translation
+// Port of lambda/translprim.mli (cxx/PORTING.md stage 10): the translation
 // of primitives (`external` declarations and the %-builtins).
 #pragma once
 

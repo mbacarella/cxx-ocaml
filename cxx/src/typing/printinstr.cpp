@@ -1,4 +1,4 @@
-// Port of bytecomp/printinstr.ml (TYPECHECKER.md stage 10): pretty-print
+// Port of bytecomp/printinstr.ml (cxx/PORTING.md stage 10): pretty-print
 // lists of instructions (-dinstr).
 #include "cppcaml/typing/printinstr.hpp"
 

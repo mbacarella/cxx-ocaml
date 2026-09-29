@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stage-9 oracle (TYPECHECKER.md): the error report of a rejected program --
+# Stage-9 oracle (cxx/PORTING.md): the error report of a rejected program --
 # Location's report printer, the source excerpt, each module's report_error
 # -- against ocamlc.opt's, byte for byte (stderr and the exit code).  Each
 # file is compiled alone in a scratch directory by ocamlc.opt and by

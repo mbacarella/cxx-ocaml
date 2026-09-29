@@ -1,4 +1,4 @@
-// Port of typing/subst.ml (TYPECHECKER.md): substitutions on types,
+// Port of typing/subst.ml (cxx/PORTING.md): substitutions on types,
 // declarations and (lazily) signatures.
 #pragma once
 

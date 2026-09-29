@@ -1,4 +1,4 @@
-// Port of typing/parmatch.ml (TYPECHECKER.md, stage 4c): exhaustiveness and
+// Port of typing/parmatch.ml (cxx/PORTING.md, stage 4c): exhaustiveness and
 // usefulness of pattern matching.  Typecore calls check_partial /
 // check_unused (whose refutation checks reject programs), pressure_variants
 // (which closes polymorphic-variant rows) and pats_of_type.

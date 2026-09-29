@@ -1,4 +1,4 @@
-// Port of typing/out_type.ml (TYPECHECKER.md stage 9).
+// Port of typing/out_type.ml (cxx/PORTING.md stage 9).
 #include "cppcaml/typing/out_type.hpp"
 
 #include "cppcaml/typing/location.hpp"

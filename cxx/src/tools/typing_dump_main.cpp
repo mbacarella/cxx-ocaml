@@ -1,5 +1,5 @@
 // c++typing-dump: the C++ half of the oracles for the typing/ port
-// (TYPECHECKER.md).  Decodes a .cmi with typing::cmi_format::read_cmi and
+// (cxx/PORTING.md).  Decodes a .cmi with typing::cmi_format::read_cmi and
 // prints the same structural dump as cxx/harness/typing_dump.ml, statement
 // for statement, so first-visit numbering follows the same traversal order.
 #include <cmath>

@@ -1,5 +1,5 @@
 // Port of typing/signature_matching.ml (with utils/stable_matching.ml,
-// TYPECHECKER.md stage 9): the suggestions of a signature mismatch report
+// cxx/PORTING.md stage 9): the suggestions of a signature mismatch report
 // -- the missing items, and the fuzzy renamings (a stable marriage between
 // the extra and the missing items by edit distance, compatible items only).
 #pragma once

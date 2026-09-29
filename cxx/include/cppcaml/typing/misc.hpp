@@ -1,4 +1,4 @@
-// Port of the message helpers of utils/misc.ml (TYPECHECKER.md stage 9):
+// Port of the message helpers of utils/misc.ml (cxx/PORTING.md stage 9):
 // Misc.Style's inline code and hint printers, spellchecking
 // (edit_distance, spellcheck, did_you_mean), the error-hint alignment and
 // the manual references.

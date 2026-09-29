@@ -1,5 +1,5 @@
 // Port of file_formats/cmi_format.ml (the read side) for the typing/ port
-// (TYPECHECKER.md).  `read_cmi` decodes a .cmi's marshaled values straight
+// (cxx/PORTING.md).  `read_cmi` decodes a .cmi's marshaled values straight
 // into typing::Types -- the analogue of `input_value`: every marshaled block
 // becomes exactly one C++ object, so sharing and cycles are preserved.
 #pragma once

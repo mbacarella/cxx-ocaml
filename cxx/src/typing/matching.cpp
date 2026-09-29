@@ -1,4 +1,4 @@
-// Port of lambda/matching.ml (TYPECHECKER.md stage 10): compilation of
+// Port of lambda/matching.ml (cxx/PORTING.md stage 10): compilation of
 // pattern matching (Le Fessant-Maranget, "Optimizing Pattern-Matching",
 // ICFP'2001), with the parts of typing/patterns.ml it uses (Patterns.Head,
 // the views).  Switches go through the port of lambda/switch.ml.

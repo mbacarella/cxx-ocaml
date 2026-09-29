@@ -1,4 +1,4 @@
-// Port of typing/shape.ml (TYPECHECKER.md, stage 5): module shapes.  Shapes
+// Port of typing/shape.ml (cxx/PORTING.md, stage 5): module shapes.  Shapes
 // only feed the cmt file, but Typemod / Includemod build them as OCaml does,
 // because the functions that create identifiers (fresh_var,
 // leaf_for_unpack) advance the ident stamp counter, which reaches the cmi.

@@ -1,4 +1,4 @@
-// Port of lambda/simplif.ml (TYPECHECKER.md stage 10).  See simplif.hpp.
+// Port of lambda/simplif.ml (cxx/PORTING.md stage 10).  See simplif.hpp.
 //
 // Where simplif.ml builds a constructor, tuple or record whose components
 // have effects (Ident.rename, the substitution tables, next_raise_count),

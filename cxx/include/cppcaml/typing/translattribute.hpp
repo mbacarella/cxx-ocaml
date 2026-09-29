@@ -1,4 +1,4 @@
-// Port of lambda/translattribute.mli (TYPECHECKER.md stage 10): the
+// Port of lambda/translattribute.mli (cxx/PORTING.md stage 10): the
 // [@inline] / [@inlined] / [@specialise] / [@local] / [@tailcall] /
 // [@poll] / [@tail_mod_cons] attributes on the Lambda terms they annotate.
 #pragma once

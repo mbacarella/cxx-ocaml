@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stage-1 oracle for the typing/ port (TYPECHECKER.md): decode every .cmi in
+# Stage-1 oracle for the typing/ port (cxx/PORTING.md): decode every .cmi in
 # the tree with the port (c++typing-dump) and with compiler-libs
 # (typing_dump.ml, run on the bytecode runtime), and compare the two
 # structural dumps byte for byte.

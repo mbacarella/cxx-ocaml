@@ -1,4 +1,4 @@
-// Port of typing/oprint.ml (TYPECHECKER.md stage 9): types, class types,
+// Port of typing/oprint.ml (cxx/PORTING.md stage 9): types, class types,
 // module types and signature items.
 #include "cppcaml/typing/oprint.hpp"
 

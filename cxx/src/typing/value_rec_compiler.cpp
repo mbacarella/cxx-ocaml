@@ -1,4 +1,4 @@
-// Port of lambda/value_rec_compiler.ml (TYPECHECKER.md stage 10): the
+// Port of lambda/value_rec_compiler.ml (cxx/PORTING.md stage 10): the
 // compilation of generic recursive definitions -- sizing, function lifting,
 // then pre-allocation / functions / backpatching.  Misc.fatal_error is a
 // std::logic_error.

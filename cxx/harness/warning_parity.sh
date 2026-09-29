@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stage-9c oracle (TYPECHECKER.md): the warnings and alerts c++ocamlc
+# Stage-9c oracle (cxx/PORTING.md): the warnings and alerts c++ocamlc
 # prints -- their text, their order, warnings-as-errors and the exit code --
 # against ocamlc.opt's, byte for byte (stderr and the exit code).  Each file
 # is compiled alone in a scratch directory by ocamlc.opt and by c++ocamlc

@@ -6,7 +6,7 @@ This is a self-bootstrapping compiler: pre-built bytecode images of `ocamlc`/`oc
 
 ## C++ rewrite (`cxx/`): the faithful port
 
-**Read `TYPECHECKER.md` first.**  c++ocamlc must match ocamlc's semantics
+**Read `cxx/PORTING.md` first.**  c++ocamlc must match ocamlc's semantics
 exactly, by faithfully porting the compiler (`cxx/src/typing/` holds the
 ports of `typing/`, `lambda/` and `bytecomp/`'s Bytegen/Emitcode, each
 verified against ocamlc oracles).  c++ocamlc type-checks every unit, writes

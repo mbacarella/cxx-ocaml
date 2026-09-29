@@ -1,4 +1,4 @@
-// Port of typing/env.ml (TYPECHECKER.md): typing environments.
+// Port of typing/env.ml (cxx/PORTING.md): typing environments.
 //
 // Deviations, each marked at its site in env.cpp:
 //  - no shapes (Shape.t only feeds .cmt / project-index output).

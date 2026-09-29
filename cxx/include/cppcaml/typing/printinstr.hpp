@@ -1,4 +1,4 @@
-// Port of bytecomp/printinstr.mli (TYPECHECKER.md stage 10): the -dinstr
+// Port of bytecomp/printinstr.mli (cxx/PORTING.md stage 10): the -dinstr
 // printer, on the Format engine port.
 #pragma once
 

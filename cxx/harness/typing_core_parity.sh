@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stage-4c oracle for the typing/ port (TYPECHECKER.md): Typecore.  Types
+# Stage-4c oracle for the typing/ port (cxx/PORTING.md): Typecore.  Types
 # the `let` / eval structure items of an implementation (Typecore.
 # type_binding / type_expression in Env.initial + open Stdlib, then the
 # delayed checks), with compiler-libs (typing_dump.ml `core`) and with the

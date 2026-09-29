@@ -1,4 +1,4 @@
-// Port of typing/errortrace_report.ml (TYPECHECKER.md stage 9): the
+// Port of typing/errortrace_report.ml (cxx/PORTING.md stage 9): the
 // printing of unification, equality, moregen and subtyping traces -- the
 // "This expression has type ... but an expression was expected of type"
 // bodies and their explanations.

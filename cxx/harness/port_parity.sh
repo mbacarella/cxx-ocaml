@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Accept/reject parity of the ported type checker with ocamlc (TYPECHECKER.md
+# Accept/reject parity of the ported type checker with ocamlc (cxx/PORTING.md
 # stage 6): each .ml is checked by `c++ocamlc -stop-after typing` and by
 # ocamlc.opt, in a scratch copy.  Reports SAME-OK / SAME-ERR (with the error
 # location compared) / FALSE-REJECT / FALSE-ACCEPT, and the files where the

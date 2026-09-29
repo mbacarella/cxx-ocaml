@@ -1,4 +1,4 @@
-// Port of typing/includecore.mli (TYPECHECKER.md, stage 5): inclusion checks
+// Port of typing/includecore.mli (cxx/PORTING.md, stage 5): inclusion checks
 // for the core language (value descriptions, type declarations, extension
 // constructors, class types).  The mismatch values mirror includecore.mli;
 // the record / variant change lists (Diffing_with_keys, only used to print

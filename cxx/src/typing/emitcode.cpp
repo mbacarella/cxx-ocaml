@@ -1,4 +1,4 @@
-// Port of bytecomp/emitcode.ml (TYPECHECKER.md stage 10): the instruction
+// Port of bytecomp/emitcode.ml (cxx/PORTING.md stage 10): the instruction
 // list to relocatable bytecode (with the `emit` peephole), and the .cmo:
 // magic, code, the debugging events (-g), the optimization hints and the
 // marshaled Cmo_format.compilation_unit.

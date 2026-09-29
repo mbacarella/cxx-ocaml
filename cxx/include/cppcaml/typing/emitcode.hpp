@@ -1,4 +1,4 @@
-// Port of bytecomp/emitcode.mli (TYPECHECKER.md stage 10): the instruction
+// Port of bytecomp/emitcode.mli (cxx/PORTING.md stage 10): the instruction
 // list to relocatable bytecode, and the .cmo file (magic, code, debug info,
 // optimization hints, the marshaled Cmo_format.compilation_unit).
 #pragma once

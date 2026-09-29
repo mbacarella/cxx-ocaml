@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stage-9 oracle, multi-file errors (TYPECHECKER.md): scenarios that need
+# Stage-9 oracle, multi-file errors (cxx/PORTING.md): scenarios that need
 # several compilations -- inconsistent assumptions, corrupted / misnamed /
 # -rectypes .cmi, interface mismatch, missing files, -pack -- comparing
 # the last command's stderr and exit code, ocamlc.opt vs c++ocamlc, byte

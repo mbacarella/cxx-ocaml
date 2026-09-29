@@ -1,4 +1,4 @@
-// Port of utils/warnings.ml (TYPECHECKER.md): the active / error flags of
+// Port of utils/warnings.ml (cxx/PORTING.md): the active / error flags of
 // every warning and the alert settings, with `-w` / `-warn-error` /
 // `-alert` parsing and the save/restore the [@warning] scopes use; the
 // warnings themselves (Warnings.t), what they say (message) and their

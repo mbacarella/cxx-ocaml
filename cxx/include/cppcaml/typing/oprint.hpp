@@ -1,4 +1,4 @@
-// Port of typing/oprint.mli (TYPECHECKER.md stage 9): the printers of the
+// Port of typing/oprint.mli (cxx/PORTING.md stage 9): the printers of the
 // outcome trees (outcometree.hpp) -- types, class types, module types and
 // signature items.  (The toplevel's value / phrase printers are not ported.)
 // OCaml's hooks (`out_type := ...`) are plain functions here.

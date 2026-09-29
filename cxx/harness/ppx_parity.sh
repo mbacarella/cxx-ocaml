@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ppx oracle (TYPECHECKER.md, Driver options): c++ocamlc against
+# ppx oracle (cxx/PORTING.md, Driver options): c++ocamlc against
 # ocamlc.opt on the two ways an AST reaches the compiler from outside --
 #   ppx  `-ppx CMD`: Pparse writes the parsed AST (with Ast_mapper's ppx
 #        context), runs the rewriter, reads its output back

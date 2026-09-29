@@ -1,4 +1,4 @@
-// Port of lambda/printlambda.ml (TYPECHECKER.md stage 10).  See
+// Port of lambda/printlambda.ml (cxx/PORTING.md stage 10).  See
 // printlambda.hpp.
 #include "cppcaml/typing/printlambda.hpp"
 

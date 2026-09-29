@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# -pack oracle (TYPECHECKER.md stage 10): each scenario builds a packed unit
+# -pack oracle (cxx/PORTING.md stage 10): each scenario builds a packed unit
 # (and a program using it) twice in scratch directories -- once with
 # ocamlc.opt, once with c++ocamlc -- and compares the pack's .cmo and .cmi
 # byte for byte, then the program's output.  A second pass (PACKER-ONLY)

@@ -1,4 +1,4 @@
-// Port of typing/printtyp.ml (TYPECHECKER.md stage 9).
+// Port of typing/printtyp.ml (cxx/PORTING.md stage 9).
 #include "cppcaml/typing/printtyp.hpp"
 
 #include "cppcaml/typing/ident.hpp"

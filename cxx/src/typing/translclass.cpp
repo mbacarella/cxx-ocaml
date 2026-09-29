@@ -1,4 +1,4 @@
-// Port of lambda/translclass.ml (TYPECHECKER.md stage 10): the translation
+// Port of lambda/translclass.ml (cxx/PORTING.md stage 10): the translation
 // of class and object expressions.  See translclass.hpp, and translclass.ml's
 // header comment for the compilation scheme.
 //

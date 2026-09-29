@@ -1,4 +1,4 @@
-// Port of lambda/translcore.ml (TYPECHECKER.md stage 10): the translation
+// Port of lambda/translcore.ml (cxx/PORTING.md stage 10): the translation
 // of the core language to Lambda.
 //
 // Evaluation order is ocamlc's, since it decides the stamps of the idents

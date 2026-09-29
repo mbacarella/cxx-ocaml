@@ -1,4 +1,4 @@
-// Port of bytecomp/bytepackager.mli (TYPECHECKER.md stage 10): -pack, a
+// Port of bytecomp/bytepackager.mli (cxx/PORTING.md stage 10): -pack, a
 // set of .cmo (and .cmi) files as one .cmo having the original
 // compilation units as sub-modules.
 #pragma once

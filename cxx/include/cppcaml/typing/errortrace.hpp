@@ -1,4 +1,4 @@
-// Port of typing/errortrace.ml (TYPECHECKER.md): the traces carried by
+// Port of typing/errortrace.ml (cxx/PORTING.md): the traces carried by
 // unification / equality / moregen / subtyping failures.  The OCaml GADT
 // indices (unification vs comparison) become a runtime `variety`.
 #pragma once

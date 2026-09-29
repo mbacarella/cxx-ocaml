@@ -1,4 +1,4 @@
-// Port of parsing/pprintast.ml's Doc longident printers (TYPECHECKER.md stage 9).
+// Port of parsing/pprintast.ml's Doc longident printers (cxx/PORTING.md stage 9).
 #include "cppcaml/typing/pprintast.hpp"
 
 #include "cppcaml/typing/oprint.hpp"

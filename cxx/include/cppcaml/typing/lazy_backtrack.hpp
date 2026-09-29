@@ -1,4 +1,4 @@
-// Port of utils/lazy_backtrack.ml (TYPECHECKER.md): lazy values whose
+// Port of utils/lazy_backtrack.ml (cxx/PORTING.md): lazy values whose
 // forcing can be logged and undone.
 #pragma once
 

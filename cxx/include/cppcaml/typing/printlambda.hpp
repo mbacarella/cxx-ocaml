@@ -1,4 +1,4 @@
-// Port of lambda/printlambda.mli (TYPECHECKER.md stage 10): the -drawlambda
+// Port of lambda/printlambda.mli (cxx/PORTING.md stage 10): the -drawlambda
 // / -dlambda printer, on the Format engine port (format.hpp).
 #pragma once
 

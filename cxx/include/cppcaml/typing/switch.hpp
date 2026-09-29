@@ -1,4 +1,4 @@
-// Port of lambda/switch.ml (TYPECHECKER.md stage 10): action stores and the
+// Port of lambda/switch.ml (cxx/PORTING.md stage 10): action stores and the
 // compilation of integer switches into test trees and jump tables.  The
 // functors become templates: CtxStore<A> / Store<A> take a policy with the
 // Stored signature, Make<Arg> an Arg with the S signature (types and static

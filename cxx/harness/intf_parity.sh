@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stage-9 oracle (TYPECHECKER.md): `-i`, the signature Printtyp prints --
+# Stage-9 oracle (cxx/PORTING.md): `-i`, the signature Printtyp prints --
 # Out_type's naming of type variables, aliases and identifiers, and
 # Oprint's layout -- against ocamlc.opt's, byte for byte (stdout and the
 # exit code; ERR=1 compares stderr too).  Each .ml / .mli is compiled alone

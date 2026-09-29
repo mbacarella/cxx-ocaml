@@ -1,4 +1,4 @@
-// Port of lambda/translcore.mli (TYPECHECKER.md stage 10): the
+// Port of lambda/translcore.mli (cxx/PORTING.md stage 10): the
 // translation of the core language (expressions, functions, lets).
 #pragma once
 

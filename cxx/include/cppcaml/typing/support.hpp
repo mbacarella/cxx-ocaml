@@ -1,5 +1,5 @@
 // Small modules Types depends on, ported as far as the typing/ port needs them
-// (TYPECHECKER.md): Lexing.position / Location.t, Shape.Uid.t,
+// (cxx/PORTING.md): Lexing.position / Location.t, Shape.Uid.t,
 // Primitive.description, the Asttypes flags, Parsetree attributes.
 #pragma once
 

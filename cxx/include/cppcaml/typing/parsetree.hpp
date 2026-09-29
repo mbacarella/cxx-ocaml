@@ -1,4 +1,4 @@
-// Port of parsing/parsetree.mli (TYPECHECKER.md, stage 4): the abstract
+// Port of parsing/parsetree.mli (cxx/PORTING.md, stage 4): the abstract
 // syntax tree the typer consumes, field for field.  Records are structs with
 // the OCaml field names; each variant is a `*Desc` base with one subclass
 // per constructor (`as<Pexp_apply>(e->pexp_desc)`), as in types.hpp.  Lists
@@ -795,7 +795,7 @@ void reset_types_attributes();
 
 // ---- construction from the C++ parser (parsetree_of_ast.cpp) --------------------------------
 // Locations the parser does not record yet are gap_loc(): Location.none with
-// pos_cnum = -2 (TYPECHECKER.md lists them).
+// pos_cnum = -2 (cxx/PORTING.md lists them).
 Location gap_loc();
 bool is_gap_loc(const Location& l);
 Structure of_ast(const ast::Structure& s, std::string_view fname,

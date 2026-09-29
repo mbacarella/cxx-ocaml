@@ -1,4 +1,4 @@
-// Port of typing/out_type.mli (TYPECHECKER.md stage 9): the outcome trees
+// Port of typing/out_type.mli (cxx/PORTING.md stage 9): the outcome trees
 // of types, declarations and signatures -- naming of type variables, alias
 // marking of cyclic / shared types, identifier disambiguation (`t/2`) in
 // the printing environment.  The short-paths machinery (-short-paths,

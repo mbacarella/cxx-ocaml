@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Stage-4a oracle for the typing/ port (TYPECHECKER.md): the Parsetree the
+# Stage-4a oracle for the typing/ port (cxx/PORTING.md): the Parsetree the
 # typer consumes.  Parse each .ml with compiler-libs (Pparse, typing_dump.ml
 # `parse`) and with the C++ parser + parsetree::of_ast (c++typing-dump
 # `parse`), dump every field of both trees, and compare.  Locations the C++
-# parser does not record yet print as "?" on both sides (TYPECHECKER.md).
+# parser does not record yet print as "?" on both sides (cxx/PORTING.md).
 #
 # Usage: typing_parse_parity.sh [file.ml ...]   (JOBS= overridable)
 #   no args: testsuite/tests, stdlib and the compiler's own sources

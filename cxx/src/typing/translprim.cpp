@@ -1,4 +1,4 @@
-// Port of lambda/translprim.ml (TYPECHECKER.md stage 10).
+// Port of lambda/translprim.ml (cxx/PORTING.md stage 10).
 //
 // Deviations: Config.with_frame_pointers is read only in native code, where
 // it is false; the error printers belong to the error-report stage.

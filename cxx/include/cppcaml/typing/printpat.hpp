@@ -1,4 +1,4 @@
-// Port of typing/printpat.mli (TYPECHECKER.md stage 9): patterns (the
+// Port of typing/printpat.mli (cxx/PORTING.md stage 9): patterns (the
 // counter-examples of the exhaustiveness warnings) printed as values.
 #pragma once
 

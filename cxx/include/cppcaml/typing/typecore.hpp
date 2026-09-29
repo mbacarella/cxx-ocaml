@@ -1,4 +1,4 @@
-// Port of typing/typecore.ml (TYPECHECKER.md, stage 4c): typechecking of the
+// Port of typing/typecore.ml (cxx/PORTING.md, stage 4c): typechecking of the
 // core language (patterns and expressions).  Errors are `typecore::Error`
 // (the OCaml `Error.In_context`); reporting them comes with Printtyp.
 //

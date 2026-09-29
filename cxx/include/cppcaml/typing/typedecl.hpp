@@ -1,4 +1,4 @@
-// Port of typing/typedecl.mli (TYPECHECKER.md, stage 5): typing of type
+// Port of typing/typedecl.mli (cxx/PORTING.md, stage 5): typing of type
 // declarations, type extensions, exceptions, value and primitive
 // descriptions, and `with type` constraints.  Shapes (cmt-only) are not
 // returned.  Errors are `typedecl::Error` (the OCaml Error.In_context).

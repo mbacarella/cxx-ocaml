@@ -1,4 +1,4 @@
-// Port of typing/typedecl_variance.mli (TYPECHECKER.md, stage 5): variance
+// Port of typing/typedecl_variance.mli (cxx/PORTING.md, stage 5): variance
 // inference and checking for type declarations, extensions and classes.
 #pragma once
 

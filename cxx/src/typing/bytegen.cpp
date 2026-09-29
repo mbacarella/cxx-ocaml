@@ -1,4 +1,4 @@
-// Port of bytecomp/bytegen.ml (TYPECHECKER.md stage 10): translation of
+// Port of bytecomp/bytegen.ml (cxx/PORTING.md stage 10): translation of
 // lambda terms to lists of instructions.
 //
 // The instruction lists are persistent cons lists (instruct.hpp): each
