@@ -512,6 +512,7 @@ static Typed type_module_aux(bool alias, bool strengthen, bool funct_body, Path:
       return {me, shape::leaf_for_unpack()};
     }
     case K::Pmod_extension: throw ErrorForward(as<pt::Pmod_extension>(d)->ext);
+    case K::Pmod_hole: raise_error(err(smod->pmod_loc, env, EK::Unexpected_hole));
   }
   throw std::logic_error("type_module_aux");
 }

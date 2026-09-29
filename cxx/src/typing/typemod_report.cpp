@@ -229,6 +229,7 @@ Report report_error(const Location& loc, env::t, const typemod::Error& err) {
                               "local substitution (temporary name)@ for an anonymous module type.@ %a",
                               code_str(path::name(err.path)), [](Formatter& f) { misc::print_see_manual(f, {12, 7, 3}); });
     case EK::Val_in_structure: return location::errorf(loc, "Value declarations are only allowed in signatures");
+    case EK::Unexpected_hole: return location::errorf(loc, "Uninterpreted module wildcard %a.", code_str("_"));
   }
   return location::errorf(loc, "?");
 }

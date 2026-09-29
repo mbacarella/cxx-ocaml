@@ -385,8 +385,9 @@ class Decoder {
   }
   const ExpressionDesc* expression_desc(V x) {
     if (is_int(x)) {
-      if (ival(x) != 0) throw Corrupt{};
-      return mk<Pexp_unreachable>();
+      if (ival(x) == 0) return mk<Pexp_unreachable>();
+      if (ival(x) == 1) return mk<Pexp_hole>();
+      throw Corrupt{};
     }
     switch (tag(x)) {
       case 0: return mk<Pexp_ident>(lidloc(f(x, 0)));
@@ -807,7 +808,10 @@ class Decoder {
     return node<ModuleExpr>(x, [&] {
       V d = f(x, 0);
       const ModuleExprDesc* desc = nullptr;
-      switch (tag(d)) {
+      if (is_int(d)) {
+        if (ival(d) != 0) throw Corrupt{};
+        desc = mk<Pmod_hole>();
+      } else switch (tag(d)) {
         case 0: desc = mk<Pmod_ident>(lidloc(f(d, 0))); break;
         case 1: desc = mk<Pmod_structure>(structure(f(d, 0))); break;
         case 2: desc = mk<Pmod_functor>(functor_parameter(f(d, 0)), module_expr(f(d, 1))); break;

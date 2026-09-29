@@ -517,6 +517,8 @@ struct Printer {
       else line(j, "None");
     } else if (std::holds_alternative<Pexp_unreachable>(e.desc)) {
       os << ind(j) << "Pexp_unreachable";  // printast: no trailing newline
+    } else if (std::holds_alternative<Pexp_hole>(e.desc)) {
+      line(j, "Pexp_hole");
     } else if (auto* v = std::get_if<Pexp_new>(&e.desc)) {
       line(j, "Pexp_new " + lid_loc(v->id));
     } else if (auto* v = std::get_if<Pexp_override>(&e.desc)) {
@@ -813,6 +815,8 @@ struct Printer {
     } else if (auto* e = std::get_if<Pmod_extension>(&m.desc)) {
       line(j, "Pmod_extension \"" + e->name + "\"");
       ext_payload(j, e->payload);
+    } else if (std::holds_alternative<Pmod_hole>(m.desc)) {
+      line(j, "Pmod_hole");
     } else {
       auto& u = std::get<Pmod_unpack>(m.desc);
       line(j, "Pmod_unpack");

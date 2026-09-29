@@ -86,6 +86,7 @@ bool is_atom_start(Kind k) {
     case Kind::BANG: case Kind::PREFIXOP: case Kind::LBRACKETBAR:
     case Kind::BEGIN: case Kind::LBRACKETPERCENT: case Kind::BACKQUOTE:
     case Kind::OBJECT: case Kind::NEW: case Kind::LBRACELESS:
+    case Kind::UNDERSCORE:  // a hole
       return true;
     default:
       return false;
@@ -718,6 +719,9 @@ class Parser {
       case Kind::INT: case Kind::FLOAT: case Kind::CHAR: case Kind::STRING:
         advance();
         return E({Pexp_constant{const_of(t)}, tokloc(t)});
+      case Kind::UNDERSCORE:  // _  -> Pexp_hole (simple_expr: UNDERSCORE)
+        advance();
+        return E({Pexp_hole{}, tokloc(t)});
       case Kind::QUOTED_STRING_EXPR:  // {%ext|…|} -> Pexp_extension
         advance();
         return E({Pexp_extension{quoted_ext_name(t, 2), quoted_payload(t)},
@@ -978,6 +982,11 @@ class Parser {
       } else if (k == Kind::TILDE && peek(1).kind == Kind::LIDENT) {  // ~x punning
         advance(); const Token& id = cur(); advance();
         args.emplace_back(Labelled{id.text, true}, ident_expr(id.text, tokloc(id)));
+      } else if ((k == Kind::TILDE || k == Kind::QUESTION) && peek(1).kind == Kind::UNDERSCORE) {  // ~_ / ?_
+        advance(); const Token& u = cur(); advance();
+        ExprBox h = E({Pexp_hole{}, tokloc(u)});
+        if (k == Kind::TILDE) args.emplace_back(Labelled{"_"}, std::move(h));
+        else args.emplace_back(Optional{"_"}, std::move(h));
       } else if (k == Kind::TILDE && peek(1).kind == Kind::LPAREN &&
                  peek(2).kind == Kind::LIDENT && peek(3).kind == Kind::COLON) {  // ~(x : t)
         advance();  // ~
@@ -3794,7 +3803,12 @@ class Parser {
 
   Location none_loc() const { return Location{Position{0, 0, -1}, Position{0, 0, -1}, true}; }
 
-  ModuleType parse_module_type() {
+  // anon_arrow = false: the right-hand side of `with module type T = mty`
+  // (not `:=`),
+  // which parser.mly gives %prec below_MINUSGREATER -- a following `->`
+  // closes the whole `with` type (`S with module type T = S -> S` is
+  // `(S with module type T = S) -> S`)
+  ModuleType parse_module_type(bool anon_arrow = true) {
     Position symstart = position(cur().start);  // $sloc start (the `(` of a paren'd domain)
     // leading functor params with no `functor` keyword: `() -> R`, `(X : S) -> R`
     auto is_fparam_start = [&] {
@@ -3818,7 +3832,7 @@ class Parser {
       return cod;
     }
     ModuleType mt = parse_module_type_with();
-    if (cur().kind == Kind::MINUSGREATER) {  // mt -> mt2  (anonymous functor sugar)
+    if (anon_arrow && cur().kind == Kind::MINUSGREATER) {  // mt -> mt2  (anonymous functor sugar)
       advance();
       Position s = symstart;
       ModuleType cod = parse_module_type();
@@ -3890,7 +3904,10 @@ class Parser {
       LongidentLoc lid = parse_longident_path();
       bool subst = cur().kind == Kind::COLONEQUAL;
       if (subst) advance(); else expect(Kind::EQUAL, "=");
-      ModuleType mty = parse_module_type();
+      // only `=` stops at `->`: menhir's precedence resolves a conflict the
+      // `:=` form doesn't have (`S with module type T := S -> S` keeps its
+      // arrow inside)
+      ModuleType mty = parse_module_type(/*anon_arrow=*/subst);
       if (subst) return Pwith_modtypesubst{std::move(lid), box(std::move(mty))};
       return Pwith_modtype{std::move(lid), box(std::move(mty))};
     }
@@ -4422,6 +4439,10 @@ class Parser {
   ModuleExpr parse_module_expr_head() {
     const Token& t = cur();
     if (t.kind == Kind::SIG) expecting(t.start, t.end, "struct");  // SIG error
+    if (t.kind == Kind::UNDERSCORE) {  // _  -> Pmod_hole
+      advance();
+      return ModuleExpr{Pmod_hole{}, tokloc(t)};
+    }
     if (t.kind == Kind::LBRACKETPERCENT) {  // [%id payload]  -> Pmod_extension
       advance();
       auto [name, payload] = parse_ext_body();

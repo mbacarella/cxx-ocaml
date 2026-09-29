@@ -1270,6 +1270,7 @@ void expression(const Expression* e) {
     }
     case K::Pexp_extension: s("Pexp_extension "); extension(as<Pexp_extension>(d)->ext); break;
     case K::Pexp_unreachable: s("Pexp_unreachable"); break;
+    case K::Pexp_hole: s("Pexp_hole"); break;
   }
   if (d->kind == K::Pexp_assert) {
     s(" innermost ");
@@ -1650,6 +1651,7 @@ void module_expr(const ModuleExpr* m) {
     }
     case K::Pmod_unpack: s("Pmod_unpack "); expression(as<Pmod_unpack>(d)->exp); break;
     case K::Pmod_extension: s("Pmod_extension "); extension(as<Pmod_extension>(d)->ext); break;
+    case K::Pmod_hole: s("Pmod_hole"); break;
   }
   s(")");
 }
