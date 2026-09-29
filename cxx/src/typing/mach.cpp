@@ -2,6 +2,9 @@
 // printmach.ml.  See mach.hpp.
 #include "cppcaml/typing/mach.hpp"
 
+#include <functional>
+#include <unordered_map>
+
 #include <cstring>
 #include <stdexcept>
 
@@ -174,8 +177,49 @@ Instr dummy_instr() {
   return d;
 }
 
+// The zone Mach instructions are allocated in (Asmgen's generations: a
+// pass's input is dropped once its output is compacted); null = zone()
+static Zone* g_instr_zone = nullptr;
+void set_instr_zone(Zone* z) { g_instr_zone = z; }
+static Instruction* new_instr(const Instruction& d) {
+  return g_instr_zone ? g_instr_zone->make<Instruction>(d) : make<Instruction>(d);
+}
+
+Instr compact_instrs(Instr root, Zone& into) {
+  std::unordered_map<Instr, Instr> memo;
+  // a chain along `next` copied iteratively (a function body is long), the
+  // branches recursively (as deep as the code nests); shared nodes stay
+  // shared, the static dummy_instr is kept
+  std::function<Instr(Instr)> chain = [&](Instr i) -> Instr {
+    Instr head = nullptr;
+    Instr* slot = &head;
+    while (i) {
+      if (i == dummy_instr()) {
+        *slot = i;
+        break;
+      }
+      if (auto it = memo.find(i); it != memo.end()) {
+        *slot = it->second;
+        break;
+      }
+      Instruction* c = into.make<Instruction>(*i);
+      memo.emplace(i, c);
+      *slot = c;
+      if (c->ifso) c->ifso = chain(c->ifso);
+      if (c->ifnot) c->ifnot = chain(c->ifnot);
+      if (c->body) c->body = chain(c->body);
+      for (Handler& h : c->handlers) h.body = chain(h.body);
+      for (Instr& x : c->cases) x = chain(x);
+      slot = &c->next;
+      i = i->next;
+    }
+    return head;
+  };
+  return chain(root);
+}
+
 Instr end_instr() {
-  auto* i = make<Instruction>(Instruction{Instruction::K::Iend});
+  auto* i = new_instr(Instruction{Instruction::K::Iend});
   i->next = dummy_instr();
   return i;
 }
@@ -191,7 +235,7 @@ Instr instr_cons(const Instruction& d, const Regs& a, const Regs& r, Instr n) {
   return instr_cons_debug(d, a, r, debuginfo::none(), n);
 }
 Instr instr_cons_debug(const Instruction& d, const Regs& a, const Regs& r, const debuginfo::t& dbg, Instr n) {
-  auto* i = make<Instruction>(d);
+  auto* i = new_instr(d);
   i->next = n;
   i->arg = a;
   i->res = r;
@@ -199,7 +243,7 @@ Instr instr_cons_debug(const Instruction& d, const Regs& a, const Regs& r, const
   i->live.clear();
   return i;
 }
-Instr copy(Instr i) { return make<Instruction>(*i); }
+Instr copy(Instr i) { return new_instr(*i); }
 
 void instr_iter(const std::function<void(Instr)>& f, Instr i) {
   using K = Instruction::K;

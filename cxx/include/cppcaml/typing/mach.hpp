@@ -185,6 +185,10 @@ Instr end_instr();
 Instr instr_cons(const Instruction& d, const Regs& a, const Regs& r, Instr n);
 Instr instr_cons_debug(const Instruction& d, const Regs& a, const Regs& r, const debuginfo::t& dbg, Instr n);
 Instr copy(Instr i);  // { i with .. }
+// Asmgen's instruction generations: the zone new instructions go to (null:
+// the current zone), and a body deep-copied into [into] (sharing kept)
+void set_instr_zone(Zone* z);
+Instr compact_instrs(Instr root, Zone& into);
 Instruction iop(const Operation& op);
 Instruction idesc(Instruction::K k);
 void instr_iter(const std::function<void(Instr)>& f, Instr i);

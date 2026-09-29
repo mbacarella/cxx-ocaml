@@ -46,6 +46,31 @@ void dump_if(format::Formatter& dump, bool flag, const char* message, const mach
 void compile_fundecl_in_zone(format::Formatter& dump, const selection::FuncNames& funcnames,
                              const cmm::Fundecl& fd_cmm);
 
+// A function's Mach code in generations: each pass builds a new body
+// (sharing some of its input's instructions), so the output is compacted
+// into the other generation's zone and the input's zone dropped -- two
+// generations at a time instead of one per pass (and per regalloc round).
+// The passes' other data (registers, liveness...) stays in the function's
+// scratch zone.
+struct Generations {
+  Zone z[2];
+  int cur = 0;
+  void begin() { mach::set_instr_zone(&z[cur]); }
+  void compact(mach::Fundecl& fd) {
+    int nxt = 1 - cur;
+    fd.fun_body = mach::compact_instrs(fd.fun_body, z[nxt]);
+    mach::set_instr_zone(&z[nxt]);
+    z[cur].clear();
+    cur = nxt;
+  }
+  void end() {
+    mach::set_instr_zone(nullptr);
+    z[0].clear();
+    z[1].clear();
+  }
+};
+Generations g_gens;
+
 mach::Fundecl regalloc(format::Formatter& dump, long round, mach::Fundecl fd) {
   for (;; ++round) {
     if (round > 50)
@@ -58,6 +83,7 @@ mach::Fundecl regalloc(format::Formatter& dump, long round, mach::Fundecl fd) {
     std::vector<long> num_stack_slots = mp::coloring_allocate_registers();
     dump_if(dump, cf::dump_regalloc, "After register allocation", fd);
     auto [newfd, redo_regalloc] = mp::reload(fd, num_stack_slots);
+    g_gens.compact(newfd);
     dump_if(dump, cf::dump_reload, "After insertion of reloading code", newfd);
     if (!redo_regalloc) return newfd;
     reg::reinit();
@@ -84,23 +110,31 @@ void compile_fundecl_in_zone(format::Formatter& dump, const selection::FuncNames
                              const cmm::Fundecl& fd_cmm) {
   proc::init();
   reg::reset();
+  g_gens.begin();
   mach::Fundecl fd = polling::instrument_fundecl(selection::fundecl(funcnames, fd_cmm));
+  g_gens.compact(fd);
   dump_if(dump, cf::dump_selection, "After instruction selection", fd);
   fd = mp::comballoc(fd);
+  g_gens.compact(fd);
   dump_if(dump, cf::dump_combine, "After allocation combining", fd);
   fd = mp::cse(fd);
+  g_gens.compact(fd);
   dump_if(dump, cf::dump_cse, "After CSE", fd);
   mp::liveness(fd);
   fd = mp::deadcode(fd);
+  g_gens.compact(fd);
   dump_if(dump, cf::dump_live, "Liveness analysis", fd);
   fd = mp::spill(fd);
+  g_gens.compact(fd);
   mp::liveness(fd);
   dump_if(dump, cf::dump_spill, "After spilling", fd);
   fd = mp::split(fd);
+  g_gens.compact(fd);
   dump_if(dump, cf::dump_split, "After live range splitting", fd);
   mp::liveness(fd);
   fd = regalloc(dump, 1, fd);
   linear::Fundecl lf = linear::linearize(fd);
+  g_gens.end();
   if (cf::dump_linear)
     format::fprintf(dump, "*** %s@.%a@.", "Linearized code", format::pr(linear::print_fundecl, lf));
   // Scheduling (amd64): the identity
