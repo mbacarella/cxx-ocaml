@@ -494,7 +494,6 @@ V expression_desc(const ExpressionDesc* d) {
     }
     case K::Pexp_extension: return B(32, {extension(as<Pexp_extension>(d)->ext)});
     case K::Pexp_unreachable: return I(0);
-    case K::Pexp_hole: return I(1);
   }
   return I(0);
 }
@@ -801,7 +800,6 @@ V module_expr(const ModuleExpr* m) {
     }
     case K::Pmod_unpack: desc = B(6, {expression(as<Pmod_unpack>(d)->exp)}); break;
     case K::Pmod_extension: desc = B(7, {extension(as<Pmod_extension>(d)->ext)}); break;
-    case K::Pmod_hole: desc = I(0); break;  // the only constant constructor
   }
   return B(0, {desc, loc(m->pmod_loc), attrs(m->pmod_attributes)});
 }

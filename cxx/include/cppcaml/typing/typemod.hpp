@@ -45,7 +45,7 @@ struct Error : std::runtime_error {
     Not_allowed_in_functor_body, Not_a_packed_module, Incomplete_packed_module, Scoping_pack,
     Recursive_module_require_explicit_type, Apply_generative, Cannot_scrape_alias, Cannot_scrape_package_type,
     Badly_formed_signature, Cannot_hide_id, Invalid_type_subst_rhs, Non_packable_local_modtype_subst,
-    With_cannot_remove_packed_modtype, Cannot_alias, Val_in_structure, Unexpected_hole
+    With_cannot_remove_packed_modtype, Cannot_alias, Val_in_structure
   };
   Location loc;
   env::t env;

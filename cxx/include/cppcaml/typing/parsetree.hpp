@@ -249,7 +249,7 @@ struct ExpressionDesc {
     Pexp_array, Pexp_ifthenelse, Pexp_sequence, Pexp_while, Pexp_for, Pexp_constraint,
     Pexp_coerce, Pexp_send, Pexp_new, Pexp_setinstvar, Pexp_override, Pexp_struct_item,
     Pexp_assert, Pexp_lazy, Pexp_poly, Pexp_object, Pexp_newtype, Pexp_pack, Pexp_letop,
-    Pexp_extension, Pexp_unreachable, Pexp_hole
+    Pexp_extension, Pexp_unreachable
   };
   Kind kind;
 };
@@ -373,7 +373,6 @@ PT_CTOR(ExpressionDesc, Pexp_pack) const ModuleExpr* me; const PackageType* pack
 PT_CTOR(ExpressionDesc, Pexp_letop) const Letop* letop; PT_END
 PT_CTOR(ExpressionDesc, Pexp_extension) const Extension* ext; PT_END
 PT_CTOR(ExpressionDesc, Pexp_unreachable) PT_END
-PT_CTOR(ExpressionDesc, Pexp_hole) PT_END
 
 // ---- value / primitive descriptions -------------------------------------------------------
 struct ValueDescription {
@@ -714,7 +713,7 @@ PT_CTOR(SignatureItemDesc, Psig_extension) const Extension* ext; Attributes attr
 struct ModuleExprDesc {
   enum class Kind : std::uint8_t {
     Pmod_ident, Pmod_structure, Pmod_functor, Pmod_apply, Pmod_apply_unit, Pmod_constraint,
-    Pmod_unpack, Pmod_extension, Pmod_hole
+    Pmod_unpack, Pmod_extension
   };
   Kind kind;
 };
@@ -731,7 +730,6 @@ PT_CTOR(ModuleExprDesc, Pmod_apply_unit) const ModuleExpr* fn; PT_END
 PT_CTOR(ModuleExprDesc, Pmod_constraint) const ModuleExpr* me; const ModuleType* mty; PT_END
 PT_CTOR(ModuleExprDesc, Pmod_unpack) const Expression* exp; PT_END
 PT_CTOR(ModuleExprDesc, Pmod_extension) const Extension* ext; PT_END
-PT_CTOR(ModuleExprDesc, Pmod_hole) PT_END
 
 struct ValueConstraint {
   enum class Kind : std::uint8_t { Pvc_constraint, Pvc_coercion };

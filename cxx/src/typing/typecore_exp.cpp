@@ -977,7 +977,6 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
     case SXK::Pexp_unreachable:
       return re(mk(make<tt::Texp_unreachable>(tt::Texp_unreachable{{XK::Texp_unreachable}}), loc,
                 ctype::instance(ty_expected), env, sexp->pexp_attributes));
-    case SXK::Pexp_hole: raise_error(err(loc, env, EK::Unexpected_hole));
     case SXK::Pexp_struct_item: {
       auto* s = as<pt::Pexp_struct_item>(d);
       TypeExpr* tv = ctype::newvar();

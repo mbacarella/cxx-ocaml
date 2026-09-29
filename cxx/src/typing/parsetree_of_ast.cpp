@@ -910,8 +910,6 @@ struct Conv {
             d = make<Pexp_extension>(Pexp_extension{{K::Pexp_extension}, extension(v.name, v.payload)});
           } else if constexpr (std::is_same_v<T, ast::Pexp_unreachable>) {
             d = make<Pexp_unreachable>(K::Pexp_unreachable);
-          } else if constexpr (std::is_same_v<T, ast::Pexp_hole>) {
-            d = make<Pexp_hole>(K::Pexp_hole);
           }
         },
         e.desc);
@@ -1252,8 +1250,6 @@ struct Conv {
             d = make<Pmod_unpack>(Pmod_unpack{{K::Pmod_unpack}, expression(*v.e)});
           } else if constexpr (std::is_same_v<T, ast::Pmod_extension>) {
             d = make<Pmod_extension>(Pmod_extension{{K::Pmod_extension}, extension(v.name, v.payload)});
-          } else if constexpr (std::is_same_v<T, ast::Pmod_hole>) {
-            d = make<Pmod_hole>(K::Pmod_hole);
           }
         },
         m.desc);

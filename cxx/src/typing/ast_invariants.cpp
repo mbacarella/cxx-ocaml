@@ -476,7 +476,6 @@ class Iterator {
       }
       case K::Pmod_unpack: expr(as<Pmod_unpack>(d)->exp); break;
       case K::Pmod_extension: extension(as<Pmod_extension>(d)->ext); break;
-      case K::Pmod_hole: break;
     }
     if (auto* i = as<Pmod_ident>(d)) simple_longident(i->lid);
   }
@@ -721,7 +720,6 @@ class Iterator {
       case K::Pexp_constant:
       case K::Pexp_new:
       case K::Pexp_unreachable: break;
-      case K::Pexp_hole: break;
       case K::Pexp_let: {
         auto* l = as<Pexp_let>(d);
         for (const ValueBinding* vb : l->vbs) value_binding(vb);

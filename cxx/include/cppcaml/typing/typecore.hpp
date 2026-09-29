@@ -78,7 +78,7 @@ struct Error : std::runtime_error {
     Wrong_expected_kind, Expr_not_a_record_type, Constructor_labeled_arg,
     Partial_tuple_pattern_bad_type, Extra_tuple_label, Missing_tuple_label,
     Repeated_tuple_exp_label, Repeated_tuple_pat_label, Optional_poly_param,
-    Cannot_unify_tfunctor_to_tarrow, Cannot_omit_tfunctor_argument, Unexpected_hole
+    Cannot_unify_tfunctor_to_tarrow, Cannot_omit_tfunctor_argument
   };
   Location loc;
   env::t env;

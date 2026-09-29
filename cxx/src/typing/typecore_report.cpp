@@ -743,8 +743,6 @@ Report report_error(const Location& loc, env::t env, const typecore::Error& err)
       return location::errorf(
           loc, "@[<v>@[<2>This function has type@ %a@]@ The module argument %a cannot be omitted in this application.@]",
           print_expanded(err.ty), code_str(std::string(ident::Unscoped::name_of(err.us))));
-    case EK::Unexpected_hole:
-      return location::errorf(loc, "Uninterpreted expression wildcard %a.", code_str("_"));
   }
   return location::errorf(loc, "?");
 }
