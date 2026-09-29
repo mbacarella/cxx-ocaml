@@ -114,6 +114,7 @@ add_library(cppcaml_core
   src/typing/selection.cpp
   src/typing/mach_passes.cpp
   src/typing/linearize.cpp
+  src/typing/emit.cpp
   src/typing/format.cpp
   src/typing/printlambda.cpp
   src/typing/format_doc.cpp

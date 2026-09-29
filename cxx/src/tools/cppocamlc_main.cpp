@@ -46,6 +46,7 @@
 #include "cppcaml/typing/selection.hpp"
 #include "cppcaml/typing/mach_passes.hpp"
 #include "cppcaml/typing/linear.hpp"
+#include "cppcaml/typing/emit.hpp"
 #include "cppcaml/typing/translmod.hpp"
 #include "cppcaml/typing/compilenv.hpp"
 #include "cppcaml/typing/misc.hpp"
@@ -739,6 +740,9 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
         // end_gen_implementation: Cmmgen.compunit, compile_phrases (the
         // -dcmm dump of each phrase), then the references to the external
         // primitives' symbols
+        // Asmgen.should_emit: not stopping after scheduling
+        bool should_emit = !cf::should_stop_after(cf::Pass::Scheduling);
+        if (should_emit) ty::emit::begin_assembly();
         std::vector<ty::cmm::Phrase> phrases = ty::cmmgen::compunit(clambda);
         ty::cmm::Phrase refs;
         for (const ty::PrimitiveDescription* p : ty::translmod::primitive_declarations) {
@@ -754,7 +758,10 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
             if (p.fn) funcnames.insert(p.fn->fun_name);
           for (const ty::cmm::Phrase& p : ps) {
             if (cf::dump_cmm) ty::format::fprintf(dump, "%a@.", ty::format::pr(ty::printcmm::phrase, p));
-            if (!p.fn) continue;
+            if (!p.fn) {
+              if (should_emit) ty::emit::data(p.data);
+              continue;
+            }
             ty::proc::init();
             ty::reg::reset();
             ty::mach::Fundecl fd = ty::polling::instrument_fundecl(ty::selection::fundecl(funcnames, *p.fn));
@@ -797,6 +804,7 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
             if (cf::dump_scheduling)
               ty::format::fprintf(dump, "*** %s@.%a@.", "After instruction scheduling",
                                   ty::format::pr(ty::linear::print_fundecl, lf));
+            if (should_emit) ty::emit::fundecl(lf);
             funcnames.erase(p.fn->fun_name);
           }
         };
@@ -816,8 +824,34 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
         }
         ppf_dump.out() << dump.contents();
         ppf_dump.out().flush();
-        lap("selection", tp);
-        throw std::runtime_error("the native back end (Emit) is not supported yet");
+        lap("emit", tp);
+        if (should_emit) {
+          // compile_unit: the assembly file (kept with -S, else a temporary
+          // file), assembled into the object file
+          std::string prefix = remove_extension(cmo_out);
+          std::string asm_text = ty::emit::end_assembly();
+          std::string asm_filename = prefix + ".s";
+          if (!cf::keep_asm_file) {
+            char tmpl[] = "/tmp/camlasmXXXXXX.s";
+            int fd = mkstemps(tmpl, 2);
+            if (fd < 0) throw std::runtime_error("cannot create a temporary assembly file");
+            close(fd);
+            asm_filename = tmpl;
+          }
+          {
+            std::ofstream os(asm_filename, std::ios::binary);
+            os << asm_text;
+          }
+          std::string cmd = "as -o " + filename_quote(prefix + ".o") + " " + filename_quote(asm_filename);
+          int rc = std::system(cmd.c_str());
+          if (!cf::keep_asm_file) std::remove(asm_filename.c_str());
+          if (rc != 0) {
+            std::remove((prefix + ".o").c_str());
+            std::cerr << "Error: Assembler error, input left in file " << asm_filename << "\n";
+            return 2;
+          }
+        }
+        throw std::runtime_error("the native back end (the .cmx writer) is not supported yet");
       }
       return finish();
     }

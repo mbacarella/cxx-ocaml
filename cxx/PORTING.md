@@ -177,9 +177,19 @@ Linearize (with amd64's Stackframe analysis) is ported
 linearizing the next, and Emit allocates labels: `-dlinear` matches only
 once Emit is ported.)
 
-Next, in order: Emit (`-S` byte for byte), then the .cmx/.cmxa writers
-and Asmlink.  Until the back end exists, c++ocamlopt stops with an error
-after Linearize and does not write the .cmx.
+Emit is ported (`emit.cpp`: amd64's emit.mlp, Emitaux's frame tables
+and debug info, the X86 DSL and GAS printer; `hashtbl.hpp`'s
+`hash_value` for the frame tables' Hashtbl iteration orders):
+`DUMP=S` compares the `.s` files -- 6550/6550 probes (also `-g`,
+`-unsafe -inline 200`, `-compact`, `-g -O3`, `-nodynlink`,
+`-function-sections`), 208/208 compiler sources (and `-g`), 787/787
+testsuite files (and `-g`); `-dlinear` now matches without `-stop-after`.
+c++ocamlopt writes the `.s` (with `-S`) and assembles the `.o` with `as`.
+
+Next: the .cmx writer (Compilenv.save_unit_info: output_value of the
+unit infos with ocamlopt's sharing), then Asmlibrarian (.cmxa),
+Asmpackager and Asmlink (the startup module, caml_curry/apply/send, the
+C linker).  Until then c++ocamlopt stops with an error after the `.o`.
 
 ## Oracles and gates
 

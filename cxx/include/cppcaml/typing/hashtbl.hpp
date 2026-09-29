@@ -68,6 +68,60 @@ inline long hash_string_record(const std::vector<const std::string*>& fields) {
   return detail::final_mix(h);
 }
 
+// Hashtbl.hash on a general value: a model of the OCaml value (an int, a
+// string, or a block with a tag and fields), hashed as caml_hash does --
+// breadth first, at most 10 meaningful values (ints and strings; block
+// headers are mixed in without counting) among the first 100 queued
+struct HValue {
+  enum class K : std::uint8_t { Int, String, Block } k;
+  std::int64_t i = 0;  // Int: the OCaml int (tagged when mixed)
+  std::string s;
+  unsigned tag = 0;
+  std::vector<HValue> fields;
+  static HValue integer(std::int64_t n) { return HValue{K::Int, n}; }
+  static HValue string(std::string v) {
+    HValue h{K::String};
+    h.s = std::move(v);
+    return h;
+  }
+  static HValue block(unsigned tag, std::vector<HValue> fields) {
+    HValue h{K::Block};
+    h.tag = tag;
+    h.fields = std::move(fields);
+    return h;
+  }
+};
+
+inline long hash_value(const HValue& v) {
+  constexpr std::size_t sz = 100;
+  std::vector<const HValue*> queue{&v};
+  std::size_t rd = 0;
+  long num = 10;
+  std::uint32_t h = 0;
+  while (rd < queue.size() && num > 0) {
+    const HValue* x = queue[rd++];
+    switch (x->k) {
+      case HValue::K::Int:
+        h = detail::mix_intnat(h, x->i * 2 + 1);
+        --num;
+        break;
+      case HValue::K::String:
+        h = detail::mix_string(h, x->s);
+        --num;
+        break;
+      case HValue::K::Block:
+        // Mix in the tag and size, but do not count this towards [num]
+        h = detail::mix_uint32(h, static_cast<std::uint32_t>((x->fields.size() << 10) | x->tag));
+        for (const HValue& f : x->fields) {
+          if (queue.size() >= sz) break;
+          queue.push_back(&f);
+        }
+        break;
+    }
+  }
+  return detail::final_mix(h);
+}
+
 // ---- Hashtbl.t ---------------------------------------------------------------------
 
 // Hash: long operator()(const K&) (Hashtbl.hash); keys compare with ==

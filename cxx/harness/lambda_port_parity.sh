@@ -28,6 +28,7 @@ STOP="-stop-after lambda"
 DFLAG="-$DUMP"
 [ "$DUMP" = dinstr ] && STOP=""
 [ "$DUMP" = cmo ] && { STOP=""; DFLAG=""; }  # compare the .cmo files' bytes
+[ "$DUMP" = S ] && { STOP=""; DFLAG="-S"; }    # NATIVE=1: compare the .s files
 NATIVE="${NATIVE:-0}"
 if [ "$NATIVE" = 1 ]; then
   REFC="$ROOT/ocamlopt.opt"; OSTOP="$STOP"
@@ -40,7 +41,7 @@ fi
 # ocamlopt.opt compiles on, the port stops after its dump (the back end
 # past Clambda is not ported yet: its exit status is not checked)
 CLAMBDA=0
-case "$DUMP" in dclambda|drawclambda|dcmm|dsel|dcombine|dcse|dlive|dspill|dsplit|dinterf|dprefer|dalloc|dreload|dlinear) CLAMBDA=1; STOP=""; OSTOP="" ;; esac
+case "$DUMP" in dclambda|drawclambda|dcmm|dsel|dcombine|dcse|dlive|dspill|dsplit|dinterf|dprefer|dalloc|dreload|dlinear|S) CLAMBDA=1; STOP=""; OSTOP="" ;; esac
 export DUMP FLAGS STOP DFLAG NATIVE REFC OSTOP CLAMBDA
 OUT=/tmp/lambda_port_parity
 
@@ -58,6 +59,7 @@ if [ "${1:-}" == "--worker" ]; then
   ( cd "$w/x" && timeout 120 "$REFC" -nostdlib -I "$ROOT/stdlib" -w -a $FLAGS $DFLAG $OSTOP -c "$b" ) \
       >/dev/null 2>"$OUT/$key.o"; orc=$?
   if [ "$DUMP" = cmo ]; then cp "$w/x/${b%.ml}.cmo" "$OUT/$key.o" 2>/dev/null || orc=1; fi
+  if [ "$DUMP" = S ]; then cp "$w/x/${b%.ml}.s" "$OUT/$key.o" 2>/dev/null || orc=1; fi
   prep
   if [ -f "$i" ]; then
     ( cd "$w/x" && timeout 120 "$CPP" -I "$ROOT/stdlib" -w -a $FLAGS -c "${b}i" ) >/dev/null 2>&1
@@ -65,7 +67,8 @@ if [ "${1:-}" == "--worker" ]; then
   ( cd "$w/x" && CPPCAML_NEWLAMBDA=1 timeout 120 "$CPP" -I "$ROOT/stdlib" -w -a $FLAGS $DFLAG $STOP -c "$b" ) \
       >/dev/null 2>"$OUT/$key.c"; crc=$?
   if [ "$DUMP" = cmo ]; then cp "$w/x/${b%.ml}.cmo" "$OUT/$key.c" 2>/dev/null || crc=1; fi
-  [ "$CLAMBDA" = 1 ] && sed -i '/: the native back end ([A-Za-z]*) is not supported yet$/d' "$OUT/$key.c"
+  if [ "$DUMP" = S ]; then cp "$w/x/${b%.ml}.s" "$OUT/$key.c" 2>/dev/null || crc=1; fi
+  [ "$CLAMBDA" = 1 ] && sed -i '/: the native back end (.*) is not supported yet$/d' "$OUT/$key.c"
   rm -rf "${w:?}"
   if [ $orc -ne 0 ]; then printf 'OFAIL %s\n' "$f"
   elif { [ $crc -ne 0 ] && [ "$CLAMBDA" = 0 ]; } || [ ! -s "$OUT/$key.c" ]; then printf 'CFAIL %s\n' "$f"
