@@ -379,8 +379,8 @@ std::optional<ContinuationVar> type_continuation_pat(env::t env, TypeExpr* expec
   if (d->kind == pt::PatternDesc::Kind::Ppat_any) return std::nullopt;
   if (auto* v = as<pt::Ppat_var>(d)) {
     Ident::t id = Ident::create_local(v->name.txt);
-    auto* desc = make<tt::ContDesc>(tt::ContDesc{id, loc, expected_ty, uid::mk(env::get_current_unit())});
-    return ContinuationVar{desc};
+    auto* desc = make<ValueDescription>(expected_ty, ValueKind{}, loc, Attributes{}, uid::mk(env::get_current_unit()));
+    return ContinuationVar{id, desc};
   }
   if (auto* x = as<pt::Ppat_extension>(d)) throw ErrorForward(x->ext);
   raise_error(err(loc, env, EK::Invalid_continuation_pattern));
@@ -517,8 +517,8 @@ void finalize_variants(const tt::Pattern* p) {
 // ---- pattern variables -------------------------------------------------------------------
 static std::vector<PatternVariable> continuation_variable(const std::optional<ContinuationVar>& c) {
   if (!c) return {};
-  return {PatternVariable{c->desc->cont_id, c->desc->cont_type, c->desc->cont_loc,
-                          PatternVariableKind::Continuation_var, pt::Attributes{}, c->desc->cont_uid}};
+  return {PatternVariable{c->id, c->desc->val_type, c->desc->val_loc, PatternVariableKind::Continuation_var,
+                          pt::Attributes{}, c->desc->val_uid}};
 }
 
 std::shared_ptr<TypePatState> create_type_pat_state(const std::optional<ContinuationVar>& cont,
@@ -793,11 +793,9 @@ static TypeExpr* build_as_type_aux(env::t env, const tt::Pattern* p) {
 // to raise levels above the highest scope inside the pattern (see
 // typecore.ml).
 TypeExpr* solve_Ppat_alias(env::t env, const tt::Pattern* pat) {
-  TypeExpr* ty = ctype::with_local_level_generalize([&] {
+  return ctype::with_local_level_generalize([&] {
     return ctype::with_level(generic_level - 10, [&] { return build_as_type(env, pat); });
   });
-  check_scope_escape(pat->pat_loc, env, ctype::get_current_level(), ty);
-  return ty;
 }
 
 // Extracts the first element from a list matching a label
@@ -930,7 +928,7 @@ static std::pair<std::vector<TypeExpr*>, const tt::ConstructTypeAnnot*> solve_co
       return nullptr;
     };
     for (TypeExpr* tv : ty_ex) {
-      const TypeDesc* desc = get_folded_desc(false, tv);
+      const TypeDesc* desc = get_desc(tv);
       auto* c = as<Tconstr>(desc);
       IdDecl* found = nullptr;
       if (c && c->path->kind == Path::Kind::Pident && c->args.empty()) found = assoc(rem, c->path->id);
@@ -948,7 +946,7 @@ static std::pair<std::vector<TypeExpr*>, const tt::ConstructTypeAnnot*> solve_co
       // We have changed the definition, so clean up
       cleanup_abbrev_memo();
       // Since id is now abstract, this does not create a cycle
-      unify_pat_types(cty->ctyp_loc, env, newgenty(desc), dm->tv);
+      unify_pat_types(cty->ctyp_loc, env, tv, dm->tv);
       Ident::t rid = c->path->id;
       rem.erase(std::remove_if(rem.begin(), rem.end(),
                                [&](const IdDecl& x) { return ident::same(x.id, rid); }),

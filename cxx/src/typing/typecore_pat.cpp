@@ -569,15 +569,6 @@ env::t add_pattern_variables(env::t env, const std::vector<PatternVariable>& pv,
   return env;
 }
 
-// [add_let_pattern_vars] adds the pattern variables [pvs] to [env] for a let
-// bindings.  Additionally binds any type vars used in the patterns.
-env::t add_let_pattern_vars(env::t env, const std::vector<PatternVariable>& pvs,
-                            const std::vector<std::function<void()>>& bind_type_vars_delayed) {
-  env::t new_env = add_pattern_variables(env, pvs);
-  for (auto& f : bind_type_vars_delayed) f();
-  return new_env;
-}
-
 env::t add_module_variables(env::t env, const ModuleVariables& module_variables) {
   if (module_variables.kind != ModuleVariables::Kind::Modvars_allowed) return env;
   // List.fold_left over the list (head first)
@@ -636,23 +627,12 @@ enum class AbortReason { Adds_constraints, Empty };
 // Remember current typing state for backtracking
 struct UnificationState {
   Snapshot snapshot;
-  ctype::PatternEnv::State pattern_env;
+  env::t env;
 };
-static UnificationState save_state(ctype::PatternEnv* penv) {
-  return {btype::snapshot(), penv->save()};
-}
+static UnificationState save_state(ctype::PatternEnv* penv) { return {btype::snapshot(), penv->env}; }
 static void set_state(const UnificationState& s, ctype::PatternEnv* penv) {
   btype::backtrack(s.snapshot);
-  penv->reset(s.pattern_env);
-}
-
-// Type variables allocated when searching for counter-examples should be
-// discarded at the end of the search
-template <class F>
-static auto with_counterexample_pool(F&& f) -> decltype(f()) {
-  std::optional<decltype(f())> r;
-  btype::with_new_pool(ctype::get_current_level(), [&] { r.emplace(f()); });
-  return *r;
+  penv->set_env(s.env);
 }
 
 using K = std::function<const tt::Pattern*(const tt::Pattern*)>;
@@ -854,7 +834,7 @@ static const tt::Pattern* check_counter_example_pat(const CounterExampleInfo& in
         auto type_alternative = [&](const tt::Pattern* pat) {
           set_state(state, penv);
           // Type nodes should be discarded as soon as possible
-          return with_counterexample_pool([&] { return check_rec(pat, expected_ty, k); });
+          return check_rec(pat, expected_ty, k);
         };
         return find_valid_alternative(type_alternative, t);
       };
@@ -923,9 +903,7 @@ const tt::Pattern* partial_pred(long lev, SplittingMode splitting_mode, int expl
   UnificationState state = save_state(penv);
   CounterExampleInfo counter_example_args{explode, splitting_mode, false};
   try {
-    // Here we disable recovery (see typecore.ml)
-    const tt::Pattern* typed_p = with_counterexample_pool(
-        [&] { return check_counter_example_pat_top(counter_example_args, penv, p, expected_ty); });
+    const tt::Pattern* typed_p = check_counter_example_pat_top(counter_example_args, penv, p, expected_ty);
     set_state(state, penv);
     // types are invalidated but we don't need them here
     return typed_p;

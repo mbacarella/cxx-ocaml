@@ -811,7 +811,7 @@ lam_t transl_cont(Ident::t cont, Ident::t c_cont, lam_t body) {
 }
 
 matching::PatAction transl_case(scopes sc, Ident::t cont, const tt::Case* c) {
-  return {c->c_lhs, transl_cont(cont, c->c_cont ? c->c_cont->cont_id : nullptr,
+  return {c->c_lhs, transl_cont(cont, c->c_cont,
                                 transl_guard(sc, c->c_guard, c->c_rhs))};
 }
 

@@ -238,10 +238,6 @@ struct PatternEnv {
     Path::t source = nullptr;
     const TypeDeclaration* decl = nullptr;
   };
-  struct State {
-    env::t env;
-    std::vector<EnvOp> op_list;
-  };
   env::t env;
   std::vector<EnvOp> op_list;  // most recent first (the OCaml list)
   long equations_scope;
@@ -252,11 +248,6 @@ struct PatternEnv {
   Ident::t enter_type(long scope, std::string_view lbl, const TypeDeclaration* decl);
   void add_local_constraint(Path::t source, const TypeDeclaration* dest);
   void set_env(env::t e) { env = e; }
-  State save() const { return {env, op_list}; }
-  void reset(const State& s) {
-    env = s.env;
-    op_list = s.op_list;
-  }
   // with_mty penv id_pairs id mty f
   void with_mty(Slice<std::pair<ident::Unscoped*, ident::Unscoped*>> id_pairs,
                 ident::Unscoped* id, const ModuleType* mty, const std::function<void()>& f);
@@ -709,19 +700,6 @@ std::optional<btype::TypeSet> nongen_vars_in_schema(env::t env, TypeExpr* ty);
 btype::TypeSet nongen_class_declaration(const ClassDeclaration* cty);
 std::optional<btype::TypeSet> nongen_vars_in_class_declaration(const ClassDeclaration* cty);
 void normalize_type(TypeExpr* ty);
-struct ArrowArg {  // Arg_value of type_expr | Arg_module of Ident.Unscoped.t * package
-  bool is_module;
-  TypeExpr* value;
-  ident::Unscoped* id;
-  const Package* pack;
-};
-struct ArrowSpine {
-  std::vector<std::pair<ArgLabel, ArrowArg>> args;
-  bool ret_cycle = false;  // Ret_cycle | Ret_type ret
-  TypeExpr* ret = nullptr;
-};
-ArrowSpine arrow_spine(env::t env, TypeExpr* ty);
-std::pair<std::vector<ArgLabel>, bool> arrow_labels(env::t env, TypeExpr* ty);  // is_ret_tvar
 
 // ---- remove dependencies -------------------------------------------------------------------
 TypeExpr* nondep_type(env::t env, const std::vector<Ident::t>& ids, TypeExpr* ty);

@@ -110,14 +110,17 @@ bool has_poly_constraint(const pt::Pattern* spat);
 bool check_poly_constraint(const pt::Pattern* spat, env::t env, const ArgLabel& arg_label);
 
 // ---- unification helpers ------------------------------------------------------------
-struct ContinuationVar {
-  const tt::ContDesc* desc;
+struct ContinuationVar {  // (id, desc: Types.value_description)
+  Ident::t id;
+  const ValueDescription* desc;
 };
 std::optional<ContinuationVar> type_continuation_pat(env::t env, TypeExpr* expected_ty,
                                                      const pt::Pattern* sp);
 void unify_exp_types(const Location& loc, env::t env, TypeExpr* ty, TypeExpr* expected_ty,
                      const pt::Expression* sexp = nullptr);
 Location proper_exp_loc(const tt::Expression* exp);
+// List labels in a function type, and whether return type is a variable
+std::pair<std::vector<ArgLabel>, bool> list_labels(env::t env, TypeExpr* ty);
 void unify_exp(const pt::Expression* sexp, env::t env, const tt::Expression* exp,
                TypeExpr* expected_ty);
 void unify_pat_types(const Location& loc, env::t env, TypeExpr* ty, TypeExpr* ty2,

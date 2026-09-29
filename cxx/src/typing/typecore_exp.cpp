@@ -171,46 +171,54 @@ static const tt::Expression* type_expect_(Recarg recarg, env::t env, const pt::E
         return type_expect(env, with_desc(sexp, mkd(pt::Pexp_match{{SXK::Pexp_match}, sval, slice(cases)})),
                            ty_expected_explained);
       }
-      Slice<const tt::ValueBinding*> pat_exp_list;
-      const tt::Expression* body;
-      if (l->rec == RecFlag::Recursive) {
-        auto [pel, new_env] = type_let_rec(false, env, l->vbs);
-        body = type_expect(new_env, l->body, ty_expected_explained);
-        pat_exp_list = annotate_recursive_bindings(env, pel);
-      } else {
-        ExistentialRestriction existential_context =
-            l->vbs.size() > 1 ? ExistentialRestriction::In_group : ExistentialRestriction::With_attributes;
-        bool may_contain_modules_ = false;
-        for (auto* pvb : l->vbs)
-          if (may_contain_modules(pvb->pvb_pat)) may_contain_modules_ = true;
-        struct R {
-          Slice<const tt::ValueBinding*> pel;
-          const tt::Expression* body;
-          env::t new_env;
-        };
-        // If the patterns contain module unpacks, the types of the let body
-        // or bound expressions may mention types introduced by those
-        // unpacks: check for scope escape via both pathways.
-        R r = ctype::with_local_level_generalize_if(
-            may_contain_modules_,
-            [&] {
-              ModulePatternsRestriction allow_modules{ModulePatternsRestriction::Kind::Modules_rejected};
-              if (may_contain_modules_)
-                allow_modules = ModulePatternsRestriction{ModulePatternsRestriction::Kind::Modules_allowed,
-                                                          static_cast<int>(ctype::create_scope())};
-              auto [pel, new_env] = type_let_nonrec(false, existential_context, allow_modules, env, l->vbs);
-              const tt::Expression* b = type_expect(new_env, l->body, ty_expected_explained);
-              return R{pel, b, new_env};
-            },
-            [&](const R& r) {
-              // link the body's type to a fresh variable in the outer region,
-              // forcing an eager scope check
-              TypeExpr* v = ctype::newvar();
-              unify_exp(sexp, r.new_env, r.body, v);
-            });
-        pat_exp_list = r.pel;
-        body = r.body;
-      }
+      ExistentialRestriction existential_context = l->rec == RecFlag::Recursive ? ExistentialRestriction::In_rec
+                                                   : l->vbs.size() > 1            ? ExistentialRestriction::In_group
+                                                                                  : ExistentialRestriction::With_attributes;
+      bool may_contain_modules_ = false;
+      for (auto* pvb : l->vbs)
+        if (may_contain_modules(pvb->pvb_pat)) may_contain_modules_ = true;
+      long outer_level = ctype::get_current_level();
+      struct R {
+        Slice<const tt::ValueBinding*> pel;
+        const tt::Expression* body;
+        env::t new_env;
+      };
+      // If the patterns contain module unpacks, the types of the let body or
+      // bound expressions may mention types introduced by those unpacks: check
+      // for scope escape via both pathways (body, bound expressions).
+      R r = ctype::with_local_level_generalize_if(
+          may_contain_modules_,
+          [&] {
+            ModulePatternsRestriction allow_modules{ModulePatternsRestriction::Kind::Modules_rejected};
+            if (may_contain_modules_)
+              allow_modules = ModulePatternsRestriction{ModulePatternsRestriction::Kind::Modules_allowed,
+                                                        static_cast<int>(ctype::create_scope())};
+            auto [pel, new_env] = type_let(existential_context, env, l->rec, l->vbs, allow_modules);
+            const tt::Expression* b = type_expect(new_env, l->body, ty_expected_explained);
+            if (l->rec == RecFlag::Recursive) pel = annotate_recursive_bindings(env, pel);
+            // The "bound expressions" component of the scope escape check,
+            // relevant only for recursive module definitions.
+            if (l->rec == RecFlag::Recursive && may_contain_modules_) {
+              for (auto* vb : pel) {
+                // [type_let] already generalized bound expressions' types
+                // in-place: take an instance before checking scope escape at
+                // the outer level.
+                const tt::Expression* bound_exp = vb->vb_expr;
+                TypeExpr* bound_exp_type = ctype::instance(bound_exp->exp_type);
+                Location loc2 = proper_exp_loc(bound_exp);
+                TypeExpr* outer_var = ctype::newvar2(outer_level);
+                unify_exp_types(loc2, new_env, bound_exp_type, outer_var);
+              }
+            }
+            return R{pel, b, new_env};
+          },
+          [&](const R& r) {
+            // The "body" component of the scope escape check.
+            TypeExpr* v = ctype::newvar();
+            unify_exp(sexp, r.new_env, r.body, v);
+          });
+      Slice<const tt::ValueBinding*> pat_exp_list = r.pel;
+      const tt::Expression* body = r.body;
       return re(mk(mkd(tt::Texp_let{{XK::Texp_let}, l->rec, pat_exp_list, body}), loc, body->exp_type, env,
                 sexp->pexp_attributes));
     }

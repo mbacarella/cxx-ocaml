@@ -123,15 +123,10 @@ Slice<const tt::Case*> type_effect_cases(tt::PatternCategory category, env::t en
                                          const TypeExpected& ty_res_explained, const Location& loc,
                                          Slice<const pt::Case*> caselist,
                                          const std::vector<const pt::Pattern*>& conts);
-std::pair<Slice<const tt::ValueBinding*>, env::t> type_let_rec(bool reset_tyvarenv, env::t env,
-                                                               Slice<const pt::ValueBinding*> spat_sexp_list,
-                                                               const env::CheckFn& check = nullptr,
-                                                               const env::CheckFn& check_strict = nullptr);
-std::pair<Slice<const tt::ValueBinding*>, env::t> type_let_nonrec(
-    bool reset_tyvarenv, std::optional<ExistentialRestriction> existential_context,
-    const ModulePatternsRestriction& allow_modules, env::t env,
-    Slice<const pt::ValueBinding*> spat_sexp_list, const env::CheckFn& check = nullptr,
-    const env::CheckFn& check_strict = nullptr);
+std::pair<Slice<const tt::ValueBinding*>, env::t> type_let(
+    std::optional<ExistentialRestriction> existential_context, env::t env, RecFlag rec_flag,
+    Slice<const pt::ValueBinding*> spat_sexp_list, const ModulePatternsRestriction& allow_modules,
+    const env::CheckFn& check = nullptr, const env::CheckFn& check_strict = nullptr);
 std::pair<const tt::Expression*, Slice<const tt::BindingOp*>> type_andops(
     env::t env, const pt::Expression* sarg, Slice<const pt::BindingOp*> sands, TypeExpr* expected_ty);
 struct SendResult {

@@ -13,8 +13,6 @@ const tt::Pattern* as_comp_pattern(tt::PatternCategory category, const tt::Patte
 
 env::t add_pattern_variables(env::t env, const std::vector<PatternVariable>& pv, const env::CheckFn& check = nullptr,
                              const env::CheckFn& check_as = nullptr);
-env::t add_let_pattern_vars(env::t env, const std::vector<PatternVariable>& pvs,
-                            const std::vector<std::function<void()>>& bind_type_vars_delayed);
 env::t add_module_variables(env::t env, const ModuleVariables& module_variables);
 
 struct TypePatternResult {

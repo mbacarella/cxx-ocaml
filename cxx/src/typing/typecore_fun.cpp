@@ -120,30 +120,16 @@ TypeFunctionResult type_function(env::t env, Slice<const pt::FunctionParam*> par
       TypeExpr* ie = ctype::instance(ty_expected);
       unify_exp_types(loc, env, exp_type, ie);
     });
-    if (is_optional(arg_label)) {
-      Location pat_loc = r.pat->pat_loc;
-      auto raise_unerasable_optional_argument = [pat_loc] {
-        prerr_warning(pat_loc, WK::Unerasable_optional_argument);
-      };
-      // [arrow_labels] does expansion and is potentially expensive;
-      // only call this when necessary.
-      auto only_labels_function_ret_tvar = [env](TypeExpr* ty) -> std::optional<bool> {
-        auto [labels, is_ret_tvar] = ctype::arrow_labels(env, ty);
-        for (auto& l : labels)
-          if (l.kind == ArgLabel::Kind::Nolabel) return std::nullopt;
-        return is_ret_tvar;
-      };
-      std::optional<bool> o = only_labels_function_ret_tvar(ty_ret);
-      if (o == true) {
-        // We don't necessarily know [ty] is a function with only labelled
-        // args since unification may change this. So we add a delayed check.
-        add_delayed_check([only_labels_function_ret_tvar, ty_ret, raise_unerasable_optional_argument] {
-          if (only_labels_function_ret_tvar(ty_ret) == false) raise_unerasable_optional_argument();
-        });
-      } else if (o == false) {
-        raise_unerasable_optional_argument();
-      }
-    }
+    auto not_nolabel_function = [env](TypeExpr* ty) {
+      // [list_labels] does expansion and is potentially expensive; only
+      // call this when necessary.
+      auto [ls, tvar] = list_labels(env, ty);
+      for (auto& l : ls)
+        if (l.kind == ArgLabel::Kind::Nolabel) return false;
+      return !tvar;
+    };
+    if (is_optional(arg_label) && not_nolabel_function(ty_ret))
+      prerr_warning(r.pat->pat_loc, WK::Unerasable_optional_argument);
     tt::FunctionParamKind fp_kind{tt::FunctionParamKind::Kind::Tparam_pat, r.pat};
     Ident::t fp_param;
     if (!default_arg) {
@@ -500,8 +486,8 @@ const tt::Expression* type_argument_x(Explanation explanation, Recarg recarg, en
                                       TypeExpr* ty_expected_, TypeExpr* ty_expected) {
   // ty_expected' may be generic
   auto no_labels = [&](TypeExpr* ty) {
-    auto [ls, is_ret_tvar] = ctype::arrow_labels(env, ty);
-    if (is_ret_tvar) return false;
+    auto [ls, tvar] = list_labels(env, ty);
+    if (tvar) return false;
     for (auto& l : ls)
       if (l.kind != ArgLabel::Kind::Nolabel) return false;
     return true;
@@ -723,8 +709,8 @@ std::pair<Slice<tt::LabeledArg>, TypeExpr*> type_application(
   TypeExpr* ty = funct->exp_type;
   bool ignore_labels = clflags::classic;
   if (!ignore_labels) {
-    auto [ls, is_ret_tvar] = ctype::arrow_labels(env, ty);
-    if (!is_ret_tvar) {
+    auto [ls, tvar] = list_labels(env, ty);
+    if (!tvar) {
       std::vector<ArgLabel> labels;
       for (auto& l : ls)
         if (!is_optional(l)) labels.push_back(l);

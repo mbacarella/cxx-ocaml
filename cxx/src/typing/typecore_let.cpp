@@ -26,7 +26,7 @@ std::pair<Slice<const tt::Case*>, tt::Partial> type_cases(
   TypeBody<const pt::Case*, const tt::Case*> tb =
       [&](const pt::Case* const& c, const tt::Pattern* pat, env::t when_env, env::t ext_env,
           const std::optional<ContinuationVar>& cont, TypeExpr* ty_expected, TypeExpr* ty_infer, bool) {
-        const tt::ContDesc* c_cont = cont ? cont->desc : nullptr;
+        Ident::t c_cont = cont ? cont->id : nullptr;
         const tt::Expression* guard = nullptr;
         if (c->pc_guard)
           // The continuation is made inaccessible in the `when' expression
@@ -72,6 +72,7 @@ Slice<const tt::Case*> type_effect_cases(tt::PatternCategory category, env::t en
                                          const Location& loc, Slice<const pt::Case*> caselist,
                                          const std::vector<const pt::Pattern*>& conts) {
   TypeExpr* ty_res = ty_res_explained.ty;
+  (void)ctype::newvar();
   // remember original level
   return ctype::with_local_level([&] {
     // Create a locally abstract type for effect type.
@@ -204,106 +205,18 @@ static ExpList type_let_def_wrap_warnings(
   return exp_list;
 }
 
-static std::pair<PatList, ExpList> type_let_exps(const env::CheckFn& check, const env::CheckFn& check_strict,
-                                                 bool is_recursive, env::t exp_env, env::t new_env,
-                                                 const std::vector<pt::Attributes>& attrs_list,
-                                                 const std::vector<const tt::Pattern*>& pats,
-                                                 const std::vector<PatternVariable>& pvs,
-                                                 Slice<const pt::ValueBinding*> spat_sexp_list) {
-  // Instantiate the pattern types: the instantiated type is the pattern
-  // type, the non-instantiated one the expected type in check_let_univars.
-  PatList pat_list;
-  for (auto* pat : pats) {
-    tt::Pattern* p2 = make<tt::Pattern>(*pat);
-    p2->pat_type = ctype::instance(pat->pat_type);
-    pat_list.push_back({p2, pat->pat_type});
-  }
-  ExpList exp_list = type_let_def_wrap_warnings(
-      check, check_strict, is_recursive, exp_env, new_env, spat_sexp_list, attrs_list, pat_list, pvs,
-      [](env::t exp_env2, const pt::ValueBinding* vb, TypeExpr* expected_ty)
-          -> std::pair<const tt::Expression*, std::optional<std::vector<TypeExpr*>>> {
-        const pt::Expression* sexp = vb_exp_constraint(vb);
-        // Type annotations of the form ['a ... 'c. tau] on patterns
-        // introduce polytypes: instantiate them, and check that the
-        // instantiated univars are generalized (check_let_univars).
-        if (auto* p = as<Tpoly>(get_desc(expected_ty))) {
-          auto [vars, ty2] = ctype::with_local_level_generalize_structure_if_principal(
-              [&] { return ctype::instance_poly_fixed(p->vars, p->body, true); });
-          const tt::Expression* exp = builtin_attributes::warning_scope(
-              vb->pvb_attributes, [&] { return type_expect(exp_env2, sexp, mk_expected(ty2)); });
-          return {exp, vars};
-        }
-        const tt::Expression* exp = builtin_attributes::warning_scope(
-            vb->pvb_attributes, [&] { return type_expect(exp_env2, sexp, mk_expected(expected_ty)); });
-        return {exp, std::nullopt};
-      });
-  return {pat_list, exp_list};
-}
-
-std::pair<Slice<const tt::ValueBinding*>, env::t> type_let_rec(bool reset_tyvarenv, env::t env,
-                                                               Slice<const pt::ValueBinding*> spat_sexp_list,
-                                                               const env::CheckFn& check,
-                                                               const env::CheckFn& check_strict) {
-  std::vector<std::pair<pt::Attributes, const pt::Pattern*>> spatl;
-  for (auto* vb : spat_sexp_list) spatl.push_back(vb_pat_constraint(vb));
-  std::vector<pt::Attributes> attrs_list;
-  for (auto& x : spatl) attrs_list.push_back(x.first);
-  // Recursive patterns can only consist of (possibly annotated) variables.
-  for (auto* vb : spat_sexp_list)
-    if (!is_var_pat(vb->pvb_pat)) raise_error(err(vb->pvb_pat->ppat_loc, env, EK::Illegal_letrec_pat));
-  struct R {
-    PatList pat_list;
-    ExpList exp_list;
-    env::t new_env;
-  };
-  R r = ctype::with_local_level_generalize(
-      [&] {
-        // We must reset the tyvarenv in this local region since it resets
-        // the global level
-        if (reset_tyvarenv) typetexp::ty_var_env::reset();
-        struct P {
-          std::vector<const tt::Pattern*> pat_list;
-          env::t new_env;
-          std::vector<std::function<void()>> force;
-          std::vector<PatternVariable> pvs;
-        };
-        P p = ctype::with_local_level_generalize_structure_if_principal([&] {
-          // Typecheck the patterns
-          std::vector<TypeExpr*> nvs;
-          for (std::size_t k = 0; k < spatl.size(); ++k) nvs.push_back(ctype::newvar());
-          TypePatternListResult tp = ctype::with_local_level_generalize([&] {
-            return type_pattern_list(tt::PatternCategory::Value, ExistentialRestriction::In_rec, env, spatl, nvs,
-                                     ModulePatternsRestriction{ModulePatternsRestriction::Kind::Modules_rejected});
-          });
-          // Approximate the type of the recursive binding
-          if (tp.patl.size() != spat_sexp_list.size()) throw std::invalid_argument("List.iter2");
-          for (std::size_t k = 0; k < tp.patl.size(); ++k) {
-            TypeExpr* pat_type = tp.patl[k]->pat_type;
-            if (auto* poly = as<Tpoly>(get_desc(pat_type)))
-              pat_type = ctype::instance_poly(poly->vars, poly->body, true);
-            const pt::Expression* bound_expr = vb_exp_constraint(spat_sexp_list[k]);
-            type_approx(env, bound_expr, pat_type);
-          }
-          return P{tp.patl, tp.env, tp.pattern_forces, tp.pvs};
-        });
-        env::t new_env = add_let_pattern_vars(p.new_env, p.pvs, p.force);
-        auto [pat_list, exp_list] =
-            type_let_exps(check, check_strict, true, new_env, new_env, attrs_list, p.pat_list, p.pvs, spat_sexp_list);
-        return R{pat_list, exp_list, new_env};
-      },
-      [&](const R& r) { do_relaxed_value_restriction(env, r.pat_list, r.exp_list); });
-  check_let_univars(env, r.pat_list, r.exp_list);
-  return {value_bindings_of_pat_exp_lists(r.pat_list, r.exp_list, spat_sexp_list), r.new_env};
-}
-
-std::pair<Slice<const tt::ValueBinding*>, env::t> type_let_nonrec(
-    bool reset_tyvarenv, std::optional<ExistentialRestriction> existential_context,
-    const ModulePatternsRestriction& allow_modules, env::t env, Slice<const pt::ValueBinding*> spat_sexp_list,
+std::pair<Slice<const tt::ValueBinding*>, env::t> type_let(
+    std::optional<ExistentialRestriction> existential_context, env::t env, RecFlag rec_flag,
+    Slice<const pt::ValueBinding*> spat_sexp_list, const ModulePatternsRestriction& allow_modules,
     const env::CheckFn& check, const env::CheckFn& check_strict) {
   std::vector<std::pair<pt::Attributes, const pt::Pattern*>> spatl;
   for (auto* vb : spat_sexp_list) spatl.push_back(vb_pat_constraint(vb));
   std::vector<pt::Attributes> attrs_list;
   for (auto& x : spatl) attrs_list.push_back(x.first);
+  bool is_recursive = rec_flag == RecFlag::Recursive;
+  if (is_recursive)
+    for (auto* vb : spat_sexp_list)
+      if (!is_var_pat(vb->pvb_pat)) raise_error(err(vb->pvb_pat->ppat_loc, env, EK::Illegal_letrec_pat));
   struct R {
     PatList pat_list;
     ExpList exp_list;
@@ -312,14 +225,25 @@ std::pair<Slice<const tt::ValueBinding*>, env::t> type_let_nonrec(
   };
   R r = ctype::with_local_level_generalize(
       [&] {
-        // We must reset the tyvarenv in this local region since it resets
-        // the global level
-        if (reset_tyvarenv) typetexp::ty_var_env::reset();
+        if (existential_context == ExistentialRestriction::At_toplevel) typetexp::ty_var_env::reset();
         TypePatternListResult tp = ctype::with_local_level_generalize_structure_if_principal([&] {
           std::vector<TypeExpr*> nvs;
           for (std::size_t k = 0; k < spatl.size(); ++k) nvs.push_back(ctype::newvar());
-          TypePatternListResult res =
-              type_pattern_list(tt::PatternCategory::Value, existential_context, env, spatl, nvs, allow_modules);
+          TypePatternListResult res = ctype::with_local_level_generalize_if(is_recursive, [&] {
+            return type_pattern_list(tt::PatternCategory::Value, existential_context, env, spatl, nvs,
+                                     allow_modules);
+          });
+          // If recursive, first unify with an approximation of the expression
+          if (is_recursive) {
+            if (res.patl.size() != spat_sexp_list.size()) throw std::invalid_argument("List.iter2");
+            for (std::size_t k = 0; k < res.patl.size(); ++k) {
+              TypeExpr* pat_type = res.patl[k]->pat_type;
+              if (auto* poly = as<Tpoly>(get_desc(pat_type)))
+                pat_type = ctype::instance_poly(poly->vars, poly->body, true);
+              const pt::Expression* bound_expr = vb_exp_constraint(spat_sexp_list[k]);
+              type_approx(env, bound_expr, pat_type);
+            }
+          }
           // Polymorphic variant processing
           for (auto* pat : res.patl)
             if (has_variants(pat)) {
@@ -328,12 +252,39 @@ std::pair<Slice<const tt::ValueBinding*>, env::t> type_let_nonrec(
             }
           return res;
         });
-        // Note [add_module_variables after checking expressions]: the
-        // module variables are added after the expressions are typed.
-        env::t new_env = add_let_pattern_vars(tp.env, tp.pvs, tp.pattern_forces);
-        auto [pat_list, exp_list] =
-            type_let_exps(check, check_strict, false, env, new_env, attrs_list, tp.patl, tp.pvs, spat_sexp_list);
-        // Do exhaustiveness checks on patterns
+        // Note [add_module_variables after checking expressions]: don't call
+        // [add_module_variables] here, because its use of [type_module] will
+        // fail until after we have type-checked the expression of the let.
+        env::t new_env = add_pattern_variables(tp.env, tp.pvs);
+        PatList pat_list;
+        for (auto* pat : tp.patl) {
+          tt::Pattern* p2 = make<tt::Pattern>(*pat);
+          p2->pat_type = ctype::instance(pat->pat_type);
+          pat_list.push_back({p2, pat->pat_type});
+        }
+        // Only bind pattern variables after generalizing
+        for (auto& f : tp.pattern_forces) f();
+        // See Note [add_module_variables after checking expressions]
+        // We can't defer type-checking module variables with recursive
+        // definitions, so things like [let rec (module M) = m in ...] always
+        // fail, even if the type of [m] is known.
+        env::t exp_env = is_recursive ? add_module_variables(new_env, tp.mvs) : env;
+        ExpList exp_list = type_let_def_wrap_warnings(
+            check, check_strict, is_recursive, exp_env, new_env, spat_sexp_list, attrs_list, pat_list, tp.pvs,
+            [](env::t exp_env2, const pt::ValueBinding* vb, TypeExpr* expected_ty)
+                -> std::pair<const tt::Expression*, std::optional<std::vector<TypeExpr*>>> {
+              const pt::Expression* sexp = vb_exp_constraint(vb);
+              if (auto* p = as<Tpoly>(get_desc(expected_ty))) {
+                auto [vars, ty2] = ctype::with_local_level_generalize_structure_if_principal(
+                    [&] { return ctype::instance_poly_fixed(p->vars, p->body, true); });
+                const tt::Expression* exp = builtin_attributes::warning_scope(
+                    vb->pvb_attributes, [&] { return type_expect(exp_env2, sexp, mk_expected(ty2)); });
+                return {exp, vars};
+              }
+              const tt::Expression* exp = builtin_attributes::warning_scope(
+                  vb->pvb_attributes, [&] { return type_expect(exp_env2, sexp, mk_expected(expected_ty)); });
+              return {exp, std::nullopt};
+            });
         if (pat_list.size() != spatl.size() || exp_list.size() != spatl.size())
           throw std::invalid_argument("List.map2");
         for (std::size_t k = 0; k < pat_list.size(); ++k) {
@@ -511,26 +462,16 @@ SendResult type_send(env::t env, const Location& loc, Explanation explanation, c
 TypeBindingResult type_binding(env::t env, RecFlag rec_flag, Slice<const pt::ValueBinding*> spat_sexp_list) {
   env::CheckFn check = [](std::string s) { return warnings::Warning::with_s(WK::Unused_value_declaration, s); };
   env::CheckFn check_strict = check;
-  if (rec_flag == RecFlag::Recursive) {
-    auto [vbs, e] = type_let_rec(true, env, spat_sexp_list, check, check_strict);
-    return {vbs, e};
-  }
-  auto [vbs, e] = type_let_nonrec(true, ExistentialRestriction::At_toplevel,
-                                  ModulePatternsRestriction{ModulePatternsRestriction::Kind::Modules_rejected}, env,
-                                  spat_sexp_list, check, check_strict);
+  auto [vbs, e] = type_let(ExistentialRestriction::At_toplevel, env, rec_flag, spat_sexp_list,
+                           ModulePatternsRestriction{ModulePatternsRestriction::Kind::Modules_rejected}, check,
+                           check_strict);
   return {vbs, e};
 }
 
-TypeBindingResult type_let(std::optional<ExistentialRestriction> existential_context, env::t env, RecFlag rec_flag,
+TypeBindingResult type_let(std::optional<ExistentialRestriction> existential_ctx, env::t env, RecFlag rec_flag,
                            Slice<const pt::ValueBinding*> spat_sexp_list) {
-  bool reset_tyvarenv = existential_context == ExistentialRestriction::At_toplevel;
-  if (rec_flag == RecFlag::Recursive) {
-    auto [vbs, e] = type_let_rec(reset_tyvarenv, env, spat_sexp_list);
-    return {vbs, e};
-  }
-  auto [vbs, e] = type_let_nonrec(reset_tyvarenv, existential_context,
-                                  ModulePatternsRestriction{ModulePatternsRestriction::Kind::Modules_rejected}, env,
-                                  spat_sexp_list);
+  auto [vbs, e] = type_let(existential_ctx, env, rec_flag, spat_sexp_list,
+                           ModulePatternsRestriction{ModulePatternsRestriction::Kind::Modules_rejected});
   return {vbs, e};
 }
 

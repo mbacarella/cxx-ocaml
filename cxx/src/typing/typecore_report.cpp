@@ -267,7 +267,7 @@ Report report_unification_error(const Location& loc, std::vector<Msg> sub, env::
       std::move(sub));
 }
 
-Report report_too_many_arg_error(const tt::Expression* funct, const out_type::ExpansionPair& func_ty,
+Report report_too_many_arg_error(const tt::Expression* funct, TypeExpr* func_ty,
                                  const Location& previous_arg_loc, const Location& extra_arg_loc, bool returns_unit,
                                  const Location& loc) {
   auto cnum_offset = [](long off, Position pos) {
@@ -283,22 +283,13 @@ Report report_too_many_arg_error(const tt::Expression* funct, const out_type::Ex
   sub.push_back(location::msg(extra_arg_loc, "This extra argument is not expected."));
   return location::errorf_sub(app_loc, std::move(sub), "@[<v>@[<2>%a@ %a@]@ It is applied to too many arguments@]",
                               [&](Formatter& f) { report_this_texp_has_type("function", f, funct); },
-                              [&](Formatter& f) { printtyp::type_expansion(Mode::Type, f, func_ty); });
+                              [&](Formatter& f) { printtyp::type_expr(f, func_ty); });
 }
-
-out_type::ExpansionPair expand_type(env::t env, TypeExpr* ty) { return {ty, ctype::full_expand(true, env, ty)}; }
 
 std::string prefixed_label_name(const ArgLabel& l) { return btype::prefixed_label_name(l); }
 
 Report report_error(const Location& loc, env::t env, const typecore::Error& err) {
-  auto print_expanded = [env](TypeExpr* ty) {
-    return [env, ty](Formatter& fmt) {
-      out_type::prepare_for_printing({});
-      out_type::ExpansionPair ty_exp = expand_type(env, ty);
-      ty_exp = out_type::prepare_expansion(ty_exp);
-      printtyp::type_expansion(Mode::Type, fmt, ty_exp);
-    };
-  };
+  auto type_expr_code = [](TypeExpr* ty) { return misc::style::code(printtyp::type_expr, ty); };
   auto msg = [](auto&&... a) { return doc_printf(std::forward<decltype(a)>(a)...); };
   switch (err.kind) {
     case EK::Constructor_arity_mismatch:
@@ -313,12 +304,12 @@ Report report_error(const Location& loc, env::t env, const typecore::Error& err)
     case EK::Extra_tuple_label:
       return location::errorf(
           loc, "This pattern was expected to match values of type@ %a,@ but it contains an extra %a.",
-          print_expanded(err.ty), [&](Formatter& f) { tuple_component(false, f, err.optlabel); });
+          type_expr_code(err.ty), [&](Formatter& f) { tuple_component(false, f, err.optlabel); });
     case EK::Missing_tuple_label: {
       bool labeled = err.optlabel.some;
       return location::errorf(
           loc, "This pattern was expected to match values of type@ %a,@ but it is missing %a.%a",
-          print_expanded(err.ty), [&](Formatter& f) { tuple_component(true, f, err.optlabel); },
+          type_expr_code(err.ty), [&](Formatter& f) { tuple_component(true, f, err.optlabel); },
           [labeled](Formatter& f) {
             if (labeled) fprintf(f, "@ Hint: use .. to ignore some components.");
           });
@@ -370,9 +361,9 @@ Report report_error(const Location& loc, env::t env, const typecore::Error& err)
           "syntactic arguments, but its type is constrained to@ %a.@]@ @]@ @[@[<2>@{<hint>Hint@}: consider "
           "splitting the function definition into@ %a@ where %a is the pattern with the GADT constructor that@ "
           "introduces the local type equation%t.@]",
-          err.n1, print_expanded(err.ty), code_str("fun ... gadt_pat -> fun ..."), code_str("gadt_pat"),
+          err.n1, type_expr_code(err.ty), code_str("fun ... gadt_pat -> fun ..."), code_str("gadt_pat"),
           [&](Formatter& f) {
-            if (type_with_local_equation) fprintf(f, " on %a", print_expanded(type_with_local_equation));
+            if (type_with_local_equation) fprintf(f, " on %a", type_expr_code(type_with_local_equation));
           });
     }
     case EK::Apply_non_function: {
@@ -380,10 +371,9 @@ Report report_error(const Location& loc, env::t env, const typecore::Error& err)
       if (k == DescKind::Tarrow || k == DescKind::Tfunctor) {
         bool returns_unit = false;
         if (auto* c = as<Tconstr>(types::get_desc(err.ty2))) returns_unit = path::same(c->path, predef::paths().unit);
-        out_type::ExpansionPair func_ty = expand_type(env, err.ty);
-        return report_too_many_arg_error(err.texp, func_ty, err.loc2, err.loc3, returns_unit, loc);
+        return report_too_many_arg_error(err.texp, err.ty, err.loc2, err.loc3, returns_unit, loc);
       }
-      return location::errorf(loc, "@[<v>@[<2>This expression has type@ %a@]@ %s@]", print_expanded(err.ty),
+      return location::errorf(loc, "@[<v>@[<2>This expression has type@ %a@]@ %s@]", type_expr_code(err.ty),
                               "This is not a function; it cannot be applied.");
     }
     case EK::Apply_wrong_label: {
@@ -428,7 +418,7 @@ Report report_error(const Location& loc, env::t env, const typecore::Error& err)
           const typecore::TypeExpected& te = err.expected;
           std::string eorp = err.name;
           auto intro = [&](Formatter& f) {
-            fprintf(f, "@[%s type@;<1 2>%a%a@]@\n", eorp, print_expanded(te.ty),
+            fprintf(f, "@[%s type@;<1 2>%a%a@]@\n", eorp, type_expr_code(te.ty),
                     [&](Formatter& ff) { fd::pp_doc(ff, report_type_expected_explanation_opt(te.explanation)); });
           };
           Doc main = doc_printf("@{<ralign>There is no %s @}%a within type %a",
@@ -465,14 +455,14 @@ Report report_error(const Location& loc, env::t env, const typecore::Error& err)
     }
     case EK::Invalid_format: return location::errorf(loc, "%s", err.name);
     case EK::Not_an_object:
-      return location::errorf(loc, "This expression is not an object;@ it has type %a%a", print_expanded(err.ty),
+      return location::errorf(loc, "This expression is not an object;@ it has type %a%a", type_expr_code(err.ty),
                               [&](Formatter& f) { fd::pp_doc(f, report_type_expected_explanation_opt(err.explanation)); });
     case EK::Undefined_method: {
       Report r;
       printtyp::wrap_printing_env(true, env, [&] {
         TypeExpr* ty = err.texp->exp_type;
         auto intro = [&](Formatter& f) {
-          fprintf(f, "@[<v>@[This expression has type@;<1 2>%a@]@,@]", print_expanded(ty));
+          fprintf(f, "@[<v>@[This expression has type@;<1 2>%a@]@,@]", type_expr_code(ty));
         };
         Doc main = doc_printf("@{<ralign>It has no method @}%a", code_str(err.name));
         std::vector<Msg> sub;
@@ -529,11 +519,11 @@ Report report_error(const Location& loc, env::t env, const typecore::Error& err)
     }
     case EK::Not_a_function:
       return location::errorf(loc, "This expression should not be a function,@ the expected type is@ %a%a",
-                              print_expanded(err.ty),
+                              type_expr_code(err.ty),
                               [&](Formatter& f) { fd::pp_doc(f, report_type_expected_explanation_opt(err.explanation)); });
     case EK::Too_many_arguments:
       return location::errorf(loc, "This function expects too many arguments,@ it should have type@ %a%a",
-                              print_expanded(err.ty),
+                              type_expr_code(err.ty),
                               [&](Formatter& f) { fd::pp_doc(f, report_type_expected_explanation_opt(err.explanation)); });
     case EK::Abstract_wrong_label: {
       const ArgLabel &got = err.label, &expected = err.label2;
@@ -551,18 +541,18 @@ Report report_error(const Location& loc, env::t env, const typecore::Error& err)
       return location::errorf(
           loc,
           "@[<v>@[<2>This function should have type@ %a%a@]@,@[but its first argument is %a@ instead of %s%a@]@]",
-          print_expanded(err.ty),
+          type_expr_code(err.ty),
           [&](Formatter& f) { fd::pp_doc(f, report_type_expected_explanation_opt(err.explanation)); },
           label(true, got), second_long ? "being " : "", label(second_long, expected));
     }
     case EK::Private_type:
-      return location::errorf(loc, "Cannot create values of the private type %a", print_expanded(err.ty));
+      return location::errorf(loc, "Cannot create values of the private type %a", type_expr_code(err.ty));
     case EK::Private_label:
       return location::errorf(loc, "Cannot assign field %a of the private type %a", quoted_longident(err.lid),
-                              print_expanded(err.ty));
+                              type_expr_code(err.ty));
     case EK::Private_constructor:
       return location::errorf(loc, "Cannot use private constructor %a to create values of type %a",
-                              code_str(std::string(err.cstr->cstr_name)), print_expanded(err.ty));
+                              code_str(std::string(err.cstr->cstr_name)), type_expr_code(err.ty));
     case EK::Not_a_polymorphic_variant_type:
       return location::errorf(loc, "The type %a@ is not a variant type", quoted_longident(err.lid));
     case EK::Incoherent_label_order:
@@ -577,7 +567,7 @@ Report report_error(const Location& loc, env::t env, const typecore::Error& err)
       return location::errorf(loc, "The signature for this packaged module couldn't be inferred.");
     case EK::Not_a_packed_module:
       return location::errorf(loc, "This expression is packed module, but the expected type is@ %a",
-                              print_expanded(err.ty));
+                              type_expr_code(err.ty));
     case EK::Unexpected_existential: {
       using R = typecore::ExistentialRestriction;
       auto reason_str = [&](Formatter& f) {
@@ -700,7 +690,7 @@ Report report_error(const Location& loc, env::t env, const typecore::Error& err)
                               misc::style::code(printtyp::ident, err.id),
                               "can only be given to an existential variable",
                               "introduced by this GADT constructor", "The type annotation tries to bind it to",
-                              reason1, print_expanded(err.ty), reason2);
+                              reason1, type_expr_code(err.ty), reason2);
     }
     case EK::Missing_type_constraint:
       return location::errorf(loc, "@[%s@ %s@]", "Existential types introduced in a constructor pattern",
@@ -717,12 +707,12 @@ Report report_error(const Location& loc, env::t env, const typecore::Error& err)
         case typecore::WrongKindSort::Record: sort = "record"; break;
       }
       return location::errorf(loc, "This %s should not be a %s,@ the expected type is@ %a%a", ctx, sort,
-                              print_expanded(err.ty),
+                              type_expr_code(err.ty),
                               [&](Formatter& f) { fd::pp_doc(f, report_type_expected_explanation_opt(explanation)); });
     }
     case EK::Expr_not_a_record_type:
       return location::errorf(loc, "This expression has type %a@ which is not a record type.",
-                              print_expanded(err.ty));
+                              type_expr_code(err.ty));
     case EK::Repeated_tuple_exp_label:
       return location::errorf(loc, "@[This tuple expression has two labels named %a@]", code_str(err.name));
     case EK::Repeated_tuple_pat_label:
@@ -742,7 +732,7 @@ Report report_error(const Location& loc, env::t env, const typecore::Error& err)
     case EK::Cannot_omit_tfunctor_argument:
       return location::errorf(
           loc, "@[<v>@[<2>This function has type@ %a@]@ The module argument %a cannot be omitted in this application.@]",
-          print_expanded(err.ty), code_str(std::string(ident::Unscoped::name_of(err.us))));
+          type_expr_code(err.ty), code_str(std::string(ident::Unscoped::name_of(err.us))));
   }
   return location::errorf(loc, "?");
 }

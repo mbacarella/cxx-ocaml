@@ -13,13 +13,13 @@ branches' cxx/ differ only by the backport.
 Status: [ ] to do, [x] done, [-] no C++ counterpart / no effect.
 Lines = changed lines in the upstream diff.
 
-- [ ] typing/typecore.ml (2163)
+- [x] typing/typecore.ml (2163)
 - [x] typing/ctype.ml (1387)
 - [ ] typing/typemod.ml (965)
 - [ ] typing/typedecl.ml (774)
 - [ ] typing/env.ml (532)
 - [ ] utils/utf8_lexeme.ml (321)
-- [ ] typing/typeclass.ml (321)
+- [x] typing/typeclass.ml (321)
 - [ ] bytecomp/bytegen.ml (266)
 - [ ] utils/misc.ml (258)
 - [x] typing/out_type.ml (218)

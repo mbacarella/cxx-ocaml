@@ -49,12 +49,9 @@ struct FullClass {
   const tt::ClassInfos<B>* req;
 };
 
-enum class Final { Definitely_final, Maybe_final, Definitely_not_final };
+enum class Final { Final, Not_final };
 
-Kind kind_of_final(Final f) { return f == Final::Definitely_final ? Kind::Object : Kind::Class; }
-Final inheriting_final(Final f) {
-  return f == Final::Definitely_not_final ? Final::Definitely_not_final : Final::Maybe_final;
-}
+Kind kind_of_final(Final f) { return f == Final::Final ? Kind::Object : Kind::Class; }
 
 [[noreturn]] void raise_error(const Error& e) { typing_recovery::log_and_raise(e); }
 Error err(const Location& loc, env::t env, EK k) { return Error(loc, env, k); }
@@ -115,18 +112,27 @@ Constraints extract_constraints(const ClassType* cty) {
 
 void update_class_signature(const Location& loc, env::t env, VirtualFlag virt, Kind kind, ClassSignature* sign,
                             bool warn_implicit_public = false) {
-  std::vector<std::string_view> implicitly_public = ctype::update_implicitly_public_methods(sign);
-  if (warn_implicit_public && !implicitly_public.empty()) {
-    std::vector<std::string> l(implicitly_public.begin(), implicitly_public.end());
-    location::prerr_warning(loc, warnings::Warning::with_l(warnings::Warning::K::Implicit_public_methods, l));
-  }
-  std::vector<std::string_view> implicitly_declared = ctype::update_implicitly_declared_methods(env, sign);
-  if (!implicitly_declared.empty() && virt == VirtualFlag::Concrete) {
+  auto [implicit_public, implicit_declared] = ctype::update_class_signature(env, sign);
+  if (!implicit_declared.empty() && virt == VirtualFlag::Concrete) {
     Error e = err(loc, env, EK::Undeclared_methods);
     e.class_kind = kind;
-    e.names = implicitly_declared;
+    e.names = implicit_declared;
     raise_error(e);
   }
+  if (warn_implicit_public && !implicit_public.empty()) {
+    std::vector<std::string> l(implicit_public.begin(), implicit_public.end());
+    location::prerr_warning(loc, warnings::Warning::with_l(warnings::Warning::K::Implicit_public_methods, l));
+  }
+}
+
+void complete_class_signature(const Location& loc, env::t env, VirtualFlag virt, Kind kind, ClassSignature* sign) {
+  update_class_signature(loc, env, virt, kind, sign, false);
+  ctype::hide_private_methods(env, sign);
+}
+
+void complete_class_type(const Location& loc, env::t env, VirtualFlag virt, Kind kind, const ClassType* typ) {
+  ClassSignature* sign = signature_of_class_type(typ);
+  complete_class_signature(loc, env, virt, kind, sign);
 }
 
 void check_virtual(const Location& loc, env::t env, VirtualFlag virt, Kind kind, const ClassSignature* sign) {
@@ -164,11 +170,6 @@ TypeExpr* constructor_type(TypeExpr* constr, const ClassType* cty) {
     }
   }
   throw std::logic_error("constructor_type");
-}
-
-void add_dummy_method(env::t env, Final final, long scope, ClassSignature* sign) {
-  // Don't prevent closing the self type if it might be final
-  if (final == Final::Definitely_not_final) ctype::add_dummy_method(env, scope, sign);
 }
 
 // ---- primitives for typing classes ------------------------------------------------------
@@ -317,8 +318,7 @@ const tt::ClassTypeField* class_type_field(env::t env, ClassSignature* sign, lon
       return builtin_attributes::warning_scope(ctf->pctf_attributes, [&] {
         const tt::ClassType* parent =
             class_type_rec(env, VirtualFlag::Virtual, self_scope, as<pt::Pctf_inherit>(d)->cty);
-        ClassSignature* parent_sign = signature_of_class_type(parent->cltyp_type);
-        update_class_signature(parent->cltyp_loc, env, VirtualFlag::Virtual, Kind::Class_type, parent_sign);
+        complete_class_type(parent->cltyp_loc, env, VirtualFlag::Virtual, Kind::Class_type, parent->cltyp_type);
         inherit_class_type(false, loc, env, sign, parent->cltyp_type);
         return mkctf(mkd(tt::Tctf_inherit{{FK::Tctf_inherit}, parent}));
       });
@@ -412,12 +412,9 @@ const tt::ClassType* class_type_aux(env::t env, VirtualFlag virt, long self_scop
         raise_error(e);
       }
       auto [params, clty] = ctype::instance_class(decl->clty_params, decl->clty_type);
-      ClassSignature* sign = signature_of_class_type(clty);
       // Adding a dummy method to the self type prevents it from being closed
       // / escaping.
-      ctype::add_dummy_method(env, self_scope, sign);
-      ctype::reveal_private_methods(env, sign);
-      ctype::set_object_name(decl->clty_path, slice(params), sign->csig_self);
+      ctype::add_dummy_method(env, self_scope, signature_of_class_type(clty));
       if (params.size() != c->args.size()) {
         Error e = err(scty->pcty_loc, env, EK::Parameter_arity_mismatch);
         e.lid = c->lid.txt;
@@ -583,7 +580,7 @@ struct FirstPassAcc {
   StrMap<Ident::t> vars;
 };
 
-const tt::ClassExpr* class_expr(std::string_view cl_num, Final final, env::t val_env, env::t met_env,
+const tt::ClassExpr* class_expr(std::string_view cl_num, env::t val_env, env::t met_env,
                                 VirtualFlag virt, long self_scope, const pt::ClassExpr* scl);
 
 MethSet set_inter(const MethSet& a, const MethSet& b) {
@@ -608,7 +605,7 @@ DeclaredVar declare_var(std::string_view name, env::t val_env, env::t par_env, c
   return {false, val_env, par_env, id, vars.add(name, id)};
 }
 
-void class_field_first_pass(const Location& self_loc, std::string_view cl_num, Final final, ClassSignature* sign,
+void class_field_first_pass(const Location& self_loc, std::string_view cl_num, ClassSignature* sign,
                             long self_scope, FirstPassAcc& acc, const pt::ClassField* cf) {
   const Location& loc = cf->pcf_loc;
   const pt::Attributes& attributes = cf->pcf_attributes;
@@ -619,12 +616,11 @@ void class_field_first_pass(const Location& self_loc, std::string_view cl_num, F
     case FK::Pcf_inherit: {
       auto* in = as<pt::Pcf_inherit>(d);
       builtin_attributes::warning_scope(attributes, [&] {
-        Final final2 = inheriting_final(final);
         const tt::ClassExpr* parent =
-            class_expr(cl_num, final2, acc.val_env, acc.par_env, VirtualFlag::Virtual, self_scope, in->ce);
-        ClassSignature* parent_sign = signature_of_class_type(parent->cl_type);
-        update_class_signature(parent->cl_loc, acc.par_env, VirtualFlag::Virtual, Kind::Class, parent_sign);
+            class_expr(cl_num, acc.val_env, acc.par_env, VirtualFlag::Virtual, self_scope, in->ce);
+        complete_class_type(parent->cl_loc, acc.par_env, VirtualFlag::Virtual, Kind::Class, parent->cl_type);
         inherit_class_type(true, loc, acc.val_env, sign, parent->cl_type);
+        ClassSignature* parent_sign = signature_of_class_type(parent->cl_type);
         MethSet new_concrete_meths = concrete_methods(parent_sign);
         MethSet new_concrete_vals = concrete_instance_vars(parent_sign);
         MethSet over_meths = set_inter(new_concrete_meths, acc.concrete_meths);
@@ -882,10 +878,10 @@ void class_field_first_pass(const Location& self_loc, std::string_view cl_num, F
 }
 
 std::pair<std::vector<IntermediateClassField>, StrMap<Ident::t>> class_fields_first_pass(
-    const Location& self_loc, std::string_view cl_num, Final final, ClassSignature* sign, long self_scope,
+    const Location& self_loc, std::string_view cl_num, ClassSignature* sign, long self_scope,
     env::t val_env, env::t par_env, Slice<const pt::ClassField*> cfs) {
   FirstPassAcc acc{{}, val_env, par_env, {}, {}, {}, {}, {}};
-  for (auto* cf : cfs) class_field_first_pass(self_loc, cl_num, final, sign, self_scope, acc, cf);
+  for (auto* cf : cfs) class_field_first_pass(self_loc, cl_num, sign, self_scope, acc, cf);
   return {acc.rev_fields, acc.vars};
 }
 
@@ -980,8 +976,8 @@ const tt::ClassStructure* class_structure(std::string_view cl_num, VirtualFlag v
   self_loc = location::distinct_record(self_loc);  // {spat.ppat_loc with ...}: a record of its own
   ClassSignature* sign = ctype::new_class_signature();
   // Adding a dummy method to the signature prevents it from being closed /
-  // escaping.
-  add_dummy_method(val_env, final, self_scope, sign);
+  // escaping. That isn't needed for objects though.
+  if (final == Final::Not_final) ctype::add_dummy_method(val_env, self_scope, sign);
   // Self binder
   auto [self_pat, self_pat_vars] = tc::type_self_pattern(val_env, spat);
   for (std::size_t k = self_pat_vars.size(); k-- > 0;) {  // List.fold_right
@@ -998,7 +994,7 @@ const tt::ClassStructure* class_structure(std::string_view cl_num, VirtualFlag v
     raise_error(e);
   }
   // Typing of class fields
-  auto [fields, vars] = class_fields_first_pass(self_loc, cl_num, final, sign, self_scope, val_env, par_env,
+  auto [fields, vars] = class_fields_first_pass(self_loc, cl_num, sign, self_scope, val_env, par_env,
                                                 cstr->pcstr_fields);
   Kind kind = kind_of_final(final);
   // Check for unexpected virtual methods
@@ -1009,8 +1005,8 @@ const tt::ClassStructure* class_structure(std::string_view cl_num, VirtualFlag v
   sign->csig_meths.iter([&](std::string_view label, const MethEntry&) {
     meths = meths.add(label, Ident::create_local(label));
   });
-  // Close the signature if it is definitely final
-  if (final == Final::Definitely_final && !ctype::close_class_signature(val_env, sign)) {
+  // Close the signature if it is final
+  if (final == Final::Final && !ctype::close_class_signature(val_env, sign)) {
     Error e = err(loc, val_env, EK::Closing_self_type);
     e.sign = sign;
     raise_error(e);
@@ -1026,7 +1022,7 @@ const tt::ClassStructure* class_structure(std::string_view cl_num, VirtualFlag v
                            pt::types_attributes(pv.pv_attributes), met_env);
   }
   std::vector<const tt::ClassField*> tfields = class_fields_second_pass(cl_num, sign, met_env, fields);
-  // Update the class signature and warn about private methods made public
+  // Update the class signature and warn about public methods made private
   update_class_signature(loc, val_env, virt, kind, sign, true);
   return make<tt::ClassStructure>(self_pat, slice(tfields), sign, *meths_ref);
 }
@@ -1038,7 +1034,7 @@ tt::ClassExpr* mk_cl(const tt::ClassExprDesc* desc, const Location& loc, const C
   return c;
 }
 
-const tt::ClassExpr* class_expr_aux(std::string_view cl_num, Final final, env::t val_env, env::t met_env,
+const tt::ClassExpr* class_expr_aux(std::string_view cl_num, env::t val_env, env::t met_env,
                                     VirtualFlag virt, long self_scope, const pt::ClassExpr* scl) {
   const pt::ClassExprDesc* d = scl->pcl_desc;
   using PK = pt::ClassExprDesc::Kind;
@@ -1055,12 +1051,9 @@ const tt::ClassExpr* class_expr_aux(std::string_view cl_num, Final final, env::t
       for (auto* sty : c->args) tyl.push_back(typetexp::transl_simple_type(val_env, nullptr, false, sty));
       auto [params, clty] = ctype::instance_class(decl->cty_params, decl->cty_type);
       const ClassType* clty2 = abbreviate_class_type(path, slice(params), clty);
-      ClassSignature* sign = signature_of_class_type(clty2);
       // Adding a dummy method to the self type prevents it from being closed
       // / escaping.
-      add_dummy_method(val_env, final, self_scope, sign);
-      ctype::reveal_private_methods(val_env, sign);
-      ctype::set_object_name(decl->cty_path, slice(params), sign->csig_self);
+      ctype::add_dummy_method(val_env, self_scope, signature_of_class_type(clty2));
       if (params.size() != tyl.size()) {
         Error e = err(scl->pcl_loc, val_env, EK::Parameter_arity_mismatch);
         e.lid = c->lid.txt;
@@ -1088,7 +1081,7 @@ const tt::ClassExpr* class_expr_aux(std::string_view cl_num, Final final, env::t
     }
     case PK::Pcl_structure: {
       const tt::ClassStructure* desc =
-          class_structure(cl_num, virt, self_scope, final, val_env, met_env, scl->pcl_loc, as<pt::Pcl_structure>(d)->cs);
+          class_structure(cl_num, virt, self_scope, Final::Not_final, val_env, met_env, scl->pcl_loc, as<pt::Pcl_structure>(d)->cs);
       return mk_cl(mkd(tt::Tcl_structure{{TK::Tcl_structure}, desc}), scl->pcl_loc,
                    cty_signature(const_cast<ClassSignature*>(desc->cstr_type)), val_env, scl->pcl_attributes);
     }
@@ -1129,7 +1122,7 @@ const tt::ClassExpr* class_expr_aux(std::string_view cl_num, Final final, env::t
         auto* sfun = make<pt::ClassExpr>(
             mkd(pt::Pcl_fun{{pt::ClassExprDesc::Kind::Pcl_fun}, f->label, nullptr, pat_var(OCAML_LIT("*opt*")), slet}),
             scl->pcl_loc, pt::Attributes{});
-        return class_expr(cl_num, final, val_env, met_env, virt, self_scope, sfun);
+        return class_expr(cl_num, val_env, met_env, virt, self_scope, sfun);
       }
       tc::ClassArgPatternResult r = ctype::with_local_level_generalize_structure_if_principal(
           [&] { return tc::type_class_arg_pattern(cl_num, val_env, met_env, f->label, spat); });
@@ -1157,7 +1150,7 @@ const tt::ClassExpr* class_expr_aux(std::string_view cl_num, Final final, env::t
         partial = tc::check_partial(ctype::get_current_level(), val_env, pat->pat_type, pat->pat_loc, cases);
       }
       const tt::ClassExpr* cl = ctype::with_raised_nongen_level(
-          [&] { return class_expr(cl_num, final, val_env2, r.met_env, virt, self_scope, f->body); });
+          [&] { return class_expr(cl_num, val_env2, r.met_env, virt, self_scope, f->body); });
       auto not_nolabel_function = [](const ClassType* t) {
         for (; t->kind == ClassType::Kind::Cty_arrow; t = t->cty)
           if (t->label.kind == ArgLabel::Kind::Nolabel) return false;
@@ -1175,7 +1168,7 @@ const tt::ClassExpr* class_expr_aux(std::string_view cl_num, Final final, env::t
       std::vector<std::pair<ArgLabel, const pt::Expression*>> sargs0;
       for (auto& x : a->args) sargs0.push_back({x.label, x.exp});
       const tt::ClassExpr* cl = ctype::with_local_level_generalize_structure_if_principal(
-          [&] { return class_expr(cl_num, final, val_env, met_env, virt, self_scope, a->ce); });
+          [&] { return class_expr(cl_num, val_env, met_env, virt, self_scope, a->ce); });
       bool ignore_labels = clflags::classic;
       if (!ignore_labels) {
         std::vector<ArgLabel> labels;  // nonopt_labels [] cl.cl_type (reversed)
@@ -1298,7 +1291,7 @@ const tt::ClassExpr* class_expr_aux(std::string_view cl_num, Final final, env::t
         met_env = env::add_value(id2, desc, met_env);
         vals.insert(vals.begin(), tt::IdentExpression{id2, expr});
       }
-      const tt::ClassExpr* cl = class_expr(cl_num, final, val_env2, met_env, virt, self_scope, l->body);
+      const tt::ClassExpr* cl = class_expr(cl_num, val_env2, met_env, virt, self_scope, l->body);
       Slice<const tt::ValueBinding*> defs = tb.vbs;
       if (l->rec == RecFlag::Recursive) defs = tc::annotate_recursive_bindings(val_env2, defs);
       return mk_cl(mkd(tt::Tcl_let{{TK::Tcl_let}, l->rec, defs, slice(vals), cl}), scl->pcl_loc, cl->cl_type,
@@ -1309,20 +1302,13 @@ const tt::ClassExpr* class_expr_aux(std::string_view cl_num, Final final, env::t
       auto [cl, clty] = ctype::with_local_level_for_class([&] {
         long self_scope2 = ctype::get_current_level();
         const tt::ClassExpr* cl1 = typetexp::ty_var_env::with_local_scope([&] {
-          const tt::ClassExpr* cl0 =
-              class_expr(cl_num, Final::Definitely_not_final, val_env, met_env, virt, self_scope2, c->ce);
-          ClassSignature* sign = signature_of_class_type(cl0->cl_type);
-          update_class_signature(cl0->cl_loc, val_env, virt, Kind::Class, sign);
-          ctype::remove_dummy_method(sign);
-          ctype::hide_private_methods(sign);
+          const tt::ClassExpr* cl0 = class_expr(cl_num, val_env, met_env, virt, self_scope2, c->ce);
+          complete_class_type(cl0->cl_loc, val_env, virt, Kind::Class_type, cl0->cl_type);
           return cl0;
         });
         const tt::ClassType* clty1 = typetexp::ty_var_env::with_local_scope([&] {
           const tt::ClassType* clty0 = class_type(val_env, virt, self_scope2, c->cty);
-          ClassSignature* sign = signature_of_class_type(clty0->cltyp_type);
-          update_class_signature(clty0->cltyp_loc, val_env, virt, Kind::Class_type, sign);
-          ctype::remove_dummy_method(sign);
-          ctype::hide_private_methods(sign);
+          complete_class_type(clty0->cltyp_loc, val_env, virt, Kind::Class, clty0->cltyp_type);
           return clty0;
         });
         return std::make_pair(cl1, clty1);
@@ -1338,9 +1324,9 @@ const tt::ClassExpr* class_expr_aux(std::string_view cl_num, Final final, env::t
       }
       Constraints cs = extract_constraints(clty->cltyp_type);
       const ClassType* ty = ctype::instance_class({}, clty->cltyp_type).second;
-      ClassSignature* sign = signature_of_class_type(ty);
-      add_dummy_method(val_env, final, self_scope, sign);
-      ctype::reveal_private_methods(val_env, sign);
+      // Adding a dummy method to the self type prevents it from being closed
+      // / escaping.
+      ctype::add_dummy_method(val_env, self_scope, signature_of_class_type(ty));
       return mk_cl(mkd(tt::Tcl_constraint{{TK::Tcl_constraint}, cl, clty, cs.vals, cs.meths, cs.concrs}),
                    scl->pcl_loc, ty, val_env, scl->pcl_attributes);
     }
@@ -1349,7 +1335,7 @@ const tt::ClassExpr* class_expr_aux(std::string_view cl_num, Final final, env::t
       auto used_slot = std::make_shared<bool>(false);
       auto [od, new_val_env] = type_open_descr(used_slot, val_env, o->od);
       env::t new_met_env = type_open_descr(used_slot, met_env, o->od).second;
-      const tt::ClassExpr* cl = class_expr(cl_num, final, new_val_env, new_met_env, virt, self_scope, o->ce);
+      const tt::ClassExpr* cl = class_expr(cl_num, new_val_env, new_met_env, virt, self_scope, o->ce);
       return mk_cl(mkd(tt::Tcl_open{{TK::Tcl_open}, od, cl}), scl->pcl_loc, cl->cl_type, val_env, scl->pcl_attributes);
     }
     case PK::Pcl_extension: throw ErrorForward(as<pt::Pcl_extension>(d)->ext);
@@ -1357,10 +1343,10 @@ const tt::ClassExpr* class_expr_aux(std::string_view cl_num, Final final, env::t
   throw std::logic_error("class_expr_aux");
 }
 
-const tt::ClassExpr* class_expr(std::string_view cl_num, Final final, env::t val_env, env::t met_env,
+const tt::ClassExpr* class_expr(std::string_view cl_num, env::t val_env, env::t met_env,
                                 VirtualFlag virt, long self_scope, const pt::ClassExpr* scl) {
   return builtin_attributes::warning_scope(scl->pcl_attributes, [&] {
-    return class_expr_aux(cl_num, final, val_env, met_env, virt, self_scope, scl);
+    return class_expr_aux(cl_num, val_env, met_env, virt, self_scope, scl);
   });
 }
 
@@ -1555,16 +1541,15 @@ env::t class_infos_(bool define_class, const KindFn<S, T>& kind, const Pending<S
     try {
       ctype::unify(env, ty, constr);
     } catch (const ctype::Unify&) {
-      TypeExpr* constr2 = ctype::newconstr(Path::pident(p.obj_id), p.obj_params);
-      TypeExpr* exp = ctype::expand_head(env, constr2);
+      TypeExpr* exp = ctype::expand_head(env, constr);
       Error e = err(cl->pci_loc, env, EK::Abbrev_type_clash);
-      e.ty = constr2;
+      e.ty = constr;
       e.ty2 = ty;
       e.ty3 = exp;
       raise_error(e);
     }
   }
-  ctype::set_object_name(Path::pident(p.obj_id), params, self_type(typ));
+  ctype::set_object_name(p.obj_id, params, self_type(typ));
   // Check the other temporary abbreviation (#-type)
   {
     auto [cl_params2, cl_type] = ctype::instance_class(params, typ);
@@ -1629,7 +1614,7 @@ env::t class_infos_(bool define_class, const KindFn<S, T>& kind, const Pending<S
   auto [cl_params, cl_ty] = ctype::instance_parameterized_type(params, self_type(typ));
   // one list: the object name's `rv :: cl_params` shares it with cl_abbr
   Slice<TypeExpr*> cl_params_l = slice(cl_params);
-  ctype::set_object_name(Path::pident(p.obj_id), cl_params_l, cl_ty);
+  ctype::set_object_name(p.obj_id, cl_params_l, cl_ty);
   auto* cl_abbr = make<TypeDeclaration>(*p.cl_td);
   cl_abbr->type_params = cl_params_l;
   cl_abbr->type_manifest = cl_ty;
@@ -1802,12 +1787,8 @@ std::pair<const tt::ClassExpr*, const ClassType*> class_declaration(env::t env, 
                                                                     const pt::ClassExpr* sexpr) {
   ++class_num;
   long self_scope = ctype::get_current_level();
-  const tt::ClassExpr* expr = class_expr(zborrow(std::to_string(class_num)),
-                                         Final::Definitely_not_final, env, env, virt, self_scope, sexpr);
-  ClassSignature* sign = signature_of_class_type(expr->cl_type);
-  update_class_signature(expr->cl_loc, env, virt, Kind::Class, sign);
-  ctype::remove_dummy_method(sign);
-  ctype::hide_private_methods(sign);
+  const tt::ClassExpr* expr = class_expr(zborrow(std::to_string(class_num)), env, env, virt, self_scope, sexpr);
+  complete_class_type(expr->cl_loc, env, virt, Kind::Class, expr->cl_type);
   return {expr, expr->cl_type};
 }
 
@@ -1815,10 +1796,7 @@ std::pair<const tt::ClassType*, const ClassType*> class_description(env::t env, 
                                                                     const pt::ClassType* sexpr) {
   long self_scope = ctype::get_current_level();
   const tt::ClassType* expr = class_type(env, virt, self_scope, sexpr);
-  ClassSignature* sign = signature_of_class_type(expr->cltyp_type);
-  update_class_signature(expr->cltyp_loc, env, virt, Kind::Class_type, sign);
-  ctype::remove_dummy_method(sign);
-  ctype::hide_private_methods(sign);
+  complete_class_type(expr->cltyp_loc, env, virt, Kind::Class_type, expr->cltyp_type);
   return {expr, expr->cltyp_type};
 }
 
@@ -1826,8 +1804,9 @@ std::pair<const tt::ClassStructure*, std::vector<std::string_view>> type_object(
                                                                                 const pt::ClassStructure* s) {
   ++class_num;
   const tt::ClassStructure* desc = class_structure(zborrow(std::to_string(class_num)), VirtualFlag::Concrete,
-                                                   lowest_level, Final::Definitely_final, env, env, loc, s);
-  ctype::hide_private_methods(desc->cstr_type);
+                                                   lowest_level, Final::Final, env, env, loc, s);
+  complete_class_signature(loc, env, VirtualFlag::Concrete, Kind::Object,
+                           const_cast<ClassSignature*>(desc->cstr_type));
   std::vector<std::string_view> meths = public_methods(desc->cstr_type);
   return {desc, meths};
 }

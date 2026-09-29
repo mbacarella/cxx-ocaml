@@ -364,12 +364,6 @@ void ty(TypeExpr* t) {
       s(" "); ty(f->body); s(")");
       break;
     }
-    case DescKind::Texpand: {
-      auto* e = as<Texpand>(d);
-      s("Texpand("); ty(e->ty); s(" "); path_(e->abbrev->path); s(" "); tylist(e->abbrev->args);
-      s(" "); s(std::to_string(e->abbrev->level)); s(")");
-      break;
-    }
     case DescKind::Tlink: s("Tlink "); ty(as<Tlink>(d)->ty); break;
     case DescKind::Tsubst: {
       auto* x = as<Tsubst>(d);
@@ -431,9 +425,6 @@ void type_decl(const TypeDeclaration* d) {
         case TypeOrigin::Kind::Rec_check_regularity: s("Rec_check_regularity"); break;
         case TypeOrigin::Kind::Approx_recmod: s("Approx_recmod"); break;
         case TypeOrigin::Kind::Existential: s("Existential "); q(k->origin.existential); break;
-        case TypeOrigin::Kind::Equation:
-          s("Equation("); ty(k->origin.eq1); s(" "); ty(k->origin.eq2); s(")");
-          break;
       }
       break;
     case TypeKind::Kind::Type_record:
@@ -483,7 +474,6 @@ void ext_constr(const ExtensionConstructor* e) {
 
 void class_sig(ClassSignature* c) {
   s("{"); ty(c->csig_self); s(" "); ty(c->csig_self_row); s(" ");
-  field_kind(c->csig_dummy_method); s(" ");
   list(c->csig_vars.bindings(), [](const std::pair<std::string_view, VarEntry>& e) {
     q(e.first); s(":"); mutable_flag(e.second.mut); s(" "); virtual_flag(e.second.virt);
     s(" "); ty(e.second.ty);
@@ -777,7 +767,6 @@ using parsetree::Attributes;
 using parsetree::Extension;
 using parsetree::Payload;
 using parsetree::ValueDescription;
-using parsetree::PrimitiveDescription;
 using parsetree::ClassSignature;
 using parsetree::ClassStructure;
 using parsetree::ClassDeclaration;
@@ -1294,17 +1283,8 @@ void value_binding(const ValueBinding* vb) {
 }
 void value_description(const ValueDescription* v) {
   s("{val "); str_loc(v->pval_name); s(" "); core_type(v->pval_type); s(" ");
+  list(v->pval_prim, [](std::string_view x) { q(x); }); s(" ");
   attrs(v->pval_attributes); s(" "); loc(v->pval_loc); s("}");
-}
-void primitive(const PrimitiveDescription* p) {
-  s("{prim "); str_loc(p->pprim_name); s(" ");
-  if (p->pprim_kind.kind == PrimitiveKind::Kind::Pprim_decl) {
-    s("Pprim_decl "); core_type(p->pprim_kind.ty); s(" ");
-    list(p->pprim_kind.prims, [](std::string_view x) { q(x); });
-  } else {
-    s("Pprim_alias "); popt(p->pprim_kind.ty, core_type); s(" "); lid_loc(p->pprim_kind.alias);
-  }
-  s(" "); attrs(p->pprim_attributes); s(" "); loc(p->pprim_loc); s("}");
 }
 void type_param(const TypeParam& tp, bool gap) {
   core_type(tp.ty); s(" ");
@@ -1578,7 +1558,6 @@ void signature_item(const SignatureItem* it) {
   using K = SignatureItemDesc::Kind;
   switch (d->kind) {
     case K::Psig_value: s("Psig_value "); value_description(as<Psig_value>(d)->vd); break;
-    case K::Psig_primitive: s("Psig_primitive "); primitive(as<Psig_primitive>(d)->pd); break;
     case K::Psig_type: {
       auto* t = as<Psig_type>(d);
       s("Psig_type "); flag_rec(t->rec); s(" "); type_declarations(t->decls);
@@ -1673,8 +1652,7 @@ void structure_item(const StructureItem* it) {
       s("Pstr_value "); flag_rec(v->rec); s(" "); vbs(v->vbs);
       break;
     }
-    case K::Pstr_val: s("Pstr_val "); value_description(as<Pstr_val>(d)->vd); break;
-    case K::Pstr_primitive: s("Pstr_primitive "); primitive(as<Pstr_primitive>(d)->pd); break;
+    case K::Pstr_primitive: s("Pstr_primitive "); value_description(as<Pstr_primitive>(d)->vd); break;
     case K::Pstr_type: {
       auto* t = as<Pstr_type>(d);
       s("Pstr_type "); flag_rec(t->rec); s(" "); type_declarations(t->decls);
@@ -1893,10 +1871,6 @@ int run_ctype(const std::string& stdlib_dir, const std::string& queries) {
         } catch (const ctype::MatchesFailure& m) {
           s("ERR "); err_trace(m.err.trace);
         }
-      } else if (op == "labels" && n == 1) {
-        auto [labels, is_ret_tvar] = ctype::arrow_labels(e, value(w[1]));
-        list(labels, [](const ArgLabel& l) { arg_label(l); });
-        s(" "); bool_(is_ret_tvar);
       } else if (op == "nongen" && n == 1) {
         auto r2 = ctype::nongen_vars_in_schema(e, ctype::instance(value(w[1])));
         if (!r2) s("None");
@@ -2061,9 +2035,6 @@ int run_typexp(const std::string& dirs, const std::string& modname, const std::s
     if (it->psig_desc->kind == SK::Psig_value) {
       auto* vd = parsetree::as<parsetree::Psig_value>(it->psig_desc)->vd;
       one(vd->pval_name.txt, vd->pval_type);
-    } else if (it->psig_desc->kind == SK::Psig_primitive) {
-      auto* pd2 = parsetree::as<parsetree::Psig_primitive>(it->psig_desc)->pd;
-      if (pd2->pprim_kind.ty) one(pd2->pprim_name.txt, pd2->pprim_kind.ty);
     }
   }
   std::cout << b;
@@ -2183,11 +2154,11 @@ int run_core(const std::string& dirs, const std::string& file) {
       ext_constr(res.tyexn->tyexn_constructor->ext_type); s("\n");
       e = res.env;
     } else if (auto* pr = parsetree::as<parsetree::Pstr_primitive>(it->pstr_desc)) {
-      std::pair<const typedtree::TPrimitiveDescription*, env::t> res;
-      if (!attempt([&] { res = typedecl::transl_prim_desc(e, it->pstr_loc, pr->pd); })) return 0;
+      std::pair<const typedtree::TValueDescription*, env::t> res;
+      if (!attempt([&] { res = typedecl::transl_value_decl(e, it->pstr_loc, pr->vd); })) return 0;
       reset_numbering();
-      s("val "); s(ident::name(res.first->prim_id)); s(" : "); ty(res.first->prim_val->val_type); s(" ");
-      value_kind(res.first->prim_val->val_kind); s("\n");
+      s("val "); s(ident::name(res.first->val_id)); s(" : "); ty(res.first->val_val->val_type); s(" ");
+      value_kind(res.first->val_val->val_kind); s("\n");
       e = res.second;
     } else {
       (void)SK::Pstr_eval;

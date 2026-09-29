@@ -193,6 +193,37 @@ static FunctorArg collect_functor_module_arg(env::t env, const pt::Expression* s
   }
 }
 
+// List labels in a function type, and whether return type is a variable
+std::pair<std::vector<ArgLabel>, bool> list_labels(env::t env, TypeExpr* ty) {
+  Snapshot snap = btype::snapshot();
+  std::pair<std::vector<ArgLabel>, bool> result = ctype::wrap_trace_gadt_instances(env, [&] {
+    btype::TypeSet visited;
+    std::vector<ArgLabel> ls;
+    env::t e = env;
+    TypeExpr* ty_fun = ty;
+    for (;;) {
+      TypeExpr* t = ctype::expand_head(e, ty_fun);
+      if (visited.mem(t)) return std::make_pair(ls, false);
+      const TypeDesc* d = get_desc(t);
+      if (auto* a = as<Tarrow>(d)) {
+        visited.add(t);
+        ls.push_back(a->label);
+        ty_fun = a->t2;
+      } else if (auto* f = as<Tfunctor>(d)) {
+        auto [env2, ty_res] = ctype::open_tfunctor(e, location::none(), f->id, f->pack, f->body);
+        visited.add(t);
+        ls.push_back(f->label);
+        e = env2;
+        ty_fun = ty_res;
+      } else {
+        return std::make_pair(ls, is_Tvar(t));
+      }
+    }
+  });
+  btype::backtrack(snap);
+  return result;
+}
+
 static CollectedArgs collect_unknown_apply_args(env::t env, const tt::Expression* funct, TypeExpr* ty_fun0,
                                                 std::vector<UntypedArg> rev_args,
                                                 std::vector<std::pair<ArgLabel, const pt::Expression*>> sargs) {
@@ -200,8 +231,8 @@ static CollectedArgs collect_unknown_apply_args(env::t env, const tt::Expression
     return param == arg || (clflags::classic && arg.kind == ArgLabel::Kind::Nolabel && !is_optional(param));
   };
   auto has_label = [&](const ArgLabel& l, TypeExpr* ty_fun) {
-    auto [ls, is_ret_tvar] = ctype::arrow_labels(env, ty_fun);
-    return is_ret_tvar || std::find(ls.begin(), ls.end(), l) != ls.end();
+    auto [ls, tvar] = list_labels(env, ty_fun);
+    return tvar || std::find(ls.begin(), ls.end(), l) != ls.end();
   };
   TypeExpr* ty_fun = ty_fun0;
   for (auto& [lbl, sarg] : sargs) {
@@ -530,8 +561,6 @@ bool is_nonexpansive(const tt::Expression* exp) {
       for (auto* c : m->comp_cases)
         if (!(is_nonexpansive_opt(c->c_guard) && is_nonexpansive(c->c_rhs) && !contains_exception_pat(c->c_lhs)))
           return false;
-      for (auto* c : m->eff_cases)
-        if (!(is_nonexpansive_opt(c->c_guard) && is_nonexpansive(c->c_rhs))) return false;
       return true;
     }
     case XK::Texp_tuple:

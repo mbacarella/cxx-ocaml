@@ -1,6 +1,6 @@
 // Port of typing/ctype.ml, part 7: class type matching, subtyping
 // (build_subtype / subtype), miscellaneous (unalias, nongen_vars,
-// normalize_type, arrow_spine), removal of dependencies (nondep_*),
+// normalize_type), removal of dependencies (nondep_*),
 // collapse_conj_params and immediacy.
 #include <algorithm>
 
@@ -1160,44 +1160,6 @@ static void normalize_type_rec(TypeMark& mark, TypeExpr* ty) {
 
 void normalize_type(TypeExpr* ty) {
   with_type_mark([&](TypeMark& mark) { normalize_type_rec(mark, ty); });
-}
-
-ArrowSpine arrow_spine(env::t env, TypeExpr* ty0) {
-  ArrowSpine result;
-  with_type_mark([&](TypeMark& mark) {
-    wrap_trace_gadt_instances(env, [&] {
-      TypeExpr* ty_fun = ty0;
-      for (;;) {
-        TypeExpr* ty = expand_head(env, ty_fun);
-        if (!try_mark_node(mark, ty)) {
-          result.ret_cycle = true;
-          return;
-        }
-        const TypeDesc* d = get_desc(ty);
-        if (auto* a = as<Tarrow>(d)) {
-          result.args.push_back({a->label, ArrowArg{false, a->t1, nullptr, nullptr}});
-          ty_fun = a->t2;
-        } else if (auto* f = as<Tfunctor>(d)) {
-          result.args.push_back({f->label, ArrowArg{true, nullptr, f->id, f->pack}});
-          ty_fun = f->body;
-        } else {
-          result.ret = ty;
-          return;
-        }
-      }
-    });
-  });
-  return result;
-}
-
-std::pair<std::vector<ArgLabel>, bool> arrow_labels(env::t env, TypeExpr* ty) {
-  Snapshot snap = btype::snapshot();
-  ArrowSpine s = arrow_spine(env, ty);
-  bool is_ret_tvar = !s.ret_cycle && is_Tvar(s.ret);
-  btype::backtrack(snap);
-  std::vector<ArgLabel> labels;
-  for (auto& a : s.args) labels.push_back(a.first);
-  return {labels, is_ret_tvar};
 }
 
 // ---- remove dependencies -----------------------------------------------------------------
