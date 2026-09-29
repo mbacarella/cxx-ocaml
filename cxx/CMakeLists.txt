@@ -104,6 +104,8 @@ add_library(cppcaml_core
   src/typing/clambda.cpp
   src/typing/convert_primitives.cpp
   src/typing/printclambda.cpp
+  src/typing/compilenv.cpp
+  src/typing/closure.cpp
   src/typing/format.cpp
   src/typing/printlambda.cpp
   src/typing/format_doc.cpp

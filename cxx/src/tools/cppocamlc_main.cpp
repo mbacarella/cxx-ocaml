@@ -40,6 +40,8 @@
 
 #include "cppcaml/parser.hpp"
 #include "cppcaml/lexer.hpp"
+#include "cppcaml/typing/closure.hpp"
+#include "cppcaml/typing/compilenv.hpp"
 #include "cppcaml/typing/misc.hpp"
 #include "cppcaml/typing/pparse.hpp"
 #include "cppcaml/typing/builtin_attributes.hpp"
@@ -713,6 +715,7 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
       // classic_arguments; Translmod.transl_store_implementation,
       // -drawlambda, Simplif.simplify_lambda, -dlambda; the back end unless
       // -stop-after lambda; Compilenv.save_unit_info (the .cmx)
+      ty::compilenv::reset(cf::for_package, modname);
       cf::use_inlining_arguments_set(cf::classic_arguments);
       ty::lambda::Program prog = ty::translmod::transl_store_implementation(modname, impl->structure, impl->coercion);
       if (cf::dump_rawlambda) ppf_dump.out() << ty::printlambda::dump(prog.code);
@@ -720,8 +723,17 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
       if (cf::dump_lambda) ppf_dump.out() << ty::printlambda::dump(lam);
       ppf_dump.out().flush();
       lap("lambda", tp);
-      if (!cf::should_stop_after(cf::Pass::Lambda))
-        throw std::runtime_error("the native back end (Asmgen) is not supported yet");
+      if (!cf::should_stop_after(cf::Pass::Lambda)) {
+        // Asmgen.compile_implementation: Compilenv.require_global on the
+        // required globals, the middle end (Closure_middle_end)
+        for (ty::Ident::t id : prog.required_globals) ty::compilenv::require_global(id);
+        ty::format::Formatter dump;
+        ty::closure_middle_end::lambda_to_clambda(dump, prog, lam);
+        ppf_dump.out() << dump.contents();
+        ppf_dump.out().flush();
+        lap("clambda", tp);
+        throw std::runtime_error("the native back end (Cmmgen) is not supported yet");
+      }
       return finish();
     }
     ty::lambda::Program prog = ty::translmod::transl_implementation(modname, impl->structure, impl->coercion);

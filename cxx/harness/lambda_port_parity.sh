@@ -11,6 +11,8 @@
 # and native_code's branches) -- ocamlopt.opt against c++ocamlopt, both
 # stopped after lambda.
 #
+# NATIVE=1 DUMP=dclambda compares the Closure middle end's output.
+#
 # Usage: lambda_port_parity.sh [file.ml ...]   (JOBS=, DUMP=drawlambda|dlambda|dinstr,
 #   FLAGS= extra flags for both compilers, e.g. absolute -I dirs)
 #   no args: cxx/harness/stamp_probes
@@ -34,7 +36,12 @@ else
   REFC="$ROOT/ocamlc.opt"; OSTOP=""
   CPP="${CPP:-$ROOT/cxx/build-release/c++ocamlc}"
 fi
-export DUMP FLAGS STOP DFLAG NATIVE REFC OSTOP
+# DUMP=dclambda|drawclambda (NATIVE=1): the Closure middle end's Clambda;
+# ocamlopt.opt compiles on, the port stops after its dump (the back end
+# past Clambda is not ported yet: its exit status is not checked)
+CLAMBDA=0
+case "$DUMP" in dclambda|drawclambda) CLAMBDA=1; STOP=""; OSTOP="" ;; esac
+export DUMP FLAGS STOP DFLAG NATIVE REFC OSTOP CLAMBDA
 OUT=/tmp/lambda_port_parity
 
 if [ "${1:-}" == "--worker" ]; then
@@ -58,9 +65,10 @@ if [ "${1:-}" == "--worker" ]; then
   ( cd "$w/x" && CPPCAML_NEWLAMBDA=1 timeout 120 "$CPP" -I "$ROOT/stdlib" -w -a $FLAGS $DFLAG $STOP -c "$b" ) \
       >/dev/null 2>"$OUT/$key.c"; crc=$?
   if [ "$DUMP" = cmo ]; then cp "$w/x/${b%.ml}.cmo" "$OUT/$key.c" 2>/dev/null || crc=1; fi
+  [ "$CLAMBDA" = 1 ] && sed -i '/: the native back end (Cmmgen) is not supported yet$/d' "$OUT/$key.c"
   rm -rf "${w:?}"
   if [ $orc -ne 0 ]; then printf 'OFAIL %s\n' "$f"
-  elif [ $crc -ne 0 ] || [ ! -s "$OUT/$key.c" ]; then printf 'CFAIL %s\n' "$f"
+  elif { [ $crc -ne 0 ] && [ "$CLAMBDA" = 0 ]; } || [ ! -s "$OUT/$key.c" ]; then printf 'CFAIL %s\n' "$f"
   elif cmp -s "$OUT/$key.o" "$OUT/$key.c"; then printf 'SAME %s\n' "$f"
   else printf 'DIFF %s\n' "$f"; fi
   exit 0

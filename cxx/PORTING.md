@@ -132,12 +132,23 @@ bytecode one) with Default.Optmain's actions and Arch's `-fPIC`/`-fno-PIC`,
 the native Clflags (dumps, inlining parameters through `arg_helper.hpp`,
 the -O2/-O3/classic argument sets), and `Translmod.transl_store_implementation`.
 Oracle: `NATIVE=1 lambda_port_parity.sh` (`-drawlambda` / `-dlambda` under
-`-stop-after lambda`, against ocamlopt.opt): 6550/6550 probes.  Next, in
-order: Closure and Compilenv (`-dclambda`, the .cmx), Cmmgen (`-dcmm`),
-Selection and the Mach passes (`-dsel` ... `-dreload`), Linearize and
-Emit (`-dlinear`, then `-S` byte for byte), then the .cmx/.cmxa writers
-and Asmlink.  Until the back end exists, c++ocamlopt stops with an error
-after Lambda and does not write the .cmx.
+`-stop-after lambda`, against ocamlopt.opt): 6550/6550 probes.
+
+The Closure middle end is ported (`closure.cpp`, `compilenv.cpp`, the IR
+in `clambda.hpp`, the .cmx reader in `cmi_format.cpp`): `NATIVE=1
+DUMP=dclambda lambda_port_parity.sh` compares `-dclambda` (inlining across
+units through the stdlib's .cmx included) -- 6550/6550 probes (also with
+`-g`, `-O3`, `-inline 200 -unsafe`), 787/787 compilable testsuite files,
+208/208 compiler sources.  `c++cmxinfo` prints a .cmx as ocamlobjinfo
+does (262/262 of the tree's).  Closure consumes fresh identifiers, raise
+counts and constant labels in ocamlopt's evaluation order: arguments right
+to left, except a tuple matched on at once (`match (a, b) with`), whose
+components are let-bound left to right.
+
+Next, in order: Cmmgen (`-dcmm`), Selection and the Mach passes (`-dsel`
+... `-dreload`), Linearize and Emit (`-dlinear`, then `-S` byte for byte),
+then the .cmx/.cmxa writers and Asmlink.  Until the back end exists,
+c++ocamlopt stops with an error after Clambda and does not write the .cmx.
 
 ## Oracles and gates
 
