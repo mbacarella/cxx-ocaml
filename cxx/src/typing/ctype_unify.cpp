@@ -550,14 +550,6 @@ TypeExpr* reify_univars(env::t env, TypeExpr* ty) {
 }
 
 // ---- unification ---------------------------------------------------------------------
-static bool has_cached_expansion(Path::t p, const AbbrevMemo* m);
-
-static bool quick_eq_type_path_nocache(bool normalize, env::t env, Path::t p1, const MemoRef* a1,
-                                       Path::t p2, const MemoRef* a2) {
-  return quick_eq_type_path(normalize, env, p1, p2) &&
-         !(has_cached_expansion(p1, a1->contents) || has_cached_expansion(p2, a2->contents));
-}
-
 static bool has_cached_expansion(Path::t p, const AbbrevMemo* m) {
   for (;;) {
     switch (m->kind) {
@@ -628,19 +620,11 @@ static long get_equations_scope(const Uenv& u) {
 
 // A local constraint can be added only if the rhs of the constraint does not
 // contain any Tvars; they are removed with this (Pattern mode only).
-static void reify(const Uenv& uenv, TypeExpr* t, TypeExpr* eqn_lhs = nullptr,
-                  TypeExpr* eqn_rhs = nullptr) {
+static void reify(const Uenv& uenv, TypeExpr* t) {
   long fresh_constr_scope = get_equations_scope(uenv);
-  TypeOrigin origin;
-  if (eqn_lhs) {
-    origin.kind = TypeOrigin::Kind::Equation;
-    origin.eq1 = eqn_lhs;
-    origin.eq2 = eqn_rhs;
-    origin.obj = fresh_identity();
-  }
   auto create_fresh_constr = [&](long lev, OptStr name) -> std::pair<Path::t, TypeExpr*> {
     std::string nm = name.some ? "$'" + std::string(name.v) : "$";
-    const TypeDeclaration* decl = new_local_type(origin);
+    const TypeDeclaration* decl = new_local_type(TypeOrigin{});
     env::t env = get_env(uenv);
     // unique names are needed only for error messages
     std::string new_name = in_counterexample(uenv) ? nm : std::string(get_new_abstract_name(env, nm));
@@ -734,10 +718,14 @@ void internal::eq_labels(TraceExn error_mode, bool in_pattern_mode, const ArgLab
 }
 
 // Check for datatypes carefully; see PR#6348
-static bool expands_to_datatype(env::t env, Path::t p) {
+static bool expands_to_datatype(env::t env, TypeExpr* ty) {
+  if (get_desc(ty)->kind != DescKind::Tconstr) return false;
   try {
-    return is_datatype(env::find_type(p, env));
+    return is_datatype(env::find_type(as<Tconstr>(get_desc(ty))->path, env)) ||
+           expands_to_datatype(env, try_expand_safe(env, ty));
   } catch (const env::NotFound&) {
+    return false;
+  } catch (const CannotExpand&) {
     return false;
   }
 }
@@ -787,7 +775,7 @@ static void mcomp_type_decl(TypePairs& tp, env::t env, Path::t p1, Path::t p2,
   try {
     const TypeDeclaration* decl = env::find_type(p1, env);
     const TypeDeclaration* decl2 = env::find_type(p2, env);
-    if (quick_eq_type_path(true, env, p1, p2)) {
+    if (env::path_equiv(env, p1, p2)) {
       std::vector<bool> inj;
       try {
         for (variance::t v : env::find_type(p1, env)->type_variance)
@@ -898,7 +886,7 @@ static void mcomp_rec(TypePairs& type_pairs, env::t env, TypeExpr* t1, TypeExpr*
   if (d1->kind == DescKind::Tvar || d2->kind == DescKind::Tvar) return;
   if (auto* c1 = as<Tconstr>(d1))
     if (auto* c2 = as<Tconstr>(d2))
-      if (c1->args.empty() && c2->args.empty() && quick_eq_type_path(false, env, c1->path, c2->path)) return;
+      if (c1->args.empty() && c2->args.empty() && env::path_equiv(env, c1->path, c2->path)) return;
   TypeExpr* t1e = expand_head_opt(env, t1);
   TypeExpr* t2e = expand_head_opt(env, t2);
   // Expansion may have changed the representative of the types...
@@ -1059,21 +1047,12 @@ static TypeExpr* nondep_instance(env::t env, long level, Ident::t id, TypeExpr* 
 
 
 // Find the type paths nl1 in the module type pack2, and add them to the list
-// (nl2, tl2).
-CompleteResult internal::complete_type_list(et::Position pos, env::t env,
-                                            Slice<PackConstraint> fl1, long lv2,
-                                            const Package* pack2, bool allow_absent) {
-  struct ExitEx {
-    et::FirstClassModule e;
-  };
-  auto mismatch = [&](Slice<std::string_view> lhs, const TypeDeclaration* decl) {
-    et::FirstClassModule f;
-    f.kind = et::FirstClassModule::Kind::Constraint_on_mismatched_type;
-    f.pos = pos;
-    f.decl = decl;
-    f.lhs.assign(lhs.begin(), lhs.end());
-    return ExitEx{f};
-  };
+// (nl2, tl2).  raise Not_found if impossible
+std::vector<PackConstraint> internal::complete_type_list(env::t env, Slice<PackConstraint> fl1, long lv2,
+                                                         const Package* pack2, bool allow_absent) {
+  // This is morally WRONG: we're adding a (dummy) module without a scope in
+  // the environment (see ctype.ml).
+  struct ExitEx {};
   Ident::t id2 = Ident::create_local(OCAML_LIT("Pkg"));
   auto* mt = make<ModuleType>(ModuleType::Kind::Mty_ident);
   mt->path = pack2->pack_path;
@@ -1103,11 +1082,7 @@ CompleteResult internal::complete_type_list(et::Position pos, env::t env,
       found = env::find_type_by_name(lid, env2);
     } catch (const env::NotFound&) {
       if (allow_absent) return complete(i1 + 1, i2);
-      et::FirstClassModule f;
-      f.kind = et::FirstClassModule::Kind::Constraint_on_missing_type;
-      f.pos = pos;
-      f.lhs.assign(n.begin(), n.end());
-      throw ExitEx{f};
+      throw ExitEx{};
     }
     const TypeDeclaration* decl = found.second;
     bool abstract_public = decl->type_arity == 0 &&
@@ -1119,52 +1094,57 @@ CompleteResult internal::complete_type_list(et::Position pos, env::t env,
         t = nondep_instance(env2, lv2, id2, decl->type_manifest);
       } catch (const NondepCannotErase&) {
         if (allow_absent) return complete(i1 + 1, i2);
-        et::FirstClassModule f;
-        f.kind = et::FirstClassModule::Kind::Constraint_with_deps;
-        f.pos = pos;
-        f.lhs.assign(n.begin(), n.end());
-        throw ExitEx{f};
+        throw ExitEx{};
       }
       auto rest = complete(i1 + 1, i2);
       rest.insert(rest.begin(), PackConstraint{n, t});
       return rest;
     }
-    if (abstract_public && !decl->type_manifest) {
-      if (allow_absent) return complete(i1 + 1, i2);
-      throw mismatch(n, decl);
-    }
-    throw mismatch(n, decl);
+    if (abstract_public && !decl->type_manifest && allow_absent) return complete(i1 + 1, i2);
+    throw ExitEx{};
   };
   try {
-    return {true, complete(0, 0)};
-  } catch (const ExitEx& e) {
-    return {false, {}, e.e};
+    return complete(0, 0);
+  } catch (const ExitEx&) {
+    throw env::NotFound{};
   }
 }
 
-PackageSubtypeResult internal::compare_package(env::t env,
-                                            const std::function<void(TypeExpr*, TypeExpr*)>& unify_f,
-                                            long lv1, const Package* pack1, long lv2,
-                                            const Package* pack2) {
-  auto check = [](const CompleteResult& r) -> const std::vector<PackConstraint>& {
-    if (!r.ok) {
-      auto x = elt(EK::First_class_module);
-      x.fcm = r.err;
-      raise_for(TraceExn::Unify, x);
-    }
-    return r.res;
-  };
+bool eq_package_path(env::t env, Path::t p1, Path::t p2) {
+  return env::path_equiv(env, p1, p2) ||
+         env::path_equiv(env, env::normalize_modtype_path(env, p1), env::normalize_modtype_path(env, p2));
+}
+
+// raise Not_found rather than Unify if the module types are incompatible
+PackageSubtypeResult internal::compare_package(
+    env::t env, const std::function<void(Slice<TypeExpr*>, Slice<TypeExpr*>)>& unify_list_f, long lv1,
+    const Package* pack1, long lv2, const Package* pack2) {
   // `let ntl2 = .. and ntl1 = ..`: left to right
-  CompleteResult ntl2r = complete_type_list(et::Position::Second, env, pack1->pack_constraints, lv2, pack2);
-  CompleteResult ntl1r = complete_type_list(et::Position::First, env, pack2->pack_constraints, lv1, pack1);
-  const auto& ntl2 = check(ntl2r);
-  const auto& ntl1 = check(ntl1r);
-  // ntl1 and ntl2 have the same length by construction
-  for (std::size_t k = 0; k < ntl1.size() && k < ntl2.size(); ++k) unify_f(ntl1[k].ty, ntl2[k].ty);
+  std::vector<PackConstraint> ntl2 = complete_type_list(env, pack1->pack_constraints, lv2, pack2);
+  std::vector<PackConstraint> ntl1 = complete_type_list(env, pack2->pack_constraints, lv1, pack1);
+  std::vector<TypeExpr*> tl1, tl2;
+  for (auto& c : ntl1) tl1.push_back(c.ty);
+  for (auto& c : ntl2) tl2.push_back(c.ty);
+  unify_list_f(slice(tl1), slice(tl2));
   if (eq_package_path(env, pack1->pack_path, pack2->pack_path)) return {true};
   PackageSubtypeResult r = package_subtype(env, pack1, pack2);
   if (!r.ok) return r;
   return package_subtype(env, pack2, pack1);
+}
+
+static long find_lowest_level(TypeExpr* ty) {
+  long lowest = generic_level;
+  with_type_mark([&](TypeMark& mark) {
+    std::function<void(TypeExpr*)> find = [&](TypeExpr* t) {
+      if (try_mark_node(mark, t)) {
+        long level = get_level(t);
+        if (level < lowest) lowest = level;
+        iter_type_expr(find, t);
+      }
+    };
+    find(ty);
+  });
+  return lowest;
 }
 
 // force unification in Reither when one side has a non-conjunctive type
@@ -1172,9 +1152,10 @@ bool rigid_variants = false;
 
 static void unify_rec(const Uenv& uenv, TypeExpr* t1, TypeExpr* t2);
 static void unify2(const Uenv& uenv, TypeExpr* t1, TypeExpr* t2);
-static void unify2_rec(const Uenv& uenv, TypeExpr* t1, TypeExpr* t2);
-static void unify2_expand(const Uenv& uenv, TypeExpr* t1, TypeExpr* t2);
-static void unify3(const Uenv& uenv, TypeExpr* t1, TypeExpr* t2);
+static void unify2_rec(const Uenv& uenv, TypeExpr* t10, TypeExpr* t1, TypeExpr* t20, TypeExpr* t2);
+static void unify2_expand(const Uenv& uenv, TypeExpr* t1, TypeExpr* t1p, TypeExpr* t2, TypeExpr* t2p);
+static void unify3(const Uenv& uenv, TypeExpr* t1, TypeExpr* t1p, TypeExpr* t2, TypeExpr* t2p);
+static void unify_list(const Uenv& uenv, Slice<TypeExpr*> tl1, Slice<TypeExpr*> tl2);
 static void unify_fields(const Uenv& uenv, TypeExpr* ty1, TypeExpr* ty2);
 static void unify_row(const Uenv& uenv, const RowDesc* row1, const RowDesc* row2);
 static void unify_package(const Uenv& uenv, long lvl1, const Package* pack1, long lvl2,
@@ -1192,7 +1173,6 @@ static bool unify1_var(const Uenv& uenv, TypeExpr* t1, TypeExpr* t2) {
   }
   try {
     update_level(env, get_level(t1), t2);
-    update_level(env, get_level(t2), t1);  // for Texpand
     update_scope(get_scope(t1), t2);
   } catch (const Escape& e) {
     raise_for(TraceExn::Unify, escape_elt(e.esc));
@@ -1202,19 +1182,19 @@ static bool unify1_var(const Uenv& uenv, TypeExpr* t1, TypeExpr* t2) {
 }
 
 // Called from unify3
-static void unify3_var(const Uenv& uenv, TypeExpr* t1, TypeExpr* t2) {
-  occur_for(TraceExn::Unify, uenv, t1, t2);
+static void unify3_var(const Uenv& uenv, TypeExpr* t1p, TypeExpr* t2, TypeExpr* t2p) {
+  occur_for(TraceExn::Unify, uenv, t1p, t2);
   try {
     occur_univar_or_unscoped_for(TraceExn::Unify, get_env(uenv), t2);
   } catch (const UnifyTrace&) {
     if (!in_pattern_mode(uenv)) throw;
-    reify(uenv, t1, t1, t2);
-    reify(uenv, t2, t1, t2);
-    occur_univar_or_unscoped(get_env(uenv), t2, true);
-    record_equation(uenv, t1, t2);
+    reify(uenv, t1p);
+    reify(uenv, t2p);
+    occur_univar_or_unscoped(get_env(uenv), t2p, true);
+    record_equation(uenv, t1p, t2p);
     return;
   }
-  link_type(t1, t2);
+  link_type(t1p, t2);
 }
 
 // (see the long comment in ctype.ml on abbreviations and unification)
@@ -1228,9 +1208,9 @@ static void unify_rec(const Uenv& uenv, TypeExpr* t1, TypeExpr* t2) {
     const TypeDesc* d2 = get_desc(t2);
     auto c1 = as<Tconstr>(d1);
     auto c2 = as<Tconstr>(d2);
-    if (d1->kind == DescKind::Tvar && c2 && !c2->args.empty()) {
+    if (d1->kind == DescKind::Tvar && c2 && deep_occur(t1, t2)) {
       unify2(uenv, t1, t2);
-    } else if (c1 && !c1->args.empty() && d2->kind == DescKind::Tvar) {
+    } else if (c1 && d2->kind == DescKind::Tvar && deep_occur(t2, t1)) {
       unify2(uenv, t1, t2);
     } else if (d1->kind == DescKind::Tvar) {
       if (!unify1_var(uenv, t1, t2)) unify2(uenv, t1, t2);
@@ -1241,29 +1221,20 @@ static void unify_rec(const Uenv& uenv, TypeExpr* t1, TypeExpr* t2) {
       update_level_for(TraceExn::Unify, get_env(uenv), get_level(t1), t2);
       update_scope_for(TraceExn::Unify, get_scope(t1), t2);
       link_type(t1, t2);
+    } else if (c1 && c2 && c1->args.empty() && c2->args.empty() &&
+               env::path_equiv(get_env(uenv), c1->path, c2->path)
+               // This optimization assumes that t1 does not expand to t2
+               // (and conversely), so we fall back to the general case when
+               // any of the types has a cached expansion.
+               && !(has_cached_expansion(c1->path, c1->memo->contents) ||
+                    has_cached_expansion(c2->path, c2->memo->contents))) {
+      update_level_for(TraceExn::Unify, get_env(uenv), get_level(t1), t2);
+      update_scope_for(TraceExn::Unify, get_scope(t1), t2);
+      link_type(t1, t2);
+    } else if (c1 && c2 && env::has_local_constraints(get_env(uenv))) {
+      unify2_rec(uenv, t1, t1, t2, t2);
     } else {
-      const TypeDesc* d3 = get_constr_desc(t1);
-      const TypeDesc* d4 = get_constr_desc(t2);
-      auto c3 = as<Tconstr>(d3);
-      auto c4 = as<Tconstr>(d4);
-      if (c3 && c4 && c3->args.empty() && c4->args.empty() && (d1 == d3 || d2 == d4) &&
-          quick_eq_type_path_nocache(true, get_env(uenv), c3->path, c3->memo, c4->path, c4->memo)
-          // This optimization assumes that t1 does not expand to t2 (and
-          // conversely), so we fall back to the general case when any of
-          // the types has a cached expansion.
-      ) {
-        auto unify1_constr = [&](TypeExpr* a, TypeExpr* b) {
-          update_level_for(TraceExn::Unify, get_env(uenv), get_level(a), b);
-          update_scope_for(TraceExn::Unify, get_scope(a), b);
-          link_type(a, b);
-        };
-        if (d1 == d3) unify1_constr(t1, t2);
-        else unify1_constr(t2, t1);
-      } else if (c1 && c2 && env::has_local_constraints(get_env(uenv))) {
-        unify2_rec(uenv, t1, t2);
-      } else {
-        unify2(uenv, t1, t2);
-      }
+      unify2(uenv, t1, t2);
     }
     reset_trace_gadt_instances(reset_tracing);
   } catch (UnifyTrace& e) {
@@ -1272,16 +1243,17 @@ static void unify_rec(const Uenv& uenv, TypeExpr* t1, TypeExpr* t2) {
   }
 }
 
-static void unify2(const Uenv& uenv, TypeExpr* t1, TypeExpr* t2) { unify2_expand(uenv, t1, t2); }
+static void unify2(const Uenv& uenv, TypeExpr* t1, TypeExpr* t2) { unify2_expand(uenv, t1, t1, t2, t2); }
 
-static void unify2_rec(const Uenv& uenv, TypeExpr* t1, TypeExpr* t2) {
+static void unify2_rec(const Uenv& uenv, TypeExpr* t10, TypeExpr* t1, TypeExpr* t20, TypeExpr* t2) {
   if (unify_eq(uenv, t1, t2)) return;
   try {
     auto* c1 = as<Tconstr>(get_desc(t1));
     auto* c2 = as<Tconstr>(get_desc(t2));
     if (!(c1 && c2)) throw CannotExpand{};
-    if (c1->args.empty() && c2->args.empty() &&
-        quick_eq_type_path_nocache(false, get_env(uenv), c1->path, c1->memo, c2->path, c2->memo)) {
+    if (env::path_equiv(get_env(uenv), c1->path, c2->path) && c1->args.empty() && c2->args.empty() &&
+        !(has_cached_expansion(c1->path, c1->memo->contents) ||
+          has_cached_expansion(c2->path, c2->memo->contents))) {
       update_level_for(TraceExn::Unify, get_env(uenv), get_level(t1), t2);
       update_scope_for(TraceExn::Unify, get_scope(t1), t2);
       link_type(t1, t2);
@@ -1289,35 +1261,47 @@ static void unify2_rec(const Uenv& uenv, TypeExpr* t1, TypeExpr* t2) {
     }
     env::t env = get_env(uenv);
     if (find_expansion_scope(env, c1->path) > find_expansion_scope(env, c2->path))
-      unify2_rec(uenv, t1, try_expand_safe(env, t2));
+      unify2_rec(uenv, t10, t1, t20, try_expand_safe(env, t2));
     else
-      unify2_rec(uenv, try_expand_safe(env, t1), t2);
+      unify2_rec(uenv, t10, try_expand_safe(env, t1), t20, t2);
   } catch (const CannotExpand&) {
-    unify2_expand(uenv, t1, t2);
+    unify2_expand(uenv, t10, t1, t20, t2);
   }
 }
 
-static void unify2_expand(const Uenv& uenv, TypeExpr* t1, TypeExpr* t2) {
+static void unify2_expand(const Uenv& uenv, TypeExpr* t1, TypeExpr* t1p, TypeExpr* t2, TypeExpr* t2p) {
   // Second step: expansion of abbreviations
+  // Expansion may change the representative of the types.
   env::t env = get_env(uenv);
-  expand_head_unif(env, t1);
-  expand_head_unif(env, t2);
-  // vouillon: expanding a type can perform some unification; because of
-  // caching, a second expansion gives the right result.
-  expand_head_unif(env, t1);
-  expand_head_unif(env, t2);
-  long lv = std::min(get_level(t1), get_level(t2));
-  long scope = std::max(get_scope(t1), get_scope(t2));
+  expand_head_unif(env, t1p);
+  expand_head_unif(env, t2p);
+  t1p = expand_head_unif(env, t1p);
+  t2p = expand_head_unif(env, t2p);
+  long lv = std::min(get_level(t1p), get_level(t2p));
+  long scope = std::max(get_scope(t1p), get_scope(t2p));
   update_level_for(TraceExn::Unify, env, lv, t2);
   update_level_for(TraceExn::Unify, env, lv, t1);
   update_scope_for(TraceExn::Unify, scope, t2);
   update_scope_for(TraceExn::Unify, scope, t1);
-  if (unify_eq(uenv, t1, t2)) return;
-  if (!get_abbrev(t1) || get_abbrev(t2)) {
-    unify3(uenv, t1, t2);
+  if (unify_eq(uenv, t1p, t2p)) return;
+  if (clflags::principal && (find_lowest_level(t1p) < lv || find_lowest_level(t2p) < lv)) {
+    // Expand abbreviations hiding a lower level
+    // Should also do it for parameterized types, after unification...
+    // (the pair is built right to left: t2's first)
+    auto nullary = [](TypeExpr* t) {
+      auto* c = as<Tconstr>(get_desc(t));
+      return c && c->args.empty();
+    };
+    TypeExpr* n2 = nullary(t2) ? t2p : t2;
+    TypeExpr* n1 = nullary(t1) ? t1p : t1;
+    t1 = n1;
+    t2 = n2;
+  }
+  if (unify_eq(uenv, t1, t1p) || !unify_eq(uenv, t2, t2p)) {
+    unify3(uenv, t1, t1p, t2, t2p);
   } else {
     try {
-      unify3(uenv, t2, t1);
+      unify3(uenv, t2, t2p, t1, t1p);
     } catch (UnifyTrace& e) {
       raise_trace_for(TraceExn::Unify, et::swap_trace(e.trace));
     }
@@ -1341,11 +1325,13 @@ static void unify_labeled_list(const Uenv& uenv, Slice<LabeledTy> l1, Slice<Labe
   }
 }
 
-static void unify3(const Uenv& uenv, TypeExpr* t1p, TypeExpr* t2p) {
+static void unify3(const Uenv& uenv, TypeExpr* t1, TypeExpr* t1p, TypeExpr* t2, TypeExpr* t2p) {
   // Third step: truly unification
+  // Assumes either [t1 == t1'] or [t2 != t2']
   TypeExpr* tt1 = repr(t1p);
   const TypeDesc* d1 = tt1->desc;
   const TypeDesc* d2 = get_desc(t2p);
+  bool create_recursion = !eq_type(t2, t2p) && deep_occur(t1p, t2);
   using DK = DescKind;
   // handle vars and univars specially
   if (d1->kind == DK::Tunivar && d2->kind == DK::Tunivar) {
@@ -1354,11 +1340,11 @@ static void unify3(const Uenv& uenv, TypeExpr* t1p, TypeExpr* t2p) {
     return;
   }
   if (d1->kind == DK::Tvar) {
-    unify3_var(uenv, t1p, t2p);
+    unify3_var(uenv, t1p, t2, t2p);
     return;
   }
   if (d2->kind == DK::Tvar) {
-    unify3_var(uenv, t2p, t1p);
+    unify3_var(uenv, t2p, t1, t1p);
     return;
   }
   if (d1->kind == DK::Tfield && d2->kind == DK::Tfield) {  // special case for GADTs
@@ -1368,8 +1354,8 @@ static void unify3(const Uenv& uenv, TypeExpr* t1p, TypeExpr* t2p) {
   if (in_pattern_mode(uenv)) {
     add_type_equality(uenv, t1p, t2p);
   } else {
-    occur_for(TraceExn::Unify, uenv, t1p, t2p);
-    link_type(t1p, t2p);
+    occur_for(TraceExn::Unify, uenv, t1p, t2);
+    link_type(t1p, t2);
   }
   try {
     bool pm = in_pattern_mode(uenv);
@@ -1390,7 +1376,7 @@ static void unify3(const Uenv& uenv, TypeExpr* t1p, TypeExpr* t2p) {
       auto* f2 = as<Tfunctor>(d2);
       eq_labels(TraceExn::Unify, pm, f1->label, f2->label);
       try {
-        unify_package(uenv, get_level(t1p), f1->pack, get_level(t2p), f2->pack);
+        unify_package(uenv, get_level(t1), f1->pack, get_level(t2), f2->pack);
       } catch (UnifyTrace& e) {
         TypeExpr* got = newty(tpackage(f1->pack));
         TypeExpr* expected = newty(tpackage(f2->pack));
@@ -1428,7 +1414,7 @@ static void unify3(const Uenv& uenv, TypeExpr* t1p, TypeExpr* t2p) {
       if (!is_commu_ok(a1->commu)) set_commu_ok(a1->commu);
     } else if (d1->kind == DK::Ttuple && d2->kind == DK::Ttuple) {
       unify_labeled_list(uenv, as<Ttuple>(d1)->elems, as<Ttuple>(d2)->elems);
-    } else if (c1 && c2 && quick_eq_type_path(true, get_env(uenv), c1->path, c2->path)) {
+    } else if (c1 && c2 && env::path_equiv(get_env(uenv), c1->path, c2->path)) {
       Slice<TypeExpr*> tl1 = c1->args, tl2 = c2->args;
       if (!pm) {
         unify_list(uenv, tl1, tl2);
@@ -1436,36 +1422,26 @@ static void unify3(const Uenv& uenv, TypeExpr* t1p, TypeExpr* t2p) {
         Uenv u2 = uenv;
         u2.assume_injective = false;  // without_assume_injective
         unify_list(u2, tl1, tl2);
+      } else if (in_current_module(c1->path) /* || in_pervasives p1 */ ||
+                 expands_to_datatype(get_env(uenv), t1p) || expands_to_datatype(get_env(uenv), t1) ||
+                 expands_to_datatype(get_env(uenv), t2)) {
+        unify_list(uenv, tl1, tl2);
       } else {
-        bool datatype = false;
-        std::vector<Path::t> ps;
-        if (const Abbrev* a = get_abbrev(t1p)) ps.push_back(a->path);
-        if (const Abbrev* a = get_abbrev(t2p)) ps.push_back(a->path);
-        ps.push_back(c1->path);
-        for (Path::t p : ps)
-          if (expands_to_datatype(get_env(uenv), p)) {
-            datatype = true;
-            break;
-          }
-        if (datatype) {
-          unify_list(uenv, tl1, tl2);
-        } else {
-          std::vector<bool> inj;
-          try {
-            for (variance::t v : env::find_type(c1->path, get_env(uenv))->type_variance)
-              inj.push_back(variance::mem(variance::F::Inj, v));
-          } catch (const env::NotFound&) {
-            inj.assign(tl1.size(), false);
-          }
-          if (tl1.size() != tl2.size() || inj.size() != tl1.size())
-            throw std::invalid_argument("List.combine/iter2");
-          for (std::size_t k = 0; k < inj.size(); ++k) {
-            if (inj[k]) {
-              unify_rec(uenv, tl1[k], tl2[k]);
-            } else {
-              reify(uenv, tl1[k]);
-              reify(uenv, tl2[k]);
-            }
+        std::vector<bool> inj;
+        try {
+          for (variance::t v : env::find_type(c1->path, get_env(uenv))->type_variance)
+            inj.push_back(variance::mem(variance::F::Inj, v));
+        } catch (const env::NotFound&) {
+          inj.assign(tl1.size(), false);
+        }
+        if (tl1.size() != tl2.size() || inj.size() != tl1.size())
+          throw std::invalid_argument("List.combine/iter2");
+        for (std::size_t k = 0; k < inj.size(); ++k) {
+          if (inj[k]) {
+            unify_rec(uenv, tl1[k], tl2[k]);
+          } else {
+            reify(uenv, tl1[k]);
+            reify(uenv, tl2[k]);
           }
         }
       }
@@ -1484,16 +1460,16 @@ static void unify3(const Uenv& uenv, TypeExpr* t1p, TypeExpr* t2p) {
       record_equation(uenv, t1p, t2p);
       add_gadt_equation(uenv, source, destination);
     } else if (c1 && c1->args.empty() && pm && is_instantiable(get_env(uenv), c1->path)) {
-      reify(uenv, t2p, t1p, t2p);
+      reify(uenv, t2p);
       record_equation(uenv, t1p, t2p);
       add_gadt_equation(uenv, c1->path, t2p);
     } else if (c2 && c2->args.empty() && pm && is_instantiable(get_env(uenv), c2->path)) {
-      reify(uenv, t1p, t1p, t2p);
+      reify(uenv, t1p);
       record_equation(uenv, t1p, t2p);
       add_gadt_equation(uenv, c2->path, t1p);
     } else if ((c1 || c2) && pm) {
-      reify(uenv, t1p, t1p, t2p);
-      reify(uenv, t2p, t1p, t2p);
+      reify(uenv, t1p);
+      reify(uenv, t2p);
       mcomp_for(TraceExn::Unify, get_env(uenv), t1p, t2p);
       record_equation(uenv, t1p, t2p);
     } else if (d1->kind == DK::Tobject && d2->kind == DK::Tobject) {
@@ -1521,8 +1497,8 @@ static void unify3(const Uenv& uenv, TypeExpr* t1p, TypeExpr* t2p) {
           unify_row(uenv, row1, row2);
         } catch (const UnifyTrace&) {
           btype::backtrack(snap);
-          reify(uenv, t1p, t1p, t2p);
-          reify(uenv, t2p, t1p, t2p);
+          reify(uenv, t1p);
+          reify(uenv, t2p);
           mcomp_for(TraceExn::Unify, get_env(uenv), t1p, t2p);
           record_equation(uenv, t1p, t2p);
         }
@@ -1552,14 +1528,22 @@ static void unify3(const Uenv& uenv, TypeExpr* t1p, TypeExpr* t2p) {
         enter_poly_for(TraceExn::Unify, get_env(uenv), p1->body, p1->vars, p2->body, p2->vars,
                        [&](TypeExpr* a, TypeExpr* b) { unify_rec(uenv, a, b); });
     } else if (d1->kind == DK::Tpackage && d2->kind == DK::Tpackage) {
-      unify_package(uenv, get_level(t1p), as<Tpackage>(d1)->pack, get_level(t2p),
-                    as<Tpackage>(d2)->pack);
+      unify_package(uenv, get_level(t1), as<Tpackage>(d1)->pack, get_level(t2), as<Tpackage>(d2)->pack);
     } else if (d1->kind == DK::Tnil && c2) {
       raise_for(TraceExn::Unify, obj_elt({et::Obj::Kind::Abstract_row, et::Position::Second}));
     } else if (c1 && d2->kind == DK::Tnil) {
       raise_for(TraceExn::Unify, obj_elt({et::Obj::Kind::Abstract_row, et::Position::First}));
     } else {
       raise_unexplained_for(TraceExn::Unify);
+    }
+    // XXX Commentaires + changer "create_recursion"
+    if (create_recursion) {
+      if (auto* c = as<Tconstr>(get_desc(t2))) {
+        forget_abbrev_memo(c->memo, c->path);
+        TypeExpr* t2pp = expand_head_unif(get_env(uenv), t2);
+        if (!closed_parameterized_type(c->args, t2pp)) link_type(t2, t2p);
+      }
+      // (otherwise t2 has already been expanded by update_level)
     }
   } catch (UnifyTrace& e) {
     transient_expr::set_desc(tt1, d1);
@@ -1571,8 +1555,9 @@ static void unify_package(const Uenv& uenv, long lvl1, const Package* pack1, lon
                           const Package* pack2) {
   PackageSubtypeResult r;
   try {
-    r = compare_package(get_env(uenv), [&](TypeExpr* a, TypeExpr* b) { unify_rec(uenv, a, b); },
-                        lvl1, pack1, lvl2, pack2);
+    r = compare_package(
+        get_env(uenv), [&](Slice<TypeExpr*> a, Slice<TypeExpr*> b) { unify_list(uenv, a, b); }, lvl1,
+        pack1, lvl2, pack2);
   } catch (const env::NotFound&) {
     if (!in_pattern_mode(uenv)) raise_unexplained_for(TraceExn::Unify);
     for (auto& c : pack1->pack_constraints) reify(uenv, c.ty);
@@ -1985,11 +1970,11 @@ btype::TypePairs* unify_gadt(PatternEnv* penv, TypeExpr* ty1, TypeExpr* ty2) {
   }
 }
 
-void unify_var_uenv(bool check_occur, const Uenv& uenv, TypeExpr* t1, TypeExpr* t2) {
+void unify_var_uenv(const Uenv& uenv, TypeExpr* t1, TypeExpr* t2) {
   if (eq_type(t1, t2)) return;
   const TypeDesc* d1 = get_desc(t1);
   const TypeDesc* d2 = get_desc(t2);
-  if (d1->kind == DescKind::Tvar && d2->kind == DescKind::Tconstr && check_occur && deep_occur(t1, t2)) {
+  if (d1->kind == DescKind::Tvar && d2->kind == DescKind::Tconstr && deep_occur(t1, t2)) {
     unify_uenv(uenv, t1, t2);
     return;
   }
@@ -1997,7 +1982,7 @@ void unify_var_uenv(bool check_occur, const Uenv& uenv, TypeExpr* t1, TypeExpr* 
     env::t env = get_env(uenv);
     bool reset_tracing = check_trace_gadt_instances(env);
     try {
-      if (check_occur) occur_for(TraceExn::Unify, uenv, t1, t2);
+      occur_for(TraceExn::Unify, uenv, t1, t2);
       update_level_for(TraceExn::Unify, env, get_level(t1), t2);
       update_scope_for(TraceExn::Unify, get_scope(t1), t2);
       link_type(t1, t2);
@@ -2013,7 +1998,7 @@ void unify_var_uenv(bool check_occur, const Uenv& uenv, TypeExpr* t1, TypeExpr* 
 
 // the final versions of unification functions
 void unify_var(env::t env, TypeExpr* t1, TypeExpr* t2) {
-  unify_var_uenv(true, Uenv::expression(env), t1, t2);
+  unify_var_uenv(Uenv::expression(env), t1, t2);
 }
 
 void unify_pairs(env::t env, TypeExpr* t1, TypeExpr* t2, std::vector<UnivarPair> pairs) {

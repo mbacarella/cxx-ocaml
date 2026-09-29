@@ -104,7 +104,6 @@ bool is_poly_Tpoly(TypeExpr* ty);
 bool type_kind_is_abstract(const TypeDeclaration* decl);
 TypeOrigin type_origin(const TypeDeclaration* decl);
 inline constexpr const char* dummy_method = "*dummy method*";
-const TypeDesc* get_constr_desc(TypeExpr* ty);
 
 // ---- poly types -------------------------------------------------------------
 bool tpoly_is_mono(TypeExpr* ty);
@@ -242,6 +241,5 @@ TypeExpr* instance_variable_type(std::string_view label, const ClassSignature* s
 // ---- deep occurrences and folded description -----------------------------
 bool deep_occur(TypeExpr* t0, TypeExpr* ty);
 bool deep_occur_list(TypeExpr* t0, const std::vector<TypeExpr*>& tyl);
-const TypeDesc* get_folded_desc(bool keep_Tvar, TypeExpr* ty);
 
 }  // namespace cppcaml::typing::btype

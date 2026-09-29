@@ -259,40 +259,49 @@ TypeExpr* filter_method(env::t env, std::string_view name, TypeExpr* ty0) {
   throw f;
 }
 
-struct MethodRow {
-  FieldKind* kind;
+struct MethodRow {  // (method_privacy, field, row)
+  MethodPrivacy priv;
   TypeExpr* field;
   TypeExpr* row;
 };
 
 static MethodRow filter_method_row(env::t env, std::string_view name, PrivateFlag priv,
                                    TypeExpr* ty0) {
-  TypeExpr* ty = expand_head_unif(env, ty0);
+  TypeExpr* ty = expand_head(env, ty0);
   const TypeDesc* d = get_desc(ty);
   if (d->kind == DescKind::Tvar) {
     long level = get_level(ty);
     TypeExpr* field = newvar2(level);
     TypeExpr* row = newvar2(level);
-    FieldKind* kind = priv == PrivateFlag::Private ? field_private() : field_public();
+    FieldKind* kind;
+    MethodPrivacy mp;
+    if (priv == PrivateFlag::Private) {
+      kind = field_private();
+      mp = MethodPrivacy{true, kind};
+    } else {
+      kind = field_public();
+    }
     TypeExpr* ty2 = newty2(level, tfield(name, kind, field, row));
     link_type(ty, ty2);
-    return {kind, field, row};
+    return {mp, field, row};
   }
   if (auto* f = as<Tfield>(d)) {
     if (f->label == name) {
+      MethodPrivacy mp;
       if (priv == PrivateFlag::Public) unify_kind(f->kind_, field_public());
-      return {f->kind_, f->ty, f->rest};
+      else mp = MethodPrivacy{true, f->kind_};
+      return {mp, f->ty, f->rest};
     }
     long level = get_level(ty);
     MethodRow r = filter_method_row(env, name, priv, f->rest);
     TypeExpr* row = newty2(level, tfield(f->label, f->kind_, f->ty, r.row));
-    return {r.kind, r.field, row};
+    return {r.priv, r.field, row};
   }
   if (d->kind == DescKind::Tnil) {
     if (name == dummy_method) throw FilterMethodRowFailed{};
     if (priv == PrivateFlag::Public) throw FilterMethodRowFailed{};
     long level = get_level(ty);
-    return {field_absent(), newvar2(level), ty};
+    return {MethodPrivacy{true, field_absent()}, newvar2(level), ty};
   }
   throw FilterMethodRowFailed{};
 }
@@ -301,22 +310,13 @@ static MethodRow filter_method_row(env::t env, std::string_view name, PrivateFla
 ClassSignature* new_class_signature() {
   TypeExpr* row = newvar();
   TypeExpr* self = newobj(row);
-  return make<ClassSignature>(self, row, field_absent(), StrMap<VarEntry>{}, StrMap<MethEntry>{});
+  return make<ClassSignature>(self, row, StrMap<VarEntry>{}, StrMap<MethEntry>{});
 }
 
 void add_dummy_method(env::t env, long scope, ClassSignature* sign) {
-  if (field_kind_repr(sign->csig_dummy_method) != FieldKindView::Fabsent)
-    throw std::logic_error("Ctype.add_dummy_method");
   MethodRow r = filter_method_row(env, dummy_method, PrivateFlag::Private, sign->csig_self_row);
   unify(env, r.field, new_scoped_ty(scope, ttuple({})));
-  sign->csig_dummy_method = r.kind;
   sign->csig_self_row = r.row;
-}
-
-void remove_dummy_method(ClassSignature* sign) {
-  if (field_kind_repr(sign->csig_dummy_method) != FieldKindView::Fprivate)
-    throw std::logic_error("Ctype.remove_dummy_method");
-  link_kind(sign->csig_dummy_method, field_absent());
 }
 
 void add_method(env::t env, std::string_view label, PrivateFlag priv, VirtualFlag virt,
@@ -331,7 +331,7 @@ void add_method(env::t env, std::string_view label, PrivateFlag priv, VirtualFla
       switch (field_kind_repr(e->priv.kind)) {
         case FieldKindView::Fpublic: break;
         case FieldKindView::Fprivate: link_kind(e->priv.kind, field_public()); break;
-        case FieldKindView::Fabsent: throw AddMethodFailed(true);
+        case FieldKindView::Fabsent: throw std::logic_error("Ctype.add_method");
       }
       priv2 = MethodPrivacy{};
     } else {
@@ -352,7 +352,7 @@ void add_method(env::t env, std::string_view label, PrivateFlag priv, VirtualFla
     } catch (const FilterMethodRowFailed&) {
       throw AddMethodFailed(true);
     }
-    priv2 = priv == PrivateFlag::Public ? MethodPrivacy{} : MethodPrivacy{true, r.kind};
+    priv2 = r.priv;
     try {
       unify(env, ty, r.field);
     } catch (const Unify& u) {
@@ -416,7 +416,12 @@ void inherit_class_signature(bool strict, env::t env, ClassSignature* sign1,
                              const ClassSignature* sign2) {
   unify_self_types(env, sign1, sign2);
   sign2->csig_meths.iter([&](std::string_view label, const MethEntry& e) {
-    PrivateFlag priv = e.priv.is_private ? PrivateFlag::Private : PrivateFlag::Public;
+    PrivateFlag priv = PrivateFlag::Public;
+    if (e.priv.is_private) {
+      if (field_kind_repr(e.priv.kind) != FieldKindView::Fabsent)
+        throw std::logic_error("Ctype.inherit_class_signature");
+      priv = PrivateFlag::Private;
+    }
     try {
       add_method(env, label, priv, e.virt, e.ty, sign1);
     } catch (const AddMethodFailed& am) {
@@ -438,71 +443,48 @@ void inherit_class_signature(bool strict, env::t env, ClassSignature* sign1,
   });
 }
 
-std::vector<std::string_view> update_implicitly_public_methods(ClassSignature* sign) {
+std::pair<std::vector<std::string_view>, std::vector<std::string_view>> update_class_signature(
+    env::t env, ClassSignature* sign) {
+  TypeExpr* self = expand_head(env, sign->csig_self);
+  auto [fields, row] = flatten_fields(object_fields(self));
   StrMap<MethEntry> meths = sign->csig_meths;
-  std::vector<std::string_view> implicitly_public;  // consed
-  sign->csig_meths.iter([&](std::string_view lab, const MethEntry& e) {
-    if (!e.priv.is_private) return;
-    if (field_kind_repr(e.priv.kind) == FieldKindView::Fpublic) {
-      meths = meths.add(lab, MethEntry{MethodPrivacy{}, e.virt, e.ty});
-      implicitly_public.insert(implicitly_public.begin(), lab);
-    }
-  });
-  sign->csig_meths = meths;
-  return implicitly_public;
-}
-
-std::vector<std::string_view> update_implicitly_declared_methods(env::t env, ClassSignature* sign) {
-  TypeExpr* row0 = expand_head(env, sign->csig_self_row);
-  auto [fields, row] = flatten_fields(row0);
-  long row_level = get_level(row);
-  StrMap<MethEntry> meths = sign->csig_meths;
-  std::vector<std::string_view> implicitly_declared;
+  std::vector<std::string_view> implicitly_public, implicitly_declared;  // consed
   for (auto& f : fields) {
-    switch (field_kind_repr(f.kind)) {
-      case FieldKindView::Fabsent: throw std::logic_error("Ctype.update_implicitly_declared_methods");
-      case FieldKindView::Fprivate:
-        row = newty2(row_level, tfield(f.name, f.kind, f.ty, row));
-        break;
-      case FieldKindView::Fpublic:
-        meths = meths.add(f.name, MethEntry{MethodPrivacy{}, VirtualFlag::Virtual, f.ty});
-        implicitly_declared.insert(implicitly_declared.begin(), f.name);
-        break;
+    if (f.name == dummy_method) continue;
+    if (const MethEntry* e = meths.find_opt(f.name)) {
+      if (e->priv.is_private && field_kind_repr(f.kind) == FieldKindView::Fpublic) {
+        meths = meths.add(f.name, MethEntry{MethodPrivacy{}, e->virt, e->ty});
+        implicitly_public.insert(implicitly_public.begin(), f.name);
+      }
+    } else {
+      switch (field_kind_repr(f.kind)) {
+        case FieldKindView::Fpublic:
+          meths = meths.add(f.name, MethEntry{MethodPrivacy{}, VirtualFlag::Virtual, f.ty});
+          implicitly_declared.insert(implicitly_declared.begin(), f.name);
+          break;
+        case FieldKindView::Fprivate:
+          meths = meths.add(f.name, MethEntry{MethodPrivacy{true, f.kind}, VirtualFlag::Virtual, f.ty});
+          implicitly_declared.insert(implicitly_declared.begin(), f.name);
+          break;
+        case FieldKindView::Fabsent:
+          break;
+      }
     }
   }
   sign->csig_meths = meths;
   sign->csig_self_row = row;
-  return implicitly_declared;
+  return {implicitly_public, implicitly_declared};
 }
 
-void hide_private_methods(const ClassSignature* sign) {
-  sign->csig_meths.iter([&](std::string_view, const MethEntry& e) {
-    if (!e.priv.is_private) return;
-    switch (field_kind_repr(e.priv.kind)) {
-      case FieldKindView::Fpublic: throw std::logic_error("Ctype.hide_private_methods");
-      case FieldKindView::Fabsent: return;
-      case FieldKindView::Fprivate: link_kind(e.priv.kind, field_absent()); return;
-    }
-  });
+void hide_private_methods(env::t env, const ClassSignature* sign) {
+  TypeExpr* self = expand_head(env, sign->csig_self);
+  auto [fields, row] = flatten_fields(object_fields(self));
+  (void)row;
+  for (auto& f : fields)
+    if (field_kind_repr(f.kind) == FieldKindView::Fprivate) link_kind(f.kind, field_absent());
 }
 
-void reveal_private_methods(env::t env, ClassSignature* sign) {
-  StrMap<MethEntry> meths = sign->csig_meths;
-  TypeExpr* row = sign->csig_self_row;
-  sign->csig_meths.iter([&](std::string_view lab, const MethEntry& e) {
-    if (!e.priv.is_private) return;
-    if (field_kind_repr(e.priv.kind) != FieldKindView::Fabsent)
-      throw std::logic_error("Ctype.reveal_private_methods");
-    MethodRow r = filter_method_row(env, lab, PrivateFlag::Private, row);
-    unify(env, e.ty, r.field);
-    meths = meths.add(lab, MethEntry{MethodPrivacy{true, r.kind}, e.virt, e.ty});
-    row = r.row;
-  });
-  sign->csig_meths = meths;
-  sign->csig_self_row = row;
-}
-
-bool close_class_signature(env::t env, ClassSignature* sign) {
+bool close_class_signature(env::t env, const ClassSignature* sign) {
   std::function<bool(TypeExpr*)> close = [&](TypeExpr* ty0) -> bool {
     TypeExpr* ty = expand_head(env, ty0);
     const TypeDesc* d = get_desc(ty);
@@ -512,18 +494,13 @@ bool close_class_signature(env::t env, ClassSignature* sign) {
     }
     if (auto* f = as<Tfield>(d)) {
       if (f->label == dummy_method) return false;
-      switch (field_kind_repr(f->kind_)) {
-        case FieldKindView::Fabsent: throw std::logic_error("Ctype.close_class_signature");
-        case FieldKindView::Fpublic: return false;
-        case FieldKindView::Fprivate:
-          link_kind(f->kind_, field_absent());
-          return close(f->rest);
-      }
+      return close(f->rest);
     }
     if (d->kind == DescKind::Tnil) return true;
     throw std::logic_error("Ctype.close_class_signature");
   };
-  return close(expand_head(env, sign->csig_self_row));
+  TypeExpr* self = expand_head(env, sign->csig_self);
+  return close(object_fields(self));
 }
 
 // Build a copy of a type in which nodes reachable through a path composed
@@ -535,7 +512,6 @@ static TypeExpr* copy_spine_rec(const UnscopedMapping& unscoped, CopyScope& copy
   switch (desc->kind) {
     case DescKind::Tsubst: return as<Tsubst>(desc)->ty;
     case DescKind::Tvar: case DescKind::Tnil: case DescKind::Tlink: case DescKind::Tunivar:
-    case DescKind::Texpand:
       return ty;
     case DescKind::Tfield: case DescKind::Tvariant: case DescKind::Tobject:
       // We left the spine but still need to apply id_map.

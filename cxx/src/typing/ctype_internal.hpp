@@ -46,20 +46,18 @@ void unify_univar_for(TraceExn tr_exn, TypeExpr* t1, TypeExpr* t2,
                       const std::vector<UnivarPair>& pairs);
 void occur_univar_or_unscoped_for(TraceExn tr_exn, env::t env, TypeExpr* ty);
 void eq_labels(TraceExn error_mode, bool in_pattern_mode, const ArgLabel& l1, const ArgLabel& l2);
+// raises env::NotFound (Not_found) rather than Unify if the module types
+// are incompatible
 PackageSubtypeResult compare_package(env::t env,
-                                     const std::function<void(TypeExpr*, TypeExpr*)>& unify_f,
+                                     const std::function<void(Slice<TypeExpr*>, Slice<TypeExpr*>)>& unify_list_f,
                                      long lv1, const Package* pack1, long lv2,
                                      const Package* pack2);
 et::UnificationError expand_to_unification_error(env::t env, const et::TypeTrace& trace);
 void unify_kind(FieldKind* k1, FieldKind* k2);
 
-struct CompleteResult {  // ((Longident.t * type_expr) list, first_class_module) result
-  bool ok;
-  std::vector<PackConstraint> res;
-  et::FirstClassModule err;
-};
-CompleteResult complete_type_list(et::Position pos, env::t env, Slice<PackConstraint> fl1,
-                                  long lv2, const Package* pack2, bool allow_absent = false);
+// raises env::NotFound if impossible
+std::vector<PackConstraint> complete_type_list(env::t env, Slice<PackConstraint> fl1, long lv2,
+                                               const Package* pack2, bool allow_absent = false);
 using IdPairList = std::vector<std::pair<ident::Unscoped*, ident::Unscoped*>>;
 void enter_functor(env::t env, ident::Unscoped* id1, TypeExpr* t1, ident::Unscoped* id2,
                    TypeExpr* t2, const std::function<void(IdPairList)>& f);

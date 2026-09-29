@@ -164,7 +164,7 @@ void install_forward_refs() {
   if (done) return;
   done = true;
   env::strengthen = mtype::strengthen_lazy;
-  ctype::forward_try_expand_safe = ctype::try_expand_safe_no_link;
+  ctype::forward_try_expand_safe = ctype::try_expand_safe;
   ctype::unify_var_ref = ctype::unify_var_uenv;
   ctype::nondep_type_ref = ctype::nondep_type;
   env::same_constr = ctype::same_constr;

@@ -83,7 +83,7 @@ class Writer {
     auto key = std::make_pair(static_cast<const void*>(l.p), l.n);
     if (auto it = lists_.find(key); it != lists_.end()) return it->second;
     // the cells registered before the elements are written: an element may
-    // reach its own list again (a Texpand's args through the expansion)
+    // reach its own list again (Marshal's sharing of cyclic values)
     std::vector<V> cells;
     for (std::size_t k = 0; k < l.size(); ++k) cells.push_back(o::vblock(0, {}));
     lists_[key] = cells[0];
@@ -459,12 +459,6 @@ class Writer {
           auto* f = as<Tfunctor>(d);
           return {arg_label(f->label), unscoped(f->id), package(f->pack), ty(f->body)};
         }
-        case DescKind::Texpand: {
-          auto* e = as<Texpand>(d);
-          return {ty(e->ty), shared(memo_, e->abbrev, 0, [&]() -> std::vector<V> {
-                    return {path(e->abbrev->path), tys(e->abbrev->args), i(e->abbrev->level)};
-                  })};
-        }
         case DescKind::Tlink: return {ty(as<Tlink>(d)->ty)};
         case DescKind::Tsubst: {
           auto* s = as<Tsubst>(d);
@@ -519,9 +513,6 @@ class Writer {
           case OK::Approx_recmod: orig = i(2); break;
           case OK::Existential:
             orig = shared_by(k->origin.obj, [&] { return o::vblock(0, {str(k->origin.existential)}); });
-            break;
-          case OK::Equation:
-            orig = shared_by(k->origin.obj, [&] { return o::vblock(1, {ty(k->origin.eq1), ty(k->origin.eq2)}); });
             break;
         }
         return o::vblock(0, {orig});
@@ -590,7 +581,7 @@ class Writer {
   V mutable_flag(MutableFlag m) { return i(m == MutableFlag::Immutable ? 0 : 1); }
   V class_sig(const ClassSignature* c) {
     return shared(memo_, c, 0, [&]() -> std::vector<V> {
-      return {ty(c->csig_self), ty(c->csig_self_row), field_kind(c->csig_dummy_method),
+      return {ty(c->csig_self), ty(c->csig_self_row),
               strmap<VarEntry>(c->csig_vars.root(), [&](const VarEntry& e) {
                 return o::vblock(0, {mutable_flag(e.mut), virtual_flag(e.virt), ty(e.ty)});
               }),

@@ -167,13 +167,6 @@ long increase_global_level() {
 }
 void restore_global_level(long gl) { global_level = gl; }
 
-void reset() {
-  current_level = 0;
-  nongen_level = 0;
-  global_level = 0;
-  g_saved_levels.clear();
-}
-
 // ---- type creators ---------------------------------------------------------------
 TypeExpr* newty(const TypeDesc* desc) { return newty2(current_level, desc); }
 TypeExpr* new_scoped_ty(long scope, const TypeDesc* desc) {
@@ -258,28 +251,32 @@ void PatternEnv::with_mty(Slice<std::pair<ident::Unscoped*, ident::Unscoped*>> i
   f();
 }
 
-// [quick_eq_type_path] is used in fast-paths that check if two type
-// paths are "clearly the same", it can under-approximate path
-// equivalence to gain speed.  If [normalize] is [true], we also check
-// quick-equivalence modulo normalization.
-bool quick_eq_type_path(bool normalize, env::t env, Path::t p1, Path::t p2) {
-  if (normalize) return env::type_path_equiv_modulo(env, p1, p2);
-  return env::path_equiv(env, p1, p2);
-}
-
-// Check that [p1] and [p2] are equivalent, assuming that [p1] and [p2]
-// have been normalized.
-bool eq_expanded_type_path(env::t env, Path::t p1, Path::t p2) { return env::path_equiv(env, p1, p2); }
-
-bool eq_package_path(env::t env, Path::t p1, Path::t p2) {
-  return env::path_equiv(env, p1, p2) || env::modtype_path_equiv_modulo(env, p1, p2);
-}
-
 // ---- unification mode --------------------------------------------------------------
 env::t get_env(const Uenv& u) { return u.is_pattern ? u.penv->env : u.expr_env; }
 bool in_pattern_mode(const Uenv& u) { return u.is_pattern; }
 
 // ---- checks for type definitions ----------------------------------------------------
+bool in_current_module(Path::t p) {
+  for (;;) {
+    switch (p->kind) {
+      case Path::Kind::Pident: return true;
+      case Path::Kind::Pdot:
+      case Path::Kind::Papply: return false;
+      case Path::Kind::Pextra_ty: p = p->p1; continue;
+    }
+  }
+}
+
+bool in_pervasives(Path::t p) {
+  if (!in_current_module(p)) return false;
+  try {
+    env::find_type(p, env::initial());
+    return true;
+  } catch (const env::NotFound&) {
+    return false;
+  }
+}
+
 bool is_datatype(const TypeDeclaration* decl) {
   return decl->type_kind->kind != TypeKind::Kind::Type_abstract;
 }
@@ -368,13 +365,14 @@ TypeExpr* fields_row_variable(TypeExpr* ty) {
   }
 }
 
-void set_object_name(Path::t p, Slice<TypeExpr*> params, TypeExpr* ty) {
+void set_object_name(Ident::t id, Slice<TypeExpr*> params, TypeExpr* ty) {
   const TypeDesc* d = get_desc(ty);
   if (auto* o = as<Tobject>(d)) {
     TypeExpr* rv = fields_row_variable(o->fields);
     std::vector<TypeExpr*> args{rv};
     args.insert(args.end(), params.begin(), params.end());
-    set_name(o->name, make<PathArgs>(p, slice(args), params));  // Some (p, rv :: params)
+    // Some (Path.Pident id, rv :: params)
+    set_name(o->name, make<PathArgs>(Path::pident(id), slice(args), params));
   } else if (d->kind != DescKind::Tconstr) {
     throw std::logic_error("Ctype.set_object_name");
   }
@@ -534,6 +532,19 @@ bool closed_type_expr(TypeExpr* ty, env::t env) {
   return r;
 }
 
+bool closed_parameterized_type(Slice<TypeExpr*> params, TypeExpr* ty) {
+  bool r = true;
+  with_type_mark([&](TypeMark& mark) {
+    for (TypeExpr* p : params) mark_type(mark, p);
+    try {
+      closed_type(nullptr, mark, ty);
+    } catch (const NonClosed&) {
+      r = false;
+    }
+  });
+  return r;
+}
+
 TypeExpr* closed_type_decl(const TypeDeclaration* decl) {
   TypeExpr* r = nullptr;
   with_type_mark([&](TypeMark& mark) {
@@ -552,6 +563,20 @@ TypeExpr* closed_type_decl(const TypeDeclaration* decl) {
         for (auto* l : k->labels) closed_type(nullptr, mark, l->ld_type);
       }
       if (decl->type_manifest) closed_type(nullptr, mark, decl->type_manifest);
+    } catch (const NonClosed& e) {
+      r = e.ty;
+    }
+  });
+  return r;
+}
+
+TypeExpr* closed_extension_constructor(const ExtensionConstructor* ext) {
+  TypeExpr* r = nullptr;
+  with_type_mark([&](TypeMark& mark) {
+    try {
+      for (TypeExpr* p : ext->ext_type_params) mark_type(mark, p);
+      if (!ext->ext_ret_type)
+        iter_type_expr_cstr_args([&](TypeExpr* t) { closed_type(nullptr, mark, t); }, ext->ext_args);
     } catch (const NonClosed& e) {
       r = e.ty;
     }
@@ -673,54 +698,13 @@ void update_scope_for(TraceExn tr_exn, long scope, TypeExpr* ty) {
   }
 }
 
-static bool needs_expand(env::t env, long level, Path::t path, Slice<TypeExpr*> args) {
-  try {
-    const TypeDeclaration* decl = env::find_type(path, env);
-    // List.exists2 raises Invalid_argument on length mismatch
-    if (decl->type_variance.size() != args.size())
-      throw std::invalid_argument("List.exists2");
-    for (std::size_t k = 0; k < args.size(); ++k)
-      if (decl->type_variance[k] == variance::null && get_level(args[k]) > level) return true;
-    return false;
-  } catch (const env::NotFound&) {
-    return false;
-  }
-}
-
 // Note: the level of a type constructor must be greater than its binding
-// time, so that a type constructor cannot escape the scope of its definition.
-static bool check_level_type_rec(std::vector<TypeExpr*>& visited, long level, TypeExpr* ty) {
-  if (get_level(ty) > level) return false;
-  const Abbrev* a = get_abbrev(ty);
-  if (!a) return true;
-  if (a->level <= level) return true;
-  if (path::scope(a->path) > level) return false;
-  if (a->args.empty()) return true;
-  if (std::find(visited.begin(), visited.end(), ty) != visited.end()) return true;
-  visited.push_back(ty);
-  bool ok = true;
-  for (TypeExpr* t : a->args)
-    if (!check_level_type_rec(visited, level, t)) {
-      ok = false;
-      break;
-    }
-  visited.pop_back();
-  return ok;
-}
-
-bool check_level_type(long level, TypeExpr* ty) {
-  std::vector<TypeExpr*> visited;
-  return check_level_type_rec(visited, level, ty);
-}
-
-static void update_level_abbrev(env::t env, long level, bool expand, TypeExpr* ty);
-
+// time. That way, a type constructor cannot escape the scope of its
+// definition (without this constraint, the type system would actually be
+// unsound).
 static void update_level_rec(env::t env, long level, bool expand, TypeExpr* ty) {
   long ty_level = get_level(ty);
-  if (ty_level <= level) {
-    update_level_abbrev(env, level, expand, ty);
-    return;
-  }
+  if (ty_level <= level) return;
   if (level < get_scope(ty)) raise_scope_escape_exn(ty);
   auto set_level_ = [&]() {
     set_level(ty, level);
@@ -728,7 +712,6 @@ static void update_level_rec(env::t env, long level, bool expand, TypeExpr* ty) 
   };
   auto rec = [&](TypeExpr* t) { update_level_rec(env, level, expand, t); };
   const TypeDesc* d = get_desc(ty);
-  // Remove out-of-scope Texpand
   if (auto* c = as<Tconstr>(d)) {
     if (level < path::scope(c->path)) {
       // Try first to replace an abbreviation by its expansion.
@@ -739,12 +722,27 @@ static void update_level_rec(env::t env, long level, bool expand, TypeExpr* ty) 
         raise_escape_constructor(c->path);
       }
       link_type(ty, ty2);
-      update_level_rec(env, level, expand, ty);
+      update_level_rec(env, level, expand, ty2);
       return;
     }
     if (!c->args.empty()) {
-      bool ne = expand || needs_expand(env, level, c->path, c->args);
-      // Do not lower the level of nodes that may be unrelated
+      std::vector<variance::t> variance;
+      try {
+        const TypeDeclaration* decl = env::find_type(c->path, env);
+        variance.assign(decl->type_variance.begin(), decl->type_variance.end());
+      } catch (const env::NotFound&) {
+        variance.assign(c->args.size(), variance::unknown);
+      }
+      bool ne = expand;
+      if (!ne) {
+        // List.exists2 raises Invalid_argument on length mismatch
+        if (variance.size() != c->args.size()) throw std::invalid_argument("List.exists2");
+        for (std::size_t k = 0; k < c->args.size(); ++k)
+          if (variance[k] == variance::null && get_level(c->args[k]) > level) {
+            ne = true;
+            break;
+          }
+      }
       TypeExpr* ty2 = nullptr;
       if (ne) {
         try {
@@ -754,11 +752,10 @@ static void update_level_rec(env::t env, long level, bool expand, TypeExpr* ty) 
       }
       if (ty2) {
         link_type(ty, ty2);
-        update_level_rec(env, level, expand, ty);
+        update_level_rec(env, level, expand, ty2);
       } else {
         set_level_();
         iter_type_expr(rec, ty);
-        update_level_abbrev(env, level, expand, ty);
       }
       return;
     }
@@ -780,7 +777,6 @@ static void update_level_rec(env::t env, long level, bool expand, TypeExpr* ty) 
     if (nm && level < path::scope(nm->path)) set_type_desc(ty, tvariant(set_row_name(v->row, nullptr)));
     set_level_();
     iter_type_expr(rec, ty);
-    update_level_abbrev(env, level, expand, ty);
     return;
   }
   if (auto* fu = as<Tfunctor>(d)) {
@@ -803,43 +799,12 @@ static void update_level_rec(env::t env, long level, bool expand, TypeExpr* ty) 
   set_level_();
   // XXX what about abbreviations in Tconstr ?
   iter_type_expr(rec, ty);
-  update_level_abbrev(env, level, expand, ty);
-}
-
-static void update_level_abbrev(env::t env, long level, bool expand, TypeExpr* ty) {
-  iter_abbrev(
-      [&](Abbrev* abbr) {
-        const Path::t& p = abbr->path;
-        Slice<TypeExpr*> args = abbr->args;
-        if (level >= abbr->level) return;
-        if (level < path::scope(p)) {
-          forget_abbrev(ty);
-          return;
-        }
-        bool all = true;
-        for (TypeExpr* a : args)
-          if (!check_level_type(level, a)) {
-            all = false;
-            break;
-          }
-        if (all) {
-          set_abbrev_level(abbr, level);
-          return;
-        }
-        if (expand || needs_expand(env, level, p, args)) {
-          forget_abbrev(ty);
-          return;
-        }
-        set_abbrev_level(abbr, level);
-        for (TypeExpr* a : args) update_level_rec(env, level, expand, a);
-      },
-      ty);
 }
 
 // First try without expanding, then expand everything, to avoid
 // combinatorial blow-up
 void update_level(env::t env, long level, TypeExpr* ty) {
-  if (check_level_type(level, ty)) return;
+  if (get_level(ty) <= level) return;
   Snapshot snap = btype::snapshot();
   try {
     update_level_rec(env, level, false, ty);
@@ -857,15 +822,6 @@ void update_level_for(TraceExn tr_exn, env::t env, long level, TypeExpr* ty) {
   }
 }
 
-// Lower the level of a type to the current level
-void enforce_current_level(env::t env, TypeExpr* ty) {
-  try {
-    update_level(env, current_level, ty);
-  } catch (const Escape&) {
-    misc::fatal_error("Ctype.enforce_current_level");
-  }
-}
-
 // Lower level of type variables inside contravariant branches (see the long
 // comment in ctype.ml).
 static void lower_contravariant_rec(env::t env, long var_level,
@@ -877,10 +833,9 @@ static void lower_contravariant_rec(env::t env, long var_level,
     must_visit = it == visited.end() ? true : (contra && !it->second);
   }
   if (!must_visit) return;
-  auto visit = [&]() { visited[get_id(ty)] = contra; };  // Hashtbl.add shadows
-  if (!get_abbrev(ty)) visit();
+  visited[get_id(ty)] = contra;  // Hashtbl.add shadows
   auto lower_rec = [&](bool c, TypeExpr* t) { lower_contravariant_rec(env, var_level, visited, c, t); };
-  const TypeDesc* d = get_constr_desc(ty);
+  const TypeDesc* d = get_desc(ty);
   switch (d->kind) {
     case DescKind::Tvar:
       if (contra) set_level(ty, var_level);
@@ -902,7 +857,6 @@ static void lower_contravariant_rec(env::t env, long var_level,
       if (std::all_of(var.begin(), var.end(), [](variance::t v) { return v == variance::null; }))
         return;
       auto not_expanded = [&]() {
-        visit();
         if (var.size() != c->args.size()) throw std::invalid_argument("List.iter2");
         for (std::size_t k = 0; k < var.size(); ++k) {
           if (var[k] == variance::null) continue;
@@ -911,21 +865,13 @@ static void lower_contravariant_rec(env::t env, long var_level,
         }
       };
       if (maybe_expand) {  // we expand cautiously to avoid missing cmis
-        if (get_abbrev(ty)) {
-          lower_rec(contra, ignore_abbrev(ty));
-        } else {
-          TypeExpr* ty2 = nullptr;
-          try {
-            ty2 = forward_try_expand_safe(env, ty);
-          } catch (const CannotExpand&) {
-          }
-          if (ty2) {
-            visit();
-            lower_rec(contra, ty2);
-          } else {
-            not_expanded();
-          }
+        TypeExpr* ty2 = nullptr;
+        try {
+          ty2 = forward_try_expand_safe(env, ty);
+        } catch (const CannotExpand&) {
         }
+        if (ty2) lower_rec(contra, ty2);
+        else not_expanded();
       } else {
         not_expanded();
       }
@@ -1043,11 +989,6 @@ static void inv_type(TypeHash<InvTypeExpr*>& hash, std::vector<InvTypeExpr*> pty
   }
   auto* inv = make<InvTypeExpr>(ty, pty);
   hash.add(ty, inv);
-  iter_abbrev(
-      [&](Abbrev* abbr) {
-        for (TypeExpr* t : abbr->args) inv_type(hash, {inv}, t);
-      },
-      ty);
   iter_type_expr([&](TypeExpr* t) { inv_type(hash, {inv}, t); }, ty);
 }
 
@@ -1113,15 +1054,7 @@ TypeSet type_subexpressions_with_free_occurrences(const std::vector<Ident::t>& i
     else if (auto* v = as<Tvariant>(d)) {
       if (const PathArgs* nm = row_name(v->row)) p = nm->path;
     }
-    if (p && path::exists_free(ids0, p)) {
-      add_all_parents(ids0, inv);
-      continue;
-    }
-    iter_abbrev(
-        [&](Abbrev* abbr) {
-          if (path::exists_free(ids0, abbr->path)) add_all_parents(ids0, inv);
-        },
-        inv->inv_type);
+    if (p && path::exists_free(ids0, p)) add_all_parents(ids0, inv);
   }
   return nodes;
 }

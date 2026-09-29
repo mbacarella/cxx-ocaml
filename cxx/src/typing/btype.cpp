@@ -90,12 +90,6 @@ TypeOrigin type_origin(const TypeDeclaration* decl) {
   return TypeOrigin{};
 }
 
-const TypeDesc* get_constr_desc(TypeExpr* ty) {
-  if (const Abbrev* a = get_abbrev(ty))
-    return tconstr(a->path, a->args, make<MemoRef>(mnil()));
-  return get_desc(ty);
-}
-
 // ---- poly types -------------------------------------------------------------
 bool tpoly_is_mono(TypeExpr* ty) {
   auto* p = as<Tpoly>(get_desc(ty));
@@ -218,7 +212,7 @@ bool is_constr_row(bool allow_ident, TypeExpr* t) {
 }
 
 void set_static_row_name(const TypeDeclaration* decl, Path::t path) {
-  if (decl->type_private != PrivateFlag::Public || !decl->type_manifest) return;
+  if (!decl->type_manifest) return;
   TypeExpr* ty = decl->type_manifest;
   auto* v = as<Tvariant>(get_desc(ty));
   if (v && static_row(v->row)) {
@@ -288,8 +282,7 @@ void iter_type_desc(FnRef<void(TypeExpr*)> f, const TypeDesc* d) {
       return;
     }
     case DescKind::Tlink:
-    case DescKind::Texpand:
-      throw std::logic_error("Btype.fold_type_desc");
+      throw std::logic_error("Btype.fold_type_expr");
     case DescKind::Tsubst:
       return;
   }
@@ -592,9 +585,11 @@ const TypeDesc* copy_type_desc(FnRef<TypeExpr*(TypeExpr*)> f,
       for (auto& c : p->pack_constraints) cs.push_back({c.path, f(c.ty)});
       return tpackage(make<Package>(p->pack_path, slice(cs)));
     }
+    case DescKind::Tlink:
+      return copy_type_desc(f, get_desc(as<Tlink>(d)->ty), keep_names);
     default:
-      // Tfunctor would break unicity of the unscoped binding; Tlink, Tsubst,
-      // Texpand never reach a copy.
+      // Tfunctor would break unicity of the unscoped binding; Tsubst never
+      // reaches a copy.
       throw std::logic_error("Btype.copy_type_desc");
   }
 }
@@ -829,11 +824,6 @@ static void deep_occur_rec(TypeMark& mark, TypeExpr* t0, TypeExpr* ty) {
   if (get_level(ty) >= get_level(t0) && try_mark_node(mark, ty)) {
     if (eq_type(ty, t0)) throw Occur{};
     iter_type_expr([&](TypeExpr* t) { deep_occur_rec(mark, t0, t); }, ty);
-    iter_abbrev(
-        [&](Abbrev* abbr) {
-          for (TypeExpr* t : abbr->args) deep_occur_rec(mark, t0, t);
-        },
-        ty);
   }
 }
 
@@ -855,18 +845,6 @@ bool deep_occur_list(TypeExpr* t0, const std::vector<TypeExpr*>& tyl) {
   } catch (const Occur&) {
     return true;
   }
-}
-
-const TypeDesc* get_folded_desc(bool keep_Tvar, TypeExpr* ty) {
-  const TypeDesc* desc = get_desc(ty);
-  if (desc->kind == DescKind::Tsubst) return desc;
-  if (desc->kind == DescKind::Tvar && keep_Tvar) return desc;
-  if (const Abbrev* a = get_abbrev(ty)) {
-    std::vector<TypeExpr*> args(a->args.begin(), a->args.end());
-    if (!(path::contains_unscoped_ident(a->path) || deep_occur_list(ty, args)))
-      return tconstr(a->path, a->args, make<MemoRef>(mnil()));
-  }
-  return desc;
 }
 
 }  // namespace cppcaml::typing::btype

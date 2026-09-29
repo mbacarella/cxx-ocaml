@@ -38,8 +38,8 @@ enum class FteKind { Std, Opt, Fn };
 // Expand an abbreviation.  The expansion is memorized.  (See ctype.ml for
 // the four failure cases.)  nullptr where ctype.ml raises Cannot_expand
 // (C++ exceptions are too costly for this hot, often-failing path).
-static TypeExpr* expand_abbrev_gen_(bool link, PrivateFlag kind, FteKind fk, const FindTypeExpansion* fte,
-                                    env::t env, TypeExpr* ty) {
+static TypeExpr* expand_abbrev_gen_(PrivateFlag kind, FteKind fk, const FindTypeExpansion* fte, env::t env,
+                                    TypeExpr* ty) {
   auto* c = as<Tconstr>(get_desc(ty));
   if (!c) throw std::logic_error("Ctype.expand_abbrev_gen");
   Path::t path = c->path;
@@ -100,30 +100,27 @@ static TypeExpr* expand_abbrev_gen_(bool link, PrivateFlag kind, FteKind fk, con
       update_scope(scope2, ty2);
     }
   }
-  // set [ty.desc] to [Texpand (ty', path, args)]
-  if (link && kind == PrivateFlag::Public) link_expand(ty, ty2);
   return ty2;
 }
 
-TypeExpr* expand_abbrev_gen(bool link, PrivateFlag kind, const FindTypeExpansion& fte, env::t env,
-                            TypeExpr* ty) {
-  if (TypeExpr* r = expand_abbrev_gen_(link, kind, FteKind::Fn, &fte, env, ty)) return r;
+TypeExpr* expand_abbrev_gen(PrivateFlag kind, const FindTypeExpansion& fte, env::t env, TypeExpr* ty) {
+  if (TypeExpr* r = expand_abbrev_gen_(kind, FteKind::Fn, &fte, env, ty)) return r;
   throw CannotExpand{};
 }
 
 // Expand respecting privacy
-static TypeExpr* expand_abbrev_(bool link, env::t env, TypeExpr* ty) {
-  return expand_abbrev_gen_(link, PrivateFlag::Public, FteKind::Std, nullptr, env, ty);
+static TypeExpr* expand_abbrev_(env::t env, TypeExpr* ty) {
+  return expand_abbrev_gen_(PrivateFlag::Public, FteKind::Std, nullptr, env, ty);
 }
-TypeExpr* expand_abbrev(bool link, env::t env, TypeExpr* ty) {
-  if (TypeExpr* r = expand_abbrev_(link, env, ty)) return r;
+TypeExpr* expand_abbrev(env::t env, TypeExpr* ty) {
+  if (TypeExpr* r = expand_abbrev_(env, ty)) return r;
   throw CannotExpand{};
 }
 
 // Expand once the head of a type
 TypeExpr* expand_head_once(env::t env, TypeExpr* ty) {
   try {
-    return expand_abbrev(false, env, ty);
+    return expand_abbrev(env, ty);
   } catch (const CannotExpand&) {
     throw std::logic_error("Ctype.expand_head_once");
   } catch (const Escape&) {
@@ -135,7 +132,7 @@ TypeExpr* expand_head_once(env::t env, TypeExpr* ty) {
 bool safe_abbrev(env::t env, TypeExpr* ty) {
   Snapshot snap = btype::snapshot();
   try {
-    expand_abbrev(false, env, ty);
+    expand_abbrev(env, ty);
     return true;
   } catch (const CannotExpand&) {
     btype::backtrack(snap);
@@ -150,20 +147,20 @@ bool safe_abbrev(env::t env, TypeExpr* ty) {
 // Expand the head of a type once.  Raise CannotExpand if the type cannot be
 // expanded.  May raise Escape, if a recursion was hidden in the type.
 // (The *_nt functions return nullptr where ctype.ml raises Cannot_expand.)
-static TypeExpr* try_expand_once_nt(bool link, env::t env, TypeExpr* ty) {
-  if (get_desc(ty)->kind == DescKind::Tconstr) return expand_abbrev_(link, env, ty);
+static TypeExpr* try_expand_once_nt(env::t env, TypeExpr* ty) {
+  if (get_desc(ty)->kind == DescKind::Tconstr) return expand_abbrev_(env, ty);
   return nullptr;
 }
-TypeExpr* try_expand_once(bool link, env::t env, TypeExpr* ty) {
-  if (TypeExpr* r = try_expand_once_nt(link, env, ty)) return r;
+TypeExpr* try_expand_once(env::t env, TypeExpr* ty) {
+  if (TypeExpr* r = try_expand_once_nt(env, ty)) return r;
   throw CannotExpand{};
 }
 
 // This one only raises CannotExpand
-static TypeExpr* try_expand_safe_nt(bool link, env::t env, TypeExpr* ty) {
+static TypeExpr* try_expand_safe_nt(env::t env, TypeExpr* ty) {
   Snapshot snap = btype::snapshot();
   try {
-    return try_expand_once_nt(link, env, ty);
+    return try_expand_once_nt(env, ty);
   } catch (const Escape&) {
     btype::backtrack(snap);
     cleanup_abbrev_memo();
@@ -171,11 +168,7 @@ static TypeExpr* try_expand_safe_nt(bool link, env::t env, TypeExpr* ty) {
   }
 }
 TypeExpr* try_expand_safe(env::t env, TypeExpr* ty) {
-  if (TypeExpr* r = try_expand_safe_nt(true, env, ty)) return r;
-  throw CannotExpand{};
-}
-TypeExpr* try_expand_safe_no_link(env::t env, TypeExpr* ty) {
-  if (TypeExpr* r = try_expand_safe_nt(false, env, ty)) return r;
+  if (TypeExpr* r = try_expand_safe_nt(env, ty)) return r;
   throw CannotExpand{};
 }
 
@@ -208,7 +201,7 @@ static TypeExpr* try_expand_head_nt(F&& try_once, env::t env, TypeExpr* ty) {
 TypeExpr* expand_head_unif(env::t env, TypeExpr* ty) {
   try {
     TypeExpr* r =
-        try_expand_head_nt([](env::t e, TypeExpr* t) { return try_expand_once_nt(true, e, t); }, env, ty);
+        try_expand_head_nt([](env::t e, TypeExpr* t) { return try_expand_once_nt(e, t); }, env, ty);
     return r ? r : ty;
   } catch (const Escape& e) {
     raise_for(TraceExn::Unify, escape_elt_(e.esc));
@@ -217,39 +210,29 @@ TypeExpr* expand_head_unif(env::t env, TypeExpr* ty) {
 
 // Safe version of expand_head, never fails
 TypeExpr* expand_head(env::t env, TypeExpr* ty) {
-  TypeExpr* r =
-      try_expand_head_nt([](env::t e, TypeExpr* t) { return try_expand_safe_nt(true, e, t); }, env, ty);
-  return r ? r : ty;
-}
-TypeExpr* expand_head_nolink(env::t env, TypeExpr* ty) {
-  TypeExpr* r =
-      try_expand_head_nt([](env::t e, TypeExpr* t) { return try_expand_safe_nt(false, e, t); }, env, ty);
+  TypeExpr* r = try_expand_head_nt([](env::t e, TypeExpr* t) { return try_expand_safe_nt(e, t); }, env, ty);
   return r ? r : ty;
 }
 
 // Expand until we find a non-abstract type declaration
 TypedeclExtraction extract_concrete_typedecl(env::t env, TypeExpr* ty) {
   using K = TypedeclExtraction::Kind;
-  const TypeDesc* d = get_constr_desc(ty);
+  const TypeDesc* d = get_desc(ty);
   switch (d->kind) {
     case DescKind::Tconstr: {
       Path::t p = as<Tconstr>(d)->path;
-      auto cannot_expand = [&]() -> TypedeclExtraction {
-        if (!get_abbrev(ty)) return {K::May_have_typedecl};
-        return extract_concrete_typedecl(env, newgenty(get_desc(ty)));
-      };
       const TypeDeclaration* decl;
       try {
         decl = env::find_type(p, env);
       } catch (const env::NotFound&) {
-        return cannot_expand();
+        return {K::May_have_typedecl};
       }
       if (!type_kind_is_abstract(decl)) return {K::Typedecl, p, p, decl};
       TypeExpr* ty2;
       try {
-        ty2 = try_expand_safe_no_link(env, ty);
+        ty2 = try_expand_safe(env, ty);
       } catch (const CannotExpand&) {
-        return cannot_expand();
+        return {K::May_have_typedecl};
       }
       TypedeclExtraction r = extract_concrete_typedecl(env, ty2);
       if (r.kind == K::Typedecl) return {K::Typedecl, p, r.p2, r.decl};
@@ -270,7 +253,7 @@ TypedeclExtraction extract_concrete_typedecl(env::t env, TypeExpr* ty) {
 // expand_head_opt: the compiler's own expand_head for type-based
 // optimisations (sees private abbreviations' manifests)
 static TypeExpr* expand_abbrev_opt_(env::t env, TypeExpr* ty) {
-  return expand_abbrev_gen_(false, PrivateFlag::Private, FteKind::Opt, nullptr, env, ty);
+  return expand_abbrev_gen_(PrivateFlag::Private, FteKind::Opt, nullptr, env, ty);
 }
 TypeExpr* expand_abbrev_opt(env::t env, TypeExpr* ty) {
   if (TypeExpr* r = expand_abbrev_opt_(env, ty)) return r;
@@ -295,12 +278,6 @@ static TypeExpr* try_expand_once_opt_nt(env::t env, TypeExpr* ty) {
 }
 TypeExpr* try_expand_once_opt(env::t env, TypeExpr* ty) {
   if (TypeExpr* r = try_expand_once_opt_nt(env, ty)) return r;
-  throw CannotExpand{};
-}
-
-TypeExpr* try_expand_once_gen_nolink(const FindTypeExpansion& fte, env::t env, TypeExpr* ty) {
-  if (get_desc(ty)->kind == DescKind::Tconstr)
-    return expand_abbrev_gen(false, PrivateFlag::Private, fte, env, ty);
   throw CannotExpand{};
 }
 
@@ -336,14 +313,13 @@ TypeExpr* full_expand(bool may_forget_scope, env::t env, TypeExpr* ty) {
         // The same as expand_head, except in the failing case we return the
         // *original* type, not [duplicate_type ty].
         TypeExpr* r = try_expand_head_nt(
-            [](env::t e, TypeExpr* t) { return try_expand_safe_nt(true, e, t); }, env, duplicate_type(ty));
+            [](env::t e, TypeExpr* t) { return try_expand_safe_nt(e, t); }, env, duplicate_type(ty));
         return r ? r : ty;
       });
     }
   } else {
     ty = expand_head(env, ty);
   }
-  ty = repr(ty);  // forget Texpand
   if (auto* o = as<Tobject>(get_desc(ty)))
     if (const PathArgs* nm = o->name->contents; nm && !nm->args.empty() && is_Tvar(nm->args[0]))
       return newty2(get_level(ty), tobject(o->fields, make<NameRef>(nullptr)));
@@ -388,7 +364,8 @@ const Package* extract_package_modulo_subtype(env::t env, TypeExpr* ty) {
 
 bool is_contractive(env::t env, Path::t p) {
   try {
-    return is_datatype(env::find_type(p, env));
+    const TypeDeclaration* decl = env::find_type(p, env);
+    return (in_pervasives(p) && !decl->type_manifest) || is_datatype(decl);
   } catch (const env::NotFound&) {
     return false;
   }
@@ -427,10 +404,11 @@ static void occur_rec(env::t env, TypeMark& visited, bool allow_recursive, const
       } catch (const Occur&) {
         TypeExpr* ty2;
         try {
-          ty2 = try_expand_safe(env, ty);
+          ty2 = try_expand_head(try_expand_safe, env, ty);
         } catch (const CannotExpand&) {
           throw Occur{};
         }
+        // This call used to be inlined, but there seems no reason for it.
         occur_rec(env, visited, allow_recursive, parents, ty0, ty2);
       }
     }
@@ -496,9 +474,7 @@ static void local_non_recursive_abbrev_rec(bool allow_rec, bool strict,
   if (std::find(visited.begin(), visited.end(), id) != visited.end()) return;
   const TypeDesc* d = get_desc(ty);
   if (auto* c = as<Tconstr>(d)) {
-    // Note: p' is not necessarily normalized here,
-    // but we expand/normalize it below and retry.
-    if (eq_expanded_type_path(env, p, c->path)) throw Occur{};
+    if (env::path_equiv(env, p, c->path)) throw Occur{};
     if (allow_rec && !strict && is_contractive(env, c->path)) return;
     visited.push_back(id);
     TypeExpr* expanded = nullptr;

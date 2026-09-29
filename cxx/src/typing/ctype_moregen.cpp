@@ -56,14 +56,6 @@ static et::Elt<TypeExpr*> missing_field(et::Position pos, std::string_view n) {
   o.name = n;
   return obj_elt(o);
 }
-static et::Elt<TypeExpr*> kind_differ(std::string_view n, FieldKindView k1, FieldKindView k2) {
-  et::Obj o{};
-  o.kind = et::Obj::Kind::Kind_differ;
-  o.name = n;
-  o.k1 = k1;
-  o.k2 = k2;
-  return obj_elt(o);
-}
 static et::Elt<TypeExpr*> first_class_module(const et::FirstClassModule& fcm) {
   auto x = elt(EK::First_class_module);
   x.fcm = fcm;
@@ -135,7 +127,7 @@ static void moregen_rec(TypePairs& type_pairs, env::t env, TypeExpr* t1, TypeExp
       return;
     }
     if (c1 && c2 && c1->args.empty() && c2->args.empty() &&
-        quick_eq_type_path(false, env, c1->path, c2->path))
+        env::path_equiv(env, c1->path, c2->path))
       return;
     TypeExpr* t1p = expand_head(env, t1);
     TypeExpr* t2p = expand_head(env, t2);
@@ -188,7 +180,7 @@ static void moregen_rec(TypePairs& type_pairs, env::t env, TypeExpr* t1, TypeExp
       moregen_rec(type_pairs, env, f1->body, a2->t2);
     } else if (e1->kind == DK::Ttuple && e2->kind == DK::Ttuple) {
       moregen_labeled_list(type_pairs, env, as<Ttuple>(e1)->elems, as<Ttuple>(e2)->elems);
-    } else if (k1 && k2 && eq_expanded_type_path(env, k1->path, k2->path)) {
+    } else if (k1 && k2 && env::path_equiv(env, k1->path, k2->path)) {
       moregen_list(type_pairs, env, k1->args, k2->args);
     } else if (e1->kind == DK::Tpackage && e2->kind == DK::Tpackage) {
       moregen_package(type_pairs, env, get_level(t1p), as<Tpackage>(e1)->pack, get_level(t2p),
@@ -238,18 +230,30 @@ static void moregen_labeled_list(TypePairs& tp, env::t env, Slice<LabeledTy> l1,
 
 static void moregen_package(TypePairs& tp, env::t env, long lvl1, const Package* pack1, long lvl2,
                             const Package* pack2) {
-  PackageSubtypeResult r = compare_package(
-      env, [&](TypeExpr* a, TypeExpr* b) { moregen_rec(tp, env, a, b); }, lvl1, pack1, lvl2,
-      pack2);
+  PackageSubtypeResult r;
+  try {
+    r = compare_package(
+        env, [&](Slice<TypeExpr*> a, Slice<TypeExpr*> b) { moregen_list(tp, env, a, b); }, lvl1, pack1,
+        lvl2, pack2);
+  } catch (const env::NotFound&) {
+    raise_unexplained_for(TraceExn::Moregen);
+  }
   if (!r.ok) raise_for(TraceExn::Moregen, first_class_module(r.err));
 }
 
-static void moregen_kind(std::string_view name, FieldKind* k1, FieldKind* k2) {
+// Thrown from [moregen_kind]
+struct PublicMethodToPrivateMethod {};
+
+static void moregen_kind(FieldKind* k1, FieldKind* k2) {
   FieldKindView a = field_kind_repr(k1), b = field_kind_repr(k2);
-  if ((a == FieldKindView::Fpublic && b == FieldKindView::Fpublic) ||
-      (a == FieldKindView::Fprivate && b == FieldKindView::Fprivate))
-    return;
-  raise_for(TraceExn::Moregen, kind_differ(name, a, b));
+  if (a == FieldKindView::Fprivate && (b == FieldKindView::Fprivate || b == FieldKindView::Fpublic))
+    link_kind(k1, k2);
+  else if (a == FieldKindView::Fpublic && b == FieldKindView::Fpublic)
+    ;
+  else if (a == FieldKindView::Fpublic && b == FieldKindView::Fprivate)
+    throw PublicMethodToPrivateMethod{};
+  else
+    throw std::logic_error("Ctype.moregen_kind");
 }
 
 static void moregen_fields(TypePairs& tp, env::t env, TypeExpr* ty1, TypeExpr* ty2) {
@@ -260,7 +264,8 @@ static void moregen_fields(TypePairs& tp, env::t env, TypeExpr* ty1, TypeExpr* t
     raise_for(TraceExn::Moregen, missing_field(et::Position::Second, af.miss1[0].name));
   moregen_rec(tp, env, rest1, build_fields(get_level(ty2), af.miss2, rest2));
   for (auto& p : af.pairs) {
-    moregen_kind(p.name, p.k1, p.k2);
+    // The below call should never throw [Public_method_to_private_method]
+    moregen_kind(p.k1, p.k2);
     try {
       moregen_rec(tp, env, p.t1, p.t2);
     } catch (MoregenTrace& e) {
@@ -384,9 +389,7 @@ static void moregen_row(TypePairs& tp, env::t env, const RowDesc* row1, const Ro
 
 // Must empty univar_pairs first
 void moregen(TypePairs& type_pairs, env::t env, TypeExpr* patt, TypeExpr* subj) {
-  with_univar_pairs({}, [&] {
-    wrap_trace_gadt_instances(env, [&] { moregen_rec(type_pairs, env, patt, subj); });
-  });
+  with_univar_pairs({}, [&] { moregen_rec(type_pairs, env, patt, subj); });
 }
 
 // Non-generic variable can be instantiated only if [inst_nongen] is true
@@ -499,7 +502,7 @@ bool does_match(env::t env, TypeExpr* ty, TypeExpr* ty2) {
 TypeExpr* expand_head_rigid(env::t env, TypeExpr* ty) {
   bool old = rigid_variants;
   rigid_variants = true;
-  TypeExpr* ty2 = expand_head_nolink(env, ty);
+  TypeExpr* ty2 = expand_head(env, ty);
   rigid_variants = old;
   return ty2;
 }
@@ -552,7 +555,7 @@ static void eqtype_rec(bool rename, TypePairs& type_pairs, Subst& subst, env::t 
       return;
     }
     if (c1 && c2 && c1->args.empty() && c2->args.empty() &&
-        quick_eq_type_path(false, env, c1->path, c2->path))
+        env::path_equiv(env, c1->path, c2->path))
       return;
     TypeExpr* t1p = expand_head_rigid(env, t1);
     TypeExpr* t2p = expand_head_rigid(env, t2);
@@ -603,7 +606,7 @@ static void eqtype_rec(bool rename, TypePairs& type_pairs, Subst& subst, env::t 
     } else if (e1->kind == DK::Ttuple && e2->kind == DK::Ttuple) {
       eqtype_labeled_list(rename, type_pairs, subst, env, as<Ttuple>(e1)->elems,
                           as<Ttuple>(e2)->elems);
-    } else if (k1 && k2 && quick_eq_type_path(true, env, k1->path, k2->path)) {
+    } else if (k1 && k2 && env::path_equiv(env, k1->path, k2->path)) {
       eqtype_list_same_length_rec(rename, type_pairs, subst, env, k1->args, k2->args);
     } else if (e1->kind == DK::Tpackage && e2->kind == DK::Tpackage) {
       eqtype_package(rename, type_pairs, subst, env, get_level(t1p), as<Tpackage>(e1)->pack,
@@ -649,18 +652,29 @@ static void eqtype_labeled_list(bool rename, TypePairs& tp, Subst& subst, env::t
 
 static void eqtype_package(bool rename, TypePairs& tp, Subst& subst, env::t env, long lvl1,
                            const Package* pack1, long lvl2, const Package* pack2) {
-  PackageSubtypeResult r = compare_package(
-      env, [&](TypeExpr* a, TypeExpr* b) { eqtype_rec(rename, tp, subst, env, a, b); }, lvl1,
-      pack1, lvl2, pack2);
+  PackageSubtypeResult r;
+  try {
+    r = compare_package(
+        env,
+        [&](Slice<TypeExpr*> a, Slice<TypeExpr*> b) {
+          // eqtype_list: the lengths checked first
+          if (a.size() != b.size()) raise_unexplained_for(TraceExn::Equality);
+          eqtype_list_same_length_rec(rename, tp, subst, env, a, b);
+        },
+        lvl1, pack1, lvl2, pack2);
+  } catch (const env::NotFound&) {
+    raise_unexplained_for(TraceExn::Equality);
+  }
   if (!r.ok) raise_for(TraceExn::Equality, first_class_module(r.err));
 }
 
-static void eqtype_kind(std::string_view name, FieldKind* k1, FieldKind* k2) {
+static void eqtype_kind(FieldKind* k1, FieldKind* k2) {
   FieldKindView a = field_kind_repr(k1), b = field_kind_repr(k2);
   if ((a == FieldKindView::Fprivate && b == FieldKindView::Fprivate) ||
       (a == FieldKindView::Fpublic && b == FieldKindView::Fpublic))
     return;
-  raise_for(TraceExn::Equality, kind_differ(name, a, b));
+  // It's probably not possible to hit this case with real OCaml code
+  raise_unexplained_for(TraceExn::Unify);
 }
 
 static void eqtype_fields(bool rename, TypePairs& tp, Subst& subst, env::t env, TypeExpr* ty1,
@@ -676,13 +690,13 @@ static void eqtype_fields(bool rename, TypePairs& tp, Subst& subst, env::t env, 
     return;
   }
   AssociatedFields af = associate_fields(fields1, fields2);
+  eqtype_rec(rename, tp, subst, env, rest1, rest2);
   if (!af.miss1.empty())
     raise_for(TraceExn::Equality, missing_field(et::Position::Second, af.miss1[0].name));
   if (!af.miss2.empty())
     raise_for(TraceExn::Equality, missing_field(et::Position::First, af.miss2[0].name));
-  eqtype_rec(rename, tp, subst, env, rest1, rest2);
   for (auto& p : af.pairs) {
-    eqtype_kind(p.name, p.k1, p.k2);
+    eqtype_kind(p.k1, p.k2);
     try {
       eqtype_rec(rename, tp, subst, env, p.t1, p.t2);
     } catch (EqualityTrace& e) {
@@ -793,10 +807,7 @@ void eqtype(bool rename, TypePairs& type_pairs, Subst& subst, env::t env, TypeEx
 
 // Two modes: with or without renaming of variables
 void equal(env::t env, bool rename, Slice<TypeExpr*> tyl1, Slice<TypeExpr*> tyl2) {
-  // In practice, `Equality` is not a good error to report to users and thus
-  // callers of this function ought to raise their own error when the
-  // lengths differ.
-  if (tyl1.size() != tyl2.size()) throw std::logic_error("Ctype.equal");
+  if (tyl1.size() != tyl2.size()) raise_unexplained_for(TraceExn::Equality);
   bool all_eq = true;
   for (std::size_t k = 0; k < tyl1.size(); ++k)
     if (!eq_type(tyl1[k], tyl2[k])) {
@@ -833,7 +844,7 @@ void equal_private(env::t env, Slice<TypeExpr*> params1, TypeExpr* ty1, Slice<Ty
     return;
   } catch (const Equality& err) {
     try {
-      ty1p = try_expand_safe_opt(env, expand_head_nolink(env, ty1));
+      ty1p = try_expand_safe_opt(env, expand_head(env, ty1));
     } catch (const CannotExpand&) {
       throw err;
     }

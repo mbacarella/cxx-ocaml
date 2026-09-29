@@ -103,7 +103,7 @@ bool is_absrow(env::t env, TypeExpr* ty) {
   // This function is checking for an abstract row on the side that is being
   // included into.  In this case, the abstract row variable has been
   // substituted for an object or variant type.
-  DescKind k = get_desc(ctype::expand_head_nolink(env, ty))->kind;
+  DescKind k = get_desc(ctype::expand_head(env, ty))->kind;
   return k == DescKind::Tobject || k == DescKind::Tvariant;
 }
 
@@ -424,7 +424,7 @@ std::optional<PrivacyMismatch> privacy_mismatch(env::t env, const TypeDeclaratio
   if (k1 == TK::Type_open && k2 == TK::Type_open) return PrivacyMismatch::Private_extensible_variant;
   if (k1 == TK::Type_abstract && k2 == TK::Type_abstract && decl2->type_manifest) {
     if (!decl1->type_manifest) return std::nullopt;
-    TypeExpr* ty1 = ctype::expand_head_nolink(env, decl1->type_manifest);
+    TypeExpr* ty1 = ctype::expand_head(env, decl1->type_manifest);
     const TypeDesc* d = get_desc(ty1);
     if (auto* v = as<Tvariant>(d); v && is_constr_row(true, row_more(v->row)))
       return PrivacyMismatch::Private_row_type;
@@ -543,8 +543,8 @@ std::optional<PrivateObjectMismatch> private_object(env::t env, const std::vecto
 std::optional<TypeMismatch> type_manifest(env::t env, TypeExpr* ty1, Slice<TypeExpr*> params1, TypeExpr* ty2,
                                           Slice<TypeExpr*> params2, PrivateFlag priv2, const TypeKind* kind2) {
   // let ty1' = .. and ty2' = ..: left to right
-  TypeExpr* ty1_ = ctype::expand_head_nolink(env, ty1);
-  TypeExpr* ty2_ = ctype::expand_head_nolink(env, ty2);
+  TypeExpr* ty1_ = ctype::expand_head(env, ty1);
+  TypeExpr* ty2_ = ctype::expand_head(env, ty2);
   const TypeDesc* d1 = get_desc(ty1_);
   const TypeDesc* d2 = get_desc(ty2_);
   auto* v1 = as<Tvariant>(d1);

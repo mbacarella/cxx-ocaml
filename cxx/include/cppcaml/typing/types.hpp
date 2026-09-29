@@ -99,8 +99,8 @@ struct TyOptRef {  // type_expr option ref (Cuniv)
 
 // ---- type_desc ---------------------------------------------------------------
 enum class DescKind : std::uint8_t {
-  Tvar, Tarrow, Ttuple, Tconstr, Tobject, Tfield, Tnil, Tvariant, Tunivar,
-  Tpoly, Tpackage, Tfunctor, Texpand, Tlink, Tsubst
+  Tvar, Tarrow, Ttuple, Tconstr, Tobject, Tfield, Tnil, Tlink, Tsubst, Tvariant,
+  Tunivar, Tpoly, Tpackage, Tfunctor
 };
 
 struct TypeDesc {
@@ -170,18 +170,6 @@ struct Tfunctor : TypeDesc {
   ident::Unscoped* id;
   const Package* pack;
   TypeExpr* body;
-};
-// types.mli's abbrev: an expanded abbreviation kept in a Texpand, with the
-// level its arguments were last checked at (Ctype.update_level)
-struct Abbrev {
-  Path::t path;            // abbr_path
-  Slice<TypeExpr*> args;   // abbr_args
-  long level;              // mutable abbr_level
-};
-struct Texpand : TypeDesc {
-  static constexpr DescKind K = DescKind::Texpand;
-  TypeExpr* ty;
-  Abbrev* abbrev;
 };
 struct Tlink : TypeDesc {
   static constexpr DescKind K = DescKind::Tlink;
@@ -312,14 +300,12 @@ struct ConstructorDeclaration {
 
 struct TypeOrigin {
   enum class Kind : std::uint8_t {
-    Definition, Rec_check_regularity, Approx_recmod, Existential, Equation
+    Definition, Rec_check_regularity, Approx_recmod, Existential
   };
   Kind kind = Kind::Definition;
   std::string_view existential;
-  TypeExpr* eq1 = nullptr;
-  TypeExpr* eq2 = nullptr;
-  // Existential / Equation: the block's identity (one reify call's origin
-  // is shared by all the types it creates); nullptr = none recorded
+  // Existential: the block's identity (one reify call's origin is shared by
+  // all the types it creates); nullptr = none recorded
   const void* obj = nullptr;
 };
 
@@ -402,7 +388,6 @@ struct MethEntry {  // (method_privacy * virtual_flag * type_expr)
 struct ClassSignature {  // mutable fields as in types.ml
   TypeExpr* csig_self;
   TypeExpr* csig_self_row;
-  FieldKind* csig_dummy_method;
   StrMap<VarEntry> csig_vars;
   StrMap<MethEntry> csig_meths;
 };
@@ -565,7 +550,6 @@ const TypeDesc* tunivar(OptStr name);
 const TypeDesc* tpoly(TypeExpr* a, Slice<TypeExpr*> vars);
 const TypeDesc* tpackage(const Package* p);
 const TypeDesc* tfunctor(ArgLabel l, ident::Unscoped* id, const Package* p, TypeExpr* a);
-const TypeDesc* texpand(TypeExpr* a, Abbrev* abbrev);
 const TypeDesc* tlink(TypeExpr* a);
 const TypeDesc* tsubst(TypeExpr* a, TypeExpr* row);
 
@@ -582,12 +566,12 @@ bool is_commu_ok(const Commutable* c);
 Commutable* commu_ok();
 Commutable* commu_var();
 
-// representative: a node whose desc is not a link, an expansion or a field
-// is its own (inline); the rest follows the chain (repr_slow)
+// representative: a node whose desc is not a link or a field is its own
+// (inline); the rest follows the chain (repr_slow)
 TypeExpr* repr_slow(TypeExpr* t);
 inline TypeExpr* repr(TypeExpr* t) {
   DescKind k = t->desc->kind;
-  if (k != DescKind::Tlink && k != DescKind::Texpand && k != DescKind::Tfield) return t;
+  if (k != DescKind::Tlink && k != DescKind::Tfield) return t;
   return repr_slow(t);
 }
 inline constexpr long scope_mask = (1L << 27) - 1;
@@ -602,13 +586,6 @@ struct TypeMark;
 void with_type_mark(FnRef<void(TypeMark&)> f);
 bool not_marked_node(TypeMark& mark, TypeExpr* t);
 bool try_mark_node(TypeMark& mark, TypeExpr* t);
-
-// kept abbreviations
-Abbrev* get_abbrev(TypeExpr* t);  // abbrev option
-void iter_abbrev(FnRef<void(Abbrev*)> f, TypeExpr* t);
-void set_abbrev_level(Abbrev* abbrev, long level);
-TypeExpr* ignore_abbrev(TypeExpr* t);
-void forget_abbrev(TypeExpr* t);
 
 // Transient_expr
 namespace transient_expr {
@@ -688,7 +665,6 @@ Ident::t signature_item_id(const SignatureItem* it);
 
 // ids
 long& new_id();
-void reset();
 
 // ---- backtracking ---------------------------------------------------------
 struct ChangesRef;
@@ -713,7 +689,6 @@ void backtrack(FnRef<void()> cleanup, Snapshot s);
 void undo_first_change_after(Snapshot s);
 void undo_compress(Snapshot s);
 
-void link_expand(TypeExpr* ty, TypeExpr* ty2);
 void link_type(TypeExpr* ty, TypeExpr* ty2);
 void set_type_desc(TypeExpr* ty, const TypeDesc* td);
 void set_level(TypeExpr* ty, long level);

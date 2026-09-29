@@ -95,7 +95,6 @@ void begin_class_def();
 void raise_nongen_level();
 void end_def();
 long create_scope();
-void reset();
 void reset_global_level();
 long increase_global_level();
 void restore_global_level(long gl);
@@ -287,8 +286,8 @@ env::t get_env(const Uenv& u);
 bool in_pattern_mode(const Uenv& u);
 
 // ---- checks for type definitions ----------------------------------------------------
-bool quick_eq_type_path(bool normalize, env::t env, Path::t p1, Path::t p2);
-bool eq_expanded_type_path(env::t env, Path::t p1, Path::t p2);
+bool in_current_module(Path::t p);
+bool in_pervasives(Path::t p);
 bool is_datatype(const TypeDeclaration* decl);
 
 // ---- object types ---------------------------------------------------------------------
@@ -318,7 +317,7 @@ TypeExpr* object_row(TypeExpr* ty);
 bool opened_object(TypeExpr* ty);
 bool concrete_object(TypeExpr* ty);
 TypeExpr* fields_row_variable(TypeExpr* ty);
-void set_object_name(Path::t p, Slice<TypeExpr*> params, TypeExpr* ty);
+void set_object_name(Ident::t id, Slice<TypeExpr*> params, TypeExpr* ty);
 void remove_object_name(TypeExpr* ty);
 
 // ---- row types ------------------------------------------------------------------------
@@ -346,6 +345,8 @@ std::vector<TypeExpr*> free_variables(TypeExpr* ty, env::t env = nullptr);
 std::vector<TypeExpr*> free_variables_list(const std::vector<TypeExpr*>& tyl, env::t env = nullptr);
 bool contains_nongen_variables(TypeExpr* ty, env::t env = nullptr);
 bool closed_type_expr(TypeExpr* ty, env::t env = nullptr);
+bool closed_parameterized_type(Slice<TypeExpr*> params, TypeExpr* ty);
+TypeExpr* closed_extension_constructor(const ExtensionConstructor* ext);  // nullptr = None
 TypeExpr* closed_type_decl(const TypeDeclaration* decl);  // nullptr = None
 struct ClosedClassFailure {
   TypeExpr* free_variable;
@@ -368,7 +369,6 @@ void set_modtype_of_package(std::function<const ModuleType*(env::t, const Locati
 void check_scope_escape(env::t env, long level, TypeExpr* ty);
 void update_scope(long scope, TypeExpr* ty);
 void update_scope_for(TraceExn tr_exn, long scope, TypeExpr* ty);
-bool check_level_type(long level, TypeExpr* ty);
 void update_level(env::t env, long level, TypeExpr* ty);
 void update_level_for(TraceExn tr_exn, env::t env, long level, TypeExpr* ty);
 void lower_variables_only(env::t env, long level, TypeExpr* ty);
@@ -444,7 +444,7 @@ struct InstancedLabel {
 InstancedLabel instance_label(bool fixed, const LabelDescription* lbl);
 
 // NB: raises Unify (the error), set by the unification section
-extern std::function<void(bool, const Uenv&, TypeExpr*, TypeExpr*)> unify_var_ref;
+extern std::function<void(const Uenv&, TypeExpr*, TypeExpr*)> unify_var_ref;
 TypeExpr* subst(env::t env, long level, PrivateFlag priv, MemoRef* abbrev, TypeExpr* oty,
                 Slice<TypeExpr*> params, Slice<TypeExpr*> args, TypeExpr* body,
                 std::optional<long> scope = std::nullopt);
@@ -453,19 +453,16 @@ TypeExpr* apply(env::t env, Slice<TypeExpr*> params, TypeExpr* body, Slice<TypeE
 
 // ---- abbreviation expansion ---------------------------------------------------------
 using FindTypeExpansion = std::function<env::TypeExpansion(Path::t, env::t)>;
-TypeExpr* expand_abbrev_gen(bool link, PrivateFlag kind, const FindTypeExpansion& fte, env::t env,
-                            TypeExpr* ty);
-TypeExpr* expand_abbrev(bool link, env::t env, TypeExpr* ty);
+TypeExpr* expand_abbrev_gen(PrivateFlag kind, const FindTypeExpansion& fte, env::t env, TypeExpr* ty);
+TypeExpr* expand_abbrev(env::t env, TypeExpr* ty);
 TypeExpr* expand_head_once(env::t env, TypeExpr* ty);
 bool safe_abbrev(env::t env, TypeExpr* ty);
-TypeExpr* try_expand_once(bool link, env::t env, TypeExpr* ty);
-TypeExpr* try_expand_safe(env::t env, TypeExpr* ty);          // ~link:true
-TypeExpr* try_expand_safe_no_link(env::t env, TypeExpr* ty);  // ~link:false
+TypeExpr* try_expand_once(env::t env, TypeExpr* ty);
+TypeExpr* try_expand_safe(env::t env, TypeExpr* ty);
 TypeExpr* try_expand_head(const std::function<TypeExpr*(env::t, TypeExpr*)>& try_once,
                           env::t env, TypeExpr* ty);
 TypeExpr* expand_head_unif(env::t env, TypeExpr* ty);
 TypeExpr* expand_head(env::t env, TypeExpr* ty);
-TypeExpr* expand_head_nolink(env::t env, TypeExpr* ty);
 
 struct TypedeclExtraction {  // Typedecl of p * p' * decl | Has_no_typedecl | May_have_typedecl
   enum class Kind { Typedecl, Has_no_typedecl, May_have_typedecl };
@@ -479,7 +476,6 @@ TypedeclExtraction extract_concrete_typedecl(env::t env, TypeExpr* ty);
 TypeExpr* expand_abbrev_opt(env::t env, TypeExpr* ty);
 bool safe_abbrev_opt(env::t env, TypeExpr* ty);
 TypeExpr* try_expand_once_opt(env::t env, TypeExpr* ty);
-TypeExpr* try_expand_once_gen_nolink(const FindTypeExpansion& fte, env::t env, TypeExpr* ty);
 TypeExpr* try_expand_safe_opt(env::t env, TypeExpr* ty);
 TypeExpr* expand_head_opt(env::t env, TypeExpr* ty);
 TypeExpr* full_expand(bool may_forget_scope, env::t env, TypeExpr* ty);
@@ -563,8 +559,7 @@ void unify_uenv(const Uenv& uenv, TypeExpr* t1, TypeExpr* t2);  // raises Unify
 void unify_pairs(env::t env, TypeExpr* t1, TypeExpr* t2, std::vector<UnivarPair> pairs);
 btype::TypePairs* unify_gadt(PatternEnv* penv, TypeExpr* pat, TypeExpr* expected);
 void unify_var(env::t env, TypeExpr* t1, TypeExpr* t2);
-void unify_var_uenv(bool check_occur, const Uenv& uenv, TypeExpr* t1, TypeExpr* t2);
-void enforce_current_level(env::t env, TypeExpr* ty);
+void unify_var_uenv(const Uenv& uenv, TypeExpr* t1, TypeExpr* t2);
 TypeExpr* expand_head_trace(env::t env, TypeExpr* t);
 
 // ---- special cases of unification ------------------------------------------------------
@@ -617,7 +612,6 @@ struct FilterMethodRowFailed {};
 // ---- class signatures ----------------------------------------------------------------
 ClassSignature* new_class_signature();
 void add_dummy_method(env::t env, long scope, ClassSignature* sign);
-void remove_dummy_method(ClassSignature* sign);
 struct AddMethodFailed : std::runtime_error {
   bool unexpected_method;  // else Type_mismatch
   et::UnificationError err;
@@ -646,11 +640,11 @@ struct InheritClassSignatureFailed : std::runtime_error {
 };
 void inherit_class_signature(bool strict, env::t env, ClassSignature* sign1,
                              const ClassSignature* sign2);
-std::vector<std::string_view> update_implicitly_public_methods(ClassSignature* sign);
-std::vector<std::string_view> update_implicitly_declared_methods(env::t env, ClassSignature* sign);
-void hide_private_methods(const ClassSignature* sign);
-void reveal_private_methods(env::t env, ClassSignature* sign);
-bool close_class_signature(env::t env, ClassSignature* sign);
+// (implicitly_public, implicitly_declared)
+std::pair<std::vector<std::string_view>, std::vector<std::string_view>> update_class_signature(
+    env::t env, ClassSignature* sign);
+void hide_private_methods(env::t env, const ClassSignature* sign);
+bool close_class_signature(env::t env, const ClassSignature* sign);
 TypeExpr* copy_spine(TypeExpr* ty);
 void generalize_class_signature_spine(ClassSignature* sign);
 

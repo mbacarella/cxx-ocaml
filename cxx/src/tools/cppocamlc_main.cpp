@@ -301,8 +301,6 @@ static cppcaml::typing::env::t initial_env() {
   namespace ty = cppcaml::typing;
   ty::ident::reinit();
   ty::uid::reinit();
-  ty::types::reset();
-  ty::ctype::reset();
   ty::parsetree::reset_types_attributes();
   ty::out_type::reset_short_paths_cache();
   ty::Location cmdline = ty::location::none();

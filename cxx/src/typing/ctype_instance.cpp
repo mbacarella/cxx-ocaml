@@ -72,7 +72,6 @@ TypeExpr* copy(CopyScope& copy_scope, TypeExpr* ty, const Partial* partial, bool
   }
   if (forget != generic_level) return newty2(forget, TVAR_NONE_LIT());
   long ty_scope = scope ? std::max(*scope, get_scope(ty)) : get_scope(ty);
-  const Abbrev* ty_expand = get_abbrev(ty);
   TypeExpr* t = newstub(ty_scope);
   redirect_desc(copy_scope, ty, btype::scoped_tsubst(t, nullptr));
   const TypeDesc* desc2 = nullptr;
@@ -181,12 +180,6 @@ TypeExpr* copy(CopyScope& copy_scope, TypeExpr* ty, const Partial* partial, bool
     }
     default:
       desc2 = copy_type_desc(copy_, desc, keep_names);
-  }
-  if (ty_expand) {
-    std::vector<TypeExpr*> args;
-    for (TypeExpr* a : ty_expand->args) args.push_back(copy_(a));
-    TypeExpr* t2 = new_scoped_ty(ty_scope, desc2);
-    desc2 = texpand(t2, make<Abbrev>(Abbrev{path::subst(unscoped.map, ty_expand->path), slice(args), current_level}));
   }
   transient_expr::set_stub_desc(t, desc2);
   return t;
@@ -421,17 +414,16 @@ std::pair<std::vector<TypeExpr*>, const ClassType*> instance_class(Slice<TypeExp
         }
         case ClassType::Kind::Cty_signature: {
           const ClassSignature* sign = c->sign;
-          // record fields right to left: meths, vars, dummy, self_row, self
+          // record fields right to left: meths, vars, self_row, self
           auto meths = sign->csig_meths.map([&](const MethEntry& e) {
             return MethEntry{e.priv, e.virt, copy(cs, e.ty)};
           });
           auto vars = sign->csig_vars.map([&](const VarEntry& e) {
             return VarEntry{e.mut, e.virt, copy(cs, e.ty)};
           });
-          FieldKind* dummy = field_kind_internal_repr(sign->csig_dummy_method);
           TypeExpr* self_row = copy(cs, sign->csig_self_row);
           TypeExpr* self = copy(cs, sign->csig_self);
-          n->sign = make<ClassSignature>(self, self_row, dummy, vars, meths);
+          n->sign = make<ClassSignature>(self, self_row, vars, meths);
           break;
         }
         case ClassType::Kind::Cty_arrow: {
@@ -476,7 +468,7 @@ static TypeExpr* copy_sep(CopyScope& copy_scope, bool fixed, TypeHash<TypeExpr*>
     if (TypeExpr** v = visited.find_opt(ty)) return *v;
     TypeExpr* t = newstub(get_scope(ty));
     visited.add(ty, t);
-    const TypeDesc* d = get_folded_desc(false, ty);
+    const TypeDesc* d = get_desc(ty);
     const TypeDesc* desc2;
     switch (d->kind) {
       case DescKind::Tvariant: {
@@ -630,7 +622,7 @@ InstancedLabel instance_label(bool fixed, const LabelDescription* lbl) {
 }
 
 // ---- instantiation with parameter substitution -------------------------------------
-std::function<void(bool, const Uenv&, TypeExpr*, TypeExpr*)> unify_var_ref;
+std::function<void(const Uenv&, TypeExpr*, TypeExpr*)> unify_var_ref;
 
 TypeExpr* subst(env::t env, long level, PrivateFlag priv, MemoRef* abbrev, TypeExpr* oty,
                 Slice<TypeExpr*> params, Slice<TypeExpr*> args, TypeExpr* body,
@@ -652,27 +644,8 @@ TypeExpr* subst(env::t env, long level, PrivateFlag priv, MemoRef* abbrev, TypeE
     abbreviations = make<MemoRef>(mnil());
     Uenv uenv = Uenv::expression(env, true);
     try {
-      unify_var_ref(true, uenv, body0, body2);
-      // We can elide the occurs-check for the first occurence of parameters
-      // that are a generalizable variable (and therefore will be instantiated
-      // to a fresh variable).  Non-generalizable type variables or
-      // non-variables cannot avoid the check, since we're not able to show
-      // they cannot occur.
-      std::vector<TypeExpr*> previous_gen;
-      std::vector<std::size_t> first_gen, others;
-      for (std::size_t k = 0; k < params.size(); ++k) {
-        TypeExpr* p = params[k];
-        if (get_desc(p)->kind == DescKind::Tvar && get_level(p) == generic_level &&
-            std::none_of(previous_gen.begin(), previous_gen.end(),
-                         [&](TypeExpr* q) { return eq_type(p, q); })) {
-          previous_gen.push_back(p);
-          first_gen.push_back(k);
-        } else {
-          others.push_back(k);
-        }
-      }
-      for (std::size_t k : first_gen) unify_var_ref(false, uenv, params2[k], args[k]);
-      for (std::size_t k : others) unify_var_ref(true, uenv, params2[k], args[k]);
+      unify_var_ref(uenv, body0, body2);
+      for (std::size_t k = 0; k < params.size(); ++k) unify_var_ref(uenv, params2[k], args[k]);
       return body2;
     } catch (const Unify&) {
       undo_abbrev();

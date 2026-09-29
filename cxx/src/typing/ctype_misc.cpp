@@ -334,7 +334,7 @@ std::pair<const TypeDeclaration*, TypeExpr*> find_cltype_for_path(env::t env, Pa
 }
 
 static bool has_constr_row2(env::t env, TypeExpr* t) {
-  return has_constr_row(expand_abbrev(false, env, t));
+  return has_constr_row(expand_abbrev(env, t));
 }
 
 static std::pair<TypeExpr*, Change> build_subtype(env::t env, const Visited& visited,
@@ -399,7 +399,7 @@ static std::pair<TypeExpr*, Change> build_subtype(env::t env, const Visited& vis
       auto* co = as<Tconstr>(d);
       Path::t p = co->path;
       if (level > 0 && generic_abbrev(env, p) && safe_abbrev(env, t) && !has_constr_row2(env, t)) {
-        TypeExpr* tp = expand_abbrev(false, env, t);
+        TypeExpr* tp = expand_abbrev(env, t);
         long level2 = pred_expand(level);
         try {
           auto* ob = as<Tobject>(get_desc(tp));
@@ -671,13 +671,13 @@ static Constraints subtype_rec(env::t env, const STrace& trace, TypeExpr* t1, Ty
     return subtype_labeled_list(env, trace, as<Ttuple>(d1)->elems, as<Ttuple>(d2)->elems,
                                 std::move(constraints));
   if (c1 && c2 && c1->args.empty() && c2->args.empty() &&
-      quick_eq_type_path(true, env, c1->path, c2->path))
+      env::path_equiv(env, c1->path, c2->path))
     return constraints;
   if (c1 && generic_abbrev(env, c1->path) && safe_abbrev(env, t1))
-    return subtype_rec(env, trace, expand_abbrev(false, env, t1), t2, std::move(constraints));
+    return subtype_rec(env, trace, expand_abbrev(env, t1), t2, std::move(constraints));
   if (c2 && generic_abbrev(env, c2->path) && safe_abbrev(env, t2))
-    return subtype_rec(env, trace, t1, expand_abbrev(false, env, t2), std::move(constraints));
-  if (c1 && c2 && quick_eq_type_path(true, env, c1->path, c2->path)) {
+    return subtype_rec(env, trace, t1, expand_abbrev(env, t2), std::move(constraints));
+  if (c1 && c2 && env::path_equiv(env, c1->path, c2->path)) {
     try {
       const TypeDeclaration* decl = env::find_type(c1->path, env);
       if (c1->args.size() != c2->args.size()) throw std::invalid_argument("List.combine");
@@ -766,42 +766,47 @@ static Constraints subtype_labeled_list(env::t env, const STrace& trace, Slice<L
 static Constraints subtype_package(env::t env, const STrace& trace, long lvl1,
                                    const Package* pack1, long lvl2, const Package* pack2,
                                    Constraints constraints) {
-  // `let ntl1 = .. and ntl2 = ..`: left to right
-  CompleteResult ntl1 =
-      complete_type_list(et::Position::Second, env, pack2->pack_constraints, lvl1, pack1);
-  CompleteResult ntl2 =
-      complete_type_list(et::Position::First, env, pack1->pack_constraints, lvl2, pack2, true);
-  if (!ntl1.ok) subtype_error(env, trace, {fcm_elt(ntl1.err)});
-  if (!ntl2.ok) subtype_error(env, trace, {fcm_elt(ntl2.err)});
-  Constraints cs2;  // constraints' (in OCaml list order: head = front)
-  std::vector<SubConstraint> cprime;
-  for (auto& [n2, t2] : ntl2.res) {
-    TypeExpr* a = nullptr;
-    for (auto& [n1, t1] : ntl1.res)
-      if (std::equal(n1.begin(), n1.end(), n2.begin(), n2.end())) {
-        a = t1;
-        break;
-      }
-    if (!a) throw env::NotFound{};  // List.assoc
-    cprime.push_back({env, trace, a, t2, univar_pairs});
-  }
-  auto append = [&](Constraints c) {  // constraints' @ constraints
-    for (auto it = cprime.rbegin(); it != cprime.rend(); ++it) c.push_back(*it);
-    return c;
-  };
-  if (eq_package_path(env, pack1->pack_path, pack2->pack_path)) return append(std::move(constraints));
-  // need to check module subtyping
-  Snapshot snap = btype::snapshot();
   try {
-    for (auto& c : cprime) unify(c.env, c.t1, c.t2);
-  } catch (const Unify& u) {
+    // `let ntl1 = .. and ntl2 = ..`: left to right
+    std::vector<PackConstraint> ntl1 = complete_type_list(env, pack2->pack_constraints, lvl1, pack1);
+    std::vector<PackConstraint> ntl2 = complete_type_list(env, pack1->pack_constraints, lvl2, pack2, true);
+    std::vector<SubConstraint> cprime;
+    for (auto& [n2, t2] : ntl2) {
+      TypeExpr* a = nullptr;
+      for (auto& [n1, t1] : ntl1)
+        if (std::equal(n1.begin(), n1.end(), n2.begin(), n2.end())) {
+          a = t1;
+          break;
+        }
+      if (!a) throw env::NotFound{};  // List.assoc
+      cprime.push_back({env, trace, a, t2, univar_pairs});
+    }
+    auto append = [&](Constraints c) {  // constraints' @ constraints
+      for (auto it = cprime.rbegin(); it != cprime.rend(); ++it) c.push_back(*it);
+      return c;
+    };
+    if (eq_package_path(env, pack1->pack_path, pack2->pack_path)) return append(std::move(constraints));
+    // need to check module subtyping
+    Snapshot snap = btype::snapshot();
+    bool unified = true;
+    try {
+      for (auto& c : cprime) unify(c.env, c.t1, c.t2);
+    } catch (const Unify&) {
+      unified = false;
+    }
+    if (unified && package_subtype(env, pack1, pack2).ok) {
+      btype::backtrack(snap);
+      return append(std::move(constraints));
+    }
     btype::backtrack(snap);
-    subtype_error(env, trace, u.err.trace);
+    throw env::NotFound{};
+  } catch (const env::NotFound&) {
+    // the tuple: right to left
+    TypeExpr* p2 = newty(tpackage(pack2));
+    TypeExpr* p1 = newty(tpackage(pack1));
+    constraints.push_back({env, trace, p1, p2, univar_pairs});
+    return constraints;
   }
-  PackageSubtypeResult r = package_subtype(env, pack1, pack2);
-  btype::backtrack(snap);
-  if (r.ok) return append(std::move(constraints));
-  subtype_error(env, trace, {fcm_elt(r.err)});
 }
 
 static Constraints subtype_functor(env::t env, const STrace& trace, ident::Unscoped* id1,
@@ -853,7 +858,7 @@ static Constraints subtype_row(env::t env, const STrace& trace, const RowDesc* r
   auto vcn = [](const TypeDesc* d) {
     return d->kind == DK::Tvar || d->kind == DK::Tconstr || d->kind == DK::Tnil;
   };
-  if (k1 && k2 && quick_eq_type_path(true, env, k1->path, k2->path))
+  if (k1 && k2 && env::path_equiv(env, k1->path, k2->path))
     return subtype_rec(env, scons(more1, more2, trace), more1, more2, std::move(constraints));
   if (vcn(md1) && vcn(md2) && r1d.closed && r1.empty()) {
     Constraints cs = std::move(constraints);
@@ -947,10 +952,11 @@ static TypeExpr* unalias_object(TypeExpr* ty) {
     }
     case DK::Tvar:
     case DK::Tnil:
-    case DK::Tconstr:
       return newty2(level, d);
     case DK::Tunivar:
       return ty;
+    case DK::Tconstr:
+      return newvar2(level);
     default:
       throw std::logic_error("Ctype.unalias_object");
   }
@@ -1199,30 +1205,36 @@ std::pair<std::vector<ArgLabel>, bool> arrow_labels(env::t env, TypeExpr* ty) {
 // levels set to generic level.  We cannot use Tsubst here, because
 // unification may be called by expand_abbrev.
 
-struct NondepScope {
-  TypeHash<TypeExpr*> copied_types;
-  TypeHash<TypeExpr*> copied_variants;
-  void reset() {
-    copied_types.h.clear();
-    copied_variants.h.clear();
-  }
+// nondep_hash and nondep_variants: process-wide, as ctype.ml's (a failing
+// top-level call leaves its entries for the next one)
+struct NondepHash {
+  TypeHash<TypeExpr*> copied_types;     // nondep_hash
+  TypeHash<TypeExpr*> copied_variants;  // nondep_variants
 };
+static NondepHash& nondep_tables() {
+  static NondepHash h;
+  return h;
+}
+static void clear_hash() {
+  nondep_tables().copied_types.h.clear();
+  nondep_tables().copied_variants.h.clear();
+}
 
 using IdMap = std::vector<std::pair<Ident::t, Path::t>>;
 
-static TypeExpr* nondep_type_rec_aux(bool expand_private, env::t env, NondepScope& scope,
-                                     const IdMap& id_map, const std::vector<Ident::t>& ids,
-                                     TypeExpr* ty) {
+static TypeExpr* nondep_type_rec_aux(bool expand_private, env::t env, const IdMap& id_map,
+                                     const std::vector<Ident::t>& ids, TypeExpr* ty) {
+  NondepHash& scope = nondep_tables();
   auto try_expand = [&](env::t e, TypeExpr* t) {
-    return expand_private ? try_expand_safe_opt(e, t) : try_expand_safe_no_link(e, t);
+    return expand_private ? try_expand_safe_opt(e, t) : try_expand_safe(e, t);
   };
-  const TypeDesc* desc = get_folded_desc(true, ty);
+  const TypeDesc* desc = get_desc(ty);
   if (desc->kind == DK::Tvar || desc->kind == DK::Tunivar) return ty;
   if (TypeExpr** f = scope.copied_types.find_opt(ty)) return *f;
   TypeExpr* ty2 = newgenstub(get_scope(ty));
   scope.copied_types.add(ty, ty2);
   auto nondep_trec = [&](TypeExpr* t, bool ep = false) {
-    return nondep_type_rec_aux(ep, env, scope, id_map, ids, t);
+    return nondep_type_rec_aux(ep, env, id_map, ids, t);
   };
   const TypeDesc* desc2;
   try {
@@ -1237,19 +1249,14 @@ static TypeExpr* nondep_type_rec_aux(bool expand_private, env::t env, NondepScop
           desc2 = tconstr(path::subst(id_map, c->path), slice(tl), make<MemoRef>(mnil()));
         } catch (const NondepCannotErase& exn) {
           // If that doesn't work, try expanding abbrevs
-          if (desc != get_desc(ty)) {
-            scope.copied_types.remove(ty);
-            desc2 = tlink(nondep_trec(ignore_abbrev(ty), expand_private));
-          } else {
-            TypeExpr* exp;
-            try {
-              exp = try_expand(env, newty2(get_level(ty), desc));
-            } catch (const CannotExpand&) {
-              throw exn;
-            }
-            // The [Tlink] is important (see ctype.ml).
-            desc2 = tlink(nondep_trec(exp, expand_private));
+          TypeExpr* exp;
+          try {
+            exp = try_expand(env, newty2(get_level(ty), desc));
+          } catch (const CannotExpand&) {
+            throw exn;
           }
+          // The [Tlink] is important (see ctype.ml).
+          desc2 = tlink(nondep_trec(exp, expand_private));
         }
         break;
       }
@@ -1282,7 +1289,7 @@ static TypeExpr* nondep_type_rec_aux(bool expand_private, env::t env, NondepScop
           if (ident::same(i, id_us)) throw std::logic_error("Ctype.nondep_type_rec");
         const ModuleType* mty = modtype_of_package(env, location::none(), fu->pack);
         env::t env2 = env::add_module(id_us, ModulePresence::Mp_present, mty, env);
-        TypeExpr* t2 = nondep_type_rec_aux(false, env2, scope, id_map2, ids, fu->body);
+        TypeExpr* t2 = nondep_type_rec_aux(false, env2, id_map2, ids, fu->body);
         desc2 = tfunctor(fu->label, us2, pack3, t2);
         break;
       }
@@ -1340,125 +1347,139 @@ static TypeExpr* nondep_type_rec_aux(bool expand_private, env::t env, NondepScop
   return ty2;
 }
 
-static TypeExpr* nondep_type_rec(env::t env, NondepScope& scope, const std::vector<Ident::t>& ids,
-                                 TypeExpr* ty, bool expand_private = false) {
-  return nondep_type_rec_aux(expand_private, env, scope, {}, ids, ty);
+static TypeExpr* nondep_type_rec(env::t env, const std::vector<Ident::t>& ids, TypeExpr* ty,
+                                 bool expand_private = false) {
+  return nondep_type_rec_aux(expand_private, env, {}, ids, ty);
 }
 
 TypeExpr* nondep_type(env::t env, const std::vector<Ident::t>& ids, TypeExpr* ty) {
-  NondepScope scope;
-  return nondep_type_rec(env, scope, ids, ty);
+  try {
+    TypeExpr* r = nondep_type_rec(env, ids, ty);
+    clear_hash();
+    return r;
+  } catch (const NondepCannotErase&) {
+    clear_hash();
+    throw;
+  }
 }
 
 // Preserve sharing inside type declarations.
 const TypeDeclaration* nondep_type_decl(env::t env, const std::vector<Ident::t>& mid,
                                         bool is_covariant, const TypeDeclaration* decl) {
-  NondepScope scope;
-  std::vector<TypeExpr*> params;
-  for (TypeExpr* p : decl->type_params) params.push_back(nondep_type_rec(env, scope, mid, p));
-  const TypeKind* tk;
   try {
-    tk = map_kind([&](TypeExpr* t) { return nondep_type_rec(env, scope, mid, t); },
-                  decl->type_kind);
-  } catch (const NondepCannotErase&) {
-    if (!is_covariant) throw;
-    tk = TYPE_ABSTRACT_LIT(Definition);
-  }
-  TypeExpr* tm = nullptr;
-  PrivateFlag priv = decl->type_private;
-  if (decl->type_manifest) {
+    std::vector<TypeExpr*> params;
+    for (TypeExpr* p : decl->type_params) params.push_back(nondep_type_rec(env, mid, p));
+    // `let tk = .. and tm, priv = ..`: left to right
+    const TypeKind* tk;
     try {
-      tm = nondep_type_rec(env, scope, mid, decl->type_manifest);
+      tk = map_kind([&](TypeExpr* t) { return nondep_type_rec(env, mid, t); }, decl->type_kind);
     } catch (const NondepCannotErase&) {
       if (!is_covariant) throw;
-      scope.reset();
+      tk = TYPE_ABSTRACT_LIT(Definition);
+    }
+    TypeExpr* tm = nullptr;
+    PrivateFlag priv = decl->type_private;
+    if (decl->type_manifest) {
       try {
-        tm = nondep_type_rec(env, scope, mid, decl->type_manifest, true);
-        priv = PrivateFlag::Private;
+        tm = nondep_type_rec(env, mid, decl->type_manifest);
       } catch (const NondepCannotErase&) {
-        tm = nullptr;
-        priv = decl->type_private;
+        if (!is_covariant) throw;
+        clear_hash();
+        try {
+          tm = nondep_type_rec(env, mid, decl->type_manifest, true);
+          priv = PrivateFlag::Private;
+        } catch (const NondepCannotErase&) {
+          tm = nullptr;
+          priv = decl->type_private;
+        }
       }
     }
+    clear_hash();
+    if (tm && has_constr_row(tm)) priv = PrivateFlag::Private;
+    TypeDeclaration* r = make<TypeDeclaration>(*decl);
+    r->type_params = slice(params);
+    r->type_kind = tk;
+    r->type_manifest = tm;
+    r->manifest_obj.reset();  // a new Some block
+    r->type_private = priv;
+    r->type_is_newtype = false;
+    r->type_expansion_scope = lowest_level;
+    return r;
+  } catch (const NondepCannotErase&) {
+    clear_hash();
+    throw;
   }
-  if (tm && has_constr_row(tm)) priv = PrivateFlag::Private;
-  TypeDeclaration* r = make<TypeDeclaration>(*decl);
-  r->type_params = slice(params);
-  r->type_kind = tk;
-  r->type_manifest = tm;
-  r->manifest_obj.reset();  // a new Some block
-  r->type_private = priv;
-  r->type_is_newtype = false;
-  r->type_expansion_scope = lowest_level;
-  return r;
 }
 
 // Preserve sharing inside extension constructors.
 const ExtensionConstructor* nondep_extension_constructor(env::t env,
                                                          const std::vector<Ident::t>& ids,
                                                          const ExtensionConstructor* ext) {
-  NondepScope scope;
-  Path::t type_path;
-  Slice<TypeExpr*> type_params;
-  if (auto id = path::find_free_opt(ids, ext->ext_type_path)) {
-    TypeExpr* ty =
-        newgenty(tconstr(ext->ext_type_path, ext->ext_type_params, make<MemoRef>(mnil())));
-    TypeExpr* ty2 = nondep_type_rec(env, scope, ids, ty);
-    auto* c = as<Tconstr>(get_desc(ty2));
-    if (!c) throw NondepCannotErase{*id};
-    type_path = c->path;
-    type_params = c->args;
-  } else {
-    std::vector<TypeExpr*> tp;
-    for (TypeExpr* p : ext->ext_type_params) tp.push_back(nondep_type_rec(env, scope, ids, p));
-    type_path = ext->ext_type_path;
-    type_params = slice(tp);
+  try {
+    Path::t type_path;
+    Slice<TypeExpr*> type_params;
+    if (auto id = path::find_free_opt(ids, ext->ext_type_path)) {
+      TypeExpr* ty =
+          newgenty(tconstr(ext->ext_type_path, ext->ext_type_params, make<MemoRef>(mnil())));
+      TypeExpr* ty2 = nondep_type_rec(env, ids, ty);
+      auto* c = as<Tconstr>(get_desc(ty2));
+      if (!c) throw NondepCannotErase{*id};
+      type_path = c->path;
+      type_params = c->args;
+    } else {
+      std::vector<TypeExpr*> tp;
+      for (TypeExpr* p : ext->ext_type_params) tp.push_back(nondep_type_rec(env, ids, p));
+      type_path = ext->ext_type_path;
+      type_params = slice(tp);
+    }
+    auto f = [&](TypeExpr* t) { return nondep_type_rec(env, ids, t); };
+    ConstructorArguments args = map_type_expr_cstr_args(f, ext->ext_args);
+    TypeExpr* ret_type = ext->ext_ret_type ? f(ext->ext_ret_type) : nullptr;
+    clear_hash();
+    ExtensionConstructor* r = make<ExtensionConstructor>(*ext);
+    r->ext_type_path = type_path;
+    r->ext_type_params = type_params;
+    r->ext_args = args;
+    r->ext_ret_type = ret_type;
+    return r;
+  } catch (const NondepCannotErase&) {
+    clear_hash();
+    throw;
   }
-  auto f = [&](TypeExpr* t) { return nondep_type_rec(env, scope, ids, t); };
-  ConstructorArguments args = map_type_expr_cstr_args(f, ext->ext_args);
-  TypeExpr* ret_type = ext->ext_ret_type ? f(ext->ext_ret_type) : nullptr;
-  ExtensionConstructor* r = make<ExtensionConstructor>(*ext);
-  r->ext_type_path = type_path;
-  r->ext_type_params = type_params;
-  r->ext_args = args;
-  r->ext_ret_type = ret_type;
-  return r;
 }
 
 // Preserve sharing inside class types.
-static ClassSignature* nondep_class_signature(env::t env, NondepScope& scope,
-                                              const std::vector<Ident::t>& ids,
+static ClassSignature* nondep_class_signature(env::t env, const std::vector<Ident::t>& ids,
                                               const ClassSignature* sign) {
-  auto f = [&](TypeExpr* t) { return nondep_type_rec(env, scope, ids, t); };
+  auto f = [&](TypeExpr* t) { return nondep_type_rec(env, ids, t); };
   // record fields: right to left in definition order
   StrMap<MethEntry> meths =
       sign->csig_meths.map([&](const MethEntry& e) { return MethEntry{e.priv, e.virt, f(e.ty)}; });
   StrMap<VarEntry> vars =
       sign->csig_vars.map([&](const VarEntry& e) { return VarEntry{e.mut, e.virt, f(e.ty)}; });
-  FieldKind* dummy = field_kind_internal_repr(sign->csig_dummy_method);
   TypeExpr* self_row = f(sign->csig_self_row);
   TypeExpr* self = f(sign->csig_self);
-  return make<ClassSignature>(self, self_row, dummy, vars, meths);
+  return make<ClassSignature>(self, self_row, vars, meths);
 }
 
-static const ClassType* nondep_class_type(env::t env, NondepScope& scope,
-                                          const std::vector<Ident::t>& ids, const ClassType* cty) {
+static const ClassType* nondep_class_type(env::t env, const std::vector<Ident::t>& ids,
+                                          const ClassType* cty) {
   using CK = ClassType::Kind;
   switch (cty->kind) {
     case CK::Cty_constr: {
-      if (path::exists_free(ids, cty->path)) return nondep_class_type(env, scope, ids, cty->cty);
+      if (path::exists_free(ids, cty->path)) return nondep_class_type(env, ids, cty->cty);
       // constructor arguments: right to left
-      const ClassType* c = nondep_class_type(env, scope, ids, cty->cty);
+      const ClassType* c = nondep_class_type(env, ids, cty->cty);
       std::vector<TypeExpr*> tyl;
-      for (TypeExpr* t : cty->args) tyl.push_back(nondep_type_rec(env, scope, ids, t));
+      for (TypeExpr* t : cty->args) tyl.push_back(nondep_type_rec(env, ids, t));
       return make<ClassType>(CK::Cty_constr, cty->path, slice(tyl), c);
     }
     case CK::Cty_signature:
       return make<ClassType>(CK::Cty_signature, nullptr, Slice<TypeExpr*>{}, nullptr,
-                             nondep_class_signature(env, scope, ids, cty->sign));
+                             nondep_class_signature(env, ids, cty->sign));
     case CK::Cty_arrow: {
-      const ClassType* c = nondep_class_type(env, scope, ids, cty->cty);
-      TypeExpr* ty = nondep_type_rec(env, scope, ids, cty->arg);
+      const ClassType* c = nondep_class_type(env, ids, cty->cty);
+      TypeExpr* ty = nondep_type_rec(env, ids, cty->arg);
       return make<ClassType>(CK::Cty_arrow, nullptr, Slice<TypeExpr*>{}, c, nullptr, cty->label, ty);
     }
   }
@@ -1469,17 +1490,18 @@ const ClassDeclaration* nondep_class_declaration(env::t env, const std::vector<I
                                                  const ClassDeclaration* decl) {
   if (path::exists_free(ids, decl->cty_path))
     throw std::logic_error("Ctype.nondep_class_declaration");
-  NondepScope scope;
-  // record fields: right to left in definition order
-  TypeExpr* cty_new = decl->cty_new ? nondep_type_rec(env, scope, ids, decl->cty_new) : nullptr;
-  const ClassType* cty_type = nondep_class_type(env, scope, ids, decl->cty_type);
+  // record fields: right to left in definition order (no clear_hash if one
+  // raises, as in ctype.ml)
+  TypeExpr* cty_new = decl->cty_new ? nondep_type_rec(env, ids, decl->cty_new) : nullptr;
+  const ClassType* cty_type = nondep_class_type(env, ids, decl->cty_type);
   std::vector<TypeExpr*> params;
-  for (TypeExpr* p : decl->cty_params) params.push_back(nondep_type_rec(env, scope, ids, p));
+  for (TypeExpr* p : decl->cty_params) params.push_back(nondep_type_rec(env, ids, p));
   ClassDeclaration* r = make<ClassDeclaration>(*decl);
   r->cty_params = slice(params);
   r->cty_type = cty_type;
   r->cty_new = cty_new;
   r->new_obj.reset();  // a new Some block
+  clear_hash();
   return r;
 }
 
@@ -1487,16 +1509,16 @@ const ClassTypeDeclaration* nondep_cltype_declaration(env::t env, const std::vec
                                                       const ClassTypeDeclaration* decl) {
   if (path::exists_free(ids, decl->clty_path))
     throw std::logic_error("Ctype.nondep_cltype_declaration");
-  NondepScope scope;
   // record fields: right to left in definition order
   const TypeDeclaration* hash = nondep_type_decl(env, ids, false, decl->clty_hash_type);
-  const ClassType* clty_type = nondep_class_type(env, scope, ids, decl->clty_type);
+  const ClassType* clty_type = nondep_class_type(env, ids, decl->clty_type);
   std::vector<TypeExpr*> params;
-  for (TypeExpr* p : decl->clty_params) params.push_back(nondep_type_rec(env, scope, ids, p));
+  for (TypeExpr* p : decl->clty_params) params.push_back(nondep_type_rec(env, ids, p));
   ClassTypeDeclaration* r = make<ClassTypeDeclaration>(*decl);
   r->clty_params = slice(params);
   r->clty_type = clty_type;
   r->clty_hash_type = hash;
+  clear_hash();
   return r;
 }
 
@@ -1525,11 +1547,11 @@ void collapse_conj_params(env::t env, Slice<TypeExpr*> params) {
 }
 
 bool same_constr(env::t env, TypeExpr* t1, TypeExpr* t2) {
-  TypeExpr* a = expand_head_nolink(env, t1);
-  TypeExpr* b = expand_head_nolink(env, t2);
+  TypeExpr* a = expand_head(env, t1);
+  TypeExpr* b = expand_head(env, t2);
   auto* c1 = as<Tconstr>(get_desc(a));
   auto* c2 = as<Tconstr>(get_desc(b));
-  if (c1 && c2) return eq_expanded_type_path(env, c1->path, c2->path);
+  if (c1 && c2) return env::path_equiv(env, c1->path, c2->path);
   return false;
 }
 

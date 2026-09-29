@@ -454,18 +454,6 @@ class Reader {
     return make<Package>(p, cs);
   }
 
-  // an abbrev record {abbr_path; abbr_args; mutable abbr_level}: one per
-  // marshaled block (input_value's sharing; the level is mutable)
-  Abbrev* abbrev(std::size_t id) {
-    auto [it, fresh] = abbrevs_.try_emplace(id, nullptr);
-    if (fresh) {
-      Path::t p = path(f(id, 0));
-      Slice<TypeExpr*> args = tys(f(id, 1));
-      it->second = make<Abbrev>(Abbrev{p, args, ival(f(id, 2))});
-    }
-    return it->second;
-  }
-
   Slice<TypeExpr*> tys(std::size_t id) {
     return list<TypeExpr*>(id, [&](std::size_t t) { return ty(t); });
   }
@@ -505,30 +493,25 @@ class Reader {
         d = types::tfield(l, k, a, ty(f(id, 3)));
         break;
       }
-      case 6: d = types::tvariant(row(f(id, 0))); break;
-      case 7: d = types::tunivar(opt_str(f(id, 0))); break;
-      case 8: {
+      case 6: d = types::tlink(ty(f(id, 0))); break;
+      case 7: {
+        TypeExpr* a = ty(f(id, 0));
+        d = types::tsubst(a, opt_ptr(f(id, 1), [&](std::size_t t) { return ty(t); }));
+        break;
+      }
+      case 8: d = types::tvariant(row(f(id, 0))); break;
+      case 9: d = types::tunivar(opt_str(f(id, 0))); break;
+      case 10: {
         TypeExpr* a = ty(f(id, 0));
         d = types::tpoly(a, tys(f(id, 1)));
         break;
       }
-      case 9: d = types::tpackage(package(f(id, 0))); break;
-      case 10: {
+      case 11: d = types::tpackage(package(f(id, 0))); break;
+      case 12: {
         ArgLabel l = arg_label(f(id, 0));
         ident::Unscoped* u = unscoped(f(id, 1));
         const Package* p = package(f(id, 2));
         d = types::tfunctor(l, u, p, ty(f(id, 3)));
-        break;
-      }
-      case 11: {
-        TypeExpr* a = ty(f(id, 0));
-        d = types::texpand(a, abbrev(f(id, 1)));
-        break;
-      }
-      case 12: d = types::tlink(ty(f(id, 0))); break;
-      case 13: {
-        TypeExpr* a = ty(f(id, 0));
-        d = types::tsubst(a, opt_ptr(f(id, 1), [&](std::size_t t) { return ty(t); }));
         break;
       }
       default: throw Corrupt{};
@@ -604,14 +587,9 @@ class Reader {
             case 1: k->origin.kind = OK::Rec_check_regularity; break;
             default: k->origin.kind = OK::Approx_recmod; break;
           }
-        } else if (tag(o) == 0) {
+        } else {
           k->origin.kind = OK::Existential;
           k->origin.existential = str(f(o, 0));
-          k->origin.obj = block_identity(o);
-        } else {
-          k->origin.kind = OK::Equation;
-          k->origin.eq1 = ty(f(o, 0));
-          k->origin.eq2 = ty(f(o, 1));
           k->origin.obj = block_identity(o);
         }
         break;
@@ -711,13 +689,12 @@ class Reader {
     csig_.put(id, c);
     c->csig_self = ty(f(id, 0));
     c->csig_self_row = ty(f(id, 1));
-    c->csig_dummy_method = field_kind(f(id, 2));
-    c->csig_vars = StrMap<VarEntry>(strmap<VarEntry>(f(id, 3), [&](std::size_t x) {
+    c->csig_vars = StrMap<VarEntry>(strmap<VarEntry>(f(id, 2), [&](std::size_t x) {
       MutableFlag mu = mutable_flag(f(x, 0));
       VirtualFlag vi = virtual_flag(f(x, 1));
       return VarEntry{mu, vi, ty(f(x, 2))};
     }));
-    c->csig_meths = StrMap<MethEntry>(strmap<MethEntry>(f(id, 4), [&](std::size_t x) {
+    c->csig_meths = StrMap<MethEntry>(strmap<MethEntry>(f(id, 3), [&](std::size_t x) {
       MethodPrivacy p;
       std::size_t pv = f(x, 0);
       if (!is_int(pv)) {
@@ -939,7 +916,6 @@ class Reader {
   FlatMemo<RowFieldCell*, 7> cell_{slots_};
   FlatMemo<ident::Unscoped*, 8> us_{slots_};
   FlatMemo<ClassSignature*, 9> csig_{slots_};
-  std::unordered_map<std::size_t, Abbrev*> abbrevs_;
   std::unordered_map<std::size_t, const void*> entry_objs_;  // row fields' tuples
   FlatMemo<OValue*, 10> ov_{slots_};
   FlatMemo<std::string_view, 11> str_{slots_};

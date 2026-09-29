@@ -482,7 +482,7 @@ TypeExpr* clean_copy(TypeExpr* ty) {
   return subst::type_expr(subst::identity(), ty);
 }
 Path::t get_constructor_type_path(TypeExpr* ty, env::t tenv) {
-  TypeExpr* t = ctype::expand_head_nolink(tenv, clean_copy(ty));
+  TypeExpr* t = ctype::expand_head(tenv, clean_copy(ty));
   auto* tc = as<Tconstr>(get_desc(t));
   if (!tc) throw std::logic_error("get_constructor_type_path");
   return tc->path;

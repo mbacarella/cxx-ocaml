@@ -489,7 +489,7 @@ static Typed type_module_aux(bool alias, bool strengthen, bool funct_body, Path:
     case K::Pmod_unpack: {
       const tt::Expression* exp = ctype::with_local_level_generalize_structure_if_principal(
           [&] { return tc::type_exp(env, as<pt::Pmod_unpack>(d)->exp); });
-      const TypeDesc* td = get_desc(ctype::expand_head_nolink(env, exp->exp_type));
+      const TypeDesc* td = get_desc(ctype::expand_head(env, exp->exp_type));
       const ModuleType* mty;
       if (auto* p = as<Tpackage>(td)) {
         std::vector<std::pair<std::vector<std::string_view>, TypeExpr*>> fl;
