@@ -1217,9 +1217,16 @@ class CmxReader : public Reader {
     } else {
       k.kind = lambda::ValueKind::Kind::Pboxedintval;
       k.bi = static_cast<BoxedInteger>(ival(f(id, 0)));
+      // input_value makes one block per marshaled block, which output_value
+      // shares again
+      static std::uint32_t next_origin = 0;
+      auto [it, fresh] = boxedint_origins_.try_emplace(id, 0);
+      if (fresh) it->second = ++next_origin;
+      k.origin = it->second;
     }
     return k;
   }
+  std::unordered_map<std::size_t, std::uint32_t> boxedint_origins_;
 
   debuginfo::scopes scopes(std::size_t id) {
     if (is_int(id)) return nullptr;  // Empty
@@ -1699,15 +1706,15 @@ class CmxWriter {
       case lambda::ValueKind::Kind::Pintval: return w.i(2);
       case lambda::ValueKind::Kind::Pboxedintval: {
         // Typeopt's [Pboxedintval Pint32] (...) are literals: one static block
-        // each in ocamlopt
-        V& v = boxedint_kinds_[static_cast<int>(k.bi)];
+        // each in ocamlopt; one read from a .cmx is its own block
+        V& v = boxedint_kinds_[{k.origin, static_cast<int>(k.bi)}];
         if (!v) v = o::vblock(0, {w.i(static_cast<long>(k.bi))});
         return v;
       }
     }
     return w.i(0);
   }
-  V boxedint_kinds_[3];
+  std::map<std::pair<std::uint32_t, int>, V> boxedint_kinds_;
 
   V scopes(debuginfo::scopes s) {
     if (!s) return w.i(0);
