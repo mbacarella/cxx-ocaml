@@ -31,5 +31,9 @@ const OValue* ovalue_of_ast_signature(Signature s);
 // std::runtime_error on a value of another shape.
 Structure structure_of_ovalue(const OValue* v);
 Signature signature_of_ovalue(const OValue* v);
+// the same, decoding the marshaled value at data[off] (advanced past it)
+// directly, without a generic value in between (Pparse's binary ASTs)
+Structure structure_of_marshal(const std::uint8_t* data, std::size_t len, std::size_t& off);
+Signature signature_of_marshal(const std::uint8_t* data, std::size_t len, std::size_t& off);
 
 }  // namespace cppcaml::typing::parsetree

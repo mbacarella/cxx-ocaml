@@ -14,11 +14,11 @@
 
 #include "cppcaml/typing/parsetree_ovalue.hpp"
 
+#include "cmi_marshal.hpp"
+
 namespace cppcaml::typing::parsetree {
 
 namespace {
-
-using V = const OValue*;
 
 struct Corrupt : std::runtime_error {
   Corrupt() : std::runtime_error("Parsetree: ill-formed marshaled AST") {}
@@ -29,29 +29,75 @@ const D* mk(A&&... a) {
   return make<D>(D{{D::K}, std::forward<A>(a)...});
 }
 
-class Decoder {
- public:
-  // ---- the value's shape ----
-  static bool is_int(V x) { return x->kind == OValue::Kind::Int; }
-  static long ival(V x) {
+// The value's shape, from a generic OValue graph (a -ppx rewriter's output)
+struct OValueAcc {
+  using V = const OValue*;
+  bool is_int(V x) const { return x->kind == OValue::Kind::Int; }
+  long ival(V x) const {
     if (!is_int(x)) throw Corrupt{};
     return x->i;
   }
-  static unsigned tag(V x) {
+  unsigned tag(V x) const {
     if (x->kind != OValue::Kind::Block) throw Corrupt{};
     return x->tag;
   }
-  static V f(V x, std::size_t k) {
+  V f(V x, std::size_t k) const {
     if (x->kind != OValue::Kind::Block || k >= x->fields.size()) throw Corrupt{};
     return x->fields[k];
   }
-  static std::string_view str(V x) {
+  std::string_view str(V x) const {
     if (x->kind != OValue::Kind::String) throw Corrupt{};
     return x->s;
   }
-  static bool boolean(V x) { return ival(x) != 0; }
+  const Position* pos(V x) const { return x->pos; }  // the Reader's record
+};
+// ... or straight from input_value's graph (a binary AST file): no generic
+// value in between (for a big AST, most of the compiler's peak memory).
+// One string per marshaled string, copied into the zone.
+struct GraphAcc {
+  using V = cmi_marshal::Id;
+  const cmi_marshal::Graph& g;
+  mutable std::unordered_map<V, std::string_view> strs{};
+  bool is_int(V x) const { return cmi_marshal::is_imm(x) || g.node(x).kind == cmi_marshal::Kind::Int; }
+  long ival(V x) const {
+    if (cmi_marshal::is_imm(x)) return cmi_marshal::imm(x);
+    const cmi_marshal::Node& n = g.node(x);
+    if (n.kind != cmi_marshal::Kind::Int) throw Corrupt{};
+    return static_cast<long>(static_cast<std::int64_t>(n.v));
+  }
+  unsigned tag(V x) const {
+    if (cmi_marshal::is_imm(x) || g.node(x).kind != cmi_marshal::Kind::Block) throw Corrupt{};
+    return g.node(x).tag;
+  }
+  V f(V x, std::size_t k) const {
+    if (cmi_marshal::is_imm(x)) throw Corrupt{};
+    const cmi_marshal::Node& n = g.node(x);
+    if (n.kind != cmi_marshal::Kind::Block || k >= n.n) throw Corrupt{};
+    return g.field(n.v + k);
+  }
+  std::string_view str(V x) const {
+    if (cmi_marshal::is_imm(x) || g.node(x).kind != cmi_marshal::Kind::String) throw Corrupt{};
+    auto [it, fresh] = strs.try_emplace(x);
+    if (fresh) it->second = zstr(g.string(g.node(x)));
+    return it->second;
+  }
+  const Position* pos(V) const { return nullptr; }  // made by the Decoder, one per block
+};
+
+template <class Acc>
+class Decoder {
+ public:
+  using V = typename Acc::V;
+  explicit Decoder(Acc a) : acc_(std::move(a)) {}
+  // ---- the value's shape ----
+  bool is_int(V x) const { return acc_.is_int(x); }
+  long ival(V x) const { return acc_.ival(x); }
+  unsigned tag(V x) const { return acc_.tag(x); }
+  V f(V x, std::size_t k) const { return acc_.f(x, k); }
+  std::string_view str(V x) const { return acc_.str(x); }
+  bool boolean(V x) const { return ival(x) != 0; }
   template <class E>
-  static E flag(V x) {
+  E flag(V x) const {
     return static_cast<E>(ival(x));
   }
 
@@ -83,7 +129,7 @@ class Decoder {
 
   // ---- locations: one record per marshaled block ----
   Position position(V x) {
-    if (x->pos) return *x->pos;  // the Reader's record (its identity)
+    if (const Position* p = acc_.pos(x)) return *p;  // the Reader's record (its identity)
     if (auto it = poss_.find(x); it != poss_.end()) return *it->second;
     auto* p = make<Position>(mkpos(str(f(x, 0)), ival(f(x, 1)), ival(f(x, 2)), ival(f(x, 3))));
     p->obj = p;
@@ -942,6 +988,7 @@ class Decoder {
   }
 
  private:
+  Acc acc_;
   std::unordered_map<V, const void*> nodes_;
   std::unordered_map<V, std::pair<const void*, std::size_t>> lists_;
   std::unordered_map<V, Position*> poss_;
@@ -952,12 +999,24 @@ class Decoder {
 }  // namespace
 
 Structure structure_of_ovalue(const OValue* v) {
-  Decoder d;
+  Decoder<OValueAcc> d{OValueAcc{}};
   return d.structure(v);
 }
 Signature signature_of_ovalue(const OValue* v) {
-  Decoder d;
+  Decoder<OValueAcc> d{OValueAcc{}};
   return d.signature(v);
+}
+Structure structure_of_marshal(const std::uint8_t* data, std::size_t len, std::size_t& off) {
+  cmi_marshal::Graph g;
+  cmi_marshal::Id root = cmi_marshal::read_value(data, len, off, g);
+  Decoder<GraphAcc> d{GraphAcc{g}};
+  return d.structure(root);
+}
+Signature signature_of_marshal(const std::uint8_t* data, std::size_t len, std::size_t& off) {
+  cmi_marshal::Graph g;
+  cmi_marshal::Id root = cmi_marshal::read_value(data, len, off, g);
+  Decoder<GraphAcc> d{GraphAcc{g}};
+  return d.signature(root);
 }
 
 }  // namespace cppcaml::typing::parsetree
