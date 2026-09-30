@@ -157,19 +157,27 @@ static Sd classify_expression(const SizeEnv& env, const tt::Expression* e) {
         if (is_abstracted_arg(arg)) return Sd::Static;
       return Sd::Dynamic;
     }
-    case XK::Texp_array:
-      if (typeopt::array_kind(e) == lambda::ArrayKind::Pgenarray) return Sd::Dynamic;
-      return Sd::Static;
+    case XK::Texp_array: return Sd::Static;
     case XK::Texp_pack: return classify_module_expression(env, as<tt::Texp_pack>(d)->me);
     case XK::Texp_function: return Sd::Static;
     case XK::Texp_lazy: {
       const tt::Expression* le = as<tt::Texp_lazy>(d)->exp;
-      typeopt::LazySummary s = typeopt::classify_lazy_argument(le);
-      if (s.kind == typeopt::LazySummary::Kind::Eager && s.repr == typeopt::LazySummary::ForwardRepr::Shortcut)
-        // compiled to [e] directly.
-        return classify_expression(env, le);
-      // [e] is placed inside a Forward block, or a Lazy thunk
-      return Sd::Static;
+      // The code below was copied (in part) from translcore.ml
+      switch (typeopt::classify_lazy_argument(le)) {
+        case typeopt::LazyArgument::Constant_or_function:
+          // A constant expr (of type <> float if [Config.flat_float_array]
+          // is true) gets compiled as itself.
+          return classify_expression(env, le);
+        case typeopt::LazyArgument::Float_that_cannot_be_shortcut:
+        case typeopt::LazyArgument::Identifier_forward_value:
+          // Forward blocks
+          return Sd::Static;
+        case typeopt::LazyArgument::Identifier_other: return classify_expression(env, le);
+        case typeopt::LazyArgument::Other:
+          // other cases compile to a lazy block holding a function
+          return Sd::Static;
+      }
+      throw std::logic_error("classify_expression: Texp_lazy");
     }
     case XK::Texp_new:
     case XK::Texp_instvar:
@@ -600,11 +608,8 @@ static TermJudg expression(const tt::Expression* exp) {
       //  ----------------  (modulo some subtle compiler optimizations)
       //  G |- lazy e: m
       const tt::Expression* e = as<tt::Texp_lazy>(d)->exp;
-      // We pessimize [Eager Forward] into [Return] instead of [Guarded], so
-      // that this check remains robust to adding more shortcutting in the
-      // future.
-      Mode lazy_mode = typeopt::classify_lazy_argument(e).kind == typeopt::LazySummary::Kind::Eager ? Mode::Return
-                                                                                                    : Mode::Delay;
+      Mode lazy_mode =
+          typeopt::classify_lazy_argument(e) == typeopt::LazyArgument::Other ? Mode::Delay : Mode::Return;
       return expression(e) << lazy_mode;
     }
     case XK::Texp_letop: {

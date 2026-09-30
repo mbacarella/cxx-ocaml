@@ -3629,9 +3629,10 @@ lam for_trywith(scopes sc, const Location& loc, lam param, Slice<PatAction> pat_
                           Partial::Partial);
 }
 
-lam for_handler(scopes sc, const Location& loc, lam param, lam cont, Slice<PatAction> pat_act_list) {
+lam for_handler(scopes sc, const Location& loc, lam param, lam cont, lam cont_tail, Slice<PatAction> pat_act_list) {
   HeadScope heads;
-  return compile_matching(sc, loc, Failer{Failer::K::Reperform_noloc, {param, cont}}, nullptr, param, pat_act_list,
+  return compile_matching(sc, loc, Failer{Failer::K::Reperform_noloc, {param, cont, cont_tail}}, nullptr, param,
+                          pat_act_list,
                           Partial::Partial);
 }
 

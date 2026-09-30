@@ -146,7 +146,7 @@ Size size_of_primitive(const SizeEnv& env, const Primitive& p, Slice<lam_t> args
   switch (p.kind) {
     case PK::Pignore: case PK::Psetfield: case PK::Psetfield_computed: case PK::Psetfloatfield:
     case PK::Poffsetint: case PK::Poffsetref: case PK::Pbytessetu: case PK::Pbytessets: case PK::Parraysetu:
-    case PK::Parraysets: case PK::Pcheckbound: case PK::Pbigarrayset: case PK::Pbytes_set_16:
+    case PK::Parraysets: case PK::Pbigarrayset: case PK::Pbytes_set_16:
     case PK::Pbytes_set_32: case PK::Pbytes_set_64: case PK::Pbigstring_set_16: case PK::Pbigstring_set_32:
     case PK::Pbigstring_set_64: case PK::Ppoll:
       // Unit-returning primitives

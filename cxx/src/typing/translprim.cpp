@@ -68,8 +68,8 @@ enum class AtomicOp { Load, Exchange, Cas, Faa };
 
 struct Prim {
   enum class Kind {
-    Primitive, External, Sys_argv, Comparison, Raise, Raise_with_backtrace, Todo, Lazy_force, Loc, Send,
-    Send_self, Send_cache, Frame_pointers, Identity, Apply, Revapply, Atomic, Atomic_index, Check_array_bound
+    Primitive, External, Sys_argv, Comparison, Raise, Raise_with_backtrace, Lazy_force, Loc, Send,
+    Send_self, Send_cache, Frame_pointers, Identity, Apply, Revapply, Atomic
   };
   Kind kind;
   Primitive p{PK::Pignore};  // Primitive
@@ -153,11 +153,6 @@ Primitive psafe(PK kd, IsSafe s) {
 Primitive picmp(IntegerComparison c) {
   Primitive p = prim(PK::Pintcomp);
   p.icmp = c;
-  return p;
-}
-Primitive ppcmp(PhysicalComparison c) {
-  Primitive p = prim(PK::Pphyscomp);
-  p.pcmp = c;
   return p;
 }
 Primitive pfcmp(FloatComparison c) {
@@ -356,6 +351,10 @@ const PrimitiveDescription* prim_atomic_cas() {
   static const PrimitiveDescription* d = simple("caml_atomic_cas_field", 4, false);
   return d;
 }
+const PrimitiveDescription* prim_atomic_fetch_add() {
+  static const PrimitiveDescription* d = simple("caml_atomic_fetch_add_field", 3, false);
+  return d;
+}
 
 const std::unordered_map<std::string_view, Prim>& primitives_table() {
   using IP = ImmediateOrPointer;
@@ -419,8 +418,8 @@ const std::unordered_map<std::string_view, Prim>& primitives_table() {
       {"%lslint", P(pr(PK::Plslint), 2)},
       {"%lsrint", P(pr(PK::Plsrint), 2)},
       {"%asrint", P(pr(PK::Pasrint), 2)},
-      {"%eq", P(ppcmp(PhysicalComparison::CPeq), 2)},
-      {"%noteq", P(ppcmp(PhysicalComparison::CPneq), 2)},
+      {"%eq", P(picmp(IC::Ceq), 2)},
+      {"%noteq", P(picmp(IC::Cne), 2)},
       {"%ltint", P(picmp(IC::Clt), 2)},
       {"%leint", P(picmp(IC::Cle), 2)},
       {"%gtint", P(picmp(IC::Cgt), 2)},
@@ -456,7 +455,6 @@ const std::unordered_map<std::string_view, Prim>& primitives_table() {
       {"%array_safe_set", P(parr(PK::Parraysets, gen_array_kind), 3)},
       {"%array_unsafe_get", P(parr(PK::Parrayrefu, gen_array_kind), 2)},
       {"%array_unsafe_set", P(parr(PK::Parraysetu, gen_array_kind), 3)},
-      {"%check_array_bound", k(K::Check_array_bound)},
       {"%obj_size", P(parr(PK::Parraylength, gen_array_kind), 1)},
       {"%obj_field", P(parr(PK::Parrayrefu, gen_array_kind), 2)},
       {"%obj_set_field", P(parr(PK::Parraysetu, gen_array_kind), 3)},
@@ -595,14 +593,12 @@ const std::unordered_map<std::string_view, Prim>& primitives_table() {
       {"%atomic_exchange_loc", at(AtomicOp::Exchange, AtomicKind::Loc)},
       {"%atomic_cas_loc", at(AtomicOp::Cas, AtomicKind::Loc)},
       {"%atomic_fetch_add_loc", at(AtomicOp::Faa, AtomicKind::Loc)},
-      {"%atomic_unsafe_index", k(K::Atomic_index)},
       {"%runstack", P(pr(PK::Prunstack), 3)},
-      {"%reperform", P(pr(PK::Preperform), 2)},
+      {"%reperform", P(pr(PK::Preperform), 3)},
       {"%perform", P(pr(PK::Pperform), 1)},
-      {"%resume", P(pr(PK::Presume), 3)},
+      {"%resume", P(pr(PK::Presume), 4)},
       {"%dls_get", P(pr(PK::Pdls_get), 1)},
       {"%poll", P(pr(PK::Ppoll), 1)},
-      {"%todo", k(K::Todo)},
   };
   return t;
 }
@@ -876,7 +872,7 @@ lam_t lambda_of_atomic(std::string_view prim_name, const ScopedLocation& loc, At
   Primitive prim = op == AtomicOp::Load       ? pr(PK::Patomic_load)
                    : op == AtomicOp::Exchange ? pccall(prim_atomic_exchange())
                    : op == AtomicOp::Cas      ? pccall(prim_atomic_cas())
-                                              : pr(PK::Patomic_fetch_add);
+                                              : pccall(prim_atomic_fetch_add());
   std::vector<lam_t> rest(args.begin() + 1, args.end());
   switch (kind) {
     case AtomicKind::Ref: {
@@ -903,11 +899,6 @@ lam_t lambda_of_atomic(std::string_view prim_name, const ScopedLocation& loc, At
   throw std::logic_error("lambda_of_atomic");
 }
 
-lam_t check_array_bound(const ScopedLocation& loc, lam_t array, lam_t idx) {
-  lam_t len = lprim(parr(PK::Parraylength, ArrayKind::Pgenarray), slice({array}), loc);
-  return lprim(pr(PK::Pcheckbound), slice({len, idx}), loc);
-}
-
 const PrimitiveDescription* caml_restore_raw_backtrace() {
   static const PrimitiveDescription* d = simple("caml_restore_raw_backtrace", 2, false);
   return d;
@@ -915,23 +906,6 @@ const PrimitiveDescription* caml_restore_raw_backtrace() {
 
 IdentSet try_ids;
 
-// arg_exps: nullptr = None
-lam_t raise_todo(const ScopedLocation& loc, lam_t arg, const Slice<const tt::Expression*>* arg_exps) {
-  lam_t todo_exn_id = transl_extension_path(debuginfo::loc_unknown(), env::initial(), predef::paths().todo);
-  Location l = to_location(loc);
-  std::string fname(l.loc_start.pos_fname);
-  long line = l.loc_start.pos_lnum;
-  if (arg_exps) {
-    if (arg_exps->size() != 1) throw std::logic_error("Translprim.raise_todo");
-    arg = event_after(loc, (*arg_exps)[0], arg);
-  }
-  return lsequence(
-      arg, lprim(praise(RaiseKind::Raise_regular),
-                 slice({lprim(pmakeblock(0, MutableFlag::Immutable),
-                              slice({todo_exn_id, lconst(const_block(0, {const_immstring(fname), const_int(line)}))}),
-                              loc)}),
-                 loc));
-}
 
 lam_t lambda_of_prim(std::string_view prim_name, const Prim& prim, const ScopedLocation& loc, Slice<lam_t> args,
                      const Slice<const tt::Expression*>* arg_exps) {
@@ -975,9 +949,6 @@ lam_t lambda_of_prim(std::string_view prim_name, const Prim& prim, const ScopedL
                   lsequence(lprim(pccall(caml_restore_raw_backtrace()), slice({lvar(vexn), args[1]}), loc),
                             lprim(praise(RaiseKind::Raise_reraise), slice({raise_arg}), loc)));
     }
-    case K::Todo:
-      if (n == 1) return raise_todo(loc, args[0], arg_exps);
-      return wrong_arity();
     case K::Lazy_force:
       if (n == 1) return matching::inline_lazy_force(args[0], loc);
       return wrong_arity();
@@ -1017,12 +988,6 @@ lam_t lambda_of_prim(std::string_view prim_name, const Prim& prim, const ScopedL
       return lapply(ap);
     }
     case K::Atomic: return lambda_of_atomic(prim_name, loc, prim.op, prim.ak, args);
-    case K::Atomic_index:
-      if (n == 2) return make_atomic_loc(loc, args[0], args[1]);
-      return wrong_arity();
-    case K::Check_array_bound:
-      if (n == 2) return check_array_bound(loc, args[0], args[1]);
-      return wrong_arity();
   }
   throw std::logic_error("lambda_of_prim");
 }
@@ -1090,7 +1055,6 @@ void check_primitive_arity(const Location& loc, const PrimitiveDescription* p) {
     case K::Comparison: ok = a == 2; break;
     case K::Raise: ok = a == 1; break;
     case K::Raise_with_backtrace: ok = a == 2; break;
-    case K::Todo: ok = a == 1; break;
     case K::Lazy_force: ok = a == 1; break;
     case K::Loc: ok = a == 1 || a == 0; break;
     case K::Send: case K::Send_self: ok = a == 2; break;
@@ -1099,8 +1063,6 @@ void check_primitive_arity(const Location& loc, const PrimitiveDescription* p) {
     case K::Identity: ok = a == 1; break;
     case K::Apply: case K::Revapply: ok = a == 2; break;
     case K::Atomic: ok = a == atomic_arity(prim.op, prim.ak); break;
-    case K::Atomic_index: ok = a == 2; break;
-    case K::Check_array_bound: ok = a == 2; break;
   }
   if (!ok) throw Error(loc, Error::Kind::Wrong_arity_builtin_primitive, std::string(p->prim_name));
 }

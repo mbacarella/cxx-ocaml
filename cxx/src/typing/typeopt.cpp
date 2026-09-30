@@ -114,8 +114,7 @@ Classification classify(env::t env, TypeExpr* ty0) {
           case TC::Array:
           case TC::Floatarray:
           case TC::Iarray:
-          case TC::Atomic_loc:
-          case TC::Todo_info: return Classification::Addr;
+          case TC::Atomic_loc: return Classification::Addr;
           default: break;  // data_type_constr
         }
       }
@@ -163,74 +162,38 @@ ArrayKind array_type_kind(env::t env, TypeExpr* ty) {
 ArrayKind array_kind(const tt::Expression* exp) { return array_type_kind(exp->exp_env, exp->exp_type); }
 ArrayKind array_pattern_kind(const tt::Pattern* pat) { return array_type_kind(pat->pat_env, pat->pat_type); }
 
-// The compilation of the expression [lazy e] depends on the form of e: in
-// some cases we optimize it into [let x = e in lazy x], evaluating [e] right
-// now (if it is equivalent) and avoiding creating a thunk.  This
-// optimization must be taken into account when determining whether a
-// recursive binding is safe.
-LazySummary classify_lazy_argument(const tt::Expression* e) {
-  // We can compile [lazy e] into [let x = e in lazy x] whenever [e] is
-  // "commutative" (no coeffects, only generative effects), with a cutoff on
-  // expression size.
-  const int size_cutoff = 42;
-  int size = 0;
-  std::function<bool(const tt::Expression*)> small_and_commutative = [&](const tt::Expression* e2) -> bool {
-    ++size;
-    if (size > size_cutoff) return false;
-    const tt::ExpressionDesc* d = e2->exp_desc;
-    switch (d->kind) {
-      case XK::Texp_ident:
-      case XK::Texp_constant:
-      case XK::Texp_function:
-      case XK::Texp_lazy: return true;
-      case XK::Texp_variant: {
-        auto* v = as<tt::Texp_variant>(d);
-        return !v->arg || small_and_commutative(v->arg);
-      }
-      case XK::Texp_construct:
-        for (auto* a : as<tt::Texp_construct>(d)->args)
-          if (!small_and_commutative(a)) return false;
-        return true;
-      case XK::Texp_array:
-        for (auto* a : as<tt::Texp_array>(d)->el)
-          if (!small_and_commutative(a)) return false;
-        return true;
-      case XK::Texp_tuple:
-        for (auto& a : as<tt::Texp_tuple>(d)->el)
-          if (!small_and_commutative(a.exp)) return false;
-        return true;
-      case XK::Texp_record: {
-        auto* r = as<tt::Texp_record>(d);
-        for (auto& f : r->fields) {
-          if (!f.def.kept) {
-            if (!small_and_commutative(f.def.exp)) return false;
-          } else {
-            ++size;
-          }
-        }
-        return !r->extended_expression || small_and_commutative(r->extended_expression);
-      }
-      case XK::Texp_extension_constructor: return true;
-      // under-approximations (Texp_let, Texp_pack, Texp_field,
-      // Texp_atomic_loc, Texp_object, Texp_struct_item) and the
-      // (typically) not commutative expressions
-      default: return false;
-    }
-  };
-  // In [let x = e in lazy x], [lazy x] sometimes need to be a [Forward]
-  // block, but this block can typically be shortcut into just [x]. The
-  // forward block is required for expressions that may have a lazy type
-  // themselves, or float when flat-float-array is enabled.
-  if (!small_and_commutative(e)) return {LazySummary::Kind::Lazy_thunk};
-  using FR = LazySummary::ForwardRepr;
-  switch (classify(e->exp_env, e->exp_type)) {
-    case Classification::Addr:
-    case Classification::Int: return {LazySummary::Kind::Eager, FR::Shortcut};
+// Whether a forward block is needed for a lazy thunk on a value, i.e. if the
+// value can be represented as a float/forward/lazy
+static bool lazy_val_requires_forward(env::t env, TypeExpr* ty) {
+  switch (classify(env, ty)) {
     case Classification::Any:
-    case Classification::Lazy: return {LazySummary::Kind::Eager, FR::Forward};
-    case Classification::Float: return {LazySummary::Kind::Eager, flat_float_array ? FR::Forward : FR::Shortcut};
+    case Classification::Lazy: return true;
+    case Classification::Float: return flat_float_array;
+    case Classification::Addr:
+    case Classification::Int: return false;
   }
-  throw std::logic_error("Typeopt.classify_lazy_argument");
+  throw std::logic_error("Typeopt.lazy_val_requires_forward");
+}
+
+// The compilation of the expression [lazy e] depends on the form of e:
+// constants, floats and identifiers are optimized.  The optimization must be
+// taken into account when determining whether a recursive binding is safe.
+LazyArgument classify_lazy_argument(const tt::Expression* e) {
+  const tt::ExpressionDesc* d = e->exp_desc;
+  switch (d->kind) {
+    case XK::Texp_constant:
+      if (as<tt::Texp_constant>(d)->c.kind == tt::Constant::Kind::Const_float)
+        return flat_float_array ? LazyArgument::Float_that_cannot_be_shortcut : LazyArgument::Constant_or_function;
+      return LazyArgument::Constant_or_function;
+    case XK::Texp_function: return LazyArgument::Constant_or_function;
+    case XK::Texp_construct:
+      if (as<tt::Texp_construct>(d)->cstr->cstr_arity == 0) return LazyArgument::Constant_or_function;
+      return LazyArgument::Other;
+    case XK::Texp_ident:
+      if (lazy_val_requires_forward(e->exp_env, e->exp_type)) return LazyArgument::Identifier_forward_value;
+      return LazyArgument::Identifier_other;
+    default: return LazyArgument::Other;
+  }
 }
 
 // ---- the rest of typeopt.ml (stage 10) ----------------------------------------
@@ -291,12 +254,6 @@ lambda::ValueKind value_kind(env::t env, TypeExpr* ty0) {
   if (path::same(c->path, p.int64)) return VK::boxedint(BoxedInteger::Pint64);
   if (path::same(c->path, p.nativeint)) return VK::boxedint(BoxedInteger::Pnativeint);
   return VK::gen();
-}
-
-lambda::ValueKind pattern_kind(const env::LocalEquations* local_equations, const typedtree::Pattern* pat) {
-  if (!local_equations) return value_kind(pat->pat_env, pat->pat_type);
-  env::t env = env::restrict_local_equations(*local_equations, pat->pat_env);
-  return value_kind(env, pat->pat_type);
 }
 
 lambda::ValueKind value_kind_union(const lambda::ValueKind& a, const lambda::ValueKind& b) {

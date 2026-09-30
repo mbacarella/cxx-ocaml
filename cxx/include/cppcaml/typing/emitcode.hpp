@@ -1,6 +1,6 @@
 // Port of bytecomp/emitcode.mli (cxx/PORTING.md stage 10): the instruction
 // list to relocatable bytecode, and the .cmo file (magic, code, debug info,
-// optimization hints, the marshaled Cmo_format.compilation_unit).
+// the marshaled Cmo_format.compilation_unit).
 #pragma once
 
 #include <cstdio>
@@ -47,11 +47,9 @@ struct PackedFile {
   std::vector<std::pair<omarshal::ValPtr, long>> relocs;        // List.rev !reloc_info: (reloc_info, pos)
   std::vector<instruct::DebugEvent*> events;                    // !events (newest first)
   std::set<std::string> debug_dirs;                             // !debug_dirs
-  std::vector<std::pair<long, omarshal::ValPtr>> hints;         // !hints (newest first)
 };
 // to_packed_file outchan code: the code is appended to [out]; the relocs
-// are built in [w], the hints in [hw].  (to_memory, the toplevel's, is not
-// ported.)
-PackedFile to_packed_file(std::string& out, instruct::code code, ValueContext& w, ValueContext& hw);
+// are built in [w].  (to_memory, the toplevel's, is not ported.)
+PackedFile to_packed_file(std::string& out, instruct::code code, ValueContext& w);
 
 }  // namespace cppcaml::typing::emitcode

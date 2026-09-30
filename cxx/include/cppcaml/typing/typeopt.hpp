@@ -22,7 +22,6 @@ struct BigarrayKindLayout {
 BigarrayKindLayout bigarray_type_kind_and_layout(env::t env, TypeExpr* ty);
 lambda::ValueKind value_kind(env::t env, TypeExpr* ty);
 // [local_equations]: nullptr = None
-lambda::ValueKind pattern_kind(const env::LocalEquations* local_equations, const typedtree::Pattern* pat);
 lambda::ValueKind value_kind_union(const lambda::ValueKind& a, const lambda::ValueKind& b);
 
 TypeExpr* scrape_ty(env::t env, TypeExpr* ty);  // nullptr = None
@@ -33,13 +32,11 @@ ArrayKind array_type_kind(env::t env, TypeExpr* ty);
 ArrayKind array_kind(const typedtree::Expression* exp);
 ArrayKind array_pattern_kind(const typedtree::Pattern* pat);
 
-// lazy_summary = Lazy_thunk | Eager of forward_repr (Forward | Shortcut)
-struct LazySummary {
-  enum class Kind { Lazy_thunk, Eager };
-  enum class ForwardRepr { Forward, Shortcut };
-  Kind kind;
-  ForwardRepr repr = ForwardRepr::Forward;  // Eager
+// [`Constant_or_function | `Float_that_cannot_be_shortcut
+//  | `Identifier of [`Forward_value | `Other] | `Other]
+enum class LazyArgument {
+  Constant_or_function, Float_that_cannot_be_shortcut, Identifier_forward_value, Identifier_other, Other
 };
-LazySummary classify_lazy_argument(const typedtree::Expression* e);
+LazyArgument classify_lazy_argument(const typedtree::Expression* e);
 
 }  // namespace cppcaml::typing::typeopt

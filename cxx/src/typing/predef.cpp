@@ -14,7 +14,7 @@ const std::vector<TypeConstr>& all_type_constrs() {
       TC::Int, TC::Char, TC::String, TC::Bytes, TC::Float, TC::Bool, TC::Unit, TC::Exn,
       TC::Eff, TC::Continuation, TC::Array, TC::List, TC::Option, TC::Nativeint, TC::Int32,
       TC::Int64, TC::Lazy_t, TC::Extension_constructor, TC::Floatarray, TC::Iarray,
-      TC::Atomic_loc, TC::Todo_info};
+      TC::Atomic_loc};
   return v;
 }
 
@@ -61,7 +61,6 @@ const Idents& idents() {
     i.floatarray = ident_create("floatarray");
     i.iarray = ident_create("iarray");
     i.atomic_loc = ident_create("atomic_loc");
-    i.todo_info = ident_create("todo_info");
     i.match_failure = ident_create("Match_failure");
     i.out_of_memory = ident_create("Out_of_memory");
     i.invalid_argument = ident_create("Invalid_argument");
@@ -75,7 +74,6 @@ const Idents& idents() {
     i.assert_failure = ident_create("Assert_failure");
     i.undefined_recursive_module = ident_create("Undefined_recursive_module");
     i.continuation_already_taken = ident_create("Continuation_already_taken");
-    i.todo = ident_create("Todo");
     i.false_ = ident_create("false");
     i.true_ = ident_create("true");
     i.void_ = ident_create("()");
@@ -112,7 +110,6 @@ Ident::t ident_of_type_constr(TypeConstr c) {
     case TC::Floatarray: return i.floatarray;
     case TC::Iarray: return i.iarray;
     case TC::Atomic_loc: return i.atomic_loc;
-    case TC::Todo_info: return i.todo_info;
   }
   return nullptr;
 }
@@ -148,11 +145,9 @@ const Paths& paths() {
     p.floatarray = Path::pident(i.floatarray);
     p.iarray = Path::pident(i.iarray);
     p.atomic_loc = Path::pident(i.atomic_loc);
-    p.todo_info = Path::pident(i.todo_info);
     p.match_failure = Path::pident(i.match_failure);
     p.assert_failure = Path::pident(i.assert_failure);
     p.undefined_recursive_module = Path::pident(i.undefined_recursive_module);
-    p.todo = Path::pident(i.todo);
     return p;
   }();
   return ps;
@@ -174,7 +169,7 @@ static TypeExpr* tconstr_(Path::t p, std::vector<TypeExpr*> args) {
 // created together in the `let .. and ..` group's order.
 struct Nullary {
   TypeExpr *int_, *char_, *bytes, *float_, *bool_, *unit, *exn, *nativeint, *int32, *int64,
-      *string, *extension_constructor, *floatarray, *todo_info;
+      *string, *extension_constructor, *floatarray;
 };
 static const Nullary& nullary() {
   static const Nullary n = [] {
@@ -194,7 +189,6 @@ static const Nullary& nullary() {
     x.string = tconstr_(p.string, {});
     x.extension_constructor = tconstr_(p.extension_constructor, {});
     x.floatarray = tconstr_(p.floatarray, {});
-    x.todo_info = tconstr_(p.todo_info, {});
     return x;
   }();
   return n;
@@ -213,7 +207,6 @@ TypeExpr* type_int64() { return nullary().int64; }
 TypeExpr* type_string() { return nullary().string; }
 TypeExpr* type_extension_constructor() { return nullary().extension_constructor; }
 TypeExpr* type_floatarray() { return nullary().floatarray; }
-TypeExpr* type_todo_info() { return nullary().todo_info; }
 TypeExpr* type_eff(TypeExpr* t) { return tconstr_(paths().eff, {t}); }
 TypeExpr* type_continuation(TypeExpr* t1, TypeExpr* t2) {
   return tconstr_(paths().continuation, {t1, t2});
@@ -231,7 +224,7 @@ const std::vector<Ident::t>& all_predef_exns() {
     return std::vector<Ident::t>{
         i.match_failure, i.out_of_memory, i.invalid_argument, i.failure, i.not_found,
         i.sys_error, i.end_of_file, i.division_by_zero, i.stack_overflow, i.sys_blocked_io,
-        i.assert_failure, i.undefined_recursive_module, i.continuation_already_taken, i.todo};
+        i.assert_failure, i.undefined_recursive_module, i.continuation_already_taken};
   }();
   return v;
 }
@@ -280,7 +273,7 @@ const TypeDeclaration* decl_of_type_constr(TypeConstr c) {
     case TC::Char:
       return decl0(TypeImmediacy::Always, external());
     case TC::String: case TC::Bytes: case TC::Float: case TC::Floatarray: case TC::Nativeint:
-    case TC::Int32: case TC::Int64: case TC::Extension_constructor: case TC::Todo_info:
+    case TC::Int32: case TC::Int64: case TC::Extension_constructor:
       return decl0(TypeImmediacy::Unknown, external());
     case TC::Bool: {
       const Idents& i = idents();
@@ -378,7 +371,6 @@ std::vector<std::pair<Ident::t, std::function<Slice<TypeExpr*>()>>> initial_exte
   v.emplace_back(i.stack_overflow, none);
   v.emplace_back(i.sys_blocked_io, none);
   v.emplace_back(i.sys_error, str);
-  v.emplace_back(i.todo, [] { return slice({tconstr_(paths().todo_info, {})}); });
   v.emplace_back(i.undefined_recursive_module, triple);
   v.emplace_back(i.continuation_already_taken, none);
   return v;

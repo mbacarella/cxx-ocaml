@@ -51,11 +51,6 @@ void copy_compunit(const ObjFile& ic, bytesections::OutChannel& oc, CompUnit& cu
     cu.set_int_field(cmo_format::cu_debug, oc.pos());
     copy(debug, cu.int_field(cmo_format::cu_debugsize));
   }
-  long hint = cu.int_field(cmo_format::cu_hint);
-  if (hint > 0) {
-    cu.set_int_field(cmo_format::cu_hint, oc.pos());
-    copy(hint, cu.int_field(cmo_format::cu_hintsize));
-  }
 }
 
 // Add C objects and options and "custom" info from a library descriptor

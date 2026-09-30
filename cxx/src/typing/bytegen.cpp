@@ -44,10 +44,9 @@ Instruction kconst(const L::StructuredConstant* c) {
   i.cst = c;
   return i;
 }
-Instruction kccall(std::string_view name, long arity, const CcallHint* hint) {
+Instruction kccall(std::string_view name, long arity) {
   Instruction i = instr(IK::Kccall, arity);
   i.prim = name;
-  i.ccall_hint = hint;
   return i;
 }
 Instruction kintcomp(L::IntegerComparison c) {
@@ -55,10 +54,9 @@ Instruction kintcomp(L::IntegerComparison c) {
   i.icmp = c;
   return i;
 }
-Instruction kmakeblock(long size, long tag, MutableFlag mut) {
+Instruction kmakeblock(long size, long tag) {
   Instruction i = instr(IK::Kmakeblock, size);
   i.m = tag;
-  i.mut = mut;
   return i;
 }
 Instruction kevent(DebugEvent* ev) {
@@ -398,16 +396,7 @@ Instruction comp_bint_primitive(BoxedInteger bi, std::string_view suff, Slice<la
   std::string_view pref = bi == BoxedInteger::Pnativeint ? "caml_nativeint_"
                           : bi == BoxedInteger::Pint32   ? "caml_int32_"
                                                          : "caml_int64_";
-  return kccall(zstr(std::string(pref) + std::string(suff)), static_cast<long>(args.size()), nullptr);
-}
-
-const CcallHint* hint_unsafe(bool unsafe) {
-  if (!unsafe) return nullptr;
-  return make<CcallHint>(CcallHint{CcallHint::K::Hint_unsafe});
-}
-
-std::string_view primitive_native_name(const PrimitiveDescription* p) {
-  return !p->prim_native_name.empty() ? p->prim_native_name : p->prim_name;
+  return kccall(zstr(std::string(pref) + std::string(suff)), static_cast<long>(args.size()));
 }
 
 Instruction comp_primitive(const StackInfo& si, const L::Primitive& p, long sz, Slice<lambda> args) {
@@ -424,31 +413,18 @@ Instruction comp_primitive(const StackInfo& si, const L::Primitive& p, long sz, 
       return i;
     }
     case PK::Pintcomp: return kintcomp(p.icmp);
-    case PK::Pphyscomp: {
-      Instruction i = K(IK::Kphyscomp);
-      i.pcmp = p.pcmp;
-      return i;
-    }
-    case PK::Pcompare_ints: return kccall("caml_int_compare", 2, nullptr);
-    case PK::Pcompare_floats: return kccall("caml_float_compare", 2, nullptr);
+    case PK::Pcompare_ints: return kccall("caml_int_compare", 2);
+    case PK::Pcompare_floats: return kccall("caml_float_compare", 2);
     case PK::Pcompare_bints: return comp_bint_primitive(p.bi, "compare", args);
     case PK::Pfield: return K(IK::Kgetfield, p.n);
     case PK::Pfield_computed: return K(IK::Kgetvectitem);
     case PK::Psetfield: return K(IK::Ksetfield, p.n);
     case PK::Psetfield_computed: return K(IK::Ksetvectitem);
     case PK::Psetfloatfield: return K(IK::Ksetfloatfield, p.n);
-    case PK::Pduprecord: return kccall("caml_obj_dup", 1, nullptr);
+    case PK::Pduprecord: return kccall("caml_obj_dup", 1);
     case PK::Pccall: {
       const PrimitiveDescription* d = p.ccall;
-      // If we have a native name, we probably have a specialized
-      // representation of arguments/result.
-      const CcallHint* hint = nullptr;
-      if (primitive_native_name(d) != d->prim_name) {
-        auto* h = make<CcallHint>(CcallHint{CcallHint::K::Hint_primitive});
-        h->prim = d;
-        hint = h;
-      }
-      return kccall(d->prim_name, d->prim_arity, hint);
+      return kccall(d->prim_name, d->prim_arity);
     }
     case PK::Pperform:
       check_stack(si, sz + 4);
@@ -467,51 +443,47 @@ Instruction comp_primitive(const StackInfo& si, const L::Primitive& p, long sz, 
     case PK::Pasrint: return K(IK::Kasrint);
     case PK::Poffsetint: return K(IK::Koffsetint, p.n);
     case PK::Poffsetref: return K(IK::Koffsetref, p.n);
-    case PK::Pintoffloat: return kccall("caml_int_of_float", 1, nullptr);
-    case PK::Pfloatofint: return kccall("caml_float_of_int", 1, nullptr);
-    case PK::Pnegfloat: return kccall("caml_neg_float", 1, nullptr);
-    case PK::Pabsfloat: return kccall("caml_abs_float", 1, nullptr);
-    case PK::Paddfloat: return kccall("caml_add_float", 2, nullptr);
-    case PK::Psubfloat: return kccall("caml_sub_float", 2, nullptr);
-    case PK::Pmulfloat: return kccall("caml_mul_float", 2, nullptr);
-    case PK::Pdivfloat: return kccall("caml_div_float", 2, nullptr);
-    case PK::Pstringlength: return kccall("caml_ml_string_length", 1, nullptr);
-    case PK::Pbyteslength: return kccall("caml_ml_bytes_length", 1, nullptr);
-    case PK::Pstringrefs: return kccall("caml_string_get", 2, nullptr);
-    case PK::Pbytesrefs: return kccall("caml_bytes_get", 2, nullptr);
-    case PK::Pbytessets: return kccall("caml_bytes_set", 3, nullptr);
+    case PK::Pintoffloat: return kccall("caml_int_of_float", 1);
+    case PK::Pfloatofint: return kccall("caml_float_of_int", 1);
+    case PK::Pnegfloat: return kccall("caml_neg_float", 1);
+    case PK::Pabsfloat: return kccall("caml_abs_float", 1);
+    case PK::Paddfloat: return kccall("caml_add_float", 2);
+    case PK::Psubfloat: return kccall("caml_sub_float", 2);
+    case PK::Pmulfloat: return kccall("caml_mul_float", 2);
+    case PK::Pdivfloat: return kccall("caml_div_float", 2);
+    case PK::Pstringlength: return kccall("caml_ml_string_length", 1);
+    case PK::Pbyteslength: return kccall("caml_ml_bytes_length", 1);
+    case PK::Pstringrefs: return kccall("caml_string_get", 2);
+    case PK::Pbytesrefs: return kccall("caml_bytes_get", 2);
+    case PK::Pbytessets: return kccall("caml_bytes_set", 3);
     case PK::Pstringrefu: return K(IK::Kgetstringchar);
     case PK::Pbytesrefu: return K(IK::Kgetbyteschar);
     case PK::Pbytessetu: return K(IK::Ksetbyteschar);
-    case PK::Pstring_load_16: return kccall("caml_string_get16", 2, hint_unsafe(p.unsafe));
-    case PK::Pstring_load_32: return kccall("caml_string_get32", 2, hint_unsafe(p.unsafe));
-    case PK::Pstring_load_64: return kccall("caml_string_get64", 2, hint_unsafe(p.unsafe));
-    case PK::Pbytes_set_16: return kccall("caml_bytes_set16", 3, hint_unsafe(p.unsafe));
-    case PK::Pbytes_set_32: return kccall("caml_bytes_set32", 3, hint_unsafe(p.unsafe));
-    case PK::Pbytes_set_64: return kccall("caml_bytes_set64", 3, hint_unsafe(p.unsafe));
-    case PK::Pbytes_load_16: return kccall("caml_bytes_get16", 2, hint_unsafe(p.unsafe));
-    case PK::Pbytes_load_32: return kccall("caml_bytes_get32", 2, hint_unsafe(p.unsafe));
-    case PK::Pbytes_load_64: return kccall("caml_bytes_get64", 2, hint_unsafe(p.unsafe));
-    case PK::Parraylength: {
-      Instruction i = K(IK::Kvectlength);
-      i.array = p.array;
-      return i;
-    }
+    case PK::Pstring_load_16: return kccall("caml_string_get16", 2);
+    case PK::Pstring_load_32: return kccall("caml_string_get32", 2);
+    case PK::Pstring_load_64: return kccall("caml_string_get64", 2);
+    case PK::Pbytes_set_16: return kccall("caml_bytes_set16", 3);
+    case PK::Pbytes_set_32: return kccall("caml_bytes_set32", 3);
+    case PK::Pbytes_set_64: return kccall("caml_bytes_set64", 3);
+    case PK::Pbytes_load_16: return kccall("caml_bytes_get16", 2);
+    case PK::Pbytes_load_32: return kccall("caml_bytes_get32", 2);
+    case PK::Pbytes_load_64: return kccall("caml_bytes_get64", 2);
+    case PK::Parraylength: return K(IK::Kvectlength);
     case PK::Parrayrefs:
-      return p.array == L::ArrayKind::Pgenarray     ? kccall("caml_array_get", 2, nullptr)
-             : p.array == L::ArrayKind::Pfloatarray ? kccall("caml_floatarray_get", 2, nullptr)
-                                                    : kccall("caml_array_get_addr", 2, nullptr);
+      return p.array == L::ArrayKind::Pgenarray     ? kccall("caml_array_get", 2)
+             : p.array == L::ArrayKind::Pfloatarray ? kccall("caml_floatarray_get", 2)
+                                                    : kccall("caml_array_get_addr", 2);
     case PK::Parraysets:
-      return p.array == L::ArrayKind::Pgenarray     ? kccall("caml_array_set", 3, nullptr)
-             : p.array == L::ArrayKind::Pfloatarray ? kccall("caml_floatarray_set", 3, nullptr)
-                                                    : kccall("caml_array_set_addr", 3, nullptr);
+      return p.array == L::ArrayKind::Pgenarray     ? kccall("caml_array_set", 3)
+             : p.array == L::ArrayKind::Pfloatarray ? kccall("caml_floatarray_set", 3)
+                                                    : kccall("caml_array_set_addr", 3);
     case PK::Parrayrefu:
-      return p.array == L::ArrayKind::Pgenarray     ? kccall("caml_array_unsafe_get", 2, nullptr)
-             : p.array == L::ArrayKind::Pfloatarray ? kccall("caml_floatarray_unsafe_get", 2, nullptr)
+      return p.array == L::ArrayKind::Pgenarray     ? kccall("caml_array_unsafe_get", 2)
+             : p.array == L::ArrayKind::Pfloatarray ? kccall("caml_floatarray_unsafe_get", 2)
                                                     : K(IK::Kgetvectitem);
     case PK::Parraysetu:
-      return p.array == L::ArrayKind::Pgenarray     ? kccall("caml_array_unsafe_set", 3, nullptr)
-             : p.array == L::ArrayKind::Pfloatarray ? kccall("caml_floatarray_unsafe_set", 3, nullptr)
+      return p.array == L::ArrayKind::Pgenarray     ? kccall("caml_array_unsafe_set", 3)
+             : p.array == L::ArrayKind::Pfloatarray ? kccall("caml_floatarray_unsafe_set", 3)
                                                     : K(IK::Ksetvectitem);
     case PK::Pctconst: {
       std::string_view const_name;
@@ -526,22 +498,21 @@ Instruction comp_primitive(const StackInfo& si, const L::Primitive& p, long sz, 
         case L::CompileTimeConstant::Backend_type: const_name = "backend_type"; break;
         case L::CompileTimeConstant::Standard_library_default: const_name = "standard_library_default"; break;
       }
-      return kccall(zstr("caml_sys_const_" + std::string(const_name)), 1, nullptr);
+      return kccall(zstr("caml_sys_const_" + std::string(const_name)), 1);
     }
     case PK::Pisint: return K(IK::Kisint);
     case PK::Pisout: return K(IK::Kisout);
-    case PK::Pcheckbound: return kccall("caml_check_bound", 2, nullptr);
     case PK::Pbintofint: return comp_bint_primitive(p.bi, "of_int", args);
     case PK::Pintofbint: return comp_bint_primitive(p.bi, "to_int", args);
     case PK::Pcvtbint: {
       using B = BoxedInteger;
       B src = p.bi, dst = p.bi2;
-      if (src == B::Pint32 && dst == B::Pnativeint) return kccall("caml_nativeint_of_int32", 1, nullptr);
-      if (src == B::Pnativeint && dst == B::Pint32) return kccall("caml_nativeint_to_int32", 1, nullptr);
-      if (src == B::Pint32 && dst == B::Pint64) return kccall("caml_int64_of_int32", 1, nullptr);
-      if (src == B::Pint64 && dst == B::Pint32) return kccall("caml_int64_to_int32", 1, nullptr);
-      if (src == B::Pnativeint && dst == B::Pint64) return kccall("caml_int64_of_nativeint", 1, nullptr);
-      if (src == B::Pint64 && dst == B::Pnativeint) return kccall("caml_int64_to_nativeint", 1, nullptr);
+      if (src == B::Pint32 && dst == B::Pnativeint) return kccall("caml_nativeint_of_int32", 1);
+      if (src == B::Pnativeint && dst == B::Pint32) return kccall("caml_nativeint_to_int32", 1);
+      if (src == B::Pint32 && dst == B::Pint64) return kccall("caml_int64_of_int32", 1);
+      if (src == B::Pint64 && dst == B::Pint32) return kccall("caml_int64_to_int32", 1);
+      if (src == B::Pnativeint && dst == B::Pint64) return kccall("caml_int64_of_nativeint", 1);
+      if (src == B::Pint64 && dst == B::Pnativeint) return kccall("caml_int64_to_nativeint", 1);
       fatal_error("Bytegen.comp_primitive: invalid Pcvtbint cast");
     }
     case PK::Pnegbint: return comp_bint_primitive(p.bi, "neg", args);
@@ -557,8 +528,6 @@ Instruction comp_primitive(const StackInfo& si, const L::Primitive& p, long sz, 
     case PK::Plsrbint: return comp_bint_primitive(p.bi, "shift_right_unsigned", args);
     case PK::Pasrbint: return comp_bint_primitive(p.bi, "shift_right", args);
     case PK::Pbintcomp: {
-      auto* h = make<CcallHint>(CcallHint{CcallHint::K::Hint_int});
-      h->bi = p.bi;
       std::string_view name;
       switch (p.icmp) {
         case L::IntegerComparison::Ceq: name = "caml_equal"; break;
@@ -568,33 +537,28 @@ Instruction comp_primitive(const StackInfo& si, const L::Primitive& p, long sz, 
         case L::IntegerComparison::Cle: name = "caml_lessequal"; break;
         case L::IntegerComparison::Cge: name = "caml_greaterequal"; break;
       }
-      return kccall(name, 2, h);
+      return kccall(name, 2);
     }
     case PK::Pbigarrayref:
     case PK::Pbigarrayset: {
-      auto* h = make<CcallHint>(CcallHint{CcallHint::K::Hint_bigarray});
-      h->unsafe = p.unsafe;
-      h->elt_kind = p.ba_kind;
-      h->layout = p.ba_layout;
       bool set = p.kind == PK::Pbigarrayset;
-      return kccall(zstr((set ? "caml_ba_set_" : "caml_ba_get_") + std::to_string(p.n)), p.n + (set ? 2 : 1), h);
+      return kccall(zstr((set ? "caml_ba_set_" : "caml_ba_get_") + std::to_string(p.n)), p.n + (set ? 2 : 1));
     }
-    case PK::Pbigarraydim: return kccall(zstr("caml_ba_dim_" + std::to_string(p.n)), 1, nullptr);
-    case PK::Pbigstring_load_16: return kccall("caml_ba_uint8_get16", 2, hint_unsafe(p.unsafe));
-    case PK::Pbigstring_load_32: return kccall("caml_ba_uint8_get32", 2, hint_unsafe(p.unsafe));
-    case PK::Pbigstring_load_64: return kccall("caml_ba_uint8_get64", 2, hint_unsafe(p.unsafe));
-    case PK::Pbigstring_set_16: return kccall("caml_ba_uint8_set16", 3, hint_unsafe(p.unsafe));
-    case PK::Pbigstring_set_32: return kccall("caml_ba_uint8_set32", 3, hint_unsafe(p.unsafe));
-    case PK::Pbigstring_set_64: return kccall("caml_ba_uint8_set64", 3, hint_unsafe(p.unsafe));
-    case PK::Pbswap16: return kccall("caml_bswap16", 1, nullptr);
+    case PK::Pbigarraydim: return kccall(zstr("caml_ba_dim_" + std::to_string(p.n)), 1);
+    case PK::Pbigstring_load_16: return kccall("caml_ba_uint8_get16", 2);
+    case PK::Pbigstring_load_32: return kccall("caml_ba_uint8_get32", 2);
+    case PK::Pbigstring_load_64: return kccall("caml_ba_uint8_get64", 2);
+    case PK::Pbigstring_set_16: return kccall("caml_ba_uint8_set16", 3);
+    case PK::Pbigstring_set_32: return kccall("caml_ba_uint8_set32", 3);
+    case PK::Pbigstring_set_64: return kccall("caml_ba_uint8_set64", 3);
+    case PK::Pbswap16: return kccall("caml_bswap16", 1);
     case PK::Pbbswap: return comp_bint_primitive(p.bi, "bswap", args);
-    case PK::Pint_as_pointer: return kccall("caml_int_as_pointer", 1, nullptr);
-    case PK::Pbytes_to_string: return kccall("caml_string_of_bytes", 1, nullptr);
-    case PK::Pbytes_of_string: return kccall("caml_bytes_of_string", 1, nullptr);
-    case PK::Patomic_load: return kccall("caml_atomic_load_field", 2, nullptr);
-    case PK::Patomic_fetch_add: return kccall("caml_atomic_fetch_add_field", 3, nullptr);
-    case PK::Pdls_get: return kccall("caml_domain_dls_get", 1, nullptr);
-    case PK::Ppoll: return kccall("caml_process_pending_actions_with_root", 1, nullptr);
+    case PK::Pint_as_pointer: return kccall("caml_int_as_pointer", 1);
+    case PK::Pbytes_to_string: return kccall("caml_string_of_bytes", 1);
+    case PK::Pbytes_of_string: return kccall("caml_bytes_of_string", 1);
+    case PK::Patomic_load: return kccall("caml_atomic_load_field", 2);
+    case PK::Pdls_get: return kccall("caml_domain_dls_get", 1);
+    case PK::Ppoll: return kccall("caml_process_pending_actions_with_root", 1);
     // The cases below are handled in [comp_expr] before the [comp_primitive] call
     case PK::Prunstack: case PK::Presume: case PK::Preperform:
     case PK::Pignore: case PK::Popaque:
@@ -608,13 +572,6 @@ Instruction comp_primitive(const StackInfo& si, const L::Primitive& p, long sz, 
       fatal_error("Bytegen.comp_primitive");
   }
   fatal_error("Bytegen.comp_primitive");
-}
-
-const ClosureHint* closure_hint(const L::LFunction* f) {
-  std::vector<L::ValueKind> params;
-  for (const L::Param& p : f->params) params.push_back(p.kind);
-  return make<ClosureHint>(
-      ClosureHint{slice(params), f->return_, f->attr.inline_, f->attr.specialise, f->attr.is_a_functor});
 }
 
 bool is_immed(long n) { return immed_min <= n && n <= immed_max; }
@@ -739,7 +696,6 @@ code comp_expr(const StackInfo& si, const CompilationEnv& env, lambda exp, long 
       functions_to_compile.push_back(FunctionToCompile{slice(params), lfun->body, lbl, entries, 0});
       Instruction cl = K(IK::Kclosure, lbl);
       cl.m = static_cast<long>(fv.size());
-      cl.closure_hint = closure_hint(lfun);
       return comp_args_v(si, env, lvars(fv), sz, cons(cl, cont));
     }
     case L::LK::Llet:
@@ -775,11 +731,9 @@ code comp_expr(const StackInfo& si, const CompilationEnv& env, lambda exp, long 
         lbls.push_back(lbl);
         ++pos;
       }
-      std::vector<ClosureLabel> lbl_hints;
-      for (std::size_t k = 0; k < lbls.size(); ++k) lbl_hints.push_back(ClosureLabel{lbls[k], closure_hint(decl[k].def)});
       code body = comp_expr(si, add_vars(rec_idents, sz + 1, env), lr->body, sz + ndecl, add_pop(ndecl, cont));
       Instruction cr = K(IK::Kclosurerec, static_cast<long>(fv.size()));
-      cr.closures = slice(lbl_hints);
+      cr.lbls = slice(lbls);
       return comp_args_v(si, env, lvars(fv), sz, cons(cr, body));
     }
     case L::LK::Lprim: {
@@ -858,34 +812,48 @@ code comp_expr(const StackInfo& si, const CompilationEnv& env, lambda exp, long 
           switch (p.array) {
             case L::ArrayKind::Pintarray:
             case L::ArrayKind::Paddrarray:
-              return comp_args(si, env, args, sz, cons(kmakeblock(n, 0, p.mut), cont));
+              return comp_args(si, env, args, sz, cons(kmakeblock(n, 0), cont));
             case L::ArrayKind::Pfloatarray: {
-              Instruction mf = K(IK::Kmakefloatblock, n);
-              mf.mut = p.mut;
-              return comp_args(si, env, args, sz, cons(mf, cont));
+              return comp_args(si, env, args, sz, cons(K(IK::Kmakefloatblock, n), cont));
             }
             case L::ArrayKind::Pgenarray:
-              if (na == 0) return cons(kmakeblock(0, 0, p.mut), cont);
+              if (na == 0) return cons(kmakeblock(0, 0), cont);
               return comp_args(si, env, args, sz,
-                               cons(kmakeblock(n, 0, p.mut),
-                                    cons(kccall("caml_array_of_uniform_array", 1, nullptr), cont)));
+                               cons(kmakeblock(n, 0),
+                                    cons(kccall("caml_array_of_uniform_array", 1), cont)));
           }
           break;
         }
-        case PK::Presume:
-        case PK::Prunstack: {
+        case PK::Presume: {
           long nargs = static_cast<long>(na) - 1;
-          if (nargs != 2) fatal_error("Bytegen: assertion failed (Presume/Prunstack arity)");
-          if (is_tailcall(cont))
-            // Resumeterm pushes no extra words
+          if (nargs != 3) fatal_error("Bytegen: assertion failed (Presume arity)");
+          if (is_tailcall(cont)) {
+            // Resumeterm itself only pushes 2 words, but perform adds another
+            check_stack(si, 3);
             return comp_args(si, env, args, sz, cons(K(IK::Kresumeterm, sz + nargs), discard_dead_code(cont)));
-          // Resume itself pushes 3 words, and perform does not push any
-          check_stack(si, sz + 3);
+          }
+          // Resume itself only pushes 2 words, but perform adds another
+          check_stack(si, sz + nargs + 3);
           return comp_args(si, env, args, sz, cons(K(IK::Kresume), cont));
+        }
+        case PK::Prunstack: {
+          long nargs = static_cast<long>(na);
+          if (nargs != 3) fatal_error("Bytegen: assertion failed (Prunstack arity)");
+          if (is_tailcall(cont)) {
+            // Resumeterm itself only pushes 2 words, but perform adds another
+            check_stack(si, 3);
+            return cons(kconst(L::const_unit()),
+                        cons(K(IK::Kpush), comp_args(si, env, args, sz + 1,
+                                                     cons(K(IK::Kresumeterm, sz + nargs), discard_dead_code(cont)))));
+          }
+          // Resume itself only pushes 2 words, but perform adds another
+          check_stack(si, sz + nargs + 3);
+          return cons(kconst(L::const_unit()),
+                      cons(K(IK::Kpush), comp_args(si, env, args, sz + 1, cons(K(IK::Kresume), cont))));
         }
         case PK::Preperform: {
           long nargs = static_cast<long>(na) - 1;
-          if (nargs != 1) fatal_error("Bytegen: assertion failed (Preperform arity)");
+          if (nargs != 2) fatal_error("Bytegen: assertion failed (Preperform arity)");
           // Reperformterm resets the stack before pushing 3 words
           check_stack(si, 3);
           if (is_tailcall(cont))
@@ -929,18 +897,9 @@ code comp_expr(const StackInfo& si, const CompilationEnv& env, lambda exp, long 
             return comp_args(si, env, args2, sz, cons(i, cont));
           }
           break;
-        // Constant first for enabling further optimization (cf. emitcode.ml)
-        case PK::Pphyscomp:
-          if (na == 2 && L::as<L::Lconst>(args[1])) {
-            Slice<lambda> args2 = slice(std::vector<lambda>{args[1], args[0]});
-            long nargs = 1;
-            Instruction i = comp_primitive(si, p, sz + nargs - 1, args2);
-            return comp_args(si, env, args2, sz, cons(i, cont));
-          }
-          break;
         case PK::Pfloatcomp: {
           using FC = L::FloatComparison;
-          auto cc = [](std::string_view name) { return kccall(name, 2, nullptr); };
+          auto cc = [](std::string_view name) { return kccall(name, 2); };
           code c;
           switch (p.fcmp) {
             case FC::CFeq: c = cons(cc("caml_eq_float"), cont); break;
@@ -958,12 +917,12 @@ code comp_expr(const StackInfo& si, const CompilationEnv& env, lambda exp, long 
         }
         case PK::Pmakeblock:
           cont = add_pseudo_event(lp->loc, compunit_name, cont);
-          return comp_args(si, env, args, sz, cons(kmakeblock(static_cast<long>(na), p.n, p.mut), cont));
+          return comp_args(si, env, args, sz, cons(kmakeblock(static_cast<long>(na), p.n), cont));
         case PK::Pmakelazyblock:
           if (na == 1) {
             cont = add_pseudo_event(lp->loc, compunit_name, cont);
             return comp_args(si, env, args, sz,
-                             cons(kmakeblock(1, L::tag_of_lazy_tag(p.lazy_tag), MutableFlag::Mutable), cont));
+                             cons(kmakeblock(1, L::tag_of_lazy_tag(p.lazy_tag)), cont));
           }
           break;
         case PK::Pfloatfield:
@@ -1254,7 +1213,7 @@ code comp_block(const CompilationEnv& env, lambda exp, long sz, code cont) {
   code c = comp_expr(si, env, exp, sz, cont);
   long used_safe = *si.max_stack_used + stack_safety_margin;
   if (used_safe > stack_threshold)
-    return cons(kconst(L::const_int(used_safe)), cons(kccall("caml_ensure_stack_capacity", 1, nullptr), c));
+    return cons(kconst(L::const_int(used_safe)), cons(kccall("caml_ensure_stack_capacity", 1), c));
   return c;
 }
 

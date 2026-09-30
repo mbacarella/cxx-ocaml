@@ -77,10 +77,10 @@ struct Primitive {
     Poffsetint, Poffsetref, Pintoffloat, Pfloatofint, Pnegfloat, Pabsfloat, Paddfloat, Psubfloat,
     Pmulfloat, Pdivfloat, Pfloatcomp, Pstringlength, Pstringrefu, Pstringrefs, Pbyteslength, Pbytesrefu,
     Pbytessetu, Pbytesrefs, Pbytessets, Pmakearray, Pduparray, Parraylength, Parrayrefu, Parraysetu,
-    Parrayrefs, Parraysets, Pisint, Pisout, Pcheckbound, Pbintofint, Pintofbint, Pcvtbint, Pnegbint,
+    Parrayrefs, Parraysets, Pisint, Pisout, Pbintofint, Pintofbint, Pcvtbint, Pnegbint,
     Paddbint, Psubbint, Pmulbint, Pdivbint, Pmodbint, Pandbint, Porbint, Pxorbint, Plslbint, Plsrbint,
     Pasrbint, Pbintcomp, Pbigarrayref, Pbigarrayset, Pbigarraydim, Pstring_load, Pbytes_load, Pbytes_set,
-    Pbigstring_load, Pbigstring_set, Pbswap16, Pbbswap, Pint_as_pointer, Patomic_load, Patomic_fetch_add,
+    Pbigstring_load, Pbigstring_set, Pbswap16, Pbbswap, Pint_as_pointer, Patomic_load,
     Popaque, Pdls_get, Ppoll
   };
   K kind;

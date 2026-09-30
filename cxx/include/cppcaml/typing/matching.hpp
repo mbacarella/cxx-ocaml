@@ -26,7 +26,7 @@ lambda::lambda for_function(scopes sc, const Location& loc, lambda::IntRef* repr
                             Slice<PatAction> pat_act_list, typedtree::Partial partial);
 lambda::lambda for_trywith(scopes sc, const Location& loc, lambda::lambda param, Slice<PatAction> pat_act_list);
 lambda::lambda for_handler(scopes sc, const Location& loc, lambda::lambda param, lambda::lambda cont,
-                           Slice<PatAction> pat_act_list);
+                           lambda::lambda cont_tail, Slice<PatAction> pat_act_list);
 lambda::lambda for_let(scopes sc, const Location& loc, lambda::lambda param, const typedtree::Pattern* pat,
                        lambda::lambda body);
 lambda::lambda for_multiple_match(scopes sc, const Location& loc, Slice<lambda::lambda> paraml,

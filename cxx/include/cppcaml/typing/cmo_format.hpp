@@ -19,10 +19,10 @@ namespace cppcaml::typing::cmo_format {
 using V = omarshal::ValPtr;
 
 // compilation_unit's fields (a mutable record: the librarian and the linker
-// rewrite cu_pos, cu_force_link, cu_debug, cu_hint in place)
+// rewrite cu_pos, cu_force_link, cu_debug in place)
 enum CuField {
   cu_name, cu_pos, cu_codesize, cu_reloc, cu_imports, cu_required_compunits, cu_primitives, cu_force_link,
-  cu_debug, cu_debugsize, cu_hint, cu_hintsize
+  cu_debug, cu_debugsize
 };
 // library's fields
 enum LibField { lib_units, lib_custom, lib_ccobjs, lib_ccopts, lib_dllibs };

@@ -159,7 +159,6 @@ bool equal_primitive(const Primitive& a, const Primitive& b) {
     case PK::Pdivint:
     case PK::Pmodint: return a.safe == b.safe;
     case PK::Pintcomp: return a.icmp == b.icmp;
-    case PK::Pphyscomp: return a.pcmp == b.pcmp;
     case PK::Pcompare_bints: return a.bi == b.bi;
     case PK::Poffsetint:
     case PK::Poffsetref: return a.n == b.n;
@@ -993,13 +992,6 @@ lambda transl_prim(std::string_view modname, std::string_view field) {
   return transl_value_path({}, r.env, found.first);
 }
 
-lambda make_atomic_loc(const ScopedLocation& loc, lambda arg, lambda field) {
-  Primitive p = prim(PK::Pmakeblock);
-  p.n = 0;
-  p.mut = MutableFlag::Immutable;
-  p.shape = BlockShape{true, slice(std::vector<ValueKind>{ValueKind::gen(), ValueKind::intval()})};
-  return lprim(p, slice(std::vector<lambda>{arg, field}), loc);
-}
 
 // ---- substitution -------------------------------------------------------------------
 namespace {
@@ -1382,9 +1374,6 @@ lambda bind(LetKind str, Ident::t var, lambda exp, lambda body) {
 }
 
 // ---- comparisons -------------------------------------------------------------------
-PhysicalComparison negate_physical_comparison(PhysicalComparison c) {
-  return c == PhysicalComparison::CPeq ? PhysicalComparison::CPneq : PhysicalComparison::CPeq;
-}
 IntegerComparison negate_integer_comparison(IntegerComparison c) {
   using C = IntegerComparison;
   switch (c) {

@@ -186,13 +186,12 @@ void clear_crc_interfaces() {
   g_crc_objs.clear();
 }
 
-// Record compilation events: (ofs, evl, debug_dirs) / (ofs, hints), the latest first
+// Record compilation events: (ofs, evl, debug_dirs), the latest first
 struct DebugInfo {
   long ofs;
   V evl, dirs;
 };
 std::vector<DebugInfo> g_debug_info;
-std::vector<std::pair<long, V>> g_hint_info;
 
 using OutputFun = std::function<void(const std::string&)>;
 using CurrposFun = std::function<long()>;
@@ -215,12 +214,6 @@ bool link_compunit(bool accu, const OutputFun& output_fun, const CurrposFun& cur
     for (const V& d : cmo_format::list_elems(debug_dirs)) mem = mem || d->str() == file_path;
     if (!mem) debug_dirs = o::vblock(0, {o::vstr(file_path), debug_dirs});
     g_debug_info.insert(g_debug_info.begin(), DebugInfo{currpos_fun(), debug_event_list, debug_dirs});
-  }
-  long cu_hint = cu.int_field(cmo_format::cu_hint);
-  if (cf::bytecode_hints && cu_hint > 0) {
-    long p = cu_hint;
-    V hint_list = inchan.input_value(p);
-    g_hint_info.insert(g_hint_info.begin(), {currpos_fun(), hint_list});
   }
   output_fun(*code_block);
   bool needs_stdlib = accu;
@@ -275,15 +268,6 @@ void output_debug_info(bs::OutChannel& oc) {
     oc.output_bytes(o::marshal(d.dirs));
   }
   g_debug_info.clear();
-}
-
-void output_hint_info(bs::OutChannel& oc) {
-  oc.output_binary_int(static_cast<long>(g_hint_info.size()));
-  for (auto& [ofs, hints] : g_hint_info) {
-    oc.output_binary_int(ofs);
-    oc.output_bytes(o::marshal(hints));
-  }
-  g_hint_info.clear();
 }
 
 // output_value (extract_crc_interfaces ())
@@ -576,10 +560,6 @@ void link_bytecode(const std::vector<LinkAction>& tolink, const std::string& exe
   if (cf::debug) {
     output_debug_info(outchan);
     bs::record(toc_writer, bs::Name::DBUG);
-  }
-  if (cf::bytecode_hints) {
-    output_hint_info(outchan);
-    bs::record(toc_writer, bs::Name::HINT);
   }
   // The table of contents and the trailer
   bs::write_toc_and_trailer(toc_writer);
@@ -994,7 +974,6 @@ void reset() {
   g_lib_dllibs.clear();
   g_crc_interfaces.clear();
   g_debug_info.clear();
-  g_hint_info.clear();
   g_output_code_string_counter = 0;
 }
 

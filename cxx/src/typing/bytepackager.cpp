@@ -1,6 +1,6 @@
 // Port of bytecomp/bytepackager.ml (cxx/PORTING.md stage 10): -pack.
 //
-// The member units' descriptors (and debug events, hints) are read back
+// The member units' descriptors (and debug events) are read back
 // with the Marshal reader and re-marshaled as omarshal values that keep the
 // reader's sharing (one value per decoded object), combined with the values
 // the package's own code produces (Emitcode.to_packed_file) in one
@@ -43,7 +43,7 @@ using V = o::ValPtr;
 // compilation_unit fields (Cmo_format)
 enum CuField {
   cu_name, cu_pos, cu_codesize, cu_reloc, cu_imports, cu_required_compunits, cu_primitives, cu_force_link,
-  cu_debug, cu_debugsize, cu_hint, cu_hintsize
+  cu_debug, cu_debugsize
 };
 
 std::uint32_t be32(const std::vector<std::uint8_t>& b, std::size_t o) {
@@ -328,7 +328,6 @@ struct State {
   std::vector<V> relocs;  // (reloc_info * int), in output order
   std::vector<V> events;  // output order
   std::set<std::string> debug_dirs;
-  std::vector<V> hints;  // output order
   std::vector<V> primitives;
   long offset = 0;
   // Subst: identity, or the modules map (Path.Map) of the added modules
@@ -478,16 +477,6 @@ void rename_append_bytecode(std::string_view packagename, std::string& oc, State
       st.events.push_back(relocate_debug(st.offset, packagename, st, mb, ev, composed));
     for (std::size_t d : list_elems(*mb.arena, dirs)) st.debug_dirs.insert((*mb.arena)[d].str());
   }
-  if (mb.int_field(cu_hint) > 0) {
-    std::size_t off = static_cast<std::size_t>(mb.int_field(cu_hint));
-    std::size_t hs = m::read_value(mb.bytes.data(), mb.bytes.size(), off, *mb.arena);
-    mb.arena->finalize();
-    for (std::size_t h : list_elems(*mb.arena, hs)) {  // relocate_hint
-      const m::Value& hv = (*mb.arena)[h];
-      st.hints.push_back(o::vblock(0, {o::vint(st.offset + static_cast<long>((*mb.arena)[hv.fields[0]].i)),
-                                       (*mb.reader)(hv.fields[1])}));
-    }
-  }
   st.offset += size;
 }
 
@@ -544,7 +533,7 @@ void package_object_files(std::vector<std::string>& files, const std::string& ta
     for (auto it = req.rbegin(); it != req.rend(); ++it)
       required.try_emplace(a[*it].str(), (*mit->reader)(*it));
   }
-  emitcode::ValueContext w, hw;
+  emitcode::ValueContext w;
   std::string oc(config::cmo_magic_number);
   long pos_depl = static_cast<long>(oc.size());
   output_binary_int(oc, 0);
@@ -563,15 +552,13 @@ void package_object_files(std::vector<std::string>& files, const std::string& ta
     lam = simplif::simplify_lambda(lam);
     if (clflags::dump_lambda) std::cerr << printlambda::dump(lam);
     instruct::code instrs = bytegen::compile_implementation(targetname, lam);
-    emitcode::PackedFile pf = emitcode::to_packed_file(oc, instrs, w, hw);
+    emitcode::PackedFile pf = emitcode::to_packed_file(oc, instrs, w);
     // events = List.rev_append pack_events state.events: the package's
     // events (their positions not relocated) after the members'
     std::vector<const instruct::DebugEvent*> pevs(pf.events.begin(), pf.events.end());
     // (their ev_module is target_name: the package name string, as in the
     // members' composed substitutions)
     for (V& ev : cmi_format::debug_event_values(pevs, w.str(targetname))) st.events.push_back(ev);
-    // (the package's hints and events keep their positions: not relocated)
-    for (auto& h : pf.hints) st.hints.push_back(o::vblock(0, {o::vint(h.first), h.second}));
     st.debug_dirs.insert(pf.debug_dirs.begin(), pf.debug_dirs.end());
     for (auto& [r, ofs] : pf.relocs) st.relocs.push_back(o::vblock(0, {r, o::vint(st.offset + ofs)}));
     st.offset += pf.size;
@@ -583,8 +570,6 @@ void package_object_files(std::vector<std::string>& files, const std::string& ta
     for (const std::string& d : st.debug_dirs) dirs.push_back(o::vstr(d));
     compressed_output_value(oc, o::vlist(dirs));
   }
-  long pos_hint = static_cast<long>(oc.size());
-  if (!st.hints.empty()) compressed_output_value(oc, o::vlist(st.hints));
   bool force_link = false;
   for (const Member& mb : members)
     if (!mb.intf && mb.int_field(cu_force_link)) force_link = true;
@@ -610,10 +595,8 @@ void package_object_files(std::vector<std::string>& files, const std::string& ta
       o::vlist(req),
       o::vlist(st.primitives),
       o::vint(force_link ? 1 : 0),
-      o::vint(pos_hint > pos_debug ? pos_debug : 0),
-      o::vint(pos_hint - pos_debug),
-      o::vint(pos_final > pos_hint ? pos_hint : 0),
-      o::vint(pos_final - pos_hint),
+      o::vint(pos_final > pos_debug ? pos_debug : 0),
+      o::vint(pos_final - pos_debug),
   });
   output_value(oc, compunit);
   std::string depl;

@@ -2093,13 +2093,6 @@ t add_local_constraint(Path::t path, const TypeDeclaration* info, t env) {
   return e;
 }
 
-LocalEquations freeze_local_equations(t env) { return env->local_constraints; }
-t restrict_local_equations(const LocalEquations& local_constraints, t env) {
-  EnvT* e = copy_env(env);
-  e->local_constraints = local_constraints;
-  return e;
-}
-
 // ---- insertion of bindings by name ---------------------------------------------------
 std::pair<Ident::t, t> enter_value(std::string_view name, const ValueDescription* desc, t env,
                                    const CheckFn& check) {

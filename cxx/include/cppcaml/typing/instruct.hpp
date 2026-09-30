@@ -71,34 +71,6 @@ struct DebugEvent {
   DebugEventRepr ev_repr;        // position of the representative
 };
 
-// ---- optimization hints ---------------------------------------------------------
-
-struct ClosureHint {
-  Slice<lambda::ValueKind> params;
-  lambda::ValueKind return_;
-  lambda::InlineAttribute inline_;
-  lambda::SpecialiseAttribute specialise;
-  bool is_a_functor;
-};
-
-struct CcallHint {
-  enum class K : std::uint8_t { Hint_unsafe, Hint_int, Hint_bigarray, Hint_primitive } k;
-  BoxedInteger bi = BoxedInteger::Pnativeint;  // Hint_int
-  bool unsafe = false;                                          // Hint_bigarray
-  lambda::BigarrayKind elt_kind = lambda::BigarrayKind::Pbigarray_unknown;
-  lambda::BigarrayLayout layout = lambda::BigarrayLayout::Pbigarray_unknown_layout;
-  const PrimitiveDescription* prim = nullptr;                   // Hint_primitive
-};
-
-struct OptimizationHint {
-  enum class K : std::uint8_t {
-    Hint_immutable_block, Hint_arraylength, Hint_closures, Hint_ccall, Hint_physical_comparison
-  } k;
-  lambda::ArrayKind array = lambda::ArrayKind::Pgenarray;  // Hint_arraylength
-  Slice<ClosureHint> closures;                             // Hint_closures
-  CcallHint ccall{};                                       // Hint_ccall
-};
-
 // ---- instructions -------------------------------------------------------------------
 
 using label = long;
@@ -112,14 +84,9 @@ enum class IK : std::uint8_t {
   Kpushtrap, Kpoptrap, Kraise, Kcheck_signals, Kccall,
   Knegint, Kaddint, Ksubint, Kmulint, Kdivint, Kmodint,
   Kandint, Korint, Kxorint, Klslint, Klsrint, Kasrint,
-  Kintcomp, Kphyscomp, Koffsetint, Koffsetref, Kisint, Kisout,
+  Kintcomp, Koffsetint, Koffsetref, Kisint, Kisout,
   Kgetmethod, Kgetpubmet, Kgetdynmet, Kevent, Kperform, Kresume, Kresumeterm,
   Kreperformterm, Kstop
-};
-
-struct ClosureLabel {  // label * closure_hint
-  label lbl;
-  const ClosureHint* hint;
 };
 
 // One instruction.  The operand fields a variant uses:
@@ -131,26 +98,21 @@ struct ClosureLabel {  // label * closure_hint
 //   m: Kappterm (slot size), Kclosure (the free-variable count), Kmakeblock (tag)
 struct Instruction {
   IK k;
-  MutableFlag mut = MutableFlag::Immutable;                            // Kmakeblock / Kmakefloatblock
-  lambda::ArrayKind array = lambda::ArrayKind::Pgenarray;              // Kvectlength
   lambda::RaiseKind raise = lambda::RaiseKind::Raise_regular;          // Kraise
   lambda::IntegerComparison icmp = lambda::IntegerComparison::Ceq;     // Kintcomp
-  lambda::PhysicalComparison pcmp = lambda::PhysicalComparison::CPeq;  // Kphyscomp
   long n = 0;
   long m = 0;
   // The payloads of one kind each, overlaid (a Bytegen instruction list is
   // long): a field is read only for its instruction's kind.
   union {
     Slice<label> sw_consts{};       // Kswitch
-    Slice<ClosureLabel> closures;   // Kclosurerec
+    Slice<label> lbls;              // Kclosurerec
     std::string_view prim;          // Kccall
   };
   union {
     Slice<label> sw_blocks{};                // Kswitch
-    const ClosureHint* closure_hint;         // Kclosure
     Ident::t id;                             // Kgetglobal / Ksetglobal
     const lambda::StructuredConstant* cst;   // Kconst
-    const CcallHint* ccall_hint;             // Kccall (option: nullptr = None)
     DebugEvent* event;                       // Kevent
   };
 };

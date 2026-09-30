@@ -25,8 +25,8 @@ struct OutChannel {
   }
 };
 
-// Name.t: CODE CRCS DATA DBUG HINT DLLS DLPT OSLD PRIM RNTM SYMB | Other
-enum class Name { CODE, CRCS, DATA, DBUG, HINT, DLLS, DLPT, OSLD, PRIM, RNTM, SYMB };
+// Name.t: CODE CRCS DATA DBUG DLLS DLPT OSLD PRIM RNTM SYMB | Other
+enum class Name { CODE, CRCS, DATA, DBUG, DLLS, DLPT, OSLD, PRIM, RNTM, SYMB };
 const char* name_to_string(Name n);
 
 struct SectionEntry {

@@ -170,7 +170,6 @@ void primitive(Formatter& ppf, const clambda::Primitive& p) {
     case K::Parraysets: fprintf(ppf, "array.set[%s]", array_kind(p.array)); return;
     case K::Pisint: fprintf(ppf, "isint"); return;
     case K::Pisout: fprintf(ppf, "isout"); return;
-    case K::Pcheckbound: fprintf(ppf, "checkbound"); return;
     case K::Pbintofint: print_boxed_integer("of_int", ppf, p.bi); return;
     case K::Pintofbint: print_boxed_integer("to_int", ppf, p.bi); return;
     case K::Pcvtbint: fprintf(ppf, "%s_of_%s", boxed_integer_name(p.bi2), boxed_integer_name(p.bi)); return;
@@ -211,7 +210,6 @@ void primitive(Formatter& ppf, const clambda::Primitive& p) {
     case K::Pbbswap: print_boxed_integer("bswap", ppf, p.bi); return;
     case K::Pint_as_pointer: fprintf(ppf, "int_as_pointer"); return;
     case K::Patomic_load: fprintf(ppf, "atomic_load"); return;
-    case K::Patomic_fetch_add: fprintf(ppf, "atomic_fetch_add"); return;
     case K::Popaque: fprintf(ppf, "opaque"); return;
     case K::Pdls_get: fprintf(ppf, "dls_get"); return;
     case K::Ppoll: fprintf(ppf, "poll"); return;

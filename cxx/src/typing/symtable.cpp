@@ -28,7 +28,7 @@ using cmo_format::V;
 const char* const kBuiltinExceptions[] = {
     "Out_of_memory", "Sys_error", "Failure", "Invalid_argument", "End_of_file",
     "Division_by_zero", "Not_found", "Match_failure", "Stack_overflow",
-    "Sys_blocked_io", "Assert_failure", "Undefined_recursive_module", "Todo"};
+    "Sys_blocked_io", "Assert_failure", "Undefined_recursive_module"};
 
 // Global.Map's compare: the polymorphic compare of the key blocks (the tag,
 // then the name)

@@ -308,6 +308,8 @@ expression transl_prim_1(const Env& env, const CL::Primitive& p, ulambda arg, co
 expression transl_prim_2(const Env& env, const CL::Primitive& p, ulambda arg1, ulambda arg2, const Dbg& dbg);
 expression transl_prim_3(const Env& env, const CL::Primitive& p, ulambda arg1, ulambda arg2, ulambda arg3,
                          const Dbg& dbg);
+expression transl_prim_4(const Env& env, const CL::Primitive& p, ulambda arg1, ulambda arg2, ulambda arg3,
+                         ulambda arg4, const Dbg& dbg);
 expression transl_catch(const Env& env, long nfail, Slice<CL::UParam> ids, ulambda body, ulambda handler,
                         const Dbg& dbg);
 expression transl_make_array(const Dbg& dbg, const Env& env, L::ArrayKind kind, Slice<ulambda> args);
@@ -491,6 +493,7 @@ expression transl_prim(const Env& env, const CL::Uprim* x) {
     case 1: return transl_prim_1(env, p, args[0], dbg);
     case 2: return transl_prim_2(env, p, args[0], args[1], dbg);
     case 3: return transl_prim_3(env, p, args[0], args[1], args[2], dbg);
+    case 4: return transl_prim_4(env, p, args[0], args[1], args[2], args[3], dbg);
     default: fatal("Cmmgen.transl:prim, wrong arity");
   }
 }
@@ -847,7 +850,7 @@ expression transl_prim_1(const Env& env, const CL::Primitive& p, ulambda arg, co
     case PK::Pbswap16:
       return tag_int(bswap16(ignore_high_bit_int(untag_int(transl(env, arg), dbg)), dbg), dbg);
     case PK::Pperform: {
-      expression cont = make_alloc(dbg, 245 /* Obj.cont_tag */, {int_const(dbg, 0)});
+      expression cont = make_alloc(dbg, 245 /* Obj.cont_tag */, {int_const(dbg, 0), int_const(dbg, 0)});
       return cop(capply(typ_val()), {cconst_symbol("caml_perform", dbg), transl(env, arg), cont}, dbg);
     }
     case PK::Pdls_get: return cop(op(OK::Cdls_get), {transl(env, arg)}, dbg);
@@ -987,11 +990,6 @@ expression transl_prim_2(const Env& env, const CL::Primitive& p, ulambda arg1, u
       expression a = transl(env, arg1);
       return arrayref_safe(p.array, a, b, dbg);
     }
-    case PK::Pcheckbound: {
-      expression b = transl(env, arg2);
-      expression a = transl(env, arg1);
-      return make_checkbound(dbg, {a, b});
-    }
     // Boxed integers
     case PK::Paddbint:
     case PK::Psubbint:
@@ -1041,11 +1039,6 @@ expression transl_prim_2(const Env& env, const CL::Primitive& p, ulambda arg1, u
       expression a = transl_unbox_int(dbg, env, p.bi, arg1);
       return tag_int(cop(ccmpi(p.icmp), {a, b}, dbg), dbg);
     }
-    case PK::Preperform: {
-      expression b = transl(env, arg2);
-      expression a = transl(env, arg1);
-      return cop(capply(typ_val()), {cconst_symbol("caml_reperform", dbg), a, b}, dbg);
-    }
     default: fatal("Cmmgen.transl_prim_2");
   }
 }
@@ -1088,24 +1081,33 @@ expression transl_prim_3(const Env& env, const CL::Primitive& p, ulambda arg1, u
                                       : bigstring_set(p.size, p.safe, a, b, c, dbg);
     }
     // Effects
-    case PK::Prunstack:
-    case PK::Presume: {
+    case PK::Prunstack: {
       expression c = transl(env, arg3);
       expression b = transl(env, arg2);
       expression a = transl(env, arg1);
-      return cop(capply(typ_val()),
-                 {cconst_symbol(p.kind == PK::Prunstack ? "caml_runstack" : "caml_resume", dbg), a, b, c}, dbg);
+      return cop(capply(typ_val()), {cconst_symbol("caml_runstack", dbg), a, b, c}, dbg);
     }
-    case PK::Patomic_fetch_add: {
-      expression ptr = transl(env, arg1);
-      expression ofs = transl(env, arg2);
-      expression incr = transl(env, arg3);
-      // incr is a tagged integer (2*n+1). The atomic add must operate on the
-      // tagged representation: add 2*n = incr - 1 to the field.
-      expression raw_incr = cop(op(OK::Csubi), {incr, cconst_int(1, dbg)}, dbg);
-      return cop(op(OK::Catomic_fetch_add), {field_address_computed(ptr, ofs, dbg), raw_incr}, dbg);
+    case PK::Preperform: {
+      expression c = transl(env, arg3);
+      expression b = transl(env, arg2);
+      expression a = transl(env, arg1);
+      return cop(capply(typ_val()), {cconst_symbol("caml_reperform", dbg), a, b, c}, dbg);
     }
     default: fatal("Cmmgen.transl_prim_3");
+  }
+}
+
+expression transl_prim_4(const Env& env, const CL::Primitive& p, ulambda arg1, ulambda arg2, ulambda arg3,
+                         ulambda arg4, const Dbg& dbg) {
+  switch (p.kind) {
+    case PK::Presume: {
+      expression d = transl(env, arg4);
+      expression c = transl(env, arg3);
+      expression b = transl(env, arg2);
+      expression a = transl(env, arg1);
+      return cop(capply(typ_val()), {cconst_symbol("caml_resume", dbg), a, b, c, d}, dbg);
+    }
+    default: fatal("Cmmgen.transl_prim_4");
   }
 }
 

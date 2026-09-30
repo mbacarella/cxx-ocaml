@@ -2589,7 +2589,7 @@ Phrase segment_table(const std::vector<std::string_view>& namelist, std::string_
 const std::vector<std::string_view> builtin_exceptions = {
     "Out_of_memory",  "Sys_error",      "Failure",        "Invalid_argument", "End_of_file",
     "Division_by_zero", "Not_found",    "Match_failure",  "Stack_overflow",   "Sys_blocked_io",
-    "Assert_failure", "Undefined_recursive_module", "Todo"};
+    "Assert_failure", "Undefined_recursive_module"};
 
 // These apply funs are always present in the main program because the
 // run-time system needs them (cf. runtime/<arch>.S)

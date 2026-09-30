@@ -1,6 +1,6 @@
 // Port of bytecomp/emitcode.ml (cxx/PORTING.md stage 10): the instruction
 // list to relocatable bytecode (with the `emit` peephole), and the .cmo:
-// magic, code, the debugging events (-g), the optimization hints and the
+// magic, code, the debugging events (-g) and the
 // marshaled Cmo_format.compilation_unit.
 //
 // Marshal preserves physical sharing, so the values are built with the
@@ -43,7 +43,6 @@ using V = o::ValPtr;
 using namespace instruct;
 using L = lambda::StructuredConstant;
 using lambda::IntegerComparison;
-using lambda::PhysicalComparison;
 
 
 [[noreturn]] void fatal_error(const char* msg) { throw std::logic_error(msg); }
@@ -141,15 +140,6 @@ std::string absolute_path(const std::string& s0) {
   return aux(s);
 }
 
-// an optimization_hint as Emitcode records it: the instruction's own
-// closure_hint records and ccall_hint (their identities are marshaled)
-struct RecordedHint {
-  OptimizationHint::K k;
-  lambda::ArrayKind array = lambda::ArrayKind::Pgenarray;  // Hint_arraylength
-  std::vector<const ClosureHint*> closures;                // Hint_closures
-  const CcallHint* ccall = nullptr;                        // Hint_ccall
-};
-
 // ---- values with OCaml's identities ------------------------------------------------
 
 class Values {
@@ -198,106 +188,6 @@ class Values {
       }
     }
     fatal_error("Emitcode.transl_const");
-  }
-
-  // the value kinds, inline/specialise attributes, primitive descriptions of
-  // the optimization hints
-  V value_kind(const lambda::ValueKind& k) {
-    using K = lambda::ValueKind::Kind;
-    switch (k.kind) {
-      case K::Pgenval: return i(0);
-      case K::Pfloatval: return i(1);
-      case K::Pintval: return i(2);
-      case K::Pboxedintval: {
-        // `Pboxedintval Pint64` is a static constant at its construction
-        // site (Typeopt's): one block per boxed_integer
-        V& v = boxedint_kinds_[static_cast<int>(k.bi)];
-        if (!v) v = o::vblock(0, {boxed_integer(k.bi)});
-        return v;
-      }
-    }
-    fatal_error("Emitcode.value_kind");
-  }
-  V boxed_integer(BoxedInteger bi) { return i(static_cast<long>(bi)); }  // Pnativeint|Pint32|Pint64
-  V inline_attribute(const lambda::InlineAttribute& a) {
-    using K = lambda::InlineAttribute::Kind;
-    switch (a.kind) {
-      case K::Always_inline: return i(0);
-      case K::Never_inline: return i(1);
-      case K::Hint_inline: return i(2);
-      case K::Unroll: return o::vblock(0, {i(a.unroll)});
-      case K::Default_inline: return i(3);
-    }
-    fatal_error("Emitcode.inline_attribute");
-  }
-  V specialise_attribute(lambda::SpecialiseAttribute s) { return i(static_cast<long>(s)); }
-  V native_repr(const NativeRepr& n) {
-    // Same_as_ocaml_repr | Unboxed_float | Unboxed_integer of boxed_integer | Untagged_immediate
-    switch (n.kind) {
-      case NativeRepr::Kind::Same_as_ocaml_repr: return i(0);
-      case NativeRepr::Kind::Unboxed_float: return i(1);
-      case NativeRepr::Kind::Untagged_immediate: return i(2);
-      case NativeRepr::Kind::Unboxed_integer: {
-        if (!n.obj) return o::vblock(0, {boxed_integer(n.bi)});
-        auto it = objs_.find(n.obj);
-        if (it != objs_.end()) return it->second;
-        V v = o::vblock(0, {boxed_integer(n.bi)});
-        objs_[n.obj] = v;
-        return v;
-      }
-    }
-    fatal_error("Emitcode.native_repr");
-  }
-  V prim_description(const PrimitiveDescription* p) {
-    auto it = objs_.find(p);
-    if (it != objs_.end()) return it->second;
-    std::vector<V> args;
-    for (const NativeRepr& r : p->prim_native_repr_args) args.push_back(native_repr(r));
-    V v = o::vblock(0, {str(p->prim_name), i(p->prim_arity), b(p->prim_alloc),
-                        str(p->prim_native_name), o::vlist(args), native_repr(p->prim_native_repr_res)});
-    objs_[p] = v;
-    return v;
-  }
-  V closure_hint(const ClosureHint* h) {  // the instruction's record
-    auto it = objs_.find(h);
-    if (it != objs_.end()) return it->second;
-    std::vector<V> params;
-    for (const lambda::ValueKind& k : h->params) params.push_back(value_kind(k));
-    V v = o::vblock(0, {o::vlist(params), value_kind(h->return_), inline_attribute(h->inline_),
-                        specialise_attribute(h->specialise), b(h->is_a_functor)});
-    objs_[h] = v;
-    return v;
-  }
-  V ccall_hint(const CcallHint* h) {  // the instruction's
-    if (h->k == CcallHint::K::Hint_unsafe) return i(0);
-    auto it = objs_.find(h);
-    if (it != objs_.end()) return it->second;
-    V v;
-    switch (h->k) {
-      case CcallHint::K::Hint_unsafe: break;
-      case CcallHint::K::Hint_int: v = o::vblock(0, {boxed_integer(h->bi)}); break;
-      case CcallHint::K::Hint_bigarray:
-        v = o::vblock(1, {b(h->unsafe), i(static_cast<long>(h->elt_kind)), i(static_cast<long>(h->layout))});
-        break;
-      case CcallHint::K::Hint_primitive: v = o::vblock(2, {prim_description(h->prim)}); break;
-    }
-    objs_[h] = v;
-    return v;
-  }
-  V optimization_hint(const RecordedHint& h) {
-    using K = OptimizationHint::K;
-    switch (h.k) {
-      case K::Hint_immutable_block: return i(0);
-      case K::Hint_physical_comparison: return i(1);
-      case K::Hint_arraylength: return o::vblock(0, {i(static_cast<long>(h.array))});
-      case K::Hint_closures: {  // a fresh list of the instruction's records
-        std::vector<V> hs;
-        for (const ClosureHint* c : h.closures) hs.push_back(closure_hint(c));
-        return o::vblock(1, {o::vlist(hs)});
-      }
-      case K::Hint_ccall: return o::vblock(2, {ccall_hint(h.ccall)});
-    }
-    fatal_error("Emitcode.optimization_hint");
   }
 
  private:
@@ -376,7 +266,6 @@ class Emitter {
   std::vector<Reloc> reloc_info;             // in emission order (List.rev !reloc_info)
   std::vector<DebugEvent*> events;           // in emission order (!events reversed)
   std::set<std::string> debug_dirs;
-  std::vector<std::pair<long, RecordedHint>> hints;  // in emission order
 
   Emitter() {
     // init ()
@@ -476,7 +365,7 @@ class Emitter {
     out_int(0);
   }
 
-  // ---- debugging events, hints ----
+  // ---- debugging events ----
   void record_event(DebugEvent* ev) {
     // the directories are pure functions of the event's file name (and the
     // fixed cwd): computed once per name -- a unit's events share one
@@ -497,12 +386,6 @@ class Emitter {
   bool last_dirs_ = false;
   std::string last_fname_, last_dir_;
   std::optional<std::string> last_cwd_;
-  void record_hint(const RecordedHint& h) { hints.emplace_back(out_position, h); }
-  static RecordedHint hint(OptimizationHint::K k) {
-    RecordedHint h{};
-    h.k = k;
-    return h;
-  }
 
   // ---- one instruction ----
   void emit_comp(IntegerComparison c) {
@@ -524,9 +407,6 @@ class Emitter {
       case IntegerComparison::Cgt: out(opBGTINT); break;
       case IntegerComparison::Cge: out(opBGEINT); break;
     }
-  }
-  static IntegerComparison integer_comparison_of_physical(PhysicalComparison c) {
-    return c == PhysicalComparison::CPeq ? IntegerComparison::Ceq : IntegerComparison::Cne;
   }
 
   void emit_instr(const Instruction& in) {
@@ -556,20 +436,11 @@ class Emitter {
       case IK::Kreturn: out(opRETURN); out_int(n); break;
       case IK::Krestart: out(opRESTART); break;
       case IK::Kgrab: out(opGRAB); out_int(n); break;
-      case IK::Kclosure: {
-        RecordedHint h = hint(OptimizationHint::K::Hint_closures);
-        h.closures = {in.closure_hint};
-        record_hint(h);
-        out(opCLOSURE); out_int(in.m); out_label(n);
-        break;
-      }
+      case IK::Kclosure: out(opCLOSURE); out_int(in.m); out_label(n); break;
       case IK::Kclosurerec: {
-        RecordedHint h = hint(OptimizationHint::K::Hint_closures);
-        for (const ClosureLabel& cl : in.closures) h.closures.push_back(cl.hint);
-        record_hint(h);
-        out(opCLOSUREREC); out_int(static_cast<long>(in.closures.size())); out_int(n);
+        out(opCLOSUREREC); out_int(static_cast<long>(in.lbls.size())); out_int(n);
         long org = out_position;
-        for (const ClosureLabel& cl : in.closures) out_label_with_orig(org, cl.lbl);
+        for (label l : in.lbls) out_label_with_orig(org, l);
         break;
       }
       case IK::Koffsetclosure:
@@ -594,7 +465,6 @@ class Emitter {
         break;
       }
       case IK::Kmakeblock:
-        if (in.mut == MutableFlag::Immutable) record_hint(hint(OptimizationHint::K::Hint_immutable_block));
         if (n == 0) {
           if (in.m == 0) out(opATOM0);
           else { out(opATOM); out_int(in.m); }
@@ -613,19 +483,12 @@ class Emitter {
         else { out(opSETFIELD); out_int(n); }
         break;
       case IK::Kmakefloatblock:
-        if (in.mut == MutableFlag::Immutable) record_hint(hint(OptimizationHint::K::Hint_immutable_block));
         if (n == 0) out(opATOM0);
         else { out(opMAKEFLOATBLOCK); out_int(n); }
         break;
       case IK::Kgetfloatfield: out(opGETFLOATFIELD); out_int(n); break;
       case IK::Ksetfloatfield: out(opSETFLOATFIELD); out_int(n); break;
-      case IK::Kvectlength: {
-        RecordedHint h = hint(OptimizationHint::K::Hint_arraylength);
-        h.array = in.array;
-        record_hint(h);
-        out(opVECTLENGTH);
-        break;
-      }
+      case IK::Kvectlength: out(opVECTLENGTH); break;
       case IK::Kgetvectitem: out(opGETVECTITEM); break;
       case IK::Ksetvectitem: out(opSETVECTITEM); break;
       case IK::Kgetstringchar: out(opGETSTRINGCHAR); break;
@@ -656,11 +519,6 @@ class Emitter {
         break;
       case IK::Kcheck_signals: out(opCHECK_SIGNALS); break;
       case IK::Kccall:
-        if (in.ccall_hint) {
-          RecordedHint h = hint(OptimizationHint::K::Hint_ccall);
-          h.ccall = in.ccall_hint;
-          record_hint(h);
-        }
         if (n <= 5) { out(opC_CALL1 + static_cast<int>(n) - 1); slot_for_c_prim(in.prim); }
         else { out(opC_CALLN); out_int(n); slot_for_c_prim(in.prim); }
         break;
@@ -677,10 +535,6 @@ class Emitter {
       case IK::Klsrint: out(opLSRINT); break;
       case IK::Kasrint: out(opASRINT); break;
       case IK::Kintcomp: emit_comp(in.icmp); break;
-      case IK::Kphyscomp:
-        record_hint(hint(OptimizationHint::K::Hint_physical_comparison));
-        emit_comp(integer_comparison_of_physical(in.pcmp));
-        break;
       case IK::Koffsetint: out(opOFFSETINT); out_int(n); break;
       case IK::Koffsetref: out(opOFFSETREF); out_int(n); break;
       case IK::Kisint: out(opISINT); break;
@@ -728,9 +582,8 @@ class Emitter {
         if (i1->k == IK::Kconst && is_immed_const(i1->cst) && i2 && i3 &&
             (i3->k == IK::Kbranchif || i3->k == IK::Kbranchifnot)) {
           bool ifnot = i3->k == IK::Kbranchifnot;
-          if (i2->k == IK::Kintcomp || i2->k == IK::Kphyscomp) {
-            IntegerComparison cmp =
-                i2->k == IK::Kintcomp ? i2->icmp : integer_comparison_of_physical(i2->pcmp);
+          if (i2->k == IK::Kintcomp) {
+            IntegerComparison cmp = i2->icmp;
             emit_branch_comp(ifnot ? lambda::negate_integer_comparison(cmp) : cmp);
             out_const(i1->cst);
             out_label(i3->n);
@@ -759,7 +612,7 @@ class Emitter {
           continue;
         }
         if (i1->k == IK::Kenvacc) {
-          if (i1->n >= 1 && i1->n <= 4) out(opPUSHENVACC1 + static_cast<int>(i1->n) - 1);
+          if (i1->n >= 1 && i1->n < 4) out(opPUSHENVACC1 + static_cast<int>(i1->n) - 1);
           else { out(opPUSHENVACC); out_int(i1->n); }
           c = drop(c, 2);
           continue;
@@ -857,7 +710,7 @@ ValueContext::ValueContext() : impl(std::make_unique<Impl>()) {}
 ValueContext::~ValueContext() = default;
 omarshal::ValPtr ValueContext::str(std::string_view s) { return impl->v.str(s); }
 
-PackedFile to_packed_file(std::string& out, code c, ValueContext& w, ValueContext& hw) {
+PackedFile to_packed_file(std::string& out, code c, ValueContext& w) {
   Emitter em;
   em.emit(c);
   out.append(reinterpret_cast<const char*>(em.out_buffer.data()), em.out_buffer.size());
@@ -866,8 +719,6 @@ PackedFile to_packed_file(std::string& out, code c, ValueContext& w, ValueContex
   for (const Reloc& x : em.reloc_info) r.relocs.emplace_back(reloc_info_value(w.impl->v, x), x.pos);
   r.events.assign(em.events.rbegin(), em.events.rend());
   r.debug_dirs = em.debug_dirs;
-  for (auto it = em.hints.rbegin(); it != em.hints.rend(); ++it)
-    r.hints.emplace_back(it->first, hw.impl->v.optimization_hint(it->second));
   return r;
 }
 
@@ -894,16 +745,6 @@ void to_file(std::FILE* outchan, std::string_view filename, std::string_view mod
     pos_debug = p;
     size_debug = static_cast<long>(buf.size()) - p;
   }
-  long pos_hint = static_cast<long>(buf.size());
-  {
-    Values hv;
-    std::vector<V> hs;
-    for (auto it = em.hints.rbegin(); it != em.hints.rend(); ++it)  // !hints
-      hs.push_back(o::vblock(0, {hv.i(it->first), hv.optimization_hint(it->second)}));
-    compressed_output_value(buf, o::vlist(hs));
-  }
-  long size_hint = static_cast<long>(buf.size()) - pos_hint;
-
   Values w;
   V cu_name = w.str(uid::unit_name_string(modname));  // Unit_info.modname: the one string
   std::vector<V> relocs;
@@ -947,8 +788,6 @@ void to_file(std::FILE* outchan, std::string_view filename, std::string_view mod
       w.b(clflags::link_everything),                             // cu_force_link
       w.i(pos_debug),                                            // cu_debug
       w.i(size_debug),                                           // cu_debugsize
-      w.i(pos_hint),                                             // cu_hint
-      w.i(size_hint),                                            // cu_hintsize
   });
   long pos_compunit = static_cast<long>(buf.size());
   output_value(buf, compunit);

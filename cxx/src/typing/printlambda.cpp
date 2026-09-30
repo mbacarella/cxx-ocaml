@@ -17,7 +17,6 @@ using lambda::StructuredConstant;
 using lambda::ArrayKind;
 using lambda::BigarrayKind;
 using lambda::BigarrayLayout;
-using lambda::PhysicalComparison;
 using lambda::InitializationOrAssignment;
 using lambda::ImmediateOrPointer;
 using lambda::BlockShape;
@@ -248,13 +247,6 @@ void print_bigarray(std::string_view name, bool unsafe, BigarrayKind kind, Forma
 
 namespace {
 
-void physical_comparison(Formatter& ppf, PhysicalComparison c) {
-  switch (c) {
-    case PhysicalComparison::CPeq: fprintf(ppf, "=="); return;
-    case PhysicalComparison::CPneq: fprintf(ppf, "!="); return;
-  }
-}
-
 std::string_view init_name(InitializationOrAssignment init) {
   switch (init) {
     case InitializationOrAssignment::Heap_initialization: return "(heap-init)";
@@ -429,7 +421,6 @@ void primitive(Formatter& ppf, const Primitive& p) {
     case K::Plsrint: fprintf(ppf, "lsr"); return;
     case K::Pasrint: fprintf(ppf, "asr"); return;
     case K::Pintcomp: integer_comparison(ppf, p.icmp); return;
-    case K::Pphyscomp: physical_comparison(ppf, p.pcmp); return;
     case K::Pcompare_ints: fprintf(ppf, "compare_ints"); return;
     case K::Pcompare_floats: fprintf(ppf, "compare_floats"); return;
     case K::Pcompare_bints: fprintf(ppf, "compare_bints %s", boxed_integer_name(p.bi)); return;
@@ -487,7 +478,6 @@ void primitive(Formatter& ppf, const Primitive& p) {
     }
     case K::Pisint: fprintf(ppf, "isint"); return;
     case K::Pisout: fprintf(ppf, "isout"); return;
-    case K::Pcheckbound: fprintf(ppf, "checkbound"); return;
     case K::Pbintofint: pbi("of_int"); return;
     case K::Pintofbint: pbi("to_int"); return;
     case K::Pcvtbint: print_boxed_integer_conversion(ppf, p.bi, p.bi2); return;
@@ -535,7 +525,6 @@ void primitive(Formatter& ppf, const Primitive& p) {
     case K::Pbbswap: pbi("bswap"); return;
     case K::Pint_as_pointer: fprintf(ppf, "int_as_pointer"); return;
     case K::Patomic_load: fprintf(ppf, "atomic_load"); return;
-    case K::Patomic_fetch_add: fprintf(ppf, "atomic_fetch_add"); return;
     case K::Popaque: fprintf(ppf, "opaque"); return;
     case K::Pdls_get: fprintf(ppf, "dls_get"); return;
     case K::Ppoll: fprintf(ppf, "poll"); return;
@@ -577,7 +566,6 @@ std::string name_of_primitive(const Primitive& p) {
     case K::Plsrint: return "Plsrint";
     case K::Pasrint: return "Pasrint";
     case K::Pintcomp: return "Pintcomp";
-    case K::Pphyscomp: return "Pphyscomp";
     case K::Pcompare_ints: return "Pcompare_ints";
     case K::Pcompare_floats: return "Pcompare_floats";
     case K::Pcompare_bints: return "Pcompare";
@@ -610,7 +598,6 @@ std::string name_of_primitive(const Primitive& p) {
     case K::Pctconst: return "Pctconst";
     case K::Pisint: return "Pisint";
     case K::Pisout: return "Pisout";
-    case K::Pcheckbound: return "Pcheckbound";
     case K::Pbintofint: return "Pbintofint";
     case K::Pintofbint: return "Pintofbint";
     case K::Pcvtbint: return "Pcvtbint";
@@ -649,7 +636,6 @@ std::string name_of_primitive(const Primitive& p) {
     case K::Pbbswap: return "Pbbswap";
     case K::Pint_as_pointer: return "Pint_as_pointer";
     case K::Patomic_load: return "Patomic_load";
-    case K::Patomic_fetch_add: return "Patomic_fetch_add";
     case K::Popaque: return "Popaque";
     case K::Prunstack: return "Prunstack";
     case K::Presume: return "Presume";

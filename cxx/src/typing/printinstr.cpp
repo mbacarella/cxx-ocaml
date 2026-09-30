@@ -28,7 +28,7 @@ void instruction(Formatter& ppf, const Instruction& i) {
     case IK::Kclosure: fprintf(ppf, "\tclosure L%i, %i", i.n, i.m); return;
     case IK::Kclosurerec:
       fprintf(ppf, "\tclosurerec");
-      for (const ClosureLabel& c : i.closures) fprintf(ppf, " %i", c.lbl);
+      for (label l : i.lbls) fprintf(ppf, " %i", l);
       fprintf(ppf, ", %i", i.n);
       return;
     case IK::Koffsetclosure: fprintf(ppf, "\toffsetclosure %i", i.n); return;
@@ -88,9 +88,6 @@ void instruction(Formatter& ppf, const Instruction& i) {
         case lambda::IntegerComparison::Cle: fprintf(ppf, "\tleint"); return;
         case lambda::IntegerComparison::Cge: fprintf(ppf, "\tgeint"); return;
       }
-      return;
-    case IK::Kphyscomp:
-      fprintf(ppf, i.pcmp == lambda::PhysicalComparison::CPeq ? "\tphyseq" : "\tphysneq");
       return;
     case IK::Koffsetint: fprintf(ppf, "\toffsetint %i", i.n); return;
     case IK::Koffsetref: fprintf(ppf, "\toffsetref %i", i.n); return;

@@ -253,7 +253,6 @@ std::map<std::string, arg::Spec> actions() {
   a["-with-runtime"] = set(cf::with_runtime);
   a["-without-runtime"] = clear(cf::with_runtime);
   // Main
-  a["-bytecode-hints"] = set(cf::bytecode_hints);
   a["-compat-32"] = set(cf::bytecode_compatible_32);
   a["-custom"] = set(cf::custom_runtime);
   a["-dcamlprimc"] = set(cf::keep_camlprimc_file);

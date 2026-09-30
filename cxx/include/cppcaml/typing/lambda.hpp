@@ -76,7 +76,6 @@ enum class InitializationOrAssignment : std::uint8_t { Assignment, Heap_initiali
 enum class IsSafe : std::uint8_t { Safe, Unsafe };
 enum class LazyBlockTag : std::uint8_t { Lazy_tag, Forward_tag };
 enum class IntegerComparison : std::uint8_t { Ceq, Cne, Clt, Cgt, Cle, Cge };
-enum class PhysicalComparison : std::uint8_t { CPeq, CPneq };
 enum class FloatComparison : std::uint8_t { CFeq, CFneq, CFlt, CFnlt, CFgt, CFngt, CFle, CFnle, CFge, CFnge };
 enum class ArrayKind : std::uint8_t { Pgenarray, Paddrarray, Pintarray, Pfloatarray };
 enum class BigarrayKind : std::uint8_t {
@@ -117,13 +116,13 @@ struct Primitive {
     Praise,
     Psequand, Psequor, Pnot,
     Pnegint, Paddint, Psubint, Pmulint, Pdivint, Pmodint, Pandint, Porint, Pxorint, Plslint, Plsrint, Pasrint,
-    Pintcomp, Pphyscomp,
+    Pintcomp,
     Pcompare_ints, Pcompare_floats, Pcompare_bints,
     Poffsetint, Poffsetref,
     Pintoffloat, Pfloatofint, Pnegfloat, Pabsfloat, Paddfloat, Psubfloat, Pmulfloat, Pdivfloat, Pfloatcomp,
     Pstringlength, Pstringrefu, Pstringrefs, Pbyteslength, Pbytesrefu, Pbytessetu, Pbytesrefs, Pbytessets,
     Pmakearray, Pduparray, Parraylength, Parrayrefu, Parraysetu, Parrayrefs, Parraysets,
-    Pisint, Pisout, Pcheckbound,
+    Pisint, Pisout,
     Pbintofint, Pintofbint, Pcvtbint, Pnegbint, Paddbint, Psubbint, Pmulbint, Pdivbint, Pmodbint, Pandbint,
     Porbint, Pxorbint, Plslbint, Plsrbint, Pasrbint, Pbintcomp,
     Pbigarrayref, Pbigarrayset, Pbigarraydim,
@@ -135,7 +134,6 @@ struct Primitive {
     Pbswap16, Pbbswap,
     Pint_as_pointer,
     Patomic_load,
-    Patomic_fetch_add,
     Popaque,
     Pdls_get,
     Ppoll
@@ -148,7 +146,6 @@ struct Primitive {
   RaiseKind raise = RaiseKind::Raise_regular;                        // Praise
   IsSafe safe = IsSafe::Safe;                                        // Pdivint / Pmodint / Pdivbint / Pmodbint
   IntegerComparison icmp = IntegerComparison::Ceq;                   // Pintcomp / Pbintcomp
-  PhysicalComparison pcmp = PhysicalComparison::CPeq;                // Pphyscomp
   FloatComparison fcmp = FloatComparison::CFeq;                      // Pfloatcomp
   ArrayKind array = ArrayKind::Pgenarray;                            // Pmakearray ... Parraysets
   BoxedInteger bi = BoxedInteger::Pnativeint;  // all the bint ops; Pcvtbint source; Pcompare_bints; Pbbswap
@@ -381,7 +378,6 @@ const LFunction* map_lfunction(const std::function<lambda(lambda)>& f, const LFu
 lambda shallow_map(const std::function<lambda(lambda)>& f, lambda l);
 lambda bind(LetKind str, Ident::t var, lambda exp, lambda body);
 lambda bind_with_value_kind(LetKind str, Ident::t var, ValueKind k, lambda exp, lambda body);
-PhysicalComparison negate_physical_comparison(PhysicalComparison c);
 IntegerComparison negate_integer_comparison(IntegerComparison c);
 IntegerComparison swap_integer_comparison(IntegerComparison c);
 FloatComparison negate_float_comparison(FloatComparison c);
@@ -390,7 +386,6 @@ bool function_is_curried(const LFunction* f);
 std::optional<Slice<lambda>> find_exact_application(FunctionKind kind, long arity, Slice<lambda> args);
 long max_arity();
 long tag_of_lazy_tag(LazyBlockTag t);
-lambda make_atomic_loc(const ScopedLocation& loc, lambda arg, lambda field);
 long next_raise_count();
 lambda staticfail();
 bool is_guarded(lambda l);

@@ -18,7 +18,7 @@ namespace cppcaml::typing::predef {
 enum class TypeConstr {
   Int, Char, String, Bytes, Float, Bool, Unit, Exn, Eff, Continuation, Array,
   List, Option, Nativeint, Int32, Int64, Lazy_t, Extension_constructor,
-  Floatarray, Iarray, Atomic_loc, Todo_info
+  Floatarray, Iarray, Atomic_loc
 };
 const std::vector<TypeConstr>& all_type_constrs();
 bool is_abstract_type_constr(TypeConstr c);
@@ -31,10 +31,10 @@ std::optional<TypeConstr> find_type_constr(Path::t p);
 struct Idents {
   Ident::t int_, char_, bytes, float_, bool_, unit, exn, eff, continuation, array, list,
       option, nativeint, int32, int64, lazy_t, string, extension_constructor, floatarray,
-      iarray, atomic_loc, todo_info;
+      iarray, atomic_loc;
   Ident::t match_failure, out_of_memory, invalid_argument, failure, not_found, sys_error,
       end_of_file, division_by_zero, stack_overflow, sys_blocked_io, assert_failure,
-      undefined_recursive_module, continuation_already_taken, todo;
+      undefined_recursive_module, continuation_already_taken;
   Ident::t false_, true_, void_, nil, cons, none, some;
 };
 const Idents& idents();
@@ -42,8 +42,8 @@ const Idents& idents();
 struct Paths {
   Path::t int_, char_, bytes, float_, bool_, unit, exn, eff, continuation, array, list,
       option, nativeint, int32, int64, lazy_t, string, extension_constructor, floatarray,
-      iarray, atomic_loc, todo_info;
-  Path::t match_failure, assert_failure, undefined_recursive_module, todo;
+      iarray, atomic_loc;
+  Path::t match_failure, assert_failure, undefined_recursive_module;
 };
 const Paths& paths();
 
@@ -61,7 +61,6 @@ TypeExpr* type_int64();
 TypeExpr* type_string();
 TypeExpr* type_extension_constructor();
 TypeExpr* type_floatarray();
-TypeExpr* type_todo_info();
 // parameterised ones build a fresh node per call
 TypeExpr* type_eff(TypeExpr* t);
 TypeExpr* type_continuation(TypeExpr* t1, TypeExpr* t2);

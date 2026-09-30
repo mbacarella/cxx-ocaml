@@ -59,27 +59,12 @@ clambda::Primitive convert(const lambda::Primitive& prim) {
     SAME(Pmulfloat) SAME(Pdivfloat) SAME(Pfloatcomp) SAME(Pstringlength) SAME(Pstringrefu) SAME(Pstringrefs)
     SAME(Pbyteslength) SAME(Pbytesrefu) SAME(Pbytessetu) SAME(Pbytesrefs) SAME(Pbytessets) SAME(Pmakearray)
     SAME(Pduparray) SAME(Parraylength) SAME(Parrayrefu) SAME(Parraysetu) SAME(Parrayrefs) SAME(Parraysets)
-    SAME(Pisint) SAME(Pisout) SAME(Pcheckbound) SAME(Pcvtbint) SAME(Pnegbint) SAME(Paddbint) SAME(Psubbint)
+    SAME(Pisint) SAME(Pisout) SAME(Pcvtbint) SAME(Pnegbint) SAME(Paddbint) SAME(Psubbint)
     SAME(Pmulbint) SAME(Pbintofint) SAME(Pintofbint) SAME(Pandbint) SAME(Porbint) SAME(Pxorbint)
     SAME(Plslbint) SAME(Plsrbint) SAME(Pasrbint) SAME(Pbbswap) SAME(Pdivbint) SAME(Pmodbint) SAME(Pbintcomp)
     SAME(Pbigarrayref) SAME(Pbigarrayset) SAME(Pbigarraydim) SAME(Pbswap16) SAME(Pint_as_pointer)
-    SAME(Patomic_load) SAME(Patomic_fetch_add) SAME(Popaque) SAME(Pdls_get) SAME(Ppoll)
+    SAME(Patomic_load) SAME(Popaque) SAME(Pdls_get) SAME(Ppoll)
 #undef SAME
-    case LK::Pphyscomp: {
-      // [Pintcomp Ceq] / [Pintcomp Cne]: literals, one static block each in
-      // ocamlopt (a copy keeps the identity)
-      static const clambda::Primitive eq = [] {
-        clambda::Primitive c{CK::Pintcomp};
-        c.icmp = lambda::IntegerComparison::Ceq;
-        return c;
-      }();
-      static const clambda::Primitive ne = [] {
-        clambda::Primitive c{CK::Pintcomp};
-        c.icmp = lambda::IntegerComparison::Cne;
-        return c;
-      }();
-      return prim.pcmp == lambda::PhysicalComparison::CPeq ? eq : ne;
-    }
     case LK::Pstring_load_16: return sized(CK::Pstring_load, S::Sixteen, prim);
     case LK::Pstring_load_32: return sized(CK::Pstring_load, S::Thirty_two, prim);
     case LK::Pstring_load_64: return sized(CK::Pstring_load, S::Sixty_four, prim);
@@ -171,10 +156,10 @@ std::pair<Effects, Coeffects> for_primitive(const clambda::Primitive& prim) {
     case CK::Pbigarrayref:
       if (prim.unsafe) return {E::No_effects, C::Has_coeffects};
       return {E::Arbitrary_effects, C::Has_coeffects};
-    case CK::Parrayrefs: case CK::Pcheckbound: case CK::Pstringrefs: case CK::Pbytesrefs:
+    case CK::Parrayrefs: case CK::Pstringrefs: case CK::Pbytesrefs:
       return {E::Arbitrary_effects, C::Has_coeffects};
     case CK::Psetfield: case CK::Psetfield_computed: case CK::Psetfloatfield: case CK::Patomic_load:
-    case CK::Patomic_fetch_add: case CK::Parraysetu: case CK::Parraysets: case CK::Pbytessetu:
+    case CK::Parraysetu: case CK::Parraysets: case CK::Pbytessetu:
     case CK::Pbytessets: case CK::Pbytes_set: case CK::Pbigarrayset: case CK::Pbigstring_set:
       // Whether or not some of these are "unsafe" is irrelevant; they
       // always have an effect.

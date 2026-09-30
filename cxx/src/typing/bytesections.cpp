@@ -17,7 +17,6 @@ const char* name_to_string(Name n) {
     case Name::PRIM: return "PRIM";
     case Name::SYMB: return "SYMB";
     case Name::DBUG: return "DBUG";
-    case Name::HINT: return "HINT";
     case Name::CRCS: return "CRCS";
     case Name::RNTM: return "RNTM";
   }

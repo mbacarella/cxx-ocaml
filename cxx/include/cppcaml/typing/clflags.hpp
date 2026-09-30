@@ -87,7 +87,6 @@ inline bool plugin = false;                // -plugin
 inline bool use_threads = false;           // -thread
 inline bool verbose = false;               // -verbose
 inline bool with_runtime = true;           // -without-runtime
-inline bool bytecode_hints = false;        // -bytecode-hints
 inline bool bytecode_compatible_32 = false;  // -compat-32
 inline bool custom_runtime = false;        // -custom
 inline bool make_runtime = false;          // -make-runtime

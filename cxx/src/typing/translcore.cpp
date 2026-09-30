@@ -528,9 +528,11 @@ lam_t transl_exp0(bool in_new_scope, scopes sc, const tt::Expression* e) {
     }
     case EK::Texp_atomic_loc: {
       auto* x = static_cast<const tt::Texp_atomic_loc*>(d);
-      ScopedLocation loc = of_location(sc, e->exp_loc);
+      ValueKind k = typeopt::value_kind(x->exp->exp_env, x->exp->exp_type);
       auto [arg, lbl] = transl_atomic_loc(sc, x->exp, x->label);
-      return L::make_atomic_loc(loc, arg, lbl);
+      ScopedLocation loc = of_location(sc, e->exp_loc);
+      std::vector<ValueKind> shape{k, ValueKind::intval()};
+      return L::lprim(pmakeblock(0, MutableFlag::Immutable, &shape), slice({arg, lbl}), loc);
     }
     case EK::Texp_field: {
       auto* x = static_cast<const tt::Texp_field*>(d);
@@ -734,13 +736,23 @@ lam_t transl_exp0(bool in_new_scope, scopes sc, const tt::Expression* e) {
     }
     case EK::Texp_lazy: {
       const tt::Expression* le = static_cast<const tt::Texp_lazy*>(d)->exp;
-      typeopt::LazySummary s = typeopt::classify_lazy_argument(le);
-      if (s.kind == typeopt::LazySummary::Kind::Eager) {
-        if (s.repr == typeopt::LazySummary::ForwardRepr::Shortcut) return transl_exp_(sc, le);
-        Primitive p = L::prim(PK::Pmakelazyblock);
-        p.lazy_tag = L::LazyBlockTag::Forward_tag;
-        return L::lprim(p, slice({transl_exp_(sc, le)}), of_location(sc, le->exp_loc));
+      // when e needs no computation (constants, identifiers, ...), we
+      // optimize the translation just as Lazy.lazy_from_val would do
+      switch (typeopt::classify_lazy_argument(le)) {
+        case typeopt::LazyArgument::Constant_or_function:
+          // A constant expr (of type <> float if [Config.flat_float_array] is
+          // true) gets compiled as itself.
+          return transl_exp_(sc, le);
+        case typeopt::LazyArgument::Float_that_cannot_be_shortcut:
+        case typeopt::LazyArgument::Identifier_forward_value: {
+          Primitive p = L::prim(PK::Pmakelazyblock);
+          p.lazy_tag = L::LazyBlockTag::Forward_tag;
+          return L::lprim(p, slice({transl_exp_(sc, le)}), of_location(sc, le->exp_loc));
+        }
+        case typeopt::LazyArgument::Identifier_other: return transl_exp_(sc, le);
+        case typeopt::LazyArgument::Other: break;
       }
+      // other cases compile to a lazy block holding a function
       // lfunction ~kind ~params ~return ~body ~attr ~loc: ~body before ~params
       ScopedLocation loc = of_location(sc, le->exp_loc);
       FunctionAttribute attr = function_attribute_disallowing_arity_fusion();
@@ -877,18 +889,14 @@ FunInfo transl_tupled_function(scopes sc, env::t env, const Location& loc, Value
         std::vector<PatsExpr> pats_expr_list;
         for (const tt::Case* c : cases)
           pats_expr_list.push_back({matching::flatten_pattern(size, c->c_lhs), c->c_guard, c->c_rhs});
-        // if the match is partial, we cannot rely on GADT equations
-        std::optional<env::LocalEquations> local_equations;
-        if (eligible_cases->second == tt::Partial::Partial) local_equations = env::freeze_local_equations(env);
-        const env::LocalEquations* leq = local_equations ? &*local_equations : nullptr;
         // All the patterns might not share the same types. We must take the
         // union of the patterns types
         std::vector<ValueKind> kinds;
-        for (const tt::Pattern* pat : pats_expr_list[0].pats) kinds.push_back(typeopt::pattern_kind(leq, pat));
+        for (const tt::Pattern* pat : pats_expr_list[0].pats) kinds.push_back(typeopt::value_kind(pat->pat_env, pat->pat_type));
         for (std::size_t c = 1; c < pats_expr_list.size(); c++)
           for (std::size_t i = 0; i < kinds.size(); i++) {
             const tt::Pattern* pat = pats_expr_list[c].pats[i];
-            kinds[i] = typeopt::value_kind_union(kinds[i], typeopt::pattern_kind(leq, pat));
+            kinds[i] = typeopt::value_kind_union(kinds[i], typeopt::value_kind(pat->pat_env, pat->pat_type));
           }
         std::vector<Param> tparams;
         for (const ValueKind& kind : kinds) tparams.push_back(Param{Ident::create_local(OCAML_LIT("param")), kind});
@@ -943,24 +951,6 @@ FunInfo transl_curried_function(scopes sc, env::t env, const Location& loc, Valu
     body = matching::for_function(sc, fbody->loc, repr, L::lvar(fbody->param), slice(cases), fbody->partial);
     cases_param = Param{fbody->param, kind};
   }
-  // We freeze local GADTs equations to the set existing before the
-  // first partial match to avoid using equations that might be only
-  // valid if a match succeeds.
-  std::vector<std::optional<env::LocalEquations>> param_equations;
-  {
-    std::optional<env::LocalEquations> local_equations;
-    env::t prev_env = env;
-    for (const tt::FunctionParam* fp : params) {
-      if (!local_equations &&
-          (fp->fp_partial == tt::Partial::Partial ||
-           // in default arguments [?(pat=exp)], [exp] can raise and
-           // thus even a [Total] pattern can fail.
-           fp->fp_kind.kind == tt::FunctionParamKind::Kind::Tparam_optional_default))
-        local_equations = env::freeze_local_equations(prev_env);
-      prev_env = fp->fp_kind.pat->pat_env;
-      param_equations.push_back(local_equations);
-    }
-  }
   // List.fold_right over the params: from the last
   std::vector<Param> lparams;  // built reversed
   if (cases_param) lparams.push_back(*cases_param);
@@ -970,8 +960,7 @@ FunInfo transl_curried_function(scopes sc, env::t env, const Location& loc, Valu
     const Location& param_loc = fp->fp_loc;
     if (fp->fp_kind.kind == tt::FunctionParamKind::Kind::Tparam_pat) {
       const tt::Pattern* pat = fp->fp_kind.pat;
-      const std::optional<env::LocalEquations>& leq = param_equations[k];
-      ValueKind kind = typeopt::pattern_kind(leq ? &*leq : nullptr, pat);
+      ValueKind kind = typeopt::value_kind(pat->pat_env, pat->pat_type);
       body = matching::for_function(sc, param_loc, nullptr, L::lvar(param), slice({matching::PatAction{pat, body}}),
                                     fp->fp_partial);
       lparams.push_back(Param{param, kind});
@@ -1292,11 +1281,14 @@ lam_t transl_handler(scopes sc, const tt::Expression* e, const tt::Expression* b
   {
     Ident::t param = typecore::name_cases(OCAML_LIT("eff"), eff_caselist);
     Ident::t cont = Ident::create_local(OCAML_LIT("k"));
+    Ident::t cont_tail = Ident::create_local(OCAML_LIT("ktail"));
     std::vector<matching::PatAction> eff_cases = transl_cases(sc, cont, eff_caselist);
-    lam_t b = matching::for_handler(sc, e->exp_loc, L::lvar(param), L::lvar(cont), slice(eff_cases));
-    eff_fun = L::lfunction(L::FunctionKind::Curried,
-                           slice({Param{param, ValueKind::gen()}, Param{cont, ValueKind::gen()}}), ValueKind::gen(), b,
-                           dattr, unk);
+    lam_t b = matching::for_handler(sc, e->exp_loc, L::lvar(param), L::lvar(cont), L::lvar(cont_tail),
+                                    slice(eff_cases));
+    eff_fun = L::lfunction(
+        L::FunctionKind::Curried,
+        slice({Param{param, ValueKind::gen()}, Param{cont, ValueKind::gen()}, Param{cont_tail, ValueKind::gen()}}),
+        ValueKind::gen(), b, dattr, unk);
   }
   lam_t body_fun, arg;
   lam_t tb = transl_exp_(sc, body);
