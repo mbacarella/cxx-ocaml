@@ -312,8 +312,27 @@ std::vector<long> max_register_pressure(const mach::Operation& op);
 long safe_register_pressure(const mach::Operation& op);
 }  // namespace proc
 
+// ---- Interval: live intervals for the linear scan register allocator ----------------------------
+namespace interval {
+struct Range {
+  long rbegin, rend;
+};
+struct Interval {
+  reg::Reg* reg = nullptr;  // Reg.dummy until the register is seen
+  long ibegin = 0, iend = 0;
+  // the range list: ranges[first..] (while built, newest last)
+  std::vector<Range> ranges;
+  std::size_t first = 0;
+};
+struct Result {
+  std::vector<Interval*> intervals;  // sorted by start position
+  std::vector<Interval*> fixed_intervals;
+};
+}  // namespace interval
+
 // ---- Printmach ---------------------------------------------------------------------------------
 namespace printmach {
+void intervals(format::Formatter& ppf, const interval::Result& r);
 void reg(format::Formatter& ppf, const reg::Reg* r);
 void fundecl(format::Formatter& ppf, const mach::Fundecl& f);
 void phase(format::Formatter& ppf, const std::string& msg, const mach::Fundecl& f);

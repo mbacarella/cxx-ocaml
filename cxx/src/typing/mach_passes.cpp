@@ -1580,6 +1580,324 @@ std::vector<long> coloring_allocate_registers() {
   return num_stack_slots;
 }
 
+// ---- Interval: live intervals for the linear scan register allocator ---------------------------
+namespace {
+using interval::Interval;
+using interval::Range;
+
+// Check if two intervals overlap
+bool overlap(const Interval* i0, const Interval* i1) {
+  std::size_t k0 = i0->first, k1 = i1->first;
+  while (k0 < i0->ranges.size() && k1 < i1->ranges.size()) {
+    const Range& r0 = i0->ranges[k0];
+    const Range& r1 = i1->ranges[k1];
+    if (r0.rend >= r1.rbegin && r1.rend >= r0.rbegin) return true;
+    if (r0.rend < r1.rend) ++k0;
+    else if (r0.rend > r1.rend) ++k1;
+    else {
+      ++k0;
+      ++k1;
+    }
+  }
+  return false;
+}
+
+bool is_live(const Interval* i, long pos) {
+  for (std::size_t k = i->first; k < i->ranges.size(); ++k) {
+    if (pos < i->ranges[k].rbegin) return false;
+    if (pos <= i->ranges[k].rend) return true;
+  }
+  return false;
+}
+
+void remove_expired_ranges(Interval* i, long pos) {
+  while (i->first < i->ranges.size() && !(pos < i->ranges[i->first].rend)) ++i->first;
+}
+
+enum class Kind { Result, Argument, Live };
+
+std::vector<Interval> g_intervals;
+interval::Result g_interval_result;
+
+void update_interval_position(long pos, Kind kind, Reg* reg) {
+  Interval& i = g_intervals[reg->stamp];
+  long on = pos << 1;
+  long off = on + 1;
+  long rbegin = kind == Kind::Result ? off : on;
+  long rend = kind == Kind::Argument ? on : off;
+  if (i.iend == 0) {
+    i.ibegin = rbegin;
+    i.reg = reg;
+    i.ranges = {{rbegin, rend}};
+  } else {
+    // the list's head: the newest range
+    Range& r = i.ranges.back();
+    long ridx = r.rend >> 1;
+    if (pos - ridx <= 1) r.rend = rend;
+    else i.ranges.push_back({rbegin, rend});
+  }
+  i.iend = rend;
+}
+
+void update_interval_position_by_array(const Regs& regs, long pos, Kind kind) {
+  for (Reg* r : regs) update_interval_position(pos, kind, r);
+}
+
+void update_interval_position_by_instr(Instr i, long pos) {
+  update_interval_position_by_array(i->arg, pos, Kind::Argument);
+  update_interval_position_by_array(i->res, pos, Kind::Result);
+  for (Reg* r : i->live) update_interval_position(pos, Kind::Live, r);
+}
+
+void insert_destroyed_at_oper(Instr i, long pos) {
+  Regs destroyed = proc::destroyed_at_oper(*i);
+  if (!destroyed.empty()) update_interval_position_by_array(destroyed, pos, Kind::Result);
+}
+
+void insert_destroyed_at_raise(long pos) {
+  Regs destroyed = proc::destroyed_at_raise();
+  if (!destroyed.empty()) update_interval_position_by_array(destroyed, pos, Kind::Result);
+}
+}  // namespace
+
+// Build all intervals.  The intervals will be expanded by one step at the
+// start and end of a basic block.
+const interval::Result& build_intervals(const Fundecl& fd) {
+  g_intervals.assign(static_cast<std::size_t>(reg::num_registers()), Interval{});
+  long pos = 0;
+  std::function<void(Instr)> walk_instruction = [&](Instr i) {
+    for (;;) {
+      ++pos;
+      update_interval_position_by_instr(i, pos);
+      switch (i->desc) {
+        case IK::Iend: return;
+        case IK::Iop:
+          if (!(i->op.k == MK::Icall_ind || i->op.k == MK::Icall_imm || (i->op.k == MK::Iextcall && i->op.alloc) ||
+                i->op.k == MK::Itailcall_ind || i->op.k == MK::Itailcall_imm))
+            insert_destroyed_at_oper(i, pos);
+          break;
+        case IK::Ireturn: insert_destroyed_at_oper(i, pos); break;
+        case IK::Iifthenelse:
+          insert_destroyed_at_oper(i, pos);
+          walk_instruction(i->ifso);
+          walk_instruction(i->ifnot);
+          break;
+        case IK::Iswitch:
+          insert_destroyed_at_oper(i, pos);
+          for (Instr c : i->cases) walk_instruction(c);
+          break;
+        case IK::Icatch:
+          insert_destroyed_at_oper(i, pos);
+          for (auto& h : i->handlers) walk_instruction(h.body);
+          walk_instruction(i->body);
+          break;
+        case IK::Iexit: insert_destroyed_at_oper(i, pos); break;
+        case IK::Itrywith:
+          insert_destroyed_at_oper(i, pos);
+          walk_instruction(i->ifso);
+          insert_destroyed_at_raise(pos);
+          walk_instruction(i->ifnot);
+          break;
+        case IK::Iraise: break;
+      }
+      i = i->next;
+    }
+  };
+  walk_instruction(fd.fun_body);
+  // Generate the interval and fixed interval lists (built by consing, so
+  // the highest stamp first; the ranges are already oldest first)
+  interval::Result& r = g_interval_result;
+  r.intervals.clear();
+  r.fixed_intervals.clear();
+  for (std::size_t k = g_intervals.size(); k-- > 0;) {
+    Interval* i = &g_intervals[k];
+    if (i->iend != 0) {
+      if (i->reg->loc.k == LK::Reg) r.fixed_intervals.push_back(i);
+      else r.intervals.push_back(i);
+    }
+  }
+  // Sort the intervals according to their start position (List.sort: stable)
+  std::stable_sort(r.intervals.begin(), r.intervals.end(),
+                   [](const Interval* a, const Interval* b) { return a->ibegin < b->ibegin; });
+  return r;
+}
+
+// ---- Linscan: linear scan register allocation ------------------------------------------------
+namespace {
+struct IntervalLess {
+  bool operator()(const Interval* i, const Interval* j) const {
+    if (i->iend != j->iend) return i->iend < j->iend;
+    return i->reg->stamp < j->reg->stamp;
+  }
+};
+using IntervalSet = std::set<Interval*, IntervalLess>;
+
+// Live intervals per register class
+struct ClassIntervals {
+  IntervalSet ci_fixed;
+  IntervalSet ci_active;
+  IntervalSet ci_inactive;
+  IntervalSet ci_spilled;  // spilled stack slots (reg.loc = Stack (Local n)) still in use
+  std::set<long> ci_free_slots;  // expired stack slots available for reuse
+};
+
+// split_by_pos: the intervals ending before [pos] leave [s] (returned)
+IntervalSet take_expired(IntervalSet& s, long pos) {
+  IntervalSet expired;
+  while (!s.empty() && (*s.begin())->iend < pos) expired.insert(s.extract(s.begin()));
+  return expired;
+}
+
+void remove_expired_ranges(const IntervalSet& s, long pos) {
+  for (Interval* i : s) remove_expired_ranges(i, pos);
+}
+
+bool same_loc(const reg::Location& a, const reg::Location& b);  // Reload's
+
+struct Linscan {
+  ClassIntervals active[proc::num_register_classes];
+  std::vector<long> num_stack_slots = std::vector<long>(proc::num_register_classes, 0);
+
+  void release_expired_spilled(ClassIntervals& ci, long pos) {
+    for (Interval* i : take_expired(ci.ci_spilled, pos)) ci.ci_free_slots.insert(i->reg->loc.n);
+  }
+  void release_expired_fixed(ClassIntervals& ci, long pos) {
+    take_expired(ci.ci_fixed, pos);
+    remove_expired_ranges(ci.ci_fixed, pos);
+  }
+  void release_expired_active(ClassIntervals& ci, long pos) {
+    take_expired(ci.ci_active, pos);
+    remove_expired_ranges(ci.ci_active, pos);
+    for (auto it = ci.ci_active.begin(); it != ci.ci_active.end();) {
+      if (is_live(*it, pos)) ++it;
+      else ci.ci_inactive.insert(ci.ci_active.extract(it++));
+    }
+  }
+  void release_expired_inactive(ClassIntervals& ci, long pos) {
+    take_expired(ci.ci_inactive, pos);
+    remove_expired_ranges(ci.ci_inactive, pos);
+    for (auto it = ci.ci_inactive.begin(); it != ci.ci_inactive.end();) {
+      if (is_live(*it, pos)) ci.ci_active.insert(ci.ci_inactive.extract(it++));
+      else ++it;
+    }
+  }
+
+  // Allocate a stack slot to the interval.  [existing] indicates whether we
+  // are spilling an already allocated interval (which requires a new stack
+  // slot) or spilling a new interval, in which case we may reuse an expired
+  // stack slot.
+  void allocate_stack_slot(bool existing, Interval* i) {
+    long cl = proc::register_class(i->reg);
+    ClassIntervals& ci = active[cl];
+    long ss;
+    if (!existing && !ci.ci_free_slots.empty()) {
+      ss = *ci.ci_free_slots.begin();
+      ci.ci_free_slots.erase(ci.ci_free_slots.begin());
+    } else {
+      ss = num_stack_slots[cl];
+      num_stack_slots[cl] = ss + 1;
+    }
+    i->reg->loc = {LK::Local, ss};
+    i->reg->spill = true;
+    ci.ci_spilled.insert(i);
+  }
+
+  // Find a register for the given interval and assigns this register.  The
+  // interval is added to active.  false (Not_found) if no free registers left.
+  bool allocate_free_register(Interval* i) {
+    if (i->reg->loc.k != LK::Unknown) return true;
+    if (i->reg->spill) {
+      // Allocate a stack slot for the already spilled interval
+      allocate_stack_slot(false, i);
+      return true;
+    }
+    // We need to allocate a register to this interval somehow
+    long cl = proc::register_class(i->reg);
+    long rn = proc::num_available_registers[cl];
+    if (rn == 0) return false;  // There are no registers available for this class
+    ClassIntervals& ci = active[cl];
+    long r0 = proc::first_available_register[cl];
+    // Create register mask for this class (with frame pointers, some
+    // registers may have indexes that are off-bounds)
+    std::vector<bool> regmask(rn, true);
+    // Remove all assigned registers from the register mask
+    for (Interval* j : ci.ci_active)
+      if (j->reg->loc.k == LK::Reg) {
+        long r = j->reg->loc.n;
+        if (r - r0 < rn) regmask.at(r - r0) = false;
+      }
+    // Remove all overlapping registers from the register mask
+    auto remove_bound_overlapping = [&](Interval* j) {
+      if (j->reg->loc.k == LK::Reg) {
+        long r = j->reg->loc.n;
+        if (r - r0 < rn && regmask.at(r - r0) && overlap(j, i)) regmask[r - r0] = false;
+      }
+    };
+    for (Interval* j : ci.ci_inactive) remove_bound_overlapping(j);
+    for (Interval* j : ci.ci_fixed) remove_bound_overlapping(j);
+    // Assign the first free register (if any)
+    for (long r = 0; r < rn; ++r)
+      if (regmask[r]) {
+        // Assign the free register and insert the current interval into
+        // the active list
+        i->reg->loc = {LK::Reg, r0 + r};
+        i->reg->spill = false;
+        ci.ci_active.insert(i);
+        return true;
+      }
+    return false;
+  }
+
+  void allocate_blocked_register(Interval* i) {
+    long cl = proc::register_class(i->reg);
+    ClassIntervals& ci = active[cl];
+    if (!ci.ci_active.empty()) {
+      Interval* ilast = *ci.ci_active.rbegin();
+      auto chk = [&](Interval* r) { return same_loc(r->reg->loc, ilast->reg->loc) && overlap(r, i); };
+      // Last interval in active is the last interval, so spill it -- but
+      // only if its physical register is admissible for the current interval
+      if (ilast->iend > i->iend && !(std::any_of(ci.ci_fixed.begin(), ci.ci_fixed.end(), chk) ||
+                                     std::any_of(ci.ci_inactive.begin(), ci.ci_inactive.end(), chk))) {
+        ci.ci_active.erase(ilast);
+        if (ilast->reg->loc.k != LK::Reg) throw std::logic_error("Linscan.allocate_blocked_register");
+        // Use register from last interval for current interval
+        i->reg->loc = ilast->reg->loc;
+        // Remove the last interval from active and insert the current
+        ci.ci_active.insert(i);
+        // Now get a new stack slot for the spilled register
+        allocate_stack_slot(true, ilast);
+        return;
+      }
+    }
+    // Either the current interval is last and we have to spill it, or there
+    // are no registers at all in the register class
+    allocate_stack_slot(false, i);
+  }
+
+  void walk_interval(Interval* i) {
+    long pos = i->ibegin & ~0x01L;
+    // Release all intervals that have been expired at the current position
+    for (ClassIntervals& ci : active) {
+      release_expired_fixed(ci, pos);
+      release_expired_active(ci, pos);
+      release_expired_inactive(ci, pos);
+      release_expired_spilled(ci, pos);
+    }
+    // Allocate free register (if any); else decide which interval to spill
+    if (!allocate_free_register(i)) allocate_blocked_register(i);
+  }
+};
+}  // namespace
+
+std::vector<long> linscan_allocate_registers(const interval::Result& intervals) {
+  Linscan ls;
+  // Add all fixed intervals (sorted by end position)
+  for (Interval* i : intervals.fixed_intervals) ls.active[proc::register_class(i->reg)].ci_fixed.insert(i);
+  // Walk all the intervals within the list
+  for (Interval* i : intervals.intervals) ls.walk_interval(i);
+  return ls.num_stack_slots;
+}
+
 // ---- Reload: insert load/stores for pseudoregs that got assigned to stack locations ----------
 namespace {
 
