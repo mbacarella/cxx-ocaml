@@ -38,7 +38,7 @@ const std::string_view* Fname::intern(std::string_view s) {
   return it->second;
 }
 
-char* Zone::huge_block(std::size_t sz) {
+char* Zone::huge_block(std::size_t sz, bool advise) {
   constexpr std::size_t huge = 2 << 20;
   // over-map by one huge page and trim to a 2 MiB-aligned [sz] span
   void* m = ::mmap(nullptr, sz + huge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -48,7 +48,7 @@ char* Zone::huge_block(std::size_t sz) {
   if (p > base) ::munmap(base, p - base);
   char* end = base + sz + huge;
   if (end > p + sz) ::munmap(p + sz, end - (p + sz));
-  ::madvise(p, sz, MADV_HUGEPAGE);
+  if (advise) ::madvise(p, sz, MADV_HUGEPAGE);
   return p;
 }
 void Fname::relocate(const Zone& dying, std::string_view (*copy_of)(void*, std::string_view), void* ctx) {
