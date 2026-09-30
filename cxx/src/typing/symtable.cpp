@@ -1,6 +1,7 @@
 // Port of bytecomp/symtable.ml (batch linking); see symtable.hpp.
 #include "cppcaml/typing/symtable.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <iostream>
@@ -207,9 +208,10 @@ V data_global_map() {
 }
 
 std::vector<std::string> required_compunits(const std::vector<Reloc>& patchlist) {
-  std::vector<std::string> r;  // List.fold_left, consing
+  std::vector<std::string> r;  // List.fold_left, consing: built in reverse, then reversed
   for (const Reloc& rel : patchlist)
-    if (rel.k == Reloc::K::Reloc_getcompunit) r.insert(r.begin(), rel.name);
+    if (rel.k == Reloc::K::Reloc_getcompunit) r.push_back(rel.name);
+  std::reverse(r.begin(), r.end());
   return r;
 }
 

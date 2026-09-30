@@ -340,10 +340,136 @@ bool compressed_header(const std::uint8_t* data, std::size_t len, std::size_t of
   h.data_len = vlq();
   h.uncompressed_len = vlq();
   h.num_objects = vlq();
-  (void)vlq();  // size_32
-  (void)vlq();  // size_64
+  h.size_32 = vlq();
+  h.size_64 = vlq();
   if (off + h.header_len + h.data_len > len) throw Error("marshal: truncated compressed value");
   return true;
+}
+
+namespace {
+// A decompressed stream's items as extern.c writes them uncompressed: the
+// compressed format's shared references are absolute object numbers, the
+// plain format's the distance back from the current object count, each
+// written with extern_shared_reference's width.  Everything else is copied;
+// the objects are counted as the reader numbers them.
+std::vector<std::uint8_t> relative_shared(const std::vector<std::uint8_t>& in) {
+  std::vector<std::uint8_t> out;
+  out.reserve(in.size());
+  std::size_t p = 0, n = in.size();
+  std::uint64_t objs = 0;
+  auto need = [&](std::size_t k) {
+    if (p + k > n) throw Error("marshal: unexpected end of input");
+  };
+  auto be = [&](std::size_t k) {
+    need(k);
+    std::uint64_t v = 0;
+    for (std::size_t i = 0; i < k; ++i) v = (v << 8) | in[p + i];
+    p += k;
+    return v;
+  };
+  auto put = [&](std::uint64_t v, int k) {
+    for (int i = k - 1; i >= 0; --i) out.push_back(static_cast<std::uint8_t>(v >> (8 * i)));
+  };
+  while (p < n) {
+    std::size_t start = p;
+    int code = in[p++];
+    if (code >= PREFIX_SMALL_INT) {
+      if (code >= PREFIX_SMALL_BLOCK && ((code >> 4) & 0x7) != 0) ++objs;
+    } else if (code >= PREFIX_SMALL_STRING) {
+      need(code & 0x1F);
+      p += code & 0x1F;
+      ++objs;
+    } else {
+      switch (code) {
+        case CODE_INT8: need(1); p += 1; break;
+        case CODE_INT16: need(2); p += 2; break;
+        case CODE_INT32: need(4); p += 4; break;
+        case CODE_INT64: need(8); p += 8; break;
+        case CODE_SHARED8:
+        case CODE_SHARED16:
+        case CODE_SHARED32:
+        case CODE_SHARED64: {
+          std::uint64_t a = be(code == CODE_SHARED8 ? 1 : code == CODE_SHARED16 ? 2 : code == CODE_SHARED32 ? 4 : 8);
+          if (a >= objs) throw Error("marshal: shared back-reference out of range");
+          std::uint64_t d = objs - a;
+          if (d < 0x100) { out.push_back(CODE_SHARED8); put(d, 1); }
+          else if (d < 0x10000) { out.push_back(CODE_SHARED16); put(d, 2); }
+          else if (d >= (std::uint64_t{1} << 32)) { out.push_back(CODE_SHARED64); put(d, 8); }
+          else { out.push_back(CODE_SHARED32); put(d, 4); }
+          continue;
+        }
+        case CODE_BLOCK32: if ((be(4) >> 10) != 0) ++objs; break;
+        case CODE_BLOCK64: if ((be(8) >> 10) != 0) ++objs; break;
+        case CODE_STRING8: { std::uint64_t k = be(1); need(k); p += k; ++objs; break; }
+        case CODE_STRING32: { std::uint64_t k = be(4); need(k); p += k; ++objs; break; }
+        case CODE_STRING64: { std::uint64_t k = be(8); need(k); p += k; ++objs; break; }
+        case CODE_DOUBLE_BIG:
+        case CODE_DOUBLE_LITTLE: need(8); p += 8; ++objs; break;
+        case CODE_DOUBLE_ARRAY8_BIG:
+        case CODE_DOUBLE_ARRAY8_LITTLE: { std::uint64_t k = be(1); need(8 * k); p += 8 * k; ++objs; break; }
+        case CODE_DOUBLE_ARRAY32_BIG:
+        case CODE_DOUBLE_ARRAY32_LITTLE: { std::uint64_t k = be(4); need(8 * k); p += 8 * k; ++objs; break; }
+        case CODE_DOUBLE_ARRAY64_BIG:
+        case CODE_DOUBLE_ARRAY64_LITTLE: { std::uint64_t k = be(8); need(8 * k); p += 8 * k; ++objs; break; }
+        case CODE_CUSTOM_LEN:
+        case CODE_CUSTOM_FIXED:
+        case OLD_CODE_CUSTOM: {  // read_custom's consumption
+          std::string id;
+          for (;;) {
+            need(1);
+            char c = static_cast<char>(in[p++]);
+            if (c == '\0') break;
+            id.push_back(c);
+          }
+          std::uint64_t bsize = 0;
+          if (code == CODE_CUSTOM_LEN) { be(4); bsize = be(8); }
+          if (id == "_i") { need(4); p += 4; }
+          else if (id == "_j") { need(8); p += 8; }
+          else if (id == "_n") { need(1); int t = in[p++]; std::size_t k = t == 1 ? 4 : 8; need(k); p += k; }
+          else if (code == CODE_CUSTOM_LEN) { need(bsize); p += bsize; }
+          else throw Error("marshal: unsupported custom block '" + id + "'");
+          ++objs;
+          break;
+        }
+        default: throw Error("marshal: unsupported code " + std::to_string(code));
+      }
+    }
+    out.insert(out.end(), in.begin() + static_cast<std::ptrdiff_t>(start), in.begin() + static_cast<std::ptrdiff_t>(p));
+  }
+  return out;
+}
+}  // namespace
+
+std::vector<std::uint8_t> raw_value(const std::uint8_t* data, std::size_t len, std::size_t& off) {
+  CompressedHeader h;
+  if (!compressed_header(data, len, off, h)) {
+    std::size_t start = off;
+    skip_value(data, len, off);
+    return std::vector<std::uint8_t>(data + start, data + off);
+  }
+  std::vector<std::uint8_t> body = relative_shared(decompress(data, len, off, h));
+  off += h.header_len + h.data_len;
+  // extern.c: the big header when a length does not fit 32 bits
+  std::vector<std::uint8_t> out;
+  auto be = [&](std::uint64_t n, int bytes) {
+    for (int k = bytes - 1; k >= 0; --k) out.push_back(static_cast<std::uint8_t>(n >> (8 * k)));
+  };
+  constexpr std::uint64_t lim = std::uint64_t{1} << 32;
+  if (body.size() >= lim || h.size_32 >= lim || h.size_64 >= lim) {
+    be(MAGIC_BIG, 4);
+    be(0, 4);
+    be(body.size(), 8);
+    be(h.num_objects, 8);
+    be(h.size_64, 8);
+  } else {
+    be(MAGIC_SMALL, 4);
+    be(body.size(), 4);
+    be(h.num_objects, 4);
+    be(h.size_32, 4);
+    be(h.size_64, 4);
+  }
+  out.insert(out.end(), body.begin(), body.end());
+  return out;
 }
 
 std::vector<std::uint8_t> decompress(const std::uint8_t* data, std::size_t len, std::size_t off,

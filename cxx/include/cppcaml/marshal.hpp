@@ -178,7 +178,7 @@ private:
 // false when the value there is not compressed.  The payload is at
 // off + header_len, data_len bytes of a zstd frame.
 struct CompressedHeader {
-  std::size_t header_len, data_len, uncompressed_len, num_objects;
+  std::size_t header_len, data_len, uncompressed_len, num_objects, size_32 = 0, size_64 = 0;
 };
 bool compressed_header(const std::uint8_t* data, std::size_t len, std::size_t off, CompressedHeader& h);
 // intern.c's caml_intern_decompress_input (zstd.c: ZSTD_decompress);
@@ -195,5 +195,11 @@ std::size_t read_value(const std::uint8_t* data, std::size_t len,
 // cmi's signature) to reach the next one (its crc table) without materialising
 // the whole node graph.  Throws marshal::Error on a bad/short header.
 void skip_value(const std::uint8_t* data, std::size_t len, std::size_t& off);
+
+// The bytes output_value writes for the value input_value reads at data[off]
+// (advancing off past it): the value re-marshaled unchanged is the same
+// graph walked in the same order, so these are its bytes as they are, or,
+// when compressed, the decompressed data under extern.c's plain header.
+std::vector<std::uint8_t> raw_value(const std::uint8_t* data, std::size_t len, std::size_t& off);
 
 }  // namespace cppcaml::marshal

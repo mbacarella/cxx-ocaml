@@ -99,22 +99,7 @@ class Set {
   std::vector<Reg*> v_;
 };
 
-// An OCaml list built by consing (the newest first): push_front appends to
-// a vector, iteration runs backwards (a std::deque allocates a chunk and a
-// map for each register, even an empty one)
-template <class T>
-class NewestFirst {
- public:
-  void push_front(T x) { v_.push_back(std::move(x)); }
-  void clear() { v_.clear(); }
-  auto begin() const { return v_.rbegin(); }
-  auto end() const { return v_.rend(); }
-  std::size_t size() const { return v_.size(); }
-  bool empty() const { return v_.empty(); }
-
- private:
-  std::vector<T> v_;
-};
+using ::cppcaml::typing::NewestFirst;
 
 struct Reg {
   RawName raw_name;
