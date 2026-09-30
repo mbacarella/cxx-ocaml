@@ -103,18 +103,12 @@ void set_input_lexbuf(const std::string& name) {
 }
 
 // the values of a binary AST's contents after its magic: input_name, AST
-// With [scratch], the generic value's nodes are allocated there (what the
-// caller drops once it has decoded the parsetree), its strings and position
-// records in the current zone.
-std::pair<std::string, const OValue*> input_ast(const std::string& contents, AstKind kind, Zone* scratch = nullptr) {
+std::pair<std::string, const OValue*> input_ast(const std::string& contents, AstKind kind) {
   std::size_t off = magic_of_kind(kind).size();
   auto* d = reinterpret_cast<const std::uint8_t*>(contents.data());
-  Zone* keep = scratch ? &zone() : nullptr;
-  std::optional<ZoneScope> in_scratch;
-  if (scratch) in_scratch.emplace(*scratch);
-  const OValue* name = cmi_format::input_ovalue(d, contents.size(), off, keep);
+  const OValue* name = cmi_format::input_ovalue(d, contents.size(), off);
   if (name->kind != OValue::Kind::String) throw cppcaml::marshal::Error("input_value: not a string");
-  const OValue* ast = cmi_format::input_ovalue(d, contents.size(), off, keep);
+  const OValue* ast = cmi_format::input_ovalue(d, contents.size(), off);
   return {std::string(name->s), ast};
 }
 
@@ -307,29 +301,33 @@ bool is_ast_file(const std::string& contents, AstKind kind) {
 }
 
 namespace {
+// the input name, then the AST decoded straight from its marshaled form
 template <class R, class F>
 R read_ast_file(const std::string& contents, AstKind kind, F&& decode) {
-  // the generic value is only decoded: its nodes go when the parsetree is made
-  Zone scratch;
-  auto [name, ast] = input_ast(contents, kind, &scratch);
-  location::input_name = name;
-  set_input_lexbuf(name);
+  std::size_t off = magic_of_kind(kind).size();
+  auto* d = reinterpret_cast<const std::uint8_t*>(contents.data());
+  const OValue* name = cmi_format::input_ovalue(d, contents.size(), off);
+  if (name->kind != OValue::Kind::String) throw cppcaml::marshal::Error("input_value: not a string");
+  location::input_name = std::string(name->s);
+  set_input_lexbuf(location::input_name);
   if (clflags::unsafe)
     location::prerr_warning(location::in_file(location::input_name),
                             warnings::Warning::make(warnings::Warning::K::Unsafe_array_syntax_without_parsing));
-  return decode(ast);
+  return decode(d, contents.size(), off);
 }
 }  // namespace
 
 Structure read_ast_structure(const std::string& contents) {
-  Structure s = read_ast_file<Structure>(contents, AstKind::Structure,
-                                         [](const OValue* v) { return pt::structure_of_ovalue(v); });
+  Structure s = read_ast_file<Structure>(contents, AstKind::Structure, [](auto d, std::size_t n, std::size_t& o) {
+    return pt::structure_of_marshal(d, n, o);
+  });
   if (clflags::all_ppx.empty()) ast_invariants::structure(s);
   return s;
 }
 Signature read_ast_signature(const std::string& contents) {
-  Signature s = read_ast_file<Signature>(contents, AstKind::Signature,
-                                         [](const OValue* v) { return pt::signature_of_ovalue(v); });
+  Signature s = read_ast_file<Signature>(contents, AstKind::Signature, [](auto d, std::size_t n, std::size_t& o) {
+    return pt::signature_of_marshal(d, n, o);
+  });
   if (clflags::all_ppx.empty()) ast_invariants::signature(s);
   return s;
 }
