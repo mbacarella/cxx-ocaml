@@ -3,8 +3,16 @@
 #include <dirent.h>
 #include "cppcaml/typing/persistent_env.hpp"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
 #include <filesystem>
 
 #include "cppcaml/typing/utf8_lexeme.hpp"
@@ -28,17 +36,125 @@ struct Dir {
   bool hidden;
 };
 
+// A directory's listing, cached on disk across compilations: every compiler
+// of a parallel build lists the same load path, and concurrent getdents on
+// one directory contend in the kernel (in a 32-way dune build, most of the
+// compilers' system time).  An entry is keyed by the directory's device and
+// inode and valid while its mtime and ctime are the ones recorded; it is
+// recorded only for a directory unchanged for two seconds, so that any later
+// change moves a timestamp.  The names keep readdir's order.
+// CPPCAML_DIR_CACHE=0 disables it, =<dir> puts it in <dir> (default
+// $XDG_CACHE_HOME/c++ocamlc/dirs, else ~/.cache/c++ocamlc/dirs).
+namespace dir_cache {
+const std::string& dir() {
+  static const std::string d = [] {
+    const char* e = std::getenv("CPPCAML_DIR_CACHE");
+    if (e && std::strcmp(e, "0") == 0) return std::string();
+    std::string r;
+    if (e && *e) r = e;
+    else if (const char* x = std::getenv("XDG_CACHE_HOME"); x && *x) r = std::string(x) + "/c++ocamlc/dirs";
+    else if (const char* h = std::getenv("HOME"); h && *h) r = std::string(h) + "/.cache/c++ocamlc/dirs";
+    else return std::string();
+    std::error_code ec;
+    fs::create_directories(r, ec);
+    return ec ? std::string() : r;
+  }();
+  return d;
+}
+struct Header {
+  std::uint64_t magic, dev, ino, mtime_s, mtime_ns, ctime_s, ctime_ns, count;
+};
+constexpr std::uint64_t kMagic = 0x6370706461697231ULL;  // "cppdair1"
+std::string file_of(const struct stat& st) {
+  char b[64];
+  std::snprintf(b, sizeof b, "/%llx-%llx", static_cast<unsigned long long>(st.st_dev),
+                static_cast<unsigned long long>(st.st_ino));
+  return dir() + b;
+}
+Header header_of(const struct stat& st, std::uint64_t count) {
+  return Header{kMagic,
+                static_cast<std::uint64_t>(st.st_dev),
+                static_cast<std::uint64_t>(st.st_ino),
+                static_cast<std::uint64_t>(st.st_mtim.tv_sec),
+                static_cast<std::uint64_t>(st.st_mtim.tv_nsec),
+                static_cast<std::uint64_t>(st.st_ctim.tv_sec),
+                static_cast<std::uint64_t>(st.st_ctim.tv_nsec),
+                count};
+}
+bool load(const struct stat& st, std::vector<std::string>& files) {
+  int fd = ::open(file_of(st).c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return false;
+  std::string buf;
+  char chunk[65536];
+  for (;;) {
+    ssize_t n = ::read(fd, chunk, sizeof chunk);
+    if (n <= 0) break;
+    buf.append(chunk, static_cast<std::size_t>(n));
+  }
+  ::close(fd);
+  if (buf.size() < sizeof(Header)) return false;
+  Header h, want = header_of(st, 0);
+  std::memcpy(&h, buf.data(), sizeof h);
+  if (h.magic != kMagic || h.dev != want.dev || h.ino != want.ino || h.mtime_s != want.mtime_s ||
+      h.mtime_ns != want.mtime_ns || h.ctime_s != want.ctime_s || h.ctime_ns != want.ctime_ns)
+    return false;
+  std::vector<std::string> out;
+  out.reserve(h.count);
+  std::size_t p = sizeof h;
+  for (std::uint64_t k = 0; k < h.count; ++k) {
+    std::size_t e = buf.find('\0', p);
+    if (e == std::string::npos) return false;
+    out.emplace_back(buf, p, e - p);
+    p = e + 1;
+  }
+  if (p != buf.size()) return false;
+  files = std::move(out);
+  return true;
+}
+void record(const struct stat& st, const std::vector<std::string>& files) {
+  struct timespec now;
+  ::clock_gettime(CLOCK_REALTIME, &now);
+  auto settled = [&](const struct timespec& t) { return t.tv_sec + 2 < now.tv_sec; };
+  if (!settled(st.st_mtim) || !settled(st.st_ctim)) return;
+  std::string buf(sizeof(Header), '\0');
+  Header h = header_of(st, files.size());
+  std::memcpy(buf.data(), &h, sizeof h);
+  for (const std::string& f : files) {
+    buf += f;
+    buf += '\0';
+  }
+  std::string target = file_of(st);
+  std::string tmp = target + ".tmp." + std::to_string(::getpid());
+  int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  if (fd < 0) return;
+  bool ok = ::write(fd, buf.data(), buf.size()) == static_cast<ssize_t>(buf.size());
+  ::close(fd);
+  if (!ok || ::rename(tmp.c_str(), target.c_str()) != 0) ::unlink(tmp.c_str());
+}
+}  // namespace dir_cache
+
 static Dir dir_create(bool hidden, const std::string& path) {
   // readdir_compat: a missing directory has no files; "" is the current one
   // (readdir's order, without "." and "..", as Sys.readdir)
   Dir d{path, {}, hidden};
-  if (DIR* dp = ::opendir(path.empty() ? "." : path.c_str())) {
+  const char* p = path.empty() ? "." : path.c_str();
+  struct stat st;
+  bool cacheable = !dir_cache::dir().empty() && ::stat(p, &st) == 0 && S_ISDIR(st.st_mode);
+  if (cacheable && dir_cache::load(st, d.files)) return d;
+  if (DIR* dp = ::opendir(p)) {
     while (const struct dirent* e = ::readdir(dp)) {
       const char* n = e->d_name;
       if (n[0] == '.' && (n[1] == 0 || (n[1] == '.' && n[2] == 0))) continue;
       d.files.emplace_back(n);
     }
     ::closedir(dp);
+    // the listing belongs to the directory [st] describes only if nothing
+    // changed it meanwhile
+    struct stat after;
+    if (cacheable && ::stat(p, &after) == 0 && after.st_ino == st.st_ino && after.st_dev == st.st_dev &&
+        after.st_mtim.tv_sec == st.st_mtim.tv_sec && after.st_mtim.tv_nsec == st.st_mtim.tv_nsec &&
+        after.st_ctim.tv_sec == st.st_ctim.tv_sec && after.st_ctim.tv_nsec == st.st_ctim.tv_nsec)
+      dir_cache::record(st, d.files);
   }
   return d;
 }
