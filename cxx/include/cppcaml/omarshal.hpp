@@ -87,15 +87,16 @@ class ArenaVec {
     new (p_ + n_) T(x);
     ++n_;
   }
-
- private:
-  static_assert(std::is_trivially_destructible_v<T>, "arena elements are never destroyed");
+  // a copy of src[0..k) in fresh storage
   void assign(const T* src, std::size_t k) {
     T* q = k ? static_cast<T*>(arena_alloc(sizeof(T) * k, alignof(T))) : nullptr;
     for (std::size_t j = 0; j < k; ++j) new (q + j) T(src[j]);
     p_ = q;
     n_ = cap_ = static_cast<std::uint32_t>(k);
   }
+
+ private:
+  static_assert(std::is_trivially_destructible_v<T>, "arena elements are never destroyed");
   T* p_ = nullptr;
   std::uint32_t n_ = 0, cap_ = 0;
 };
@@ -134,36 +135,41 @@ class ValPtr {
   std::uintptr_t b_ = 0;
 };
 
+// 32 bytes: a .cmt's graph is millions of them.
 struct Value {
   enum K : std::uint8_t { Int, Str, Dbl, Block, DblArr, Custom } k_ = Int;  // never Int: an immediate
-  int tag = 0;
+  std::uint8_t tag = 0;
   // the marshaling session that last serialized this object, and its index
   // in that session's object table (a repeat is a back-reference)
   std::uint32_t seen_session = 0;
   std::uint32_t seen_index = 0;
-  union {
-    double d = 0;  // Dbl
-    // Custom: the DATA size in bytes, as the serializer wrote it.  extern.c
-    // sizes a custom block as `2 + ((sz + wordsize - 1) / wordsize)` -- header
-    // + ops + data -- and the 32- and 64-bit counts therefore differ for the
-    // same block, which a word count taken on one of them cannot express.
-    long long custom_bytes;
-  };
-  ArenaVec<ValPtr> fields;  // Block
   // what only a string, a float array or a custom has (the -g debug events'
   // hundreds of thousands of blocks stay small)
   struct Extra {
     std::string s;  // Str data / Custom raw on-disk bytes (from the code byte)
     ArenaVec<double> darr;
+    // Custom: the DATA size in bytes, as the serializer wrote it.  extern.c
+    // sizes a custom block as `2 + ((sz + wordsize - 1) / wordsize)` -- header
+    // + ops + data -- and the 32- and 64-bit counts therefore differ for the
+    // same block, which a word count taken on one of them cannot express.
+    long long custom_bytes = 0;
     // the 32-bit data size when it differs from the 64-bit one (nativeint:
     // 4 / 8, runtime/ints.c); -1 = custom_bytes
     long long custom_bytes32 = -1;
   };
-  Extra* x = nullptr;
+  // A block's fields, or what another kind has in their storage pointer's
+  // place (their count stays 0)
+  union {
+    ArenaVec<ValPtr> fields;  // Block
+    Extra* x;                 // Str, DblArr, Custom (nullptr until extra())
+    double d;                 // Dbl
+  };
+  Value() : fields() {}
   Extra& extra();  // (created on first use, in the arena)
-  const std::string& str() const { return x ? x->s : empty_str(); }
+  const std::string& str() const { return (k_ == Str || k_ == Custom) && x ? x->s : empty_str(); }
   static const std::string& empty_str();
 };
+static_assert(sizeof(Value) == 32);
 inline int ValPtr::kind() const { return is_int() ? Value::Int : get()->k_; }
 
 ValPtr vint(long long n);

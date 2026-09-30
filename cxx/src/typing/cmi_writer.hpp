@@ -13,6 +13,7 @@
 #include "cppcaml/omarshal.hpp"
 #include "cppcaml/typing/env.hpp"
 #include "cppcaml/typing/instruct.hpp"
+#include "cppcaml/typing/zone.hpp"
 
 namespace cppcaml::typing::cmi_format::writer {
 
@@ -101,20 +102,22 @@ class Writer {
     memo_[x.obj] = v;
     return v;
   }
+  // a block's fields as [shared] builds them (off the heap for a few)
+  using Fields = SmallVec<V, 8>;
   // a block registered under [key] before its fields are filled
-  template <class K>
-  V shared(FlatMap<const void*, V>& memo, const K* key, int tag,
-           const std::function<std::vector<V>()>& fields) {
+  template <class K, class F>
+  V shared(FlatMap<const void*, V>& memo, const K* key, int tag, F&& fields) {
     if (auto it = memo.find(key); it != memo.end()) return it->second;
     V v = o::vblock(tag, {});
     memo[key] = v;
-    v->fields = fields();
+    Fields fs = fields();
+    v->fields.assign(fs.data(), fs.size());
     return v;
   }
 
   // ---- Ident / Path ----
   V unscoped(const ident::Unscoped* u) {
-    return shared(memo_, u, 0, [&]() -> std::vector<V> {  // { mutable state }
+    return shared(memo_, u, 0, [&]() -> Fields {  // { mutable state }
       if (u->state == ident::Unscoped::State::Udesc)
         return {o::vblock(0, {o::vblock(0, {str(u->name), i(u->stamp)})})};
       return {o::vblock(1, {unscoped(u->ulink)})};
@@ -123,7 +126,7 @@ class Writer {
   V ident(Ident::t id) {
     using K = Ident::Kind;
     int tag = static_cast<int>(id->kind);  // Local, Scoped, Global, Predef, Unscoped
-    return shared(memo_, id, tag, [&]() -> std::vector<V> {
+    return shared(memo_, id, tag, [&]() -> Fields {
       switch (id->kind) {
         case K::Local: return {str(id->name_), i(id->stamp_)};
         case K::Scoped: return {str(id->name_), i(id->stamp_), i(id->scope_)};
@@ -136,7 +139,7 @@ class Writer {
   }
   V path(Path::t p) {
     using K = Path::Kind;
-    return shared(memo_, p, static_cast<int>(p->kind), [&]() -> std::vector<V> {
+    return shared(memo_, p, static_cast<int>(p->kind), [&]() -> Fields {
       switch (p->kind) {
         case K::Pident: return {ident(p->id)};
         case K::Pdot: return {path(p->p1), str(p->s)};
@@ -283,7 +286,7 @@ class Writer {
           return loc(*x->loc_rec);
         }
         if (x->loc_val) return loc(*x->loc_val);
-        return shared(memo_, x, static_cast<int>(x->tag), [&]() -> std::vector<V> {
+        return shared(memo_, x, static_cast<int>(x->tag), [&]() -> Fields {
           std::vector<V> fs;
           for (const OValue* f : x->fields) fs.push_back(ovalue(f));
           return fs;
@@ -293,7 +296,7 @@ class Writer {
   }
   V attributes(const Attributes& as) {
     return list(as, [&](const Attribute* a) {
-      return shared(memo_, a, 0, [&]() -> std::vector<V> {
+      return shared(memo_, a, 0, [&]() -> Fields {
         V name;
         if (a->name_obj) {
           V l = loc(a->attr_name_loc);
@@ -327,7 +330,7 @@ class Writer {
     switch (c->kind) {
       case Commutable::Kind::Cok: return i(0);
       case Commutable::Kind::Cunknown: return i(1);
-      case Commutable::Kind::Cvar: return shared(memo_, c, 0, [&]() -> std::vector<V> { return {commu(c->commu)}; });
+      case Commutable::Kind::Cvar: return shared(memo_, c, 0, [&]() -> Fields { return {commu(c->commu)}; });
     }
     return i(0);
   }
@@ -337,12 +340,12 @@ class Writer {
       case FieldKind::Kind::FKpublic: return i(1);
       case FieldKind::Kind::FKabsent: return i(2);
       case FieldKind::Kind::FKvar:
-        return shared(memo_, k, 0, [&]() -> std::vector<V> { return {field_kind(k->field_kind)}; });
+        return shared(memo_, k, 0, [&]() -> Fields { return {field_kind(k->field_kind)}; });
     }
     return i(0);
   }
   V path_args(const PathArgs* pa) {
-    return shared(memo_, pa, 0, [&]() -> std::vector<V> { return {path(pa->path), path_args_list(pa)}; });
+    return shared(memo_, pa, 0, [&]() -> Fields { return {path(pa->path), path_args_list(pa)}; });
   }
   // `x :: tail` with the tail list shared (PathArgs::tail), else the list
   V path_args_list(const PathArgs* pa) {
@@ -356,7 +359,7 @@ class Writer {
     return v;
   }
   V name_ref(const NameRef* r) {
-    return shared(memo_, r, 0, [&]() -> std::vector<V> {
+    return shared(memo_, r, 0, [&]() -> Fields {
       return {r->contents ? some(path_args(r->contents)) : none()};
     });
   }
@@ -364,29 +367,29 @@ class Writer {
     switch (m->kind) {
       case AbbrevMemo::Kind::Mnil: return i(0);
       case AbbrevMemo::Kind::Mcons:
-        return shared(memo_, m, 0, [&]() -> std::vector<V> {
+        return shared(memo_, m, 0, [&]() -> Fields {
           return {i(m->privacy == PrivateFlag::Private ? 0 : 1), path(m->path), ty(m->abbreviation),
                   ty(m->expansion), memo(m->rem)};
         });
       case AbbrevMemo::Kind::Mlink:
-        return shared(memo_, m, 1, [&]() -> std::vector<V> { return {memo_ref(m->link)}; });
+        return shared(memo_, m, 1, [&]() -> Fields { return {memo_ref(m->link)}; });
     }
     return i(0);
   }
   V memo_ref(const MemoRef* r) {
-    return shared(memo_, r, 0, [&]() -> std::vector<V> { return {memo(r->contents)}; });
+    return shared(memo_, r, 0, [&]() -> Fields { return {memo(r->contents)}; });
   }
   V row_cell(const RowFieldCell* c) {
-    return shared(memo_, c, 0, [&]() -> std::vector<V> { return {row_field(c->contents)}; });
+    return shared(memo_, c, 0, [&]() -> Fields { return {row_field(c->contents)}; });
   }
   V row_field(const RowField* f) {
     switch (f->kind) {
       case RowField::Kind::RFabsent: return i(0);
       case RowField::Kind::RFnone: return i(1);
       case RowField::Kind::RFpresent:
-        return shared(memo_, f, 0, [&]() -> std::vector<V> { return {f->present ? some(ty(f->present)) : none()}; });
+        return shared(memo_, f, 0, [&]() -> Fields { return {f->present ? some(ty(f->present)) : none()}; });
       case RowField::Kind::RFeither:
-        return shared(memo_, f, 1, [&]() -> std::vector<V> {
+        return shared(memo_, f, 1, [&]() -> Fields {
           return {b(f->no_arg), tys(f->arg_type), b(f->matched), row_cell(f->ext)};
         });
     }
@@ -403,11 +406,11 @@ class Writer {
     return i(0);
   }
   V row(const RowDesc* r) {
-    return shared(memo_, r, 0, [&]() -> std::vector<V> {
+    return shared(memo_, r, 0, [&]() -> Fields {
       return {list(r->row_fields,
                    [&](const RowFieldEntry& e) {
                      return shared(memo_, e.obj, 0,
-                                   [&]() -> std::vector<V> { return {str(e.label), row_field(e.field)}; });
+                                   [&]() -> Fields { return {str(e.label), row_field(e.field)}; });
                    }),
               ty(r->row_more), b(r->row_closed),
               // the options are passed on with the row's other fields
@@ -418,7 +421,7 @@ class Writer {
     });
   }
   V package(const Package* p) {
-    return shared(memo_, p, 0, [&]() -> std::vector<V> {
+    return shared(memo_, p, 0, [&]() -> Fields {
       return {path(p->pack_path), list(p->pack_constraints, [&](const PackConstraint& c) {
                 return o::vblock(0, {list(c.path, [&](std::string_view s) { return str(s); }), ty(c.ty)});
               })};
@@ -432,7 +435,7 @@ class Writer {
     // non-constant constructors in declaration order, Tnil (constant) skipped
     int tag = static_cast<int>(d->kind);
     if (d->kind > DescKind::Tnil) --tag;
-    return shared(memo_, d, tag, [&]() -> std::vector<V> {
+    return shared(memo_, d, tag, [&]() -> Fields {
       switch (d->kind) {
         case DescKind::Tvar: return {opt_str(as<Tvar>(d)->name)};
         case DescKind::Tarrow: {
@@ -476,12 +479,12 @@ class Writer {
   }
   V ty(const TypeExpr* t) {
     // transient_expr = { mutable desc; mutable level; mutable scope; id }
-    return shared(memo_, t, 0, [&]() -> std::vector<V> { return {desc(t->desc), i(t->level), i(t->scope), i(t->id)}; });
+    return shared(memo_, t, 0, [&]() -> Fields { return {desc(t->desc), i(t->level), i(t->scope), i(t->id)}; });
   }
 
   // ---- declarations ----
   V label_decl(const LabelDeclaration* l) {
-    return shared(memo_, l, 0, [&]() -> std::vector<V> {
+    return shared(memo_, l, 0, [&]() -> Fields {
       return {ident(l->ld_id), i(l->ld_mutable == MutableFlag::Immutable ? 0 : 1),
               i(l->ld_atomic == AtomicFlag::Nonatomic ? 0 : 1), ty(l->ld_type), loc(l->ld_loc),
               attributes(l->ld_attributes), uid(l->ld_uid)};
@@ -492,7 +495,7 @@ class Writer {
     return o::vblock(1, {list(a.record, [&](const LabelDeclaration* l) { return label_decl(l); })});
   }
   V cstr_decl(const ConstructorDeclaration* c) {
-    return shared(memo_, c, 0, [&]() -> std::vector<V> {
+    return shared(memo_, c, 0, [&]() -> Fields {
       return {ident(c->cd_id), cstr_args(c->cd_args), c->cd_res ? some(ty(c->cd_res)) : none(), loc(c->cd_loc),
               attributes(c->cd_attributes), uid(c->cd_uid)};
     });
@@ -557,7 +560,7 @@ class Writer {
     }
   }
   V type_decl(const TypeDeclaration* d) {
-    return shared(memo_, d, 0, [&]() -> std::vector<V> {
+    return shared(memo_, d, 0, [&]() -> Fields {
       return {tys(d->type_params), i(d->type_arity), type_kind(d->type_kind), private_flag(d->type_private),
               d->type_manifest ? some_tok(d->manifest_obj, ty(d->type_manifest)) : none(),
               list(d->type_variance, [&](variance::t v) { return i(v); }),
@@ -567,7 +570,7 @@ class Writer {
     });
   }
   V ext_constr(const ExtensionConstructor* e) {
-    return shared(memo_, e, 0, [&]() -> std::vector<V> {
+    return shared(memo_, e, 0, [&]() -> Fields {
       return {path(e->ext_type_path), tys(e->ext_type_params), cstr_args(e->ext_args),
               e->ext_ret_type ? some(ty(e->ext_ret_type)) : none(), private_flag(e->ext_private), loc(e->ext_loc),
               attributes(e->ext_attributes), uid(e->ext_uid)};
@@ -585,7 +588,7 @@ class Writer {
   V virtual_flag(VirtualFlag v) { return i(v == VirtualFlag::Virtual ? 0 : 1); }
   V mutable_flag(MutableFlag m) { return i(m == MutableFlag::Immutable ? 0 : 1); }
   V class_sig(const ClassSignature* c) {
-    return shared(memo_, c, 0, [&]() -> std::vector<V> {
+    return shared(memo_, c, 0, [&]() -> Fields {
       return {ty(c->csig_self), ty(c->csig_self_row),
               strmap<VarEntry>(c->csig_vars.root(), [&](const VarEntry& e) {
                 return o::vblock(0, {mutable_flag(e.mut), virtual_flag(e.virt), ty(e.ty)});
@@ -609,7 +612,7 @@ class Writer {
   }
   V class_type(const ClassType* c) {
     using CK = ClassType::Kind;
-    return shared(memo_, c, static_cast<int>(c->kind), [&]() -> std::vector<V> {
+    return shared(memo_, c, static_cast<int>(c->kind), [&]() -> Fields {
       switch (c->kind) {
         case CK::Cty_constr: return {path(c->path), tys(c->args), class_type(c->cty)};
         case CK::Cty_signature: return {class_sig(c->sign)};
@@ -669,7 +672,7 @@ class Writer {
           meths = o::vblock(0, {ident_map(*k.meths)});  // Self_concrete
           self_meths_[k.meths] = meths;
         } else {                                        // Self_virtual of a ref
-          V r = shared(memo_, k.meths, 0, [&]() -> std::vector<V> { return {ident_map(*k.meths)}; });
+          V r = shared(memo_, k.meths, 0, [&]() -> Fields { return {ident_map(*k.meths)}; });
           meths = o::vblock(1, {r});
           self_meths_[k.meths] = meths;
         }
@@ -685,7 +688,7 @@ class Writer {
   template <class Val, class F>
   V strmap_shared(const StrMapNode<Val>* n, F&& data) {
     if (!n) return i(0);
-    return shared(memo_, n, 0, [&]() -> std::vector<V> {
+    return shared(memo_, n, 0, [&]() -> Fields {
       V l = strmap_shared<Val>(n->l, data);
       V k = str(n->v);
       V d = data(n->d);
@@ -695,7 +698,7 @@ class Writer {
   }
   V module_type(const ModuleType* mt) {
     using MK = ModuleType::Kind;
-    return shared(memo_, mt, static_cast<int>(mt->kind), [&]() -> std::vector<V> {
+    return shared(memo_, mt, static_cast<int>(mt->kind), [&]() -> Fields {
       switch (mt->kind) {
         case MK::Mty_ident: return {path(mt->path)};
         case MK::Mty_signature: return {signature(mt->sign)};
@@ -714,31 +717,31 @@ class Writer {
   }
   // the declarations, one value per record
   V value_desc(const ValueDescription* vd) {
-    return shared(memo_, vd, 0, [&]() -> std::vector<V> {
+    return shared(memo_, vd, 0, [&]() -> Fields {
       return {ty(vd->val_type), value_kind(vd->val_kind), loc(vd->val_loc), attributes(vd->val_attributes),
               uid(vd->val_uid)};
     });
   }
   V module_decl(const ModuleDeclaration* md) {
-    return shared(memo_, md, 0, [&]() -> std::vector<V> {
+    return shared(memo_, md, 0, [&]() -> Fields {
       return {module_type(md->md_type), attributes(md->md_attributes), loc(md->md_loc), uid(md->md_uid)};
     });
   }
   V modtype_decl(const ModtypeDeclaration* mtd) {
-    return shared(memo_, mtd, 0, [&]() -> std::vector<V> {
+    return shared(memo_, mtd, 0, [&]() -> Fields {
       return {mtd->mtd_type ? some(module_type(mtd->mtd_type)) : none(), attributes(mtd->mtd_attributes),
               loc(mtd->mtd_loc), uid(mtd->mtd_uid)};
     });
   }
   V class_decl(const ClassDeclaration* cd) {
-    return shared(memo_, cd, 0, [&]() -> std::vector<V> {
+    return shared(memo_, cd, 0, [&]() -> Fields {
       return {tys(cd->cty_params), class_type(cd->cty_type), path(cd->cty_path),
               cd->cty_new ? some_tok(cd->new_obj, ty(cd->cty_new)) : none(), variances(cd->cty_variance), loc(cd->cty_loc),
               attributes(cd->cty_attributes), uid(cd->cty_uid)};
     });
   }
   V cltype_decl(const ClassTypeDeclaration* cd) {
-    return shared(memo_, cd, 0, [&]() -> std::vector<V> {
+    return shared(memo_, cd, 0, [&]() -> Fields {
       return {tys(cd->clty_params), class_type(cd->clty_type), path(cd->clty_path), type_decl(cd->clty_hash_type),
               variances(cd->clty_variance), loc(cd->clty_loc), attributes(cd->clty_attributes), uid(cd->clty_uid)};
     });
@@ -811,7 +814,7 @@ class EventWriter {
     using K = env::Summary::Kind;
     if (s->kind == K::Env_empty) return w_.i(0);
     int tag = static_cast<int>(s->kind) - 1;  // Env_empty is the constant constructor
-    return w_.shared(memo_, s, tag, [&]() -> std::vector<V> {
+    return w_.shared(memo_, s, tag, [&]() -> Writer::Fields {
       V next = summary(s->next);
       switch (s->kind) {
         case K::Env_empty: break;
@@ -852,7 +855,7 @@ class EventWriter {
   template <class Val, class F>
   V path_map(const PMapNode<Path::t, Val>* n, F&& data) {
     if (!n) return w_.i(0);
-    return w_.shared(memo_, n, 0, [&]() -> std::vector<V> {
+    return w_.shared(memo_, n, 0, [&]() -> Writer::Fields {
       V l = path_map<Val>(n->l, data);
       V k = w_.path(n->v);
       V d = data(n->d);
@@ -864,7 +867,7 @@ class EventWriter {
   template <class A, class F>
   V tbl(const typename ident::Tbl<A>::Node* n, F&& data) {
     if (!n) return w_.i(0);
-    return w_.shared(memo_, n, 0, [&]() -> std::vector<V> {
+    return w_.shared(memo_, n, 0, [&]() -> Writer::Fields {
       V l = tbl<A>(n->l, data);
       V d = tbl_data<A>(n->d, data);
       V r = tbl<A>(n->r, data);
@@ -873,7 +876,7 @@ class EventWriter {
   }
   template <class A, class F>
   V tbl_data(const ident::TblData<A>* d, F&& data) {
-    return w_.shared(memo_, d, 0, [&]() -> std::vector<V> {
+    return w_.shared(memo_, d, 0, [&]() -> Writer::Fields {
       return {w_.ident(d->ident), w_.str(d->name), w_.i(d->stamp), data(d->data),
               d->previous ? w_.some(tbl_data<A>(d->previous, data)) : w_.none()};
     });
@@ -912,7 +915,7 @@ class EventWriter {
     using EK = instruct::DebugEventKindK;
     using IK = instruct::DebugEventInfoK;
     using RK = instruct::DebugEventReprK;
-    return w_.shared(memo_, ev, 0, [&]() -> std::vector<V> {
+    return w_.shared(memo_, ev, 0, [&]() -> Writer::Fields {
       V kind;
       switch (ev->ev_kind.k) {
         case EK::Event_before: kind = w_.i(0); break;
@@ -928,7 +931,7 @@ class EventWriter {
       V repr = w_.i(0);  // Event_none
       if (ev->ev_repr.k != RK::Event_none) {
         const lambda::IntRef* r = ev->ev_repr.ref;
-        V ref = w_.shared(memo_, r, 0, [&]() -> std::vector<V> { return {w_.i(r->contents)}; });
+        V ref = w_.shared(memo_, r, 0, [&]() -> Writer::Fields { return {w_.i(r->contents)}; });
         repr = o::vblock(ev->ev_repr.k == RK::Event_parent ? 0 : 1, {ref});
       }
       // ev_typsubst: Bytegen's is Subst.identity, one static record
