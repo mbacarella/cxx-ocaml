@@ -20,7 +20,7 @@ struct Instruction {
     Lprologue, Lend, Lop, Lreloadretaddr, Lreturn, Llabel, Lbranch, Lcondbranch, Lcondbranch3, Lswitch, Lentertrap,
     Ladjust_trap_depth, Lpushtrap, Lpoptrap, Lraise
   } desc;
-  mach::Operation op{mach::Operation::K::Imove};  // Lop
+  const mach::Operation* op = mach::imove_op();  // Lop (the Mach instruction's)
   Label lbl = 0;                                  // Llabel, Lbranch, Lcondbranch, Lpushtrap's handler
   mach::Test test{mach::Test::K::Itruetest};      // Lcondbranch
   std::optional<Label> lbl0, lbl1, lbl2;          // Lcondbranch3

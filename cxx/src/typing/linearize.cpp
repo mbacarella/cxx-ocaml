@@ -24,7 +24,7 @@ bool has_fallthrough(const Instruction& i) {
     case K::Lbranch:
     case K::Lswitch:
     case K::Lraise: return false;
-    case K::Lop: return !(i.op.k == MK::Itailcall_ind || i.op.k == MK::Itailcall_imm);
+    case K::Lop: return !(i.op->k == MK::Itailcall_ind || i.op->k == MK::Itailcall_imm);
     default: return true;
   }
 }
@@ -93,7 +93,7 @@ Instruction condbranch_d(const Test& t, Label l) {
   d.lbl = l;
   return d;
 }
-Instruction op_d(const mach::Operation& op) {
+Instruction op_d(const mach::Operation* op) {
   Instruction d = desc(K::Lop);
   d.op = op;
   return d;
@@ -142,7 +142,7 @@ Instr discard_dead_code(Instr n) {
     case K::Lpushtrap: return adjust(+1);
     case K::Ladjust_trap_depth: return adjust(n->delta_traps);
     case K::Lop:
-      if (n->op.k == MK::Istackoffset) {
+      if (n->op->k == MK::Istackoffset) {
         Instr c = make<Instruction>(*n);
         c->next = discard_dead_code(n->next);
         return c;
@@ -193,8 +193,8 @@ Instr linear(const ExitInfo& exit_info, mach::Instr i, Instr n, bool contains_ca
   switch (i->desc) {
     case IK::Iend: return n;
     case IK::Iop: {
-      const mach::Operation& op = i->op;
-      if (op.k == MK::Itailcall_ind || op.k == MK::Itailcall_imm) return copy_instr(op_d(op), i, discard_dead_code(n));
+      const mach::Operation& op = *i->op;
+      if (op.k == MK::Itailcall_ind || op.k == MK::Itailcall_imm) return copy_instr(op_d(i->op), i, discard_dead_code(n));
       if ((op.k == MK::Imove || op.k == MK::Ireload || op.k == MK::Ispill) && same_loc(i->arg[0]->loc, i->res[0]->loc))
         return lin(exit_info, i->next, n);
       if (op.k == MK::Ipoll && !op.return_label) {
@@ -207,9 +207,9 @@ Instr linear(const ExitInfo& exit_info, mach::Instr i, Instr n, bool contains_ca
           op2.return_label = n2->lbl;
           n2 = n2->next;
         }
-        return copy_instr(op_d(op2), i, n2);
+        return copy_instr(op_d(mach::op_ref(op2)), i, n2);
       }
-      return copy_instr(op_d(op), i, lin(exit_info, i->next, n));
+      return copy_instr(op_d(i->op), i, lin(exit_info, i->next, n));
     }
     case IK::Ireturn: {
       Instr n1 = copy_instr(desc(K::Lreturn), i, discard_dead_code(n));
@@ -336,7 +336,7 @@ bool is_call(const mach::Instruction& i) {
   using IO = mach::IntegerOperation;
   switch (i.desc) {
     case IK::Iop:
-      switch (i.op.k) {
+      switch (i.op->k) {
         case MK::Icall_ind:
         case MK::Icall_imm:
         case MK::Iextcall:
@@ -344,7 +344,7 @@ bool is_call(const mach::Instruction& i) {
         case MK::Ipoll: return true;
         // (amd64) caml_ml_array_bound_error
         case MK::Iintop:
-        case MK::Iintop_imm: return i.op.intop.op == IO::Icheckbound;
+        case MK::Iintop_imm: return i.op->intop.op == IO::Icheckbound;
         default: return false;
       }
     case IK::Iraise: return i.raise != lambda::RaiseKind::Raise_notrace;
@@ -367,9 +367,9 @@ Analysis analyze(const mach::Fundecl& f) {
         case IK::Iexit:
         case IK::Iraise: return;
         case IK::Iop:
-          if (i->op.k == MK::Istackoffset) sp += i->op.n;
-          else if (i->op.k == MK::Itailcall_ind || i->op.k == MK::Itailcall_imm) return;
-          else if (i->op.k == MK::Icall_ind || i->op.k == MK::Icall_imm) contains_nontail_calls = true;
+          if (i->op->k == MK::Istackoffset) sp += i->op->n;
+          else if (i->op->k == MK::Itailcall_ind || i->op->k == MK::Itailcall_imm) return;
+          else if (i->op->k == MK::Icall_ind || i->op->k == MK::Icall_imm) contains_nontail_calls = true;
           break;
         case IK::Iifthenelse:
           an(sp, i->ifso);
@@ -440,7 +440,7 @@ void instr(Formatter& ppf, Instr i) {
     case K::Lend: break;
     case K::Lprologue: fprintf(ppf, "prologue"); break;
     case K::Lop:
-      switch (i->op.k) {
+      switch (i->op->k) {
         case MK::Ialloc:
         case MK::Ipoll:
         case MK::Icall_ind:
@@ -450,7 +450,7 @@ void instr(Formatter& ppf, Instr i) {
           break;
         default: break;
       }
-      printmach::print_operation(ppf, i->op, i->arg, i->res);
+      printmach::print_operation(ppf, *i->op, i->arg, i->res);
       break;
     case K::Lreloadretaddr: fprintf(ppf, "reload retaddr"); break;
     case K::Lreturn: fprintf(ppf, "return %t", [i](Formatter& f) { printmach::print_regs(f, i->arg); }); break;

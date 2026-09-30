@@ -220,6 +220,12 @@ struct Operation {
   std::optional<long> return_label;                                // Ipoll
 };
 inline Operation mop(Operation::K k) { return Operation{k}; }
+// An instruction's operation, shared by its copies as ocamlc's instructions
+// share their immutable desc: a copy of [op] in the current zone (the
+// function's scratch zone while it compiles, which outlives its
+// instructions' generations), or the shared Imove.
+const Operation* op_ref(const Operation& op);
+const Operation* imove_op();
 
 struct Instruction;
 using Instr = Instruction*;
@@ -229,7 +235,7 @@ struct Handler {
 };
 struct Instruction {
   enum class K : std::uint8_t { Iend, Iop, Ireturn, Iifthenelse, Iswitch, Icatch, Iexit, Itrywith, Iraise } desc;
-  Operation op{Operation::K::Imove};  // Iop
+  const Operation* op = imove_op();  // Iop (op_ref)
   Test test{Test::K::Itruetest};      // Iifthenelse
   Instr ifso = nullptr, ifnot = nullptr;  // Iifthenelse; Itrywith's body / handler
   Slice<long> index;                      // Iswitch

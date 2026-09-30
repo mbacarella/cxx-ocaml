@@ -224,9 +224,15 @@ Instr end_instr() {
   return i;
 }
 
+const Operation* op_ref(const Operation& op) { return make<Operation>(op); }
+const Operation* imove_op() {
+  static const Operation* m = permanent_zone().make<Operation>(Operation{Operation::K::Imove});
+  return m;
+}
+
 Instruction iop(const Operation& op) {
   Instruction d{Instruction::K::Iop};
-  d.op = op;
+  d.op = op_ref(op);
   return d;
 }
 Instruction idesc(Instruction::K k) { return Instruction{k}; }
@@ -252,7 +258,7 @@ void instr_iter(const std::function<void(Instr)>& f, Instr i) {
     switch (i->desc) {
       case K::Ireturn: return;
       case K::Iop:
-        if (i->op.k == Operation::K::Itailcall_ind || i->op.k == Operation::K::Itailcall_imm) return;
+        if (i->op->k == Operation::K::Itailcall_ind || i->op->k == Operation::K::Itailcall_imm) return;
         break;
       case K::Iifthenelse:
         instr_iter(f, i->ifso);
@@ -439,7 +445,7 @@ Regs destroyed_at_oper(const mach::Instruction& i) {
   if (i.desc == mach::Instruction::K::Iswitch) return regs_of({0, 4});
   if (i.desc == mach::Instruction::K::Itrywith) return regs_of({11});
   if (i.desc != mach::Instruction::K::Iop) return {};
-  const mach::Operation& op = i.op;
+  const mach::Operation& op = *i.op;
   switch (op.k) {
     case K::Icall_ind:
     case K::Icall_imm: return all_phys_regs();
@@ -738,7 +744,7 @@ void instr(Formatter& ppf, Instr i) {
   }
   switch (i->desc) {
     case K::Iend: break;
-    case K::Iop: operation(ppf, i->op, i->arg, i->res); break;
+    case K::Iop: operation(ppf, *i->op, i->arg, i->res); break;
     case K::Ireturn: fprintf(ppf, "return %a", pr(regs, i->arg)); break;
     case K::Iifthenelse:
       fprintf(ppf, "@[<v 2>if %t then@,%a", [&](Formatter& f) { test(f, i->test, i->arg); }, pr(instr, i->ifso));
