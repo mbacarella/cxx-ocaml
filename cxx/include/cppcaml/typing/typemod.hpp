@@ -95,15 +95,10 @@ const ModuleType* modtype_of_package(env::t env, const Location& loc, const Pack
 
 // Compilation units (driver side: Unit_info)
 struct UnitInfo {
-  std::string source_file;   // the .ml (Unit_info.input_source_file)
-  // Unit_info.human_source_file: the name the parsed AST gives the source
-  // (Compile_common's update_unit_info: !Location.input_name -- a binary
-  // AST's recorded name); empty: source_file
-  std::string human_source_file;
+  std::string source_file;   // the .ml (Unit_info.source_file)
   std::string modname;       // the unit name
   std::string prefix;        // output prefix (no extension)
   std::string cmi_file;      // [prefix].cmi
-  const std::string& human() const { return human_source_file.empty() ? source_file : human_source_file; }
 };
 tt::Implementation type_implementation(const UnitInfo& target, env::t initial_env, pt::Structure ast);
 const tt::Signature* type_interface(const UnitInfo& target, env::t env, pt::Signature ast);

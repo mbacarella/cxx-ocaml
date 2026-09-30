@@ -987,7 +987,7 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
           if (ty::clflags::print_types) {
             ty::printtyp::wrap_printing_env(false, env0, [&] {
               ty::format_doc::Formatter d;
-              ty::printtyp::printed_signature(target.human(), d, tsg->sig_type);
+              ty::printtyp::printed_signature(target.source_file, d, tsg->sig_type);
               ty::format::Formatter out;
               ty::format_doc::format(out, d.doc);
               out.print_newline();

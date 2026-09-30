@@ -345,10 +345,7 @@ const tt::Signature* transl_signature_(env::t env0, pt::Signature ssg) {
         bool aliasable = env::is_aliasable(path, env);
         const ModuleDeclaration* md;
         if (!aliasable) {
-          auto* m2 = make<ModuleDeclaration>(*md0);
-          m2->md_loc = pms->pms_loc;
-          m2->md_uid = uid::mk(env::get_current_unit());
-          md = m2;
+          md = md0;
         } else {
           md = make<ModuleDeclaration>(mty_alias(path), parsetree::types_attributes(pms->pms_attributes), pms->pms_loc,
                                        uid::mk(env::get_current_unit()));

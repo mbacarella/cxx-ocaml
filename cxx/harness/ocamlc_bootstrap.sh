@@ -96,7 +96,6 @@ echo "stdlib: built"
 CL_COMMON="utils/config.mli utils/config.ml
 utils/build_path_prefix_map.mli utils/build_path_prefix_map.ml
 utils/format_doc.mli utils/format_doc.ml
-utils/utf8_lexeme.mli utils/utf8_lexeme.ml
 utils/misc.mli utils/misc.ml
 utils/identifiable.mli utils/identifiable.ml
 utils/numbers.mli utils/numbers.ml
@@ -157,7 +156,6 @@ typing/oprint.mli typing/oprint.ml
 typing/subst.mli typing/subst.ml
 typing/predef.mli typing/predef.ml
 typing/datarepr.mli typing/datarepr.ml
-typing/typing_recovery.mli typing/typing_recovery.ml
 file_formats/cmi_format.mli file_formats/cmi_format.ml
 typing/persistent_env.mli typing/persistent_env.ml
 typing/env.mli typing/env.ml
@@ -179,7 +177,6 @@ typing/stypes.mli typing/stypes.ml
 typing/shape_reduce.mli typing/shape_reduce.ml
 file_formats/cmt_format.mli file_formats/cmt_format.ml
 typing/cmt2annot.mli typing/cmt2annot.ml
-typing/typing_recovery_state.mli typing/typing_recovery_state.ml
 typing/untypeast.mli typing/untypeast.ml
 typing/includemod.mli typing/includemod.ml
 typing/signature_matching.mli typing/signature_matching.ml
@@ -229,8 +226,7 @@ driver/compmisc.mli driver/compmisc.ml
 driver/makedepend.mli driver/makedepend.ml
 driver/compile_common.mli driver/compile_common.ml"
 
-CL_BYTE="bytecomp/opnames.mli bytecomp/opnames.ml
-bytecomp/instruct.mli bytecomp/instruct.ml
+CL_BYTE="bytecomp/instruct.mli bytecomp/instruct.ml
 bytecomp/bytegen.mli bytecomp/bytegen.ml
 bytecomp/printinstr.mli bytecomp/printinstr.ml
 bytecomp/emitcode.mli bytecomp/emitcode.ml

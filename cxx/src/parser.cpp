@@ -285,12 +285,30 @@ class Parser {
     size_t structBegin = idx_ > 0 ? tokens_[idx_ - 1].end : 0;
     Structure body;
     size_t firstStart = static_cast<size_t>(-1);
+    // a structure's expression items: its first item, or one after `;;`
+    bool saved_expr_ok = str_expr_ok_;
+    bool expr_ok = true;
     while (cur().kind != Kind::TEOF && cur().kind != stop) {
-      if (cur().kind == Kind::SEMISEMI) { advance(); continue; }
+      if (cur().kind == Kind::SEMISEMI) { advance(); expr_ok = true; continue; }
       if (firstStart == static_cast<size_t>(-1)) firstStart = cur().start;
       emit_text(body, docs_.floating, cur().start);  // text_str before each item
-      body.push_back(parse_structure_item());
+      str_expr_ok_ = expr_ok;
+      size_t item_start = cur().start, item_end = cur().end;
+      try {
+        body.push_back(parse_structure_item());
+      } catch (const NotAnItem&) {
+        // the structure ends here: at top level a syntax error, in
+        // `struct ... end` the caller's `end expected`
+        if (stop == Kind::TEOF) {
+          ParseError e("syntax error", item_start);
+          e.end = item_end;
+          throw e;
+        }
+        break;
+      }
+      expr_ok = false;
     }
+    str_expr_ok_ = saved_expr_ok;
     size_t startKey = firstStart != static_cast<size_t>(-1) ? firstStart : structBegin;
     size_t endKey = idx_ > 0 ? tokens_[idx_ - 1].end : structBegin;  // last consumed token end
     Structure items;
@@ -361,6 +379,15 @@ class Parser {
   [[noreturn]] void expecting(size_t at, size_t at_end, const char* nonterm) {
     ParseError e(std::string("expected ") + nonterm, at);
     e.kind = ParseError::Kind::Expecting;
+    e.end = at_end;
+    e.what_ = nonterm;
+    throw e;
+  }
+
+  // `{ not_expecting $loc nonterm }`
+  [[noreturn]] void not_expecting(size_t at, size_t at_end, const char* nonterm) {
+    ParseError e(std::string(nonterm) + " not expected", at);
+    e.kind = ParseError::Kind::Not_expecting;
     e.end = at_end;
     e.what_ = nonterm;
     throw e;
@@ -754,6 +781,12 @@ class Parser {
         }
         if (cur().kind == Kind::MODULE) {  // (module ME [: S [with type …]])  first-class module
           advance();
+          switch (cur().kind) {  // val_extra_ident: LPAREN MODULE error { expecting $loc($3) "module-expr" }
+            case Kind::UIDENT: case Kind::STRUCT: case Kind::FUNCTOR: case Kind::LPAREN: case Kind::PERCENT:
+            case Kind::LBRACKETAT: case Kind::LBRACKETPERCENT:
+              break;
+            default: expecting(cur().start, cur().end, "module-expr");
+          }
           std::optional<ExtName> ext = take_ext(); Attributes attrs = take_attrs();  // (module%ext[@attr] …)
           ModuleExpr me = parse_module_expr();
           std::optional<Ptyp_package> pkg;
@@ -999,6 +1032,12 @@ class Parser {
         args.emplace_back(Optional{id.text, true}, ident_expr(id.text, tokloc(id)));
       } else if (is_atom_start(k)) {
         args.emplace_back(Nolabel{}, postfix_field(parse_atom()));
+      } else if ((k == Kind::TILDE || k == Kind::QUESTION) && peek(1).kind != Kind::LPAREN) {
+        // `~`/`?` shifted as a label's start: an error on the token after it
+        const Token& nt = peek(1);
+        ParseError e("syntax error", nt.start);
+        e.end = nt.end;
+        throw e;
       } else {
         break;
       }
@@ -1073,6 +1112,8 @@ class Parser {
       return e;
     }
     const Token& t = cur();
+    // fun_expr: UNDERSCORE { not_expecting $loc($1) "wildcard \"_\"" }
+    if (t.kind == Kind::UNDERSCORE) not_expecting(t.start, t.end, "wildcard \"_\"");
     // A keyword-led expression (match/function/fun/try/if/let) appearing in
     // operand position (e.g. the RHS of an infix operator) extends to the right
     // and is a full expression — delegate to parse_expr_no_seq.
@@ -1105,6 +1146,8 @@ class Parser {
         return E({Pexp_constant{std::move(c)}, cl});
       }
       advance();
+      // (the operand is an expr: fun_expr's UNDERSCORE)
+      if (cur().kind == Kind::UNDERSCORE) not_expecting(cur().start, cur().end, "wildcard \"_\"");
       ExprBox arg = parse_app();
       Position ae = arg->loc.end;
       ExprBox fn = ident_expr(std::string("~") + name, tokloc(t));
@@ -1432,6 +1475,8 @@ class Parser {
     return e;
   }
   std::optional<ExprBox> injected_left_;  // a left operand already parsed (above)
+  bool str_expr_ok_ = true;  // parse_structure_item may parse an expression item
+  struct NotAnItem {};
   ExprBox parse_expr_no_seq_core() {
     const Token& t = cur();
     switch (t.kind) {
@@ -3714,6 +3759,7 @@ class Parser {
       return StructureItem{Pstr_extension{std::move(name), std::move(payload), std::move(attrs)},
                            span(position(t.start), position(tokens_[idx_ - 1].end))};
     }
+    if (!str_expr_ok_) throw NotAnItem{};  // an expression item neither first nor after `;;`
     ExprBox e = parse_expr();
     Location l = e->loc;
     Attributes attrs;  // `e [@@attr]` -> Pstr_eval attributes (do not extend the item loc)
