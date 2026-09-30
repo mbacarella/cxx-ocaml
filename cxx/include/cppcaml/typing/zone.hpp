@@ -178,6 +178,25 @@ struct ZoneScope {
   explicit ZoneScope(Zone& z);
   ~ZoneScope();
 };
+// While a scratch zone is current for temporaries (Matching's patterns), the
+// zone the types live in: what outlives the scratch -- an abbreviation's
+// memorized expansion, Ctype's [abbreviations] -- is allocated there
+// (TypesZoneScope, around the expansion of an abbreviation).
+extern Zone* g_types_zone;
+struct TypesZoneScope {
+  Zone* saved = nullptr;
+  TypesZoneScope() {
+    if (g_types_zone && g_types_zone != &zone()) {
+      saved = &zone();
+      set_zone(g_types_zone);
+    }
+  }
+  ~TypesZoneScope() {
+    if (saved) set_zone(saved);
+  }
+  TypesZoneScope(const TypesZoneScope&) = delete;
+  TypesZoneScope& operator=(const TypesZoneScope&) = delete;
+};
 
 template <class T, class... A>
 T* make(A&&... a) {

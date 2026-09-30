@@ -17,6 +17,7 @@ static Zone* g_zone = &g_default_zone;
 Zone& zone() { return *g_zone; }
 Zone& permanent_zone() { return g_default_zone; }
 void set_zone(Zone* z) { g_zone = z ? z : &g_default_zone; }
+Zone* g_types_zone = nullptr;
 ZoneScope::ZoneScope(Zone& z) : saved(g_zone) { g_zone = &z; }
 ZoneScope::~ZoneScope() { g_zone = saved; }
 const void* fresh_identity() { return zone().alloc(1, 1); }

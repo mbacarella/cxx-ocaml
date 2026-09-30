@@ -157,14 +157,20 @@ extern Zone* g_head_zone;
 bool g_pat_permanent = false;
 struct PatZone {
   Zone* saved = nullptr;
+  Zone* saved_types = nullptr;
   PatZone() {
     if (g_head_zone && !g_pat_permanent) {
       saved = &zone();
+      saved_types = g_types_zone;
+      if (!g_types_zone) g_types_zone = saved;
       set_zone(g_head_zone);
     }
   }
   ~PatZone() {
-    if (saved) set_zone(saved);
+    if (saved) {
+      set_zone(saved);
+      g_types_zone = saved_types;
+    }
   }
   PatZone(const PatZone&) = delete;
   PatZone& operator=(const PatZone&) = delete;

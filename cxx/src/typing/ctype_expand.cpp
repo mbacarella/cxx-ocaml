@@ -40,6 +40,7 @@ enum class FteKind { Std, Opt, Fn };
 // (C++ exceptions are too costly for this hot, often-failing path).
 static TypeExpr* expand_abbrev_gen_(PrivateFlag kind, FteKind fk, const FindTypeExpansion* fte, env::t env,
                                     TypeExpr* ty) {
+  TypesZoneScope in_types_zone;  // the expansion is memorized on [ty]: not in a scratch zone
   auto* c = as<Tconstr>(get_desc(ty));
   if (!c) throw std::logic_error("Ctype.expand_abbrev_gen");
   Path::t path = c->path;
