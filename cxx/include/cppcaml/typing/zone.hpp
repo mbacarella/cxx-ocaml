@@ -22,9 +22,187 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+#include <initializer_list>
+#include <stdexcept>
+#include <iterator>
 
 namespace cppcaml::typing {
 
+// A vector of trivially copyable values keeping up to N of them inline: the
+// backend's register arrays and sets are copied with every instruction, and a
+// heap allocation each (std::vector's) was a native compilation's largest
+// cost.  The std::vector operations the backend uses.
+template <class T, std::size_t N>
+class SmallVec {
+  static_assert(std::is_trivially_copyable_v<T>);
+
+ public:
+  using value_type = T;
+  using iterator = T*;
+  using const_iterator = const T*;
+  using size_type = std::size_t;
+  SmallVec() = default;
+  explicit SmallVec(std::size_t n) { resize(n); }
+  SmallVec(std::size_t n, const T& v) { resize(n, v); }
+  SmallVec(std::initializer_list<T> l) { assign(l.begin(), l.end()); }
+  template <class It, class = decltype(*std::declval<It>())>
+  SmallVec(It first, It last) {
+    assign(first, last);
+  }
+  SmallVec(const std::vector<T>& v) { assign(v.begin(), v.end()); }
+  SmallVec(const SmallVec& o) { assign(o.begin(), o.end()); }
+  SmallVec(SmallVec&& o) noexcept { take(o); }
+  ~SmallVec() {
+    if (p_ != buf_) std::free(p_);
+  }
+  SmallVec& operator=(const SmallVec& o) {
+    if (this != &o) assign(o.begin(), o.end());
+    return *this;
+  }
+  SmallVec& operator=(SmallVec&& o) noexcept {
+    if (this != &o) {
+      if (p_ != buf_) std::free(p_);
+      p_ = buf_;
+      cap_ = N;
+      take(o);
+    }
+    return *this;
+  }
+  SmallVec& operator=(std::initializer_list<T> l) {
+    assign(l.begin(), l.end());
+    return *this;
+  }
+  operator std::vector<T>() const { return std::vector<T>(begin(), end()); }
+
+  template <class It>
+  void assign(It first, It last) {
+    n_ = 0;
+    if constexpr (std::is_same_v<std::remove_cv_t<std::remove_pointer_t<It>>, T> ||
+                  std::contiguous_iterator<It>) {
+      std::size_t m = static_cast<std::size_t>(last - first);
+      if (m > cap_) grow(m);
+      if (m) std::memcpy(p_, &*first, m * sizeof(T));
+      n_ = static_cast<std::uint32_t>(m);
+    } else {
+      if constexpr (std::is_base_of_v<std::forward_iterator_tag,
+                                      typename std::iterator_traits<It>::iterator_category>)
+        reserve(static_cast<std::size_t>(std::distance(first, last)));
+      for (; first != last; ++first) push_back(*first);
+    }
+  }
+  std::size_t size() const { return n_; }
+  bool empty() const { return n_ == 0; }
+  T* begin() { return p_; }
+  T* end() { return p_ + n_; }
+  const T* begin() const { return p_; }
+  const T* end() const { return p_ + n_; }
+  const T* cbegin() const { return p_; }
+  const T* cend() const { return p_ + n_; }
+  std::reverse_iterator<const T*> rbegin() const { return std::reverse_iterator<const T*>(end()); }
+  std::reverse_iterator<const T*> rend() const { return std::reverse_iterator<const T*>(begin()); }
+  T* data() { return p_; }
+  const T* data() const { return p_; }
+  T& operator[](std::size_t k) { return p_[k]; }
+  const T& operator[](std::size_t k) const { return p_[k]; }
+  T& at(std::size_t k) {
+    if (k >= n_) throw std::out_of_range("SmallVec::at");
+    return p_[k];
+  }
+  const T& at(std::size_t k) const {
+    if (k >= n_) throw std::out_of_range("SmallVec::at");
+    return p_[k];
+  }
+  T& front() { return p_[0]; }
+  const T& front() const { return p_[0]; }
+  T& back() { return p_[n_ - 1]; }
+  const T& back() const { return p_[n_ - 1]; }
+  void reserve(std::size_t c) {
+    if (c > cap_) grow(c);
+  }
+  [[gnu::noinline]] void grow(std::size_t c) {
+    std::size_t nc = cap_ * 2 > c ? cap_ * 2 : c;
+    T* q = static_cast<T*>(std::malloc(nc * sizeof(T)));
+    if (!q) throw std::bad_alloc();
+    if (n_) std::memcpy(q, p_, n_ * sizeof(T));
+    if (p_ != buf_) std::free(p_);
+    p_ = q;
+    cap_ = static_cast<std::uint32_t>(nc);
+  }
+  void push_back(const T& v) {
+    if (n_ == cap_) [[unlikely]] {
+      T copy = v;  // (v may be one of ours)
+      grow(n_ + 1);
+      p_[n_++] = copy;
+      return;
+    }
+    p_[n_++] = v;
+  }
+  template <class... A>
+  T& emplace_back(A&&... a) {
+    push_back(T{std::forward<A>(a)...});
+    return back();
+  }
+  void pop_back() { --n_; }
+  void clear() { n_ = 0; }
+  void resize(std::size_t n) { resize(n, T{}); }
+  void resize(std::size_t n, const T& v) {
+    reserve(n);
+    for (std::size_t k = n_; k < n; ++k) p_[k] = v;
+    n_ = static_cast<std::uint32_t>(n);
+  }
+  T* insert(const T* pos, const T& v) {
+    std::size_t k = static_cast<std::size_t>(pos - p_);
+    T copy = v;
+    reserve(n_ + 1);
+    std::memmove(p_ + k + 1, p_ + k, (n_ - k) * sizeof(T));
+    p_[k] = copy;
+    ++n_;
+    return p_ + k;
+  }
+  template <class It, class = decltype(*std::declval<It>())>
+  T* insert(const T* pos, It first, It last) {
+    std::size_t k = static_cast<std::size_t>(pos - p_);
+    SmallVec tmp(first, last);  // (the range may be ours)
+    std::size_t m = tmp.size();
+    reserve(n_ + m);
+    std::memmove(p_ + k + m, p_ + k, (n_ - k) * sizeof(T));
+    if (m) std::memcpy(p_ + k, tmp.p_, m * sizeof(T));
+    n_ += static_cast<std::uint32_t>(m);
+    return p_ + k;
+  }
+  T* erase(const T* pos) { return erase(pos, pos + 1); }
+  T* erase(const T* first, const T* last) {
+    std::size_t k = static_cast<std::size_t>(first - p_), m = static_cast<std::size_t>(last - first);
+    std::memmove(p_ + k, p_ + k + m, (n_ - k - m) * sizeof(T));
+    n_ -= static_cast<std::uint32_t>(m);
+    return p_ + k;
+  }
+  friend bool operator==(const SmallVec& a, const SmallVec& b) {
+    return a.n_ == b.n_ && std::equal(a.begin(), a.end(), b.begin());
+  }
+  friend bool operator!=(const SmallVec& a, const SmallVec& b) { return !(a == b); }
+  friend bool operator<(const SmallVec& a, const SmallVec& b) {
+    return std::lexicographical_compare(a.begin(), a.end(), b.begin(), b.end());
+  }
+
+ private:
+  void take(SmallVec& o) {
+    if (o.p_ == o.buf_) {
+      n_ = o.n_;
+      if (n_) std::memcpy(buf_, o.buf_, n_ * sizeof(T));
+    } else {
+      p_ = o.p_;
+      n_ = o.n_;
+      cap_ = o.cap_;
+      o.p_ = o.buf_;
+      o.cap_ = N;
+    }
+    o.n_ = 0;
+  }
+  T* p_ = buf_;
+  std::uint32_t n_ = 0, cap_ = N;
+  T buf_[N];
+};
 // An OCaml list built by consing (the newest first): push_front appends to
 // a vector, iteration runs backwards (a std::deque allocates a chunk and a
 // map for each register, even an empty one)
