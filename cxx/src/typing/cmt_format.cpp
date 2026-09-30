@@ -3171,7 +3171,15 @@ using location::rewrite_absolute_path;
 
 std::string file_digest(const std::string& path) {
   std::ifstream in(path, std::ios::binary);
-  std::string data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  std::string data;  // one read (an unreadable file digests as empty)
+  if (in.seekg(0, std::ios::end)) {
+    std::streamoff n = in.tellg();
+    if (n > 0 && in.seekg(0)) {
+      data.resize(static_cast<std::size_t>(n));
+      in.read(data.data(), n);
+      data.resize(static_cast<std::size_t>(in.gcount()));
+    }
+  }
   return blake2::blake128(reinterpret_cast<const unsigned char*>(data.data()), data.size());
 }
 
