@@ -28,7 +28,7 @@ Lines = changed lines in the upstream diff.
 - [x] typing/typeopt.ml (136)
 - [x] typing/errortrace_report.ml (131)
 - [x] typing/typetexp.ml (130)
-- [ ] lambda/value_rec_compiler.ml (129)
+- [x] lambda/value_rec_compiler.ml (129)
 - [ ] typing/rawprinttyp.ml (122)
 - [x] parsing/parser.mly (118)
 - [ ] typing/typing_recovery_state.ml (111)
