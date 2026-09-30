@@ -64,6 +64,12 @@ struct IdentLess {
   bool operator()(Ident::t a, Ident::t b) const { return ident::compare(a, b) < 0; }
 };
 using IdentSet = std::set<Ident::t, IdentLess>;
+// Ident.Map as a persistent map (add shares the tree, as Map.add)
+struct IdentCompare {
+  int operator()(Ident::t a, Ident::t b) const { return ident::compare(a, b); }
+};
+template <class V>
+using IdentPMap = PMap<Ident::t, V, IdentCompare>;
 template <class V>
 using IdentMap = std::map<Ident::t, V, IdentLess>;
 
@@ -377,6 +383,7 @@ lambda make_sequence(F&& fn, const T& l) {
 }
 using UpdateEnv = std::function<env::t(Ident::t, const ValueDescription*, env::t)>;
 lambda subst(const UpdateEnv& update_env, bool freshen_bound_variables, const IdentMap<lambda>& s, lambda lt);
+lambda subst(const UpdateEnv& update_env, bool freshen_bound_variables, const IdentPMap<lambda>& s, lambda lt);
 lambda rename(const IdentMap<Ident::t>& idmap, lambda lt);
 const LFunction* duplicate_function(const LFunction* f);
 lambda map(const std::function<lambda(lambda)>& f, lambda l);

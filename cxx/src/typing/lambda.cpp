@@ -1003,10 +1003,28 @@ lambda make_atomic_loc(const ScopedLocation& loc, lambda arg, lambda field) {
 
 // ---- substitution -------------------------------------------------------------------
 namespace {
+// the substitution: an IdentMap or an IdentPMap
+struct SubstMap {
+  const IdentMap<lambda>* m = nullptr;
+  const IdentPMap<lambda>* p = nullptr;
+  const lambda* find(Ident::t id) const {
+    if (!m) return p->find_opt(id);
+    auto it = m->find(id);
+    return it == m->end() ? nullptr : &it->second;
+  }
+  bool count(Ident::t id) const { return find(id) != nullptr; }
+  template <class F>
+  void keys(F&& f) const {  // in key order
+    if (m)
+      for (auto& [k, _] : *m) f(k);
+    else
+      p->iter([&](Ident::t k, const lambda&) { f(k); });
+  }
+};
 struct Substs {
   const UpdateEnv& update_env;
   bool freshen;
-  const IdentMap<lambda>& s;
+  SubstMap s;
   using L = IdentMap<Ident::t>;
 
   Ident::t bind(Ident::t id, L& l) {
@@ -1031,8 +1049,8 @@ struct Substs {
         bool mut = lam->kind == LK::Lmutvar;
         Ident::t id = mut ? as<Lmutvar>(lam)->id : as<Lvar>(lam)->id;
         if (const Ident::t* id2 = find(l, id)) return mut ? lmutvar(*id2) : lvar(*id2);
-        auto it = s.find(id);
-        return it == s.end() ? lam : it->second;
+        const lambda* v = s.find(id);
+        return v ? *v : lam;
       }
       case LK::Lconst: return lam;
       case LK::Lapply: {
@@ -1157,8 +1175,9 @@ struct Substs {
         // apply in Ident order
         std::vector<Ident::t> keys;
         for (auto& [k, _] : l) keys.push_back(k);
-        for (auto& [k, _] : s)
+        s.keys([&](Ident::t k) {
           if (!l.count(k)) keys.push_back(k);
+        });
         std::sort(keys.begin(), keys.end(), IdentLess{});
         env::t new_env = old_env;
         // find_in_old runs inside the update, and a bound variable renamed to
@@ -1212,7 +1231,11 @@ struct Substs {
 }  // namespace
 
 lambda subst(const UpdateEnv& update_env, bool freshen_bound_variables, const IdentMap<lambda>& s, lambda lt) {
-  Substs st{update_env, freshen_bound_variables, s};
+  Substs st{update_env, freshen_bound_variables, SubstMap{&s, nullptr}};
+  return st.subst({}, lt);
+}
+lambda subst(const UpdateEnv& update_env, bool freshen_bound_variables, const IdentPMap<lambda>& s, lambda lt) {
+  Substs st{update_env, freshen_bound_variables, SubstMap{nullptr, &s}};
   return st.subst({}, lt);
 }
 
@@ -1228,7 +1251,7 @@ lambda rename(const IdentMap<Ident::t>& idmap, lambda lt) {
 const LFunction* duplicate_function(const LFunction* f) {
   UpdateEnv id = [](Ident::t, const ValueDescription*, env::t e) { return e; };
   IdentMap<lambda> empty;
-  Substs st{id, true, empty};
+  Substs st{id, true, SubstMap{&empty, nullptr}};
   return st.subst_lfun({}, f);
 }
 
