@@ -57,8 +57,8 @@ class Zone {
     for (auto it = dtors_.rbegin(); it != dtors_.rend(); ++it) it->second(it->first);
   }
   // 2 MiB-aligned storage straight from the kernel, advised for
-  // transparent huge pages (Free unmaps it)
-  static char* huge_block(std::size_t sz);
+  // transparent huge pages when [advise] (Free unmaps it)
+  static char* huge_block(std::size_t sz, bool advise = true);
 
   // (the bump is inlined at every allocation; a new block is out of line)
   void* alloc(std::size_t n, std::size_t align) {
@@ -158,7 +158,11 @@ class Zone {
     std::size_t sz = n > unit ? n : unit;
     block_bytes() += sz;
     bool mapped = big || mmap_all_;
-    char* blk = mapped ? huge_block(sz) : static_cast<char*>(std::malloc(sz));
+    // huge pages once the compilation is big (fewer TLB misses and page
+    // faults); a small one's pages stay small: a huge page's fault zeroes
+    // 2 MiB, which many small compilers at once pay for in the kernel
+    bool advise = block_bytes() > (std::size_t{64} << 20);
+    char* blk = mapped ? huge_block(sz, advise) : static_cast<char*>(std::malloc(sz));
     if (!blk) throw std::bad_alloc();
     blocks_.emplace_back(blk, Free{mapped ? sz : 0});
     cur_ = blk;
