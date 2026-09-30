@@ -1,6 +1,7 @@
 // Port of asmcomp/asmlink.ml; see asmlink.hpp.
 #include "cppcaml/typing/asmlink.hpp"
 
+#include <algorithm>
 #include <unistd.h>
 
 #include <cstdio>
@@ -47,26 +48,29 @@ bool ends_with(const std::string& s, const std::string& suff) {
 // keep the first crc checked; interfaces / implementations are the names'
 // string objects (from the .cmx files), the latest first.
 Consistbl g_crc_interfaces;
-std::vector<std::string_view> g_interfaces;
+std::vector<std::string_view> g_interfaces;  // consed in reverse: the latest last
 std::map<std::string, std::string, std::less<>> g_crc_interface_objs;
 Consistbl g_crc_implementations;
-std::vector<std::string_view> g_implementations;
+std::vector<std::string_view> g_implementations;  // consed in reverse: the latest last
 std::map<std::string, std::string, std::less<>> g_crc_implementation_objs;
 std::vector<std::string> g_cmx_required;
 
 // Consistbl.extract l tbl: the names sorted (List.sort_uniq's choice among
 // equal names is the object the result carries), then consed
+// ([names] consed in reverse: the latest last)
 cmx_format::Crcs extract(const std::vector<std::string_view>& names,
                          const std::map<std::string, std::string, std::less<>>& crcs) {
-  std::vector<std::string_view> l = list_sort::sort_uniq(names, [](std::string_view a, std::string_view b) {
+  std::vector<std::string_view> latest_first(names.rbegin(), names.rend());
+  std::vector<std::string_view> l = list_sort::sort_uniq(latest_first, [](std::string_view a, std::string_view b) {
     int c = a.compare(b);
     return c < 0 ? -1 : c > 0 ? 1 : 0;
   });
   cmx_format::Crcs assc;
   for (std::string_view name : l) {
     auto it = crcs.find(name);
-    assc.insert(assc.begin(), {name, it == crcs.end() ? std::nullopt : std::optional<std::string>(it->second)});
+    assc.push_back({name, it == crcs.end() ? std::nullopt : std::optional<std::string>(it->second)});
   }
+  std::reverse(assc.begin(), assc.end());  // consed
   return assc;
 }
 
@@ -345,7 +349,7 @@ void call_linker(const std::vector<std::string>& file_list, const std::string& s
 void check_consistency(const std::string& file_name, const UnitInfos& unit, const std::string& crc) {
   try {
     for (auto& [name, crco] : unit.ui_imports_cmi) {
-      g_interfaces.insert(g_interfaces.begin(), name);
+      g_interfaces.push_back(name);
       if (crco) {
         g_crc_interfaces.check(std::string(name), *crco, file_name);
         g_crc_interface_objs.emplace(std::string(name), *crco);  // (Consistbl.check adds the first)
@@ -356,7 +360,7 @@ void check_consistency(const std::string& file_name, const UnitInfos& unit, cons
   }
   try {
     for (auto& [name, crco] : unit.ui_imports_cmx) {
-      g_implementations.insert(g_implementations.begin(), name);
+      g_implementations.push_back(name);
       if (!crco) {
         for (const std::string& r : g_cmx_required)
           if (r == name) fail(Error::Kind::Missing_cmx, file_name, std::string(name));
@@ -368,10 +372,10 @@ void check_consistency(const std::string& file_name, const UnitInfos& unit, cons
   } catch (const Consistbl::Inconsistency& e) {
     fail(Error::Kind::Inconsistent_implementation, e.unit_name, e.inconsistent_source, e.original_source);
   }
-  g_implementations.insert(g_implementations.begin(), unit.ui_name);
+  g_implementations.push_back(unit.ui_name);
   g_crc_implementations.check(std::string(unit.ui_name), crc, file_name);
   g_crc_implementation_objs.emplace(std::string(unit.ui_name), crc);
-  if (unit.ui_symbol != unit.ui_name) g_cmx_required.insert(g_cmx_required.begin(), std::string(unit.ui_name));
+  if (unit.ui_symbol != unit.ui_name) g_cmx_required.push_back(std::string(unit.ui_name));  // (a set: order unused)
 }
 
 // Main entry point
