@@ -13,6 +13,7 @@
 #include <set>
 #include <stdexcept>
 
+#include "cppcaml/flat_map.hpp"
 #include "cppcaml/typing/clflags.hpp"
 
 namespace cppcaml::typing::mach_passes {
@@ -79,7 +80,7 @@ std::pair<Instr, AllocState> combine(Instr i, const AllocState& allocstate) {
     case IK::Iexit:
     case IK::Iraise: return {i, allocstate};
     case IK::Iop: {
-      const mach::Operation& op = i->op;
+      const mach::Operation& op = *i->op;
       if (op.k == MK::Ialloc) {
         long sz = op.n;
         const std::vector<AllocDbginfo>& dbginfo = op.dbginfo;
@@ -382,7 +383,7 @@ Instr cse_i(const Numbering& n, Instr i) {
     case IK::Iexit:
     case IK::Iraise: return i;
     case IK::Iop: {
-      const mach::Operation& op = i->op;
+      const mach::Operation& op = *i->op;
       switch (op.k) {
         case MK::Itailcall_ind:
         case MK::Itailcall_imm: return i;
@@ -526,7 +527,7 @@ RegSet analyze_sets(const std::function<RegSet(const RegSet&)>& exnhandler, cons
       case IK::Iend: return transfer(i, end_, exn);
       case IK::Ireturn: return transfer(i, {}, {});
       case IK::Iop: {
-        if (i->op.k == MK::Itailcall_ind || i->op.k == MK::Itailcall_imm) return transfer(i, {}, {});
+        if (i->op->k == MK::Itailcall_ind || i->op->k == MK::Itailcall_imm) return transfer(i, {}, {});
         RegSet bx = before(end_, exn, i->next);
         return transfer(i, bx, exn);
       }
@@ -585,7 +586,7 @@ void liveness(const mach::Fundecl& f) {
         i->live.clear();  // no regs are live across
         return set_of_array(i->arg);
       case IK::Iop: {
-        const mach::Operation& op = i->op;
+        const mach::Operation& op = *i->op;
         if (op.k == MK::Itailcall_ind || op.k == MK::Itailcall_imm) {
           i->live.clear();
           return set_of_array(i->arg);
@@ -651,10 +652,10 @@ D deadcode_i(Instr i) {
     case IK::Ireturn:
     case IK::Iraise: return {i, add_set_array(i->live, i->arg), {}};
     case IK::Iop: {
-      if (i->op.k == MK::Itailcall_ind || i->op.k == MK::Itailcall_imm)
+      if (i->op->k == MK::Itailcall_ind || i->op->k == MK::Itailcall_imm)
         return {i, add_set_array(i->live, i->arg), {}};
       D s = deadcode_i(i->next);
-      if (operation_is_pure(i->op) && disjoint_set_array(s.regs, i->res)) return s;
+      if (operation_is_pure(*i->op) && disjoint_set_array(s.regs, i->res)) return s;
       Instr c = copy(i);
       c->next = s.i;
       return {c, add_set_array(i->live, i->arg), s.exits};
@@ -756,7 +757,9 @@ struct SpillEnv {
 
 struct ReloadData {
   SpillEnv* spill_env;
-  RegMap<long> use_date;  // Record the position of last use of registers
+  // Record the position of last use of registers (a Reg.Map.t in a mutable
+  // field, only found and added to: a table updated in place)
+  FlatMap<Reg*, long> use_date;
   long current_date = 0;
   std::vector<std::pair<Instr, RegSet>> destroyed_at_fork;  // list order: the newest first
   std::map<long, RegSet> reload_at_exit;
@@ -783,9 +786,8 @@ Reg* spill_reg(SpillEnv* env, Reg* r) {
 
 void record_use(ReloadData& t, const Regs& regv) {
   for (Reg* r : regv) {
-    const long* p = t.use_date.find_opt(r);
-    long prev_date = p ? *p : 0;
-    if (t.current_date > prev_date) t.use_date = t.use_date.add(r, t.current_date);
+    auto [it, fresh] = t.use_date.try_emplace(r, 0);
+    if (t.current_date > it->second) it->second = t.current_date;
   }
 }
 
@@ -817,9 +819,9 @@ RegSet add_superpressure_regs(ReloadData& t, const mach::Operation& op, const Re
     Reg* lru_reg = nullptr;
     for (Reg* r : live_regs) {
       if (proc::register_class(r) == cl && !spilled.count(r) && r->loc.k == LK::Unknown) {
-        if (const long* d = t.use_date.find_opt(r))
-          if (*d < lru_date) {
-            lru_date = *d;
+        if (auto it = t.use_date.find(r); it && it->second)  // (0: never recorded)
+          if (it->second < lru_date) {
+            lru_date = it->second;
             lru_reg = r;
           }
       }
@@ -856,7 +858,7 @@ std::pair<Instr, RegSet> reload_i(ReloadData& t, Instr i, const RegSet& before) 
     case IK::Iend: return {i, before};
     case IK::Ireturn: return {add_reloads(t.spill_env, inter_set_array(before, i->arg), i), {}};
     case IK::Iop: {
-      const mach::Operation& op = i->op;
+      const mach::Operation& op = *i->op;
       if (op.k == MK::Itailcall_ind || op.k == MK::Itailcall_imm)
         return {add_reloads(t.spill_env, inter_set_array(before, i->arg), i), {}};
       if (op.k == MK::Icall_ind || op.k == MK::Icall_imm || (op.k == MK::Iextcall && op.alloc)) {
@@ -971,7 +973,7 @@ std::pair<Instr, RegSet> spill_i(SpillData& t, Instr i, const RegSet& finally) {
     case IK::Iend: return {i, finally};
     case IK::Ireturn: return {i, {}};
     case IK::Iop: {
-      const mach::Operation& op = i->op;
+      const mach::Operation& op = *i->op;
       if (op.k == MK::Itailcall_ind || op.k == MK::Itailcall_imm) return {i, {}};
       if (op.k == MK::Ireload) {
         auto [new_next, after] = spill_i(t, i->next, finally);
@@ -1164,9 +1166,9 @@ std::pair<Instr, Subst> rename(Instr i, const Subst& sub) {
     case IK::Iend: return {i, sub};
     case IK::Ireturn: return {instr_cons_debug(*i, subst_regs(i->arg, sub), {}, i->dbg, i->next), std::nullopt};
     case IK::Iop: {
-      if (i->op.k == MK::Itailcall_ind || i->op.k == MK::Itailcall_imm)
+      if (i->op->k == MK::Itailcall_ind || i->op->k == MK::Itailcall_imm)
         return {instr_cons_debug(*i, subst_regs(i->arg, sub), {}, i->dbg, i->next), std::nullopt};
-      if (i->op.k == MK::Ireload && i->res[0]->loc.k == LK::Unknown) {
+      if (i->op->k == MK::Ireload && i->res[0]->loc.k == LK::Unknown) {
         if (!sub) return rename(i->next, sub);
         Reg* oldr = i->res[0];
         Reg* newr = reg::clone(i->res[0]);
@@ -1319,7 +1321,7 @@ void interf_build_graph(const mach::Fundecl& fundecl) {
         case IK::Iexit:
         case IK::Iraise: return;
         case IK::Iop:
-          switch (i->op.k) {
+          switch (i->op->k) {
             case MK::Imove:
             case MK::Ispill:
             case MK::Ireload: add_interf_move(i->arg[0], i->res[0], i->live); break;
@@ -1390,7 +1392,7 @@ void interf_build_graph(const mach::Fundecl& fundecl) {
         case IK::Iexit:
         case IK::Iraise: return;
         case IK::Iop:
-          switch (i->op.k) {
+          switch (i->op->k) {
             case MK::Imove: add_mutual_pref(weight, i->arg[0], i->res[0]); break;
             case MK::Ispill: add_pref(weight / 4, i->arg[0], i->res[0]); break;
             case MK::Ireload: add_pref(weight / 4, i->res[0], i->arg[0]); break;
@@ -1682,8 +1684,8 @@ const interval::Result& build_intervals(const Fundecl& fd) {
       switch (i->desc) {
         case IK::Iend: return;
         case IK::Iop:
-          if (!(i->op.k == MK::Icall_ind || i->op.k == MK::Icall_imm || (i->op.k == MK::Iextcall && i->op.alloc) ||
-                i->op.k == MK::Itailcall_ind || i->op.k == MK::Itailcall_imm))
+          if (!(i->op->k == MK::Icall_ind || i->op->k == MK::Icall_imm || (i->op->k == MK::Iextcall && i->op->alloc) ||
+                i->op->k == MK::Itailcall_ind || i->op->k == MK::Itailcall_imm))
             insert_destroyed_at_oper(i, pos);
           break;
         case IK::Ireturn: insert_destroyed_at_oper(i, pos); break;
@@ -2060,7 +2062,7 @@ struct Reloader {
       case IK::Ireturn:
       case IK::Iraise: return i;
       case IK::Iop: {
-        const mach::Operation& op = i->op;
+        const mach::Operation& op = *i->op;
         if (op.k == MK::Itailcall_imm) return i;
         if (op.k == MK::Itailcall_ind) {
           Regs newarg = makereg1(i->arg);
