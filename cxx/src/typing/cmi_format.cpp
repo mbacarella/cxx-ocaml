@@ -981,6 +981,7 @@ std::vector<o::ValPtr> debug_event_values(const std::vector<const instruct::Debu
 }
 
 std::vector<std::uint8_t> marshal_debug_events(const std::vector<const instruct::DebugEvent*>& events) {
+  o::ArenaScope arena_scope;  // the values made here die with the output
   Writer w;
   // the uids' and ev_module's unit name: the one Unit_info string, which
   // the unit's module ident (a top-level scope's name) shares too
@@ -1003,11 +1004,13 @@ const OValue* input_ovalue(const std::uint8_t* data, std::size_t len, std::size_
 }
 
 std::vector<std::uint8_t> output_ovalue(const OValue* v) {
+  o::ArenaScope arena_scope;  // the values made here die with the output
   Writer w;
   return o::marshal(w.ovalue(v));
 }
 
 std::size_t marshaled_size(const ModuleType* a, const ModuleType* b) {
+  o::ArenaScope arena_scope;  // the values made here die with the output
   Writer w;
   w.set_current_unit(env::get_current_unit_name());
   // (got, expected): a tuple, fields evaluated right to left
@@ -1016,6 +1019,7 @@ std::size_t marshaled_size(const ModuleType* a, const ModuleType* b) {
   return o::marshal(o::vblock(0, {va, vb})).size();
 }
 std::size_t marshaled_size(const ModtypeDeclaration* a, const ModtypeDeclaration* b) {
+  o::ArenaScope arena_scope;  // the values made here die with the output
   Writer w;
   w.set_current_unit(env::get_current_unit_name());
   o::ValPtr vb = w.modtype_decl(b);
@@ -1024,6 +1028,7 @@ std::size_t marshaled_size(const ModtypeDeclaration* a, const ModtypeDeclaration
 }
 
 std::pair<std::string, std::string> output_cmi_bytes(const CmiInfos& cmi) {
+  o::ArenaScope arena_scope;  // the values made here die with the output
   // (the provided signature must have been substituted for saving)
   Writer w;
   w.set_current_unit(cmi.cmi_name);
@@ -2096,6 +2101,7 @@ V unit_infos(CmxWriter& cw, const UnitInfos& ui, const V& export_info) {
 }  // namespace
 
 std::string write_unit_info(const UnitInfos& ui) {
+  o::ArenaScope arena_scope;  // the values made here die with the output
   CmxWriter cw;
   V info = unit_infos(cw, ui, o::vblock(0, {cw.approx(ui.ui_export_info)}));
   std::vector<std::uint8_t> bytes = o::marshal(info);
@@ -2107,6 +2113,7 @@ std::string write_unit_info(const UnitInfos& ui) {
 }
 
 std::string write_library_info(const LibraryInfos& l) {
+  o::ArenaScope arena_scope;  // the values made here die with the output
   CmxWriter cw;
   auto& w = cw.w;
   V default_export_info = o::vblock(0, {w.i(0)});  // Clambda Value_unknown

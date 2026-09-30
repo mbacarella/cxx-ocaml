@@ -25,26 +25,56 @@ namespace cppcaml::omarshal {
 constexpr std::uint32_t hdr_color() { return 3u << 8; }
 
 // ---- the values' arena ------------------------------------------------------
+namespace {
+struct Arena {
+  char* cur = nullptr;
+  std::size_t left = 0;
+  std::vector<char*> blocks;
+  std::vector<Value::Extra*> extras;  // (their strings own heap storage)
+};
+Arena& arena() {
+  static Arena* a = new Arena;
+  return *a;
+}
+}  // namespace
+
 void* arena_alloc(std::size_t n, std::size_t align) {
-  static char* cur = nullptr;
-  static std::size_t left = 0;
+  Arena& a = arena();
   constexpr std::size_t kBlock = 1 << 20;
-  std::size_t pad = (align - reinterpret_cast<std::uintptr_t>(cur) % align) % align;
-  if (!cur || pad + n > left) {
+  std::size_t pad = (align - reinterpret_cast<std::uintptr_t>(a.cur) % align) % align;
+  if (!a.cur || pad + n > a.left) {
     std::size_t sz = n + align > kBlock ? n + align : kBlock;
-    cur = static_cast<char*>(std::malloc(sz));
-    if (!cur) throw std::bad_alloc();
-    left = sz;
-    pad = (align - reinterpret_cast<std::uintptr_t>(cur) % align) % align;
+    a.cur = static_cast<char*>(std::malloc(sz));
+    if (!a.cur) throw std::bad_alloc();
+    a.blocks.push_back(a.cur);
+    a.left = sz;
+    pad = (align - reinterpret_cast<std::uintptr_t>(a.cur) % align) % align;
   }
-  char* p = cur + pad;
-  cur = p + n;
-  left -= pad + n;
+  char* p = a.cur + pad;
+  a.cur = p + n;
+  a.left -= pad + n;
   return p;
 }
 
+ArenaMark arena_mark() {
+  Arena& a = arena();
+  return ArenaMark{a.blocks.size(), a.extras.size(), a.cur, a.left};
+}
+void arena_release(const ArenaMark& m) {
+  Arena& a = arena();
+  for (std::size_t k = a.extras.size(); k-- > m.extras;) a.extras[k]->~Extra();
+  a.extras.resize(m.extras);
+  for (std::size_t k = m.blocks; k < a.blocks.size(); ++k) std::free(a.blocks[k]);
+  a.blocks.resize(m.blocks);
+  a.cur = m.cur;
+  a.left = m.left;
+}
+
 Value::Extra& Value::extra() {
-  if (!x) x = new (arena_alloc(sizeof(Extra), alignof(Extra))) Extra;
+  if (!x) {
+    x = new (arena_alloc(sizeof(Extra), alignof(Extra))) Extra;
+    arena().extras.push_back(x);
+  }
   return *x;
 }
 const std::string& Value::empty_str() {

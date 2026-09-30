@@ -22,6 +22,28 @@ namespace cppcaml::omarshal {
 // storage from the values' arena (never freed)
 void* arena_alloc(std::size_t n, std::size_t align);
 
+// The values' arena is released by scope: an output's writer builds its
+// values, marshals them and drops them (without, every value any output ever
+// made stayed until the process exited).  Nothing made in the scope may
+// outlive it.
+struct ArenaMark {
+  std::size_t blocks, extras;
+  char* cur;
+  std::size_t left;
+};
+ArenaMark arena_mark();
+void arena_release(const ArenaMark& m);
+class ArenaScope {
+ public:
+  ArenaScope() : m_(arena_mark()) {}
+  ~ArenaScope() { arena_release(m_); }
+  ArenaScope(const ArenaScope&) = delete;
+  ArenaScope& operator=(const ArenaScope&) = delete;
+
+ private:
+  ArenaMark m_;
+};
+
 // A growable array in the arena, with value semantics: assigning copies the
 // elements into fresh storage (the source is left alone).
 template <class T>

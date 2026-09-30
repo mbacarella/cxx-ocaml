@@ -3235,6 +3235,7 @@ void clear() {
 
 void save_cmt(const std::string& filename, std::string_view modname, const std::optional<std::string>& sourcefile,
               const BinaryAnnots& annots, env::t initial_env, const cmi_format::CmiInfos* cmi, shape::t shape) {
+  o::ArenaScope arena_scope;  // the values made here die with the output
   if (!clflags::binary_annotations || clflags::print_types) {
     clear();
     return;
