@@ -138,7 +138,8 @@ class Decoder {
   }
   Location loc(V x) {
     if (auto it = locs_.find(x); it != locs_.end()) return *it->second;
-    auto* l = make<Location>(Location{position(f(x, 0)), position(f(x, 1)), boolean(f(x, 2))});
+    // (the memo's copy: dropped with the decoder, the record is [obj])
+    auto* l = memo_zone_.make<Location>(Location{position(f(x, 0)), position(f(x, 1)), boolean(f(x, 2))});
     l->obj = loc_record(*l);
     locs_[x] = l;
     return *l;
@@ -993,6 +994,7 @@ class Decoder {
   FlatMap<V, std::pair<const void*, std::size_t>> lists_;
   FlatMap<V, Position*> poss_;
   FlatMap<V, Location*> locs_;
+  Zone memo_zone_;  // what only the memo tables point to
   FlatMap<V, const void*> somes_;
 };
 
