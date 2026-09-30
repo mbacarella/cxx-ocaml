@@ -2,6 +2,8 @@
 // printmach.ml.  See mach.hpp.
 #include "cppcaml/typing/mach.hpp"
 
+#include "cppcaml/flat_map.hpp"
+
 #include <functional>
 #include <unordered_map>
 
@@ -184,7 +186,7 @@ static Instruction* new_instr(const Instruction& d) {
 }
 
 Instr compact_instrs(Instr root, Zone& into) {
-  std::unordered_map<Instr, Instr> memo;
+  FlatMap<Instr, Instr> memo;  // (open addressing: an unordered_map node per instruction was ~2%)
   // a chain along `next` copied iteratively (a function body is long), the
   // branches recursively (as deep as the code nests); shared nodes stay
   // shared, the static dummy_instr is kept
@@ -196,12 +198,12 @@ Instr compact_instrs(Instr root, Zone& into) {
         *slot = i;
         break;
       }
-      if (auto it = memo.find(i); it != memo.end()) {
+      if (auto it = memo.find(i)) {
         *slot = it->second;
         break;
       }
       Instruction* c = into.make<Instruction>(*i);
-      memo.emplace(i, c);
+      memo.try_emplace(i, c);
       *slot = c;
       if (c->ifso) c->ifso = chain(c->ifso);
       if (c->ifnot) c->ifnot = chain(c->ifnot);
