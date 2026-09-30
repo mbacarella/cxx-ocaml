@@ -67,7 +67,11 @@ do_build() {
     rm -rf "$mi_src" "$mi_build" "$mi_pfx"
     mkdir -p "$mi_src"
     tar xzf "$tarball" -C "$mi_src" --strip-components=1
+    # arenas committed as used, not eagerly: an eager commit makes every
+    # compiler fault in and zero memory it never uses (a parallel build's
+    # system time, a third of a small compilation's resident memory)
     cmake -S "$mi_src" -B "$mi_build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_FLAGS=-DMI_DEFAULT_ARENA_EAGER_COMMIT=0 \
       -DMI_BUILD_SHARED=OFF -DMI_BUILD_STATIC=ON -DMI_BUILD_OBJECT=ON -DMI_BUILD_TESTS=OFF \
       -DCMAKE_INSTALL_PREFIX="$mi_pfx" >/dev/null
     ninja -C "$mi_build" -j "$jobs" install >/dev/null
