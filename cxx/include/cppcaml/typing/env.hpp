@@ -593,9 +593,6 @@ std::function<t(t)> make_copy_of_types(t env0);
 t with_pairs(Slice<std::pair<ident::Unscoped*, ident::Unscoped*>> id_pairs, t env);
 Slice<std::pair<ident::Unscoped*, ident::Unscoped*>> get_pairs(t env);
 bool path_equiv(t env, Path::t p1, Path::t p2);
-// Equivalence of (mod)type paths modulo path normalization.
-bool type_path_equiv_modulo(t env, Path::t p1, Path::t p2);
-bool modtype_path_equiv_modulo(t env, Path::t p1, Path::t p2);
 
 // persistent structures
 Signature read_signature(const std::string& modname, const std::string& filename);

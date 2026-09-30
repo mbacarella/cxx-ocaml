@@ -456,21 +456,17 @@ static ModuleComponents* components_of_module(StrMap<std::string_view> alerts, c
 // ---- persistent structures ---------------------------------------------------
 static persistent_env::PersistentEnv<const ModuleData*> g_persistent_env;
 
-// hashcons_name: the first string of each unit name, for the whole process
-// (the persistent idents of one unit share one string across resets)
-static std::string_view hashcons_name(std::string_view name) {
-  static std::unordered_map<std::string, std::string_view> names;
-  auto [it, fresh] = names.try_emplace(std::string(name), std::string_view{});
-  if (fresh) {
-    ZoneScope perm(permanent_zone());
-    it->second = zborrow(name);
-  }
-  return it->second;
+// the persistent ident's name: the cmi's own string (a fresh one per read,
+// as OCaml's; kept for the whole process -- a cached lambda may hold the
+// ident past the unit's zone)
+static std::string_view persistent_name(std::string_view name) {
+  ZoneScope perm(permanent_zone());
+  return zborrow(name);
 }
 
 static const ModuleData* sign_of_cmi(bool freshen, const persistent_env::PersistentSignature& ps) {
   const auto& cmi = ps.cmi;
-  Ident::t id = Ident::create_persistent(hashcons_name(cmi.cmi_name));
+  Ident::t id = Ident::create_persistent(persistent_name(cmi.cmi_name));
   Path::t path = Path::pident(id);
   StrMap<std::string_view> alerts;
   for (auto& f : cmi.cmi_flags)
@@ -3401,84 +3397,6 @@ bool path_equiv(t env, Path::t p1, Path::t p2) {
   std::vector<std::pair<Ident::t, Ident::t>> pairs;
   for (auto& [a, b] : env->id_pairs) pairs.emplace_back(Ident::of_unscoped(a), Ident::of_unscoped(b));
   return path::equiv(pairs, p1, p2);
-}
-
-static bool path_has_apply(Path::t p) {
-  switch (p->kind) {
-    case Path::Kind::Pident: return false;
-    case Path::Kind::Pdot: case Path::Kind::Pextra_ty: return path_has_apply(p->p1);
-    case Path::Kind::Papply: return true;
-  }
-  return false;
-}
-
-static const lz::ModuleDecl* find_module_and_expand(t env, Path::t path) {
-  for (;;) {
-    const lz::ModuleDecl* d = find_module_lazy_(true, path, env);
-    if (d->mdl_type->kind != lz::Modtype::Kind::MtyL_alias) return d;
-    path = d->mdl_type->path;
-  }
-}
-
-static const lz::ModtypeDecl* find_modtype_and_expand(t env, Path::t path) {
-  for (;;) {
-    const lz::ModtypeDecl* d = find_modtype_lazy(path, env);
-    if (!(d->mtdl_type && d->mtdl_type->kind == lz::Modtype::Kind::MtyL_ident)) return d;
-    path = d->mtdl_type->path;
-  }
-}
-
-static bool module_path_equiv_modulo(t env, Path::t p1, Path::t p2) {
-  if (p1 == p2 || path_equiv(env, p1, p2)) return true;
-  try {
-    if (path_has_apply(p1) || path_has_apply(p2)) throw NotFound{};
-    // (ocamlc evaluates the right operand of [==] first; the lookups may
-    // force components, which creates type nodes)
-    auto* d2 = find_module_and_expand(env, p2);
-    auto* d1 = find_module_and_expand(env, p1);
-    return d1 == d2;
-  } catch (const NotFound&) {
-    // fallback in presence of functor applications or missing .cmi.
-    return path_equiv(env, normalize_module_path(nullptr, env, p1),
-                      normalize_module_path(nullptr, env, p2));
-  }
-}
-
-bool type_path_equiv_modulo(t env, Path::t p1, Path::t p2) {
-  if (p1 == p2) return true;
-  if (p1->kind == Path::Kind::Papply || p2->kind == Path::Kind::Papply)
-    throw std::logic_error("Env.type_path_equiv_modulo");
-  if (p1->kind != p2->kind) return false;
-  switch (p1->kind) {
-    case Path::Kind::Pident:
-      // these are type paths, not module paths, so we do not
-      // need to consider unscoped module equalities.
-      return ident::same(p1->id, p2->id);
-    case Path::Kind::Pdot:
-      return p1->s == p2->s && module_path_equiv_modulo(env, p1->p1, p2->p1);
-    case Path::Kind::Pextra_ty: {
-      bool same_extra = p1->extra == p2->extra &&
-                        (p1->extra == Path::Extra::Pext_ty || p1->s == p2->s);
-      return same_extra && type_path_equiv_modulo(env, p1->p1, p2->p1);
-    }
-    case Path::Kind::Papply: break;
-  }
-  return false;
-}
-
-bool modtype_path_equiv_modulo(t env, Path::t p1, Path::t p2) {
-  if (p1 == p2 || path_equiv(env, p1, p2)) return true;
-  try {
-    if (path_has_apply(p1) || path_has_apply(p2)) throw NotFound{};
-    // (ocamlc evaluates the right operand of [==] first; the lookups may
-    // force components, which creates type nodes)
-    auto* d2 = find_modtype_and_expand(env, p2);
-    auto* d1 = find_modtype_and_expand(env, p1);
-    return d1 == d2;
-  } catch (const NotFound&) {
-    // fallback in presence of functor applications or missing .cmi.
-    return path_equiv(env, normalize_modtype_path(env, p1), normalize_modtype_path(env, p2));
-  }
 }
 
 }  // namespace cppcaml::typing::env
