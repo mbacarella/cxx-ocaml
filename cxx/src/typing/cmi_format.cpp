@@ -1455,6 +1455,7 @@ class CmxReader : public Reader {
     for (std::size_t k = 0; k < n; ++k) v.push_back(elt(f(id, k)));
     return slice(v);
   }
+  std::unordered_map<std::size_t, Slice<long>> index_arrays_;
 
   ulambda ulam(std::size_t id) {
     if (is_int(id)) return uunreachable();  // the constant constructor
@@ -1484,9 +1485,16 @@ class CmxReader : public Reader {
       case UK::Uswitch: {
         std::size_t sw = f(id, 1);
         USwitch u;
-        u.us_index_consts = array<long>(f(sw, 0), [&](std::size_t x) { return ival(x); });
+        // one index array per marshaled block (an inlined copy shares its
+        // original's)
+        auto index = [&](std::size_t a) {
+          auto [it, fresh] = index_arrays_.try_emplace(a);
+          if (fresh) it->second = array<long>(a, [&](std::size_t x) { return ival(x); });
+          return it->second;
+        };
+        u.us_index_consts = index(f(sw, 0));
         u.us_actions_consts = array<ulambda>(f(sw, 1), [&](std::size_t x) { return ulam(x); });
-        u.us_index_blocks = array<long>(f(sw, 2), [&](std::size_t x) { return ival(x); });
+        u.us_index_blocks = index(f(sw, 2));
         u.us_actions_blocks = array<ulambda>(f(sw, 3), [&](std::size_t x) { return ulam(x); });
         return uswitch(ulam(f(id, 0)), u, dbg(f(id, 2)));
       }
@@ -1719,6 +1727,7 @@ class CmxWriter {
     return w.i(0);
   }
   std::map<std::pair<std::uint32_t, int>, V> boxedint_kinds_;
+  std::unordered_map<const long*, V> index_arrays_;
 
   V scopes(debuginfo::scopes s) {
     if (!s) return w.i(0);
@@ -1969,7 +1978,13 @@ class CmxWriter {
         }
         case UK::Uswitch: {
           auto* x = static_cast<const Uswitch*>(u);
-          auto ints = [&](const Slice<long>& a) { return array(a, [&](long n) { return w.i(n); }); };
+          // Closure.substitute keeps a switch's index arrays: one value each
+          auto ints = [&](const Slice<long>& a) {
+            if (a.empty()) return array(a, [&](long n) { return w.i(n); });
+            V& v = index_arrays_[a.begin()];
+            if (!v) v = array(a, [&](long n) { return w.i(n); });
+            return v;
+          };
           auto acts = [&](const Slice<ulambda>& a) { return array(a, [&](ulambda y) { return ulam(y); }); };
           V sw = o::vblock(0, {ints(x->sw.us_index_consts), acts(x->sw.us_actions_consts), ints(x->sw.us_index_blocks),
                                acts(x->sw.us_actions_blocks)});
