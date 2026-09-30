@@ -784,7 +784,7 @@ class Writer {
   FlatMap<std::pair<const void*, std::size_t>, V> lists_;
   FlatMap<const void*, V> mprivate_;
   FlatMap<std::tuple<int, const char*, std::size_t>, V> labels_;
-  FlatMap<std::uint64_t, V> label_objs_;
+  FlatMap<const void*, V> label_objs_;
   FlatMap<std::tuple<const void*, long, long, long>, V> poss_;
   FlatMap<std::tuple<const void*, const void*, bool>, V> locs_;
   FlatMap<const void*, V> self_meths_;  // Val_self's self_meths blocks
