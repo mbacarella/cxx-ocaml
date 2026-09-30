@@ -724,6 +724,7 @@ PackedFile to_packed_file(std::string& out, code c, ValueContext& w) {
 
 void to_file(std::FILE* outchan, std::string_view filename, std::string_view modname,
              const lambda::IdentSet& required_globals, code c) {
+  o::ArenaScope arena_scope;  // the values made here die with the output
   Emitter em;
   std::string buf(config::cmo_magic_number);
   long pos_depl = static_cast<long>(buf.size());
