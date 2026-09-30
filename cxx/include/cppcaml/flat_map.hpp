@@ -1,18 +1,21 @@
 // A hash map for the writers' memo tables: open addressing (linear probing,
-// power-of-two capacity) over an index, the entries themselves in a deque so
-// their addresses stay put while the table grows -- the writers register an
-// entry, then recurse and insert more before filling it in.  The subset of
-// std::map / std::unordered_map they use: find / end / try_emplace /
-// emplace / operator[] / count / size / clear.  No ordered iteration.
+// power-of-two capacity), the entries in the slots themselves, a byte per
+// slot beside them (occupied + 7 bits of the hash) so that a probe reads the
+// dense control bytes and one entry.  An insertion may move every entry: a
+// writer must not hold an entry across a call that inserts into the same
+// map.  The subset of std::map / std::unordered_map they use: find / end /
+// try_emplace / emplace / operator[] / count / size / clear.  No erasure,
+// no iteration.
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <functional>
+#include <new>
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -55,22 +58,33 @@ class FlatMap {
   using value_type = std::pair<const K, V>;
   using iterator = value_type*;  // nullptr = end()
 
-  iterator end() const { return nullptr; }
-  std::size_t size() const { return entries_.size(); }
-  bool empty() const { return entries_.empty(); }
-  void clear() {
-    entries_.clear();
-    slots_.clear();
+  FlatMap() = default;
+  FlatMap(const FlatMap&) = delete;
+  FlatMap& operator=(const FlatMap&) = delete;
+  FlatMap(FlatMap&& o) noexcept { take(o); }
+  FlatMap& operator=(FlatMap&& o) noexcept {
+    if (this != &o) {
+      destroy();
+      take(o);
+    }
+    return *this;
   }
+  ~FlatMap() { destroy(); }
+
+  iterator end() const { return nullptr; }
+  std::size_t size() const { return size_; }
+  bool empty() const { return size_ == 0; }
+  void clear() { destroy(); }
 
   template <class Q>
   iterator find(const Q& k) const {
-    if (slots_.empty()) return nullptr;
-    std::size_t mask = slots_.size() - 1;
-    for (std::size_t i = MemoHash{}(k) & mask;; i = (i + 1) & mask) {
-      value_type* e = slots_[i];
-      if (!e) return nullptr;
-      if (e->first == k) return e;
+    if (!cap_) return nullptr;
+    std::uint64_t h = MemoHash{}(k);
+    std::uint8_t tag = tag_of(h);
+    for (std::size_t i = h & (cap_ - 1);; i = (i + 1) & (cap_ - 1)) {
+      std::uint8_t c = ctrl_[i];
+      if (!c) return nullptr;
+      if (c == tag && slots_[i].first == k) return &slots_[i];
     }
   }
   template <class Q>
@@ -78,13 +92,20 @@ class FlatMap {
 
   template <class Q, class... A>
   std::pair<iterator, bool> try_emplace(Q&& k, A&&... a) {
-    if (iterator e = find(k)) return {e, false};
-    if (4 * (entries_.size() + 1) > 3 * slots_.size()) grow();
-    entries_.emplace_back(std::piecewise_construct, std::forward_as_tuple(std::forward<Q>(k)),
-                          std::forward_as_tuple(std::forward<A>(a)...));
-    value_type* e = &entries_.back();
-    place(e);
-    return {e, true};
+    if (4 * (size_ + 1) > 3 * cap_) grow();
+    std::uint64_t h = MemoHash{}(k);
+    std::uint8_t tag = tag_of(h);
+    std::size_t i = h & (cap_ - 1);
+    for (;; i = (i + 1) & (cap_ - 1)) {
+      std::uint8_t c = ctrl_[i];
+      if (!c) break;
+      if (c == tag && slots_[i].first == k) return {&slots_[i], false};
+    }
+    new (&slots_[i]) value_type(std::piecewise_construct, std::forward_as_tuple(std::forward<Q>(k)),
+                                std::forward_as_tuple(std::forward<A>(a)...));
+    ctrl_[i] = tag;
+    ++size_;
+    return {&slots_[i], true};
   }
   template <class Q, class W>
   std::pair<iterator, bool> emplace(Q&& k, W&& v) {
@@ -94,18 +115,52 @@ class FlatMap {
   V& operator[](Q&& k) { return try_emplace(std::forward<Q>(k)).first->second; }
 
  private:
-  void place(value_type* e) {
-    std::size_t mask = slots_.size() - 1;
-    std::size_t i = MemoHash{}(e->first) & mask;
-    while (slots_[i]) i = (i + 1) & mask;
-    slots_[i] = e;
+  static std::uint8_t tag_of(std::uint64_t h) { return static_cast<std::uint8_t>(0x80 | (h >> 57)); }
+  static value_type* alloc(std::size_t n) {
+    return static_cast<value_type*>(::operator new(n * sizeof(value_type), std::align_val_t{alignof(value_type)}));
   }
+  static void dealloc(value_type* p) { ::operator delete(p, std::align_val_t{alignof(value_type)}); }
   void grow() {
-    slots_.assign(slots_.empty() ? 64 : 2 * slots_.size(), nullptr);
-    for (value_type& e : entries_) place(&e);
+    std::size_t ncap = cap_ ? 2 * cap_ : 64;
+    value_type* ns = alloc(ncap);
+    std::uint8_t* nc = new std::uint8_t[ncap]();
+    for (std::size_t j = 0; j < cap_; ++j) {
+      if (!ctrl_[j]) continue;
+      std::uint64_t h = MemoHash{}(slots_[j].first);
+      std::size_t i = h & (ncap - 1);
+      while (nc[i]) i = (i + 1) & (ncap - 1);
+      new (&ns[i]) value_type(std::move(const_cast<K&>(slots_[j].first)), std::move(slots_[j].second));
+      nc[i] = ctrl_[j];
+      slots_[j].~value_type();
+    }
+    if (slots_) dealloc(slots_);
+    delete[] ctrl_;
+    slots_ = ns;
+    ctrl_ = nc;
+    cap_ = ncap;
   }
-  std::deque<value_type> entries_;
-  std::vector<value_type*> slots_;
+  void destroy() {
+    if (!std::is_trivially_destructible_v<value_type>)
+      for (std::size_t j = 0; j < cap_; ++j)
+        if (ctrl_[j]) slots_[j].~value_type();
+    if (slots_) dealloc(slots_);
+    delete[] ctrl_;
+    slots_ = nullptr;
+    ctrl_ = nullptr;
+    cap_ = size_ = 0;
+  }
+  void take(FlatMap& o) {
+    slots_ = o.slots_;
+    ctrl_ = o.ctrl_;
+    cap_ = o.cap_;
+    size_ = o.size_;
+    o.slots_ = nullptr;
+    o.ctrl_ = nullptr;
+    o.cap_ = o.size_ = 0;
+  }
+  value_type* slots_ = nullptr;
+  std::uint8_t* ctrl_ = nullptr;
+  std::size_t cap_ = 0, size_ = 0;
 };
 
 }  // namespace cppcaml

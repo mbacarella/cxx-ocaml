@@ -867,7 +867,8 @@ class TreeWriter {
     // literal tuples, static constants (one per value)
     auto [it, fresh] = var_inj_.try_emplace(std::make_pair(static_cast<int>(p.variance), static_cast<int>(p.injectivity)), nullptr);
     if (fresh) it->second = o::vblock(0, {w_.i(static_cast<long>(p.variance)), w_.i(static_cast<long>(p.injectivity))});
-    return o::vblock(0, {typ(p.ty), it->second});
+    V vi = it->second;  // (typ may insert into var_inj_)
+    return o::vblock(0, {typ(p.ty), vi});
   }
   V type_params(const Slice<tt::TypeParam>& ps) {
     std::vector<V> xs;
