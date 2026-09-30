@@ -63,6 +63,64 @@ static bool is_not_doc(const Attribute* a) {
   return !(n == "ocaml.doc" || n == "ocaml.text" || n == "doc" || n == "text");
 }
 
+// remove_loc: Ast_mapper.default_mapper with every location Location.none.
+// The mapper rebuilds the payload's records and lists, and keeps what holds
+// no location (a longident, an integer constant, a label) as it is.
+static bool is_position(const OValue* x) {
+  return x->kind == OValue::Kind::Block && x->tag == 0 && x->fields.size() == 4 &&
+         x->fields[0]->kind == OValue::Kind::String;
+}
+static bool is_location(const OValue* x) {
+  if (x->kind != OValue::Kind::Block) return false;
+  if (x->loc_rec || x->loc_val) return true;
+  return x->tag == 0 && x->fields.size() == 3 && is_position(x->fields[0]) && is_position(x->fields[1]) &&
+         x->fields[2]->kind == OValue::Kind::Int;
+}
+static bool is_location_list(const OValue* x) {
+  for (; x->kind == OValue::Kind::Block; x = x->fields[1])
+    if (x->tag != 0 || x->fields.size() != 2 || !is_location(x->fields[0])) return false;
+  return x->kind == OValue::Kind::Int && x->i == 0;
+}
+static bool holds_location(const OValue* x) {
+  if (x->kind != OValue::Kind::Block || is_position(x)) return false;
+  if (is_location(x)) return true;
+  for (const OValue* f : x->fields)
+    if (holds_location(f)) return true;
+  return false;
+}
+static const OValue* remove_loc(const OValue* x) {
+  if (!holds_location(x)) return x;
+  if (is_location(x)) {
+    static const Location none = location::none();
+    auto* n = make<OValue>();
+    n->kind = OValue::Kind::Block;
+    n->loc_val = &none;
+    return n;
+  }
+  std::vector<const OValue*> fs;
+  for (const OValue* f : x->fields) fs.push_back(remove_loc(f));
+  // an expression, pattern or core type ({_desc; _loc; _loc_stack;
+  // _attributes}): Ast_helper's rebuilt record has an empty location stack
+  if (x->tag == 0 && fs.size() == 4 && is_location(x->fields[1]) && is_location_list(x->fields[2])) {
+    static const OValue nil{};
+    fs[2] = &nil;
+  }
+  auto* r = make<OValue>();
+  r->kind = OValue::Kind::Block;
+  r->tag = x->tag;
+  r->fields = slice(fs);
+  return r;
+}
+// the mapper's attribute: { attr_name = map_loc; attr_payload; attr_loc }
+static const Attribute* remove_loc(const Attribute* a) {
+  auto* r = make<Attribute>(*a);
+  r->attr_payload = a->attr_payload ? remove_loc(a->attr_payload) : nullptr;
+  r->attr_name_loc = location::none();
+  r->attr_loc = location::none();
+  r->name_obj = nullptr;
+  return r;
+}
+
 static Attributes attrs(t s, Attributes x) {
   if (s->for_saving && !keep_docs) {
     std::vector<const Attribute*> v;
@@ -70,8 +128,11 @@ static Attributes attrs(t s, Attributes x) {
       if (is_not_doc(a)) v.push_back(a);
     x = slice(v);  // List.filter always builds a new list
   }
-  // remove_loc (Ast_mapper) applies only when for_saving && not keep_locs,
-  // which the default flags never reach.
+  if (s->for_saving && !keep_locs) {
+    std::vector<const Attribute*> v;
+    for (auto* a : x) v.push_back(remove_loc(a));
+    x = slice(v);
+  }
   return x;
 }
 
