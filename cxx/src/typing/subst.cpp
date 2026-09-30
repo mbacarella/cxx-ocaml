@@ -623,11 +623,43 @@ const ExtensionConstructor* extension_constructor(t s, const ExtensionConstructo
   return r;
 }
 
-// For every binding k |-> d of m1, add k |-> f d to m2.
+// For every binding k |-> d of m1, add k |-> f d to m2 (the values made in
+// m1's key order, as the fold).  Many bindings into a map of comparable size
+// are merged into one new tree instead of added one by one: the same
+// bindings in about n nodes rather than n log n (Components_of_module_maker
+// composes a module's whole prefixing substitution once per submodule).
 template <class V, class F>
 static PathMap<V> merge_path_maps(F&& f, PathMap<V> m1, PathMap<V> m2) {
-  m1.iter([&](Path::t k, const V& d) { m2 = m2.add(k, f(d)); });
-  return m2;
+  if (m1.is_empty()) return m2;
+  std::vector<std::pair<Path::t, V>> a;
+  m1.iter([&](Path::t k, const V& d) { a.emplace_back(k, f(d)); });
+  // the fewest nodes an AVL tree of m2's height holds
+  int h = m2.height();
+  double min_size = 0, f1 = 1, f2 = 1;  // Fibonacci: N(h) = N(h-1) + N(h-2) + 1
+  for (int k = 0; k < h; ++k) {
+    min_size = f1 + f2 - 1;
+    double f3 = f1 + f2;
+    f1 = f2;
+    f2 = f3;
+  }
+  if (static_cast<double>(a.size()) * (h + 1) < min_size) {
+    for (auto& [k, v] : a) m2 = m2.add(k, v);
+    return m2;
+  }
+  std::vector<std::pair<Path::t, V>> b = m2.bindings(), out;
+  out.reserve(a.size() + b.size());
+  std::size_t i = 0, j = 0;
+  while (i < a.size() || j < b.size()) {
+    if (j == b.size()) out.push_back(a[i++]);
+    else if (i == a.size()) out.push_back(b[j++]);
+    else {
+      int c = PathCmp{}(a[i].first, b[j].first);
+      if (c < 0) out.push_back(a[i++]);
+      else if (c > 0) out.push_back(b[j++]);
+      else { out.push_back(a[i++]); ++j; }  // add rebinds the key: m1's key and value
+    }
+  }
+  return PathMap<V>::of_sorted(out);
 }
 
 static const TypeReplacement* type_replacement(t s, const TypeReplacement* r) {
