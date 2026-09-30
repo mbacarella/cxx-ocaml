@@ -1199,7 +1199,7 @@ void emit_instr(Env& env, bool fallthrough, linear::Instr i) {
       return;
   }
   // Lop
-  const mach::Operation& op = i->op;
+  const mach::Operation& op = *i->op;
   switch (op.k) {
     case MK::Imove:
     case MK::Ispill:

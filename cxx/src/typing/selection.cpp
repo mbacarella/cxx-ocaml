@@ -1662,7 +1662,7 @@ std::pair<bool, std::map<long, bool>> analyze(const Domain& D, bool exnescape, c
       case IK::Iend: return transfer(i, end_, exn);
       case IK::Ireturn: return transfer(i, D.bot, D.bot);
       case IK::Iop: {
-        if (i->op.k == MK::Itailcall_ind || i->op.k == MK::Itailcall_imm) return transfer(i, D.bot, D.bot);
+        if (i->op->k == MK::Itailcall_ind || i->op->k == MK::Itailcall_imm) return transfer(i, D.bot, D.bot);
         bool bx = before(end_, exn, i->next);
         return transfer(i, bx, exn);
       }
@@ -1725,10 +1725,10 @@ std::map<long, bool> polled_loops_analysis(Instr funbody) {
     switch (i->desc) {
       case IK::Iend: return next;
       case IK::Iop:
-        if (i->op.k == MK::Ialloc || i->op.k == MK::Ipoll || i->op.k == MK::Itailcall_ind ||
-            i->op.k == MK::Itailcall_imm)
+        if (i->op->k == MK::Ialloc || i->op->k == MK::Ipoll || i->op->k == MK::Itailcall_ind ||
+            i->op->k == MK::Itailcall_imm)
           return true;
-        if (operation_can_raise(i->op)) return next && exn;
+        if (operation_can_raise(*i->op)) return next && exn;
         return next;
       case IK::Ireturn: return true;
       case IK::Iraise: return exn;
@@ -1745,11 +1745,11 @@ bool potentially_recursive_tailcall_always_polls(const selection::FuncNames& fut
     switch (i->desc) {
       case IK::Iend: return next;
       case IK::Iop:
-        if (i->op.k == MK::Ialloc || i->op.k == MK::Ipoll) return true;
-        if (i->op.k == MK::Itailcall_ind) return false;  // this is a PTRC
-        if (i->op.k == MK::Itailcall_imm)
-          return !(future_funcnames.count(i->op.func) || function_is_assumed_to_never_poll(i->op.func));
-        if (operation_can_raise(i->op)) return next && exn;
+        if (i->op->k == MK::Ialloc || i->op->k == MK::Ipoll) return true;
+        if (i->op->k == MK::Itailcall_ind) return false;  // this is a PTRC
+        if (i->op->k == MK::Itailcall_imm)
+          return !(future_funcnames.count(i->op->func) || function_is_assumed_to_never_poll(i->op->func));
+        if (operation_can_raise(*i->op)) return next && exn;
         return next;
       case IK::Ireturn: return true;
       case IK::Iraise: return exn;
@@ -1844,7 +1844,7 @@ mach::Fundecl instrument_fundecl(const mach::Fundecl& f) {
     instr_iter(
         [&](Instr i) {
           if (i->desc != IK::Iop) return;
-          switch (i->op.k) {
+          switch (i->op->k) {
             case MK::Ipoll: err.points.push_back({PollError::Point::Poll, i->dbg}); break;
             case MK::Ialloc: err.points.push_back({PollError::Point::Alloc, i->dbg}); break;
             case MK::Icall_ind:
@@ -1852,7 +1852,7 @@ mach::Fundecl instrument_fundecl(const mach::Fundecl& f) {
             case MK::Itailcall_ind:
             case MK::Itailcall_imm: err.points.push_back({PollError::Point::Function_call, i->dbg}); break;
             case MK::Iextcall:
-              if (i->op.alloc) err.points.push_back({PollError::Point::External_call, i->dbg});
+              if (i->op->alloc) err.points.push_back({PollError::Point::External_call, i->dbg});
               break;
             default: break;
           }
