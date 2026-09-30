@@ -124,12 +124,21 @@ class Parser {
   // the span of the token starting at a ParseError's offset (Location.curr
   // lexbuf: the offending lookahead token)
   void locate(ParseError& e) const {
-    if (e.end != e.pos) return;
-    for (const Token& t : tokens_)
-      if (t.start == e.pos) {
-        e.end = t.end;
-        return;
-      }
+    if (e.end == e.pos)
+      for (const Token& t : tokens_)
+        if (t.start == e.pos) {
+          e.end = t.end;
+          break;
+        }
+    auto res = [&](size_t cnum) {
+      Position p = position(cnum);
+      return ParseError::Pos{p.lnum, p.bol, p.cnum, p.file_id ? filenames_[p.file_id - 1] : std::string()};
+    };
+    e.p_start = res(e.pos);
+    e.p_end = res(e.end);
+    e.p_open_start = res(e.open_pos);
+    e.p_open_end = res(e.open_end);
+    e.resolved = true;
   }
 
   // --- docstrings (ocaml.doc / ocaml.text) ---
@@ -717,6 +726,12 @@ class Parser {
         const Token& m = cur(); advance();
         Location l = span(e->loc.start, position(m.end));
         e = E({Pexp_send{std::move(e), StringLoc{m.text, tokloc(m)}}, l});
+      } else if (cur().kind == Kind::HASH) {
+        // `simple_expr HASH label`: the `#` shifted, an error on the token after it
+        const Token& nt = peek(1);
+        ParseError err("syntax error", nt.start);
+        err.end = nt.end;
+        throw err;
       } else {
         break;
       }
@@ -762,6 +777,17 @@ class Parser {
           const Token& c = cur(); advance();
           Location l = span(position(t.start), position(c.end));
           return mk_construct(lid0("()", l), std::nullopt, l);
+        }
+        if (cur().kind == Kind::COLONCOLON && peek(1).kind == Kind::RPAREN) {  // (::) -> Lident "::"
+          advance();  // ::
+          const Token& c = cur(); advance();  // )
+          Location cloc = span(position(t.start), position(c.end));
+          if (is_atom_start(cur().kind)) {  // `(::) arg`  -> constructor application
+            ExprBox arg = parse_atom_postfix();
+            Position ae = arg->loc.end;
+            return mk_construct(lid0("::", cloc), std::move(arg), span(position(t.start), ae));
+          }
+          return mk_construct(lid0("::", cloc), std::nullopt, cloc);
         }
         if (cur().kind == Kind::MODULE) {  // (module ME [: S [with type …]])  first-class module
           advance();
@@ -2425,25 +2451,34 @@ class Parser {
           inner.loc = span(cl.loc.start, end);
         return Pattern{Ppat_open{cl, box(std::move(inner))}, span(cl.loc.start, end)};
       }
-      std::vector<StringLoc> vars;  // `Constr (type a b) pat` — existential univars
-      if (cur().kind == Kind::LPAREN && peek(1).kind == Kind::TYPE) {
-        advance(); advance();  // ( type
-        while (cur().kind == Kind::LIDENT) {
-          const Token& id = cur(); advance();
-          vars.push_back(StringLoc{id.text, tokloc(id)});
-        }
-        expect(Kind::RPAREN, ")");
-      }
-      if (at_simple_pattern_start()) {
-        // `C p` arg is a full `pattern` at prec_constr_appl, so `Some A _` is
-        // `Some (A _)`; but `C (type a) p` (vars present) restricts it to a simple pattern.
-        Pattern arg = vars.empty() ? parse_pat_app() : parse_simple_pattern();
-        Location l = span(cl.loc.start, arg.loc.end);
-        return Pattern{Ppat_construct{.id = cl, .arg = box(std::move(arg)), .vars = std::move(vars)}, l};
-      }
-      return Pattern{Ppat_construct{.id = cl, .arg = std::nullopt}, cl.loc};
+      return pat_constr_rest(std::move(cl));
+    }
+    if (cur().kind == Kind::LPAREN && peek(1).kind == Kind::COLONCOLON && peek(2).kind == Kind::RPAREN) {
+      const Token& lp = cur(); advance(); advance();  // ( ::
+      const Token& rp = cur(); advance();  // )
+      return pat_constr_rest(lid0("::", span(position(lp.start), position(rp.end))));  // (::) -> Lident "::"
     }
     return parse_simple_pattern();
+  }
+  // a constructor pattern after its name: `C`, `C p`, `C (type a b) p`
+  Pattern pat_constr_rest(LongidentLoc cl) {
+    std::vector<StringLoc> vars;  // `Constr (type a b) pat` — existential univars
+    if (cur().kind == Kind::LPAREN && peek(1).kind == Kind::TYPE) {
+      advance(); advance();  // ( type
+      while (cur().kind == Kind::LIDENT) {
+        const Token& id = cur(); advance();
+        vars.push_back(StringLoc{id.text, tokloc(id)});
+      }
+      expect(Kind::RPAREN, ")");
+    }
+    if (at_simple_pattern_start()) {
+      // `C p` arg is a full `pattern` at prec_constr_appl, so `Some A _` is
+      // `Some (A _)`; but `C (type a) p` (vars present) restricts it to a simple pattern.
+      Pattern arg = vars.empty() ? parse_pat_app() : parse_simple_pattern();
+      Location l = span(cl.loc.start, arg.loc.end);
+      return Pattern{Ppat_construct{.id = cl, .arg = box(std::move(arg)), .vars = std::move(vars)}, l};
+    }
+    return Pattern{Ppat_construct{.id = cl, .arg = std::nullopt}, cl.loc};
   }
   Pattern ppat_construct0(const char* name, Location l) {
     return Pattern{Ppat_construct{.id = LongidentLoc{.txt = {Lident{name}}, .loc = l}, .arg = std::nullopt}, l};
@@ -2528,6 +2563,11 @@ class Parser {
         if (cur().kind == Kind::RPAREN) {
           const Token& c = cur(); advance();
           return ppat_construct0("()", span(position(t.start), position(c.end)));
+        }
+        if (cur().kind == Kind::COLONCOLON && peek(1).kind == Kind::RPAREN) {  // (::) -> Lident "::"
+          advance();
+          const Token& c = cur(); advance();
+          return ppat_construct0("::", span(position(t.start), position(c.end)));
         }
         if (cur().kind == Kind::MODULE) {  // (module M [: S])
           advance();

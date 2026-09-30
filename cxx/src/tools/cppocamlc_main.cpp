@@ -440,10 +440,14 @@ static void report_syntax_error(const std::string& path, const std::string& src,
   namespace ty = cppcaml::typing;
   namespace fd = ty::format_doc;
   using ty::misc::style::code_str;
-  ty::Location loc = span_loc(path, src, e.pos, e.end);
+  auto rpos = [&](const cppcaml::ParseError::Pos& p) {
+    return ty::mkpos(ty::zborrow(p.file.empty() ? path : p.file), p.lnum, p.bol, p.cnum);
+  };
+  ty::Location loc = e.resolved ? ty::Location{rpos(e.p_start), rpos(e.p_end), false} : span_loc(path, src, e.pos, e.end);
   switch (e.kind) {
     case cppcaml::ParseError::Kind::Unclosed: {
-      ty::Location oloc = span_loc(path, src, e.open_pos, e.open_end);
+      ty::Location oloc = e.resolved ? ty::Location{rpos(e.p_open_start), rpos(e.p_open_end), false}
+                                     : span_loc(path, src, e.open_pos, e.open_end);
       emit_report(ty::location::errorf_sub(
           loc, {ty::location::msg(oloc, "This %a might be unmatched", code_str(e.opening))},
           "Syntax error: %a expected", code_str(e.what_)));
