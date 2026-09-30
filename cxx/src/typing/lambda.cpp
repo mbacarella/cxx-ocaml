@@ -787,130 +787,150 @@ bool is_evaluated(lambda l) {
 }
 
 // ---- free variables -----------------------------------------------------------
-static void fv(lambda l, IdentSet& out);
-static void fv_list(Slice<lambda> es, IdentSet& out) {
-  for (lambda e : es) fv(e, out);
-}
+// One walk with the identifiers bound in scope counted (fv e = the variables
+// met where none is bound): the same set as lambda.ml's unions and removals
+// -- fv (let x = a in b) = fv a U (fv b \ {x}), and so on -- without a set
+// per binder (a module's initializer, a let chain thousands deep, made that
+// quadratic).
+namespace {
+struct FreeVars {
+  IdentSet& out;
+  std::map<Ident::t, int, IdentLess> bound;
+  void bind(Ident::t id) { ++bound[id]; }
+  void unbind(Ident::t id) {
+    auto it = bound.find(id);
+    if (--it->second == 0) bound.erase(it);
+  }
+  void var(Ident::t id) {
+    if (!bound.count(id)) out.insert(id);
+  }
+  void list(Slice<lambda> es) {
+    for (lambda e : es) go(e);
+  }
+  void go(lambda l) {
+    switch (l->kind) {
+      case LK::Lvar: var(as<Lvar>(l)->id); return;
+      case LK::Lmutvar: var(as<Lmutvar>(l)->id); return;
+      case LK::Lconst: return;
+      case LK::Lapply: {
+        auto* a = as<Lapply>(l);
+        go(a->ap.ap_func);
+        list(a->ap.ap_args);
+        return;
+      }
+      case LK::Lfunction: {
+        auto* f = as<Lfunction>(l)->f;
+        for (auto& p : f->params) bind(p.id);
+        go(f->body);
+        for (auto& p : f->params) unbind(p.id);
+        return;
+      }
+      case LK::Llet:
+      case LK::Lmutlet: {
+        Ident::t id;
+        lambda arg, body;
+        if (auto* x = as<Llet>(l)) { id = x->id; arg = x->arg; body = x->body; }
+        else { auto* y = as<Lmutlet>(l); id = y->id; arg = y->arg; body = y->body; }
+        go(arg);
+        // (a let chain: its bodies iteratively, not recursively)
+        bind(id);
+        go(body);
+        unbind(id);
+        return;
+      }
+      case LK::Lletrec: {
+        auto* x = as<Lletrec>(l);
+        for (auto& rb : x->decl) bind(rb.id);
+        go(x->body);
+        for (auto& rb : x->decl) go(lfunction_node(rb.def));
+        for (auto& rb : x->decl) unbind(rb.id);
+        return;
+      }
+      case LK::Lprim: list(as<Lprim>(l)->args); return;
+      case LK::Lswitch: {
+        auto* s = as<Lswitch>(l);
+        go(s->arg);
+        for (auto& c : s->sw.sw_consts) go(c.action);
+        for (auto& c : s->sw.sw_blocks) go(c.action);
+        if (s->sw.sw_failaction) go(s->sw.sw_failaction);
+        return;
+      }
+      case LK::Lstringswitch: {
+        auto* s = as<Lstringswitch>(l);
+        go(s->arg);
+        for (auto& c : s->cases) go(c.action);
+        if (s->def) go(s->def);
+        return;
+      }
+      case LK::Lstaticraise: list(as<Lstaticraise>(l)->args); return;
+      case LK::Lstaticcatch: {
+        auto* c = as<Lstaticcatch>(l);
+        for (auto& p : c->params) bind(p.id);
+        go(c->handler);
+        for (auto& p : c->params) unbind(p.id);
+        go(c->body);
+        return;
+      }
+      case LK::Ltrywith: {
+        auto* t = as<Ltrywith>(l);
+        bind(t->exn);
+        go(t->handler);
+        unbind(t->exn);
+        go(t->body);
+        return;
+      }
+      case LK::Lifthenelse: {
+        auto* i = as<Lifthenelse>(l);
+        go(i->cond);
+        go(i->ifso);
+        go(i->ifnot);
+        return;
+      }
+      case LK::Lsequence: {
+        auto* s = as<Lsequence>(l);
+        go(s->l1);
+        go(s->l2);
+        return;
+      }
+      case LK::Lwhile: {
+        auto* w = as<Lwhile>(l);
+        go(w->cond);
+        go(w->body);
+        return;
+      }
+      case LK::Lfor: {
+        auto* x = as<Lfor>(l);
+        go(x->lo);
+        go(x->hi);
+        bind(x->id);
+        go(x->body);
+        unbind(x->id);
+        return;
+      }
+      case LK::Lassign: {
+        auto* a = as<Lassign>(l);
+        var(a->id);
+        go(a->e);
+        return;
+      }
+      case LK::Lsend: {
+        auto* s = as<Lsend>(l);
+        go(s->met);
+        go(s->obj);
+        list(s->args);
+        return;
+      }
+      case LK::Levent: go(as<Levent>(l)->l); return;
+      case LK::Lifused: go(as<Lifused>(l)->l); return;
+    }
+  }
+};
+}  // namespace
+static void fv(lambda l, IdentSet& out) { FreeVars{out, {}}.go(l); }
 static IdentSet fv_of(lambda l) {
   IdentSet s;
   fv(l, s);
   return s;
-}
-static void fv(lambda l, IdentSet& out) {
-  switch (l->kind) {
-    case LK::Lvar: out.insert(as<Lvar>(l)->id); return;
-    case LK::Lmutvar: out.insert(as<Lmutvar>(l)->id); return;
-    case LK::Lconst: return;
-    case LK::Lapply: {
-      auto* a = as<Lapply>(l);
-      fv(a->ap.ap_func, out);
-      fv_list(a->ap.ap_args, out);
-      return;
-    }
-    case LK::Lfunction: {
-      auto* f = as<Lfunction>(l)->f;
-      IdentSet b = fv_of(f->body);
-      for (auto& p : f->params) b.erase(p.id);
-      out.insert(b.begin(), b.end());
-      return;
-    }
-    case LK::Llet:
-    case LK::Lmutlet: {
-      Ident::t id;
-      lambda arg, body;
-      if (auto* x = as<Llet>(l)) { id = x->id; arg = x->arg; body = x->body; }
-      else { auto* y = as<Lmutlet>(l); id = y->id; arg = y->arg; body = y->body; }
-      fv(arg, out);
-      IdentSet b = fv_of(body);
-      b.erase(id);
-      out.insert(b.begin(), b.end());
-      return;
-    }
-    case LK::Lletrec: {
-      auto* x = as<Lletrec>(l);
-      IdentSet s = fv_of(x->body);
-      for (auto& rb : x->decl) fv(lfunction_node(rb.def), s);
-      for (auto& rb : x->decl) s.erase(rb.id);
-      out.insert(s.begin(), s.end());
-      return;
-    }
-    case LK::Lprim: fv_list(as<Lprim>(l)->args, out); return;
-    case LK::Lswitch: {
-      auto* s = as<Lswitch>(l);
-      fv(s->arg, out);
-      for (auto& c : s->sw.sw_consts) fv(c.action, out);
-      for (auto& c : s->sw.sw_blocks) fv(c.action, out);
-      if (s->sw.sw_failaction) fv(s->sw.sw_failaction, out);
-      return;
-    }
-    case LK::Lstringswitch: {
-      auto* s = as<Lstringswitch>(l);
-      fv(s->arg, out);
-      for (auto& c : s->cases) fv(c.action, out);
-      if (s->def) fv(s->def, out);
-      return;
-    }
-    case LK::Lstaticraise: fv_list(as<Lstaticraise>(l)->args, out); return;
-    case LK::Lstaticcatch: {
-      auto* c = as<Lstaticcatch>(l);
-      IdentSet h = fv_of(c->handler);
-      for (auto& p : c->params) h.erase(p.id);
-      out.insert(h.begin(), h.end());
-      fv(c->body, out);
-      return;
-    }
-    case LK::Ltrywith: {
-      auto* t = as<Ltrywith>(l);
-      IdentSet h = fv_of(t->handler);
-      h.erase(t->exn);
-      out.insert(h.begin(), h.end());
-      fv(t->body, out);
-      return;
-    }
-    case LK::Lifthenelse: {
-      auto* i = as<Lifthenelse>(l);
-      fv(i->cond, out);
-      fv(i->ifso, out);
-      fv(i->ifnot, out);
-      return;
-    }
-    case LK::Lsequence: {
-      auto* s = as<Lsequence>(l);
-      fv(s->l1, out);
-      fv(s->l2, out);
-      return;
-    }
-    case LK::Lwhile: {
-      auto* w = as<Lwhile>(l);
-      fv(w->cond, out);
-      fv(w->body, out);
-      return;
-    }
-    case LK::Lfor: {
-      auto* x = as<Lfor>(l);
-      fv(x->lo, out);
-      fv(x->hi, out);
-      IdentSet b = fv_of(x->body);
-      b.erase(x->id);
-      out.insert(b.begin(), b.end());
-      return;
-    }
-    case LK::Lassign: {
-      auto* a = as<Lassign>(l);
-      out.insert(a->id);
-      fv(a->e, out);
-      return;
-    }
-    case LK::Lsend: {
-      auto* s = as<Lsend>(l);
-      fv(s->met, out);
-      fv(s->obj, out);
-      fv_list(s->args, out);
-      return;
-    }
-    case LK::Levent: fv(as<Levent>(l)->l, out); return;
-    case LK::Lifused: fv(as<Lifused>(l)->l, out); return;
-  }
 }
 IdentSet free_variables(lambda l) { return fv_of(l); }
 
