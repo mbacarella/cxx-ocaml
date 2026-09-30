@@ -661,13 +661,17 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
                 << std::chrono::duration<double, std::milli>(now - prev).count() << " ms\n";
       // resident set and zone storage after the phase (not an "ms" line:
       // bench.sh's phase sums skip it)
-      long pages = 0, resident = 0;
+      // (shared: file-backed pages -- the executable, mapped .cmi images --
+      // which the page cache shares between compilers)
+      long pages = 0, resident = 0, shared = 0;
       if (std::FILE* f = std::fopen("/proc/self/statm", "r")) {
-        if (std::fscanf(f, "%ld %ld", &pages, &resident) != 2) resident = 0;
+        if (std::fscanf(f, "%ld %ld %ld", &pages, &resident, &shared) != 3) resident = shared = 0;
         std::fclose(f);
       }
-      std::cerr << "  mem after " << what << ": rss " << resident * ::sysconf(_SC_PAGESIZE) / (1 << 20)
-                << " MB, zones " << cppcaml::typing::Zone::block_bytes() / (1 << 20) << " MB\n";
+      long ps = ::sysconf(_SC_PAGESIZE);
+      std::cerr << "  mem after " << what << ": rss " << resident * ps / (1 << 20) << " MB (private "
+                << (resident - shared) * ps / (1 << 20) << " MB, shared " << shared * ps / (1 << 20) << " MB), zones "
+                << cppcaml::typing::Zone::block_bytes() / (1 << 20) << " MB\n";
       // the phase's end on CLOCK_MONOTONIC (steady_clock's), to cut a
       // `perf record -k CLOCK_MONOTONIC` profile into phases
       char at[32];
