@@ -301,9 +301,13 @@ class Reader {
   }
   ArgLabel arg_label(std::size_t id) {
     if (is_int(id)) return ArgLabel::nolabel();
+    // input_value's blocks: one label object per marshaled block
+    auto [it, fresh] = label_objs_.try_emplace(id, 0);
+    if (fresh) it->second = ArgLabel::fresh_obj();
     return ArgLabel{tag(id) == 0 ? ArgLabel::Kind::Labelled : ArgLabel::Kind::Optional,
-                    str(f(id, 0))};
+                    str(f(id, 0)), it->second};
   }
+  std::unordered_map<std::size_t, std::uint64_t> label_objs_;
 
   const OValue* ovalue(std::size_t id) {
     if (cmi_marshal::is_imm(id)) return make<OValue>(OValue::Kind::Int, cmi_marshal::imm(id));

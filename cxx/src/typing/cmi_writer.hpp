@@ -254,6 +254,11 @@ class Writer {
   V arg_label(const ArgLabel& l) {
     if (l.kind == ArgLabel::Kind::Nolabel) return i(0);
     int tag = l.kind == ArgLabel::Kind::Labelled ? 0 : 1;
+    if (l.obj) {  // a .cmi's label: that block's one value
+      auto [it, fresh] = label_objs_.try_emplace(l.obj, nullptr);
+      if (fresh) it->second = o::vblock(tag, {str(l.name)});
+      return it->second;
+    }
     if (l.name.empty()) return o::vblock(tag, {str(l.name)});
     auto [it, fresh] = labels_.try_emplace(std::make_tuple(tag, l.name.data(), l.name.size()), nullptr);
     if (fresh) it->second = o::vblock(tag, {str(l.name)});
@@ -779,6 +784,7 @@ class Writer {
   FlatMap<std::pair<const void*, std::size_t>, V> lists_;
   FlatMap<const void*, V> mprivate_;
   FlatMap<std::tuple<int, const char*, std::size_t>, V> labels_;
+  FlatMap<std::uint64_t, V> label_objs_;
   FlatMap<std::tuple<const void*, long, long, long>, V> poss_;
   FlatMap<std::tuple<const void*, const void*, bool>, V> locs_;
   FlatMap<const void*, V> self_meths_;  // Val_self's self_meths blocks

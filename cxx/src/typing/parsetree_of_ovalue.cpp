@@ -152,8 +152,12 @@ class Decoder {
   LidLoc lidloc(V x) { return LidLoc{lident(f(x, 0)), loc(f(x, 1))}; }
   ArgLabel arg_label(V x) {
     if (is_int(x)) return ArgLabel::nolabel();
-    return ArgLabel{tag(x) == 0 ? ArgLabel::Kind::Labelled : ArgLabel::Kind::Optional, str(f(x, 0))};
+    // one label object per marshaled block (a ppx may share the string)
+    auto [it, fresh] = labels_.try_emplace(x, 0);
+    if (fresh) it->second = ArgLabel::fresh_obj();
+    return ArgLabel{tag(x) == 0 ? ArgLabel::Kind::Labelled : ArgLabel::Kind::Optional, str(f(x, 0)), it->second};
   }
+  std::unordered_map<V, std::uint64_t> labels_;
   void char_opt(V x, bool& has, char& c) {
     has = !is_int(x);
     if (has) c = static_cast<char>(ival(f(x, 0)));
