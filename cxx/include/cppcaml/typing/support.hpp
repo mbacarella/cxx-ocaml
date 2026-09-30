@@ -130,6 +130,12 @@ struct ArgLabel {
   enum class Kind : std::uint8_t { Nolabel, Labelled, Optional };
   Kind kind = Kind::Nolabel;
   std::string_view name;
+  // the block's identity where it was read back (a .cmi, a binary AST): a
+  // zone object of the reader's, so a .cmi image keeps it (no counter,
+  // cmi_image.hpp); nullptr: the parser's label, which the writers share by
+  // its name's string
+  const void* obj = nullptr;
+  static const void* fresh_obj() { return make<char>('\0'); }
   static ArgLabel nolabel() { return {}; }
   static ArgLabel labelled(std::string_view s) { return {Kind::Labelled, zborrow(s)}; }
   static ArgLabel optional(std::string_view s) { return {Kind::Optional, zborrow(s)}; }
