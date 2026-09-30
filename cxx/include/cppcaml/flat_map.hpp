@@ -48,6 +48,12 @@ struct MemoHash {
     std::apply([&](const T&... x) { ((r = combine(r, h(x))), ...); }, t);
     return r;
   }
+  template <class T>
+  static std::uint64_t h(const std::vector<T>& v) {
+    std::uint64_t r = v.size();
+    for (const T& x : v) r = combine(r, h(x));
+    return r;
+  }
   template <class K>
   std::uint64_t operator()(const K& k) const { return h(k); }
 };
