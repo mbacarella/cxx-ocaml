@@ -367,7 +367,7 @@ std::vector<const StructuredConstant*> init_shape_struct(Path::t path, env::t en
         Path::t new_path = Path::pdot(path, ident::name(it->id));
         const TypeDesc* d = types::get_desc(ctype::expand_head(env, vd->val_type));
         const StructuredConstant* init_v;
-        if (d->kind == DescKind::Tarrow || d->kind == DescKind::Tfunctor) {
+        if (d->kind == DescKind::Tarrow) {
           init_v = L::const_int(0);  // camlinternalMod.Function
         } else if (auto* c = as<Tconstr>(d); c && path::same(c->path, predef::paths().lazy_t)) {
           init_v = L::const_int(1);  // camlinternalMod.Lazy
