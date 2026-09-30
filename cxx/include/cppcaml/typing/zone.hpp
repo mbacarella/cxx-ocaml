@@ -325,6 +325,10 @@ class PMap {
     int hl = height(l), hr = height(r);
     return make<Node>(l, x, d, r, hl >= hr ? hl + 1 : hr + 1);
   }
+  // A balanced tree of bindings sorted by key, distinct keys (n nodes where
+  // n adds make about n log n)
+  static PMap of_sorted(const std::vector<std::pair<K, V>>& b) { return PMap(of_sorted_(b, 0, b.size())); }
+  int height() const { return height(t_); }
   // Rebuild a marshaled node exactly (the cmi decoder).
   static const Node* node(const Node* l, const K& x, const V& d, const Node* r, int h) {
     return make<Node>(l, x, d, r, h);
@@ -332,6 +336,13 @@ class PMap {
 
  private:
   static int height(const Node* n) { return n ? n->h : 0; }
+  static const Node* of_sorted_(const std::vector<std::pair<K, V>>& b, std::size_t lo, std::size_t hi) {
+    if (lo >= hi) return nullptr;
+    std::size_t mid = lo + (hi - lo) / 2;
+    const Node* l = of_sorted_(b, lo, mid);
+    const Node* r = of_sorted_(b, mid + 1, hi);
+    return create(l, b[mid].first, b[mid].second, r);
+  }
   static const Node* bal(const Node* l, const K& x, const V& d, const Node* r) {
     int hl = height(l), hr = height(r);
     if (hl > hr + 2) {
