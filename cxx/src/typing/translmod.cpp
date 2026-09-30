@@ -1101,7 +1101,7 @@ std::vector<Ident::t> all_idents(Slice<const tt::StructureItem*> items, std::siz
 
 // In the native toplevel, this reference is threaded through successive
 // calls of transl_store_structure
-L::IdentMap<Lam> transl_store_subst;
+L::IdentPMap<Lam> transl_store_subst;  // Ident.Map: persistent
 
 // field_of_str loc str (pos, cc)
 std::function<Lam(const tt::PosCoercion&)> field_of_str(const ScopedLocation& loc, const tt::Structure* str) {
@@ -1125,13 +1125,24 @@ std::function<Lam(const tt::PosCoercion&)> field_of_str(const ScopedLocation& lo
 Lam lambda_subst(const L::IdentMap<Lam>& subst, Lam lam) {
   return L::subst([](Ident::t, const ValueDescription*, env::t env) { return env; }, false, subst, lam);
 }
+Lam lambda_subst(const L::IdentPMap<Lam>& subst, Lam lam) {
+  return L::subst([](Ident::t, const ValueDescription*, env::t env) { return env; }, false, subst, lam);
+}
 
-// Ident.tbl: find_same finds the latest binding of the same ident
+// Ident.tbl: find_same finds the latest binding of the same ident (by
+// name, then along the name's bindings, newest first)
 struct IdentTbl {
   std::vector<std::pair<Ident::t, std::pair<long, const MC*>>> v;
+  std::unordered_map<std::string_view, std::vector<std::size_t>> by_name;
+  void add(Ident::t id, std::pair<long, const MC*> data) {
+    by_name[ident::name(id)].push_back(v.size());
+    v.push_back({id, data});
+  }
   const std::pair<long, const MC*>* find_same(Ident::t id) const {
-    for (auto it = v.rbegin(); it != v.rend(); ++it)
-      if (ident::same(it->first, id)) return &it->second;
+    auto it = by_name.find(ident::name(id));
+    if (it == by_name.end()) return nullptr;
+    for (auto k = it->second.rbegin(); k != it->second.rend(); ++k)
+      if (ident::same(v[*k].first, id)) return &v[*k].second;
     return nullptr;
   }
 };
@@ -1161,7 +1172,7 @@ struct StoreCtx {
   Lam store_idents(const ScopedLocation& loc, const std::vector<Ident::t>& ids) const {
     return L::make_sequence([&](Ident::t id) { return store_ident(loc, id); }, ids);
   }
-  L::IdentMap<Lam> add_ident(bool may_coerce, Ident::t id, L::IdentMap<Lam> subst) const {
+  L::IdentPMap<Lam> add_ident(bool may_coerce, Ident::t id, L::IdentPMap<Lam> subst) const {
     const std::pair<long, const MC*>* e = map.find_same(id);
     if (!e) fatal_error("Translmod.add_ident: assert false");
     if (e->second->kind == MC::Kind::Tcoerce_none) {
@@ -1169,20 +1180,19 @@ struct StoreCtx {
       f.n = e->first;
       f.ptr = L::ImmediateOrPointer::Pointer;
       f.mut = MutableFlag::Immutable;
-      subst[id] = L::lprim(f, slice<Lam>({L::lprim(getglobal(), {}, ScopedLocation{})}), ScopedLocation{});
-      return subst;
+      return subst.add(id, L::lprim(f, slice<Lam>({L::lprim(getglobal(), {}, ScopedLocation{})}), ScopedLocation{}));
     }
     if (may_coerce) return subst;
     fatal_error("Translmod.add_ident: assert false");
   }
   // List.fold_right (add_ident may_coerce) idlist subst
-  L::IdentMap<Lam> add_idents(bool may_coerce, const std::vector<Ident::t>& ids, L::IdentMap<Lam> subst) const {
+  L::IdentPMap<Lam> add_idents(bool may_coerce, const std::vector<Ident::t>& ids, L::IdentPMap<Lam> subst) const {
     for (std::size_t k = ids.size(); k-- > 0;) subst = add_ident(may_coerce, ids[k], std::move(subst));
     return subst;
   }
 
   // transl_store ~scopes rootpath subst cont items[k..]
-  Lam transl_store(scopes sc, Path::t rootpath, const L::IdentMap<Lam>& subst, Lam cont,
+  Lam transl_store(scopes sc, Path::t rootpath, const L::IdentPMap<Lam>& subst, Lam cont,
                    Slice<const tt::StructureItem*> items, std::size_t k) const {
     if (k == items.size()) {
       transl_store_subst = subst;
@@ -1191,7 +1201,7 @@ struct StoreCtx {
     const tt::StructureItem* item = items[k];
     const tt::StructureItemDesc* d = item->str_desc;
     using K = tt::StructureItemDesc::Kind;
-    auto rest = [&](const L::IdentMap<Lam>& s) { return transl_store(sc, rootpath, s, cont, items, k + 1); };
+    auto rest = [&](const L::IdentPMap<Lam>& s) { return transl_store(sc, rootpath, s, cont, items, k + 1); };
     switch (d->kind) {
       case K::Tstr_eval: {
         // Lsequence (lambda_subst subst (transl_exp expr), transl_store rem): right to left
@@ -1258,7 +1268,7 @@ struct StoreCtx {
           Lam lam = transl_store(debuginfo::enter_module_definition(sc, id), field_path(rootpath, id), subst,
                                  L::lambda_unit(), str->str_items, 0);
           // Careful: see next case
-          L::IdentMap<Lam> subst2 = transl_store_subst;
+          L::IdentPMap<Lam> subst2 = transl_store_subst;
           Lam r = rest(add_ident(true, id, subst2));
           Lam st = store_ident(loc, id);
           std::vector<Lam> fields;
@@ -1329,7 +1339,7 @@ struct StoreCtx {
           // a more precise name to exceptions in the included structured, but
           // this would introduce a difference of behavior compared to bytecode.
           Lam lam = transl_store(sc, nullptr, subst, L::lambda_unit(), str->str_items, 0);
-          L::IdentMap<Lam> subst2 = transl_store_subst;
+          L::IdentPMap<Lam> subst2 = transl_store_subst;
           auto field = field_of_str(loc, str);
           std::vector<Ident::t> ids0 = types::bound_value_identifiers(incl->incl_type);
           std::vector<tt::PosCoercion> map;
@@ -1371,7 +1381,7 @@ struct StoreCtx {
           ScopedLocation loc = debuginfo::of_location(sc, od->open_loc);
           std::vector<Ident::t> ids = defined_idents(str->str_items);
           std::vector<Ident::t> ids0 = types::bound_value_identifiers(od->open_bound_items);
-          L::IdentMap<Lam> subst2 = transl_store_subst;
+          L::IdentPMap<Lam> subst2 = transl_store_subst;
           std::function<Lam(long)> store_idents_from = [&](long pos) -> Lam {
             if (static_cast<std::size_t>(pos) == ids0.size()) return rest(add_idents(true, ids0, subst2));
             Ident::t id = ids0[pos];
@@ -1433,7 +1443,7 @@ Lam transl_store_structure(scopes sc, Ident::t glob, const IdentTbl& map,
   // List.fold_right store_primitive prims (transl_store ...)
   // (a copy: the [] case assigns transl_store_subst while items still hold
   // the substitution they started from)
-  L::IdentMap<Lam> subst0 = transl_store_subst;
+  L::IdentPMap<Lam> subst0 = transl_store_subst;
   Lam acc = ctx.transl_store(sc, global_path(glob), subst0, alias_seq, str, 0);
   for (std::size_t k = prims.size(); k-- > 0;) {
     const tt::PrimitiveCoercion* prim = prims[k].second;
@@ -1455,7 +1465,7 @@ IdentMapResult build_ident_map(const MC* restr, const std::vector<Ident::t>& idl
                                const std::vector<Ident::t>& more_ids) {
   IdentMapResult r;
   auto natural_map = [&](long pos, const std::vector<Ident::t>& ids) {
-    for (Ident::t id : ids) r.map.v.push_back({id, {pos++, tt::tcoerce_none()}});
+    for (Ident::t id : ids) r.map.add(id, {pos++, tt::tcoerce_none()});
     return pos;
   };
   long pos;
@@ -1473,7 +1483,7 @@ IdentMapResult build_ident_map(const MC* restr, const std::vector<Ident::t>& idl
       } else {
         if (pc.pos < 0 || static_cast<std::size_t>(pc.pos) >= idlist.size()) throw std::out_of_range("index out of bounds");
         Ident::t id = idlist[pc.pos];
-        r.map.v.push_back({id, {pos, pc.cc}});
+        r.map.add(id, {pos, pc.cc});
         // Misc.list_remove id undef (structural equality)
         for (auto it = undef.begin(); it != undef.end(); ++it)
           if (ident::same(*it, id)) {
@@ -1526,8 +1536,8 @@ L::Program transl_implementation(std::string_view module_name, const tt::Structu
 }
 
 L::Program transl_store_implementation(std::string_view module_name, const tt::Structure* str, const MC* restr) {
-  L::IdentMap<Lam> s = transl_store_subst;
-  transl_store_subst.clear();
+  L::IdentPMap<Lam> s = transl_store_subst;
+  transl_store_subst = {};
   Ident::t module_ident = Ident::create_persistent(module_name);
   scopes sc = debuginfo::enter_module_definition(debuginfo::empty_scopes, module_ident);
   auto [i, code] = transl_store_gen(sc, module_name, str, restr, false);
@@ -1598,7 +1608,7 @@ std::pair<long, Lam> transl_store_package(Slice<Ident::t> component_names, Ident
 
 void reset() {
   primitive_declarations.clear();
-  transl_store_subst.clear();
+  transl_store_subst = {};
   aliased_idents.clear();
   env::reset_required_globals();
   translprim::clear_used_primitives();
