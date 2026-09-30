@@ -6,6 +6,7 @@
 // blocks of their fields in order, `option` is 0 | Some = block tag 0.
 #include "cppcaml/typing/cmi_format.hpp"
 
+#include <optional>
 #include <cerrno>
 #include <cstring>
 
@@ -153,6 +154,8 @@ class Reader {
   std::string_view str(std::size_t id) {
     if (cmi_marshal::is_imm(id) || g_.node(id).kind != cmi_marshal::Kind::String) throw Corrupt{};
     if (std::string_view s; str_.get(id, s)) return s;
+    std::optional<ZoneScope> in_keep;
+    if (keep_) in_keep.emplace(*keep_);
     std::string_view s = zstr(g_.string(g_.node(id)));
     str_.put(id, s);
     return s;
@@ -259,7 +262,10 @@ class Reader {
   // one record per marshaled block, with its identity (support.hpp)
   Position position(std::size_t id) {
     if (const Position* mv; pos_.get(id, mv)) return *mv;
-    auto* p = make<Position>(mkpos(str(f(id, 0)), ival(f(id, 1)), ival(f(id, 2)), ival(f(id, 3))));
+    std::string_view fname = str(f(id, 0));
+    std::optional<ZoneScope> in_keep;
+    if (keep_) in_keep.emplace(*keep_);
+    auto* p = make<Position>(mkpos(fname, ival(f(id, 1)), ival(f(id, 2)), ival(f(id, 3))));
     p->obj = p;
     pos_.put(id, p);
     return *p;
@@ -933,6 +939,9 @@ class Reader {
 
  private:
   const cmi_marshal::Graph& g_;
+ public:
+  Zone* keep_ = nullptr;  // input_ovalue's keep zone (strings, positions)
+ private:
   SlotTable slots_;
   FlatMemo<TypeExpr*, 1> ty_{slots_};
   FlatMemo<const TypeDesc*, 2> desc_{slots_};
@@ -991,10 +1000,11 @@ std::vector<std::uint8_t> marshal_debug_events(const std::vector<const instruct:
   return o::marshal(o::vlist(evs), config::compression_supported);  // Compression.output_value
 }
 
-const OValue* input_ovalue(const std::uint8_t* data, std::size_t len, std::size_t& off) {
+const OValue* input_ovalue(const std::uint8_t* data, std::size_t len, std::size_t& off, Zone* keep) {
   cmi_marshal::Graph graph;
   std::size_t root = cmi_marshal::read_value(data, len, off, graph);
   Reader r(graph);
+  r.keep_ = keep;
   try {
     return r.ovalue(root);
   } catch (const Corrupt&) {

@@ -61,7 +61,10 @@ std::size_t marshaled_size(const ModtypeDeclaration* a, const ModtypeDeclaration
 // (Pparse's binary ASTs): an OValue graph with input_value's sharing -- one
 // OValue per marshaled block, one string per marshaled string, position
 // records with their identity (OValue::pos).  Throws marshal::Error.
-const OValue* input_ovalue(const std::uint8_t* data, std::size_t len, std::size_t& off);
+// With [keep], the strings and position records (what a decoded parsetree
+// keeps) are allocated there and the rest in the current zone, which the
+// caller can then drop.
+const OValue* input_ovalue(const std::uint8_t* data, std::size_t len, std::size_t& off, Zone* keep = nullptr);
 // output_value of a generic value, with the .cmi Writer's sharing (strings
 // by storage, positions and locations as it writes a typed tree's)
 std::vector<std::uint8_t> output_ovalue(const OValue* v);

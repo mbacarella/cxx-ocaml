@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <optional>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -102,12 +103,18 @@ void set_input_lexbuf(const std::string& name) {
 }
 
 // the values of a binary AST's contents after its magic: input_name, AST
-std::pair<std::string, const OValue*> input_ast(const std::string& contents, AstKind kind) {
+// With [scratch], the generic value's nodes are allocated there (what the
+// caller drops once it has decoded the parsetree), its strings and position
+// records in the current zone.
+std::pair<std::string, const OValue*> input_ast(const std::string& contents, AstKind kind, Zone* scratch = nullptr) {
   std::size_t off = magic_of_kind(kind).size();
   auto* d = reinterpret_cast<const std::uint8_t*>(contents.data());
-  const OValue* name = cmi_format::input_ovalue(d, contents.size(), off);
+  Zone* keep = scratch ? &zone() : nullptr;
+  std::optional<ZoneScope> in_scratch;
+  if (scratch) in_scratch.emplace(*scratch);
+  const OValue* name = cmi_format::input_ovalue(d, contents.size(), off, keep);
   if (name->kind != OValue::Kind::String) throw cppcaml::marshal::Error("input_value: not a string");
-  const OValue* ast = cmi_format::input_ovalue(d, contents.size(), off);
+  const OValue* ast = cmi_format::input_ovalue(d, contents.size(), off, keep);
   return {std::string(name->s), ast};
 }
 
@@ -302,7 +309,9 @@ bool is_ast_file(const std::string& contents, AstKind kind) {
 namespace {
 template <class R, class F>
 R read_ast_file(const std::string& contents, AstKind kind, F&& decode) {
-  auto [name, ast] = input_ast(contents, kind);
+  // the generic value is only decoded: its nodes go when the parsetree is made
+  Zone scratch;
+  auto [name, ast] = input_ast(contents, kind, &scratch);
   location::input_name = name;
   set_input_lexbuf(name);
   if (clflags::unsafe)
