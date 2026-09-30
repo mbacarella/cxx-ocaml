@@ -1007,12 +1007,8 @@ static NongenAcc nongen_loop(env::t env, NongenAcc acc, TypeExpr* ty) {
       NongenAcc unexpanded = fold(acc, ty);
       // `unexpanded_candidate == weak_set`: the sets only grow
       if (unexpanded.weak_set.s.size() == acc.weak_set.s.size()) return acc;
-      TypeExpr* exp;
-      try {
-        exp = try_expand_head(try_expand_safe, env, ty);
-      } catch (const CannotExpand&) {
-        return unexpanded;
-      }
+      TypeExpr* exp = try_expand_head_safe_nt(env, ty);
+      if (!exp) return unexpanded;
       return nongen_loop(env, std::move(acc), exp);
     }
     case DK::Tfield: {

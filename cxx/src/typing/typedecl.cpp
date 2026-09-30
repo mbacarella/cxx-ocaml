@@ -717,11 +717,7 @@ static void check_well_founded(env::t abs_env, env::t env, const Location& loc, 
       bool tc_check = to_check(tc->path);
       if (tc_check)
         for (TypeExpr* t : tc->args) check_subtype(parents, trace, ty, t);
-      TypeExpr* ty2 = nullptr;
-      try {
-        ty2 = ctype::try_expand_once_opt(env, ty);
-      } catch (const ctype::CannotExpand&) {
-      }
+      TypeExpr* ty2 = ctype::try_expand_once_opt_nt(env, ty);  // (nullptr: Cannot_expand)
       if (ty2) {
         check(parents, cons_trace(trace, {ReachingTypeStep::Kind::Expands_to, ty, ty2}), ty2);
       } else if (!tc_check) {

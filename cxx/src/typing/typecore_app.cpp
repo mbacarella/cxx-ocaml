@@ -1074,18 +1074,19 @@ static void shallow_iter_ppat(const std::function<void(const pt::Pattern*)>& f, 
   }
 }
 
+// (the `raise Found` is a flag: the walk stops calling [f] once it is set)
 bool exists_ppat(const std::function<bool(const pt::Pattern*)>& f, const pt::Pattern* p) {
-  struct Found {};
+  bool found = false;
   std::function<void(const pt::Pattern*)> loop = [&](const pt::Pattern* q) {
-    if (f(q)) throw Found{};
+    if (found) return;
+    if (f(q)) {
+      found = true;
+      return;
+    }
     shallow_iter_ppat(loop, q);
   };
-  try {
-    loop(p);
-  } catch (const Found&) {
-    return true;
-  }
-  return false;
+  loop(p);
+  return found;
 }
 
 bool contains_polymorphic_variant(const pt::Pattern* p) {

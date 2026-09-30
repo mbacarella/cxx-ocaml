@@ -114,18 +114,15 @@ void iter_pattern(const std::function<void(const Pattern*)>& f, const Pattern* p
       },
       p);
 }
+// (the `raise Found` is a flag: [f] is not called once it is set)
 bool exists_general_pattern(const std::function<bool(const Pattern*)>& f, const Pattern* p) {
-  struct Found {};
-  try {
-    iter_general_pattern(
-        [&](const Pattern* q) {
-          if (f(q)) throw Found{};
-        },
-        p);
-  } catch (const Found&) {
-    return true;
-  }
-  return false;
+  bool found = false;
+  iter_general_pattern(
+      [&](const Pattern* q) {
+        if (!found && f(q)) found = true;
+      },
+      p);
+  return found;
 }
 bool exists_pattern(const std::function<bool(const Pattern*)>& f, const Pattern* p) {
   return exists_general_pattern(
