@@ -98,7 +98,7 @@ void ident(Formatter& ppf, Ident::t id) {
       return;
     case Ident::Kind::Unscoped: {
       auto d = ident::Unscoped::get_desc(id->us);
-      fprintf(ppf, "U:");
+      fprintf(ppf, "U");
       pp_stamped(ppf, d.name, d.stamp);
       return;
     }

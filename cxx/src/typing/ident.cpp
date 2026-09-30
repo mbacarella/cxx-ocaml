@@ -237,7 +237,7 @@ std::string print(t id) {
     case K::Scoped:
       return std::string(id->name_);
     case K::Unscoped:
-      return "U:" + std::string(Unscoped::name_of(id->us));
+      return "U" + std::string(Unscoped::name_of(id->us));
   }
   return {};
 }
