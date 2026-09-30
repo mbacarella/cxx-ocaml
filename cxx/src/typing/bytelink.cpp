@@ -598,14 +598,58 @@ void link_bytecode(const std::vector<LinkAction>& tolink, const std::string& exe
 
 long g_output_code_string_counter = 0;
 
+// The arrays of a C file only the C compiler reads (a temporary: not the
+// user's -output-obj .c) are written as string literals, one per line where
+// the lists had theirs, with the same declarations at the same lines and
+// columns: gcc makes the same object of them (its debug line table holds no
+// digest of the source, unlike clang's), but reads a string as one constant
+// instead of a tree node per element -- an awso executable's 48M-word
+// caml_code took gcc 63 s and 6.2 GB, 21 s and 2.9 GB so.  The int array is
+// a wide string: on amd64 Linux, wchar_t is int.
+bool g_string_arrays = false;
+bool string_arrays_ok() {
+  std::string cc = config::c_compiler.substr(0, config::c_compiler.find(' '));
+  cc = cc.substr(cc.find_last_of('/') + 1);
+  return config::architecture == "amd64" && config::system == "linux" && cc.find("gcc") != std::string::npos &&
+         cc.find("clang") == std::string::npos;
+}
+bool g_line_open = false;  // a string literal begun on the current line
+void open_line(std::string& out, const char* quote) {
+  if (!g_line_open) out += quote;
+  g_line_open = true;
+}
+// the current line ended as the list's lines end ("\n" after its last item)
+void close_line(std::string& out) {
+  if (g_line_open) out += '"';
+  g_line_open = false;
+}
+
 // Output a string as a C array of unsigned ints
 void output_code_string(std::string& out, const std::string& code) {
   char b[32];
   for (std::size_t pos = 0; pos < code.size(); pos += 4) {
     auto c = [&](std::size_t k) { return static_cast<unsigned>(static_cast<unsigned char>(code[pos + k])); };
-    std::snprintf(b, sizeof b, "0x%02x%02x%02x%02x, ", c(3), c(2), c(1), c(0));
-    out += b;
+    static const char hex[] = "0123456789abcdef";
+    unsigned w = c(3) << 24 | c(2) << 16 | c(1) << 8 | c(0);
+    if (g_string_arrays) {
+      open_line(out, "L\"");
+      // \x and the word's hex digits, no leading zeros ("%x")
+      char* p = b + sizeof b;
+      do *--p = hex[w & 15]; while (w >>= 4);
+      out += "\\x";
+      out.append(p, b + sizeof b - p);
+    } else {
+      // "0x%08x, "
+      char* p = b;
+      *p++ = '0';
+      *p++ = 'x';
+      for (int sh = 28; sh >= 0; sh -= 4) *p++ = hex[(w >> sh) & 15];
+      *p++ = ',';
+      *p++ = ' ';
+      out.append(b, p - b);
+    }
     if (++g_output_code_string_counter >= 6) {
+      close_line(out);
       out += '\n';
       g_output_code_string_counter = 0;
     }
@@ -616,8 +660,21 @@ void output_code_string(std::string& out, const std::string& code) {
 void output_data_string(std::string& out, const std::string& data) {
   int counter = 0;
   for (unsigned char ch : data) {
-    out += std::to_string(static_cast<int>(ch)) + ", ";
+    if (g_string_arrays) {
+      open_line(out, "\"");
+      // (an octal escape is always three digits: a digit after it is not part of it)
+      if (ch >= 0x20 && ch < 0x7f && ch != '\\' && ch != '"' && ch != '?') {
+        out += static_cast<char>(ch);
+      } else {
+        char b[8];
+        std::snprintf(b, sizeof b, "\\%03o", ch);
+        out += b;
+      }
+    } else {
+      out += std::to_string(static_cast<int>(ch)) + ", ";
+    }
     if (++counter >= 12) {
+      close_line(out);
       out += "\n";
       counter = 0;
     }
@@ -722,15 +779,28 @@ std::string emit_runtime_standard_library_default() {
 }
 
 // Output a bytecode executable as a C file
-void link_bytecode_as_c(const std::vector<LinkAction>& tolink, const std::string& outfile, bool with_main) {
+void link_bytecode_as_c(const std::vector<LinkAction>& tolink, const std::string& outfile, bool with_main,
+                        bool temporary) {
   RemoveOnFailure guard{outfile};
   std::string out;
+  g_string_arrays = temporary && string_arrays_ok();
+  g_line_open = false;
+  auto decl = [](const char* ty, const char* name, std::size_t n) {
+    return g_string_arrays ? std::string("static ") + ty + " " + name + "[" + std::to_string(n) + "] =\n"
+                           : std::string("static ") + ty + " " + name + "[] = {\n";
+  };
+  auto end = [](std::string& o, const char* after) {  // the list's "\n};" and what follows
+    close_line(o);
+    o += g_string_arrays ? "\n;" : "\n};";
+    o += after;
+  };
   // The bytecode
   out +=
       "#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n#define CAML_INTERNALS\n#define CAMLDLLIMPORT\n"
       "#define CAML_INTERNALS_NO_PRIM_DECLARATIONS\n\n#include <caml/mlvalues.h>\n#include <caml/startup.h>\n"
       "#include <caml/sys.h>\n#include <caml/misc.h>\n\n"
-      "const enum caml_byte_program_mode caml_byte_program_mode = EMBEDDED;\n\nstatic int caml_code[] = {\n";
+      "const enum caml_byte_program_mode caml_byte_program_mode = EMBEDDED;\n\n";
+  std::size_t code_decl_at = out.size();  // (its size is known once linked)
   symtable::init();
   clear_crc_interfaces();
   long currpos = 0;
@@ -742,20 +812,23 @@ void link_bytecode_as_c(const std::vector<LinkAction>& tolink, const std::string
   (void)link_files(output_fun, currpos_fun, tolink);
   // The final STOP instruction
   char stop[32];
-  std::snprintf(stop, sizeof stop, "\n0x%x};\n", opSTOP);
+  close_line(out);
+  if (g_string_arrays) std::snprintf(stop, sizeof stop, "\nL\"\\x%x\";\n", opSTOP);
+  else std::snprintf(stop, sizeof stop, "\n0x%x};\n", opSTOP);
   out += stop;
+  out.insert(code_decl_at, decl("int", "caml_code", static_cast<std::size_t>(currpos) / 4 + 1));
   // The table of global data
-  out += "\nstatic char caml_data[] = {\n";
   std::vector<std::uint8_t> data = o::marshal(symtable::initial_global_table());
+  out += "\n" + decl("char", "caml_data", data.size());
   output_data_string(out, std::string(data.begin(), data.end()));
-  out += "\n};\n";
+  end(out, "\n");
   // The sections: [| "SYMB", data_global_map (); "CRCS", extract_crc_interfaces () |]
   V sections = o::vblock(0, {o::vblock(0, {o::vstr("SYMB"), symtable::data_global_map()}),
                              o::vblock(0, {o::vstr("CRCS"), crcs_value()})});
-  out += "\nstatic char caml_sections[] = {\n";
   std::vector<std::uint8_t> sect = o::marshal(sections);
+  out += "\n" + decl("char", "caml_sections", sect.size());
   output_data_string(out, std::string(sect.begin(), sect.end()));
-  out += "\n};\n\n";
+  end(out, "\n\n");
   out += emit_runtime_standard_library_default();
   // The table of primitives
   out += symtable::primitive_table();
@@ -930,7 +1003,8 @@ void link(const std::vector<std::string>& objfiles0, const std::string& output_n
         for (const std::string& f : l) misc::remove_file(f);
       }
     } temps;
-    link_bytecode_as_c(tolink, c_file, cf::output_complete_executable);
+    // (the C file is the user's output when output_name is a .c)
+    link_bytecode_as_c(tolink, c_file, cf::output_complete_executable, !filename::check_suffix(output_name, ".c"));
     if (cf::output_complete_executable) {
       temps.l.insert(temps.l.begin(), c_file);
       if (!build_custom_runtime(c_file, output_name)) fail(Error::Kind::Custom_runtime);
