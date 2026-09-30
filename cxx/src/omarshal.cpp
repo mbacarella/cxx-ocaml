@@ -3,6 +3,9 @@
 #include <algorithm>
 #include <cstdlib>
 #include "cppcaml/omarshal.hpp"
+#include "cppcaml/typing/zone.hpp"
+
+#include <sys/mman.h>
 
 #include <new>
 #include <stdexcept>
@@ -29,7 +32,13 @@ namespace {
 struct Arena {
   char* cur = nullptr;
   std::size_t left = 0;
-  std::vector<char*> blocks;
+  struct Block {
+    char* p;
+    std::size_t size;
+    bool mapped;  // the kernel's (else malloc'd)
+  };
+  std::vector<Block> blocks;
+  std::size_t live = 0;  // the blocks' bytes
   std::vector<Value::Extra*> extras;  // (their strings own heap storage)
 };
 Arena& arena() {
@@ -38,15 +47,23 @@ Arena& arena() {
 }
 }  // namespace
 
+// An arena that has grown takes big blocks straight from the kernel (as the
+// typing zones do), unmapped when released: the resident pages of a big
+// .cmt's values go back as soon as it is written, not into the allocator's
+// free lists, where the phases after it would not reuse them.
 void* arena_alloc(std::size_t n, std::size_t align) {
   Arena& a = arena();
-  constexpr std::size_t kBlock = 1 << 20;
+  constexpr std::size_t kBlock = 1 << 20, kBigBlock = 8 << 20, kSmallBlocks = 8;
   std::size_t pad = (align - reinterpret_cast<std::uintptr_t>(a.cur) % align) % align;
   if (!a.cur || pad + n > a.left) {
-    std::size_t sz = n + align > kBlock ? n + align : kBlock;
-    a.cur = static_cast<char*>(std::malloc(sz));
+    bool big = a.blocks.size() >= kSmallBlocks;
+    std::size_t unit = big ? kBigBlock : kBlock;
+    std::size_t sz = n + align > unit ? n + align : unit;
+    // (huge pages only once the arena is big, as Zone::alloc_block)
+    a.cur = big ? typing::Zone::huge_block(sz, a.live + sz > (std::size_t{64} << 20)) : static_cast<char*>(std::malloc(sz));
     if (!a.cur) throw std::bad_alloc();
-    a.blocks.push_back(a.cur);
+    a.blocks.push_back({a.cur, sz, big});
+    a.live += sz;
     a.left = sz;
     pad = (align - reinterpret_cast<std::uintptr_t>(a.cur) % align) % align;
   }
@@ -64,7 +81,12 @@ void arena_release(const ArenaMark& m) {
   Arena& a = arena();
   for (std::size_t k = a.extras.size(); k-- > m.extras;) a.extras[k]->~Extra();
   a.extras.resize(m.extras);
-  for (std::size_t k = m.blocks; k < a.blocks.size(); ++k) std::free(a.blocks[k]);
+  for (std::size_t k = m.blocks; k < a.blocks.size(); ++k) {
+    Arena::Block& b = a.blocks[k];
+    if (b.mapped) ::munmap(b.p, b.size);
+    else std::free(b.p);
+    a.live -= b.size;
+  }
   a.blocks.resize(m.blocks);
   a.cur = m.cur;
   a.left = m.left;
