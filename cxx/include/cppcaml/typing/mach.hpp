@@ -42,7 +42,7 @@ struct RegLess {
 class Set {
  public:
   using value_type = Reg*;
-  using const_iterator = std::vector<Reg*>::const_iterator;
+  using const_iterator = Reg* const*;
   using iterator = const_iterator;
   Set() = default;
   template <class It>
@@ -96,7 +96,7 @@ class Set {
   friend bool operator!=(const Set& a, const Set& b) { return a.v_ != b.v_; }
 
  private:
-  std::vector<Reg*> v_;
+  SmallVec<Reg*, 4> v_;
 };
 
 using ::cppcaml::typing::NewestFirst;
@@ -116,7 +116,7 @@ struct Reg {
 };
 inline bool RegLess::operator()(const Reg* a, const Reg* b) const { return a->stamp < b->stamp; }
 
-using Regs = std::vector<Reg*>;  // Reg.t array
+using Regs = SmallVec<Reg*, 2>;  // Reg.t array (mostly 0 to 2 registers: inline)
 
 Reg* create(cmm::MachtypeComponent ty);
 Regs createv(cmm::Machtype tyv);
