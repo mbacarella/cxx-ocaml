@@ -582,7 +582,7 @@ struct Conv {
           }
         },
         t.desc);
-    return make<CoreType>(d, l, LocationStack{}, attrs(t.attrs));
+    return make<CoreType>(d, l, loc_stack(t.loc_stack), attrs(t.attrs));
   }
 
   // ---- patterns ----
@@ -667,7 +667,7 @@ struct Conv {
           }
         },
         p.desc);
-    return make<Pattern>(d, loc(p.loc), LocationStack{}, attrs(p.attrs));
+    return make<Pattern>(d, loc(p.loc), loc_stack(p.loc_stack), attrs(p.attrs));
   }
 
   // ---- expressions ----
@@ -731,11 +731,17 @@ struct Conv {
     if (std::string_view n = pv.pun ? punned_name(d.pat) : std::string_view{}; n.data()) d.label.name = n;
     return make<FunctionParam>(loc(pv.loc), d);
   }
+  // a location stack: the parser's (oldest first) as OCaml's list (newest first)
+  LocationStack loc_stack(const std::vector<ast::Location>& st) const {
+    std::vector<Location> v;
+    for (auto it = st.rbegin(); it != st.rend(); ++it) v.push_back(loc(*it));
+    return slice(v);
+  }
   const Expression* expression(const ast::Expression& e) const {
     using K = ExpressionDesc::Kind;
     const ExpressionDesc* d = nullptr;
     Location l = loc(e.loc);
-    LocationStack stack;
+    LocationStack stack = loc_stack(e.loc_stack);
     std::visit(
         [&](auto& v) {
           using T = std::decay_t<decltype(v)>;
@@ -857,13 +863,6 @@ struct Conv {
             d = make<Pexp_struct_item>(Pexp_struct_item{{K::Pexp_struct_item}, structure_item(*v.item),
                                                         expression(*v.body)});
           } else if constexpr (std::is_same_v<T, ast::Pexp_assert>) {
-            // The parser keeps the innermost location of the `assert` node
-            // (pexp_loc_stack's last element, all Typecore reads).
-            Location kw = loc(v.kw_loc);
-            // (a relocation widens the span; an equal span means none)
-            if (!(kw.loc_start.pos_cnum == l.loc_start.pos_cnum &&
-                  kw.loc_end.pos_cnum == l.loc_end.pos_cnum))
-              stack = slice({kw});
             d = make<Pexp_assert>(Pexp_assert{{K::Pexp_assert}, expression(*v.e)});
           } else if constexpr (std::is_same_v<T, ast::Pexp_lazy>) {
             d = make<Pexp_lazy>(Pexp_lazy{{K::Pexp_lazy}, expression(*v.e)});

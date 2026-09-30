@@ -384,6 +384,13 @@ class Parser {
     throw e;
   }
 
+  // reloc_exp / reloc_pat / reloc_typ: the node takes [l], its old location
+  // pushed onto its location stack (push_loc: unless ghost)
+  static void reloc(Location& loc, std::vector<Location>& stack, const Location& l) {
+    if (!loc.ghost) stack.push_back(loc);
+    loc = l;
+  }
+
   // `{ not_expecting $loc nonterm }`
   [[noreturn]] void not_expecting(size_t at, size_t at_end, const char* nonterm) {
     ParseError e(std::string(nonterm) + " not expected", at);
@@ -830,7 +837,7 @@ class Parser {
                     span(position(t.start), position(c.end))});
         }
         const Token& c = cur(); expect_closing(Kind::RPAREN, ")", t, "(");
-        inner->loc = span(position(t.start), position(c.end));  // reloc to parens
+        reloc(inner->loc, inner->loc_stack, span(position(t.start), position(c.end)));  // reloc_exp
         return inner;
       }
       case Kind::LBRACKETPERCENT: {  // [%id payload]
@@ -917,6 +924,7 @@ class Parser {
         if (cur().kind == Kind::SEMI) advance();  // optional trailing ';' before end
         const Token& c = cur(); expect_closing(Kind::END, "end", t, "begin");
         inner->loc = span(position(t.start), position(c.end));
+        inner->loc_stack.clear();
         // parser.mly rebuilds the node (mkexp_attrs ~loc:$sloc): its
         // pexp_loc_stack is empty, so an `assert`'s innermost location --
         // the Assert_failure location -- becomes the begin..end span.
@@ -2076,7 +2084,7 @@ class Parser {
       // core types keep the inner loc (no paren reloc) — except a parenthesised
       // poly type `('a. t)`, which spans the parens.
       if (std::holds_alternative<Ptyp_poly>(inner->desc))
-        inner->loc = span(position(t.start), position(rp.end));
+        reloc(inner->loc, inner->loc_stack, span(position(t.start), position(rp.end)));  // reloc_typ
       return inner;
     }
     if (t.kind == Kind::LBRACKET || t.kind == Kind::LBRACKETGREATER ||
@@ -2595,7 +2603,7 @@ class Parser {
           return {Ppat_constraint{box(std::move(p)), std::move(ty)}, l};
         }
         const Token& c = cur(); expect_closing(Kind::RPAREN, ")", t, "(");
-        p.loc = span(position(t.start), position(c.end));  // reloc to parens
+        reloc(p.loc, p.loc_stack, span(position(t.start), position(c.end)));  // reloc_pat
         return p;
       }
       case Kind::LBRACKET: {
@@ -4591,7 +4599,7 @@ class Parser {
                        span(position(lp.start), position(c.end))};
       } else {
         const Token& c = cur(); expect(Kind::RPAREN, ")");
-        self.loc = span(position(lp.start), position(c.end));  // reloc_pat
+        reloc(self.loc, self.loc_stack, span(position(lp.start), position(c.end)));  // reloc_pat
       }
     } else {
       Position p = position(tokens_[idx_ - 1].end);  // ghpat at empty-rule position

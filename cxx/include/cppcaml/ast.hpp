@@ -173,6 +173,7 @@ struct CoreType {
       desc;
   Location loc;
   Attributes attrs;
+  std::vector<Location> loc_stack;  // ptyp_loc_stack (reloc_typ), oldest first
 };
 
 // --- patterns ---
@@ -213,6 +214,7 @@ struct Pattern {
       desc;
   Location loc;
   Attributes attrs;
+  std::vector<Location> loc_stack;  // ppat_loc_stack (reloc_pat), oldest first
 };
 
 // --- expressions (fragment) ---
@@ -288,6 +290,7 @@ struct Expression {
       desc;
   Location loc;
   Attributes attrs;
+  std::vector<Location> loc_stack;  // pexp_loc_stack (reloc_exp), oldest first
 };
 
 struct Case { Pattern lhs; std::optional<ExprBox> guard; ExprBox rhs; };
