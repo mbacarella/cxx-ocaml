@@ -8,11 +8,11 @@
 
 #include <functional>
 
-#include <map>
 #include <optional>
 #include <tuple>
 #include <vector>
 
+#include "cppcaml/flat_map.hpp"
 #include "cppcaml/typing/cmt_format.hpp"
 #include "cppcaml/typing/types.hpp"
 
@@ -145,20 +145,20 @@ class Interner {
 
  private:
   long strid(std::string_view s) {
-    auto [it, fresh] = strs_.try_emplace(std::string(s), static_cast<long>(strs_.size()) + 1);
-    return it->second;
+    if (auto it = strs_.find(s)) return it->second;
+    return strs_.try_emplace(std::string(s), static_cast<long>(strs_.size()) + 1).first->second;
   }
   long canon(const std::vector<long>& k) {
     auto [it, fresh] = canon_.try_emplace(k, static_cast<long>(canon_.size()) + 1);
     return it->second;
   }
-  std::map<std::string, long> strs_;
-  std::map<std::vector<long>, long> canon_;
-  std::map<Ident::t, long> ids_;
-  std::map<shape::t, long> shapes_;
-  std::map<const void*, long> smaps_, envs_, tmaps_;
-  std::map<const Thunk*, long> thunks_;
-  std::map<const NF*, long> nfs_;
+  FlatMap<std::string, long> strs_;
+  FlatMap<std::vector<long>, long> canon_;
+  FlatMap<Ident::t, long> ids_;
+  FlatMap<shape::t, long> shapes_;
+  FlatMap<const void*, long> smaps_, envs_, tmaps_;
+  FlatMap<const Thunk*, long> thunks_;
+  FlatMap<const NF*, long> nfs_;
 };
 
 class Reducer {
@@ -387,8 +387,8 @@ class Reducer {
   }
 
   Interner in_;
-  std::map<std::pair<long, long>, const NF*> reduce_memo_;
-  std::map<long, shape::t> read_back_memo_;
+  FlatMap<std::pair<long, long>, const NF*> reduce_memo_;
+  FlatMap<long, shape::t> read_back_memo_;
 };
 
 Reducer* g_reducer = nullptr;
