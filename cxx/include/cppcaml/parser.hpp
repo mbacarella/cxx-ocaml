@@ -21,6 +21,14 @@ struct ParseError : std::runtime_error {
   std::string what_;                        // Unclosed: closing; Expecting / Not_expecting: nonterminal
   size_t open_pos = 0, open_end = 0;        // Unclosed: the opening delimiter
   std::string opening;                      // Unclosed
+  // the positions, resolved by the parser (`# N "file"` directives applied);
+  // file: empty for the source path
+  struct Pos {
+    long lnum = 0, bol = 0, cnum = 0;
+    std::string file;
+  };
+  bool resolved = false;
+  Pos p_start, p_end, p_open_start, p_open_end;
   ParseError(std::string m, size_t p) : std::runtime_error(std::move(m)), pos(p), end(p) {}
 };
 
