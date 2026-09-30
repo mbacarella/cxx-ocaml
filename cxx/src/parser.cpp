@@ -3229,7 +3229,14 @@ class Parser {
 
   ValueBinding parse_value_binding_core() {
     // val_ident form (`let f p.. = e` / `let (+) p.. = e`) vs pattern form.
+    size_t save = idx_, dsave = ds_journal_.size();
     std::optional<StringLoc> opname = try_paren_operator();  // consumes `( op )` on success
+    if (opname && (cur().kind == Kind::COMMA || cur().kind == Kind::AS || cur().kind == Kind::BAR ||
+                   cur().kind == Kind::COLONCOLON)) {
+      // `let ( - ), ( + ) = ...`: the operator starts a pattern
+      idx_ = save; undo_docs(dsave);
+      opname.reset();
+    }
     bool op_ident = opname.has_value();
     bool val_ident = op_ident ||
                      (cur().kind == Kind::LIDENT &&
