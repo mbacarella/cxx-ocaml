@@ -21,7 +21,10 @@ opam pin add -n ocaml-option-cxx.1   'git+https://github.com/mbacarella/cxx-ocam
 opam install ocaml-option-cxx ocaml-variants
 ```
 
-(From a local clone, pin `git+file:///path/to/clone#cxx-5.5` instead.)
+(From a local clone, pin `git+file:///path/to/clone#cxx-5.5` instead --
+with `cxx-5.5` checked out in that clone, or a worktree of it: opam reads
+the packages' opam files from the working tree, so a clone on another
+branch gives it that branch's `ocaml-option-cxx`.)
 `ocaml-option-cxx` on this branch requires `ocaml-variants` 5.5.x, so the
 two pins must come from the same branch.
 
