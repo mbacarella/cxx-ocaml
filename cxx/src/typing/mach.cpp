@@ -152,8 +152,6 @@ bool operation_is_pure(const SpecificOperation& op) {
   switch (op.k) {
     case K::Ilea:
     case K::Ibswap:
-    case K::Iclz:
-    case K::Ictz:
     case K::Isqrtf:
     case K::Isextend32:
     case K::Izextend32:
@@ -287,14 +285,12 @@ bool operation_is_pure(const Operation& op) {
     case K::Iextcall:
     case K::Istackoffset:
     case K::Istore:
-    case K::Iatomic_fetch_add:
     case K::Ialloc:
     case K::Ipoll:
     case K::Idls_get:
     case K::Iopaque: return false;
     case K::Iintop:
     case K::Iintop_imm: return op.intop.op != IntegerOperation::Icheckbound;
-    case K::Iload: return !op.is_atomic;
     case K::Ispecific: return arch::operation_is_pure(op.spec);
     default: return true;
   }
@@ -669,8 +665,6 @@ void print_specific_operation(Formatter& ppf, const arch::SpecificOperation& op,
       return;
     }
     case K::Ibswap: fprintf(ppf, "bswap_%i %a", static_cast<long>(op.n), pr(reg, arg[0])); return;
-    case K::Iclz: fprintf(ppf, "clz %a", pr(reg, arg[0])); return;
-    case K::Ictz: fprintf(ppf, "ctz %a", pr(reg, arg[0])); return;
     case K::Isextend32: fprintf(ppf, "sextend32 %a", pr(reg, arg[0])); return;
     case K::Izextend32: fprintf(ppf, "zextend32 %a", pr(reg, arg[0])); return;
   }
@@ -710,7 +704,6 @@ void operation(Formatter& ppf, const Operation& op, const Regs& arg, const Regs&
               pr(reg, arg[0]), op.is_assign ? "(assign)" : "(init)");
       return;
     }
-    case K::Iatomic_fetch_add: fprintf(ppf, "atomic_fetch_add [%a] %a", pr(reg, arg[0]), pr(reg, arg[1])); return;
     case K::Ialloc: fprintf(ppf, "alloc %i", static_cast<long>(op.n)); return;
     case K::Iintop: fprintf(ppf, "%a%s%a", pr(reg, arg[0]), intop(op.intop), pr(reg, arg[1])); return;
     case K::Iintop_imm: fprintf(ppf, "%a%s%i", pr(reg, arg[0]), intop(op.intop), static_cast<long>(op.n)); return;

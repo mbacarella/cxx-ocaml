@@ -2612,20 +2612,8 @@ std::vector<Phrase> generic_functions(bool shared, const std::vector<const cmx_f
   return accu;
 }
 
-// Generate the entry point:
-//   CAMLprim value caml_program()
-//   {
-//     int id = 0;
-//     while (true) {
-//       if (id == len_caml_globals_entry_functions) goto out;
-//       caml_globals_entry_functions[id]();
-//       caml_globals_inited += 1;
-//       id += 1;
-//     }
-//     out:
-//     return 1;
-//   }
-std::vector<Phrase> entry_point(const std::vector<std::string_view>& namelist) {
+// Generate the entry point
+Phrase entry_point(const std::vector<std::string_view>& namelist) {
   Dbg dbg;
   auto ci = [&](long i) { return cconst_int(i, dbg); };
   auto incr_global_inited = [&] {
@@ -2636,34 +2624,14 @@ std::vector<Phrase> entry_point(const std::vector<std::string_view>& namelist) {
                     dbg)},
                dbg);
   };
-  std::string_view table_symbol = compilenv::make_symbol(std::string_view("caml_globals_entry_functions"));
-  auto call = [&](expression i) {
-    // address of caml_globals_entry_functions[i]
-    expression entry_slot = cop(O(OK::Cadda),
-                                {cconst_symbol(table_symbol, dbg),
-                                 cop(O(OK::Clsl), {i, ci(log2(size_addr))}, dbg)},
-                                dbg);
-    return csequence(cop(capply(typ_void()), {cop(mk_load_immut(MC::Word_int), {entry_slot}, dbg)}, dbg),
-                     incr_global_inited());
-  };
-  Phrase data;
-  data.data.push_back(data_sym(DK::Cdefine_symbol, table_symbol));
-  for (std::string_view name : namelist)
-    data.data.push_back(data_sym(DK::Csymbol_address, compilenv::make_symbol_in(name, "entry")));
-  long raise_num = L::next_raise_count();
-  Var id = Ident::create_local("*id*");
-  expression var_id = cvar(id);
-  expression high = ci(static_cast<long>(namelist.size()));
-  expression next_iteration = cexit(raise_num, slice(std::vector<expression>{cop(O(OK::Caddi), {var_id, ci(1)}, dbg)}));
-  Handler h{raise_num, slice(std::vector<CatchParam>{param(id, typ_int())}),
-            cifthenelse(cop(ccmpi(IntegerComparison::Ceq), {var_id, high}, dbg), dbg, ctuple({}), dbg,
-                        csequence(call(var_id), next_iteration), dbg),
-            dbg};
-  expression body = ccatch_node(cmm::RecFlag::Recursive, slice(std::vector<Handler>{h}),
-                                cexit(raise_num, slice(std::vector<expression>{ci(0)})));
-  std::vector<Phrase> r{std::move(data)};
-  r.push_back(function_phrase("caml_program", {}, csequence(body, ci(1)), {CodegenOption::Reduce_code_size}));
-  return r;
+  // List.fold_right: from the last unit
+  expression body = ci(1);
+  for (auto it = namelist.rbegin(); it != namelist.rend(); ++it) {
+    std::string_view entry_sym = compilenv::make_symbol_in(*it, "entry");
+    body = csequence(cop(capply(typ_void()), {cconst_symbol(entry_sym, dbg)}, dbg),
+                     csequence(incr_global_inited(), body));
+  }
+  return function_phrase("caml_program", {}, body, {CodegenOption::Reduce_code_size});
 }
 
 // Generate the table of globals

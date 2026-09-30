@@ -208,8 +208,8 @@ std::vector<cmm::Phrase> emit_preallocated_blocks(const std::vector<clambda::Pre
 extern const std::vector<std::string_view> builtin_exceptions;
 // generic_functions shared units: caml_applyN, caml_sendN, caml_curryN...
 std::vector<cmm::Phrase> generic_functions(bool shared, const std::vector<const cmx_format::UnitInfos*>& units);
-// entry_point namelist: the table of entry functions and caml_program
-std::vector<cmm::Phrase> entry_point(const std::vector<std::string_view>& namelist);
+// entry_point namelist: caml_program, calling each unit's entry in turn
+cmm::Phrase entry_point(const std::vector<std::string_view>& namelist);
 cmm::Phrase global_table(const std::vector<std::string_view>& namelist);
 cmm::Phrase reference_symbols(const std::vector<std::string_view>& namelist);
 // global_data name v, v already marshaled (Marshal.to_string v [])

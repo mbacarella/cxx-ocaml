@@ -145,7 +145,6 @@ std::string operation(const debuginfo::t& d, const Operation& o) {
     case OK::Craise: return std::string(lambda::raise_kind(o.raise)) + location(d);
     case OK::Ccheckbound: return "checkbound" + location(d);
     case OK::Copaque: return "opaque";
-    case OK::Catomic_fetch_add: return "atomic_fetch_add";
     case OK::Cdls_get: return "dls_get";
     case OK::Cpoll: return "poll";
   }

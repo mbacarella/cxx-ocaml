@@ -240,7 +240,7 @@ std::string make_startup_file(format::Formatter& dump, const std::vector<ToLink>
   std::vector<std::string_view> name_list;
   for (const ToLink& u : units_list) name_list.insert(name_list.end(), u.info->ui_defines.begin(), u.info->ui_defines.end());
   // (Config.tsan is false: no wrap_tsan)
-  for (const cmm::Phrase& p : cmm_helpers::entry_point(name_list)) compile_phrase(dump, p);
+  compile_phrase(dump, cmm_helpers::entry_point(name_list));
   std::vector<const UnitInfos*> units;
   for (const ToLink& u : units_list) units.push_back(u.info);
   for (const cmm::Phrase& p :
@@ -260,7 +260,13 @@ std::string make_startup_file(format::Formatter& dump, const std::vector<ToLink>
   std::vector<std::string_view> startup_names{"_startup"};
   startup_names.insert(startup_names.end(), name_list.begin(), name_list.end());
   compile_phrase(dump, cmm_helpers::data_segment_table(startup_names));
-  compile_phrase(dump, cmm_helpers::code_segment_table(startup_names));
+  if (clflags::function_sections) {
+    std::vector<std::string_view> hot_names{"_hot"};
+    hot_names.insert(hot_names.end(), startup_names.begin(), startup_names.end());
+    compile_phrase(dump, cmm_helpers::code_segment_table(hot_names));
+  } else {
+    compile_phrase(dump, cmm_helpers::code_segment_table(startup_names));
+  }
   std::vector<std::string_view> all_names{"_startup", "_system"};
   all_names.insert(all_names.end(), name_list.begin(), name_list.end());
   compile_phrase(dump, cmm_helpers::frame_table(all_names));

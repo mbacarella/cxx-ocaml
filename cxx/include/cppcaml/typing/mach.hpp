@@ -168,7 +168,7 @@ inline AddressingMode identity_addressing() { return iindexed(0); }
 enum class FloatOperation : std::uint8_t { Ifloatadd, Ifloatsub, Ifloatmul, Ifloatdiv };
 struct SpecificOperation {
   enum class K : std::uint8_t {
-    Ilea, Istore_int, Ioffset_loc, Ifloatarithmem, Ibswap, Iclz, Ictz, Isqrtf, Ifloatsqrtf, Isextend32, Izextend32
+    Ilea, Istore_int, Ioffset_loc, Ifloatarithmem, Ibswap, Isqrtf, Ifloatsqrtf, Isextend32, Izextend32
   } k;
   AddressingMode addr{};
   std::int64_t n = 0;  // Istore_int's constant, Ioffset_loc's delta, Ibswap's width
@@ -213,7 +213,7 @@ struct AllocDbginfo {
 struct Operation {
   enum class K : std::uint8_t {
     Imove, Ispill, Ireload, Iconst_int, Iconst_float, Iconst_symbol, Icall_ind, Icall_imm, Itailcall_ind,
-    Itailcall_imm, Iextcall, Istackoffset, Iload, Istore, Iatomic_fetch_add, Ialloc, Iintop, Iintop_imm, Icompf,
+    Itailcall_imm, Iextcall, Istackoffset, Iload, Istore, Ialloc, Iintop, Iintop_imm, Icompf,
     Inegf, Iabsf, Iaddf, Isubf, Imulf, Idivf, Ifloatofint, Iintoffloat, Iopaque, Ispecific, Ipoll, Idls_get,
     Ireturn_addr
   } k;

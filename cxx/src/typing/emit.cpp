@@ -238,10 +238,7 @@ void add(const Arg& x, const Arg& y) { i2_s("add", x, y); }
 void addsd(const Arg& x, const Arg& y) { i2("addsd", x, y); }
 void and_(const Arg& x, const Arg& y) { i2_s("and", x, y); }
 void andpd(const Arg& x, const Arg& y) { i2("andpd", x, y); }
-void bsf(const Arg& x, const Arg& y) { i2_s("bsf", x, y); }
-void bsr(const Arg& x, const Arg& y) { i2_s("bsr", x, y); }
 void bswap(const Arg& x) { i1("bswap", x); }
-void bts(const Arg& x, const Arg& y) { i2_s("bts", x, y); }
 void call(const Arg& x) { i1_call_jmp("call", x); }
 void cmp(const Arg& x, const Arg& y) { i2_s("cmp", x, y); }
 void cmpsd(const char* c, const Arg& x, const Arg& y) { i2(std::string("cmp") + c + "sd", x, y); }
@@ -291,8 +288,6 @@ void sub(const Arg& x, const Arg& y) { i2_s("sub", x, y); }
 void subsd(const Arg& x, const Arg& y) { i2("subsd", x, y); }
 void test(const Arg& x, const Arg& y) { i2_s("test", x, y); }
 void ucomisd(const Arg& x, const Arg& y) { i2("ucomisd", x, y); }
-void lock_xadd(const Arg& x, const Arg& y) { i2_s("lock xadd", x, y); }
-void xadd(const Arg& x, const Arg& y) { i2_s("xadd", x, y); }
 void xchg(const Arg& x, const Arg& y) { i2("xchg", x, y); }
 void xor_(const Arg& x, const Arg& y) { i2_s("xor", x, y); }
 void xorpd(const Arg& x, const Arg& y) { i2("xorpd", x, y); }
@@ -344,7 +339,7 @@ std::string cst(const Constant& c) {
 // X86_proc.string_of_string_literal
 std::string string_of_string_literal(std::string_view s) {
   std::string b;
-  bool last_was_escape = false, last_was_question_mark = false;
+  bool last_was_escape = false;
   char buf[8];
   for (char ch : s) {
     unsigned char c = static_cast<unsigned char>(ch);
@@ -354,7 +349,7 @@ std::string string_of_string_literal(std::string_view s) {
         b += buf;
       } else
         b += static_cast<char>(c);
-    } else if (c >= ' ' && c <= '~' && c != '"' && c != '\\' && (c != '?' || !last_was_question_mark)) {
+    } else if (c >= ' ' && c <= '~' && c != '"' && c != '\\') {
       b += static_cast<char>(c);
       last_was_escape = false;
     } else {
@@ -362,7 +357,6 @@ std::string string_of_string_literal(std::string_view s) {
       b += buf;
       last_was_escape = true;
     }
-    last_was_question_mark = c == '?';
   }
   return b;
 }
@@ -1484,16 +1478,6 @@ void emit_instr(Env& env, bool fallthrough, linear::Instr i) {
           else
             fatal("Emit: Ibswap");
           return;
-        case SK::Iclz:
-          // The tag bit keeps bsr away from 0 and counts over Sys.int_size bits
-          I::bsr(arg(0), res(0));
-          I::xor_(imm(63), res(0));
-          return;
-        case SK::Ictz:
-          if (arg(0) != res(0)) I::mov(arg(0), res(0));
-          I::bts(imm(63), res(0));
-          I::bsf(res(0), res(0));
-          return;
         case SK::Isqrtf:
           if (arg(0) != res(0)) I::xorpd(res(0), res(0));  // avoid partial register stall
           I::sqrtsd(arg(0), res(0));
@@ -1507,19 +1491,6 @@ void emit_instr(Env& env, bool fallthrough, linear::Instr i) {
       }
       return;
     case MK::Idls_get: I::mov(domain_field(DomainField::dls_root), res(0)); return;
-    case MK::Iatomic_fetch_add: {
-      long lbl_multi = cmm::new_label();
-      long lbl_done = cmm::new_label();
-      I::cmp(imm(1), mem64(DataType::QWORD, 0, arg64(2)));
-      I::j(Cond::NE, label(lbl_multi));
-      // Single-domain fast path: xadd without the lock prefix
-      I::xadd(res(0), mem64(DataType::QWORD, 0, arg64(0)));
-      I::jmp(label(lbl_done));
-      def_label(lbl_multi);
-      I::lock_xadd(res(0), mem64(DataType::QWORD, 0, arg64(0)));
-      def_label(lbl_done);
-      return;
-    }
     case MK::Ireturn_addr: {
       long offset = frame_size(env) - 8;
       I::mov(mem64(DataType::QWORD, offset, R64::RSP), res(0));

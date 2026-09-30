@@ -99,7 +99,7 @@ Machtype oper_result_type(const cmm::Operation& op) {
     case OK::Ccheckbound:
     case OK::Cpoll: return typ_void();
     case OK::Copaque: return typ_val();
-    default: return typ_int();  // arithmetic, comparisons, Cintoffloat, Catomic_fetch_add
+    default: return typ_int();  // arithmetic, comparisons, Cintoffloat
   }
 }
 
@@ -206,8 +206,7 @@ const EC ec_arbitrary{Effect::Arbitrary, Coeffect::Arbitrary};
 // inline_ops (amd64)
 bool is_inline_op(std::string_view fn) {
   return fn == "sqrt" || fn == "caml_bswap16_direct" || fn == "caml_int32_direct_bswap" ||
-         fn == "caml_int64_direct_bswap" || fn == "caml_nativeint_direct_bswap" || fn == "caml_int_clz_direct" ||
-         fn == "caml_int_ctz_direct";
+         fn == "caml_int64_direct_bswap" || fn == "caml_nativeint_direct_bswap";
 }
 
 bool is_immediate32(long n) { return n <= 0x7FFFFFFFL && n >= -0x80000000L; }
@@ -420,7 +419,6 @@ class Selector {
           case OK::Cstore:
           case OK::Craise:
           case OK::Copaque:
-          case OK::Catomic_fetch_add:
           case OK::Cpoll: return false;
           // The remaining operations are simple if their args are
           default: break;
@@ -477,7 +475,6 @@ class Selector {
             break;
           case OK::Capply:
           case OK::Copaque:
-          case OK::Catomic_fetch_add:
           case OK::Cpoll: from_op = ec_arbitrary; break;
           case OK::Calloc: break;
           case OK::Cstore: from_op = {Effect::Arbitrary, Coeffect::None}; break;
@@ -643,8 +640,6 @@ class Selector {
         if (fn == "caml_bswap16_direct") return bswap(16);
         if (fn == "caml_int32_direct_bswap") return bswap(32);
         if (fn == "caml_int64_direct_bswap" || fn == "caml_nativeint_direct_bswap") return bswap(64);
-        if (fn == "caml_int_clz_direct") return {specific(SK::Iclz), vec(args)};
-        if (fn == "caml_int_ctz_direct") return {specific(SK::Ictz), vec(args)};
         break;
       }
       // Recognize store instructions
@@ -682,12 +677,6 @@ class Selector {
           if (is_mask(args[0])) return {specific(SK::Izextend32), {args[1]}};
         }
         break;
-      case OK::Catomic_fetch_add: {
-        // Materialise &caml_num_domains_running as a regalloc-managed operand
-        std::vector<expression> a = vec(args);
-        a.push_back(cconst_symbol("caml_num_domains_running", dbg));
-        return {simple(MK::Iatomic_fetch_add), a};
-      }
       default: break;
     }
     return select_operation_generic(op, args, dbg);
@@ -739,7 +728,6 @@ class Selector {
           return {o, {args[1], eloc}};  // Inversion addr/datum in Istore
         }
         break;
-      case OK::Catomic_fetch_add: return {simple(MK::Iatomic_fetch_add), vec(args)};
       case OK::Cdls_get: return {simple(MK::Idls_get), vec(args)};
       case OK::Cpoll: return {simple(MK::Ipoll), vec(args)};
       case OK::Calloc: return {simple(MK::Ialloc), vec(args)};
@@ -927,9 +915,6 @@ class Selector {
         bool is_swapped = op.fcmp == FC::CFgt || op.fcmp == FC::CFngt || op.fcmp == FC::CFge || op.fcmp == FC::CFnge;
         return std::pair{is_swapped ? Regs{arg[0], treg} : Regs{treg, arg[1]}, Regs{res[0], treg}};
       }
-      // Atomic fetch-and-add: res.(0) holds the increment then receives the
-      // old value.
-      case MK::Iatomic_fetch_add: return std::pair{Regs{arg[0], res[0], arg[2]}, res};
       default: return std::nullopt;
     }
   }

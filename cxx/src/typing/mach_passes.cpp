@@ -332,7 +332,6 @@ OpClass class_of_operation(const mach::Operation& op) {
       if (op.is_atomic) return OpClass::Op_store_assign;
       return op.mut == MutableFlag::Mutable ? OpClass::Op_load_mutable : OpClass::Op_load_immutable;
     case MK::Istore: return op.is_assign ? OpClass::Op_store_assign : OpClass::Op_store_init;
-    case MK::Iatomic_fetch_add: return OpClass::Op_store_assign;  // atomic read-modify-write
     case MK::Iintop:
     case MK::Iintop_imm: return op.intop.op == IO::Icheckbound ? OpClass::Op_checkbound : OpClass::Op_pure;
     case MK::Icompf:
@@ -349,9 +348,7 @@ OpClass class_of_operation(const mach::Operation& op) {
       switch (op.spec.k) {
         case SK::Ilea:
         case SK::Isextend32:
-        case SK::Izextend32:
-        case SK::Iclz:
-        case SK::Ictz: return OpClass::Op_pure;
+        case SK::Izextend32: return OpClass::Op_pure;
         case SK::Istore_int: return op.spec.is_assign ? OpClass::Op_store_assign : OpClass::Op_store_init;
         case SK::Ioffset_loc: return OpClass::Op_store_assign;
         case SK::Ifloatarithmem:
@@ -1325,13 +1322,6 @@ void interf_build_graph(const mach::Fundecl& fundecl) {
             case MK::Ireload: add_interf_move(i->arg[0], i->res[0], i->live); break;
             case MK::Itailcall_ind:
             case MK::Itailcall_imm: return;
-            case MK::Iatomic_fetch_add:
-              // result must differ from address and increment (LL/SC loop)
-              add_interf(i->res[0], i->arg[0]);
-              add_interf(i->res[0], i->arg[1]);
-              add_interf_set(i->res, i->live);
-              add_interf_self(i->res);
-              break;
             default:
               add_interf_set(i->res, i->live);
               add_interf_self(i->res);

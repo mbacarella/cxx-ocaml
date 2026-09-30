@@ -45,7 +45,7 @@ struct Operation {
   enum class K : std::uint8_t {
     Capply, Cextcall, Cload, Calloc, Cstore, Caddi, Csubi, Cmuli, Cmulhi, Cdivi, Cmodi, Cand, Cor, Cxor,
     Clsl, Clsr, Casr, Ccmpi, Caddv, Cadda, Ccmpa, Cnegf, Cabsf, Caddf, Csubf, Cmulf, Cdivf, Cfloatofint,
-    Cintoffloat, Ccmpf, Craise, Ccheckbound, Copaque, Catomic_fetch_add, Cdls_get, Cpoll
+    Cintoffloat, Ccmpf, Craise, Ccheckbound, Copaque, Cdls_get, Cpoll
   };
   K kind;
   Machtype ty;                   // Capply's result; Cextcall's ty_res
