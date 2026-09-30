@@ -69,6 +69,9 @@ class ObjFile {
   // input_value at pos, advancing pos past the value (raises EndOfFile when
   // truncated)
   V input_value(long& pos) const;
+  // the bytes output_value would write for that value (marshal::raw_value),
+  // without decoding it
+  std::vector<std::uint8_t> raw_value(long& pos) const;
   const std::uint8_t* data() const { return bytes_.data(); }
 
  private:

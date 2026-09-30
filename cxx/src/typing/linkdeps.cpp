@@ -34,17 +34,16 @@ void T::add(const std::string& filename, const std::string& compunit, const std:
   CompunitAndSource by{compunit, filename};
   // add_required t by name
   auto add_required = [&](const std::string& name) {
-    auto add = [&](const Refs* s) {
-      Refs r = s ? *s : Refs{};
-      r.insert(by);
-      return r;
+    // update t k f = Hashtbl.replace t k (f (Hashtbl.find_opt t k)), f adding
+    // [by] to the set: an existing binding's set grows in place (a copy per
+    // add is quadratic, where OCaml's Set.add shares)
+    auto update = [&](auto& tbl, const auto& k) {
+      if (Refs* r = tbl.find_mut(k)) r->insert(by);
+      else tbl.replace(k, Refs{by});
     };
-    // update t k f = Hashtbl.replace t k (f (Hashtbl.find_opt t k))
-    if (const std::vector<std::string>* files = t_->provided_compunits.find_opt(name)) {
-      CompunitAndSource k{name, files->front()};
-      t_->badly_ordered_deps.replace(k, add(t_->badly_ordered_deps.find_opt(k)));
-    }
-    t_->missing_compunits.replace(name, add(t_->missing_compunits.find_opt(name)));
+    if (const std::vector<std::string>* files = t_->provided_compunits.find_opt(name))
+      update(t_->badly_ordered_deps, CompunitAndSource{name, files->front()});
+    update(t_->missing_compunits, name);
   };
   for (const std::string& r : requires_) add_required(r);
   for (const std::string& p : provides) {

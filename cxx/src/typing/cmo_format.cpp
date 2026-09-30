@@ -145,4 +145,17 @@ V ObjFile::input_value(long& pos) const {
   return reader(root);
 }
 
+std::vector<std::uint8_t> ObjFile::raw_value(long& pos) const {
+  if (pos < 0 || pos >= size()) throw EndOfFile{};
+  std::size_t off = static_cast<std::size_t>(pos);
+  std::vector<std::uint8_t> r;
+  try {
+    r = m::raw_value(bytes_.data(), bytes_.size(), off);
+  } catch (const std::exception&) {
+    throw EndOfFile{};
+  }
+  pos = static_cast<long>(off);
+  return r;
+}
+
 }  // namespace cppcaml::typing::cmo_format

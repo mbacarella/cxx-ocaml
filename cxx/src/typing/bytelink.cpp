@@ -1,6 +1,7 @@
 // Port of bytecomp/bytelink.ml; see bytelink.hpp.
 #include "cppcaml/typing/bytelink.hpp"
 
+#include <algorithm>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -159,8 +160,9 @@ void scan_file(linkdeps::T& ldeps, const std::string& obj_name, std::vector<Link
 
 // Consistency check between interfaces
 Consistbl g_crc_interfaces;
-// interfaces: the names' string objects, the latest first; and each name's
-// crc object as the table keeps it (the first one checked)
+// interfaces: the names' string objects, the latest LAST (the list consed
+// in reverse); and each name's crc object as the table keeps it (the first
+// one checked)
 std::vector<V> g_interfaces;
 std::map<std::string, V> g_crc_objs;
 
@@ -168,15 +170,17 @@ std::map<std::string, V> g_crc_objs;
 // List.sort_uniq on the names (its choice among equal names is the object
 // the result carries), then consed
 std::vector<std::pair<V, V>> extract_crc_interfaces() {
-  std::vector<V> l = list_sort::sort_uniq(g_interfaces, [](const V& a, const V& b) {
+  std::vector<V> latest_first(g_interfaces.rbegin(), g_interfaces.rend());
+  std::vector<V> l = list_sort::sort_uniq(latest_first, [](const V& a, const V& b) {
     int c = a->str().compare(b->str());
     return c < 0 ? -1 : c > 0 ? 1 : 0;
   });
   std::vector<std::pair<V, V>> assc;
   for (const V& name : l) {
     auto it = g_crc_objs.find(name->str());
-    assc.insert(assc.begin(), {name, it == g_crc_objs.end() ? nullptr : it->second});
+    assc.push_back({name, it == g_crc_objs.end() ? nullptr : it->second});
   }
+  std::reverse(assc.begin(), assc.end());  // consed
   return assc;
 }
 
@@ -189,10 +193,13 @@ void clear_crc_interfaces() {
 // Record compilation events: (ofs, evl, debug_dirs) / (ofs, hints), the latest first
 struct DebugInfo {
   long ofs;
-  V evl, dirs;
+  // the event list is written back unchanged: its bytes (input_value then
+  // output_value), not the decoded value
+  std::vector<std::uint8_t> evl;
+  V dirs;
 };
-std::vector<DebugInfo> g_debug_info;
-std::vector<std::pair<long, V>> g_hint_info;
+NewestFirst<DebugInfo> g_debug_info;  // the latest first
+NewestFirst<std::pair<long, V>> g_hint_info;  // the latest first
 
 using OutputFun = std::function<void(const std::string&)>;
 using CurrposFun = std::function<long()>;
@@ -208,19 +215,19 @@ bool link_compunit(bool accu, const OutputFun& output_fun, const CurrposFun& cur
   long cu_debug = cu.int_field(cmo_format::cu_debug);
   if (cf::debug && cu_debug > 0) {
     long p = cu_debug;
-    V debug_event_list = inchan.input_value(p);
+    std::vector<std::uint8_t> debug_event_list = inchan.raw_value(p);
     V debug_dirs = inchan.input_value(p);
     std::string file_path = filename::dirname(location::absolute_path(file_name));
     bool mem = false;
     for (const V& d : cmo_format::list_elems(debug_dirs)) mem = mem || d->str() == file_path;
     if (!mem) debug_dirs = o::vblock(0, {o::vstr(file_path), debug_dirs});
-    g_debug_info.insert(g_debug_info.begin(), DebugInfo{currpos_fun(), debug_event_list, debug_dirs});
+    g_debug_info.push_front(DebugInfo{currpos_fun(), std::move(debug_event_list), debug_dirs});
   }
   long cu_hint = cu.int_field(cmo_format::cu_hint);
   if (cf::bytecode_hints && cu_hint > 0) {
     long p = cu_hint;
     V hint_list = inchan.input_value(p);
-    g_hint_info.insert(g_hint_info.begin(), {currpos_fun(), hint_list});
+    g_hint_info.push_front({currpos_fun(), hint_list});
   }
   output_fun(*code_block);
   bool needs_stdlib = accu;
@@ -271,7 +278,7 @@ void output_debug_info(bs::OutChannel& oc) {
   oc.output_binary_int(static_cast<long>(g_debug_info.size()));
   for (const DebugInfo& d : g_debug_info) {
     oc.output_binary_int(d.ofs);
-    oc.output_bytes(o::marshal(d.evl));
+    oc.output_bytes(d.evl);
     oc.output_bytes(o::marshal(d.dirs));
   }
   g_debug_info.clear();
@@ -836,7 +843,7 @@ std::string fix_exec_name(const std::string& name) { return name; }
 void check_consistency(const std::string& file_name, const CompUnit& cu) {
   try {
     for (auto& [name, crco] : cu.import_objs()) {
-      g_interfaces.insert(g_interfaces.begin(), name);
+      g_interfaces.push_back(name);
       if (crco) {
         g_crc_interfaces.check(name->str(), crco->str(), file_name);
         g_crc_objs.emplace(name->str(), crco);  // (Consistbl.check adds the first)

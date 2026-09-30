@@ -175,6 +175,12 @@ class Hashtbl {
     return nullptr;
   }
   bool mem(const K& key) const { return find_opt(key) != nullptr; }
+  // the first binding's data, to update in place (what replace does to it)
+  V* find_mut(const K& key) {
+    for (Cell* c = data_[index(key)]; c; c = c->next)
+      if (c->key == key) return &c->data;
+    return nullptr;
+  }
   // replace h key data: the first binding of key rebound in place, else a
   // new binding at the head of its bucket
   void replace(const K& key, const V& data) {
