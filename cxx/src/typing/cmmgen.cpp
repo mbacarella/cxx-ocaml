@@ -1298,7 +1298,7 @@ void transl_all_functions_(std::set<std::string_view>& already_translated,
   while (const CL::UFunction* f = cmmgen_state::next_function()) {
     if (already_translated.count(f->label)) continue;
     already_translated.insert(f->label);
-    cont.insert(cont.begin(), {f->dbg, transl_function(f)});
+    cont.push_back({f->dbg, transl_function(f)});  // consed: reversed by the caller
   }
 }
 
@@ -1306,6 +1306,7 @@ std::vector<Phrase> transl_all_functions(std::vector<Phrase> cont) {
   std::set<std::string_view> already_translated;
   std::vector<std::pair<Dbg, Phrase>> translated;  // newest first
   while (!cmmgen_state::no_more_functions()) transl_all_functions_(already_translated, translated);
+  std::reverse(translated.begin(), translated.end());
   // Sort functions according to source position
   std::stable_sort(translated.begin(), translated.end(),
                    [](const auto& a, const auto& b) { return debuginfo::compare(a.first, b.first) < 0; });
@@ -1316,18 +1317,27 @@ std::vector<Phrase> transl_all_functions(std::vector<Phrase> cont) {
 }
 
 // Emit all structured constants
+// the phrases [added] consed onto [cont] one by one (so in reverse order)
+std::vector<Phrase> prepend_consed(std::vector<Phrase> added, std::vector<Phrase> cont) {
+  std::reverse(added.begin(), added.end());
+  added.insert(added.end(), std::make_move_iterator(cont.begin()), std::make_move_iterator(cont.end()));
+  return added;
+}
+
 std::vector<Phrase> transl_clambda_constants(const std::vector<CL::PreallocatedConstant>& constants,
                                              std::vector<Phrase> cont) {
+  std::vector<Phrase> added;
   for (auto& c : constants) {
     Symb symb{c.symbol, c.exported ? cmmgen_state::IsGlobal::Global : cmmgen_state::IsGlobal::Local};
     Phrase p;
     p.data = emit_structured_constant(symb, c.definition, {});
-    cont.insert(cont.begin(), std::move(p));
+    added.push_back(std::move(p));
   }
-  return cont;
+  return prepend_consed(std::move(added), std::move(cont));
 }
 
 std::vector<Phrase> emit_cmm_data_items_for_constants(std::vector<Phrase> cont) {
+  std::vector<Phrase> added;
   for (auto& [symbol, cst] : cmmgen_state::get_and_clear_constants()) {
     Phrase p;
     if (cst.is_closure) {
@@ -1338,12 +1348,12 @@ std::vector<Phrase> emit_cmm_data_items_for_constants(std::vector<Phrase> cont) 
       p.data = cdefine_symbol({symbol, cst.global});
       p.data.insert(p.data.end(), cst.table.begin(), cst.table.end());
     }
-    cont.insert(cont.begin(), std::move(p));
+    added.push_back(std::move(p));
   }
   Phrase items;
   items.data = cmmgen_state::get_and_clear_data_items();
-  cont.insert(cont.begin(), std::move(items));
-  return cont;
+  added.push_back(std::move(items));
+  return prepend_consed(std::move(added), std::move(cont));
 }
 
 }  // namespace

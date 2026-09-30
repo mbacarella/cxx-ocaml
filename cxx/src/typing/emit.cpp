@@ -448,7 +448,7 @@ struct FrameDescr {
   std::vector<long> fd_live_offset;
   FrameDebuginfo fd_debuginfo;
 };
-std::vector<FrameDescr> frame_descriptors;  // list order: the newest first
+reg::NewestFirst<FrameDescr> frame_descriptors;  // list order: the newest first
 
 // a debuginfo list copied out of the function's scratch zone (Asmgen): the
 // frame table is emitted at end_assembly
@@ -463,7 +463,7 @@ void record_frame_descr(long label, long frame_size, std::vector<long> live_offs
   for (mach::AllocDbginfo& a : debuginfo.alloc) a.alloc_dbg = keep_dbg(a.alloc_dbg);
   std::sort(live_offset.begin(), live_offset.end());
   live_offset.erase(std::unique(live_offset.begin(), live_offset.end()), live_offset.end());
-  frame_descriptors.insert(frame_descriptors.begin(), FrameDescr{label, frame_size, live_offset, debuginfo});
+  frame_descriptors.push_front(FrameDescr{label, frame_size, live_offset, debuginfo});
 }
 
 // Hashtbl.hash on a Debuginfo item
@@ -718,8 +718,8 @@ struct BoundErrorCall {
 struct Env {
   const linear::Fundecl* f;
   long stack_offset = 0;
-  std::vector<GcCall> call_gc_sites;  // list order: the newest first
-  std::vector<BoundErrorCall> bound_error_sites;
+  reg::NewestFirst<GcCall> call_gc_sites;  // list order: the newest first
+  reg::NewestFirst<BoundErrorCall> bound_error_sites;  // list order: the newest first
   std::optional<long> bound_error_call;
 };
 
@@ -838,16 +838,17 @@ Arg addressing(const arch::AddressingMode& addr, DataType typ, linear::Instr i, 
 // Record live pointers at call points -- see Emitaux
 long record_frame_label(const Env& env, const reg::Set& live, FrameDebuginfo dbg) {
   long lbl = cmm::new_label();
-  std::vector<long> live_offset;
+  std::vector<long> live_offset;  // consed: built in reverse, then reversed
   for (reg::Reg* r : live) {
     if (r->typ == cmm::MachtypeComponent::Val) {
-      if (r->loc.k == reg::Location::K::Reg) live_offset.insert(live_offset.begin(), (r->loc.n << 1) + 1);
+      if (r->loc.k == reg::Location::K::Reg) live_offset.push_back((r->loc.n << 1) + 1);
       else if (r->loc.k != reg::Location::K::Unknown)
-        live_offset.insert(live_offset.begin(), slot_offset(env, r->loc, proc::register_class(r)));
+        live_offset.push_back(slot_offset(env, r->loc, proc::register_class(r)));
     } else if (r->typ == cmm::MachtypeComponent::Addr) {
       fatal("bad GC root " + reg::name(r));
     }
   }
+  std::reverse(live_offset.begin(), live_offset.end());
   record_frame_descr(lbl, frame_size(env), live_offset, std::move(dbg));
   return lbl;
 }
@@ -871,7 +872,7 @@ long bound_error_label(Env& env, const debuginfo::t& dbg) {
   if (clflags::debug) {
     long lbl_bound_error = cmm::new_label();
     long lbl_frame = record_frame_label(env, {}, dbg_other(dbg));
-    env.bound_error_sites.insert(env.bound_error_sites.begin(), {lbl_bound_error, lbl_frame});
+    env.bound_error_sites.push_front({lbl_bound_error, lbl_frame});
     return lbl_bound_error;
   }
   if (!env.bound_error_call) env.bound_error_call = cmm::new_label();
@@ -1023,13 +1024,13 @@ void output_epilogue(const Env& env, const std::function<void()>& f) {
 }
 
 // Floating-point constants
-std::vector<std::pair<std::int64_t, long>> float_constants;  // list order: the newest first
+reg::NewestFirst<std::pair<std::int64_t, long>> float_constants;  // list order: the newest first
 
 long add_float_constant(std::int64_t c) {
   for (auto& [k, l] : float_constants)
     if (k == c) return l;
   long lbl = cmm::new_label();
-  float_constants.insert(float_constants.begin(), {c, lbl});
+  float_constants.push_front({c, lbl});
   return lbl;
 }
 
@@ -1333,7 +1334,7 @@ void emit_instr(Env& env, bool fallthrough, linear::Instr i) {
         long lbl_after_alloc = cmm::new_label();
         def_label(lbl_after_alloc);
         I::lea(mem64(DataType::NONE, 8, R64::R15), res(0));
-        env.call_gc_sites.insert(env.call_gc_sites.begin(), {lbl_call_gc, lbl_after_alloc, lbl_frame});
+        env.call_gc_sites.push_front({lbl_call_gc, lbl_after_alloc, lbl_frame});
       } else {
         switch (n) {
           case 16: emit_call("caml_alloc1"); break;
@@ -1356,7 +1357,7 @@ void emit_instr(Env& env, bool fallthrough, linear::Instr i) {
       long lbl_frame = record_frame_label(env, i->live, dbg_alloc({}));
       if (!op.return_label) I::j(Cond::BE, label(gc_call_label));
       else I::j(Cond::A, label(*op.return_label));
-      env.call_gc_sites.insert(env.call_gc_sites.begin(), {gc_call_label, lbl_after_poll, lbl_frame});
+      env.call_gc_sites.push_front({gc_call_label, lbl_after_poll, lbl_frame});
       if (!op.return_label) def_label(lbl_after_poll);
       else I::jmp(label(gc_call_label));
       return;
