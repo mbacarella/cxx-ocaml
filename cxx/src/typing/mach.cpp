@@ -809,6 +809,19 @@ void interferences(Formatter& ppf) {
   }
 }
 
+void intervals(Formatter& ppf, const interval::Result& r) {
+  auto one = [&](const interval::Interval* i) {
+    auto interv = [i](Formatter& f) {
+      for (std::size_t k = i->first; k < i->ranges.size(); ++k)
+        fprintf(f, "@ [%d;%d]", i->ranges[k].rbegin, i->ranges[k].rend);
+    };
+    fprintf(ppf, "@[<2>%a:%t@]@.", pr(reg, i->reg), interv);
+  };
+  fprintf(ppf, "*** Intervals@.");
+  for (const interval::Interval* i : r.fixed_intervals) one(i);
+  for (const interval::Interval* i : r.intervals) one(i);
+}
+
 void preferences(Formatter& ppf) {
   fprintf(ppf, "*** Preferences@.");
   for (reg::Reg* r : reg::all_registers()) {

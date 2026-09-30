@@ -76,11 +76,19 @@ mach::Fundecl regalloc(format::Formatter& dump, long round, mach::Fundecl fd) {
     if (round > 50)
       throw std::runtime_error(std::string(fd.fun_name) + ": function too complex, cannot complete register allocation");
     dump_if(dump, cf::dump_live, "Liveness analysis", fd);
-    // Graph Coloring
-    mp::interf_build_graph(fd);
-    if (cf::dump_interf) printmach::interferences(dump);
-    if (cf::dump_prefer) printmach::preferences(dump);
-    std::vector<long> num_stack_slots = mp::coloring_allocate_registers();
+    std::vector<long> num_stack_slots;
+    if (cf::use_linscan) {
+      // Linear Scan
+      const interval::Result& intervals = mp::build_intervals(fd);
+      if (cf::dump_interval) printmach::intervals(dump, intervals);
+      num_stack_slots = mp::linscan_allocate_registers(intervals);
+    } else {
+      // Graph Coloring
+      mp::interf_build_graph(fd);
+      if (cf::dump_interf) printmach::interferences(dump);
+      if (cf::dump_prefer) printmach::preferences(dump);
+      num_stack_slots = mp::coloring_allocate_registers();
+    }
     dump_if(dump, cf::dump_regalloc, "After register allocation", fd);
     auto [newfd, redo_regalloc] = mp::reload(fd, num_stack_slots);
     g_gens.compact(newfd);
