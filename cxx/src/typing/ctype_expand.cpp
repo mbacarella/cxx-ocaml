@@ -215,6 +215,11 @@ TypeExpr* expand_head_unif(env::t env, TypeExpr* ty) {
   }
 }
 
+// try_expand_head try_expand_safe, nullptr where it raises Cannot_expand
+TypeExpr* try_expand_head_safe_nt(env::t env, TypeExpr* ty) {
+  return try_expand_head_nt([](env::t e, TypeExpr* t) { return try_expand_safe_nt(true, e, t); }, env, ty);
+}
+
 // Safe version of expand_head, never fails
 TypeExpr* expand_head(env::t env, TypeExpr* ty) {
   TypeExpr* r =
@@ -289,7 +294,7 @@ bool safe_abbrev_opt(env::t env, TypeExpr* ty) {
   return false;
 }
 
-static TypeExpr* try_expand_once_opt_nt(env::t env, TypeExpr* ty) {
+TypeExpr* try_expand_once_opt_nt(env::t env, TypeExpr* ty) {
   if (get_desc(ty)->kind == DescKind::Tconstr) return expand_abbrev_opt_(env, ty);
   return nullptr;
 }
@@ -412,35 +417,46 @@ struct Parents {
 bool parents_mem(const Parents* p, TypeExpr* t) { return p && p->mem(t); }
 }  // namespace
 
-static void occur_rec(env::t env, TypeMark& visited, bool allow_recursive, const Parents* parents,
+// ctype.ml's occur_rec, its `raise Occur` returned as true: the recursion
+// unwinds by return (a C++ exception per abbreviation holding the variable
+// cost microseconds) and occur raises Occur once.  A node is marked when
+// its call returns normally, as when no Occur escaped it.
+static bool occur_rec(env::t env, TypeMark& visited, bool allow_recursive, const Parents* parents,
                       TypeExpr* ty0, TypeExpr* ty) {
-  if (!not_marked_node(visited, ty)) return;
-  if (eq_type(ty, ty0)) throw Occur{};
+  if (!not_marked_node(visited, ty)) return false;
+  if (eq_type(ty, ty0)) return true;
   const TypeDesc* d = get_desc(ty);
+  // iter_type_expr stopping at the first Occur
+  auto children = [&](const Parents* ps) {
+    bool occ = false;
+    iter_type_expr(
+        [&](TypeExpr* t) {
+          if (!occ) occ = occur_rec(env, visited, allow_recursive, ps, ty0, t);
+        },
+        ty);
+    return occ;
+  };
   if (auto* c = as<Tconstr>(d)) {
     if (!(allow_recursive && is_contractive(env, c->path))) {
-      try {
-        if (parents_mem(parents, ty)) throw Occur{};
+      bool occ = parents_mem(parents, ty);
+      if (!occ) {
         Parents parents2{repr(ty), parents};
-        iter_type_expr(
-            [&](TypeExpr* t) { occur_rec(env, visited, allow_recursive, &parents2, ty0, t); }, ty);
-      } catch (const Occur&) {
-        TypeExpr* ty2;
-        try {
-          ty2 = try_expand_safe(env, ty);
-        } catch (const CannotExpand&) {
-          throw Occur{};
-        }
-        occur_rec(env, visited, allow_recursive, parents, ty0, ty2);
+        occ = children(&parents2);
+      }
+      if (occ) {
+        TypeExpr* ty2 = try_expand_safe_nt(true, env, ty);
+        if (!ty2) return true;
+        // This call used to be inlined, but there seems no reason for it.
+        if (occur_rec(env, visited, allow_recursive, parents, ty0, ty2)) return true;
       }
     }
   } else if (d->kind == DescKind::Tobject || d->kind == DescKind::Tvariant) {
   } else if (!(allow_recursive || parents_mem(parents, ty))) {
     Parents parents2{repr(ty), parents};
-    iter_type_expr(
-        [&](TypeExpr* t) { occur_rec(env, visited, allow_recursive, &parents2, ty0, t); }, ty);
+    if (children(&parents2)) return true;
   }
   try_mark_node(visited, ty);
+  return false;
 }
 
 bool type_changed = false;  // trace possible changes to the studied type
@@ -458,7 +474,9 @@ void occur(const Uenv& uenv, TypeExpr* ty0, TypeExpr* ty) {
       type_changed = false;
       if (!eq_type(ty0, ty))
         with_type_mark(
-            [&](TypeMark& mark) { occur_rec(env, mark, allow_recursive, nullptr, ty0, ty); });
+            [&](TypeMark& mark) {
+              if (occur_rec(env, mark, allow_recursive, nullptr, ty0, ty)) throw Occur{};
+            });
     } while (type_changed);
     if (old) type_changed = true;
   } catch (...) {
@@ -501,12 +519,8 @@ static void local_non_recursive_abbrev_rec(bool allow_rec, bool strict,
     if (eq_expanded_type_path(env, p, c->path)) throw Occur{};
     if (allow_rec && !strict && is_contractive(env, c->path)) return;
     visited.push_back(id);
-    TypeExpr* expanded = nullptr;
-    try {
-      // try expanding, since [p] could be hidden
-      expanded = try_expand_head(try_expand_safe_opt, env, ty);
-    } catch (const CannotExpand&) {
-    }
+    // try expanding, since [p] could be hidden (nullptr: Cannot_expand)
+    TypeExpr* expanded = try_expand_head_nt(try_expand_safe_opt_nt, env, ty);
     if (expanded) {
       local_non_recursive_abbrev_rec(allow_rec, strict, visited, env, p, expanded);
     } else {

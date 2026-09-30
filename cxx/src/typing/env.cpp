@@ -102,6 +102,16 @@ static A idtbl_find_same(Ident::t id, const IdTbl<A, B>& tbl) {
   if (tbl.layer->is_open) return idtbl_find_same(id, tbl.layer->next);
   return tbl.layer->f(idtbl_find_same(id, tbl.layer->next));
 }
+// the same, nullopt where it raises Not_found (for the callers that catch it
+// at once: a persistent module, the common case, is found without a throw)
+template <class A, class B>
+static std::optional<A> idtbl_find_same_opt(Ident::t id, const IdTbl<A, B>& tbl) {
+  if (const A* x = tbl.current.find_same_opt(id)) return *x;
+  if (!tbl.layer) return std::nullopt;
+  std::optional<A> r = idtbl_find_same_opt(id, tbl.layer->next);
+  if (!r || tbl.layer->is_open) return r;
+  return tbl.layer->f(*r);
+}
 
 // idtbl_find_name, nullopt where it raises Not_found: nothing observable
 // happens on that path (wrap and the using callbacks run only on a find), so
@@ -409,12 +419,9 @@ static const ModuleEntry* mod_persistent() {
 
 static const ModuleEntry* find_same_module(Ident::t id,
                                            const IdTbl<const ModuleEntry*, const ModuleData*>& tbl) {
-  try {
-    return idtbl_find_same(id, tbl);
-  } catch (const NotFound&) {
-    if (ident::persistent(id) && !current_unit_is_ident(id)) return mod_persistent();
-    throw;
-  }
+  if (std::optional<const ModuleEntry*> e = idtbl_find_same_opt(id, tbl)) return *e;
+  if (ident::persistent(id) && !current_unit_is_ident(id)) return mod_persistent();
+  throw NotFound{};
 }
 
 static std::pair<Path::t, const ModuleEntry*> find_name_module(
@@ -2242,14 +2249,13 @@ shape::t find_shape(t env, shape::SigComponentKind ns, Ident::t id) {
       return v->data->vda_shape;
     }
     case NS::Module: {
-      const ModuleEntry* m;
-      try {
-        m = idtbl_find_same(id, env->modules);
-      } catch (const NotFound&) {
+      std::optional<const ModuleEntry*> found = idtbl_find_same_opt(id, env->modules);
+      if (!found) {
         if (ident::persistent(id) && !current_unit_is_ident(id))
           return shape::for_persistent_unit(ident::name(id));
-        throw;
+        throw NotFound{};
       }
+      const ModuleEntry* m = *found;
       switch (m->kind) {
         case ModuleEntry::Kind::Mod_local: return m->data->mda_shape;
         case ModuleEntry::Kind::Mod_persistent: return shape::for_persistent_unit(ident::name(id));

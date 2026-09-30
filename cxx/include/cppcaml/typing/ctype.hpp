@@ -461,6 +461,10 @@ bool safe_abbrev(env::t env, TypeExpr* ty);
 TypeExpr* try_expand_once(bool link, env::t env, TypeExpr* ty);
 TypeExpr* try_expand_safe(env::t env, TypeExpr* ty);          // ~link:true
 TypeExpr* try_expand_safe_no_link(env::t env, TypeExpr* ty);  // ~link:false
+// try_expand_once_opt, nullptr where it raises Cannot_expand
+TypeExpr* try_expand_once_opt_nt(env::t env, TypeExpr* ty);
+// try_expand_head try_expand_safe, nullptr where it raises Cannot_expand
+TypeExpr* try_expand_head_safe_nt(env::t env, TypeExpr* ty);
 TypeExpr* try_expand_head(const std::function<TypeExpr*(env::t, TypeExpr*)>& try_once,
                           env::t env, TypeExpr* ty);
 TypeExpr* expand_head_unif(env::t env, TypeExpr* ty);

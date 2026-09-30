@@ -287,14 +287,21 @@ long prim_size(const P& prim, Slice<ulambda> args) {
 
 // Very raw approximation of switch cost
 struct Exit {};
+// (lambda_smaller's `raise Exit` is the [stop] flag: once set, the walk
+// returns at once -- a C++ exception per too-big function costs microseconds)
 struct Sizer {
   long size = 0;
   long threshold;
+  bool stop = false;
   void list(Slice<ulambda> l) {
     for (ulambda u : l) lam(u);
   }
   void lam(ulambda u) {
-    if (size > threshold) throw Exit{};
+    if (stop) return;
+    if (size > threshold) {
+      stop = true;
+      return;
+    }
     switch (u->kind) {
       case UK::Uvar: return;
       case UK::Uconst: ++size; return;
@@ -309,7 +316,7 @@ struct Sizer {
         list(x->args);
         return;
       }
-      case UK::Uclosure: throw Exit{};  // inlining would duplicate function definitions
+      case UK::Uclosure: stop = true; return;  // inlining would duplicate function definitions
       case UK::Uoffset:
         ++size;
         lam(static_cast<const Uoffset*>(u)->l);
@@ -411,7 +418,7 @@ bool lambda_smaller(ulambda lam, long threshold) {
   Sizer s{0, threshold};
   try {
     s.lam(lam);
-    return s.size <= threshold;
+    return !s.stop && s.size <= threshold;
   } catch (const Exit&) {
     return false;
   }
@@ -1609,11 +1616,14 @@ std::pair<ulambda, std::vector<std::pair<Ident::t, std::pair<long, Approx>>>> cl
   for (std::size_t k = uncurried_defs.size(); k-- > 0;)
     cenv_entries = cenv_entries.add(uncurried_defs[k].id, ClosureEntry{true, clos_offsets[k]});
   // Translate each function definition
-  auto clos_fundef = [&](const UncurriedDef& d, long fenv_pos) {
+  // (nullopt: raise NotClosed -- returned, not thrown: a C++ exception per
+  // function that uses its environment costs microseconds)
+  using Info = std::pair<const UFunction*, std::pair<Ident::t, std::pair<long, Approx>>>;
+  auto clos_fundef = [&](const UncurriedDef& d, long fenv_pos) -> std::optional<Info> {
     Var env_param = Ident::create_local(OCAML_LIT("env"));
     ClosureEnv cenv_body{true, cenv_entries, env_param, fenv_pos};
     UA b = close(CEnv{cenv_body, fenv_rec, env.mutable_vars}, d.body);
-    if (useless_env && occurs(env_param, b.u)) throw NotClosed{};
+    if (useless_env && occurs(env_param, b.u)) return std::nullopt;
     std::vector<L::Param> fun_params = vec(d.params);
     if (!useless_env) fun_params.push_back({env_param, pgenval()});
     auto* f = make<UFunction>();
@@ -1651,22 +1661,25 @@ std::pair<ulambda, std::vector<std::pair<Ident::t, std::pair<long, Approx>>>> cl
       d.fundesc->inline_params = sl(inline_params);
       d.fundesc->inline_body = b.u;
     }
-    return std::pair<const UFunction*, std::pair<Ident::t, std::pair<long, Approx>>>{
-        f, {d.id, {fenv_pos, value_closure(d.fundesc, b.a)}}};
+    return Info{f, {d.id, {fenv_pos, value_closure(d.fundesc, b.a)}}};
   };
-  // Translate all function definitions.
-  using Info = std::pair<const UFunction*, std::pair<Ident::t, std::pair<long, Approx>>>;
-  auto map2 = [&]() {
+  // Translate all function definitions (nullopt: NotClosed, at the first
+  // function it is raised for)
+  auto map2 = [&]() -> std::optional<std::vector<Info>> {
     std::vector<Info> r;
-    for (std::size_t k = 0; k < uncurried_defs.size(); ++k) r.push_back(clos_fundef(uncurried_defs[k], clos_offsets[k]));
+    for (std::size_t k = 0; k < uncurried_defs.size(); ++k) {
+      std::optional<Info> i = clos_fundef(uncurried_defs[k], clos_offsets[k]);
+      if (!i) return std::nullopt;
+      r.push_back(*i);
+    }
     return r;
   };
   std::vector<Info> clos_info_list;
   if (initially_closed) {
     compilenv::Snapshot snap = compilenv::snapshot();
-    try {
-      clos_info_list = map2();
-    } catch (const NotClosed&) {
+    if (std::optional<std::vector<Info>> r = map2()) {
+      clos_info_list = std::move(*r);
+    } else {
       // If the hypothesis that the environment parameters are useless has
       // been invalidated, then set [fun_closed] to false in all
       // descriptions and recompile
@@ -1678,11 +1691,11 @@ std::pair<ulambda, std::vector<std::pair<Ident::t, std::pair<long, Approx>>>> cl
         d.fundesc->inline_body = nullptr;
       }
       useless_env = false;
-      clos_info_list = map2();
+      clos_info_list = *map2();
     }
   } else {
     // Excessive closure nesting: assume environment parameter is used
-    clos_info_list = map2();
+    clos_info_list = *map2();
   }
   // Update nesting depth
   --function_nesting_depth;

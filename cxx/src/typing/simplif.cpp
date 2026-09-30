@@ -1216,6 +1216,21 @@ Slice<RecBinding> split_default_wrapper(Ident::t fun_id, FunctionKind kind, Slic
     const LFunction* inner_fun = lfunction_(FunctionKind::Curried, slice(ps), return_, body2, attr, loc);
     return {wrapper_body, RecBinding{inner_id, inner_fun}};
   };
+  // (the usual function, whose body does not start with an optional
+  // parameter's default: aux raises Exit before making anything -- decided
+  // here without a C++ exception)
+  auto starts_with_default = [&](Lam b) {
+    auto* x = as<Llet>(b);
+    if (!x || x->str != LetKind::Strict) return false;
+    auto* ite = as<Lifthenelse>(x->arg);
+    if (!ite) return false;
+    auto* isint = as<Lprim>(ite->cond);
+    if (!isint || isint->p.kind != PK::Pisint || isint->args.size() != 1) return false;
+    auto* opt = as<Lvar>(isint->args[0]);
+    return opt && ident::name(opt->id) == "*opt*" && mem_assoc_params(opt->id);
+  };
+  if (!starts_with_default(body))
+    return slice({RecBinding{fun_id, lfunction_(kind, params, return_, body, attr, loc)}});
   try {
     auto [wbody, inner] = aux({}, body);
     FunctionAttribute sattr = default_stub_attribute();
