@@ -1,5 +1,9 @@
 # An opam switch whose `ocamlc` and `ocamlopt` are c++ocamlc and c++ocamlopt
 
+This is the `cxx-5.5` branch: OCaml 5.5.1 (upstream's `5.5` branch) with
+the C++ port following 5.5.1's compiler.  The `cxx-trunk` branch has the
+same setup for OCaml's development version (5.6.0+trunk).
+
 With the `ocaml-option-cxx` option, `ocaml-variants` built from this
 repository also builds c++ocamlc and c++ocamlopt and installs them as
 `bin/ocamlc.opt` and `bin/ocamlopt.opt` (`bin/ocamlc` and `bin/ocamlopt`
@@ -11,11 +15,15 @@ is the non-flambda amd64 one on Linux: for any other configuration the
 stock ocamlopt stays (with a warning in the build log).
 
 ```sh
-opam switch create cxx --empty
-opam pin add -n ocaml-variants.5.6.0+trunk 'git+https://github.com/mbacarella/cxx-ocaml#cpp-rewrite'
-opam pin add -n ocaml-option-cxx.1        'git+https://github.com/mbacarella/cxx-ocaml#cpp-rewrite'
+opam switch create cxx-5.5 --empty
+opam pin add -n ocaml-variants.5.5.1 'git+https://github.com/mbacarella/cxx-ocaml#cxx-5.5'
+opam pin add -n ocaml-option-cxx.1   'git+https://github.com/mbacarella/cxx-ocaml#cxx-5.5'
 opam install ocaml-option-cxx ocaml-variants
 ```
+
+(From a local clone, pin `git+file:///path/to/clone#cxx-5.5` instead.)
+`ocaml-option-cxx` on this branch requires `ocaml-variants` 5.5.x, so the
+two pins must come from the same branch.
 
 Requirements, besides OCaml's own: `clang++` 18 or newer (`CXX` selects
 another C++23 compiler), `cmake`, `ninja`, and -- when OCaml is built with
@@ -54,21 +62,14 @@ c++ocamlc keeps pre-decoded images of the `.cmi` files it reads in
 `CPPCAML_CMI_CACHE=<dir>` moves it, `CPPCAML_CMI_CACHE_VERIFY=1` checks
 each image's bytes (a few percent slower).
 
-Packages for this development version: ppxlib's release does not know
-OCaml 5.6's syntax tree; pin its main branch:
-`opam pin add ppxlib 'git+https://github.com/ocaml-ppx/ppxlib#main'`.
-Trunk's runtime defines `caml_int_clz` / `caml_int_ctz`, which
-ocaml_intrinsics_kernel v0.17's C stubs define too, so native executables
-linking it (the Jane Street ppx drivers) fail to link -- with the stock
-compiler as well.  Until it is fixed upstream, pin a copy of its `v0.17`
-branch with those two stubs renamed (in `src/int_stubs.c` and `src/int.ml`).
+Packages: 5.5.1 is a released version, so opam's released packages
+(ppxlib included) are the ones to use; nothing needs pinning.
 
-Tested (2026-09-29): a switch created this way (c++ocamlc and
-c++ocamlopt), dune 3.24.2 bootstrapped by c++ocamlopt, ctypes,
-ppx_inline_test and their dependencies (base, ppxlib, the Jane Street ppx
-stack, integers, dune-configurator, ...) installed, and
-mbacarella/mpg123 (C stubs, dune's ctypes stanza, inline tests run as
-bytecode and native) built with its tests passing.  Every package rebuilt
-with the stock compilers at the same paths: all 3292 .cmi, .cmo, .cma,
-.cmx, .o, .cmxa, .a, .cmxs and executables identical; 262 .cmt files have
-identical contents but a different Marshal sharing.
+Verified on this branch (2026-09-29), against the stock 5.5.1 compilers
+built from the same tree: the standard library's .cmo (with and without
+-g) and the compiler's own .cmi/.cmo byte-identical; the native compiler
+built by c++ocamlopt (every .cmx, .o, .cmi, library and the ocamlopt.opt
+executable) identical; errors, warnings, `-i`, `-dlambda`, `.cmt` and
+native executables identical over the corpus; the diverse double-compiling
+check passing.  An opam switch built from this branch has not been
+exercised yet (the `cxx-trunk` one has: see that branch's INSTALL.md).
