@@ -19,7 +19,14 @@ opam switch create cxx-5.5 --empty
 opam pin add -n ocaml-variants.5.5.1 'git+https://github.com/mbacarella/cxx-ocaml#cxx-5.5'
 opam pin add -n ocaml-option-cxx.1   'git+https://github.com/mbacarella/cxx-ocaml#cxx-5.5'
 opam install ocaml-option-cxx ocaml-variants
+opam switch set-invariant --packages=ocaml-variants,ocaml-option-cxx
 ```
+
+The last step matters: a switch created `--empty` has no invariant, and
+opam's solver may then replace the pinned `ocaml-variants` by
+`ocaml-base-compiler` (removing `ocaml-option-cxx`) when it installs
+packages later -- installing awso's dependencies did exactly that, and
+the switch silently went back to the stock compilers.
 
 (From a local clone, pin `git+file:///path/to/clone#cxx-5.5` instead --
 with `cxx-5.5` checked out in that clone, or a worktree of it: opam reads
