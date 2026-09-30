@@ -9,9 +9,9 @@
 // marshaled string (the Reader's), one identity per `Some` block.
 #include <new>
 #include <stdexcept>
-#include <unordered_map>
 #include <vector>
 
+#include "cppcaml/flat_map.hpp"
 #include "cppcaml/typing/parsetree_ovalue.hpp"
 
 #include "cmi_marshal.hpp"
@@ -57,7 +57,7 @@ struct OValueAcc {
 struct GraphAcc {
   using V = cmi_marshal::Id;
   const cmi_marshal::Graph& g;
-  mutable std::unordered_map<V, std::string_view> strs{};
+  mutable FlatMap<V, std::string_view> strs{};
   bool is_int(V x) const { return cmi_marshal::is_imm(x) || g.node(x).kind == cmi_marshal::Kind::Int; }
   long ival(V x) const {
     if (cmi_marshal::is_imm(x)) return cmi_marshal::imm(x);
@@ -203,7 +203,7 @@ class Decoder {
     if (fresh) it->second = ArgLabel::fresh_obj();
     return ArgLabel{tag(x) == 0 ? ArgLabel::Kind::Labelled : ArgLabel::Kind::Optional, str(f(x, 0)), it->second};
   }
-  std::unordered_map<V, const void*> labels_;
+  FlatMap<V, const void*> labels_;
   void char_opt(V x, bool& has, char& c) {
     has = !is_int(x);
     if (has) c = static_cast<char>(ival(f(x, 0)));
@@ -1008,11 +1008,11 @@ class Decoder {
 
  private:
   Acc acc_;
-  std::unordered_map<V, const void*> nodes_;
-  std::unordered_map<V, std::pair<const void*, std::size_t>> lists_;
-  std::unordered_map<V, Position*> poss_;
-  std::unordered_map<V, Location*> locs_;
-  std::unordered_map<V, const void*> somes_;
+  FlatMap<V, const void*> nodes_;
+  FlatMap<V, std::pair<const void*, std::size_t>> lists_;
+  FlatMap<V, Position*> poss_;
+  FlatMap<V, Location*> locs_;
+  FlatMap<V, const void*> somes_;
 };
 
 }  // namespace
