@@ -6,7 +6,7 @@ open Cmt_format
 let pr fmt = Printf.printf fmt
 
 let decl_kind = function
-  | Typedtree.Value _ -> "Value" | Primitive _ -> "Primitive"
+  | Typedtree.Value _ -> "Value"
   | Value_binding _ -> "Value_binding" | Type _ -> "Type"
   | Constructor _ -> "Constructor"
   | Extension_constructor _ -> "Extension_constructor" | Label _ -> "Label"

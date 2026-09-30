@@ -36,14 +36,13 @@ saved_types_t get_saved_types();
 void set_saved_types(saved_types_t l);
 void add_saved_type(BinaryPart p);
 saved_types_t cons_saved_type(BinaryPart p, saved_types_t l);
-// Typing_recovery_state.with_saved_types ~save_part f (without
-// -typing-recovery): on success the parts [f] saved give way to the one
-// [save_part] makes of its result; an exception leaves [f]'s own list
-// (the outer one is lost)
+// let previous_saved_types = Cmt_format.get_saved_types () in ...
+// Cmt_format.set_saved_types (part :: previous_saved_types): on success the
+// parts [f] saved give way to the one [save_part] makes of its result; an
+// exception leaves them, on top of the outer ones
 template <class F, class S>
 auto with_saved_types(F&& f, S&& save_part) {
   saved_types_t saved = get_saved_types();
-  set_saved_types(nullptr);
   auto result = f();
   set_saved_types(cons_saved_type(save_part(result), saved));
   return result;

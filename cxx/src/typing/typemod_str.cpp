@@ -939,8 +939,7 @@ static StructureTyped type_structure_s(bool toplevel, bool funct_body, Path::t a
   std::vector<const SignatureItem*> sg;
   // (typing recovery is not ported)
   using cmt_format::BinaryPart;
-  cmt_format::saved_types_t saved = cmt_format::get_saved_types();  // with_saved_types ~save_part
-  cmt_format::set_saved_types(nullptr);
+  cmt_format::saved_types_t saved = cmt_format::get_saved_types();  // previous_saved_types
   auto delayed = [&] {
     for (auto* item : sstr) {
       cmt_format::saved_types_t previous_saved_types = cmt_format::get_saved_types();
