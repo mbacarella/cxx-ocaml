@@ -91,6 +91,9 @@ struct ValueKind {
   enum class Kind : std::uint8_t { Pgenval, Pfloatval, Pboxedintval, Pintval };
   Kind kind = Kind::Pgenval;
   BoxedInteger bi = BoxedInteger::Pnativeint;  // Pboxedintval
+  // a Pboxedintval's block identity: 0 is Typeopt's literal (one static block
+  // in ocamlopt), otherwise one per block read back from a .cmx
+  std::uint32_t origin = 0;
   static ValueKind gen() { return {}; }
   static ValueKind intval() { return {Kind::Pintval}; }
   static ValueKind floatval() { return {Kind::Pfloatval}; }
