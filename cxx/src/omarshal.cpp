@@ -120,13 +120,13 @@ ValPtr vdblarr(std::vector<double> ds) {
 ValPtr vcustom(std::string raw, long long data_bytes) {
   Value* v = new_value(Value::Custom);
   v->extra().s = std::move(raw);
-  v->custom_bytes = data_bytes;
+  v->extra().custom_bytes = data_bytes;
   return ValPtr(v);
 }
 ValPtr vcustom2(std::string raw, long long bytes32, long long bytes64) {
   Value* v = new_value(Value::Custom);
   v->extra().s = std::move(raw);
-  v->custom_bytes = bytes64;
+  v->extra().custom_bytes = bytes64;
   v->extra().custom_bytes32 = bytes32;
   return ValPtr(v);
 }
@@ -137,18 +137,80 @@ ValPtr vlist(const std::vector<ValPtr>& xs) {
 }
 
 namespace {
+#ifdef CPPCAML_HAVE_ZSTD
+// zstd.c caml_zstd_compress: a default context, the output streamed with
+// ZSTD_e_continue, then ZSTD_e_end on no more input -- the frame carries no
+// content size.  (zstd's output does not depend on how the input is split
+// into extern.c's blocks, or into ours.)
+struct ZStream {
+  ZSTD_CCtx* ctx = ZSTD_createCCtx();
+  std::vector<std::uint8_t> body = std::vector<std::uint8_t>(1 << 20);
+  ZSTD_outBuffer ob{body.data(), body.size(), 0};
+  ZStream() {
+    if (!ctx) throw std::bad_alloc();
+  }
+  ~ZStream() { ZSTD_freeCCtx(ctx); }
+  ZStream(const ZStream&) = delete;
+  ZStream& operator=(const ZStream&) = delete;
+  void grow() {
+    body.resize(body.size() * 2);
+    ob.dst = body.data();
+    ob.size = body.size();
+  }
+  void feed(const std::uint8_t* p, std::size_t n) {
+    ZSTD_inBuffer in{p, n, 0};
+    while (in.pos < in.size) {
+      std::size_t rc = ZSTD_compressStream2(ctx, &ob, &in, ZSTD_e_continue);
+      if (ZSTD_isError(rc)) throw std::runtime_error("output_value: compression error");
+      if (ob.pos == ob.size) grow();
+    }
+  }
+  void finish() {
+    ZSTD_inBuffer none{nullptr, 0, 0};
+    for (;;) {
+      std::size_t rc = ZSTD_compressStream2(ctx, &ob, &none, ZSTD_e_end);
+      if (ZSTD_isError(rc)) throw std::runtime_error("output_value: compression error");
+      if (rc == 0) break;
+      grow();
+    }
+  }
+};
+#endif
+
 struct Marshaler {
-  // the output, the 20-byte header's room first (filled in at the end)
-  std::vector<std::uint8_t> out = std::vector<std::uint8_t>(kHeader);
-  std::size_t len = kHeader;
   static constexpr std::size_t kHeader = 20;
+  static constexpr std::size_t kChunk = 1 << 20;
+  // the output, the 20-byte header's room first (filled in at the end); or,
+  // compressing, the body's latest chunk (the whole body is never held)
+  std::vector<std::uint8_t> out;
+  std::size_t len;
+#ifdef CPPCAML_HAVE_ZSTD
+  ZStream* z = nullptr;
+#endif
+  std::size_t flushed = 0;  // (compressing) the body's bytes before `out`'s
+  explicit Marshaler(bool compress) : out(compress ? kChunk : kHeader), len(compress ? 0 : kHeader) {}
   long long nobjs = 0, w32 = 0, w64 = 0;
   std::uint8_t* room(std::size_t n) {  // n bytes at the end
-    if (len + n > out.size()) out.resize(std::max(out.size() * 2, len + n));
+    if (len + n > out.size()) {
+#ifdef CPPCAML_HAVE_ZSTD
+      if (z) {
+        flush();
+        if (n > out.size()) out.resize(n);
+      } else
+#endif
+        out.resize(std::max(out.size() * 2, len + n));
+    }
     std::uint8_t* p = out.data() + len;
     len += n;
     return p;
   }
+#ifdef CPPCAML_HAVE_ZSTD
+  void flush() {
+    z->feed(out.data(), len);
+    flushed += len;
+    len = 0;
+  }
+#endif
   // Each sharable object (block size>0 / string / double / dblarr / custom) is
   // assigned its emit-order index in `seen` so a repeat emits a CODE_SHARED
   // back-reference instead of re-serializing -- required for the shared / cyclic
@@ -240,8 +302,8 @@ struct Marshaler {
       case Value::Custom: {  // verbatim on-disk custom bytes (incl. its code byte)
         bytes(v->str());
         nobjs++;                                  // extern.c:858 (header + ops)
-        w32 += 2 + (((v->extra().custom_bytes32 >= 0 ? v->extra().custom_bytes32 : v->custom_bytes) + 3) >> 2);
-        w64 += 2 + ((v->custom_bytes + 7) >> 3);
+        w32 += 2 + (((v->extra().custom_bytes32 >= 0 ? v->extra().custom_bytes32 : v->extra().custom_bytes) + 3) >> 2);
+        w64 += 2 + ((v->extra().custom_bytes + 7) >> 3);
         return;
       }
     }
@@ -273,36 +335,18 @@ bool zstd_available() {
 
 std::vector<std::uint8_t> marshal(const ValPtr& root, bool compressed) {
   static std::uint32_t sessions = 0;
-  Marshaler m;
+  Marshaler m(compressed);
   m.session = ++sessions;
   m.compressed = compressed;
-  m.emit(root);
   if (compressed) {
 #ifdef CPPCAML_HAVE_ZSTD
-    // zstd.c caml_zstd_compress: a default context, the output streamed with
-    // ZSTD_e_continue, then ZSTD_e_end on no more input -- the frame carries no
-    // content size.  (zstd's output does not depend on how the input is split
-    // into extern.c's blocks.)
-    const std::uint8_t* src = m.out.data() + Marshaler::kHeader;
-    std::size_t uncompressed_len = m.len - Marshaler::kHeader;
-    ZSTD_CCtx* ctx = ZSTD_createCCtx();
-    if (!ctx) throw std::bad_alloc();
-    std::vector<std::uint8_t> body(ZSTD_compressBound(uncompressed_len) + 64);
-    ZSTD_outBuffer out{body.data(), body.size(), 0};
-    ZSTD_inBuffer in{src, uncompressed_len, 0};
-    while (in.pos < in.size) {
-      std::size_t rc = ZSTD_compressStream2(ctx, &out, &in, ZSTD_e_continue);
-      if (ZSTD_isError(rc)) { ZSTD_freeCCtx(ctx); throw std::runtime_error("output_value: compression error"); }
-      if (out.pos == out.size) { body.resize(body.size() * 2); out.dst = body.data(); out.size = body.size(); }
-    }
-    ZSTD_inBuffer none{nullptr, 0, 0};
-    for (;;) {
-      std::size_t rc = ZSTD_compressStream2(ctx, &out, &none, ZSTD_e_end);
-      if (ZSTD_isError(rc)) { ZSTD_freeCCtx(ctx); throw std::runtime_error("output_value: compression error"); }
-      if (rc == 0) break;
-      body.resize(body.size() * 2); out.dst = body.data(); out.size = body.size();
-    }
-    ZSTD_freeCCtx(ctx);
+    ZStream zs;
+    m.z = &zs;
+    m.emit(root);
+    m.flush();
+    zs.finish();
+    std::size_t uncompressed_len = m.flushed;
+    ZSTD_outBuffer out = zs.ob;
     // the header in compressed format: magic, its own length, then the
     // compressed and uncompressed lengths, the object count, size_32, size_64
     std::vector<std::uint8_t> res = {0x84, 0x95, 0xA6, 0xBD, 0};
@@ -312,12 +356,13 @@ std::vector<std::uint8_t> marshal(const ValPtr& root, bool compressed) {
     storevlq(res, m.w32);
     storevlq(res, m.w64);
     res[4] = static_cast<std::uint8_t>(res.size());
-    res.insert(res.end(), body.data(), body.data() + out.pos);
+    res.insert(res.end(), zs.body.data(), zs.body.data() + out.pos);
     return res;
 #else
     throw std::logic_error("omarshal: compressed output needs a c++ocamlc built with zstd");
 #endif
   }
+  m.emit(root);
   std::vector<std::uint8_t> out = std::move(m.out);
   out.resize(m.len);
   std::uint8_t* h = out.data();

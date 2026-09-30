@@ -312,7 +312,7 @@ class TreeWriter {
     return w_.i(0);
   }
   V cstr_desc(const ConstructorDescription* c) {
-    return w_.shared(memo_, c, 0, [&]() -> std::vector<V> {
+    return w_.shared(memo_, c, 0, [&]() -> Writer::Fields {
       return {w_.str(c->cstr_name), w_.ty(c->cstr_res), w_.tys(c->cstr_existentials), w_.tys(c->cstr_args),
               w_.i(c->cstr_arity), cstr_tag(c->cstr_tag), w_.i(c->cstr_consts), w_.i(c->cstr_nonconsts),
               w_.b(c->cstr_generalized), w_.private_flag(c->cstr_private), w_.loc(c->cstr_loc),
@@ -321,7 +321,7 @@ class TreeWriter {
     });
   }
   V lbl_desc(const LabelDescription* l) {
-    return w_.shared(memo_, l, 0, [&]() -> std::vector<V> {
+    return w_.shared(memo_, l, 0, [&]() -> Writer::Fields {
       // lbl_all: one array for all the type's labels (each label's lbl_all)
       V all = lbl_all(l->lbl_all);
       return {w_.str(l->lbl_name), w_.ty(l->lbl_res), w_.ty(l->lbl_arg), w_.mutable_flag(l->lbl_mut),
@@ -408,7 +408,7 @@ class TreeWriter {
       case K::Tpat_variant: {
         auto* x = tt::as<tt::Tpat_variant>(d);
         V arg = opt(x->arg != nullptr, [&] { return pat(x->arg); });
-        V rd = w_.shared(memo_, x->row, 0, [&]() -> std::vector<V> { return {w_.row(x->row->contents)}; });
+        V rd = w_.shared(memo_, x->row, 0, [&]() -> Writer::Fields { return {w_.row(x->row->contents)}; });
         return o::vblock(5, {w_.str(x->label), arg, rd});
       }
       case K::Tpat_record: {
@@ -739,7 +739,7 @@ class TreeWriter {
   }
   // a Parsetree.pattern kept by reference (Texp_for's)
   V ppattern(const pt::Pattern* p) {
-    return w_.shared(memo_, p, 0, [&]() -> std::vector<V> {
+    return w_.shared(memo_, p, 0, [&]() -> Writer::Fields {
       V desc;
       if (auto* v = pt::as<pt::Ppat_var>(p->ppat_desc)) desc = o::vblock(0, {o::vblock(0, {w_.str(v->name.txt), loc(v->name.loc)})});
       else desc = w_.i(0);  // Ppat_any (the only other for-loop pattern)
@@ -3370,13 +3370,13 @@ void save_cmt(const std::string& filename, std::string_view modname, const std::
                        });
   out += config::cmt_magic_number;
   std::vector<std::uint8_t> bytes = o::marshal(cmt, config::compression_supported);  // Compression.output_value
-  out.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
   // Misc.output_to_file_via_temporary
   std::string tmp = filename + ".tmp";
   {
     std::ofstream f(tmp, std::ios::binary);
     if (!f) throw std::runtime_error("Cannot open " + tmp);
     f.write(out.data(), static_cast<std::streamsize>(out.size()));
+    f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     if (!f) throw std::runtime_error("Cannot write " + tmp);
   }
   if (std::rename(tmp.c_str(), filename.c_str()) != 0) {
