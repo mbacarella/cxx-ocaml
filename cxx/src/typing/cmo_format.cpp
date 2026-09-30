@@ -113,7 +113,16 @@ std::vector<std::string> CompUnit::primitives() const {
 ObjFile::ObjFile(const std::string& path) : path_(path) {
   std::ifstream f(path, std::ios::binary);  // open_in_bin
   if (!f) throw arg::SysError(path + ": " + std::strerror(errno));
-  bytes_.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+  // (one read of the file's size, not a character at a time: a library is
+  // hundreds of megabytes)
+  f.seekg(0, std::ios::end);
+  std::streamoff n = f.tellg();
+  f.seekg(0);
+  if (n > 0) {
+    bytes_.resize(static_cast<std::size_t>(n));
+    f.read(reinterpret_cast<char*>(bytes_.data()), n);
+    bytes_.resize(static_cast<std::size_t>(f.gcount()));
+  }
 }
 
 std::optional<std::string> ObjFile::read_string(long pos, long len) const {
