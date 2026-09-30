@@ -136,6 +136,19 @@ static Attributes attrs(t s, Attributes x) {
   return x;
 }
 
+const Path::t* ModMap::find_opt(Path::t k) const {
+  if (const Path::t* v = map.find_opt(k)) return v;
+  return base ? base->find_opt(k) : nullptr;
+}
+const Path::t* LazyModules::find_opt(Path::t k) const {
+  if (const Path::t* d = left.find_opt(k)) {
+    auto it = memo.find(k);
+    if (it == memo.end()) it = memo.emplace(k, module_path(right, *d)).first;
+    return &it->second;
+  }
+  return right->modules.find_opt(k);
+}
+
 Path::t module_path(t s, Path::t path) {
   if (auto* p = s->modules.find_opt(path)) return *p;
   switch (path->kind) {
@@ -1006,8 +1019,11 @@ t compose(t s1, t s2) {
   auto modtypes = merge_path_maps(
       [&](const ModuleType* m) { return modtype(Scoping::keep(), s2, m); }, s1->modtypes,
       s2->modtypes);
-  auto modules =
-      merge_path_maps([&](Path::t p) { return module_path(s2, p); }, s1->modules, s2->modules);
+  // the modules: module_path s2 applied to s1's bindings on demand (they
+  // make only paths, so when is not observable), memoized: one path per
+  // binding, as the fold makes
+  ModMap modules = s2->modules;
+  if (!s1->modules.is_empty()) modules = ModMap{{}, make<LazyModules>(LazyModules{s1->modules, s2, {}})};
   auto types = merge_path_maps(
       [&](const TypeReplacement* r) { return type_replacement(s2, r); }, s1->types, s2->types);
   return make<S>(types, modules, modtypes, fs, l);

@@ -2,6 +2,7 @@
 // declarations and (lazily) signatures.
 #pragma once
 
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <vector>
@@ -18,14 +19,40 @@ struct TypeReplacement {  // Path of Path.t | Type_function of {params; body}
   TypeExpr* body = nullptr;
 };
 
+struct S;
+struct LazyModules;
+// A substitution's module map: its bindings, over (for a composition) the
+// composed map, computed on demand (LazyModules)
+struct ModMap {
+  PathMap<Path::t> map;
+  const LazyModules* base = nullptr;
+  const Path::t* find_opt(Path::t k) const;
+  bool is_empty() const { return map.is_empty() && !base; }
+  ModMap add(Path::t k, Path::t v) const {
+    ModMap r = *this;
+    r.map = map.add(k, v);
+    return r;
+  }
+};
 struct S {
   PathMap<const TypeReplacement*> types;
-  PathMap<Path::t> modules;
+  ModMap modules;
   PathMap<const ModuleType*> modtypes;
   bool for_saving = false;
   const Location* loc = nullptr;  // None = nullptr
 };
 using t = const S*;  // `safe subst` and `unsafe subst` share the representation
+// compose s1 s2's modules: s1's bindings k |-> module_path s2 d, made on
+// first lookup, then s2's
+struct LazyModules {
+  ModMap left;
+  t right;
+  struct Less {
+    bool operator()(Path::t a, Path::t b) const { return PathCmp{}(a, b) < 0; }
+  };
+  mutable std::map<Path::t, Path::t, Less> memo;
+  const Path::t* find_opt(Path::t k) const;
+};
 
 struct ModuleTypePathSubstitutedAway : std::runtime_error {
   Path::t path;
