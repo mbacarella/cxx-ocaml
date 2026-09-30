@@ -224,7 +224,7 @@ void report_private_variant_mismatch(std::string_view first, std::string_view se
               choose(err.pos, first, second), decl);
       break;
     case PrivateVariantMismatch::Kind::Presence:
-      fprintf(ppf, "The tag %a is present in %s %s,@ but might not be in %s", misc::style::code(pp_tag, err.tag),
+      fprintf(ppf, "The tag %a is present in the %s %s,@ but might not be in the %s", misc::style::code(pp_tag, err.tag),
               second, decl, first);
       break;
     case PrivateVariantMismatch::Kind::Incompatible_types_for:
@@ -275,10 +275,6 @@ void report_extension_constructor_mismatch(std::string_view first, std::string_v
                                            env::t env, Formatter& ppf, const ExtensionConstructorMismatch& err) {
   if (err.kind == ExtensionConstructorMismatch::Kind::Constructor_privacy) {
     fprintf(ppf, "Private extension constructor(s) would be revealed.");
-    return;
-  }
-  if (err.kind == ExtensionConstructorMismatch::Kind::Constructor_arity) {
-    fprintf(ppf, "They have a different number of type parameters.");
     return;
   }
   Ident::t id = err.id;

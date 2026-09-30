@@ -282,7 +282,9 @@ std::optional<NativeRepr> native_repr_of_type(env::t env, NativeReprKind kind, T
   if (path::same(tc->path, p.int32)) { static const char k = 0; return NativeRepr{NativeRepr::Kind::Unboxed_integer, BoxedInteger::Pint32, &k}; }
   if (path::same(tc->path, p.int64)) { static const char k = 0; return NativeRepr{NativeRepr::Kind::Unboxed_integer, BoxedInteger::Pint64, &k}; }
   if (path::same(tc->path, p.nativeint))
-    { static const char k = 0; return NativeRepr{NativeRepr::Kind::Unboxed_integer, BoxedInteger::Pnativeint, &k}; }
+    // ocamlopt shares typedecl.ml's structured constants: `Unboxed_integer
+    // Pnativeint` is the block of its `Type_abstract Definition`
+    return NativeRepr{NativeRepr::Kind::Unboxed_integer, BoxedInteger::Pnativeint, TYPE_ABSTRACT_LIT(Definition)};
   return std::nullopt;
 }
 

@@ -352,8 +352,6 @@ void print_simple_out_type(Formatter& ppf, const ot::OutType* ty) {
           print_list<ot::OutVariant::Field>(print_row_field, [](Formatter& g) { fprintf(g, "@;<1 -2>| "); }, f,
                                             ty->variant.fields);
         } else {
-          // conflict with class argument after arrow at [ t ]
-          if (closed && !tags) pp_print_string(f, "| ");
           print_simple_out_type(f, ty->variant.typ);
         }
       };

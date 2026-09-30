@@ -101,10 +101,8 @@ E::SigitemSymptom core_symptom(E::CoreSigitemSymptom c) {
 // Core_inclusion: all functions "blah env x1 x2" check that x1 is included
 // in x2.
 CoreResult ci_value_descriptions(const Location& loc, env::t env, Direction d, subst::t s, Ident::t id,
-                                 const ValueDescription* vd1_, const ValueDescription* vd2_) {
-  if (mark_as_used(d)) env::mark_value_used(vd1_->val_uid);
-  // Using [Subst] reverts expansions
-  const ValueDescription* vd1 = subst::value_description(subst::identity(), vd1_);
+                                 const ValueDescription* vd1, const ValueDescription* vd2_) {
+  if (mark_as_used(d)) env::mark_value_used(vd1->val_uid);
   const ValueDescription* vd2 = subst::value_description(s, vd2_);
   try {
     return CoreResult::Ok(includecore::value_descriptions(loc, env, ident::name(id), vd1, vd2));
@@ -117,10 +115,9 @@ CoreResult ci_value_descriptions(const Location& loc, env::t env, Direction d, s
   }
 }
 CoreResult ci_type_declarations(const Location& loc, env::t env, Direction d, subst::t s, Ident::t id,
-                                const TypeDeclaration* decl1_, const TypeDeclaration* decl2_) {
+                                const TypeDeclaration* decl1, const TypeDeclaration* decl2_) {
   bool mark = mark_as_used(d);
-  if (mark) env::mark_type_used(decl1_->type_uid);
-  const TypeDeclaration* decl1 = subst::type_declaration(subst::identity(), decl1_);
+  if (mark) env::mark_type_used(decl1->type_uid);
   const TypeDeclaration* decl2 = subst::type_declaration(s, decl2_);
   if (auto err = includecore::type_declarations(false, loc, env, mark, ident::name(id), decl1, Path::pident(id), decl2)) {
     E::CoreSigitemSymptom c{E::CoreSigitemSymptom::Kind::Type_declarations};
@@ -132,9 +129,8 @@ CoreResult ci_type_declarations(const Location& loc, env::t env, Direction d, su
   return CoreResult::Ok(tt::tcoerce_none());
 }
 CoreResult ci_extension_constructors(const Location& loc, env::t env, Direction d, subst::t s, Ident::t id,
-                                     const ExtensionConstructor* ext1_, const ExtensionConstructor* ext2_) {
+                                     const ExtensionConstructor* ext1, const ExtensionConstructor* ext2_) {
   bool mark = mark_as_used(d);
-  const ExtensionConstructor* ext1 = subst::extension_constructor(subst::identity(), ext1_);
   const ExtensionConstructor* ext2 = subst::extension_constructor(s, ext2_);
   if (auto err = includecore::extension_constructors(loc, env, mark, id, ext1, ext2)) {
     E::CoreSigitemSymptom c{E::CoreSigitemSymptom::Kind::Extension_constructors};
@@ -146,8 +142,7 @@ CoreResult ci_extension_constructors(const Location& loc, env::t env, Direction 
   return CoreResult::Ok(tt::tcoerce_none());
 }
 CoreResult ci_class_type_declarations(const Location& loc, env::t env, Direction, subst::t s, Ident::t,
-                                      const ClassTypeDeclaration* d1_, const ClassTypeDeclaration* d2_) {
-  const ClassTypeDeclaration* d1 = subst::cltype_declaration(subst::identity(), d1_);
+                                      const ClassTypeDeclaration* d1, const ClassTypeDeclaration* d2_) {
   const ClassTypeDeclaration* d2 = subst::cltype_declaration(s, d2_);
   auto reason = includeclass::class_type_declarations(loc, env, d1, d2);
   if (reason.empty()) return CoreResult::Ok(tt::tcoerce_none());
@@ -158,8 +153,7 @@ CoreResult ci_class_type_declarations(const Location& loc, env::t env, Direction
   return CoreResult::Err(core_symptom(c));
 }
 CoreResult ci_class_declarations(const Location&, env::t env, Direction, subst::t s, Ident::t,
-                                 const ClassDeclaration* d1_, const ClassDeclaration* d2_) {
-  const ClassDeclaration* d1 = subst::class_declaration(subst::identity(), d1_);
+                                 const ClassDeclaration* d1, const ClassDeclaration* d2_) {
   const ClassDeclaration* d2 = subst::class_declaration(s, d2_);
   auto reason = includeclass::class_declarations(env, d1, d2);
   if (reason.empty()) return CoreResult::Ok(tt::tcoerce_none());
