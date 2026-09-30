@@ -288,7 +288,6 @@ void read_one_param(Position position, const std::string& name, const std::strin
   else if (name == "no-app-funct") clear("no-app-funct", {&cf::applicative_functors});
   else if (name == "nodynlink") clear("nodynlink", {&cf::dlcode});
   else if (name == "short-paths") clear("short-paths", {&cf::real_paths});
-  else if (name == "typing-recovery") set("typing-recovery", {&cf::typing_recovery});
   else if (name == "no-alias-deps") set("no-alias-deps", {&cf::no_alias_deps});
   else if (name == "opaque") set("opaque", {&cf::opaque});
   else if (name == "pp") cf::preprocessor = v;

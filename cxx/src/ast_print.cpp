@@ -649,10 +649,20 @@ struct Printer {
   std::string str_opt_loc(const StrOptLoc& s) const {
     return '"' + (s.txt ? *s.txt : std::string("_")) + "\" " + loc(s.loc);
   }
+  // value_description: a `val` (no primitives) or an `external`
+  void value_description(int i, const StringLoc& name, const Location& l, const Attributes& attrs,
+                         const CoreType& type, const std::vector<std::string>& prims) {
+    line(i, "value_description " + str_loc(name) + " " + loc(l));
+    attributes(i, attrs);
+    core_type(i + 1, type);
+    if (prims.empty()) line(i + 1, "[]");
+    else { line(i + 1, "["); for (auto& s : prims) line(i + 2, '"' + s + '"'); line(i + 1, "]"); }
+  }
   void value_description(int i, const ValueDescription& v) {
-    line(i, "value_description " + str_loc(v.name) + " " + loc(v.loc));
-    attributes(i, v.attrs);
-    core_type(i + 1, *v.type);
+    value_description(i, v.name, v.loc, v.attrs, *v.type, {});
+  }
+  void primitive_description(int i, const PrimitiveDescription& p) {
+    value_description(i, p.name, p.loc, p.attrs, *p.type, p.prims);
   }
   void signature_item(int i, const SignatureItem& s) {
     line(i, "signature_item " + loc(s.loc));
@@ -661,7 +671,7 @@ struct Printer {
       line(j, "Psig_value");
       value_description(j, v->vd);
     } else if (auto* v = std::get_if<Psig_primitive>(&s.desc)) {
-      line(j, "Psig_primitive");
+      line(j, "Psig_value");
       primitive_description(j, v->pd);
     } else if (auto* v = std::get_if<Psig_type>(&s.desc)) {
       line(j, std::string("Psig_type ") + rec_flag(v->rf));
@@ -739,7 +749,7 @@ struct Printer {
     } else if (auto* v = std::get_if<Pmty_alias>(&m.desc)) {
       line(j, "Pmty_alias " + lid_loc(v->id));
     } else if (auto* v = std::get_if<Pmty_extension>(&m.desc)) {
-      line(j, "Pmty_extension \"" + v->name + "\"");
+      line(j, "Pmod_extension \"" + v->name + "\"");  // (5.5.1's printast says Pmod_)
       ext_payload(j, v->payload);
     } else if (auto* v = std::get_if<Pmty_signature>(&m.desc)) {
       line(j, "Pmty_signature");
@@ -1049,22 +1059,6 @@ struct Printer {
     else { line(j + 1, "["); for (auto& c : x.ctors) extension_constructor(j + 2, c); line(j + 1, "]"); }
     line(j, std::string("ptyext_private = ") + private_flag(x.priv));
   }
-  void primitive_description(int i, const PrimitiveDescription& p) {
-    line(i, "primitive_description " + str_loc(p.name) + " " + loc(p.loc));
-    attributes(i, p.attrs);  // value_description attributes (i+1)
-    if (p.alias) {  // `external f [: t] = path`
-      line(i + 1, "Pprim_alias");
-      if (p.type) { line(i + 2, "Some"); core_type(i + 3, *p.type); }
-      else line(i + 2, "None");
-      line(i + 2, str_loc(*p.alias));
-      return;
-    }
-    line(i + 1, "Pprim_decl");
-    core_type(i + 2, *p.type);
-    if (p.prims.empty()) line(i + 2, "[]");
-    else { line(i + 2, "["); for (auto& s : p.prims) line(i + 3, '"' + s + '"'); line(i + 2, "]"); }
-  }
-
   void value_constraint(int i, const ValueConstraint& vc) {
     if (auto* c = std::get_if<Pvc_constraint>(&vc)) {
       if (!c->univars.empty()) {
@@ -1127,7 +1121,7 @@ struct Printer {
       line(j, "Pstr_primitive");
       primitive_description(j, v->prim);
     } else if (auto* v = std::get_if<Pstr_val>(&s.desc)) {
-      line(j, "Pstr_val");
+      line(j, "Pstr_primitive");
       value_description(j, v->vd);
     } else if (auto* v = std::get_if<Pstr_module>(&s.desc)) {
       line(j, "Pstr_module");

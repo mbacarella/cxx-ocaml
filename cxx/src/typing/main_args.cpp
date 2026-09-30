@@ -249,7 +249,6 @@ std::map<std::string, arg::Spec> actions() {
   a["--version"] = unit([] { compenv::print_version_string(); });
   a["-vnum"] = unit([] { compenv::print_version_string(); });
   a["-where"] = unit([] { compenv::print_standard_library(); });
-  a["-typing-recovery"] = set(cf::typing_recovery);
   a["-with-runtime"] = set(cf::with_runtime);
   a["-without-runtime"] = clear(cf::with_runtime);
   // Main

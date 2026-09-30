@@ -357,7 +357,7 @@ struct Defaults {
   Defaults() {
     parse_options_(false, "+a-4-7-9-27-29-30-32..42-44-45-48-50-60-66..70-74");  // defaults_w
     parse_options_(true, "-a");                                                     // defaults_warn_error
-    for (const char* a : {"unstable", "unsynchronized_access", "todo"}) set_alert(false, false, a);
+    for (const char* a : {"unstable", "unsynchronized_access"}) set_alert(false, false, a);
   }
 };
 
