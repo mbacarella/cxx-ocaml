@@ -21,6 +21,8 @@
 # Menhir of that version does, where the recipe dumps menhirLib; otherwise:
 #   opam source menhir.<version> --dir=/tmp/menhir-<version>
 #   (cd /tmp/menhir-<version> && dune build -p menhirLib,menhirSdk,menhir)
+#   (Menhir 20260209 and later also need menhirGLR:
+#    dune build -p menhirLib,menhirGLR,menhirSdk,menhir)
 #   MENHIR=/tmp/menhir-<version>/_build/install/default/bin/menhir
 # What stays trusted: Menhir itself (an OCaml program, built by the host's OCaml)
 # and awk/sed.
