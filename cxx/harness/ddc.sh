@@ -15,10 +15,11 @@
 # reimplementation reproduces the exact compiler bytecode.
 #
 # SCOPE (be honest): this covers the compiler-source -> bytecode step only
-# (the bytecode compiler, and the native compiler's sources compiled to bytecode).  The
-# stdlib is shared between both builds (not yet diversely rebuilt) and the C
-# runtime (ocamlrun) executing S1/S2 is the official one.  See the DDC plan in
-# the project notes for closing those gaps.
+# (the bytecode compiler, and the native compiler's sources compiled to bytecode).
+# Both builds compile against the same stdlib interfaces; stdlib_ddc.sh rebuilds
+# the whole stdlib with S2 and compares it.  The generated parser the build
+# compiles (boot/menhir/) is checked against parsing/parser.mly by
+# menhir_check.sh.  The C runtime (ocamlrun) executing S1/S2 is the official one.
 #
 # Usage:   [WD=<bootstrap-workdir>] bash cxx/harness/ddc.sh
 #   WD unset -> a fresh KEEP=1 bootstrap is run to produce S1.

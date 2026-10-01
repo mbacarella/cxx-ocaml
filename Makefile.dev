@@ -63,6 +63,9 @@ clean-all-asts:
 #   make stdlib-ddc S2DIR=/tmp/ddc_s2.XXXX   diverse-verify the stdlib (S2 vs
 #                         official bytecode ./ocamlc; run `make ddc` first, it
 #                         prints S2=...).  In-place build, backed up + restored.
+#   make menhir-check MENHIR=<menhir>   regenerate boot/menhir/ from
+#                         parsing/parser.mly with the menhir release it requires
+#                         and compare byte for byte (see the script's header)
 #   make ddc-lint         guard the harness against the pipe-rc antipattern
 .PHONY: ddc
 ddc:
@@ -71,6 +74,10 @@ ddc:
 .PHONY: stdlib-ddc
 stdlib-ddc:
 	S2DIR="$(S2DIR)" bash cxx/harness/stdlib_ddc.sh
+
+.PHONY: menhir-check
+menhir-check:
+	MENHIR="$(MENHIR)" bash cxx/harness/menhir_check.sh
 
 .PHONY: ddc-lint
 ddc-lint:
