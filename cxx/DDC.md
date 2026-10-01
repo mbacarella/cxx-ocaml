@@ -48,9 +48,10 @@ preprocessor), and Menhir.
 
 ## Running it
 
-You need what OCaml's build needs, plus `clang++` 18 or newer (or another
-C++23 compiler), `cmake` and `ninja`, and the mimalloc library (or build
-with `-DCPPCAML_MIMALLOC=OFF`, which only costs speed).
+You need what OCaml's build needs, plus a C++23 compiler (`clang++` 18 or
+newer, or `g++` 13 or newer -- CMake takes the system's default `c++` unless
+given `-DCMAKE_CXX_COMPILER=`), `cmake` and `ninja`, and the mimalloc library
+(or build with `-DCPPCAML_MIMALLOC=OFF`, which only costs speed).
 
 ```sh
 # 1. The official toolchain, from this tree's sources.
