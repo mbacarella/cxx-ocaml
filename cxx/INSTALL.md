@@ -1,5 +1,8 @@
 # An opam switch whose `ocamlc` and `ocamlopt` are c++ocamlc and c++ocamlopt
 
+*This document, like the C++ implementation it installs, was generated
+with an AI assistant (Claude Code).*
+
 This is the `cxx-5.5` branch: OCaml 5.5.1 (upstream's `5.5` branch) with
 the C++ port following 5.5.1's compiler.  The `cxx-trunk` branch has the
 same setup for OCaml's development version (5.6.0+trunk).
