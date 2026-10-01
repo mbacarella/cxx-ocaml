@@ -80,6 +80,8 @@ make stdlib-ddc S2DIR=/tmp/ddc_s2.XXXXXX
 #    an opam-installed menhir of that version works too:
 opam source menhir.<version> --dir=/tmp/menhir-<version>
 (cd /tmp/menhir-<version> && dune build -p menhirLib,menhirSdk,menhir)
+#    (Menhir 20260209 and later also need its menhirGLR package:
+#     dune build -p menhirLib,menhirGLR,menhirSdk,menhir)
 make menhir-check MENHIR=/tmp/menhir-<version>/_build/install/default/bin/menhir
 ```
 
