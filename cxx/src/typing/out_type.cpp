@@ -5,6 +5,7 @@
 #include "cppcaml/typing/location.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <map>
 #include <set>
 

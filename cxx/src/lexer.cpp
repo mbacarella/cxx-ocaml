@@ -7,6 +7,7 @@
 // dedicated/earlier rule).
 #include "cppcaml/lexer.hpp"
 
+#include <algorithm>
 #include <array>
 #include <string_view>
 #include <unordered_map>

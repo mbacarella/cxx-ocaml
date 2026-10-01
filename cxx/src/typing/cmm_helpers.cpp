@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <deque>
+#include <limits>
 #include <set>
 #include <stdexcept>
 #include <unordered_map>

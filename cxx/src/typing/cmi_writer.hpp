@@ -300,7 +300,7 @@ class Writer {
         V name;
         if (a->name_obj) {
           V l = loc(a->attr_name_loc);
-          auto [it, fresh] = attr_names_.try_emplace(std::make_pair(a->name_obj, l.get()), nullptr);
+          auto [it, fresh] = attr_names_.try_emplace(std::pair<const void*, const void*>(a->name_obj, l.get()), nullptr);
           if (fresh) it->second = o::vblock(0, {str(a->attr_name), l});
           name = it->second;
         } else {
