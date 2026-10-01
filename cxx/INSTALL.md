@@ -1,5 +1,8 @@
 # An opam switch whose `ocamlc` and `ocamlopt` are c++ocamlc and c++ocamlopt
 
+*This document, like the C++ implementation it installs, was generated
+with an AI assistant (Claude Code).*
+
 With the `ocaml-option-cxx` option, `ocaml-variants` built from this
 repository also builds c++ocamlc and c++ocamlopt and installs them as
 `bin/ocamlc.opt` and `bin/ocamlopt.opt` (`bin/ocamlc` and `bin/ocamlopt`
