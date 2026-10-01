@@ -48,19 +48,21 @@ preprocessor), and Menhir.
 
 ## Running it
 
-You need what OCaml's build needs, plus a C++23 compiler (`clang++` 18 or
-newer, or `g++` 13 or newer -- CMake takes the system's default `c++` unless
-given `-DCMAKE_CXX_COMPILER=`), `cmake` and `ninja`, and the mimalloc library
-(or build with `-DCPPCAML_MIMALLOC=OFF`, which only costs speed).
+You need what OCaml's build needs, plus `clang++` 18 or newer, `cmake` and
+`ninja`.  The commands below configure OCaml without zstd (c++ocamlc built
+this way reads only uncompressed compiled interfaces; both sides of the DDC
+use the same configuration, so nothing compared depends on it) and build
+c++ocamlc without the mimalloc allocator, which only costs speed.
 
 ```sh
 # 1. The official toolchain, from this tree's sources.
-./configure
+./configure --without-zstd
 make -j world.opt
 
 # 2. c++ocamlc.  The DDC harnesses use the build in cxx/build (and rebuild
 #    it themselves if the sources changed).
-cmake -S cxx -B cxx/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake -S cxx -B cxx/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_CXX_COMPILER=clang++ -DCPPCAML_MIMALLOC=OFF
 ninja -C cxx/build c++ocamlc
 
 # 3. The compiler DDC (a fresh bootstrap builds S1; tens of minutes).
