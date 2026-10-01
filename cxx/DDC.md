@@ -1,5 +1,8 @@
 # Diverse double-compiling (DDC): checking the compiler yourself
 
+*This document, like the C++ implementation and the harnesses it describes,
+was generated with an AI assistant (Claude Code).*
+
 OCaml builds itself from a binary it ships (`boot/ocamlc`).  A compiler
 binary can carry a backdoor that its source does not show and that it
 re-inserts every time it compiles itself (Ken Thompson's "trusting trust").
