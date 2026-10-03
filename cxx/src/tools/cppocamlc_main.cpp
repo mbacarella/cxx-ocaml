@@ -725,6 +725,8 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
                                        ty::parsetree::Structure st;
                                        if (ast_file) {
                                          st = ty::pparse::read_ast_structure(src);
+                                         // (the decoder's graph and memos are freed: give them back)
+                                         release_free_memory();
                                          ty::cmt_format::set_comments({});  // no lexing: Lexer.comments () = []
                                        } else {
                                          // with -pp the lexer's positions name the file through a
@@ -978,6 +980,7 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
           ty::parsetree::Signature sg;
           if (ast_file) {
             sg = ty::pparse::read_ast_signature(src);
+            release_free_memory();  // (as the implementation's)
             ty::cmt_format::set_comments({});  // no lexing: Lexer.comments () = []
           } else {
             std::string_view pos_name = cf::preprocessor ? ty::zstr(in_path) : src_name;  // as compile_ml's
