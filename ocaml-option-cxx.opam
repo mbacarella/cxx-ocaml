@@ -16,7 +16,7 @@ depends: [
   "ocaml-variants" {post & >= "5.6.0~"}
 ]
 depexts: [
-  ["clang" "cmake" "ninja-build" "libzstd-dev" "pkg-config"] {os-family = "debian"}
-  ["clang" "cmake" "ninja-build" "libzstd-devel" "pkgconf-pkg-config"] {os-family = "fedora"}
+  ["g++" "libzstd-dev" "pkg-config"] {os-family = "debian"}
+  ["gcc-c++" "libzstd-devel" "pkgconf-pkg-config"] {os-family = "fedora"}
 ]
 flags: compiler

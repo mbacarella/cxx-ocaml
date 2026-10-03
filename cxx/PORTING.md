@@ -243,8 +243,9 @@ found parser divergences the testsuite had not).
 
 Every harness compares against the tree's `ocamlc.opt` (the stdlib DDC
 against the bytecode `./ocamlc`, whose -g output differs from the native
-one's).  Build `cxx/build-release` first; never edit sources or run two
-builds while a chain runs; cap memory (`ulimit -v`).  Results as of the
+one's).  Build `cxx/build-release` first (`make -C cxx`; `make -C cxx
+debug` for `cxx/build`; settings in `cxx/Makefile`); never edit sources or
+run two builds while a chain runs; cap memory (`ulimit -v`).  Results as of the
 2026-09-28 trunk catch-up:
 
 | Harness | Compares | Result |
