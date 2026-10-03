@@ -7,6 +7,7 @@
 #include <unordered_map>
 
 #include "cppcaml/typing/clflags.hpp"
+#include "cppcaml/typing/config.hpp"
 #include "cppcaml/typing/env.hpp"
 #include "cppcaml/typing/location.hpp"
 #include "cppcaml/typing/misc.hpp"
@@ -116,6 +117,11 @@ void reset(const std::optional<std::string>& packname0, std::string_view name) {
   exported_constants().clear();
   constants() = Constants{};
   cu.ui_export_info = value_unknown();
+  if constexpr (config::flambda) {
+    compilation_unit::t c =
+        compilation_unit::create(Ident::create_persistent(name), current_unit_linkage_name());
+    compilation_unit::set_current(c);
+  }
 }
 
 std::string_view current_unit_name() { return current_unit().ui_name; }
@@ -204,6 +210,42 @@ std::string_view symbol_for_global(Ident::t id) {
   const UnitInfos* ui = get_global_info(id);
   if (!ui) return make_symbol_in(ident::name(id), std::nullopt);
   return make_symbol_in(ui->ui_symbol, std::nullopt);
+}
+
+// unit_for_global id
+compilation_unit::t unit_for_global(Ident::t id) {
+  linkage_name::t sym_label = symbol_for_global(id);
+  return compilation_unit::create(id, sym_label);
+}
+
+compilation_unit::t predefined_exception_compilation_unit() {
+  static compilation_unit::t c =
+      compilation_unit::create(Ident::create_persistent("__dummy__"), std::string_view("__dummy__"));
+  return c;
+}
+
+bool is_predefined_exception(symbol::t sym) {
+  return compilation_unit::equal(predefined_exception_compilation_unit(), symbol::compilation_unit(sym));
+}
+
+// symbol_for_global' id
+symbol::t symbol_for_global_prime(Ident::t id) {
+  linkage_name::t sym_label = symbol_for_global(id);
+  if (ident::is_predef(id) || ident::same(stdlib_symbol_name(), id))
+    return symbol::of_global_linkage(predefined_exception_compilation_unit(), sym_label);
+  return symbol::of_global_linkage(unit_for_global(id), sym_label);
+}
+
+linkage_name::t current_unit_linkage_name() { return make_symbol_in(current_unit().ui_symbol, std::nullopt); }
+
+compilation_unit::t current_compilation_unit() {
+  compilation_unit::t c = compilation_unit::get_current();
+  if (!c) misc::fatal_error("Compilenv.current_unit");
+  return c;
+}
+
+symbol::t current_unit_symbol() {
+  return symbol::of_global_linkage(current_compilation_unit(), current_unit_linkage_name());
 }
 
 void set_global_approx(const ValueApproximation* approx) { current_unit().ui_export_info = approx; }

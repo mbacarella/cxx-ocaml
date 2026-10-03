@@ -11,6 +11,7 @@
 
 #include "cppcaml/typing/clambda.hpp"
 #include "cppcaml/typing/cmx_format.hpp"
+#include "cppcaml/typing/flambda_ids.hpp"
 #include "cppcaml/typing/format_doc.hpp"
 
 namespace cppcaml::typing::compilenv {
@@ -52,6 +53,20 @@ void need_send_fun(long n);
 void need_stdlib_location();
 
 std::string_view new_const_symbol();
+
+// ---- the flambda half ----------------------------------------------------
+// (reset also sets the current Compilation_unit when Config.flambda)
+// current_unit_linkage_name (): make_symbol None, the current unit's
+linkage_name::t current_unit_linkage_name();
+// unit_for_global id / symbol_for_global' id
+compilation_unit::t unit_for_global(Ident::t id);
+symbol::t symbol_for_global_prime(Ident::t id);
+// predefined_exception_compilation_unit / is_predefined_exception
+compilation_unit::t predefined_exception_compilation_unit();
+bool is_predefined_exception(symbol::t sym);
+// current_unit () (the Compilation_unit) / current_unit_symbol ()
+compilation_unit::t current_compilation_unit();
+symbol::t current_unit_symbol();
 
 // the structured constants: snapshot / backtrack restore the table
 struct Snapshot {

@@ -1,0 +1,261 @@
+// Port of middle_end/internal_variable_names.ml (see internal_variable_names.hpp).
+#include "cppcaml/typing/internal_variable_names.hpp"
+
+#include <string>
+
+#include "cppcaml/typing/filename.hpp"
+#include "cppcaml/typing/location.hpp"
+
+namespace cppcaml::typing::internal_variable_names {
+
+std::string_view anon_fn_with_loc(const lambda::ScopedLocation& sloc) {
+  Location loc = debuginfo::to_location(sloc);
+  auto [file, line, startchar] = location::get_pos_info(loc.loc_start);
+  long endchar = loc.loc_end.pos_cnum - loc.loc_start.pos_bol;
+  if (loc.loc_ghost) return "anon_fn";
+  // Format.asprintf "anon_fn[%s:%i%t]" (Filename.basename file) line pp_chars
+  std::string s = "anon_fn[" + filename::basename(std::string(file)) + ":" + std::to_string(line);
+  if (startchar >= 0) s += "," + std::to_string(startchar) + "--" + std::to_string(endchar);
+  s += "]";
+  return zstr(s);
+}
+
+t of_primitive(const lambda::Primitive& p) {
+  using K = lambda::Primitive::K;
+  switch (p.kind) {
+    case K::Pbytes_of_string: return pbytes_of_string;
+    case K::Pbytes_to_string: return pbytes_to_string;
+    case K::Pignore: return pignore;
+    case K::Pgetglobal: return pgetglobal;
+    case K::Psetglobal: return psetglobal;
+    case K::Pmakeblock: return pmakeblock;
+    case K::Pmakelazyblock: return pmakelazyblock;
+    case K::Pfield: return pfield;
+    case K::Pfield_computed: return pfield_computed;
+    case K::Psetfield: return psetfield;
+    case K::Psetfield_computed: return psetfield_computed;
+    case K::Pfloatfield: return pfloatfield;
+    case K::Psetfloatfield: return psetfloatfield;
+    case K::Pduprecord: return pduprecord;
+    case K::Pccall: return pccall;
+    case K::Praise: return praise;
+    case K::Psequand: return psequand;
+    case K::Psequor: return psequor;
+    case K::Pnot: return pnot;
+    case K::Pnegint: return pnegint;
+    case K::Paddint: return paddint;
+    case K::Psubint: return psubint;
+    case K::Pmulint: return pmulint;
+    case K::Pdivint: return pdivint;
+    case K::Pmodint: return pmodint;
+    case K::Pandint: return pandint;
+    case K::Porint: return porint;
+    case K::Pxorint: return pxorint;
+    case K::Plslint: return plslint;
+    case K::Plsrint: return plsrint;
+    case K::Pasrint: return pasrint;
+    case K::Pintcomp: return pintcomp;
+    case K::Pphyscomp: return pphyscomp;
+    case K::Pcompare_ints: return pcompare_ints;
+    case K::Pcompare_floats: return pcompare_floats;
+    case K::Pcompare_bints: return pcompare_bints;
+    case K::Poffsetint: return poffsetint;
+    case K::Poffsetref: return poffsetref;
+    case K::Pintoffloat: return pintoffloat;
+    case K::Pfloatofint: return pfloatofint;
+    case K::Pnegfloat: return pnegfloat;
+    case K::Pabsfloat: return pabsfloat;
+    case K::Paddfloat: return paddfloat;
+    case K::Psubfloat: return psubfloat;
+    case K::Pmulfloat: return pmulfloat;
+    case K::Pdivfloat: return pdivfloat;
+    case K::Pfloatcomp: return pfloatcomp;
+    case K::Pstringlength: return pstringlength;
+    case K::Pstringrefu: return pstringrefu;
+    case K::Pstringrefs: return pstringrefs;
+    case K::Pbyteslength: return pbyteslength;
+    case K::Pbytesrefu: return pbytesrefu;
+    case K::Pbytessetu: return pbytessetu;
+    case K::Pbytesrefs: return pbytesrefs;
+    case K::Pbytessets: return pbytessets;
+    case K::Parraylength: return parraylength;
+    case K::Pmakearray: return pmakearray;
+    case K::Pduparray: return pduparray;
+    case K::Parrayrefu: return parrayrefu;
+    case K::Parraysetu: return parraysetu;
+    case K::Parrayrefs: return parrayrefs;
+    case K::Parraysets: return parraysets;
+    case K::Pctconst: return pctconst;
+    case K::Pisint: return pisint;
+    case K::Pisout: return pisout;
+    case K::Pcheckbound: return pcheckbound;
+    case K::Pbintofint: return pbintofint;
+    case K::Pintofbint: return pintofbint;
+    case K::Pcvtbint: return pcvtbint;
+    case K::Pnegbint: return pnegbint;
+    case K::Paddbint: return paddbint;
+    case K::Psubbint: return psubbint;
+    case K::Pmulbint: return pmulbint;
+    case K::Pdivbint: return pdivbint;
+    case K::Pmodbint: return pmodbint;
+    case K::Pandbint: return pandbint;
+    case K::Porbint: return porbint;
+    case K::Pxorbint: return pxorbint;
+    case K::Plslbint: return plslbint;
+    case K::Plsrbint: return plsrbint;
+    case K::Pasrbint: return pasrbint;
+    case K::Pbintcomp: return pbintcomp;
+    case K::Pbigarrayref: return pbigarrayref;
+    case K::Pbigarrayset: return pbigarrayset;
+    case K::Pbigarraydim: return pbigarraydim;
+    case K::Pstring_load_16: return pstring_load_16;
+    case K::Pstring_load_32: return pstring_load_32;
+    case K::Pstring_load_64: return pstring_load_64;
+    case K::Pbytes_load_16: return pbytes_load_16;
+    case K::Pbytes_load_32: return pbytes_load_32;
+    case K::Pbytes_load_64: return pbytes_load_64;
+    case K::Pbytes_set_16: return pbytes_set_16;
+    case K::Pbytes_set_32: return pbytes_set_32;
+    case K::Pbytes_set_64: return pbytes_set_64;
+    case K::Pbigstring_load_16: return pbigstring_load_16;
+    case K::Pbigstring_load_32: return pbigstring_load_32;
+    case K::Pbigstring_load_64: return pbigstring_load_64;
+    case K::Pbigstring_set_16: return pbigstring_set_16;
+    case K::Pbigstring_set_32: return pbigstring_set_32;
+    case K::Pbigstring_set_64: return pbigstring_set_64;
+    case K::Pbswap16: return pbswap16;
+    case K::Pbbswap: return pbbswap;
+    case K::Pint_as_pointer: return pint_as_pointer;
+    case K::Popaque: return popaque;
+    case K::Patomic_load: return patomic_load;
+    case K::Patomic_fetch_add: return patomic_fetch_add;
+    case K::Prunstack: return prunstack;
+    case K::Pperform: return pperform;
+    case K::Presume: return presume;
+    case K::Preperform: return preperform;
+    case K::Pdls_get: return pdls_get;
+    case K::Ppoll: return ppoll;
+  }
+  return {};
+}
+
+t of_primitive_arg(const lambda::Primitive& p) {
+  using K = lambda::Primitive::K;
+  switch (p.kind) {
+    case K::Pbytes_of_string: return pbytes_of_string_arg;
+    case K::Pbytes_to_string: return pbytes_to_string_arg;
+    case K::Pignore: return pignore_arg;
+    case K::Pgetglobal: return pgetglobal_arg;
+    case K::Psetglobal: return psetglobal_arg;
+    case K::Pmakeblock: return pmakeblock_arg;
+    case K::Pmakelazyblock: return pmakelazyblock_arg;
+    case K::Pfield: return pfield_arg;
+    case K::Pfield_computed: return pfield_computed_arg;
+    case K::Psetfield: return psetfield_arg;
+    case K::Psetfield_computed: return psetfield_computed_arg;
+    case K::Pfloatfield: return pfloatfield_arg;
+    case K::Psetfloatfield: return psetfloatfield_arg;
+    case K::Pduprecord: return pduprecord_arg;
+    case K::Pccall: return pccall_arg;
+    case K::Praise: return praise_arg;
+    case K::Psequand: return psequand_arg;
+    case K::Psequor: return psequor_arg;
+    case K::Pnot: return pnot_arg;
+    case K::Pnegint: return pnegint_arg;
+    case K::Paddint: return paddint_arg;
+    case K::Psubint: return psubint_arg;
+    case K::Pmulint: return pmulint_arg;
+    case K::Pdivint: return pdivint_arg;
+    case K::Pmodint: return pmodint_arg;
+    case K::Pandint: return pandint_arg;
+    case K::Porint: return porint_arg;
+    case K::Pxorint: return pxorint_arg;
+    case K::Plslint: return plslint_arg;
+    case K::Plsrint: return plsrint_arg;
+    case K::Pasrint: return pasrint_arg;
+    case K::Pintcomp: return pintcomp_arg;
+    case K::Pphyscomp: return pphyscomp_arg;
+    case K::Pcompare_ints: return pcompare_ints_arg;
+    case K::Pcompare_floats: return pcompare_floats_arg;
+    case K::Pcompare_bints: return pcompare_bints_arg;
+    case K::Poffsetint: return poffsetint_arg;
+    case K::Poffsetref: return poffsetref_arg;
+    case K::Pintoffloat: return pintoffloat_arg;
+    case K::Pfloatofint: return pfloatofint_arg;
+    case K::Pnegfloat: return pnegfloat_arg;
+    case K::Pabsfloat: return pabsfloat_arg;
+    case K::Paddfloat: return paddfloat_arg;
+    case K::Psubfloat: return psubfloat_arg;
+    case K::Pmulfloat: return pmulfloat_arg;
+    case K::Pdivfloat: return pdivfloat_arg;
+    case K::Pfloatcomp: return pfloatcomp_arg;
+    case K::Pstringlength: return pstringlength_arg;
+    case K::Pstringrefu: return pstringrefu_arg;
+    case K::Pstringrefs: return pstringrefs_arg;
+    case K::Pbyteslength: return pbyteslength_arg;
+    case K::Pbytesrefu: return pbytesrefu_arg;
+    case K::Pbytessetu: return pbytessetu_arg;
+    case K::Pbytesrefs: return pbytesrefs_arg;
+    case K::Pbytessets: return pbytessets_arg;
+    case K::Parraylength: return parraylength_arg;
+    case K::Pmakearray: return pmakearray_arg;
+    case K::Pduparray: return pduparray_arg;
+    case K::Parrayrefu: return parrayrefu_arg;
+    case K::Parraysetu: return parraysetu_arg;
+    case K::Parrayrefs: return parrayrefs_arg;
+    case K::Parraysets: return parraysets_arg;
+    case K::Pctconst: return pctconst_arg;
+    case K::Pisint: return pisint_arg;
+    case K::Pisout: return pisout_arg;
+    case K::Pcheckbound: return pcheckbound_arg;
+    case K::Pbintofint: return pbintofint_arg;
+    case K::Pintofbint: return pintofbint_arg;
+    case K::Pcvtbint: return pcvtbint_arg;
+    case K::Pnegbint: return pnegbint_arg;
+    case K::Paddbint: return paddbint_arg;
+    case K::Psubbint: return psubbint_arg;
+    case K::Pmulbint: return pmulbint_arg;
+    case K::Pdivbint: return pdivbint_arg;
+    case K::Pmodbint: return pmodbint_arg;
+    case K::Pandbint: return pandbint_arg;
+    case K::Porbint: return porbint_arg;
+    case K::Pxorbint: return pxorbint_arg;
+    case K::Plslbint: return plslbint_arg;
+    case K::Plsrbint: return plsrbint_arg;
+    case K::Pasrbint: return pasrbint_arg;
+    case K::Pbintcomp: return pbintcomp_arg;
+    case K::Pbigarrayref: return pbigarrayref_arg;
+    case K::Pbigarrayset: return pbigarrayset_arg;
+    case K::Pbigarraydim: return pbigarraydim_arg;
+    case K::Pstring_load_16: return pstring_load_16_arg;
+    case K::Pstring_load_32: return pstring_load_32_arg;
+    case K::Pstring_load_64: return pstring_load_64_arg;
+    case K::Pbytes_load_16: return pbytes_load_16_arg;
+    case K::Pbytes_load_32: return pbytes_load_32_arg;
+    case K::Pbytes_load_64: return pbytes_load_64_arg;
+    case K::Pbytes_set_16: return pbytes_set_16_arg;
+    case K::Pbytes_set_32: return pbytes_set_32_arg;
+    case K::Pbytes_set_64: return pbytes_set_64_arg;
+    case K::Pbigstring_load_16: return pbigstring_load_16_arg;
+    case K::Pbigstring_load_32: return pbigstring_load_32_arg;
+    case K::Pbigstring_load_64: return pbigstring_load_64_arg;
+    case K::Pbigstring_set_16: return pbigstring_set_16_arg;
+    case K::Pbigstring_set_32: return pbigstring_set_32_arg;
+    case K::Pbigstring_set_64: return pbigstring_set_64_arg;
+    case K::Pbswap16: return pbswap16_arg;
+    case K::Pbbswap: return pbbswap_arg;
+    case K::Pint_as_pointer: return pint_as_pointer_arg;
+    case K::Popaque: return popaque_arg;
+    case K::Patomic_load: return patomic_load_arg;
+    case K::Patomic_fetch_add: return patomic_fetch_add_arg;
+    case K::Prunstack: return prunstack_arg;
+    case K::Pperform: return pperform_arg;
+    case K::Presume: return presume_arg;
+    case K::Preperform: return preperform_arg;
+    case K::Pdls_get: return pdls_get_arg;
+    case K::Ppoll: return ppoll_arg;
+  }
+  return {};
+}
+
+}  // namespace cppcaml::typing::internal_variable_names
