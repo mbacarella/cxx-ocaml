@@ -773,6 +773,31 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
       // unit infos' ui_name, __MODULE__)
       std::string_view umod = ty::uid::unit_name_string(modname);
       ty::compilenv::reset(cf::for_package, umod);
+      if constexpr (ty::config::flambda) {
+        // Optcompile.flambda: -Oclassic's settings; Translmod.
+        // transl_implementation_flambda, -drawlambda, Simplif.
+        // simplify_lambda, -dlambda; the back end (Flambda_middle_end)
+        // unless -stop-after lambda
+        if (cf::classic_inlining) {
+          cf::default_simplify_rounds = 1;
+          cf::use_inlining_arguments_set(cf::classic_arguments);
+          cf::unbox_free_vars_of_closures = false;
+          cf::unbox_specialised_args = false;
+        }
+        static ty::Zone lambda_nodes;
+        ty::lambda::set_node_zone(&lambda_nodes);
+        ty::lambda::Program prog = ty::translmod::transl_implementation_flambda(umod, impl->structure, impl->coercion);
+        if (cf::dump_rawlambda) ppf_dump.out() << ty::printlambda::dump(prog.code);
+        ty::lambda::lambda lam = ty::simplif::simplify_lambda(prog.code);
+        if (cf::dump_lambda) ppf_dump.out() << ty::printlambda::dump(lam);
+        ppf_dump.out().flush();
+        lap("lambda", tp);
+        if (!cf::should_stop_after(cf::Pass::Lambda)) {
+          std::cerr << CPPCAML_SELF ": the flambda middle end is not ported yet\n";
+          return 2;
+        }
+        return finish();
+      }
       cf::use_inlining_arguments_set(cf::classic_arguments);
       // Lambda's nodes in a zone of their own, dropped once Closure has
       // turned them into Clambda
@@ -1096,11 +1121,10 @@ static int run_main(int argc, char** argv) {
   // Optmaindriver.main: native_code := true, before the arguments
   if (kNative) cf::native_code = true;
   if (kNative) {
-    // the native back end ported: non-flambda amd64 on Linux, as this
-    // configuration's Config says (the code generator reads these values
-    // as constants)
+    // the native back end ported: amd64 on Linux, as this configuration's
+    // Config says (the code generator reads these values as constants)
     static const std::pair<const char*, const char*> supported[] = {
-        {"architecture", "amd64"}, {"system", "linux"},       {"flambda", "false"},
+        {"architecture", "amd64"}, {"system", "linux"},
         {"with_frame_pointers", "false"}, {"asm_cfi_supported", "true"}, {"tsan", "false"}};
     for (auto& [k, v] : supported) {
       std::optional<std::string> x = ty::config::config_var(k);
