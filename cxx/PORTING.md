@@ -308,8 +308,8 @@ menhir error points.
 corpus).  Baseline 2026-09-28 (release build with mimalloc, warm .cmi image
 cache): startup 0.66x, small 0.63x, compiler 0.57x, stdlib 0.65x of
 ocamlc.opt's time; peak RSS 1.5-2.7x.  The release build must link mimalloc
-(`CPPCAML_MIMALLOC`, on by default): glibc's malloc costs ~25%.
-`cxx/tools/pgo_build.sh` (PGO + ThinLTO) is optional, ~5% more.
+(vendored in `cxx/vendor/mimalloc`, on unless `MIMALLOC=no`): glibc's malloc
+costs ~25%.
 
 ## Following trunk
 
