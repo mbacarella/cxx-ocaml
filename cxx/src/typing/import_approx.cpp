@@ -49,6 +49,8 @@ const A::FunctionDeclarations* import_function_declarations(const A::FunctionDec
 const A::FunctionDeclarations* import_set_of_closures(set_of_closures_id::t set_of_closures_id) {
   auto& table = imported_sets_of_closures_table();
   if (auto it = table.find(set_of_closures_id); it != table.end()) return it->second;
+  // (memoized for the whole compilation: in the permanent zone)
+  ZoneScope in_permanent(permanent_zone());
   const A::FunctionDeclarations* r = nullptr;
   if (const export_info::T* ex_info = compilenv::approx_for_global(set_of_closures_id->unit)) {
     const auto* fd = ex_info->sets_of_closures.find_opt(set_of_closures_id);

@@ -149,6 +149,8 @@ const UnitInfos* get_global_info(Ident::t global_ident) {
   if (modname == cu.ui_name) return &cu;
   auto& table = global_infos_table();
   if (auto it = table.find(modname); it != table.end()) return it->second;
+  // (cached for the whole compilation: in the permanent zone)
+  ZoneScope in_permanent(permanent_zone());
   const UnitInfos* infos = nullptr;
   std::optional<std::string> crc;
   if (!env::is_imported_opaque(modname)) {
@@ -215,7 +217,11 @@ const ValueApproximation* global_approx(Ident::t id) {
 
 // The name of the symbol defined globally for %standard_library_default
 Ident::t stdlib_symbol_name() {
-  static Ident::t id = Ident::create_persistent("caml_standard_library_nat");
+  // (process-long: in the permanent zone, whichever zone is current)
+  static Ident::t id = [] {
+    ZoneScope in_permanent(permanent_zone());
+    return Ident::create_persistent("caml_standard_library_nat");
+  }();
   return id;
 }
 
@@ -235,8 +241,10 @@ compilation_unit::t unit_for_global(Ident::t id) {
 }
 
 compilation_unit::t predefined_exception_compilation_unit() {
-  static compilation_unit::t c =
-      compilation_unit::create(Ident::create_persistent("__dummy__"), std::string_view("__dummy__"));
+  static compilation_unit::t c = [] {
+    ZoneScope in_permanent(permanent_zone());
+    return compilation_unit::create(Ident::create_persistent("__dummy__"), std::string_view("__dummy__"));
+  }();
   return c;
 }
 
@@ -272,6 +280,7 @@ const export_info::T* approx_for_global(compilation_unit::t comp_unit) {
   std::string modname(ident::name(id));
   FlambdaState& st = flambda_state();
   if (auto it = st.export_infos_table.find(modname); it != st.export_infos_table.end()) return it->second;
+  ZoneScope in_permanent(permanent_zone());
   const UnitInfos* ui = get_global_info(id);
   if (!ui) return nullptr;
   const export_info::T* exported = ui->ui_flambda_export_info;
@@ -291,12 +300,12 @@ void set_export_info(const export_info::T* ei) { current_unit().ui_flambda_expor
 symbol::t closure_symbol(variable::t fv) {
   compilation_unit::t cu = variable::get_compilation_unit(fv);
   std::string linkage_name = concat_symbol(cu->linkage_name, variable::unique_name(fv) + "_closure");
-  return symbol::of_global_linkage(cu, zstr(linkage_name));
+  return symbol::of_global_linkage(cu, permanent_zone().str(linkage_name));
 }
 
 std::string_view function_label(variable::t fv) {
   compilation_unit::t cu = variable::get_compilation_unit(fv);
-  return zstr(concat_symbol(cu->linkage_name, variable::unique_name(fv)));
+  return permanent_zone().str(concat_symbol(cu->linkage_name, variable::unique_name(fv)));
 }
 
 void set_global_approx(const ValueApproximation* approx) { current_unit().ui_export_info = approx; }

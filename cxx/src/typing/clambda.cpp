@@ -72,7 +72,9 @@ t inline_(const t& dbg1, const t& dbg2) {
   if (dbg1.empty()) return dbg2;
   std::vector<Item> v(dbg1.begin(), dbg1.end());
   v.insert(v.end(), dbg2.begin(), dbg2.end());
-  t r = slice(v);
+  // (in the permanent zone: a list's identity is its address -- [shapes]
+  // and the keys -- so it is never copied, nor its storage reused)
+  t r = slice_in(permanent_zone(), v);
   std::vector<std::uint64_t> cells, items;
   for (std::size_t k = 0; k < dbg1.size(); ++k) {
     cells.push_back(fresh_key());

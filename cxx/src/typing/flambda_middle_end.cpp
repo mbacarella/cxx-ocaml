@@ -4,10 +4,17 @@
 // middle end merely has to score byte-identical.
 #include "cppcaml/typing/flambda_middle_end.hpp"
 
+#include <algorithm>
+#include <cstdlib>
 #include <functional>
+#include <memory>
+#include <optional>
+#include <string_view>
+#include <vector>
 
 #include "cppcaml/typing/clflags.hpp"
 #include "cppcaml/typing/closure_conversion.hpp"
+#include "cppcaml/typing/flambda_evacuate.hpp"
 #include "cppcaml/typing/initialize_symbol_to_let_symbol.hpp"
 #include "cppcaml/typing/inline_and_simplify.hpp"
 #include "cppcaml/typing/lift_code.hpp"
@@ -24,12 +31,102 @@ using format::fprintf;
 using flambda::Program;
 using Pass = std::function<Program(const Program&)>;
 
+namespace {
+// The passes allocate in a transient zone; once it holds enough, the
+// program they leave is copied out (flambda_evacuate.hpp) into a zone of
+// its own and the pass zone -- the garbage the OCaml GC would reclaim --
+// is dropped with the previous program's.  CPPCAML_FLAMBDA_EVACUATE=always
+// copies after every pass, =never not at all; CPPCAML_ZONE_PROTECT makes
+// the dropped zones' storage inaccessible instead of freeing it (a later
+// use faults).
+class PassZones {
+ public:
+  PassZones() : outer_(zone()), protect_(std::getenv("CPPCAML_ZONE_PROTECT") != nullptr) {
+    if (const char* e = std::getenv("CPPCAML_FLAMBDA_EVACUATE")) {
+      always_ = std::string_view(e) == "always";
+      never_ = std::string_view(e) == "never";
+    }
+    pass_ = fresh();
+    in_pass_.emplace(*pass_);
+  }
+  ~PassZones() {
+    in_pass_.reset();
+    drop(program_);
+    drop(pass_);
+  }
+  PassZones(const PassZones&) = delete;
+  PassZones& operator=(const PassZones&) = delete;
+
+  // after a pass: its program copied out when the pass zone has grown past
+  // twice the program's (and 64 MiB): the copying costs at most half of
+  // what the passes allocate
+  Program after_pass(const Program& p) {
+    if (never_) return p;
+    std::size_t live = program_ ? program_->bytes() : 0;
+    if (!always_ && pass_->bytes() < std::max<std::size_t>(std::size_t{64} << 20, 2 * live)) return p;
+    std::unique_ptr<Zone> next = fresh();
+    Program copy;
+    {
+      ZoneScope in_next(*next);
+      copy = flambda_evacuate::evacuate(p, dying());
+    }
+    in_pass_.reset();
+    drop(program_);
+    drop(pass_);
+    program_ = std::move(next);
+    pass_ = fresh();
+    in_pass_.emplace(*pass_);
+    return copy;
+  }
+  // the middle end's result, copied into the zone it was called in
+  Program finish(const Program& p) {
+    in_pass_.reset();
+    Program copy = flambda_evacuate::evacuate(p, dying());
+    drop(program_);
+    drop(pass_);
+    return copy;
+  }
+
+ private:
+  std::unique_ptr<Zone> fresh() {
+    auto z = std::make_unique<Zone>(protect_);
+    transient_zones().push_back(z.get());
+    return z;
+  }
+  void drop(std::unique_ptr<Zone>& z) {
+    if (!z) return;
+    auto& tz = transient_zones();
+    tz.erase(std::remove(tz.begin(), tz.end(), z.get()), tz.end());
+    if (protect_) z->drop_protected();
+    z.reset();
+  }
+  std::vector<const Zone*> dying() const {
+    std::vector<const Zone*> v;
+    if (program_) v.push_back(program_.get());
+    if (pass_) v.push_back(pass_.get());
+    return v;
+  }
+
+  Zone& outer_;
+  bool protect_;
+  bool always_ = false, never_ = false;
+  std::unique_ptr<Zone> program_;  // the current program's (null: in the outer zone)
+  std::unique_ptr<Zone> pass_;
+  std::optional<ZoneScope> in_pass_;
+};
+}  // namespace
+
 flambda::Program lambda_to_flambda(format::Formatter& ppf_dump, long size, Ident::t module_ident,
                                    lambda::lambda module_initializer) {
   // (the warning reporter that drops duplicate warnings and
   // Flambda_invariants' checks: not ported yet)
   long pass_number = 0;
   long round_number = 0;
+  Program flam = closure_conversion::lambda_to_flambda(module_ident, size, module_initializer);
+  if (clflags::dump_rawflambda)
+    fprintf(ppf_dump, "After closure conversion:@ %a@.",
+            [&](format::Formatter& f) { flambda::print_program(f, flam); });
+  PassZones zones;
   // flam +-+ (name, pass); a null pass is not ported yet
   auto step = [&](const Program& flam, const char* name, Pass pass) -> Program {
     ++pass_number;
@@ -40,12 +137,8 @@ flambda::Program lambda_to_flambda(format::Formatter& ppf_dump, long size, Ident
       fprintf(ppf_dump, "\n@?");
     }
     if (!pass) throw NotPorted(name);
-    return pass(flam);
+    return zones.after_pass(pass(flam));
   };
-  Program flam = closure_conversion::lambda_to_flambda(module_ident, size, module_initializer);
-  if (clflags::dump_rawflambda)
-    fprintf(ppf_dump, "After closure conversion:@ %a@.",
-            [&](format::Formatter& f) { flambda::print_program(f, flam); });
   Pass lift_lets = lift_code::lift_lets;
   Pass lift_constants = lift_constants::lift_constants;
   Pass share_constants = share_constants::share_constants;
@@ -112,7 +205,7 @@ flambda::Program lambda_to_flambda(format::Formatter& ppf_dump, long size, Ident
   // (the unused [@inlined] / [@unrolled] warnings)
   if (clflags::dump_flambda)
     fprintf(ppf_dump, "End of middle end:@ %a@.", [&](format::Formatter& f) { flambda::print_program(f, flam); });
-  return flam;
+  return zones.finish(flam);
 }
 
 }  // namespace cppcaml::typing::flambda_middle_end

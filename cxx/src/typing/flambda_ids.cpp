@@ -13,6 +13,10 @@ namespace cppcaml::typing {
 using format::Formatter;
 using format::fprintf;
 
+// The identifiers outlive the middle end's transient pass zones (which are
+// dropped once their pass's output program is copied out: evacuation
+// copies terms, never identities): they are in the permanent zone.
+
 // ---- Linkage_name ---------------------------------------------------------
 long linkage_name::hash(t s) { return hashtbl::hash_string(std::string(s)); }
 
@@ -23,7 +27,8 @@ t g_current = nullptr;
 }
 t create(Ident::t id, linkage_name::t linkage_name) {
   if (!ident::persistent(id)) misc::fatal_error("Compilation_unit.create with non-persistent Ident.t");
-  return make<CompilationUnit>(id, linkage_name, hashtbl::hash_string(std::string(ident::name(id))));
+  return permanent_zone().make<CompilationUnit>(id, keep_str(linkage_name),
+                                                hashtbl::hash_string(std::string(ident::name(id))));
 }
 int compare(t a, t b) {
   if (a == b) return 0;
@@ -53,7 +58,7 @@ long g_previous_name_stamp = -1;
 t create_with_name_string(std::string_view name, compilation_unit::t cu) {
   if (!cu) cu = compilation_unit::get_current_exn();
   long stamp = ++g_previous_name_stamp;
-  return make<VariableDesc>(cu, name, stamp);
+  return permanent_zone().make<VariableDesc>(cu, keep_str(name), stamp);
 }
 t create_with_same_name_as_ident(Ident::t id) { return create_with_name_string(ident::name(id)); }
 std::string unique_name(t v) { return std::string(v->name) + "_" + std::to_string(v->name_stamp); }
@@ -100,13 +105,15 @@ int compare(t a, t b) {
 }
 long hash(t s) { return s->kind == SymbolDesc::Kind::Linkage ? s->hash : variable::hash(s->variable); }
 t of_global_linkage(compilation_unit::t cu, linkage_name::t label) {
-  return make<SymbolDesc>(SymbolDesc::Kind::Linkage, cu, label, linkage_name::hash(label), nullptr);
+  return permanent_zone().make<SymbolDesc>(SymbolDesc::Kind::Linkage, cu, keep_str(label), linkage_name::hash(label),
+                                           nullptr);
 }
 t of_variable(variable::t v) {
-  return make<SymbolDesc>(SymbolDesc::Kind::Variable, variable::get_compilation_unit(v), linkage_name::t{}, 0, v);
+  return permanent_zone().make<SymbolDesc>(SymbolDesc::Kind::Variable, variable::get_compilation_unit(v),
+                                           linkage_name::t{}, 0, v);
 }
 t import_for_pack(compilation_unit::t pack, t s) {
-  return make<SymbolDesc>(s->kind, pack, s->label, s->hash, s->variable);
+  return permanent_zone().make<SymbolDesc>(s->kind, pack, s->label, s->hash, s->variable);
 }
 void print(Formatter& ppf, t s) { fprintf(ppf, "%s", std::string(label(s))); }
 void print_opt(Formatter& ppf, t s) {
@@ -137,7 +144,8 @@ namespace {
 long g_counter = 0;
 }
 t create(compilation_unit::t cu, std::optional<std::string_view> name) {
-  return make<UnitIdDesc>(++g_counter, name, cu);
+  if (name) name = keep_str(*name);
+  return permanent_zone().make<UnitIdDesc>(++g_counter, name, cu);
 }
 }  // namespace set_of_closures_id
 namespace export_id {
@@ -145,7 +153,8 @@ namespace {
 long g_counter = 0;
 }
 t create(compilation_unit::t cu, std::optional<std::string_view> name) {
-  return make<UnitIdDesc>(++g_counter, name, cu);
+  if (name) name = keep_str(*name);
+  return permanent_zone().make<UnitIdDesc>(++g_counter, name, cu);
 }
 }  // namespace export_id
 
