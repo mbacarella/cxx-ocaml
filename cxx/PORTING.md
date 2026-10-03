@@ -261,11 +261,13 @@ Inlining_transforms, Inlining_stats -- the decisions, not the
 Simplify_boxed_integer_ops, Invariant_params, Extract_projections,
 Augment_specialised_args, Unbox_closures, Unbox_free_vars_of_closures,
 Unbox_specialised_args, Remove_free_vars_equal_to_args and
-Remove_unused_arguments).
+Remove_unused_arguments), Ref_to_variables and
+Initialize_symbol_to_let_symbol: the whole middle end (Flambda_invariants
+and the duplicate-warning reporter aside).
 `NATIVE=1 DUMP=drawflambda lambda_port_parity.sh` compares closure
 conversion; `DUMP=dflambda-verbose` the program before each pass (the
 port's dump, which stops at the first pass not ported, against the same
-prefix of ocamlopt's): up to Ref_to_variables, 6553/6553 probes (also
+prefix of ocamlopt's): through "End of middle end", 6553/6553 probes (also
 `-Oclassic`, `-O2`, `-g -O3`, `-unsafe`), 787/787 testsuite files and
 272/272 compiler sources (both also at `-O3`).  Inline_and_simplify runs
 at the round number before the loop's increment (0, 1, 2 under `-O3`;

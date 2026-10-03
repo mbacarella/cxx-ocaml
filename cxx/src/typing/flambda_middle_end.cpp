@@ -8,10 +8,12 @@
 
 #include "cppcaml/typing/clflags.hpp"
 #include "cppcaml/typing/closure_conversion.hpp"
+#include "cppcaml/typing/initialize_symbol_to_let_symbol.hpp"
 #include "cppcaml/typing/inline_and_simplify.hpp"
 #include "cppcaml/typing/lift_code.hpp"
 #include "cppcaml/typing/lift_constants.hpp"
 #include "cppcaml/typing/lift_let_to_initialize_symbol.hpp"
+#include "cppcaml/typing/ref_to_variables.hpp"
 #include "cppcaml/typing/remove_unused_closure_vars.hpp"
 #include "cppcaml/typing/remove_unused_program_constructs.hpp"
 #include "cppcaml/typing/share_constants.hpp"
@@ -76,8 +78,8 @@ flambda::Program lambda_to_flambda(format::Formatter& ppf_dump, long size, Ident
     flam = step(flam, "Lift_let_to_initialize_symbol", lift_let_to_initialize_symbol);
     flam = step(flam, "Inline_and_simplify", inline_and_simplify);
     flam = step(flam, "Remove_unused_closure_vars 2", remove_unused_closure_vars);
-    flam = step(flam, "Ref_to_variables", not_ported);
-    flam = step(flam, "Initialize_symbol_to_let_symbol", not_ported);
+    flam = step(flam, "Ref_to_variables", ref_to_variables::eliminate_ref);
+    flam = step(flam, "Initialize_symbol_to_let_symbol", initialize_symbol_to_let_symbol::run);
   } else {
     for (;;) {
       pass_number = 0;
@@ -98,8 +100,8 @@ flambda::Program lambda_to_flambda(format::Formatter& ppf_dump, long size, Ident
       flam = step(flam, "lift_lets 3", lift_lets);
       flam = step(flam, "Inline_and_simplify noinline", inline_and_simplify_noinline);
       flam = step(flam, "Remove_unused_closure_vars 3", remove_unused_closure_vars);
-      flam = step(flam, "Ref_to_variables", not_ported);
-      flam = step(flam, "Initialize_symbol_to_let_symbol", not_ported);
+      flam = step(flam, "Ref_to_variables", ref_to_variables::eliminate_ref);
+      flam = step(flam, "Initialize_symbol_to_let_symbol", initialize_symbol_to_let_symbol::run);
     }
   }
   // back_end
