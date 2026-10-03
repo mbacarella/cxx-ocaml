@@ -55,8 +55,7 @@ You need what OCaml's build needs, plus a C++23 compiler: `g++` 13 or newer
 (or `clang++` 18 or newer, with `CXX=clang++`).  The commands below
 configure OCaml without zstd (c++ocamlc built this way reads only
 uncompressed compiled interfaces; both sides of the DDC use the same
-configuration, so nothing compared depends on it) and build c++ocamlc
-without the mimalloc allocator, which only costs speed.
+configuration, so nothing compared depends on it).
 
 ```sh
 # 1. The official toolchain, from this tree's sources.
@@ -64,9 +63,7 @@ without the mimalloc allocator, which only costs speed.
 make -j world.opt
 
 # 2. c++ocamlc.  The DDC harnesses use the build in cxx/build (and rebuild
-#    it themselves if the sources changed); cxx/Makefile.local keeps the
-#    settings for those rebuilds.
-echo 'MIMALLOC = no' > cxx/Makefile.local
+#    it themselves if the sources changed).
 make -C cxx debug
 
 # 3. The compiler DDC (a fresh bootstrap builds S1; tens of minutes).

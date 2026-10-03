@@ -26,12 +26,11 @@ built with zstd, the default -- libzstd's development files
 (`ocaml-option-cxx.opam` lists them as depexts).  It builds with GNU make,
 like OCaml (`cxx/Makefile`).  The native compiler is needed (not
 `ocaml-option-bytecode-only`): c++ocamlc's configuration is read from the
-installed OCaml by a native program.  opam downloads mimalloc's sources
-(a checksummed `extra-source`); c++ocamlc links its allocator statically.
+installed OCaml by a native program.  c++ocamlc links the mimalloc
+allocator, vendored in `cxx/vendor/mimalloc`, statically.
 
 What the build does (`cxx/opam/build-cxx.sh`, in `ocaml-variants`' build
-stage): it builds mimalloc's allocator override (one C file, with the C
-compiler); installs the tree into a stage (`make install
+stage): it installs the tree into a stage (`make install
 DESTDIR=`: the installation is `--with-relative-libdir`, so the stage
 resolves its standard library as the real one will); generates
 c++ocamlc's driver tables (Config, the option list, warning descriptions)

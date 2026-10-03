@@ -16,8 +16,8 @@ approximating typers and translator and the legacy .cmi code
 `cxx/INSTALL.md`: an opam switch whose `ocamlc` is c++ocamlc
 (`ocaml-option-cxx`).  Build it with GNU make and g++ like the rest of the
 tree: `make -C cxx` (release, `cxx/build-release/`) or `make -C cxx debug`
-(`cxx/build/`, what the DDC harnesses use); per-checkout settings such as
-`MIMALLOC=` go in `cxx/Makefile.local`.
+(`cxx/build/`, what the DDC harnesses use); per-checkout settings
+(`CXX=`, `OPTFLAGS=`, ...) go in `cxx/Makefile.local`.
 
 ## AI contribution policy
 

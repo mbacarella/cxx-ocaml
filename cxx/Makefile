@@ -9,12 +9,11 @@
 # Settings (on the command line, in the environment, or in cxx/Makefile.local,
 # which is read first and not under version control):
 #   CXX         the C++23 compiler (default g++)
+#   CC          the C compiler, for mimalloc (default cc)
 #   OPTFLAGS    the optimisation flags (release -O3 -DNDEBUG, debug -g)
 #   CXXFLAGS, CPPFLAGS, LDFLAGS   added to the compiler's / the linker's
-#   MIMALLOC    the directories to find mimalloc's static allocator override
-#               in (mimalloc.o, mimalloc.h: directly, or in lib/ and
-#               include/); default: CMAKE_PREFIX_PATH's, /usr/local, /usr.
-#               MIMALLOC=no builds without it (slower).
+#   MIMALLOC=no without the vendored mimalloc allocator (vendor/mimalloc;
+#               slower)
 #   ZSTD_LIBS   libzstd's link flags; default configure's (Makefile.config):
 #               compressed marshaled output is byte-identical only with the
 #               libzstd the OCaml runtime itself uses.  Empty: without zstd
@@ -45,6 +44,7 @@ ifeq "$(V)" "0"
 V_CXX = @$(info $(SPACE)  CXX $@)
 V_AR = @$(info $(SPACE)  AR $@)
 V_LINK = @$(info $(SPACE)  LINK $@)
+V_CC = @$(info $(SPACE)  CC $@)
 endif
 SPACE :=
 
@@ -67,22 +67,23 @@ clean:
 	rm -rf build build-release
 
 # ---- mimalloc ---------------------------------------------------------------
-# (statically linked: the compiler is allocation-bound, and the override
-# object, rather than -lmimalloc, always interposes libc's malloc)
+# Statically linked: the compiler is allocation-bound.  Its static override
+# object, as mimalloc's own build makes it (one translation unit,
+# src/static.c), rather than a library: the object always interposes libc's
+# malloc.  Arenas are committed as they are used, not eagerly: an eager
+# commit makes every compiler fault in and zero memory it never uses (a
+# parallel build's system time, a third of a small compilation's memory).
 ifneq "$(MIMALLOC)" "no"
-MIMALLOC_DIRS := $(or $(MIMALLOC),\
-  $(subst :, ,$(CMAKE_PREFIX_PATH)) /usr/local /usr)
-mimalloc_find = $(firstword $(wildcard \
-  $(foreach d,$(MIMALLOC_DIRS),$(d)/$(1) $(d)/$(2)/$(1))))
-MIMALLOC_O := $(call mimalloc_find,mimalloc.o,lib)
-MIMALLOC_H := $(call mimalloc_find,mimalloc.h,include)
-MIMALLOC_MISSING := $(if $(MIMALLOC_O),,mimalloc.o not found in \
-  $(MIMALLOC_DIRS): set MIMALLOC to its directory, or MIMALLOC=no)
+MIMALLOC_O := $(O)/mimalloc.o
+MIMALLOC_CFLAGS := -O3 -DNDEBUG -std=gnu11 -fPIC -fvisibility=hidden \
+  -ftls-model=initial-exec -fno-builtin-malloc \
+  -DMI_BUILD_RELEASE -DMI_MALLOC_OVERRIDE -DMI_DEFAULT_ARENA_EAGER_COMMIT=0 \
+  -Ivendor/mimalloc/include
 endif
 
 # ---- flags ------------------------------------------------------------------
 DEFINES := $(if $(ZSTD_LIBS),-DCPPCAML_HAVE_ZSTD=1) \
-  $(if $(MIMALLOC_H),-DCPPCAML_HAVE_MIMALLOC=1 -I$(dir $(MIMALLOC_H)))
+  $(if $(MIMALLOC_O),-DCPPCAML_HAVE_MIMALLOC=1 -Ivendor/mimalloc/include)
 ALL_CXXFLAGS := -std=c++23 $(OPTFLAGS) \
   -Wall -Wextra -Wpedantic -Wno-unused-parameter \
   -Iinclude $(DEFINES) $(ZSTD_CFLAGS) $(CPPFLAGS) $(CXXFLAGS)
@@ -99,7 +100,8 @@ COMPILER_LDFLAGS := -static-libstdc++ -static-libgcc -Wl,--build-id=sha1
 # a changed flag rebuilds everything (the stamp is rewritten only then)
 FLAGS_STAMP := $(O)/flags
 $(shell mkdir -p $(O) && \
-  echo '$(CXX) $(ALL_CXXFLAGS) | $(LDFLAGS) $(LIBS)' > $(O)/flags.new && \
+  echo '$(CXX) $(ALL_CXXFLAGS) | $(LDFLAGS) $(LIBS)' \
+    '| $(CC) $(MIMALLOC_CFLAGS)' > $(O)/flags.new && \
   (cmp -s $(O)/flags.new $(FLAGS_STAMP) || mv $(O)/flags.new $(FLAGS_STAMP)); \
   rm -f $(O)/flags.new)
 
@@ -107,12 +109,7 @@ $(shell mkdir -p $(O) && \
 CORE_SRCS := $(wildcard src/*.cpp src/typing/*.cpp)
 CORE_OBJS := $(CORE_SRCS:%.cpp=$(O)/%.o)
 
-# (before compiling anything)
-.PHONY: check-mimalloc
-check-mimalloc:
-	$(if $(MIMALLOC_MISSING),$(error $(MIMALLOC_MISSING)))@:
-
-$(O)/%.o: %.cpp $(FLAGS_STAMP) | check-mimalloc
+$(O)/%.o: %.cpp $(FLAGS_STAMP)
 	@mkdir -p $(@D)
 	$(V_CXX)$(CXX) $(ALL_CXXFLAGS) $(EXTRA_CXXFLAGS) -MMD -MP -c $< -o $@
 
@@ -120,29 +117,33 @@ $(O)/src/typing/%.o $(O)/src/tools/typing_dump_main.o: \
   EXTRA_CXXFLAGS := $(PARTIAL_INIT)
 
 # c++ocamlopt: c++ocamlc's driver as Optmaindriver / Optcompile
-$(O)/src/tools/cppocamlopt_main.o: src/tools/cppocamlc_main.cpp $(FLAGS_STAMP) \
-  | check-mimalloc
+$(O)/src/tools/cppocamlopt_main.o: src/tools/cppocamlc_main.cpp $(FLAGS_STAMP)
 	@mkdir -p $(@D)
 	$(V_CXX)$(CXX) $(ALL_CXXFLAGS) -DCPPCAML_OCAMLOPT=1 -MMD -MP -c $< -o $@
+
+$(O)/mimalloc.o: vendor/mimalloc/src/static.c $(FLAGS_STAMP)
+	$(V_CC)$(CC) $(MIMALLOC_CFLAGS) -MMD -MP -c $< -o $@
 
 $(O)/libcppcaml_core.a: $(CORE_OBJS)
 	$(V_AR)rm -f $@ && $(AR) rcs $@ $^
 
 # ---- tools ------------------------------------------------------------------
+CORE := $(O)/libcppcaml_core.a $(MIMALLOC_O)
 LINK = $(V_LINK)$(CXX) \
   $(OPTFLAGS) $(LDFLAGS) -o $@ $< $(O)/libcppcaml_core.a $(LIBS)
 
-$(O)/c++ocamlc: $(O)/src/tools/cppocamlc_main.o $(O)/libcppcaml_core.a
+$(O)/c++ocamlc: $(O)/src/tools/cppocamlc_main.o $(CORE)
 	$(LINK) $(COMPILER_LDFLAGS)
-$(O)/c++ocamlopt: $(O)/src/tools/cppocamlopt_main.o $(O)/libcppcaml_core.a
+$(O)/c++ocamlopt: $(O)/src/tools/cppocamlopt_main.o $(CORE)
 	$(LINK) $(COMPILER_LDFLAGS)
-$(O)/c++lex: $(O)/src/tools/cpplex_main.o $(O)/libcppcaml_core.a
+$(O)/c++lex: $(O)/src/tools/cpplex_main.o $(CORE)
 	$(LINK)
-$(O)/c++parse: $(O)/src/tools/cppparse_main.o $(O)/libcppcaml_core.a
+$(O)/c++parse: $(O)/src/tools/cppparse_main.o $(CORE)
 	$(LINK)
-$(O)/c++cmxinfo: $(O)/src/tools/cmxinfo_main.o $(O)/libcppcaml_core.a
+$(O)/c++cmxinfo: $(O)/src/tools/cmxinfo_main.o $(CORE)
 	$(LINK)
-$(O)/c++typing-dump: $(O)/src/tools/typing_dump_main.o $(O)/libcppcaml_core.a
+$(O)/c++typing-dump: $(O)/src/tools/typing_dump_main.o $(CORE)
 	$(LINK)
 
--include $(wildcard $(O)/src/*.d $(O)/src/typing/*.d $(O)/src/tools/*.d)
+-include $(wildcard $(O)/*.d $(O)/src/*.d $(O)/src/typing/*.d \
+  $(O)/src/tools/*.d)
