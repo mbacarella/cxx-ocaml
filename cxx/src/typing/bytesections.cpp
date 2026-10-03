@@ -3,9 +3,65 @@
 
 #include <stdexcept>
 
+#include <unistd.h>
+#include <cerrno>
+#include <cstring>
+
+#include "cppcaml/typing/arg.hpp"
+
 #include "cppcaml/typing/config.hpp"
 
 namespace cppcaml::typing::bytesections {
+
+namespace {
+constexpr std::size_t kChannelBuffer = 65536;  // (an OCaml channel's IO_BUFFER_SIZE)
+
+void write_all(int fd, const char* p, std::size_t n, long at, const std::string& path) {
+  while (n > 0) {
+    ssize_t k = at < 0 ? ::write(fd, p, n) : ::pwrite(fd, p, n, at);
+    if (k <= 0) throw arg::SysError(path + ": " + std::strerror(errno));
+    p += k;
+    n -= static_cast<std::size_t>(k);
+    if (at >= 0) at += k;
+  }
+}
+}  // namespace
+
+void OutChannel::to_file(int file, std::string path) {
+  fd = file;
+  path_ = std::move(path);
+  flushed = 0;
+  buf.clear();
+}
+
+void OutChannel::output_data(const void* p, std::size_t n) {
+  const char* c = static_cast<const char*>(p);
+  if (fd >= 0 && buf.size() + n > kChannelBuffer) {
+    flush();
+    if (n >= kChannelBuffer) {  // (a big chunk: straight to the file)
+      write_all(fd, c, n, -1, path_);
+      flushed += static_cast<long>(n);
+      return;
+    }
+  }
+  buf.append(c, n);
+}
+
+void OutChannel::flush() {
+  if (fd < 0 || buf.empty()) return;
+  write_all(fd, buf.data(), buf.size(), -1, path_);
+  flushed += static_cast<long>(buf.size());
+  buf.clear();
+}
+
+void OutChannel::overwrite(long at, const std::string& bytes) {
+  if (fd >= 0) flush();
+  if (fd < 0) {
+    buf.replace(static_cast<std::size_t>(at), bytes.size(), bytes);
+    return;
+  }
+  write_all(fd, bytes.data(), bytes.size(), at, path_);
+}
 
 const char* name_to_string(Name n) {
   switch (n) {
