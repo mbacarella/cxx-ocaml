@@ -5,6 +5,9 @@
 
 #include "cppcaml/blake2.hpp"
 #include "cppcaml/typing/cmx_format.hpp"
+#include "cppcaml/typing/config.hpp"
+#include "cppcaml/typing/export_info.hpp"
+#include "cppcaml/typing/flambda_ids.hpp"
 #include "cppcaml/typing/format.hpp"
 #include "cppcaml/typing/printclambda.hpp"
 
@@ -40,12 +43,30 @@ int main(int argc, char** argv) {
       for (auto& e : ui->ui_imports_cmi) print_name_crc(e);
       std::printf("Implementations imported:\n");
       for (auto& e : ui->ui_imports_cmx) print_name_crc(e);
-      std::printf("Clambda approximation:\n");
-      format::Formatter ppf;
-      ppf.print_string("  ");
-      printclambda::approx(ppf, ui->ui_export_info);
-      ppf.print_newline();
-      std::fputs(ppf.contents().c_str(), stdout);
+      if (ui->ui_flambda_export_info) {
+        // Export_info.print_approx / print_functions, with the unit as
+        // ocamlobjinfo sets it up
+        std::printf("Flambda export information:\n");
+        compilation_unit::t cu =
+            compilation_unit::create(Ident::create_persistent(ui->ui_name), std::string_view("__dummy__"));
+        compilation_unit::set_current(cu);
+        std::vector<symbol::t> root_symbols;
+        for (auto d : ui->ui_defines)
+          root_symbols.push_back(symbol::of_global_linkage(cu, zstr("caml" + std::string(d))));
+        format::Formatter ppf;
+        format::fprintf(ppf, "approximations@ %a@.@.",
+                        [&](format::Formatter& f) { export_info::print_approx(f, ui->ui_flambda_export_info, root_symbols); });
+        format::fprintf(ppf, "functions@ %a@.@.",
+                        [&](format::Formatter& f) { export_info::print_functions(f, ui->ui_flambda_export_info); });
+        std::fwrite(ppf.contents().data(), 1, ppf.contents().size(), stdout);
+      } else {
+        std::printf("Clambda approximation:\n");
+        format::Formatter ppf;
+        ppf.print_string("  ");
+        printclambda::approx(ppf, ui->ui_export_info);
+        ppf.print_newline();
+        std::fputs(ppf.contents().c_str(), stdout);
+      }
       auto ints = [](const char* what, const std::vector<long>& v) {
         std::printf("%s", what);
         for (long n : v) std::printf(" %ld", n);

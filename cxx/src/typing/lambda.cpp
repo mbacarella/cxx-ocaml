@@ -106,7 +106,7 @@ bool equal_value_kind(const ValueKind& a, const ValueKind& b) {
   return a.kind != ValueKind::Kind::Pboxedintval || a.bi == b.bi;
 }
 
-static bool equal_shape(const BlockShape& a, const BlockShape& b) {
+bool equal_shape(const BlockShape& a, const BlockShape& b) {
   if (a.some != b.some) return false;
   if (!a.some) return true;
   if (a.kinds.size() != b.kinds.size()) return false;
@@ -114,7 +114,7 @@ static bool equal_shape(const BlockShape& a, const BlockShape& b) {
     if (!equal_value_kind(a.kinds[k], b.kinds[k])) return false;
   return true;
 }
-static bool equal_repr(const RecordRepresentation& a, const RecordRepresentation& b) {
+bool equal_repr(const RecordRepresentation& a, const RecordRepresentation& b) {
   using RK = RecordRepresentation::Kind;
   if (a.kind != b.kind) return false;
   switch (a.kind) {
@@ -127,7 +127,7 @@ static bool equal_repr(const RecordRepresentation& a, const RecordRepresentation
 static bool equal_native_repr(const NativeRepr& a, const NativeRepr& b) {
   return a.kind == b.kind && (a.kind != NativeRepr::Kind::Unboxed_integer || a.bi == b.bi);
 }
-static bool equal_prim_desc(const PrimitiveDescription* a, const PrimitiveDescription* b) {
+bool equal_prim_desc(const PrimitiveDescription* a, const PrimitiveDescription* b) {
   if (a == b) return true;
   if (!a || !b) return false;
   if (a->prim_name != b->prim_name || a->prim_arity != b->prim_arity || a->prim_alloc != b->prim_alloc ||

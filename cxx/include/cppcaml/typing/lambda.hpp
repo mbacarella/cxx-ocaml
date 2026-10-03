@@ -174,6 +174,10 @@ struct Primitive {
 // the constant and simple constructors
 inline Primitive prim(Primitive::K k) { return Primitive{k}; }
 bool equal_primitive(const Primitive& a, const Primitive& b);
+// (=) on a primitive's parts, for Clambda_primitives.equal too
+bool equal_shape(const BlockShape& a, const BlockShape& b);
+bool equal_repr(const RecordRepresentation& a, const RecordRepresentation& b);
+bool equal_prim_desc(const PrimitiveDescription* a, const PrimitiveDescription* b);
 
 struct StructuredConstant {
   enum class Kind : std::uint8_t {

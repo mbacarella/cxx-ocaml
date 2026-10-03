@@ -795,10 +795,15 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
           // conversion so far
           for (ty::Ident::t id : prog.required_globals) ty::compilenv::require_global(id);
           ty::format::Formatter dump;
-          ty::flambda_middle_end::lambda_to_flambda(dump, prog.main_module_block_size, prog.module_ident, lam);
+          std::string stopped_at = "the back end";
+          try {
+            ty::flambda_middle_end::lambda_to_flambda(dump, prog.main_module_block_size, prog.module_ident, lam);
+          } catch (const ty::flambda_middle_end::NotPorted& e) {
+            stopped_at = e.what();
+          }
           ppf_dump.out() << dump.contents();
           ppf_dump.out().flush();
-          std::cerr << CPPCAML_SELF ": the flambda middle end (past closure conversion) is not ported yet\n";
+          std::cerr << CPPCAML_SELF ": the flambda middle end (" << stopped_at << ") is not ported yet\n";
           return 2;
         }
         return finish();

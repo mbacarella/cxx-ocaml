@@ -1147,6 +1147,8 @@ CmiInfos read_cmi(const std::string& filename) {
 // function descriptions -- mutable -- and the approximations, which the
 // current unit's approximation may re-export).
 #include "cppcaml/typing/cmx_format.hpp"
+#include "cppcaml/typing/export_info.hpp"
+#include "cppcaml/typing/flambda.hpp"
 
 namespace cppcaml::typing::cmi_format {
 namespace {
@@ -1576,6 +1578,364 @@ class CmxReader : public Reader {
     return list_vec<long>(id, [&](std::size_t x) { return ival(x); });
   }
 
+  // ---- the flambda export info (Export_info.t, with its Flambda terms) ----
+  // One object per marshaled block: the graph's sharing kept.
+  compilation_unit::t fl_cu(std::size_t id) {
+    if (auto it = fl_cu_.find(id); it != fl_cu_.end()) return it->second;
+    auto* c = make<CompilationUnit>(CompilationUnit{ident(f(id, 0)), str(f(id, 1)), ival(f(id, 2))});
+    fl_cu_[id] = c;
+    return c;
+  }
+  variable::t fl_var(std::size_t id) {
+    if (auto it = fl_var_.find(id); it != fl_var_.end()) return it->second;
+    auto* v = make<VariableDesc>(VariableDesc{fl_cu(f(id, 0)), str(f(id, 1)), ival(f(id, 2))});
+    fl_var_[id] = v;
+    return v;
+  }
+  symbol::t fl_sym(std::size_t id) {
+    if (auto it = fl_sym_.find(id); it != fl_sym_.end()) return it->second;
+    SymbolDesc d{};
+    if (tag(id) == 0) d = SymbolDesc{SymbolDesc::Kind::Linkage, fl_cu(f(id, 0)), str(f(id, 1)), ival(f(id, 2)), nullptr};
+    else d = SymbolDesc{SymbolDesc::Kind::Variable, fl_cu(f(id, 0)), linkage_name::t{}, 0, fl_var(f(id, 1))};
+    auto* s = make<SymbolDesc>(d);
+    fl_sym_[id] = s;
+    return s;
+  }
+  // Id_types.UnitId: {id = (int, name); unit} ("" read back is a name:
+  // not Id_types' physical empty_string)
+  unit_id::t fl_unit_id(std::size_t id) {
+    if (auto it = fl_uid_.find(id); it != fl_uid_.end()) return it->second;
+    std::size_t inner = f(id, 0);
+    auto* u = make<UnitIdDesc>(UnitIdDesc{ival(f(inner, 0)), str(f(inner, 1)), fl_cu(f(id, 1))});
+    fl_uid_[id] = u;
+    return u;
+  }
+  // Map.Make's nodes (Empty | Node {l; v; d; r; h}), rebuilt node for node
+  template <class K, class V, class Cmp, class FK, class FV>
+  OMap<K, V, Cmp> fl_map(std::size_t id, FK&& key, FV&& data) {
+    using Node = typename OMap<K, V, Cmp>::Node;
+    std::function<const Node*(std::size_t)> go = [&](std::size_t n) -> const Node* {
+      if (is_int(n)) return nullptr;
+      const Node* l = go(f(n, 0));
+      K k = key(f(n, 1));
+      V d = data(f(n, 2));
+      const Node* r = go(f(n, 3));
+      return make<Node>(Node{l, k, d, r, static_cast<int>(ival(f(n, 4)))});
+    };
+    return OMap<K, V, Cmp>(go(id));
+  }
+  template <class K, class Cmp, class FK>
+  OSet<K, Cmp> fl_set(std::size_t id, FK&& key) {
+    using Node = typename OSet<K, Cmp>::Node;
+    std::function<const Node*(std::size_t)> go = [&](std::size_t n) -> const Node* {
+      if (is_int(n)) return nullptr;
+      const Node* l = go(f(n, 0));
+      K k = key(f(n, 1));
+      const Node* r = go(f(n, 2));
+      return make<Node>(Node{l, k, r, static_cast<int>(ival(f(n, 3)))});
+    };
+    return OSet<K, Cmp>(go(id));
+  }
+  variable::Set fl_var_set(std::size_t id) {
+    return fl_set<variable::t, variable::Cmp>(id, [&](std::size_t x) { return fl_var(x); });
+  }
+  symbol::Set fl_sym_set(std::size_t id) {
+    return fl_set<symbol::t, symbol::Cmp>(id, [&](std::size_t x) { return fl_sym(x); });
+  }
+  template <class V, class FV>
+  variable::Map<V> fl_var_map(std::size_t id, FV&& data) {
+    return fl_map<variable::t, V, variable::Cmp>(id, [&](std::size_t x) { return fl_var(x); }, data);
+  }
+  Slice<variable::t> fl_vars(std::size_t id) { return list<variable::t>(id, [&](std::size_t x) { return fl_var(x); }); }
+
+  lambda::InlineAttribute fl_inline(std::size_t id) {
+    using IK = lambda::InlineAttribute::Kind;
+    if (!is_int(id)) return lambda::InlineAttribute{IK::Unroll, ival(f(id, 0))};
+    static constexpr IK constant[] = {IK::Always_inline, IK::Never_inline, IK::Hint_inline, IK::Default_inline};
+    return lambda::InlineAttribute{constant[ival(id)], 0};
+  }
+  lambda::SpecialiseAttribute fl_specialise(std::size_t id) {
+    return static_cast<lambda::SpecialiseAttribute>(ival(id));
+  }
+  lambda::PollAttribute fl_poll(std::size_t id) { return static_cast<lambda::PollAttribute>(ival(id)); }
+
+  flambda::SpecialisedTo fl_specialised_to(std::size_t id) {
+    std::size_t o = f(id, 1);
+    return flambda::SpecialisedTo{fl_var(f(id, 0)), is_int(o) ? nullptr : fl_projection(f(o, 0))};
+  }
+  projection::t fl_projection(std::size_t id) {
+    projection::T p{static_cast<projection::T::Kind>(tag(id))};
+    switch (p.kind) {
+      case projection::T::Kind::Project_var: p.project_var = fl_project_var(f(id, 0)); break;
+      case projection::T::Kind::Project_closure: p.project_closure = fl_project_closure(f(id, 0)); break;
+      case projection::T::Kind::Move_within_set_of_closures: p.move = fl_move(f(id, 0)); break;
+      case projection::T::Kind::Field:
+        p.field_index = ival(f(id, 0));
+        p.field_var = fl_var(f(id, 1));
+        break;
+    }
+    return make<projection::T>(p);
+  }
+  projection::ProjectVar fl_project_var(std::size_t id) {
+    return {fl_var(f(id, 0)), fl_var(f(id, 1)), fl_var(f(id, 2))};
+  }
+  projection::ProjectClosure fl_project_closure(std::size_t id) { return {fl_var(f(id, 0)), fl_var(f(id, 1))}; }
+  projection::MoveWithinSetOfClosures fl_move(std::size_t id) {
+    return {fl_var(f(id, 0)), fl_var(f(id, 1)), fl_var(f(id, 2))};
+  }
+  Slice<Parameter> fl_params(std::size_t id) {
+    return list<Parameter>(id, [&](std::size_t x) { return parameter::wrap(fl_var(f(x, 0))); });
+  }
+  flambda::Const fl_const(std::size_t id) {
+    return flambda::Const{tag(id) == 0 ? flambda::Const::Kind::Int : flambda::Const::Kind::Char, ival(f(id, 0))};
+  }
+  allocated_const::t fl_allocated_const(std::size_t id) {
+    AllocatedConst c{static_cast<AllocatedConst::Kind>(tag(id))};
+    using K = AllocatedConst::Kind;
+    switch (c.kind) {
+      case K::Float: c.f = dbl(f(id, 0)); break;
+      case K::Int32: case K::Int64: case K::Nativeint: c.i = ival(f(id, 0)); break;
+      case K::Float_array: case K::Immutable_float_array:
+        c.floats = list<double>(f(id, 0), [&](std::size_t x) { return dbl(x); });
+        break;
+      case K::String: case K::Immutable_string: c.s = str(f(id, 0)); break;
+    }
+    return make<AllocatedConst>(c);
+  }
+
+  flambda::t fl_expr(std::size_t id) {
+    if (auto it = fl_expr_.find(id); it != fl_expr_.end()) return it->second;
+    flambda::t e = fl_expr_raw(id);
+    fl_expr_[id] = e;
+    return e;
+  }
+  flambda::t fl_expr_raw(std::size_t id) {
+    namespace F = flambda;
+    if (is_int(id)) return F::proved_unreachable();
+    switch (tag(id)) {
+      case 0: return F::var(fl_var(f(id, 0)));
+      case 1: {
+        std::size_t r = f(id, 0);
+        return make<F::Let>(F::Let{{F::EK::Let}, fl_var(f(r, 0)), fl_named(f(r, 1)), fl_expr(f(r, 2)),
+                                   fl_var_set(f(r, 3)), fl_var_set(f(r, 4))});
+      }
+      case 2: {
+        std::size_t r = f(id, 0);
+        return F::let_mutable(fl_var(f(r, 0)), fl_var(f(r, 1)), vk(f(r, 2)), fl_expr(f(r, 3)));
+      }
+      case 3: {
+        std::size_t r = f(id, 0);
+        std::size_t k = f(r, 2);
+        F::CallKind ck{is_int(k) ? nullptr : fl_var(f(k, 0))};
+        return F::apply(fl_var(f(r, 0)), fl_vars(f(r, 1)), ck, dbg(f(r, 3)), fl_inline(f(r, 4)),
+                        fl_specialise(f(r, 5)));
+      }
+      case 4: {
+        std::size_t r = f(id, 0);
+        return F::send(static_cast<lambda::MethKind>(ival(f(r, 0))), fl_var(f(r, 1)), fl_var(f(r, 2)),
+                       fl_vars(f(r, 3)), dbg(f(r, 4)));
+      }
+      case 5: {
+        std::size_t r = f(id, 0);
+        return F::assign(fl_var(f(r, 0)), fl_var(f(r, 1)));
+      }
+      case 6: return F::if_then_else(fl_var(f(id, 0)), fl_expr(f(id, 1)), fl_expr(f(id, 2)));
+      case 7: {
+        std::size_t sw = f(id, 1);
+        auto cases = [&](std::size_t l) {
+          return list<F::SwitchCase>(l, [&](std::size_t x) { return F::SwitchCase{ival(f(x, 0)), fl_expr(f(x, 1))}; });
+        };
+        auto ints = [&](std::size_t s) { return fl_set<long, IntCmp>(s, [&](std::size_t x) { return ival(x); }); };
+        std::size_t fa = f(sw, 4);
+        return F::switch_(fl_var(f(id, 0)), ints(f(sw, 0)), cases(f(sw, 1)), ints(f(sw, 2)), cases(f(sw, 3)),
+                          is_int(fa) ? nullptr : fl_expr(f(fa, 0)));
+      }
+      case 8: {
+        std::size_t d = f(id, 2);
+        return F::string_switch(
+            fl_var(f(id, 0)),
+            list<F::StringCase>(f(id, 1), [&](std::size_t x) { return F::StringCase{str(f(x, 0)), fl_expr(f(x, 1))}; }),
+            is_int(d) ? nullptr : fl_expr(f(d, 0)));
+      }
+      case 9: return F::static_raise(ival(f(id, 0)), fl_vars(f(id, 1)));
+      case 10:
+        return F::static_catch(
+            ival(f(id, 0)),
+            list<F::CatchVar>(f(id, 1), [&](std::size_t x) { return F::CatchVar{fl_var(f(x, 0)), vk(f(x, 1))}; }),
+            fl_expr(f(id, 2)), fl_expr(f(id, 3)));
+      case 11: return F::try_with(fl_expr(f(id, 0)), fl_var(f(id, 1)), fl_expr(f(id, 2)));
+      case 12: return F::while_(fl_expr(f(id, 0)), fl_expr(f(id, 1)));
+      case 13: {
+        std::size_t r = f(id, 0);
+        return F::for_(fl_var(f(r, 0)), fl_var(f(r, 1)), fl_var(f(r, 2)),
+                       static_cast<parsetree::DirectionFlag>(ival(f(r, 3))), fl_expr(f(r, 4)));
+      }
+      default: throw Corrupt{};
+    }
+  }
+  flambda::named fl_named(std::size_t id) {
+    if (auto it = fl_named_.find(id); it != fl_named_.end()) return it->second;
+    namespace F = flambda;
+    F::named n = nullptr;
+    switch (tag(id)) {
+      case 0: n = F::n_symbol(fl_sym(f(id, 0))); break;
+      case 1: n = F::n_const(fl_const(f(id, 0))); break;
+      case 2: n = F::n_allocated_const(fl_allocated_const(f(id, 0))); break;
+      case 3: n = F::n_read_mutable(fl_var(f(id, 0))); break;
+      case 4: n = F::n_read_symbol_field(fl_sym(f(id, 0)), ival(f(id, 1))); break;
+      case 5: n = F::n_set_of_closures(fl_set_of_closures(f(id, 0))); break;
+      case 6: n = F::n_project_closure(fl_project_closure(f(id, 0))); break;
+      case 7: n = F::n_move_within_set_of_closures(fl_move(f(id, 0))); break;
+      case 8: n = F::n_project_var(fl_project_var(f(id, 0))); break;
+      case 9: {
+        Primitive p = primitive(f(id, 0));
+        n = F::n_prim(p, fl_vars(f(id, 1)), dbg(f(id, 2)));
+        break;
+      }
+      case 10: n = F::n_expr(fl_expr(f(id, 0))); break;
+      default: throw Corrupt{};
+    }
+    fl_named_[id] = n;
+    return n;
+  }
+  const flambda::SetOfClosures* fl_set_of_closures(std::size_t id) {
+    if (auto it = fl_soc_.find(id); it != fl_soc_.end()) return it->second;
+    namespace F = flambda;
+    std::size_t fd = f(id, 0);
+    auto funs = fl_var_map<const F::FunctionDeclaration*>(f(fd, 3), [&](std::size_t x) {
+      return make<F::FunctionDeclaration>(F::FunctionDeclaration{
+          fl_var(f(x, 0)), fl_params(f(x, 1)), fl_expr(f(x, 2)), fl_var_set(f(x, 3)), fl_sym_set(f(x, 4)),
+          boolean(f(x, 5)), dbg(f(x, 6)), fl_inline(f(x, 7)), fl_specialise(f(x, 8)), boolean(f(x, 9)),
+          fl_poll(f(x, 10))});
+    });
+    auto* decls = make<F::FunctionDeclarations>(
+        F::FunctionDeclarations{boolean(f(fd, 0)), fl_unit_id(f(fd, 1)), fl_unit_id(f(fd, 2)), funs});
+    auto spec = [&](std::size_t m) {
+      return fl_var_map<F::SpecialisedTo>(m, [&](std::size_t x) { return fl_specialised_to(x); });
+    };
+    auto* s = make<F::SetOfClosures>(F::SetOfClosures{decls, spec(f(id, 1)), spec(f(id, 2)),
+                                                      fl_var_map<variable::t>(f(id, 3), [&](std::size_t x) {
+                                                        return fl_var(x);
+                                                      })});
+    fl_soc_[id] = s;
+    return s;
+  }
+
+  // Simple_value_approx.function_declarations
+  const simple_value_approx::FunctionDeclarations* fl_approx_fun_decls(std::size_t id) {
+    namespace A = simple_value_approx;
+    auto funs = fl_var_map<const A::FunctionDeclaration*>(f(id, 3), [&](std::size_t x) {
+      std::size_t b = f(x, 2);
+      const A::FunctionBody* body = nullptr;
+      if (!is_int(b)) {
+        std::size_t r = f(b, 0);
+        body = make<A::FunctionBody>(A::FunctionBody{fl_var_set(f(r, 0)), fl_sym_set(f(r, 1)), boolean(f(r, 2)),
+                                                     dbg(f(r, 3)), fl_inline(f(r, 4)), fl_specialise(f(r, 5)),
+                                                     boolean(f(r, 6)), fl_expr(f(r, 7)), fl_poll(f(r, 8))});
+      }
+      return make<A::FunctionDeclaration>(A::FunctionDeclaration{fl_var(f(x, 0)), fl_params(f(x, 1)), body});
+    });
+    return make<A::FunctionDeclarations>(
+        A::FunctionDeclarations{boolean(f(id, 0)), fl_unit_id(f(id, 1)), fl_unit_id(f(id, 2)), funs});
+  }
+
+  export_info::Approx fl_ei_approx(std::size_t id) {
+    using K = export_info::Approx::Kind;
+    if (is_int(id)) return {};
+    if (tag(id) == 0) return {K::Value_id, fl_unit_id(f(id, 0)), nullptr};
+    return {K::Value_symbol, nullptr, fl_sym(f(id, 0))};
+  }
+  const export_info::ValueSetOfClosures* fl_ei_set(std::size_t id) {
+    if (auto it = fl_eiset_.find(id); it != fl_eiset_.end()) return it->second;
+    auto approxes = [&](std::size_t m) {
+      return fl_var_map<export_info::Approx>(m, [&](std::size_t x) { return fl_ei_approx(x); });
+    };
+    std::size_t a = f(id, 4);
+    auto* s = make<export_info::ValueSetOfClosures>(export_info::ValueSetOfClosures{
+        fl_unit_id(f(id, 0)), approxes(f(id, 1)),
+        fl_var_map<flambda::SpecialisedTo>(f(id, 2), [&](std::size_t x) { return fl_specialised_to(x); }),
+        approxes(f(id, 3)), is_int(a) ? nullptr : fl_sym(f(a, 0))});
+    fl_eiset_[id] = s;
+    return s;
+  }
+  const export_info::Descr* fl_ei_descr(std::size_t id) {
+    using K = export_info::Descr::Kind;
+    export_info::Descr d{K::Value_unknown_descr};
+    if (!is_int(id)) {
+      d.kind = static_cast<K>(tag(id));
+      switch (d.kind) {
+        case K::Value_block:
+          d.tag = ival(f(id, 0));
+          d.fields = array<export_info::Approx>(f(id, 1), [&](std::size_t x) { return fl_ei_approx(x); });
+          break;
+        case K::Value_mutable_block: d.tag = ival(f(id, 0)); d.n = ival(f(id, 1)); break;
+        case K::Value_int: case K::Value_char: d.n = ival(f(id, 0)); break;
+        case K::Value_float: d.f = dbl(f(id, 0)); break;
+        case K::Value_float_array: {
+          std::size_t r = f(id, 0);
+          std::size_t c = f(r, 0);
+          d.float_array.size = ival(f(r, 1));
+          d.float_array.contents_known = !is_int(c);
+          if (!is_int(c))
+            d.float_array.contents = array<std::optional<double>>(f(c, 0), [&](std::size_t x) {
+              return is_int(x) ? std::optional<double>() : std::optional<double>(dbl(f(x, 0)));
+            });
+          break;
+        }
+        case K::Value_boxed_int:
+          d.bi = static_cast<simple_value_approx::BoxedInt>(ival(f(id, 0)));
+          d.bival = ival(f(id, 1));
+          break;
+        case K::Value_string: {
+          std::size_t r = f(id, 0);
+          std::size_t c = f(r, 0);
+          d.str.size = ival(f(r, 1));
+          if (!is_int(c)) d.str.contents = str(f(c, 0));
+          break;
+        }
+        case K::Value_closure: {
+          std::size_t r = f(id, 0);
+          d.closure_id = fl_var(f(r, 0));
+          d.set = fl_ei_set(f(r, 1));
+          break;
+        }
+        case K::Value_set_of_closures: d.set = fl_ei_set(f(id, 0)); break;
+        case K::Value_unknown_descr: throw Corrupt{};
+      }
+    }
+    return make<export_info::Descr>(d);
+  }
+  const export_info::T* fl_export_info(std::size_t id) {
+    export_info::T t;
+    t.sets_of_closures = fl_map<set_of_closures_id::t, const simple_value_approx::FunctionDeclarations*, unit_id::Cmp>(
+        f(id, 0), [&](std::size_t x) { return fl_unit_id(x); }, [&](std::size_t x) { return fl_approx_fun_decls(x); });
+    t.values = fl_map<compilation_unit::t, export_id::Map<const export_info::Descr*>, compilation_unit::Cmp>(
+        f(id, 1), [&](std::size_t x) { return fl_cu(x); },
+        [&](std::size_t m) {
+          return fl_map<export_id::t, const export_info::Descr*, unit_id::Cmp>(
+              m, [&](std::size_t x) { return fl_unit_id(x); }, [&](std::size_t x) { return fl_ei_descr(x); });
+        });
+    t.symbol_id = fl_map<symbol::t, export_id::t, symbol::Cmp>(f(id, 2), [&](std::size_t x) { return fl_sym(x); },
+                                                                [&](std::size_t x) { return fl_unit_id(x); });
+    t.offset_fun = fl_var_map<long>(f(id, 3), [&](std::size_t x) { return ival(x); });
+    t.offset_fv = fl_var_map<long>(f(id, 4), [&](std::size_t x) { return ival(x); });
+    t.constant_closures = fl_var_set(f(id, 5));
+    t.invariant_params = fl_map<set_of_closures_id::t, variable::Map<variable::Set>, unit_id::Cmp>(
+        f(id, 6), [&](std::size_t x) { return fl_unit_id(x); },
+        [&](std::size_t m) { return fl_var_map<variable::Set>(m, [&](std::size_t x) { return fl_var_set(x); }); });
+    t.recursive = fl_map<set_of_closures_id::t, variable::Set, unit_id::Cmp>(
+        f(id, 7), [&](std::size_t x) { return fl_unit_id(x); }, [&](std::size_t x) { return fl_var_set(x); });
+    return make<export_info::T>(t);
+  }
+  std::unordered_map<std::size_t, compilation_unit::t> fl_cu_;
+  std::unordered_map<std::size_t, variable::t> fl_var_;
+  std::unordered_map<std::size_t, symbol::t> fl_sym_;
+  std::unordered_map<std::size_t, unit_id::t> fl_uid_;
+  std::unordered_map<std::size_t, flambda::t> fl_expr_;
+  std::unordered_map<std::size_t, flambda::named> fl_named_;
+  std::unordered_map<std::size_t, const flambda::SetOfClosures*> fl_soc_;
+  std::unordered_map<std::size_t, const export_info::ValueSetOfClosures*> fl_eiset_;
+
   cmx_format::UnitInfos* unit_infos(std::size_t id) {
     auto* ui = make<cmx_format::UnitInfos>();
     ui->ui_name = str(f(id, 0));
@@ -1588,9 +1948,9 @@ class CmxReader : public Reader {
     ui->ui_send_fun = ints(f(id, 7));
     std::size_t ei = f(id, 8);
     if (tag(ei) == 1 && config::flambda) {
-      // Flambda of Export_info.t: not decoded yet (the flambda middle end
-      // reads it through Import_approx, not ported yet)
+      // Flambda of Export_info.t
       ui->ui_export_info = nullptr;
+      ui->ui_flambda_export_info = fl_export_info(f(ei, 0));
     } else {
       if (tag(ei) != 0) throw Corrupt{};
       ui->ui_export_info = approx(f(ei, 0));

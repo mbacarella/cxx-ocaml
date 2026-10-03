@@ -13,6 +13,10 @@
 
 #include "cppcaml/typing/clambda.hpp"
 
+namespace cppcaml::typing::export_info {
+struct T;
+}
+
 namespace cppcaml::typing::cmx_format {
 
 using Crcs = std::vector<std::pair<std::string_view, std::optional<std::string>>>;
@@ -27,6 +31,7 @@ struct UnitInfos {
   std::vector<long> ui_apply_fun;   // Apply functions needed
   std::vector<long> ui_send_fun;    // Send functions needed
   const clambda::ValueApproximation* ui_export_info;  // Clambda approx
+  const export_info::T* ui_flambda_export_info = nullptr;  // Flambda export info (Config.flambda)
   bool ui_force_link;               // Always linked
   std::optional<std::string_view> ui_for_pack;  // Part of a pack
   bool ui_need_stdlib;              // caml_standard_library_nat needed

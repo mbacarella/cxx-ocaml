@@ -242,18 +242,24 @@ found parser divergences the testsuite had not).
 Flambda (in progress, branch `cxx-flambda`, a tree configured with
 `--enable-flambda`): c++ocamlopt applies Optcompile.flambda's settings and
 Translmod.transl_implementation_flambda, then the flambda middle end
-(`flambda_middle_end.cpp`).  Ported so far: the term language
-(`flambda.cpp`: Flambda with Allocated_const, Parameter and Projection,
-its printer, free variables, the constructors' invariant checks; the
-identifiers in `flambda_ids.cpp`, the stdlib's Map/Set trees in
-`ocaml_map.hpp`), Internal_variable_names, Lift_code.lifting_helper and
-Closure_conversion, which stops with "not ported yet" after the
-`-drawflambda` dump.  `NATIVE=1 DUMP=drawflambda lambda_port_parity.sh`:
-6553/6553 probes (also with `-g`, `-Oclassic`, `-O3`, `-unsafe`,
-`-for-pack`), 787/787 testsuite files, 265/265 compiler sources.  Closure
-conversion creates its variables in ocamlopt's evaluation order (a switch's
-failaction before its blocks and consts, an [if]'s else branch first): the
-stamps are in the dump.
+(`flambda_middle_end.cpp`), which runs its passes up to the first one not
+ported yet.  Ported: the term language (`flambda.cpp`, with
+Allocated_const, Parameter and Projection; the identifiers in
+`flambda_ids.cpp`, the stdlib's Map/Set trees in `ocaml_map.hpp`, the
+Tbl modules as `hashtbl.hpp`'s OCaml Hashtbl), Flambda_iterators,
+Flambda_utils, Internal_variable_names, Closure_conversion, Lift_code,
+Inconstant_idents, Alias_analysis, Lift_constants (with utils'
+Strongly_connected_components), Effect_analysis, Inlining_cost,
+Simple_value_approx, Export_info with the .cmx's flambda export info
+(decoded: `c++cmxinfo` prints it as ocamlobjinfo does, 336/336 of the
+tree's .cmx), Import_approx and Compilenv's flambda half.
+`NATIVE=1 DUMP=drawflambda lambda_port_parity.sh` compares closure
+conversion; `DUMP=dflambda-verbose` the program before each pass (the
+port's dump, which stops at the first pass not ported, against the same
+prefix of ocamlopt's): through Lift_constants, 6553/6553 probes (also
+`-Oclassic`), 787/787 testsuite files, 272/272 compiler sources.  The
+passes create variables and set-of-closures ids in ocamlopt's evaluation
+order and its tables' iteration orders: the stamps are in the dumps.
 
 ## Oracles and gates
 

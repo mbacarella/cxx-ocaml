@@ -12,6 +12,10 @@
 #include "cppcaml/typing/clambda.hpp"
 #include "cppcaml/typing/cmx_format.hpp"
 #include "cppcaml/typing/flambda_ids.hpp"
+
+namespace cppcaml::typing::export_info {
+struct T;
+}
 #include "cppcaml/typing/format_doc.hpp"
 
 namespace cppcaml::typing::compilenv {
@@ -67,6 +71,14 @@ bool is_predefined_exception(symbol::t sym);
 // current_unit () (the Compilation_unit) / current_unit_symbol ()
 compilation_unit::t current_compilation_unit();
 symbol::t current_unit_symbol();
+// approx_for_global comp_unit (null: None): the unit's export info, merged
+// into approx_env () when first read
+const export_info::T* approx_for_global(compilation_unit::t comp_unit);
+const export_info::T* approx_env();
+void set_export_info(const export_info::T* export_info);
+// closure_symbol fv / function_label fv
+symbol::t closure_symbol(variable::t closure_id);
+std::string_view function_label(variable::t closure_id);
 
 // the structured constants: snapshot / backtrack restore the table
 struct Snapshot {

@@ -109,6 +109,8 @@ struct Primitive {
   unsigned long id = fresh_uconstant_id();
 };
 inline Primitive prim(Primitive::K k) { return Primitive{k}; }
+// Clambda_primitives.equal (structural)
+bool equal_primitive(const Primitive& a, const Primitive& b);
 
 // ---- Clambda ------------------------------------------------------------------------------------
 using FunctionLabel = std::string_view;

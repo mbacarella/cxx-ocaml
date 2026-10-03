@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -124,9 +125,9 @@ inline long hash_value(const HValue& v) {
 
 // ---- Hashtbl.t ---------------------------------------------------------------------
 
-// Hash: long operator()(const K&) (Hashtbl.hash); keys compare with ==
-// (compare k k' = 0).
-template <class K, class V, class Hash>
+// Hash: long operator()(const K&) (Hashtbl.hash, or Hashtbl.Make's H.hash);
+// Eq: H.equal (default: ==, compare k k' = 0).
+template <class K, class V, class Hash, class Eq = std::equal_to<K>>
 class Hashtbl {
  public:
   struct Cell {
@@ -163,7 +164,7 @@ class Hashtbl {
     std::size_t i = index(key);
     Cell* prec = nullptr;
     for (Cell* c = data_[i]; c; prec = c, c = c->next)
-      if (c->key == key) {
+      if (Eq{}(c->key, key)) {
         --size_;
         (prec ? prec->next : data_[i]) = c->next;
         return;
@@ -171,14 +172,14 @@ class Hashtbl {
   }
   const V* find_opt(const K& key) const {
     for (Cell* c = data_[index(key)]; c; c = c->next)
-      if (c->key == key) return &c->data;
+      if (Eq{}(c->key, key)) return &c->data;
     return nullptr;
   }
   bool mem(const K& key) const { return find_opt(key) != nullptr; }
   // the first binding's data, to update in place (what replace does to it)
   V* find_mut(const K& key) {
     for (Cell* c = data_[index(key)]; c; c = c->next)
-      if (c->key == key) return &c->data;
+      if (Eq{}(c->key, key)) return &c->data;
     return nullptr;
   }
   // replace h key data: the first binding of key rebound in place, else a
@@ -186,13 +187,26 @@ class Hashtbl {
   void replace(const K& key, const V& data) {
     std::size_t i = index(key);
     for (Cell* c = data_[i]; c; c = c->next)
-      if (c->key == key) {
+      if (Eq{}(c->key, key)) {
         c->key = key;
         c->data = data;
         return;
       }
     data_[i] = alloc(key, data, data_[i]);
     grow();
+  }
+  // iter / fold: the buckets from index 0, each bucket's cells in order
+  // (f may replace the binding it is given, as OCaml allows)
+  template <class F>
+  void iter(F&& f) const {
+    for (std::size_t i = 0; i < data_.size(); ++i)
+      for (Cell* c = data_[i]; c; c = c->next) f(c->key, c->data);
+  }
+  template <class A, class F>  // f key data acc -> acc
+  A fold(F&& f, A acc) const {
+    for (std::size_t i = 0; i < data_.size(); ++i)
+      for (Cell* c = data_[i]; c; c = c->next) acc = f(c->key, c->data, std::move(acc));
+    return acc;
   }
   // to_seq: the buckets from index 0, each bucket's cells in order
   std::vector<std::pair<K, V>> to_seq() const {

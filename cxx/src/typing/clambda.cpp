@@ -347,5 +347,44 @@ int compare_structured_constants(const UStructuredConstant* c1, const UStructure
   return static_cast<int>(c1->kind) - static_cast<int>(c2->kind);
 }
 
+// Clambda_primitives.equal = (=): structural equality over every argument
+bool equal_primitive(const Primitive& a, const Primitive& b) {
+  using K = Primitive::K;
+  if (a.kind != b.kind) return false;
+  switch (a.kind) {
+    case K::Pread_symbol: return a.sym == b.sym;
+    case K::Pmakeblock: return a.n == b.n && a.mut == b.mut && lambda::equal_shape(a.shape, b.shape);
+    case K::Pmakelazyblock: return a.lazy_tag == b.lazy_tag;
+    case K::Pfield: return a.n == b.n && a.ptr == b.ptr && a.mut == b.mut;
+    case K::Psetfield: return a.n == b.n && a.ptr == b.ptr && a.init == b.init;
+    case K::Psetfield_computed: return a.ptr == b.ptr && a.init == b.init;
+    case K::Pfloatfield: return a.n == b.n;
+    case K::Psetfloatfield: return a.n == b.n && a.init == b.init;
+    case K::Pduprecord: return lambda::equal_repr(a.repr, b.repr) && a.n == b.n;
+    case K::Pccall: return lambda::equal_prim_desc(a.ccall, b.ccall);
+    case K::Praise: return a.raise == b.raise;
+    case K::Pdivint: case K::Pmodint: return a.safe == b.safe;
+    case K::Pintcomp: return a.icmp == b.icmp;
+    case K::Pcompare_bints: return a.bi == b.bi;
+    case K::Poffsetint: case K::Poffsetref: return a.n == b.n;
+    case K::Pfloatcomp: return a.fcmp == b.fcmp;
+    case K::Pmakearray: case K::Pduparray: return a.array == b.array && a.mut == b.mut;
+    case K::Parraylength: case K::Parrayrefu: case K::Parraysetu: case K::Parrayrefs: case K::Parraysets:
+      return a.array == b.array;
+    case K::Pbintofint: case K::Pintofbint: case K::Pnegbint: case K::Paddbint: case K::Psubbint:
+    case K::Pmulbint: case K::Pandbint: case K::Porbint: case K::Pxorbint: case K::Plslbint: case K::Plsrbint:
+    case K::Pasrbint: case K::Pbbswap: return a.bi == b.bi;
+    case K::Pcvtbint: return a.bi == b.bi && a.bi2 == b.bi2;
+    case K::Pdivbint: case K::Pmodbint: return a.bi == b.bi && a.safe == b.safe;
+    case K::Pbintcomp: return a.bi == b.bi && a.icmp == b.icmp;
+    case K::Pbigarrayref: case K::Pbigarrayset:
+      return a.unsafe == b.unsafe && a.n == b.n && a.ba_kind == b.ba_kind && a.ba_layout == b.ba_layout;
+    case K::Pbigarraydim: return a.n == b.n;
+    case K::Pstring_load: case K::Pbytes_load: case K::Pbytes_set: case K::Pbigstring_load: case K::Pbigstring_set:
+      return a.size == b.size && a.safe == b.safe;
+    default: return true;
+  }
+}
+
 }  // namespace clambda
 }  // namespace cppcaml::typing
