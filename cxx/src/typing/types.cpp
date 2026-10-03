@@ -11,12 +11,17 @@
 
 namespace cppcaml::typing {
 
-// zone.hpp's current zone lives here (the first typing/ translation unit).
-static Zone g_default_zone;
-static Zone* g_zone = &g_default_zone;
-Zone& zone() { return *g_zone; }
-Zone& permanent_zone() { return g_default_zone; }
-void set_zone(Zone* z) { g_zone = z ? z : &g_default_zone; }
+// zone.hpp's current zone lives here.  The default one is made on first
+// use: other translation units' static initializers allocate in it, in
+// whatever order the linker runs them.
+static Zone& default_zone() {
+  static Zone z;
+  return z;
+}
+static Zone* g_zone = nullptr;  // (constant-initialized) nullptr: the default zone
+Zone& zone() { return g_zone ? *g_zone : default_zone(); }
+Zone& permanent_zone() { return default_zone(); }
+void set_zone(Zone* z) { g_zone = z; }
 Zone* g_types_zone = nullptr;
 ZoneScope::ZoneScope(Zone& z) : saved(g_zone) { g_zone = &z; }
 ZoneScope::~ZoneScope() { g_zone = saved; }
@@ -137,7 +142,7 @@ bool same_record(const Location& x) {
 }
 
 std::string_view zborrow(std::string_view s) {
-  if (s.data() && (g_default_zone.owns(s.data()) || g_zone->owns(s.data()) || permanent_zone().owns(s.data())))
+  if (s.data() && (permanent_zone().owns(s.data()) || zone().owns(s.data())))
     return s;
   return zone().str(s);
 }
