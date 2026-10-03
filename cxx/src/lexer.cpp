@@ -878,7 +878,6 @@ Token Lexer::scan_string(size_t start) {
   }
   Token t = Token::make(Kind::STRING, start, pos_);
   t.text = strbuf_;
-  t.delim = std::nullopt;
   return t;
 }
 
@@ -908,7 +907,7 @@ Token Lexer::scan_quoted_string(size_t start, const std::string& delim) {
   }
   Token t = Token::make(Kind::STRING, start, pos_);
   t.text = strbuf_;
-  t.delim = delim;
+  t.quoted = std::make_shared<const QuotedInfo>(QuotedInfo{delim, {}, 0});
   return t;
 }
 
@@ -1090,9 +1089,8 @@ Token Lexer::scan_brace(size_t start) {
       pos_ = p;  // just past the opening '|'
       Token t = scan_quoted_string(start, delim);
       t.kind = item ? Kind::QUOTED_STRING_ITEM : Kind::QUOTED_STRING_EXPR;
-      t.ext_id = std::move(id);
-      t.delim = delim;  // Some delim (Some "" when empty)
-      t.content_start = p;  // byte offset of the content (just past `|`)
+      // Some delim (Some "" when empty); the content's byte offset (just past `|`)
+      t.quoted = std::make_shared<const QuotedInfo>(QuotedInfo{delim, std::move(id), static_cast<uint32_t>(p)});
       return t;
     }
     // malformed extension head: fall back to LBRACE

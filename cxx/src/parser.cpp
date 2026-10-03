@@ -471,9 +471,9 @@ class Parser {
       case Kind::FLOAT: return Constant{Pconst_float{t.text, t.modifier}, l};
       case Kind::CHAR:  return Constant{Pconst_char{t.char_code}, l};
       default: {  // STRING: strloc is the *content* span (inside the quotes/delimiters)
-        size_t d = t.delim ? t.delim->size() + 2 : 1;  // {delim| … |delim}  or  " … "
+        size_t d = t.delim() ? t.delim()->size() + 2 : 1;  // {delim| … |delim}  or  " … "
         Location strloc{position(t.start + d), position(t.end - d), false};
-        return Constant{Pconst_string{t.text, strloc, t.delim}, l};
+        return Constant{Pconst_string{t.text, strloc, t.delim()}, l};
       }
     }
   }
@@ -1471,7 +1471,7 @@ class Parser {
   // compute_quoted_string_idloc
   ExtName quoted_ext_name(const Token& t, size_t shift) {
     size_t a = t.start + shift;
-    return ExtName(t.ext_id, span(position(a), position(a + t.ext_id.size())));
+    return ExtName(t.ext_id(), span(position(a), position(a + t.ext_id().size())));
   }
   Attributes take_attrs() {  // `[@attr]` immediately after a keyword/`%ext`
     Attributes a;
@@ -3419,9 +3419,9 @@ class Parser {
   // A quoted-string extension `{%…|content|}`: the payload is a ghost Pstr_eval
   // holding the content as a string constant.
   ExtPayload quoted_payload(const Token& t) {
-    std::string delim = t.delim.value_or("");
-    Location strloc{position(t.content_start), position(t.end - (delim.size() + 2)), false};
-    Constant c{Pconst_string{t.text, strloc, t.delim}, strloc};
+    std::string delim = t.delim().value_or("");
+    Location strloc{position(t.content_start()), position(t.end - (delim.size() + 2)), false};
+    Constant c{Pconst_string{t.text, strloc, t.delim()}, strloc};
     Location gl{position(t.start), position(t.end), /*ghost=*/true};
     ExtPayload ep;
     ep.str.push_back(StructureItem{Pstr_eval{E({Pexp_constant{std::move(c)}, gl})}, gl});

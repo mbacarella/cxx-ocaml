@@ -64,16 +64,16 @@ void print_canonical(const Token& t, std::ostream& os) {
       break;
     case Kind::STRING:
       line += ' ';
-      line += t.delim ? ('{' + *t.delim + '}') : std::string("-");
+      line += t.delim() ? ('{' + *t.delim() + '}') : std::string("-");
       line += ' ';
       escape_into(t.text, line);
       break;
     case Kind::QUOTED_STRING_EXPR:
     case Kind::QUOTED_STRING_ITEM:
       line += ' ';
-      escape_into(t.ext_id, line);
+      escape_into(t.ext_id(), line);
       line += ' ';
-      line += t.delim ? ('{' + *t.delim + '}') : std::string("-");
+      line += t.delim() ? ('{' + *t.delim() + '}') : std::string("-");
       line += ' ';
       escape_into(t.text, line);
       break;

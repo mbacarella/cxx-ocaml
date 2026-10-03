@@ -9,6 +9,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <ostream>
 #include <string>
@@ -58,21 +59,44 @@ inline std::string_view kind_name(Kind k) {
   return names[static_cast<size_t>(k)];
 }
 
+// What only a quoted string has (`{delim|...|delim}`, `{%id delim|...|delim}`):
+// out of line, so that the token stream -- one Token per lexeme of the whole
+// source, alive throughout the parse -- stays small.
+struct QuotedInfo {
+  std::optional<std::string> delim;  // STRING/quoted-string delimiter (nullopt => "..." form)
+  std::string ext_id;                // QUOTED_STRING_EXPR/ITEM extension identifier
+  uint32_t content_start = 0;        // QUOTED_STRING_*: byte offset of the content (after `|`)
+};
+
 struct Token {
   Kind kind{};
-  size_t start = 0;  // byte offset of first char of the lexeme
-  size_t end = 0;    // byte offset one past the last char
+  bool lex_error = false;            // TEOF standing for a lexer error (Lexer::pending_error)
+  std::optional<char> modifier;      // INT/FLOAT trailing literal modifier (e.g. 'L','g')
+  int16_t char_code = -1;            // CHAR: byte value 0..255
+  uint32_t start = 0;  // byte offset of first char of the lexeme
+  uint32_t end = 0;    // byte offset one past the last char
 
   // Payloads (only the relevant one(s) are set for a given kind):
   std::string text;                  // ident/op/label name; literal text; STRING content
-  std::optional<char> modifier;      // INT/FLOAT trailing literal modifier (e.g. 'L','g')
-  std::optional<std::string> delim;  // STRING/quoted-string delimiter (nullopt => "..." form)
-  std::string ext_id;                // QUOTED_STRING_EXPR/ITEM extension identifier
-  size_t content_start = 0;          // QUOTED_STRING_*: byte offset of the content (after `|`)
-  int char_code = -1;                // CHAR: byte value 0..255
-  bool lex_error = false;            // TEOF standing for a lexer error (Lexer::pending_error)
+  std::shared_ptr<const QuotedInfo> quoted;  // a quoted string's (else none)
 
-  static Token make(Kind k, size_t s, size_t e) { return Token{k, s, e}; }
+  const std::optional<std::string>& delim() const {
+    static const std::optional<std::string> none;
+    return quoted ? quoted->delim : none;
+  }
+  const std::string& ext_id() const {
+    static const std::string none;
+    return quoted ? quoted->ext_id : none;
+  }
+  size_t content_start() const { return quoted ? quoted->content_start : 0; }
+
+  static Token make(Kind k, size_t s, size_t e) {
+    Token t;
+    t.kind = k;
+    t.start = static_cast<uint32_t>(s);
+    t.end = static_cast<uint32_t>(e);
+    return t;
+  }
 };
 
 // Canonical one-line rendering, identical on the OCaml oracle side, so token
