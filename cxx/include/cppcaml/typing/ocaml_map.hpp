@@ -90,8 +90,11 @@ class OMap {
   bool exists(P&& p) const { return exists_(t_, p); }
   template <class P>
   OMap filter(P&& p) const { return OMap(filter_(t_, p)); }
-  template <class F>  // f k d -> const V* (null: None) or std::optional
-  OMap filter_map(F&& f) const { return OMap(filter_map_(t_, f)); }
+  template <class F>  // f k d -> std::optional<W> (Map.filter_map: W may differ from V)
+  auto filter_map(F&& f) const {
+    using W = typename decltype(f(std::declval<const K&>(), std::declval<const V&>()))::value_type;
+    return OMap<K, W, Cmp>(filter_map_<W>(t_, f));
+  }
   template <class P>
   std::pair<OMap, OMap> partition(P&& p) const {
     auto [a, b] = partition_(t_, p);
@@ -330,14 +333,16 @@ class OMap {
     if (pvd) return l == m->l && r == m->r ? m : join(l, m->v, m->d, r);
     return concat(l, r);
   }
-  template <class F>
-  static const Node* filter_map_(const Node* m, F& f) {
+  template <class W, class F>
+  static const typename OMap<K, W, Cmp>::Node* filter_map_(const Node* m, F& f) {
     if (!m) return nullptr;
-    const Node* l = filter_map_(m->l, f);
-    std::optional<V> fvd = f(m->v, m->d);
-    const Node* r = filter_map_(m->r, f);
-    return fvd ? join(l, m->v, *fvd, r) : concat(l, r);
+    auto l = filter_map_<W>(m->l, f);
+    std::optional<W> fvd = f(m->v, m->d);
+    auto r = filter_map_<W>(m->r, f);
+    return fvd ? OMap<K, W, Cmp>::join(l, m->v, *fvd, r) : OMap<K, W, Cmp>::concat(l, r);
   }
+  template <class K2, class V2, class C2>
+  friend class OMap;
   template <class P>
   static std::pair<const Node*, const Node*> partition_(const Node* m, P& p) {
     if (!m) return {nullptr, nullptr};
