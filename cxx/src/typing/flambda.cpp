@@ -125,6 +125,51 @@ void print_project_var(Formatter& ppf, const ProjectVar& p) {
   fprintf(ppf, "@[<2>(project_var@ %a@ from %a=%a)@]", pr(variable::print, p.var), pr(variable::print, p.closure_id),
           pr(variable::print, p.closure));
 }
+int compare_project_var(const ProjectVar& a, const ProjectVar& b) {
+  if (int c = variable::compare(a.closure, b.closure); c != 0) return c;
+  if (int c = variable::compare(a.closure_id, b.closure_id); c != 0) return c;
+  return variable::compare(a.var, b.var);
+}
+int compare_move_within_set_of_closures(const MoveWithinSetOfClosures& a, const MoveWithinSetOfClosures& b) {
+  if (int c = variable::compare(a.closure, b.closure); c != 0) return c;
+  if (int c = variable::compare(a.start_from, b.start_from); c != 0) return c;
+  return variable::compare(a.move_to, b.move_to);
+}
+int compare_project_closure(const ProjectClosure& a, const ProjectClosure& b) {
+  if (int c = variable::compare(a.set_of_closures, b.set_of_closures); c != 0) return c;
+  return variable::compare(a.closure_id, b.closure_id);
+}
+int compare(t a, t b) {
+  if (a->kind != b->kind) return a->kind < b->kind ? -1 : 1;  // (constructor order)
+  switch (a->kind) {
+    case T::Kind::Project_var: return compare_project_var(a->project_var, b->project_var);
+    case T::Kind::Project_closure: return compare_project_closure(a->project_closure, b->project_closure);
+    case T::Kind::Move_within_set_of_closures: return compare_move_within_set_of_closures(a->move, b->move);
+    case T::Kind::Field:
+      if (a->field_index != b->field_index) return a->field_index < b->field_index ? -1 : 1;
+      return variable::compare(a->field_var, b->field_var);
+  }
+  return 0;
+}
+variable::t projecting_from(t p) {
+  switch (p->kind) {
+    case T::Kind::Project_var: return p->project_var.closure;
+    case T::Kind::Project_closure: return p->project_closure.set_of_closures;
+    case T::Kind::Move_within_set_of_closures: return p->move.closure;
+    case T::Kind::Field: return p->field_var;
+  }
+  return nullptr;
+}
+t map_projecting_from(t p, FnRef<variable::t(variable::t)> f) {
+  T r = *p;
+  switch (p->kind) {
+    case T::Kind::Project_var: r.project_var.closure = f(p->project_var.closure); break;
+    case T::Kind::Project_closure: r.project_closure.set_of_closures = f(p->project_closure.set_of_closures); break;
+    case T::Kind::Move_within_set_of_closures: r.move.closure = f(p->move.closure); break;
+    case T::Kind::Field: r.field_var = f(p->field_var); break;
+  }
+  return make<T>(r);
+}
 void print(Formatter& ppf, t p) {
   switch (p->kind) {
     case T::Kind::Project_closure: print_project_closure(ppf, p->project_closure); break;
@@ -781,25 +826,26 @@ t create_let_reusing_both(variable::t var, const WithFvNamed& def, const WithFvE
 }
 }  // namespace with_free_variables
 
-// ---- free symbols ----------------------------------------------------------------
+// ---- iter_general, iter_lets, map_lets -------------------------------------------
 namespace {
-// iter_general ~toplevel f f_named (with f = ignore: only the named terms)
-template <class FN>
 struct IterGeneral {
   bool toplevel;
-  FN& f_named;
+  FnRef<void(t)> f;
+  FnRef<void(named)> f_named;
   void aux(t e) {
     for (;;) {
+      if (auto* l = as<Let>(e)) {
+        // iter_lets t ~for_defining_expr:(fun _ n -> aux_named n)
+        //   ~for_last_body:aux ~for_each_let:f
+        f(e);
+        aux_named(l->defining_expr);
+        e = l->body;
+        continue;
+      }
+      f(e);
       switch (e->kind) {
-        case EK::Let: {
-          // iter_lets: for_each_let, for_defining_expr, then the body
-          auto* l = static_cast<const Let*>(e);
-          aux_named(l->defining_expr);
-          e = l->body;
-          continue;
-        }
         case EK::Var: case EK::Apply: case EK::Assign: case EK::Send: case EK::Proved_unreachable:
-        case EK::Static_raise: return;
+        case EK::Static_raise: case EK::Let: return;
         case EK::Let_mutable: e = static_cast<const Let_mutable*>(e)->body; continue;
         case EK::Try_with: {
           auto* tw = static_cast<const Try_with*>(e);
@@ -854,6 +900,68 @@ struct IterGeneral {
     }
   }
 };
+}  // namespace
+
+void iter_general(bool toplevel, FnRef<void(t)> f, FnRef<void(named)> f_named, t expr) {
+  IterGeneral{toplevel, f, f_named}.aux(expr);
+}
+void iter_general_named(bool toplevel, FnRef<void(t)> f, FnRef<void(named)> f_named, named n) {
+  IterGeneral{toplevel, f, f_named}.aux_named(n);
+}
+
+void iter_lets(t e, FnRef<void(variable::t, named)> for_defining_expr, FnRef<void(t)> for_last_body,
+               FnRef<void(t)> for_each_let) {
+  while (auto* l = as<Let>(e)) {
+    for_each_let(e);
+    for_defining_expr(l->var, l->defining_expr);
+    e = l->body;
+  }
+  for_last_body(e);
+}
+
+t map_lets(t e, FnRef<named(variable::t, named)> for_defining_expr, FnRef<t(t)> for_last_body,
+           FnRef<t(t)> after_rebuild) {
+  struct Rev {
+    variable::t var;
+    named defining_expr;
+    t original;  // null: None
+  };
+  std::vector<Rev> rev_lets;  // oldest first
+  while (auto* l = as<Let>(e)) {
+    named new_defining_expr = for_defining_expr(l->var, l->defining_expr);
+    t original = new_defining_expr == l->defining_expr ? e : nullptr;
+    rev_lets.push_back({l->var, new_defining_expr, original});
+    e = l->body;
+  }
+  t last_body = for_last_body(e);
+  // As soon as we see a change, we have to rebuild that [Let] and every
+  // outer one.
+  bool seen_change = last_body != e;
+  t acc = last_body;
+  for (std::size_t k = rev_lets.size(); k-- > 0;) {
+    const Rev& r = rev_lets[k];
+    t let_expr;
+    if (r.original && !seen_change) let_expr = r.original;
+    else {
+      seen_change = true;
+      let_expr = create_let(r.var, r.defining_expr, acc);
+    }
+    t new_let = after_rebuild(let_expr);
+    if (new_let != let_expr) seen_change = true;
+    acc = new_let;
+  }
+  return acc;
+}
+
+t map_defining_expr_of_let(const Let* let_expr, FnRef<named(named)> f) {
+  named defining_expr = f(let_expr->defining_expr);
+  if (defining_expr == let_expr->defining_expr) return let_expr;
+  variable::Set fv = free_variables_named(defining_expr);
+  return make<Let>(Let{{EK::Let}, let_expr->var, defining_expr, let_expr->body, fv, let_expr->free_vars_of_body});
+}
+
+// ---- free symbols ----------------------------------------------------------------
+namespace {
 void free_symbols_helper(symbol::Set& symbols, named n) {
   if (auto* s = as<NSymbol>(n)) symbols = symbols.add(s->sym);
   else if (auto* r = as<NRead_symbol_field>(n)) symbols = symbols.add(r->sym);
@@ -866,14 +974,12 @@ void free_symbols_helper(symbol::Set& symbols, named n) {
 
 symbol::Set free_symbols(t expr) {
   symbol::Set symbols;
-  auto f = [&](named n) { free_symbols_helper(symbols, n); };
-  IterGeneral<decltype(f)>{true, f}.aux(expr);
+  iter_general(true, [](t) {}, [&](named n) { free_symbols_helper(symbols, n); }, expr);
   return symbols;
 }
 symbol::Set free_symbols_named(named n) {
   symbol::Set symbols;
-  auto f = [&](named m) { free_symbols_helper(symbols, m); };
-  IterGeneral<decltype(f)>{true, f}.aux_named(n);
+  iter_general_named(true, [](t) {}, [&](named m) { free_symbols_helper(symbols, m); }, n);
   return symbols;
 }
 
@@ -989,6 +1095,97 @@ const SetOfClosures* create_set_of_closures(const FunctionDeclarations* function
     }
   }
   return make<SetOfClosures>(SetOfClosures{function_decls, free_vars, specialised_args, direct_call_surrogates});
+}
+
+const FunctionDeclaration* update_body_of_function_declaration(const FunctionDeclaration* d, t body) {
+  return update_function_decl_params_and_body(d, d->params, body);
+}
+
+const FunctionDeclaration* update_function_decl_params_and_body(const FunctionDeclaration* d, Slice<Parameter> params,
+                                                                t body) {
+  symbol::Set fs = free_symbols(body);
+  variable::Set fv = free_variables(body);
+  FunctionDeclaration r = *d;
+  r.params = params;
+  r.body = body;
+  r.free_variables = fv;
+  r.free_symbols = fs;
+  return make<FunctionDeclaration>(r);
+}
+
+const FunctionDeclaration* update_function_declaration(const FunctionDeclaration* d, Slice<Parameter> params, t body) {
+  return update_function_decl_params_and_body(d, params, body);
+}
+
+const FunctionDeclarations* create_function_declarations_with_origin(bool is_classic_mode,
+                                                                     variable::Map<const FunctionDeclaration*> funs,
+                                                                     set_of_closures_id::t set_of_closures_origin) {
+  set_of_closures_id::t id = set_of_closures_id::create(compilation_unit::get_current_exn());
+  return make<FunctionDeclarations>(FunctionDeclarations{is_classic_mode, id, set_of_closures_origin, funs});
+}
+
+const FunctionDeclarations* update_function_declarations(const FunctionDeclarations* fds,
+                                                         variable::Map<const FunctionDeclaration*> funs) {
+  set_of_closures_id::t id = set_of_closures_id::create(compilation_unit::get_current_exn());
+  return make<FunctionDeclarations>(FunctionDeclarations{fds->is_classic_mode, id, fds->set_of_closures_origin, funs});
+}
+
+const FunctionDeclarations* import_function_declarations_for_pack(
+    const FunctionDeclarations* fds, FnRef<set_of_closures_id::t(set_of_closures_id::t)> import_set_of_closures_id,
+    FnRef<set_of_closures_id::t(set_of_closures_id::t)> import_set_of_closures_origin) {
+  set_of_closures_id::t id = import_set_of_closures_id(fds->set_of_closures_id);
+  set_of_closures_id::t origin = import_set_of_closures_origin(fds->set_of_closures_origin);
+  return make<FunctionDeclarations>(FunctionDeclarations{fds->is_classic_mode, id, origin, fds->funs});
+}
+
+variable::Set used_params(const FunctionDeclaration* d) {
+  return parameter::set_vars(d->params).filter([&](variable::t p) { return d->free_variables.mem(p); });
+}
+
+int compare_const(const Const& a, const Const& b) {
+  if (a.kind != b.kind) return a.kind == Const::Kind::Int ? -1 : 1;
+  return a.n < b.n ? -1 : a.n > b.n ? 1 : 0;  // (Char.compare: the codes)
+}
+
+int compare_block_field(const BlockField& a, const BlockField& b) {
+  if (a.sym && b.sym) return symbol::compare(a.sym, b.sym);
+  if (!a.sym && !b.sym) return compare_const(a.c, b.c);
+  return a.sym ? -1 : 1;
+}
+
+int compare_constant_defining_value(constant_defining_value a, constant_defining_value b) {
+  using K = ConstantDefiningValue::Kind;
+  if (a->kind != b->kind) return a->kind < b->kind ? -1 : 1;  // (constructor order)
+  switch (a->kind) {
+    case K::Allocated_const: return allocated_const::compare(a->c, b->c);
+    case K::Block: {
+      if (a->tag != b->tag) return a->tag < b->tag ? -1 : 1;
+      // Misc.Stdlib.List.compare
+      for (std::size_t k = 0;; ++k) {
+        if (k == a->fields.size()) return k == b->fields.size() ? 0 : -1;
+        if (k == b->fields.size()) return 1;
+        if (int c = compare_block_field(a->fields[k], b->fields[k]); c != 0) return c;
+      }
+    }
+    case K::Set_of_closures:
+      return unit_id::compare(a->set->function_decls->set_of_closures_id, b->set->function_decls->set_of_closures_id);
+    case K::Project_closure: {
+      if (int c = symbol::compare(a->sym, b->sym); c != 0) return c;
+      return variable::compare(a->closure_id, b->closure_id);
+    }
+  }
+  return 0;
+}
+
+bool equal_call_kind(const CallKind& a, const CallKind& b) {
+  if (!a.direct || !b.direct) return !a.direct && !b.direct;
+  return variable::equal(a.direct, b.direct);
+}
+
+bool equal_specialised_to(const SpecialisedTo& a, const SpecialisedTo& b) {
+  if (!variable::equal(a.var, b.var)) return false;
+  if (!a.projection || !b.projection) return !a.projection && !b.projection;
+  return projection::equal(a.projection, b.projection);
 }
 
 }  // namespace flambda

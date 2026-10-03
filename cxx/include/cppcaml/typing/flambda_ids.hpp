@@ -16,6 +16,7 @@
 #include <string_view>
 
 #include "cppcaml/typing/format.hpp"
+#include "cppcaml/typing/hashtbl.hpp"
 #include "cppcaml/typing/ident.hpp"
 #include "cppcaml/typing/ocaml_map.hpp"
 
@@ -80,6 +81,16 @@ using Set = OSet<t, Cmp>;
 template <class V>
 using Map = OMap<t, V, Cmp>;
 
+struct Hash {
+  long operator()(t v) const { return hash(v); }
+};
+struct Eq {
+  bool operator()(t a, t b) const { return equal(a, b); }
+};
+// Variable.Tbl (Hashtbl.Make: OCaml's buckets and orders)
+template <class V>
+using Tbl = hashtbl::Hashtbl<t, V, Hash, Eq>;
+
 // create_with_name_string ?current_compilation_unit name
 t create_with_name_string(std::string_view name, compilation_unit::t cu = nullptr);
 // create ?current_compilation_unit name (an Internal_variable_names.t)
@@ -122,6 +133,14 @@ struct Cmp {
 using Set = OSet<t, Cmp>;
 template <class V>
 using Map = OMap<t, V, Cmp>;
+struct Hash {
+  long operator()(t s) const { return hash(s); }
+};
+struct Eq {
+  bool operator()(t a, t b) const { return equal(a, b); }
+};
+template <class V>
+using Tbl = hashtbl::Hashtbl<t, V, Hash, Eq>;
 }  // namespace symbol
 
 // ---- Id_types.UnitId (Set_of_closures_id, Export_id) ----------------------
@@ -173,5 +192,16 @@ namespace tag {
 using t = long;
 t create_exn(long tag);  // 0 .. 255
 }  // namespace tag
+
+// Identifiable.Make_tbl: to_map / of_map / map
+template <class Tbl, class M>
+M tbl_to_map(const Tbl& t) {
+  // fold T_map.add v T_map.empty
+  return t.fold([](const auto& k, const auto& d, M m) { return m.add(k, d); }, M{});
+}
+template <class Tbl, class M>
+void tbl_of_map(Tbl& t, const M& m) {
+  m.iter([&](const auto& k, const auto& v) { t.add(k, v); });
+}
 
 }  // namespace cppcaml::typing

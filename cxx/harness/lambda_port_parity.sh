@@ -13,7 +13,9 @@
 #
 # NATIVE=1 DUMP=dclambda compares the Closure middle end's output.
 # NATIVE=1 DUMP=drawflambda (an --enable-flambda tree) compares flambda's
-# closure conversion.
+# closure conversion; DUMP=dflambda-verbose the flambda passes: the port
+# prints the program before each pass up to the first one not ported yet,
+# compared with the same prefix of ocamlopt's dump.
 #
 # Usage: lambda_port_parity.sh [file.ml ...]   (JOBS=, DUMP=drawlambda|dlambda|dinstr,
 #   FLAGS= extra flags for both compilers, e.g. absolute -I dirs)
@@ -45,7 +47,7 @@ fi
 # ocamlopt.opt compiles on, the port stops after its dump (the back end
 # past Clambda is not ported yet: its exit status is not checked)
 CLAMBDA=0
-case "$DUMP" in drawflambda|dclambda|drawclambda|dcmm|dsel|dcombine|dcse|dlive|dspill|dsplit|dinterf|dprefer|dalloc|dreload|dlinear|S) CLAMBDA=1; STOP=""; OSTOP="" ;; esac
+case "$DUMP" in dflambda-verbose|drawflambda|dclambda|drawclambda|dcmm|dsel|dcombine|dcse|dlive|dspill|dsplit|dinterf|dprefer|dalloc|dreload|dlinear|S) CLAMBDA=1; STOP=""; OSTOP="" ;; esac
 export DUMP FLAGS STOP DFLAG NATIVE REFC OSTOP CLAMBDA
 OUT=/tmp/lambda_port_parity
 
@@ -76,6 +78,10 @@ if [ "${1:-}" == "--worker" ]; then
   if [ "$DUMP" = cmx ] || [ "$DUMP" = o ]; then cp "$w/x/${b%.ml}.$DUMP" "$OUT/$key.c" 2>/dev/null || crc=1; fi
   [ "$CLAMBDA" = 1 ] && sed -i -e '/: the native back end (.*) is not supported yet$/d' \
     -e '/: the flambda middle end (.*) is not ported yet$/d' "$OUT/$key.c"
+  if [ "$DUMP" = dflambda-verbose ]; then  # the port's dump: a prefix of ocamlopt's
+    head -c "$(stat -c %s "$OUT/$key.c")" "$OUT/$key.o" > "$OUT/$key.o.prefix"
+    mv "$OUT/$key.o.prefix" "$OUT/$key.o"
+  fi
   rm -rf "${w:?}"
   if [ $orc -ne 0 ]; then printf 'OFAIL %s\n' "$f"
   elif { [ $crc -ne 0 ] && [ "$CLAMBDA" = 0 ]; } || [ ! -s "$OUT/$key.c" ]; then printf 'CFAIL %s\n' "$f"

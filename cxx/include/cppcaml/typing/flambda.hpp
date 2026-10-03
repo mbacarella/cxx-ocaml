@@ -14,9 +14,11 @@
 #include <cstdint>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "cppcaml/typing/clambda.hpp"
 #include "cppcaml/typing/flambda_ids.hpp"
+#include "cppcaml/typing/fn_ref.hpp"
 #include "cppcaml/typing/format.hpp"
 #include "cppcaml/typing/lambda.hpp"
 
@@ -82,6 +84,13 @@ struct T {
   variable::t field_var = nullptr;
 };
 using t = const T*;
+int compare_project_var(const ProjectVar& a, const ProjectVar& b);
+int compare_move_within_set_of_closures(const MoveWithinSetOfClosures& a, const MoveWithinSetOfClosures& b);
+int compare_project_closure(const ProjectClosure& a, const ProjectClosure& b);
+int compare(t a, t b);
+inline bool equal(t a, t b) { return compare(a, b) == 0; }
+variable::t projecting_from(t p);
+t map_projecting_from(t p, FnRef<variable::t(variable::t)> f);
 void print_project_closure(format::Formatter& ppf, const ProjectClosure& p);
 void print_move_within_set_of_closures(format::Formatter& ppf, const MoveWithinSetOfClosures& m);
 void print_project_var(format::Formatter& ppf, const ProjectVar& p);
@@ -379,6 +388,51 @@ t create_let_reusing_both(variable::t var, const WithFvNamed& def, const WithFvE
 inline WithFvNamed expr(const WithFvExpr& e) { return {n_expr(e.expr), e.free_vars}; }
 }  // namespace with_free_variables
 
+// iter_general ~toplevel f f_named (Is_expr expr / Is_named named)
+void iter_general(bool toplevel, FnRef<void(t)> f, FnRef<void(named)> f_named, t expr);
+void iter_general_named(bool toplevel, FnRef<void(t)> f, FnRef<void(named)> f_named, named n);
+// iter_lets t ~for_defining_expr ~for_last_body ~for_each_let
+void iter_lets(t e, FnRef<void(variable::t, named)> for_defining_expr, FnRef<void(t)> for_last_body,
+               FnRef<void(t)> for_each_let);
+// map_lets t ~for_defining_expr ~for_last_body ~after_rebuild
+t map_lets(t e, FnRef<named(variable::t, named)> for_defining_expr, FnRef<t(t)> for_last_body,
+           FnRef<t(t)> after_rebuild);
+t map_defining_expr_of_let(const Let* let_expr, FnRef<named(named)> f);
+// fold_lets_option t ~init ~for_defining_expr ~for_last_body
+//   ~filter_defining_expr
+template <class A, class B, class FD, class FL, class FF>
+std::pair<t, B> fold_lets_option(t e, A init, FD&& for_defining_expr, FL&& for_last_body,
+                                 FF&& filter_defining_expr);
+
+// update_body_of_function_declaration / update_function_decl's_params_and_body
+const FunctionDeclaration* update_body_of_function_declaration(const FunctionDeclaration* d, t body);
+const FunctionDeclaration* update_function_decl_params_and_body(const FunctionDeclaration* d, Slice<Parameter> params,
+                                                                t body);
+const FunctionDeclaration* update_function_declaration(const FunctionDeclaration* d, Slice<Parameter> params, t body);
+const FunctionDeclarations* create_function_declarations_with_origin(bool is_classic_mode,
+                                                                     variable::Map<const FunctionDeclaration*> funs,
+                                                                     set_of_closures_id::t set_of_closures_origin);
+inline const FunctionDeclarations* create_function_declarations_with_closures_origin(
+    bool is_classic_mode, variable::Map<const FunctionDeclaration*> funs, set_of_closures_id::t origin) {
+  return create_function_declarations_with_origin(is_classic_mode, funs, origin);
+}
+const FunctionDeclarations* update_function_declarations(const FunctionDeclarations* fds,
+                                                         variable::Map<const FunctionDeclaration*> funs);
+const FunctionDeclarations* import_function_declarations_for_pack(
+    const FunctionDeclarations* fds, FnRef<set_of_closures_id::t(set_of_closures_id::t)> import_set_of_closures_id,
+    FnRef<set_of_closures_id::t(set_of_closures_id::t)> import_set_of_closures_origin);
+variable::Set used_params(const FunctionDeclaration* d);
+
+int compare_const(const Const& a, const Const& b);
+int compare_block_field(const BlockField& a, const BlockField& b);
+// Constant_defining_value.compare / equal
+int compare_constant_defining_value(constant_defining_value a, constant_defining_value b);
+inline bool equal_constant_defining_value(constant_defining_value a, constant_defining_value b) {
+  return a == b || compare_constant_defining_value(a, b) == 0;
+}
+bool equal_call_kind(const CallKind& a, const CallKind& b);
+bool equal_specialised_to(const SpecialisedTo& a, const SpecialisedTo& b);
+
 // printers
 void print_const(format::Formatter& ppf, const Const& c);
 void print(format::Formatter& ppf, t flam);  // "%a@." lam
@@ -389,6 +443,36 @@ void print_function_declarations(format::Formatter& ppf, const FunctionDeclarati
 void print_specialised_to(format::Formatter& ppf, const SpecialisedTo& s);
 void print_constant_defining_value(format::Formatter& ppf, constant_defining_value c);
 void print_program(format::Formatter& ppf, const Program& program);
+
+template <class A, class B, class FD, class FL, class FF>
+std::pair<t, B> fold_lets_option(t e, A init, FD&& for_defining_expr, FL&& for_last_body,
+                                 FF&& filter_defining_expr) {
+  struct Def {
+    variable::t var;
+    named defining_expr;
+  };
+  std::vector<Def> lets;  // rev_lets, oldest first
+  A acc = std::move(init);
+  while (auto* l = as<Let>(e)) {
+    auto [acc2, var, defining_expr] = for_defining_expr(std::move(acc), l->var, l->defining_expr);
+    acc = std::move(acc2);
+    lets.push_back({var, defining_expr});
+    e = l->body;
+  }
+  auto [last_body, acc_b] = for_last_body(std::move(acc), e);
+  // finish: List.fold_left over rev_lets, the innermost let first
+  B accb = std::move(acc_b);
+  WithFvExpr w = with_free_variables::of_expr(last_body);
+  for (std::size_t k = lets.size(); k-- > 0;) {
+    auto [accb2, var, defining_expr] = filter_defining_expr(std::move(accb), lets[k].var, lets[k].defining_expr,
+                                                            w.free_vars);
+    accb = std::move(accb2);
+    if (!defining_expr) continue;
+    t let_expr = with_free_variables::create_let_reusing_body(var, defining_expr, w);
+    w = with_free_variables::of_expr(let_expr);
+  }
+  return {w.expr, std::move(accb)};
+}
 
 }  // namespace flambda
 }  // namespace cppcaml::typing

@@ -9,6 +9,8 @@
 #include "cppcaml/typing/clflags.hpp"
 #include "cppcaml/typing/config.hpp"
 #include "cppcaml/typing/env.hpp"
+#include "cppcaml/typing/export_info.hpp"
+#include "cppcaml/typing/import_approx.hpp"
 #include "cppcaml/typing/location.hpp"
 #include "cppcaml/typing/misc.hpp"
 #include "cppcaml/typing/persistent_env.hpp"
@@ -69,6 +71,16 @@ bool is_import_from_same_pack(std::string_view imported, std::string_view curren
 
 long const_label = 0;
 
+// the flambda half's tables
+struct FlambdaState {
+  std::unordered_map<std::string, const export_info::T*> export_infos_table;
+  const export_info::T* merged_environment = nullptr;  // (null: Export_info.empty)
+};
+FlambdaState& flambda_state() {
+  static FlambdaState s;
+  return s;
+}
+
 }  // namespace
 
 UnitInfos& current_unit() {
@@ -118,6 +130,10 @@ void reset(const std::optional<std::string>& packname0, std::string_view name) {
   constants() = Constants{};
   cu.ui_export_info = value_unknown();
   if constexpr (config::flambda) {
+    // merged_environment := Export_info.empty; Hashtbl.clear
+    // export_infos_table (and imported_sets_of_closures_table)
+    flambda_state() = FlambdaState{};
+    import_approx::clear_imported_sets_of_closures_table();
     compilation_unit::t c =
         compilation_unit::create(Ident::create_persistent(name), current_unit_linkage_name());
     compilation_unit::set_current(c);
@@ -246,6 +262,41 @@ compilation_unit::t current_compilation_unit() {
 
 symbol::t current_unit_symbol() {
   return symbol::of_global_linkage(current_compilation_unit(), current_unit_linkage_name());
+}
+
+const export_info::T* approx_for_global(compilation_unit::t comp_unit) {
+  Ident::t id = comp_unit->id;
+  if (compilation_unit::equal(predefined_exception_compilation_unit(), comp_unit) || ident::is_predef(id) ||
+      !ident::global(id))
+    misc::fatal_error("approx_for_global " + ident::unique_name(id));  // (invalid_arg)
+  std::string modname(ident::name(id));
+  FlambdaState& st = flambda_state();
+  if (auto it = st.export_infos_table.find(modname); it != st.export_infos_table.end()) return it->second;
+  const UnitInfos* ui = get_global_info(id);
+  if (!ui) return nullptr;
+  const export_info::T* exported = ui->ui_flambda_export_info;
+  if (!exported) misc::fatal_error("Compilenv.get_flambda_export_info");
+  st.export_infos_table.emplace(modname, exported);
+  st.merged_environment = export_info::merge(approx_env(), exported);
+  return exported;
+}
+
+const export_info::T* approx_env() {
+  FlambdaState& st = flambda_state();
+  return st.merged_environment ? st.merged_environment : export_info::empty();
+}
+
+void set_export_info(const export_info::T* ei) { current_unit().ui_flambda_export_info = ei; }
+
+symbol::t closure_symbol(variable::t fv) {
+  compilation_unit::t cu = variable::get_compilation_unit(fv);
+  std::string linkage_name = concat_symbol(cu->linkage_name, variable::unique_name(fv) + "_closure");
+  return symbol::of_global_linkage(cu, zstr(linkage_name));
+}
+
+std::string_view function_label(variable::t fv) {
+  compilation_unit::t cu = variable::get_compilation_unit(fv);
+  return zstr(concat_symbol(cu->linkage_name, variable::unique_name(fv)));
 }
 
 void set_global_approx(const ValueApproximation* approx) { current_unit().ui_export_info = approx; }

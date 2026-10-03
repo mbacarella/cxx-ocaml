@@ -6,19 +6,82 @@
 
 #include "cppcaml/typing/clflags.hpp"
 #include "cppcaml/typing/closure_conversion.hpp"
+#include "cppcaml/typing/lift_code.hpp"
+#include "cppcaml/typing/lift_constants.hpp"
 
 namespace cppcaml::typing::flambda_middle_end {
 
 using format::fprintf;
+using flambda::Program;
+using Pass = Program (*)(const Program&);
 
 flambda::Program lambda_to_flambda(format::Formatter& ppf_dump, long size, Ident::t module_ident,
                                    lambda::lambda module_initializer) {
-  // (the warning reporter that drops duplicate warnings, Flambda_invariants'
-  // checks and the passes: not ported yet)
-  flambda::Program flam = closure_conversion::lambda_to_flambda(module_ident, size, module_initializer);
+  // (the warning reporter that drops duplicate warnings and
+  // Flambda_invariants' checks: not ported yet)
+  long pass_number = 0;
+  long round_number = 0;
+  // flam +-+ (name, pass); a null pass is not ported yet
+  auto step = [&](const Program& flam, const char* name, Pass pass) -> Program {
+    ++pass_number;
+    if (clflags::dump_flambda_verbose) {
+      fprintf(ppf_dump, "@.PASS: %s@.", name);
+      fprintf(ppf_dump, "Before pass %d, round %d:@ %a@.", pass_number, round_number,
+              [&](format::Formatter& f) { flambda::print_program(f, flam); });
+      fprintf(ppf_dump, "\n@?");
+    }
+    if (!pass) throw NotPorted(name);
+    return pass(flam);
+  };
+  Program flam = closure_conversion::lambda_to_flambda(module_ident, size, module_initializer);
   if (clflags::dump_rawflambda)
     fprintf(ppf_dump, "After closure conversion:@ %a@.",
             [&](format::Formatter& f) { flambda::print_program(f, flam); });
+  Pass lift_lets = lift_code::lift_lets;
+  Pass lift_constants = lift_constants::lift_constants;
+  Pass not_ported = nullptr;
+  if (clflags::classic_inlining) {
+    // fast_mode
+    pass_number = 0;
+    flam = step(flam, "lift_lets 1", lift_lets);
+    flam = step(flam, "Lift_constants", lift_constants);
+    flam = step(flam, "Share_constants", not_ported);
+    flam = step(flam, "Lift_let_to_initialize_symbol", not_ported);
+    flam = step(flam, "Inline_and_simplify", not_ported);
+    flam = step(flam, "Remove_unused_closure_vars 2", not_ported);
+    flam = step(flam, "Ref_to_variables", not_ported);
+    flam = step(flam, "Initialize_symbol_to_let_symbol", not_ported);
+  } else {
+    for (;;) {
+      pass_number = 0;
+      ++round_number;
+      if (round_number > clflags::rounds()) break;
+      // Beware: [Lift_constants] must be run before any pass that might
+      // duplicate strings.
+      flam = step(flam, "lift_lets 1", lift_lets);
+      flam = step(flam, "Lift_constants", lift_constants);
+      flam = step(flam, "Share_constants", not_ported);
+      flam = step(flam, "Remove_unused_program_constructs", not_ported);
+      flam = step(flam, "Lift_let_to_initialize_symbol", not_ported);
+      flam = step(flam, "lift_lets 2", lift_lets);
+      flam = step(flam, "Remove_unused_closure_vars 1", not_ported);
+      flam = step(flam, "Inline_and_simplify", not_ported);
+      flam = step(flam, "Remove_unused_closure_vars 2", not_ported);
+      flam = step(flam, "lift_lets 3", lift_lets);
+      flam = step(flam, "Inline_and_simplify noinline", not_ported);
+      flam = step(flam, "Remove_unused_closure_vars 3", not_ported);
+      flam = step(flam, "Ref_to_variables", not_ported);
+      flam = step(flam, "Initialize_symbol_to_let_symbol", not_ported);
+    }
+  }
+  // back_end
+  flam = step(flam, "Remove_unused_closure_vars", not_ported);
+  flam = step(flam, "Lift_constants", lift_constants);
+  flam = step(flam, "Share_constants", not_ported);
+  flam = step(flam, "Remove_unused_program_constructs", not_ported);
+  // (the unused [@inlined] / [@unrolled] warnings)
+  if (clflags::dump_flambda)
+    fprintf(ppf_dump, "End of middle end:@ %a@.", [&](format::Formatter& f) { flambda::print_program(f, flam); });
   return flam;
 }
 
