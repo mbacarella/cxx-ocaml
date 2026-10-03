@@ -514,7 +514,8 @@ struct Conv {
     const CoreTypeDesc* d = nullptr;
     using K = CoreTypeDesc::Kind;
     std::visit(
-        [&](auto& v) {
+        [&](auto& raw) {
+          auto& v = ast::unbox(raw);  // (an Indirect alternative: itself)
           using T = std::decay_t<decltype(v)>;
           if constexpr (std::is_same_v<T, ast::Ptyp_any>) {
             d = make<Ptyp_any>(K::Ptyp_any);
@@ -593,7 +594,8 @@ struct Conv {
     using K = PatternDesc::Kind;
     const PatternDesc* d = nullptr;
     std::visit(
-        [&](auto& v) {
+        [&](auto& raw) {
+          auto& v = ast::unbox(raw);  // (an Indirect alternative: itself)
           using T = std::decay_t<decltype(v)>;
           if constexpr (std::is_same_v<T, ast::Ppat_any>) {
             d = make<Ppat_any>(K::Ppat_any);
@@ -743,7 +745,8 @@ struct Conv {
     Location l = loc(e.loc);
     LocationStack stack = loc_stack(e.loc_stack);
     std::visit(
-        [&](auto& v) {
+        [&](auto& raw) {
+          auto& v = ast::unbox(raw);  // (an Indirect alternative: itself)
           using T = std::decay_t<decltype(v)>;
           if constexpr (std::is_same_v<T, ast::Pexp_ident>) {
             LidLoc id = lidloc(v.id);

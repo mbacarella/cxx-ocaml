@@ -39,6 +39,26 @@ struct Comment {
 template <class T>
 using Box = std::unique_ptr<T>;
 
+// A rare and large variant alternative, out of line: a variant is as big as
+// its largest alternative, and the parser's nodes for a big source are
+// millions (made from the alternative itself, as it would be in place).
+template <class T>
+struct Indirect {
+  Box<T> p;
+  Indirect(T v) : p(std::make_unique<T>(std::move(v))) {}  // NOLINT: implicit, as in place
+};
+// an alternative itself, through its Indirect if it has one
+template <class T>
+const T& unbox(const T& x) { return x; }
+template <class T>
+const T& unbox(const Indirect<T>& x) { return *x.p; }
+// std::get_if of an Indirect alternative
+template <class T, class V>
+const T* get_boxed(const V* v) {
+  auto* b = std::get_if<Indirect<T>>(v);
+  return b ? b->p.get() : nullptr;
+}
+
 // Forward-declared early so attributes (whose payload is a structure) can be
 // threaded through expression/pattern/type/binding nodes.
 struct StructureItem;
@@ -168,8 +188,8 @@ struct Ptyp_functor { ArgLabel label; StringLoc name; Ptyp_package pkg; CoreType
 struct Ptyp_extension { ExtName name; ExtPayload payload; };  // [%id]
 struct CoreType {
   std::variant<Ptyp_any, Ptyp_var, Ptyp_arrow, Ptyp_tuple, Ptyp_constr,
-               Ptyp_variant, Ptyp_object, Ptyp_package, Ptyp_class, Ptyp_alias,
-               Ptyp_poly, Ptyp_open, Ptyp_functor, Ptyp_extension>
+               Ptyp_variant, Ptyp_object, Indirect<Ptyp_package>, Ptyp_class, Ptyp_alias,
+               Ptyp_poly, Ptyp_open, Indirect<Ptyp_functor>, Ptyp_extension>
       desc;
   Location loc;
   Attributes attrs;
@@ -209,8 +229,8 @@ struct Ppat_effect { PatBox eff; PatBox cont; };        // effect P, k
 struct Pattern {
   std::variant<Ppat_any, Ppat_var, Ppat_constant, Ppat_tuple, Ppat_construct,
                Ppat_or, Ppat_alias, Ppat_constraint, Ppat_record, Ppat_lazy,
-               Ppat_interval, Ppat_variant, Ppat_exception, Ppat_array,
-               Ppat_type, Ppat_unpack, Ppat_extension, Ppat_open, Ppat_effect>
+               Indirect<Ppat_interval>, Ppat_variant, Ppat_exception, Ppat_array,
+               Ppat_type, Indirect<Ppat_unpack>, Ppat_extension, Ppat_open, Ppat_effect>
       desc;
   Location loc;
   Attributes attrs;
@@ -283,10 +303,10 @@ struct Expression {
   std::variant<Pexp_ident, Pexp_constant, Pexp_apply, Pexp_let, Pexp_function,
                Pexp_tuple, Pexp_ifthenelse, Pexp_construct, Pexp_match, Pexp_try,
                Pexp_sequence, Pexp_constraint, Pexp_field, Pexp_record,
-               Pexp_assert, Pexp_lazy, Pexp_while, Pexp_for, Pexp_array,
+               Pexp_assert, Pexp_lazy, Pexp_while, Indirect<Pexp_for>, Pexp_array,
                Pexp_variant, Pexp_newtype, Pexp_struct_item, Pexp_setfield,
-               Pexp_setinstvar, Pexp_coerce, Pexp_send, Pexp_pack,
-               Pexp_extension, Pexp_letop, Pexp_object, Pexp_new, Pexp_override,
+               Pexp_setinstvar, Pexp_coerce, Pexp_send, Indirect<Pexp_pack>,
+               Pexp_extension, Indirect<Pexp_letop>, Pexp_object, Pexp_new, Pexp_override,
                Pexp_poly, Pexp_unreachable, Pexp_hole>
       desc;
   Location loc;

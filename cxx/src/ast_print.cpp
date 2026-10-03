@@ -153,7 +153,7 @@ struct Printer {
     } else if (auto* v = std::get_if<Ptyp_open>(&t.desc)) {
       line(j, "Ptyp_open \"" + lid_loc(v->mod_) + "\"");
       core_type(j, *v->type);
-    } else if (auto* v = std::get_if<Ptyp_functor>(&t.desc)) {
+    } else if (auto* v = get_boxed<Ptyp_functor>(&t.desc)) {
       line(j, "Ptyp_functor");
       arg_label(j, v->label);
       line(j, "\"" + v->name.txt + "\"");
@@ -191,7 +191,7 @@ struct Printer {
         if (v->labels->empty()) line(j + 1, "[]");
         else { line(j + 1, "["); for (auto& s : *v->labels) line(j + 2, '"' + s + '"'); line(j + 1, "]"); }
       } else line(j, "None");
-    } else if (auto* v = std::get_if<Ptyp_package>(&t.desc)) {
+    } else if (auto* v = get_boxed<Ptyp_package>(&t.desc)) {
       line(j, "Ptyp_package");
       line(j + 1, "package_type " + lid_loc(v->path));
       if (v->constraints.empty()) line(j + 1, "[]");
@@ -292,7 +292,7 @@ struct Printer {
     } else if (auto* v = std::get_if<Ppat_lazy>(&p.desc)) {
       line(j, "Ppat_lazy");
       pattern(j, *v->p);
-    } else if (auto* v = std::get_if<Ppat_interval>(&p.desc)) {
+    } else if (auto* v = get_boxed<Ppat_interval>(&p.desc)) {
       line(j, "Ppat_interval");
       constant(j, v->c1);
       constant(j, v->c2);
@@ -310,7 +310,7 @@ struct Printer {
     } else if (auto* v = std::get_if<Ppat_type>(&p.desc)) {
       line(j, "Ppat_type");
       line(j, lid_loc(v->id));
-    } else if (auto* v = std::get_if<Ppat_unpack>(&p.desc)) {
+    } else if (auto* v = get_boxed<Ppat_unpack>(&p.desc)) {
       line(j, "Ppat_unpack " + str_opt_loc(v->name));
       if (!v->pkg) { line(j, "None"); }
       else {
@@ -445,7 +445,7 @@ struct Printer {
       line(j, "Pexp_while");
       expression(j, *v->cond);
       expression(j, *v->body);
-    } else if (auto* v = std::get_if<Pexp_for>(&e.desc)) {
+    } else if (auto* v = get_boxed<Pexp_for>(&e.desc)) {
       line(j, std::string("Pexp_for ") + (v->dir == DirectionFlag::Upto ? "Up" : "Down"));
       pattern(j, v->var);
       expression(j, *v->lo);
@@ -482,7 +482,7 @@ struct Printer {
     } else if (auto* v = std::get_if<Pexp_send>(&e.desc)) {
       line(j, "Pexp_send \"" + v->meth.txt + "\"");
       expression(j, *v->obj);
-    } else if (auto* v = std::get_if<Pexp_pack>(&e.desc)) {
+    } else if (auto* v = get_boxed<Pexp_pack>(&e.desc)) {
       line(j, "Pexp_pack");
       module_expr(j, *v->me);
       if (!v->pkg) { line(j, "None"); }
@@ -503,7 +503,7 @@ struct Printer {
     } else if (auto* v = std::get_if<Pexp_extension>(&e.desc)) {
       line(j, "Pexp_extension \"" + v->name + "\"");
       ext_payload(j, v->payload);
-    } else if (auto* v = std::get_if<Pexp_letop>(&e.desc)) {
+    } else if (auto* v = get_boxed<Pexp_letop>(&e.desc)) {
       line(j, "Pexp_letop");
       binding_op(j, v->let_);
       if (v->ands.empty()) line(j, "[]");  // list i binding_op ands
