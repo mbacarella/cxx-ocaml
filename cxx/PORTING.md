@@ -249,14 +249,16 @@ Allocated_const, Parameter and Projection; the identifiers in
 Tbl modules as `hashtbl.hpp`'s OCaml Hashtbl), Flambda_iterators,
 Flambda_utils, Internal_variable_names, Closure_conversion, Lift_code,
 Inconstant_idents, Alias_analysis, Lift_constants (with utils'
-Strongly_connected_components), Effect_analysis, Inlining_cost,
+Strongly_connected_components), Share_constants,
+Remove_unused_program_constructs, Lift_let_to_initialize_symbol,
+Remove_unused_closure_vars, Effect_analysis, Inlining_cost,
 Simple_value_approx, Export_info with the .cmx's flambda export info
 (decoded: `c++cmxinfo` prints it as ocamlobjinfo does, 336/336 of the
 tree's .cmx), Import_approx and Compilenv's flambda half.
 `NATIVE=1 DUMP=drawflambda lambda_port_parity.sh` compares closure
 conversion; `DUMP=dflambda-verbose` the program before each pass (the
 port's dump, which stops at the first pass not ported, against the same
-prefix of ocamlopt's): through Lift_constants, 6553/6553 probes (also
+prefix of ocamlopt's): up to Inline_and_simplify, 6553/6553 probes (also
 `-Oclassic`), 787/787 testsuite files, 272/272 compiler sources.  The
 passes create variables and set-of-closures ids in ocamlopt's evaluation
 order and its tables' iteration orders: the stamps are in the dumps.

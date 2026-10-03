@@ -8,6 +8,10 @@
 #include "cppcaml/typing/closure_conversion.hpp"
 #include "cppcaml/typing/lift_code.hpp"
 #include "cppcaml/typing/lift_constants.hpp"
+#include "cppcaml/typing/lift_let_to_initialize_symbol.hpp"
+#include "cppcaml/typing/remove_unused_closure_vars.hpp"
+#include "cppcaml/typing/remove_unused_program_constructs.hpp"
+#include "cppcaml/typing/share_constants.hpp"
 
 namespace cppcaml::typing::flambda_middle_end {
 
@@ -39,16 +43,25 @@ flambda::Program lambda_to_flambda(format::Formatter& ppf_dump, long size, Ident
             [&](format::Formatter& f) { flambda::print_program(f, flam); });
   Pass lift_lets = lift_code::lift_lets;
   Pass lift_constants = lift_constants::lift_constants;
+  Pass share_constants = share_constants::share_constants;
+  Pass remove_unused_program_constructs = remove_unused_program_constructs::remove_unused_program_constructs;
+  Pass lift_let_to_initialize_symbol = lift_let_to_initialize_symbol::lift;
+  Pass remove_unused_closure_vars = [](const Program& p) {
+    return remove_unused_closure_vars::remove_unused_closure_variables(false, p);
+  };
+  Pass remove_unused_closure_vars_back_end = [](const Program& p) {
+    return remove_unused_closure_vars::remove_unused_closure_variables(true, p);
+  };
   Pass not_ported = nullptr;
   if (clflags::classic_inlining) {
     // fast_mode
     pass_number = 0;
     flam = step(flam, "lift_lets 1", lift_lets);
     flam = step(flam, "Lift_constants", lift_constants);
-    flam = step(flam, "Share_constants", not_ported);
-    flam = step(flam, "Lift_let_to_initialize_symbol", not_ported);
+    flam = step(flam, "Share_constants", share_constants);
+    flam = step(flam, "Lift_let_to_initialize_symbol", lift_let_to_initialize_symbol);
     flam = step(flam, "Inline_and_simplify", not_ported);
-    flam = step(flam, "Remove_unused_closure_vars 2", not_ported);
+    flam = step(flam, "Remove_unused_closure_vars 2", remove_unused_closure_vars);
     flam = step(flam, "Ref_to_variables", not_ported);
     flam = step(flam, "Initialize_symbol_to_let_symbol", not_ported);
   } else {
@@ -60,25 +73,25 @@ flambda::Program lambda_to_flambda(format::Formatter& ppf_dump, long size, Ident
       // duplicate strings.
       flam = step(flam, "lift_lets 1", lift_lets);
       flam = step(flam, "Lift_constants", lift_constants);
-      flam = step(flam, "Share_constants", not_ported);
-      flam = step(flam, "Remove_unused_program_constructs", not_ported);
-      flam = step(flam, "Lift_let_to_initialize_symbol", not_ported);
+      flam = step(flam, "Share_constants", share_constants);
+      flam = step(flam, "Remove_unused_program_constructs", remove_unused_program_constructs);
+      flam = step(flam, "Lift_let_to_initialize_symbol", lift_let_to_initialize_symbol);
       flam = step(flam, "lift_lets 2", lift_lets);
-      flam = step(flam, "Remove_unused_closure_vars 1", not_ported);
+      flam = step(flam, "Remove_unused_closure_vars 1", remove_unused_closure_vars);
       flam = step(flam, "Inline_and_simplify", not_ported);
-      flam = step(flam, "Remove_unused_closure_vars 2", not_ported);
+      flam = step(flam, "Remove_unused_closure_vars 2", remove_unused_closure_vars);
       flam = step(flam, "lift_lets 3", lift_lets);
       flam = step(flam, "Inline_and_simplify noinline", not_ported);
-      flam = step(flam, "Remove_unused_closure_vars 3", not_ported);
+      flam = step(flam, "Remove_unused_closure_vars 3", remove_unused_closure_vars);
       flam = step(flam, "Ref_to_variables", not_ported);
       flam = step(flam, "Initialize_symbol_to_let_symbol", not_ported);
     }
   }
   // back_end
-  flam = step(flam, "Remove_unused_closure_vars", not_ported);
+  flam = step(flam, "Remove_unused_closure_vars", remove_unused_closure_vars_back_end);
   flam = step(flam, "Lift_constants", lift_constants);
-  flam = step(flam, "Share_constants", not_ported);
-  flam = step(flam, "Remove_unused_program_constructs", not_ported);
+  flam = step(flam, "Share_constants", share_constants);
+  flam = step(flam, "Remove_unused_program_constructs", remove_unused_program_constructs);
   // (the unused [@inlined] / [@unrolled] warnings)
   if (clflags::dump_flambda)
     fprintf(ppf_dump, "End of middle end:@ %a@.", [&](format::Formatter& f) { flambda::print_program(f, flam); });
