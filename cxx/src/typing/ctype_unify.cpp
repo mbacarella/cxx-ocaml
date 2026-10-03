@@ -1665,13 +1665,46 @@ static void unify_row_field(const Uenv& uenv, const FixedExplanation* fixed1,
                             const FixedExplanation* fixed2, TypeExpr* rm1, TypeExpr* rm2,
                             std::string_view l, const RowField* f1, const RowField* f2);
 
+// The field lists unify_row works on (row_repr's, merge_row_fields') are its
+// temporaries (the GC reclaims them in ocamlc): they are made in a scratch
+// zone, dropped when the outermost unify_row returns.  The one that becomes
+// part of a type (the merged row's rest) is copied out of it.
+namespace {
+Zone* g_row_zone = nullptr;  // the scratch zone while a unify_row runs
+struct RowScope {
+  bool outer = false;
+  RowScope() {
+    static Zone scratch;
+    if (!g_row_zone) {
+      scratch.scratch = true;
+      g_row_zone = &scratch;
+      outer = true;
+    }
+  }
+  ~RowScope() {
+    if (outer) {
+      g_row_zone->clear();
+      g_row_zone = nullptr;
+    }
+  }
+  RowScope(const RowScope&) = delete;
+  RowScope& operator=(const RowScope&) = delete;
+};
+// a list that becomes part of a type: out of the scratch zone
+Slice<RowFieldEntry> lasting(Slice<RowFieldEntry> l) {
+  if (l.empty() || !g_row_zone->owns(reinterpret_cast<const char*>(l.begin()))) return l;
+  return slice(std::vector<RowFieldEntry>(l.begin(), l.end()));
+}
+}  // namespace
+
 static void unify_row(const Uenv& uenv, const RowDesc* row1, const RowDesc* row2) {
-  RowDescRepr r1d = row_repr(row1);
-  RowDescRepr r2d = row_repr(row2);
+  RowScope scope;
+  RowDescRepr r1d = row_repr(row1, g_row_zone);
+  RowDescRepr r2d = row_repr(row2, g_row_zone);
   TypeExpr* rm1 = r1d.more;
   TypeExpr* rm2 = r2d.more;
   if (unify_eq(uenv, rm1, rm2)) return;
-  MergedRowFields m = merge_row_fields(r1d.fields, r2d.fields);
+  MergedRowFields m = merge_row_fields(r1d.fields, r2d.fields, g_row_zone);
   auto& r1 = m.r1;
   auto& r2 = m.r2;
   auto& pairs = m.pairs;
@@ -1723,7 +1756,7 @@ static void unify_row(const Uenv& uenv, const RowDesc* row1, const RowDesc* row2
   else
     name = nullptr;
   auto set_more = [&](et::Position pos, const RowDesc* row, Slice<RowFieldEntry> rest) {
-    if (closed) rest = slice(filter_row_fields(row_closed(row), rest));
+    if (closed) rest = slice_in(*g_row_zone, filter_row_fields(row_closed(row), rest));
     const FixedExplanation* fx = fixed_explanation(row);
     if (!fx) {
       if (!rest.empty() && row_closed(row)) {
@@ -1760,7 +1793,7 @@ static void unify_row(const Uenv& uenv, const RowDesc* row1, const RowDesc* row2
       if (is_Tvar(rm)) link_type(rm, more);
       else unify_rec(uenv, rm, more);
     } else {
-      TypeExpr* ty = newgenty(tvariant(create_row(slice(rest), more, closed, fixed, name)));
+      TypeExpr* ty = newgenty(tvariant(create_row(lasting(rest), more, closed, fixed, name)));
       update_level_for(TraceExn::Unify, get_env(uenv), get_level(rm), ty);
       update_scope_for(TraceExn::Unify, get_scope(rm), ty);
       link_type(rm, ty);

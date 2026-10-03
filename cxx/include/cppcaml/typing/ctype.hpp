@@ -332,8 +332,9 @@ struct MergedRowFields {
   };
   std::vector<Pair> pairs;
 };
+// (the lists it makes are made in [in], the current zone by default)
 MergedRowFields merge_row_fields(Slice<RowFieldEntry> fi1,
-                                 Slice<RowFieldEntry> fi2);
+                                 Slice<RowFieldEntry> fi2, Zone* in = nullptr);
 std::vector<RowFieldEntry> filter_row_fields(bool erase, Slice<RowFieldEntry> fi);
 
 // ---- genericity -------------------------------------------------------------------------

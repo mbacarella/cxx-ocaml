@@ -397,7 +397,7 @@ static bool mem_assoc(std::string_view l, Slice<RowFieldEntry> fi) {
   return std::any_of(fi.begin(), fi.end(), [&](const RowFieldEntry& e) { return e.label == l; });
 }
 
-MergedRowFields merge_row_fields(Slice<RowFieldEntry> fi1, Slice<RowFieldEntry> fi2) {
+MergedRowFields merge_row_fields(Slice<RowFieldEntry> fi1, Slice<RowFieldEntry> fi2, Zone* in) {
   MergedRowFields r;
   if (fi1.empty() || fi2.empty() ||
       (fi1.size() == 1 && !mem_assoc(fi1[0].label, fi2)) ||
@@ -424,8 +424,8 @@ MergedRowFields merge_row_fields(Slice<RowFieldEntry> fi1, Slice<RowFieldEntry> 
   }
   for (; i < s1.size(); ++i) r1.push_back(s1[i]);
   for (; j < s2.size(); ++j) r2.push_back(s2[j]);
-  r.r1 = slice(r1);
-  r.r2 = slice(r2);
+  r.r1 = slice_in(in ? *in : zone(), r1);
+  r.r2 = slice_in(in ? *in : zone(), r2);
   return r;
 }
 
