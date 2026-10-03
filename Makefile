@@ -3125,3 +3125,11 @@ clean-for-dune:
 	rm -f stdlib/std_exit.{o,cmo,cmx}
 	rm -f otherlibs/str/str.cma
 	rm -f otherlibs/unix/unix.cma
+
+# The C++ compiler, c++ocamlc / c++ocamlopt (cxx/Makefile, cxx/PORTING.md):
+# its release build in cxx/build-release/, its debug build in cxx/build/
+.PHONY: cxx cxx-debug
+cxx:
+	$(MAKE) -C cxx
+cxx-debug:
+	$(MAKE) -C cxx debug

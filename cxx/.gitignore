@@ -8,3 +8,5 @@ oracle/*.o
 
 # clangd index cache
 .cache/
+# per-checkout settings of cxx/Makefile (not under version control)
+Makefile.local

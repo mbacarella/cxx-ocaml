@@ -24,7 +24,7 @@
 #     cxx/harness/exec_parity.sh
 # Environment: DIR=, ZSTD=<zstd store path>, ZSTD_DEV=<its -dev output>,
 #   MIMALLOC=, MIMALLOC_DEV= (default: found in /nix/store), CXX= (the C++
-#   compiler, default the one cxx/build-release was configured with).
+#   compiler, default g++).
 set -euo pipefail
 SELF="$(readlink -f "$0")"
 ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
@@ -37,7 +37,7 @@ MIMALLOC_DEV="${MIMALLOC_DEV:-$(pick 'mimalloc-3.4.5-dev')}"
 for v in ZSTD ZSTD_DEV MIMALLOC MIMALLOC_DEV; do
   [ -d "${!v}" ] || { echo "zstd_reference.sh: $v not found (set $v=, e.g. nix build nixpkgs#zstd.dev)" >&2; exit 2; }
 done
-CXX_COMPILER="${CXX:-$(sed -n 's/^CMAKE_CXX_COMPILER:[A-Z]*=//p' "$ROOT/cxx/build-release/CMakeCache.txt")}"
+CXX_COMPILER="${CXX:-g++}"
 ulimit -v 16000000
 
 if [ ! -x "$DIR/ocamlc.opt" ]; then
@@ -51,8 +51,6 @@ fi
 ( cd "$DIR" && cxx/harness/gen_driver_tables.sh )
 grep -q "compression_supported = true" "$DIR/cxx/include/cppcaml/typing/config_link.inc" ||
   { echo "zstd_reference.sh: $DIR's runtime has no zstd" >&2; exit 2; }
-cmake -S "$DIR/cxx" -B "$DIR/cxx/build-release" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CXX_COMPILER="$CXX_COMPILER" \
-  "-DCMAKE_PREFIX_PATH=$MIMALLOC;$MIMALLOC_DEV;$ZSTD;$ZSTD_DEV" > /dev/null
-ninja -C "$DIR/cxx/build-release" c++ocamlc c++typing-dump
+make -C "$DIR/cxx" -j12 CXX="$CXX_COMPILER" MIMALLOC="$MIMALLOC $MIMALLOC_DEV" \
+  ZSTD_CFLAGS="-I$ZSTD_DEV/include" ZSTD_LIBS="-L$ZSTD/lib -Wl,-rpath,$ZSTD/lib -lzstd" c++ocamlc c++typing-dump
 echo "ready: $DIR (ocamlc.opt with zstd; cxx/build-release/c++ocamlc configured for it)"

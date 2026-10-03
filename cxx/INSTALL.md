@@ -38,16 +38,18 @@ branch gives it that branch's `ocaml-option-cxx`.)
 `ocaml-option-cxx` on this branch requires `ocaml-variants` 5.5.x, so the
 two pins must come from the same branch.
 
-Requirements, besides OCaml's own: `clang++` 18 or newer (`CXX` selects
-another C++23 compiler), `cmake`, `ninja`, and -- when OCaml is built with
-zstd, the default -- libzstd's development files (`ocaml-option-cxx.opam`
-lists them as depexts).  The native compiler is needed (not
+Requirements, besides OCaml's own: `g++` 13 or newer (`CXX` selects
+another C++23 compiler, clang++ 18 or newer works too) and -- when OCaml is
+built with zstd, the default -- libzstd's development files
+(`ocaml-option-cxx.opam` lists them as depexts).  It builds with GNU make,
+like OCaml (`cxx/Makefile`).  The native compiler is needed (not
 `ocaml-option-bytecode-only`): c++ocamlc's configuration is read from the
 installed OCaml by a native program.  opam downloads mimalloc's sources
 (a checksummed `extra-source`); c++ocamlc links its allocator statically.
 
 What the build does (`cxx/opam/build-cxx.sh`, in `ocaml-variants`' build
-stage): it builds mimalloc; installs the tree into a stage (`make install
+stage): it builds mimalloc's allocator override (one C file, with the C
+compiler); installs the tree into a stage (`make install
 DESTDIR=`: the installation is `--with-relative-libdir`, so the stage
 resolves its standard library as the real one will); generates
 c++ocamlc's driver tables (Config, the option list, warning descriptions)
