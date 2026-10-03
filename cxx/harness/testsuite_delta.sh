@@ -18,9 +18,10 @@
 #     anything would REBUILD THE ORACLE (parsing/ carries newer mtimes than the
 #     rest of the tree).  ocamltest is built by running only the ocamltest/-
 #     scoped commands of `make -n ocamltest/ocamltest`.  Never `make` here.
-#  2. Run inside `nix develop`: outside it, native and -custom links fail
-#     (system ld vs the nix glibc the runtime was built with).  Such failures
-#     cancel in the delta but pollute the absolute numbers, so we warn.
+#  2. Run with the C toolchain the tree was configured with (Makefile.config's
+#     CC): with another one, native and -custom links fail (its ld and libc
+#     against the runtime's).  Such failures cancel in the delta but pollute
+#     the absolute numbers, so we warn.
 #  3. ocamltest interleaves subprocess stderr into its own " ... testing" status
 #     lines; the parser strips the junk, else ~150 results silently vanish.
 #  4. `compare-bytecode-programs` (exe bytes vs ocamlc.opt's) is the LAST action
@@ -46,10 +47,9 @@ CPP=$ROOT/cxx/build/c++ocamlc
 mkdir -p "$WORK"
 die() { echo "FATAL: $*" >&2; exit 1; }
 
-case "$(command -v clang)" in
-  /nix/store/*) ;;
-  *) echo "WARNING: clang is not the nix toolchain -- run inside 'nix develop'; native/-custom links will fail on both sides." >&2 ;;
-esac
+cc=$(sed -n 's/^CC=//p' "$ROOT/Makefile.config" | awk '{print $1}')
+command -v "$cc" >/dev/null ||
+  echo "WARNING: the tree's C compiler ($cc, Makefile.config) is not on PATH -- native/-custom links will fail on both sides." >&2
 
 # ---------------------------------------------------------------------------
 # 1. ocamltest, hand-built from make's own dry run (FOOTGUN 1).

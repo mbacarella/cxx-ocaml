@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Parser parity: diff c++parse against `ocamlc -dparsetree` over the corpus.
-# Run inside the nix dev shell (needs ./ocamlc.opt). Usage: parse_parity.sh [N]
+# Needs the built tree (./ocamlc.opt). Usage: parse_parity.sh [N]
 set -u
 cd "$(dirname "$0")/../.." || exit 1
 
