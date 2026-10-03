@@ -424,6 +424,14 @@ Slice<T> slice(const std::vector<T>& v) {
   std::uninitialized_copy(v.begin(), v.end(), p);
   return {p, v.size()};
 }
+// ... in the given zone
+template <class T>
+Slice<T> slice_in(Zone& z, const std::vector<T>& v) {
+  if (v.empty()) return {};
+  T* p = static_cast<T*>(z.alloc(sizeof(T) * v.size(), alignof(T)));
+  std::uninitialized_copy(v.begin(), v.end(), p);
+  return {p, v.size()};
+}
 // a Slice is already the list: the same list (its identity kept)
 template <class T>
 Slice<T> slice(Slice<T> s) {

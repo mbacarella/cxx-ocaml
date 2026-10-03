@@ -614,14 +614,14 @@ const RowDesc* create_row(Slice<RowFieldEntry> fields, TypeExpr* more, bool clos
   return make<RowDesc>(fields, more, closed, fixed, name);
 }
 
-Slice<RowFieldEntry> row_fields(const RowDesc* row) {
+Slice<RowFieldEntry> row_fields(const RowDesc* row, Zone* in) {
   auto* v = as<Tvariant>(get_desc(row->row_more));
   if (!v) return row->row_fields;
-  Slice<RowFieldEntry> rest = row_fields(v->row);
+  Slice<RowFieldEntry> rest = row_fields(v->row, in);
   if (row->row_fields.empty()) return rest;  // [] @ l == l
   std::vector<RowFieldEntry> out(row->row_fields.begin(), row->row_fields.end());
   out.insert(out.end(), rest.begin(), rest.end());
-  return slice(out);
+  return slice_in(in ? *in : zone(), out);
 }
 
 static const RowDesc* row_repr_no_fields(const RowDesc* row) {
@@ -662,8 +662,8 @@ const RowDesc* subst_row_name_path(
   return set_row_name(row, make<PathArgs>(path::subst(id_map, nm->path), nm->args, nm->tail));
 }
 
-RowDescRepr row_repr(const RowDesc* row) {
-  auto fields = row_fields(row);
+RowDescRepr row_repr(const RowDesc* row, Zone* in) {
+  auto fields = row_fields(row, in);
   const RowDesc* r = row_repr_no_fields(row);
   return {std::move(fields), r->row_more, r->row_closed, r->row_fixed, r->row_name};
 }

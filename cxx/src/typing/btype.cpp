@@ -146,9 +146,14 @@ bool has_fixed_explanation(const RowDesc* row) { return fixed_explanation(row) !
 
 bool static_row(const RowDesc* row) {
   if (!row_closed(row)) return false;
-  for (auto& e : row_fields(row))
-    if (row_field_repr(e.field).kind == RowFieldView::Kind::Reither) return false;
-  return true;
+  // (row_fields' fields in order, without making their list)
+  for (;;) {
+    for (auto& e : row->row_fields)
+      if (row_field_repr(e.field).kind == RowFieldView::Kind::Reither) return false;
+    auto* v = as<Tvariant>(get_desc(row->row_more));
+    if (!v) return true;
+    row = v->row;
+  }
 }
 
 long hash_variant(std::string_view s) {

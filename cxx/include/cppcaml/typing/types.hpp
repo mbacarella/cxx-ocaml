@@ -611,7 +611,8 @@ const RowDesc* create_row(Slice<RowFieldEntry> fields, TypeExpr* more, bool clos
 // row_fields: the row's own list when no row is chained after it (its
 // identity kept, as OCaml returns row.row_fields itself), else the lists
 // appended -- a new list, but the tail's own when the head is empty (@)
-Slice<RowFieldEntry> row_fields(const RowDesc* row);
+// (a list it makes is made in [in], the current zone by default)
+Slice<RowFieldEntry> row_fields(const RowDesc* row, Zone* in = nullptr);
 TypeExpr* row_more(const RowDesc* row);
 bool row_closed(const RowDesc* row);
 const FixedExplanation* row_fixed(const RowDesc* row);
@@ -627,7 +628,7 @@ struct RowDescRepr {
   const FixedExplanation* fixed;
   const PathArgs* name;
 };
-RowDescRepr row_repr(const RowDesc* row);
+RowDescRepr row_repr(const RowDesc* row, Zone* in = nullptr);
 
 struct RowFieldView {  // Rpresent of type_expr option | Reither of .. | Rabsent
   enum class Kind : std::uint8_t { Rpresent, Reither, Rabsent };
