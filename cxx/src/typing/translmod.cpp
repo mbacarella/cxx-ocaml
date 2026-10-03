@@ -958,7 +958,7 @@ long module_block_size(std::size_t n_component_names, const MC* coercion) {
   }
 }
 
-L::Program transl_implementation_flambda(std::string_view module_name, const tt::Structure* str, const MC* cc) {
+L::Program transl_implementation_flambda_(std::string_view module_name, const tt::Structure* str, const MC* cc) {
   translobj::reset_labels();
   primitive_declarations.clear();
   translprim::clear_used_primitives();
@@ -1528,8 +1528,12 @@ std::vector<std::pair<Ident::t, std::string>> aliased_idents;
 
 }  // namespace
 
+L::Program transl_implementation_flambda(std::string_view module_name, const tt::Structure* str, const MC* cc) {
+  return transl_implementation_flambda_(module_name, str, cc);
+}
+
 L::Program transl_implementation(std::string_view module_name, const tt::Structure* str, const MC* cc) {
-  L::Program implementation = transl_implementation_flambda(module_name, str, cc);
+  L::Program implementation = transl_implementation_flambda_(module_name, str, cc);
   implementation.code = L::lprim(pglobal(Primitive::K::Psetglobal, implementation.module_ident),
                                  slice<Lam>({implementation.code}), ScopedLocation{});
   return implementation;

@@ -15,6 +15,10 @@ namespace cppcaml::typing::translmod {
 // transl_implementation module_name (structure, coercion)
 lambda::Program transl_implementation(std::string_view module_name, const typedtree::Structure* str,
                                       const typedtree::ModuleCoercion* cc);
+// transl_implementation_flambda module_name (structure, coercion): the
+// native code with flambda (Optcompile.flambda)
+lambda::Program transl_implementation_flambda(std::string_view module_name, const typedtree::Structure* str,
+                                              const typedtree::ModuleCoercion* cc);
 // transl_store_implementation module_name (structure, coercion): the native
 // compiler's (the defined values stored in the global block as they are
 // defined; Clflags.native_code)

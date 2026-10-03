@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "cppcaml/typing/builtin_attributes.hpp"
+#include "cppcaml/typing/config.hpp"
 #include "cppcaml/typing/location.hpp"
 #include "typecore_internal.hpp"
 
@@ -22,8 +23,8 @@ using lam_t = cppcaml::typing::lambda::lambda;
 
 namespace {
 
-// Config.flambda (ocamlc: false)
-constexpr bool config_flambda = false;
+// Config.flambda (the configuration's: ocamlc's too)
+constexpr bool config_flambda = config::flambda;
 
 // Builtin_attributes.attribute_action = Return | Mark_used_only
 enum class Action { Return, Mark_used_only };
