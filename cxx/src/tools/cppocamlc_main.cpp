@@ -805,6 +805,7 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
           } catch (const ty::flambda_middle_end::NotPorted& e) {
             stopped_at = e.what();
           }
+          lap("flambda", tp);
           ppf_dump.out() << dump.contents();
           ppf_dump.out().flush();
           std::cerr << CPPCAML_SELF ": the flambda middle end (" << stopped_at << ") is not ported yet\n";
