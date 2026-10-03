@@ -16,8 +16,8 @@
 #
 # Toolchain A = cxx/build (cxx/Makefile's compiler, g++, via require_fresh).
 # Toolchain B = cxx/build-alt: built here by cxx/Makefile with the SYSTEM
-# clang++ in a clean environment (no nix paths -- nix's ld wrapper would inject
-# nix rpaths into a system link), mimalloc off.  Override with ALT_BUILD=<dir>
+# clang++ in a clean environment (the system's tools only: another toolchain's
+# linker on PATH could inject its rpaths into the link), mimalloc off.  Override with ALT_BUILD=<dir>
 # (a directory under cxx/) or CXX_B=<compiler> to pick the second compiler.
 #
 # Usage: bash cxx/harness/toolchain_determinism.sh
@@ -38,9 +38,9 @@ env -i PATH=/usr/bin:/bin HOME="$HOME" make -C cxx -j"$(nproc)" O="$ALT_BUILD" C
   || { grep -E 'error' "cxx/$ALT_BUILD/make.log" | head -5 >&2; die "toolchain B build failed"; }
 B=$ROOT/cxx/$ALT_BUILD/c++ocamlc
 # Environment-independent check (ldd would resolve against the CURRENT shell's
-# libraries): a system-g++ link done inside the nix shell carries nix RUNPATHs.
-readelf -d "$B" 2>/dev/null | grep -E 'RPATH|RUNPATH' | grep -q /nix/store \
-  && die "$B carries a /nix/store RUNPATH -- linked inside the nix shell?"
+# libraries): a link with the system's tools carries no RUNPATH.
+readelf -d "$B" 2>/dev/null | grep -qE 'RPATH|RUNPATH' \
+  && die "$B carries an RPATH/RUNPATH -- linked with a non-system toolchain?"
 
 # 2. The DDC corpus (the compiler's own sources), compiled by both.
 extract_cl() { awk '
