@@ -26,6 +26,16 @@ Zone* g_types_zone = nullptr;
 ZoneScope::ZoneScope(Zone& z) : saved(g_zone) { g_zone = &z; }
 ZoneScope::~ZoneScope() { g_zone = saved; }
 const void* fresh_identity() { return zone().alloc(1, 1); }
+std::vector<const Zone*>& transient_zones() {
+  static std::vector<const Zone*> v;
+  return v;
+}
+std::string_view keep_str(std::string_view s) {
+  if (!s.data()) return s;
+  for (const Zone* z : transient_zones())
+    if (z->owns(s.data())) return permanent_zone().str(s);
+  return s;
+}
 
 static std::unordered_map<std::uint64_t, std::unordered_map<std::size_t, const std::string_view*>>& fname_handles() {
   static std::unordered_map<std::uint64_t, std::unordered_map<std::size_t, const std::string_view*>> h;

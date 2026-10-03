@@ -12,7 +12,7 @@ using format::fprintf;
 
 namespace {
 const Tbl* empty_tbl() {
-  static const Tbl* e = make<Tbl>();
+  static const Tbl* e = permanent_zone().make<Tbl>();
   return e;
 }
 T active(const Tbl& tbl) { return T{make<Tbl>(tbl)}; }

@@ -25,16 +25,20 @@ class Lazy {
   Lazy() = default;
   static Lazy from_val(T v) {
     Lazy l;
-    l.cell_ = new Cell{true, std::move(v), {}};
+    l.cell_ = zone().make<Cell>(true, std::move(v), std::function<T()>{}, &zone());
     return l;
   }
   static Lazy of_fun(std::function<T()> f) {
     Lazy l;
-    l.cell_ = new Cell{false, T{}, std::move(f)};
+    l.cell_ = zone().make<Cell>(false, T{}, std::move(f), &zone());
     return l;
   }
+  // (the value is computed in the cell's zone: a cell of an approximation
+  // in a longer-lived zone than the current one -- an import's -- must not
+  // hold what the current zone allocates)
   const T& force() const {
     if (!cell_->forced) {
+      ZoneScope in_owner(*cell_->owner);
       cell_->value = cell_->thunk();
       cell_->forced = true;
       cell_->thunk = nullptr;
@@ -47,8 +51,9 @@ class Lazy {
     bool forced;
     T value;
     std::function<T()> thunk;
+    Zone* owner;
   };
-  Cell* cell_ = nullptr;  // (never freed: as the zone's)
+  Cell* cell_ = nullptr;
 };
 
 enum class BoxedInt : std::uint8_t { Int32, Int64, Nativeint };

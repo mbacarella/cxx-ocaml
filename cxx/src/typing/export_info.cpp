@@ -12,7 +12,7 @@ using format::Formatter;
 using format::fprintf;
 
 const T* empty() {
-  static const T* e = make<T>();
+  static const T* e = permanent_zone().make<T>();
   return e;
 }
 

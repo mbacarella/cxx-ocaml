@@ -302,6 +302,13 @@ class Zone {
   // strings are borrowed, not copied (zborrow).
   void adopt(const char* base, std::size_t n) { ranges_.emplace(base, n); }
 
+  // the bytes of block storage this zone holds
+  std::size_t bytes() const {
+    std::size_t n = 0;
+    for (const auto& r : ranges_) n += r.second;
+    return n;
+  }
+
   // whether [p] points into this zone's storage
   bool is_fixed() const { return fixed_; }
   bool owns(const char* p) const {
@@ -372,6 +379,12 @@ void set_zone(Zone* z);
 // Never dropped: process-long singletons (Predef's idents and types, the
 // shared constant descs) are allocated here, whatever zone is current.
 Zone& permanent_zone();
+// the transient zones alive (the flambda middle end registers its pass
+// zones here while they exist)
+std::vector<const Zone*>& transient_zones();
+// [s] itself, or a copy in the permanent zone where it is in a transient
+// zone (an identifier's name outlives it)
+std::string_view keep_str(std::string_view s);
 struct ZoneScope {
   Zone* saved;
   explicit ZoneScope(Zone& z);
