@@ -55,6 +55,7 @@
 #include "cppcaml/typing/cmm_helpers.hpp"
 #include "cppcaml/typing/translmod.hpp"
 #include "cppcaml/typing/compilenv.hpp"
+#include "cppcaml/typing/flambda_middle_end.hpp"
 #include "cppcaml/typing/misc.hpp"
 #include "cppcaml/typing/pparse.hpp"
 #include "cppcaml/typing/builtin_attributes.hpp"
@@ -793,7 +794,15 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
         ppf_dump.out().flush();
         lap("lambda", tp);
         if (!cf::should_stop_after(cf::Pass::Lambda)) {
-          std::cerr << CPPCAML_SELF ": the flambda middle end is not ported yet\n";
+          // Asmgen.compile_implementation: Compilenv.require_global on the
+          // required globals, the middle end (Flambda_middle_end): closure
+          // conversion so far
+          for (ty::Ident::t id : prog.required_globals) ty::compilenv::require_global(id);
+          ty::format::Formatter dump;
+          ty::flambda_middle_end::lambda_to_flambda(dump, prog.main_module_block_size, prog.module_ident, lam);
+          ppf_dump.out() << dump.contents();
+          ppf_dump.out().flush();
+          std::cerr << CPPCAML_SELF ": the flambda middle end (past closure conversion) is not ported yet\n";
           return 2;
         }
         return finish();

@@ -1611,8 +1611,14 @@ class CmxReader : public Reader {
     ui->ui_apply_fun = ints(f(id, 6));
     ui->ui_send_fun = ints(f(id, 7));
     std::size_t ei = f(id, 8);
-    if (tag(ei) != 0) throw Corrupt{};  // Flambda export info
-    ui->ui_export_info = approx(f(ei, 0));
+    if (tag(ei) == 1 && config::flambda) {
+      // Flambda of Export_info.t: not decoded yet (the flambda middle end
+      // reads it through Import_approx, not ported yet)
+      ui->ui_export_info = nullptr;
+    } else {
+      if (tag(ei) != 0) throw Corrupt{};
+      ui->ui_export_info = approx(f(ei, 0));
+    }
     ui->ui_force_link = boolean(f(id, 9));
     std::size_t fp = f(id, 10);
     if (!is_int(fp)) ui->ui_for_pack = str(f(fp, 0));
