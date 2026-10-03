@@ -9,6 +9,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <optional>
 
@@ -126,23 +127,30 @@ enum class DK : std::uint8_t {
   Value_string, Value_float_array, Value_unknown, Value_bottom, Value_extern, Value_symbol, Value_unresolved
 };
 
+// (the variants' payloads share storage: a Descr is read through the
+// fields of its kind only; zero-filled, every field holds the default it
+// had as a plain struct)
 struct Descr {
   DK kind;
-  tag::t tag = 0;               // Value_block
-  Slice<t> fields;              // Value_block
-  long i = 0;                   // Value_int, Value_char (the code)
-  std::optional<double> f;      // Value_float
-  BoxedInt bi = BoxedInt::Int32;  // Value_boxed_int
-  std::int64_t bival = 0;
-  const ValueSetOfClosures* set = nullptr;  // Value_set_of_closures
-  ValueClosure closure{};                   // Value_closure
-  ValueString str{};                        // Value_string
-  ValueFloatArray float_array{};            // Value_float_array
-  UnknownBecauseOf unknown{};               // Value_unknown
-  export_id::t ex = nullptr;                // Value_extern
-  symbol::t sym = nullptr;                  // Value_symbol
-  UnresolvedValue unresolved{};             // Value_unresolved
+  BoxedInt bi;     // Value_boxed_int
+  tag::t tag;      // Value_block
+  union {
+    Slice<t> fields;                    // Value_block
+    long i;                             // Value_int, Value_char (the code)
+    std::optional<double> f;            // Value_float
+    std::int64_t bival;                 // Value_boxed_int
+    const ValueSetOfClosures* set;      // Value_set_of_closures
+    ValueClosure closure;               // Value_closure
+    ValueString str;                    // Value_string
+    ValueFloatArray float_array;        // Value_float_array
+    UnknownBecauseOf unknown;           // Value_unknown
+    export_id::t ex;                    // Value_extern
+    symbol::t sym;                      // Value_symbol
+    UnresolvedValue unresolved;         // Value_unresolved
+  };
+  Descr() { std::memset(static_cast<void*>(this), 0, sizeof(Descr)); }
 };
+static_assert(sizeof(Descr) <= 48);
 
 struct SymbolRef {  // Symbol.t * int option
   symbol::t sym;
