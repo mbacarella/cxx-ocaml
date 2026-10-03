@@ -60,8 +60,11 @@ class ObjFile {
  public:
   // raises arg::SysError when the file cannot be read
   explicit ObjFile(const std::string& path);
+  ~ObjFile();
+  ObjFile(const ObjFile&) = delete;
+  ObjFile& operator=(const ObjFile&) = delete;
   const std::string& path() const { return path_; }
-  long size() const { return static_cast<long>(bytes_.size()); }
+  long size() const { return static_cast<long>(size_); }
   // really_input_string at pos: std::nullopt at end of file
   std::optional<std::string> read_string(long pos, long len) const;
   // input_binary_int at pos: std::nullopt at end of file
@@ -72,11 +75,16 @@ class ObjFile {
   // the bytes output_value would write for that value (marshal::raw_value),
   // without decoding it
   std::vector<std::uint8_t> raw_value(long& pos) const;
-  const std::uint8_t* data() const { return bytes_.data(); }
+  const std::uint8_t* data() const { return bytes_; }
+  // [pos, pos + len) read once and not again: its pages may go
+  void done_with(long pos, long len) const;
 
  private:
   std::string path_;
-  std::vector<std::uint8_t> bytes_;
+  // the file, mapped (read on demand, its pages the page cache's: a library
+  // is hundreds of megabytes)
+  const std::uint8_t* bytes_ = nullptr;
+  std::size_t size_ = 0;
 };
 struct EndOfFile {};
 

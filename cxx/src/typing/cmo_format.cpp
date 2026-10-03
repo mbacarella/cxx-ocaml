@@ -4,6 +4,11 @@
 #include <cerrno>
 #include <cstring>
 #include <fstream>
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <unordered_map>
 
 #include "cppcaml/marshal.hpp"
@@ -111,28 +116,46 @@ std::vector<std::string> CompUnit::primitives() const {
 }
 
 ObjFile::ObjFile(const std::string& path) : path_(path) {
-  std::ifstream f(path, std::ios::binary);  // open_in_bin
-  if (!f) throw arg::SysError(path + ": " + std::strerror(errno));
-  // (one read of the file's size, not a character at a time: a library is
-  // hundreds of megabytes)
-  f.seekg(0, std::ios::end);
-  std::streamoff n = f.tellg();
-  f.seekg(0);
-  if (n > 0) {
-    bytes_.resize(static_cast<std::size_t>(n));
-    f.read(reinterpret_cast<char*>(bytes_.data()), n);
-    bytes_.resize(static_cast<std::size_t>(f.gcount()));
+  int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);  // open_in_bin
+  if (fd < 0) throw arg::SysError(path + ": " + std::strerror(errno));
+  struct stat st;
+  if (::fstat(fd, &st) != 0) {
+    int e = errno;
+    ::close(fd);
+    throw arg::SysError(path + ": " + std::strerror(e));
   }
+  if (st.st_size > 0) {
+    void* p = ::mmap(nullptr, static_cast<std::size_t>(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0);
+    if (p == MAP_FAILED) {
+      int e = errno;
+      ::close(fd);
+      throw arg::SysError(path + ": " + std::strerror(e));
+    }
+    bytes_ = static_cast<const std::uint8_t*>(p);
+    size_ = static_cast<std::size_t>(st.st_size);
+  }
+  ::close(fd);
+}
+
+ObjFile::~ObjFile() {
+  if (bytes_) ::munmap(const_cast<std::uint8_t*>(bytes_), size_);
+}
+
+void ObjFile::done_with(long pos, long len) const {
+  // (the whole pages inside the range)
+  long page = ::sysconf(_SC_PAGESIZE);
+  long a = (pos + page - 1) / page * page, b = (pos + len) / page * page;
+  if (b > a) ::madvise(const_cast<std::uint8_t*>(bytes_) + a, static_cast<std::size_t>(b - a), MADV_DONTNEED);
 }
 
 std::optional<std::string> ObjFile::read_string(long pos, long len) const {
   if (pos < 0 || pos + len > size()) return std::nullopt;
-  return std::string(reinterpret_cast<const char*>(bytes_.data()) + pos, static_cast<std::size_t>(len));
+  return std::string(reinterpret_cast<const char*>(bytes_) + pos, static_cast<std::size_t>(len));
 }
 
 std::optional<long> ObjFile::read_binary_int(long pos) const {
   if (pos < 0 || pos + 4 > size()) return std::nullopt;
-  const std::uint8_t* b = bytes_.data() + pos;
+  const std::uint8_t* b = bytes_ + pos;
   std::uint32_t n = (static_cast<std::uint32_t>(b[0]) << 24) | (static_cast<std::uint32_t>(b[1]) << 16) |
                     (static_cast<std::uint32_t>(b[2]) << 8) | static_cast<std::uint32_t>(b[3]);
   return static_cast<long>(static_cast<std::int32_t>(n));  // input_binary_int: signed
@@ -144,7 +167,7 @@ V ObjFile::input_value(long& pos) const {
   std::size_t root;
   std::size_t off = static_cast<std::size_t>(pos);
   try {
-    root = m::read_value(bytes_.data(), bytes_.size(), off, arena);
+    root = m::read_value(bytes_, size_, off, arena);
   } catch (const std::exception&) {
     throw EndOfFile{};
   }
@@ -159,7 +182,7 @@ std::vector<std::uint8_t> ObjFile::raw_value(long& pos) const {
   std::size_t off = static_cast<std::size_t>(pos);
   std::vector<std::uint8_t> r;
   try {
-    r = m::raw_value(bytes_.data(), bytes_.size(), off);
+    r = m::raw_value(bytes_, size_, off);
   } catch (const std::exception&) {
     throw EndOfFile{};
   }

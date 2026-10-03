@@ -41,9 +41,9 @@ void copy_compunit(const ObjFile& ic, bytesections::OutChannel& oc, CompUnit& cu
   cu.set_int_field(cmo_format::cu_force_link, cu.force_link() || cf::link_everything ? 1 : 0);
   // copy_file_chunk ic oc cu_codesize (End_of_file when short)
   auto copy = [&](long from, long len) {
-    std::optional<std::string> chunk = ic.read_string(from, len);
-    if (!chunk) throw cmo_format::EndOfFile{};
-    oc.output_string(*chunk);
+    if (from < 0 || len < 0 || from + len > ic.size()) throw cmo_format::EndOfFile{};
+    oc.output_data(ic.data() + from, static_cast<std::size_t>(len));
+    ic.done_with(from, len);
   };
   copy(pos, cu.int_field(cmo_format::cu_codesize));
   long debug = cu.int_field(cmo_format::cu_debug);
@@ -111,32 +111,22 @@ std::vector<std::pair<std::string, CompUnit>> copy_object_file(bytesections::Out
   }
 }
 
-void write_file(const std::string& path, const std::string& data) {
-  int fd = ::open(path.c_str(), O_WRONLY | O_TRUNC | O_CREAT, 0666);  // open_out_bin
-  if (fd < 0) throw arg::SysError(path + ": " + std::strerror(errno));
-  std::size_t off = 0;
-  while (off < data.size()) {
-    ssize_t n = ::write(fd, data.data() + off, data.size() - off);
-    if (n <= 0) {
-      ::close(fd);
-      throw arg::SysError(path + ": " + std::strerror(errno));
-    }
-    off += static_cast<std::size_t>(n);
-  }
-  ::close(fd);
-}
 }  // namespace
 
 void create_archive(const std::vector<std::string>& file_list, const std::string& lib_name) {
-  write_file(lib_name, "");  // open_out_bin lib_name
-  struct Guard {  // ~exceptionally:(fun () -> remove_file lib_name)
+  int fd = ::open(lib_name.c_str(), O_WRONLY | O_TRUNC | O_CREAT | O_CLOEXEC, 0666);  // open_out_bin lib_name
+  if (fd < 0) throw arg::SysError(lib_name + ": " + std::strerror(errno));
+  struct Guard {  // ~always:(fun () -> close_out outchan) ~exceptionally:(fun () -> remove_file lib_name)
     std::string f;
+    int fd;
     bool armed = true;
     ~Guard() {
+      ::close(fd);
       if (armed) misc::remove_file(f);
     }
-  } guard{lib_name};
+  } guard{lib_name, fd};
   bytesections::OutChannel outchan;
+  outchan.to_file(fd, lib_name);
   outchan.output_string(config::cma_magic_number);
   long ofs_pos_toc = outchan.pos();
   outchan.output_binary_int(0);
@@ -177,8 +167,8 @@ void create_archive(const std::vector<std::string>& file_list, const std::string
     d.output_binary_int(pos_toc);
     depl = d.buf;
   }
-  outchan.buf.replace(static_cast<std::size_t>(ofs_pos_toc), 4, depl);  // seek_out; output_binary_int
-  write_file(lib_name, outchan.buf);
+  outchan.overwrite(ofs_pos_toc, depl);  // seek_out; output_binary_int
+  outchan.flush();
   guard.armed = false;
 }
 
