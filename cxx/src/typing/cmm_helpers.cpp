@@ -2068,7 +2068,7 @@ expression bytesset_safe(expression arg1, expression arg2, expression arg3, cons
 }
 
 expression arrayset_unsafe(L::ArrayKind kind, expression arg1, expression arg2, expression arg3, const Dbg& dbg) {
-  expression r;
+  expression r = nullptr;  // (every kind is a case)
   switch (kind) {
     case L::ArrayKind::Pgenarray:
       r = bind("newval", arg3, [&](expression newval) {
@@ -2088,7 +2088,7 @@ expression arrayset_unsafe(L::ArrayKind kind, expression arg1, expression arg2, 
 }
 
 expression arrayset_safe(L::ArrayKind kind, expression arg1, expression arg2, expression arg3, const Dbg& dbg) {
-  expression r;
+  expression r = nullptr;  // (every kind is a case)
   switch (kind) {
     case L::ArrayKind::Pgenarray:
       r = bind("newval", arg3, [&](expression newval) {
