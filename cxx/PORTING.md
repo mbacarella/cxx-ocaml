@@ -254,12 +254,22 @@ Remove_unused_program_constructs, Lift_let_to_initialize_symbol,
 Remove_unused_closure_vars, Effect_analysis, Inlining_cost,
 Simple_value_approx, Export_info with the .cmx's flambda export info
 (decoded: `c++cmxinfo` prints it as ocamlobjinfo does, 336/336 of the
-tree's .cmx), Import_approx and Compilenv's flambda half.
+tree's .cmx), Import_approx, Compilenv's flambda half, and
+Inline_and_simplify (with Inline_and_simplify_aux, Inlining_decision,
+Inlining_transforms, Inlining_stats -- the decisions, not the
+`-inlining-report` printer --, Freshening, Simplify_primitives and
+Simplify_boxed_integer_ops, Invariant_params, Extract_projections,
+Augment_specialised_args, Unbox_closures, Unbox_free_vars_of_closures,
+Unbox_specialised_args, Remove_free_vars_equal_to_args and
+Remove_unused_arguments).
 `NATIVE=1 DUMP=drawflambda lambda_port_parity.sh` compares closure
 conversion; `DUMP=dflambda-verbose` the program before each pass (the
 port's dump, which stops at the first pass not ported, against the same
-prefix of ocamlopt's): up to Inline_and_simplify, 6553/6553 probes (also
-`-Oclassic`), 787/787 testsuite files, 272/272 compiler sources.  The
+prefix of ocamlopt's): up to Ref_to_variables, 6553/6553 probes (also
+`-Oclassic`, `-O2`, `-g -O3`, `-unsafe`), 787/787 testsuite files and
+272/272 compiler sources (both also at `-O3`).  Inline_and_simplify runs
+at the round number before the loop's increment (0, 1, 2 under `-O3`;
+the dumps print 1, 2, 3): `-O3`'s per-round thresholds depend on it.  The
 passes create variables and set-of-closures ids in ocamlopt's evaluation
 order and its tables' iteration orders: the stamps are in the dumps.
 

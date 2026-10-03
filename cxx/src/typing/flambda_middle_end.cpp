@@ -4,8 +4,11 @@
 // middle end merely has to score byte-identical.
 #include "cppcaml/typing/flambda_middle_end.hpp"
 
+#include <functional>
+
 #include "cppcaml/typing/clflags.hpp"
 #include "cppcaml/typing/closure_conversion.hpp"
+#include "cppcaml/typing/inline_and_simplify.hpp"
 #include "cppcaml/typing/lift_code.hpp"
 #include "cppcaml/typing/lift_constants.hpp"
 #include "cppcaml/typing/lift_let_to_initialize_symbol.hpp"
@@ -17,7 +20,7 @@ namespace cppcaml::typing::flambda_middle_end {
 
 using format::fprintf;
 using flambda::Program;
-using Pass = Program (*)(const Program&);
+using Pass = std::function<Program(const Program&)>;
 
 flambda::Program lambda_to_flambda(format::Formatter& ppf_dump, long size, Ident::t module_ident,
                                    lambda::lambda module_initializer) {
@@ -52,6 +55,17 @@ flambda::Program lambda_to_flambda(format::Formatter& ppf_dump, long size, Ident
   Pass remove_unused_closure_vars_back_end = [](const Program& p) {
     return remove_unused_closure_vars::remove_unused_closure_variables(true, p);
   };
+  // the round Inline_and_simplify runs at: 0 in fast_mode, else the round
+  // number before the loop's [incr] (the dumps print it after)
+  long round = 0;
+  // (prefixname only names the -inlining-report files, which are not
+  // ported)
+  Pass inline_and_simplify = [&](const Program& p) {
+    return inline_and_simplify::run(false, "", round, ppf_dump, p);
+  };
+  Pass inline_and_simplify_noinline = [&](const Program& p) {
+    return inline_and_simplify::run(true, "", round, ppf_dump, p);
+  };
   Pass not_ported = nullptr;
   if (clflags::classic_inlining) {
     // fast_mode
@@ -60,13 +74,14 @@ flambda::Program lambda_to_flambda(format::Formatter& ppf_dump, long size, Ident
     flam = step(flam, "Lift_constants", lift_constants);
     flam = step(flam, "Share_constants", share_constants);
     flam = step(flam, "Lift_let_to_initialize_symbol", lift_let_to_initialize_symbol);
-    flam = step(flam, "Inline_and_simplify", not_ported);
+    flam = step(flam, "Inline_and_simplify", inline_and_simplify);
     flam = step(flam, "Remove_unused_closure_vars 2", remove_unused_closure_vars);
     flam = step(flam, "Ref_to_variables", not_ported);
     flam = step(flam, "Initialize_symbol_to_let_symbol", not_ported);
   } else {
     for (;;) {
       pass_number = 0;
+      round = round_number;
       ++round_number;
       if (round_number > clflags::rounds()) break;
       // Beware: [Lift_constants] must be run before any pass that might
@@ -78,10 +93,10 @@ flambda::Program lambda_to_flambda(format::Formatter& ppf_dump, long size, Ident
       flam = step(flam, "Lift_let_to_initialize_symbol", lift_let_to_initialize_symbol);
       flam = step(flam, "lift_lets 2", lift_lets);
       flam = step(flam, "Remove_unused_closure_vars 1", remove_unused_closure_vars);
-      flam = step(flam, "Inline_and_simplify", not_ported);
+      flam = step(flam, "Inline_and_simplify", inline_and_simplify);
       flam = step(flam, "Remove_unused_closure_vars 2", remove_unused_closure_vars);
       flam = step(flam, "lift_lets 3", lift_lets);
-      flam = step(flam, "Inline_and_simplify noinline", not_ported);
+      flam = step(flam, "Inline_and_simplify noinline", inline_and_simplify_noinline);
       flam = step(flam, "Remove_unused_closure_vars 3", remove_unused_closure_vars);
       flam = step(flam, "Ref_to_variables", not_ported);
       flam = step(flam, "Initialize_symbol_to_let_symbol", not_ported);
