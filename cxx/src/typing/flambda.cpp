@@ -2,6 +2,9 @@
 // projection.ml (see flambda.hpp).
 #include "cppcaml/typing/flambda.hpp"
 
+#include <map>
+#include <string>
+
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -181,6 +184,34 @@ void print(Formatter& ppf, t p) {
 }  // namespace projection
 
 namespace flambda {
+
+named n_const_literal(const char* unit, long n) {
+  static std::map<std::pair<std::string, long>, named> literals;
+  auto [it, fresh] = literals.try_emplace({unit, n}, nullptr);
+  if (fresh) {
+    ZoneScope in_permanent(permanent_zone());
+    it->second = n_const(const_int_literal(unit, n));
+  }
+  return it->second;
+}
+named n_allocated_const_literal(const char* unit, allocated_const::t (*make)(), const char* key) {
+  static std::map<std::pair<std::string, std::string>, named> literals;
+  auto [it, fresh] = literals.try_emplace({unit, key}, nullptr);
+  if (fresh) {
+    ZoneScope in_permanent(permanent_zone());
+    it->second = n_allocated_const(make());
+  }
+  return it->second;
+}
+
+Const const_int_literal(const char* unit, long n) {
+  static std::map<std::pair<std::string, long>, std::uint64_t> literals;
+  auto [it, fresh] = literals.try_emplace({unit, n}, 0);
+  if (fresh) it->second = next_value_identity();
+  Const c{Const::Kind::Int, n};
+  c.obj = it->second;
+  return c;
+}
 
 // ---- constructors -----------------------------------------------------------------
 t var(variable::t v) { return make<Var>(Var{{EK::Var}, v}); }

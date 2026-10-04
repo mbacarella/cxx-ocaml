@@ -89,7 +89,7 @@ const FunctionDeclaration* remove_params(const variable::Set& unused, const Func
   for (const Parameter& p : unused_params)
     if (fun_decl->free_variables.mem(p.var)) unused_free.push_back(p);
   t body = fun_decl->body;
-  for (const Parameter& p : unused_free) body = create_let(p.var, n_const(const_int(0)), body);
+  for (const Parameter& p : unused_free) body = create_let(p.var, FLAMBDA_NAMED_INT_LITERAL(0), body);
   return create_function_declaration(slice(used_params), body, fun_decl->stub, fun_decl->dbg, fun_decl->inline_,
                                      fun_decl->specialise, fun_decl->is_a_functor, new_fun_var, fun_decl->poll);
 }

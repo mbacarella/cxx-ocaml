@@ -6,6 +6,9 @@
 // right to left, a record's fields right to left in definition order.
 #include "cppcaml/typing/lambda.hpp"
 
+#include <map>
+#include <string>
+
 #include <algorithm>
 #include <stdexcept>
 
@@ -97,6 +100,15 @@ std::string_view string_of_scoped_location(const ScopedLocation& l) {
 }  // namespace debuginfo
 
 namespace lambda {
+
+ValueKind ValueKind::boxedint_literal(const char* unit, BoxedInteger b) {
+  static std::map<std::pair<std::string, int>, std::uint32_t> literals;
+  auto [it, fresh] = literals.try_emplace({unit, static_cast<int>(b)}, 0);
+  if (fresh) it->second = fresh_origin();
+  ValueKind k = boxedint(b);
+  k.origin = it->second;
+  return k;
+}
 
 using PK = Primitive::K;
 

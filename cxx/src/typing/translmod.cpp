@@ -1602,7 +1602,7 @@ std::pair<long, Lam> transl_store_package(Slice<Ident::t> component_names, Ident
   std::vector<Lam> cs;
   for (Ident::t id : component_names) cs.push_back(get_component(id));
   Lam components = L::lprim(pmakeblock(0, MutableFlag::Immutable), slice(cs), ScopedLocation{});
-  Ident::t blk = Ident::create_local("block");
+  Ident::t blk = Ident::create_local(OCAML_LIT("block"));
   Lam def = apply_coercion(ScopedLocation{}, LetKind::Strict, coercion, components);
   Lam body = make_sequence(coercion->pos_cc.size(), [&](long pos) {
     return setfield(pos, L::lprim(pfield(pos), slice<Lam>({L::lvar(blk)}), ScopedLocation{}));

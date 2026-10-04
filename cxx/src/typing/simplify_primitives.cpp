@@ -111,6 +111,7 @@ Result primitive(const clambda::Primitive& p, Slice<variable::t> args, const std
     mb.n = 0;
     mb.mut = MutableFlag::Immutable;
     mb.shape.some = true;
+    mb = CLAMBDA_PRIM_LITERAL(mb, "Pmakeblock(0, Immutable, Some [])");
     return {flambda::n_prim(mb, {}, dbg), A::value_block(tag::create_exn(0), {}), C::benefit::zero()};
   }
   if (p.kind == K::Pmakearray && p.array == lambda::ArrayKind::Pfloatarray) {

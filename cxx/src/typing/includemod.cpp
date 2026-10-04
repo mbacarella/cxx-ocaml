@@ -1057,7 +1057,7 @@ void check_modtype_equiv(const Location& loc, env::t env, Ident::t id, const Mod
 // ---- Check ----
 namespace check {
 namespace {
-Ident::t dummy_id() { return Ident::create_local("*dummy*"); }
+Ident::t dummy_id() { return Ident::create_local(OCAML_LIT("*dummy*")); }
 }  // namespace
 // check_ok f env subst l r: loc none, a fresh "*dummy*" ident, direction
 // unknown ~mark:false

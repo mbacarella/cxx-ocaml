@@ -1353,13 +1353,15 @@ lam_t transl_letop(scopes sc, const Location& loc, env::t env, const tt::Binding
 lam_t transl_extension_constructor(scopes sc, env::t env, Path::t path, const tt::TExtensionConstructor* ext) {
   // Printtyp.wrap_printing_env env ~error:true: cmi loading disabled
   if (path) env::without_cmis([&] { path = rewrite_double_underscore_paths(env, path); });
-  std::string name;
+  // (the ident's own string where OCaml's [name] is it: Ident.name, and
+  // Path.name of a Pident)
+  std::string_view name;
   if (!path)
-    name = std::string(ident::name(ext->ext_id));
+    name = ident::name(ext->ext_id);
   else if (!clflags::for_package)
-    name = path::name(path);
+    name = path->kind == Path::Kind::Pident ? ident::name(path->id) : zstr(path::name(path));
   else
-    name = *clflags::for_package + "." + path::name(path);
+    name = zstr(*clflags::for_package + "." + path::name(path));
   ScopedLocation loc = of_location(sc, ext->ext_loc);
   if (ext->ext_kind.kind == tt::TExtensionConstructorKind::Kind::Text_decl) {
     lam_t oo = L::lprim(prim_fresh_oo_id(), slice({L::lconst(L::const_int(0))}), loc);
@@ -1449,12 +1451,12 @@ lam_t transl_apply(scopes sc, TailcallAttribute tailcall, InlineAttribute inline
       args1 = args;
     lam_t lam2 = args1.empty() ? lam : lapply(lam, rev_map_fst(args1));
     // Evaluate the function, applied to the arguments in [args]
-    lam_t handle = protect("func", lam2);
+    lam_t handle = protect(OCAML_LIT("func"), lam2);
     // Evaluate the arguments whose applications was delayed
-    for (TArg& a : args2) a.arg = protect("arg", a.arg);
+    for (TArg& a : args2) a.arg = protect(OCAML_LIT("arg"), a.arg);
     // Evaluate the remaining arguments
     for (TArg& a : rest)
-      if (a.arg) a.arg = protect("arg", a.arg);
+      if (a.arg) a.arg = protect(OCAML_LIT("arg"), a.arg);
     Ident::t id_arg = Ident::create_local(OCAML_LIT("param"));
     // Process remaining arguments and build closure
     std::vector<TArg> nargs{TArg{L::lvar(id_arg), optional}};

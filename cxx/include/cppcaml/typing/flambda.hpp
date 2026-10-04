@@ -114,8 +114,16 @@ struct Const {
   enum class Kind : std::uint8_t { Int, Char };
   Kind kind;
   long n;  // the int, or the char's code
+  // the block's identity: one per construction, kept by copies (the .cmx
+  // writer shares it as ocamlopt's values are shared)
+  std::uint64_t obj = next_value_identity();
 };
 inline Const const_int(long n) { return {Const::Kind::Int, n}; }
+// a literal [Int n] of an OCaml source file: one block per file and value
+// (ocamlopt shares a unit's equal constants), the file being the C++ one
+// that ports it
+Const const_int_literal(const char* unit, long n);
+#define FLAMBDA_INT_LITERAL(n) ::cppcaml::typing::flambda::const_int_literal(__FILE__, n)
 
 struct SpecialisedTo {
   variable::t var;
@@ -331,6 +339,12 @@ named n_move_within_set_of_closures(const projection::MoveWithinSetOfClosures& m
 named n_project_var(const projection::ProjectVar& p);
 named n_prim(const clambda::Primitive& prim, Slice<variable::t> args, debuginfo::t dbg);
 named n_expr(t e);
+// the literal named values of an OCaml source file ([Const (Int n)],
+// [Allocated_const (Int32 0l)] ...): one block per file and value, in the
+// permanent zone
+named n_const_literal(const char* unit, long n);
+named n_allocated_const_literal(const char* unit, allocated_const::t (*make)(), const char* key);
+#define FLAMBDA_NAMED_INT_LITERAL(n) ::cppcaml::typing::flambda::n_const_literal(__FILE__, n)
 
 program_body let_symbol(symbol::t s, constant_defining_value def, program_body body);
 program_body let_rec_symbol(Slice<SymbolBinding> defs, program_body body);

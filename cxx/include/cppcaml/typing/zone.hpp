@@ -13,6 +13,7 @@
 #include <algorithm>
 
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -379,6 +380,13 @@ void set_zone(Zone* z);
 // Never dropped: process-long singletons (Predef's idents and types, the
 // shared constant descs) are allocated here, whatever zone is current.
 Zone& permanent_zone();
+// A value's identity where the port keeps OCaml's block as a plain struct
+// (copies keep it): a counter, never reused.
+inline std::uint64_t next_value_identity() {
+  static std::uint64_t n = 0;
+  return ++n;
+}
+
 // the transient zones alive (the flambda middle end registers its pass
 // zones here while they exist)
 std::vector<const Zone*>& transient_zones();

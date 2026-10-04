@@ -109,6 +109,10 @@ struct Primitive {
   unsigned long id = fresh_uconstant_id();
 };
 inline Primitive prim(Primitive::K k) { return Primitive{k}; }
+// a literal primitive of an OCaml source file ([Pintcomp Ceq] ...): one
+// block per file and value, so [p] takes the identity of the file's [key]
+Primitive prim_literal(const char* unit, Primitive p, std::string_view key);
+#define CLAMBDA_PRIM_LITERAL(p, key) ::cppcaml::typing::clambda::prim_literal(__FILE__, p, key)
 // Clambda_primitives.equal (structural)
 bool equal_primitive(const Primitive& a, const Primitive& b);
 
