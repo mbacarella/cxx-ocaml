@@ -2,6 +2,7 @@
 // cmm_helpers.hpp.  Effects (fresh variables, raise counts, constant
 // symbols, needed curry/apply/send functions) happen in OCaml's evaluation
 // order: a constructor's or an application's arguments right to left.
+#include "cppcaml/typing/config.hpp"
 #include "cppcaml/typing/cmm_helpers.hpp"
 
 #include <algorithm>
@@ -2238,10 +2239,14 @@ long fundecls_size(Slice<const clambda::UFunction*> fundecls) {
   return sz;
 }
 
-// Emit constant closures (Config.flambda = false: no closure symbols)
+// Emit constant closures
 std::vector<DataItem> emit_constant_closure(const Symb& symb, Slice<const clambda::UFunction*> fundecls,
                                             std::vector<DataItem> clos_vars, std::vector<DataItem> cont) {
   using DK = DataItem::K;
+  auto closure_symbol = [&](const clambda::UFunction* f) -> std::vector<DataItem> {
+    if constexpr (config::flambda) return cdefine_symbol({zstr(std::string(f->label) + "_closure"), symb.second});
+    else return {};
+  };
   if (fundecls.empty()) {
     // This should probably not happen: dead code has normally been
     // eliminated and a closure cannot be accessed without going through a
@@ -2257,15 +2262,17 @@ std::vector<DataItem> emit_constant_closure(const Symb& symb, Slice<const clambd
     const clambda::UFunction* f2 = fundecls[k];
     if (f2->arity == 1 || f2->arity == 0) {
       std::vector<DataItem> rest = emit_others(pos + 3, k + 1);
-      std::vector<DataItem> r{data_int(DK::Cint, infix_header(pos)), data_sym(DK::Csymbol_address, f2->label),
-                              data_int(DK::Cint, closure_info(f2->arity, startenv - pos))};
+      std::vector<DataItem> r{data_int(DK::Cint, infix_header(pos))};
+      r = cat(r, closure_symbol(f2));
+      r = cat(r, {data_sym(DK::Csymbol_address, f2->label), data_int(DK::Cint, closure_info(f2->arity, startenv - pos))});
       return cat(r, rest);
     }
     std::vector<DataItem> rest = emit_others(pos + 4, k + 1);
     std::string_view curry = curry_function_sym(f2->arity);
-    std::vector<DataItem> r{data_int(DK::Cint, infix_header(pos)), data_sym(DK::Csymbol_address, curry),
-                            data_int(DK::Cint, closure_info(f2->arity, startenv - pos)),
-                            data_sym(DK::Csymbol_address, f2->label)};
+    std::vector<DataItem> r{data_int(DK::Cint, infix_header(pos))};
+    r = cat(r, closure_symbol(f2));
+    r = cat(r, {data_sym(DK::Csymbol_address, curry), data_int(DK::Cint, closure_info(f2->arity, startenv - pos)),
+                data_sym(DK::Csymbol_address, f2->label)});
     return cat(r, rest);
   };
   const clambda::UFunction* f1 = fundecls[0];
@@ -2284,6 +2291,7 @@ std::vector<DataItem> emit_constant_closure(const Symb& symb, Slice<const clambd
   std::vector<DataItem> r{
       data_int(DK::Cint, black_closure_header(fundecls_size(fundecls) + static_cast<long>(clos_vars.size())))};
   r = cat(r, cdefine_symbol(symb));
+  r = cat(r, closure_symbol(f1));
   return cat(r, tail);
 }
 
