@@ -69,7 +69,27 @@ struct T {
   set_of_closures_id::Map<variable::Set> recursive;
 };
 
+// transient: what Build_export_info leaves for Flambda_to_clambda to
+// complete with the closures' layout (t_of_transient)
+struct Transient {
+  set_of_closures_id::Map<const A::FunctionDeclarations*> sets_of_closures;
+  CUMap<export_id::Map<const Descr*>> values;
+  symbol::Map<export_id::t> symbol_id;
+  set_of_closures_id::Map<variable::Map<variable::Set>> invariant_params;
+  set_of_closures_id::Map<variable::Set> recursive;
+  variable::Set relevant_local_closure_ids;             // Closure_id.Set
+  variable::Set relevant_imported_closure_ids;          // Closure_id.Set
+  variable::Set relevant_local_vars_within_closure;     // Var_within_closure.Set
+  variable::Set relevant_imported_vars_within_closure;  // Var_within_closure.Set
+};
+
 const T* empty();
+Transient opaque_transient(compilation_unit::t compilation_unit, symbol::t root_symbol);
+// t_of_transient transient ~program ~local_offset_fun ~local_offset_fv
+//   ~imported_offset_fun ~imported_offset_fv ~constant_closures
+const T* t_of_transient(const Transient& transient, const variable::Map<long>& local_offset_fun,
+                        const variable::Map<long>& local_offset_fv, const variable::Map<long>& imported_offset_fun,
+                        const variable::Map<long>& imported_offset_fv, const variable::Set& constant_closures);
 bool equal_approx(const Approx& a1, const Approx& a2);
 bool equal_descr(const Descr* d1, const Descr* d2);
 const T* merge(const T* t1, const T* t2);

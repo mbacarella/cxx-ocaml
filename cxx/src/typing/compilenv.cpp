@@ -133,6 +133,8 @@ void reset(const std::optional<std::string>& packname0, std::string_view name) {
     // merged_environment := Export_info.empty; Hashtbl.clear
     // export_infos_table (and imported_sets_of_closures_table)
     flambda_state() = FlambdaState{};
+    // (default_ui_export_info: Flambda Export_info.empty)
+    cu.ui_flambda_export_info = export_info::empty();
     import_approx::clear_imported_sets_of_closures_table();
     // (the unit outlives the typing zone current here: in the permanent
     // zone, its ident and linkage name with it)

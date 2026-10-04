@@ -16,6 +16,36 @@ const T* empty() {
   return e;
 }
 
+Transient opaque_transient(compilation_unit::t compilation_unit, symbol::t root_symbol) {
+  export_id::t export_id = export_id::create(compilation_unit);
+  Descr d{Descr::Kind::Value_unknown_descr};
+  export_id::Map<const Descr*> map = export_id::Map<const Descr*>{}.add(export_id, make<Descr>(d));
+  Transient t;
+  t.values = CUMap<export_id::Map<const Descr*>>{}.add(compilation_unit, map);
+  t.symbol_id = symbol::Map<export_id::t>{}.add(root_symbol, export_id);
+  return t;
+}
+
+const T* t_of_transient(const Transient& transient, const variable::Map<long>& local_offset_fun,
+                        const variable::Map<long>& local_offset_fv, const variable::Map<long>& imported_offset_fun,
+                        const variable::Map<long>& imported_offset_fv, const variable::Set& constant_closures) {
+  // Map.fold (fun key value unchanged -> if mem key set then add key value
+  // unchanged else unchanged)
+  auto fold_map = [](const variable::Set& set, const variable::Map<long>& m, variable::Map<long> unchanged) {
+    return m.fold(
+        [&](variable::t key, long value, variable::Map<long> acc) { return set.mem(key) ? acc.add(key, value) : acc; },
+        unchanged);
+  };
+  variable::Map<long> offset_fun =
+      fold_map(transient.relevant_imported_closure_ids, imported_offset_fun,
+               fold_map(transient.relevant_local_closure_ids, local_offset_fun, {}));
+  variable::Map<long> offset_fv =
+      fold_map(transient.relevant_imported_vars_within_closure, imported_offset_fv,
+               fold_map(transient.relevant_local_vars_within_closure, local_offset_fv, {}));
+  return make<T>(T{transient.sets_of_closures, transient.values, transient.symbol_id, offset_fun, offset_fv,
+                   constant_closures, transient.invariant_params, transient.recursive});
+}
+
 bool equal_approx(const Approx& a1, const Approx& a2) {
   if (a1.kind != a2.kind) return false;
   switch (a1.kind) {

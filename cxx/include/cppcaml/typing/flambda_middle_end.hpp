@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "cppcaml/typing/closure.hpp"
 #include "cppcaml/typing/flambda.hpp"
 
 namespace cppcaml::typing::flambda_middle_end {
@@ -20,5 +21,11 @@ struct NotPorted : std::runtime_error {
 //   ~module_initializer (the -d dumps on ppf_dump)
 flambda::Program lambda_to_flambda(format::Formatter& ppf_dump, long size, Ident::t module_ident,
                                    lambda::lambda module_initializer);
+
+// lambda_to_clambda ~backend ~prefixname ~ppf_dump program: the middle end,
+// Build_export_info, Flambda_to_clambda (-drawclambda), the export info
+// recorded (Compilenv.set_export_info), Un_anf (-dclambda)
+closure_middle_end::WithConstants lambda_to_clambda(format::Formatter& ppf_dump, const lambda::Program& program,
+                                                    lambda::lambda module_initializer);
 
 }  // namespace cppcaml::typing::flambda_middle_end

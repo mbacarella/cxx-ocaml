@@ -716,4 +716,78 @@ variable::Map<std::vector<SpecialisedToSameAs>> parameters_specialised_to_the_sa
   });
 }
 
+// ---- Switch_storer ------------------------------------------------------------
+namespace {
+bool comparable_named(named n);
+bool comparable_expr(t e) {
+  for (;;) {
+    if (as<Var>(e) || as<Static_raise>(e)) return true;
+    auto* l = as<Let>(e);
+    if (!l || !comparable_named(l->defining_expr)) return false;
+    e = l->body;
+  }
+}
+bool comparable_named(named n) {
+  if (as<NSymbol>(n) || as<NConst>(n) || as<NPrim>(n)) return true;
+  if (auto* x = as<NExpr>(n)) return comparable_expr(x->expr);
+  return false;
+}
+// compare_key's equality: the environment maps the variables bound in [e2]
+// to the corresponding ones of [e1]
+bool same_var(const variable::Map<variable::t>& env, variable::t v1, variable::t v2) {
+  const variable::t* bound = env.find_opt(v2);
+  return variable::compare(v1, bound ? *bound : v2) == 0;
+}
+bool same_vars(const variable::Map<variable::t>& env, Slice<variable::t> a1, Slice<variable::t> a2) {
+  if (a1.size() != a2.size()) return false;
+  for (std::size_t k = 0; k < a1.size(); ++k)
+    if (!same_var(env, a1[k], a2[k])) return false;
+  return true;
+}
+bool same_expr(variable::Map<variable::t> env, t e1, t e2);
+bool same_named(const variable::Map<variable::t>& env, named n1, named n2) {
+  if (n1->kind != n2->kind) return false;
+  switch (n1->kind) {
+    case NK::Symbol: return symbol::compare(as<NSymbol>(n1)->sym, as<NSymbol>(n2)->sym) == 0;
+    case NK::Const: return compare_const(as<NConst>(n1)->c, as<NConst>(n2)->c) == 0;
+    case NK::Expr: return same_expr(env, as<NExpr>(n1)->expr, as<NExpr>(n2)->expr);
+    case NK::Prim: {
+      auto* p1 = as<NPrim>(n1);
+      auto* p2 = as<NPrim>(n2);
+      return clambda::equal_primitive(*p1->prim, *p2->prim) && same_vars(env, p1->args, p2->args);
+    }
+    default: return false;
+  }
+}
+bool same_expr(variable::Map<variable::t> env, t e1, t e2) {
+  for (;;) {
+    if (e1->kind != e2->kind) return false;
+    switch (e1->kind) {
+      case EK::Var: return same_var(env, as<Var>(e1)->var, as<Var>(e2)->var);
+      case EK::Static_raise: {
+        auto* r1 = as<Static_raise>(e1);
+        auto* r2 = as<Static_raise>(e2);
+        return r1->exn == r2->exn && same_vars(env, r1->args, r2->args);
+      }
+      case EK::Let: {
+        auto* l1 = as<Let>(e1);
+        auto* l2 = as<Let>(e2);
+        if (!same_named(env, l1->defining_expr, l2->defining_expr)) return false;
+        env = env.add(l2->var, l1->var);
+        e1 = l1->body;
+        e2 = l2->body;
+        continue;
+      }
+      default: return false;
+    }
+  }
+}
+}  // namespace
+
+std::optional<SwitchStorerPolicy::key> SwitchStorerPolicy::make_key(const t& expr) {
+  if (!comparable_expr(expr)) return std::nullopt;
+  return expr;
+}
+bool SwitchStorerPolicy::same_key(const key& a, const key& b) { return same_expr({}, a, b); }
+
 }  // namespace cppcaml::typing::flambda_utils
