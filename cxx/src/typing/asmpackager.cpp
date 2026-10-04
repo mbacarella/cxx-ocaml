@@ -1,5 +1,7 @@
 // Port of asmcomp/asmpackager.ml; see asmpackager.hpp.
 #include "cppcaml/typing/asmpackager.hpp"
+#include "cppcaml/typing/flambda_middle_end.hpp"
+#include "cppcaml/typing/export_info_for_pack.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -94,9 +96,12 @@ void make_package_object(std::ostream& ppf_dump, const std::vector<PackMember>& 
   std::vector<Ident::t> components;
   for (const PackMember& m : members)
     components.push_back(m.pm_impl ? Ident::create_persistent(zstr(m.pm_name)) : nullptr);
-  Ident::t module_ident = Ident::create_persistent(zstr(modname_from_source(target)));
+  // (Unit_info.Artifact.modname target: the string Compilenv.reset was
+  // given, the unit's ui_name)
+  Ident::t module_ident = Ident::create_persistent(compilenv::current_unit().ui_name);
   std::string prefixname = filename::remove_extension(objtemp);
-  auto [size, code0] = translmod::transl_store_package(slice(components), module_ident, coercion);
+  auto [size, code0] = config::flambda ? translmod::transl_package_flambda(slice(components), coercion)
+                                        : translmod::transl_store_package(slice(components), module_ident, coercion);
   lambda::lambda code = simplif::simplify_lambda(code0);
   lambda::Program program;
   program.code = code;
@@ -106,7 +111,10 @@ void make_package_object(std::ostream& ppf_dump, const std::vector<PackMember>& 
   format::Formatter dump;
   try {
     asmgen::compile_unit(asmgen::asm_filename(prefixname), cf::keep_asm_file, prefixname + config::ext_obj, [&] {
-      closure_middle_end::WithConstants clambda = closure_middle_end::lambda_to_clambda(dump, program, code);
+      closure_middle_end::WithConstants clambda = [&] {
+        if constexpr (config::flambda) return flambda_middle_end::lambda_to_clambda(dump, program, code);
+        else return closure_middle_end::lambda_to_clambda(dump, program, code);
+      }();
       return asmgen::end_gen_implementation(dump, clambda);
     });
   } catch (...) {
@@ -139,6 +147,27 @@ void build_package_cmx(const std::vector<PackMember>& members, const std::string
   std::vector<const UnitInfos*> units;
   for (const PackMember& m : members)
     if (m.pm_impl) units.push_back(m.pm_impl);
+  // flambda: the members' export info renamed into the pack, then merged
+  // with the pack's own (renamed last)
+  const export_info::T* flambda_export_info = nullptr;
+  if constexpr (config::flambda) {
+    OSet<compilation_unit::t, compilation_unit::Cmp> pack_units;
+    for (const UnitInfos* u : units) {
+      Ident::t unit_id = Ident::create_persistent(u->ui_name);  // Compilenv.unit_id_from_name
+      pack_units = pack_units.add(compilenv::unit_for_global(unit_id));
+    }
+    compilation_unit::t pack = compilenv::current_compilation_unit();
+    std::vector<const UnitInfos*> imported;
+    for (const UnitInfos* u : units) {  // List.map: in order
+      auto* c = make<UnitInfos>(*u);
+      c->ui_flambda_export_info = export_info_for_pack::import_for_pack(pack_units, pack, u->ui_flambda_export_info);
+      imported.push_back(c);
+    }
+    units = imported;
+    flambda_export_info = export_info_for_pack::import_for_pack(pack_units, pack, compilenv::current_unit().ui_flambda_export_info);
+    for (const UnitInfos* u : units) flambda_export_info = export_info::merge(flambda_export_info, u->ui_flambda_export_info);
+    export_info_for_pack::clear_import_state();
+  }
   // union: List.fold_left (List.fold_left (fun accu n -> if mem then accu else n :: accu)) []
   auto union_ = [&](std::vector<long> UnitInfos::*field) {
     std::vector<long> accu;
@@ -166,6 +195,7 @@ void build_package_cmx(const std::vector<PackMember>& members, const std::string
     pkg.ui_need_stdlib = pkg.ui_need_stdlib || u->ui_need_stdlib;
   }
   pkg.ui_export_info = ui.ui_export_info;
+  pkg.ui_flambda_export_info = flambda_export_info;
   pkg.ui_for_pack = std::nullopt;
   std::string bytes = cmx_format::write_unit_info(pkg);
   std::ofstream os(cmxfile, std::ios::binary);

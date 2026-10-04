@@ -1574,6 +1574,19 @@ Lam transl_package(Slice<Ident::t> component_names, Ident::t target_name, const 
                   ScopedLocation{});
 }
 
+// transl_package_flambda component_names coercion (the flambda -pack): the
+// block size and the coerced block of the components (the pair right to
+// left: the code first)
+std::pair<long, Lam> transl_package_flambda(Slice<Ident::t> component_names, const MC* coercion) {
+  std::vector<Lam> cs;
+  for (Ident::t id : component_names)
+    cs.push_back(id ? L::lprim(pglobal(Primitive::K::Pgetglobal, id), {}, ScopedLocation{})
+                    : L::lconst(L::const_unit()));
+  Lam code = apply_coercion(ScopedLocation{}, LetKind::Strict, coercion,
+                            L::lprim(pmakeblock(0, MutableFlag::Immutable), slice(cs), ScopedLocation{}));
+  return {module_block_size(component_names.size(), coercion), code};
+}
+
 // transl_store_package component_names target_name coercion (the native
 // -pack): the block size and the code storing the components
 std::pair<long, Lam> transl_store_package(Slice<Ident::t> component_names, Ident::t target_name, const MC* coercion) {

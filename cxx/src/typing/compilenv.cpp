@@ -140,7 +140,7 @@ void reset(const std::optional<std::string>& packname0, std::string_view name) {
     // zone, its ident and linkage name with it)
     ZoneScope in_permanent(permanent_zone());
     compilation_unit::t c =
-        compilation_unit::create(Ident::create_persistent(name), current_unit_linkage_name());
+        compilation_unit::create(Ident::create_persistent(cu.ui_name), current_unit_linkage_name());
     compilation_unit::set_current(c);
   }
 }
