@@ -88,6 +88,8 @@ void Zone::drop_protected() {
   dtors_.clear();
   for (auto& b : blocks_) {
     char* p = b.release();
+    // (the pages given back, the range kept: a later use still faults)
+    ::madvise(p, ranges_.at(p), MADV_DONTNEED);
     ::mprotect(p, ranges_.at(p), PROT_NONE);
   }
   blocks_.clear();

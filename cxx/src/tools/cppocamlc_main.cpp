@@ -770,6 +770,47 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
       // unit infos' ui_name, __MODULE__)
       std::string_view umod = ty::uid::unit_name_string(modname);
       ty::compilenv::reset(cf::for_package, umod);
+      // the unit's imports recorded, then the typing zone dropped: the
+      // Lambda program's references into it, Translmod's primitive
+      // declarations, the unit's symbol strings and the file names copied
+      // out first
+      auto hand_over_from_typing = [&](ty::lambda::Program& prog, ty::lambda::lambda lam) {
+        ty::cmx_format::UnitInfos& cu = ty::compilenv::current_unit();
+        // Compilenv.save_unit_info's Env.imports (): the back end reads no
+        // .cmi, so the list is complete here.  The current unit's entry
+        // holds its modname string (ui_name's) -- unless -cmi-file named
+        // the interface (Unit_info.Artifact.from_filename makes a fresh
+        // modname, which Env.read_signature added), as Emitcode's
+        cu.ui_imports_cmi.clear();
+        for (auto& [name, crc] : ty::env::imports()) {
+          std::string_view n = name == cu.ui_name && !cf::cmi_file ? cu.ui_name : ty::env::import_name(name);
+          cu.ui_imports_cmi.push_back({n.data() ? n : ty::zstr(name), crc});
+        }
+        in_typing_zone.reset();
+        if (typing_zone) {
+          ty::evacuate::Evacuator ev(*typing_zone);
+          prog.module_ident = ev.ident(prog.module_ident);
+          ty::lambda::IdentSet globals;
+          for (ty::Ident::t id : prog.required_globals) globals.insert(ev.ident(id));
+          prog.required_globals = std::move(globals);
+          prog.code = lam;
+          ev.lambda(lam);
+          for (const ty::PrimitiveDescription*& p : ty::translmod::primitive_declarations) p = ev.prim_desc(p);
+          cu.ui_name = ev.str(cu.ui_name);
+          cu.ui_symbol = ev.str(cu.ui_symbol);
+          for (std::string_view& d : cu.ui_defines) d = ev.str(d);
+          if (cu.ui_for_pack) cu.ui_for_pack = ev.str(*cu.ui_for_pack);
+          for (auto& [n, crc] : cu.ui_imports_cmi) n = ev.str(n);
+          ty::Fname::relocate(
+              *typing_zone,
+              [](void* e, std::string_view s) { return static_cast<ty::evacuate::Evacuator*>(e)->str(s); }, &ev);
+          if (zone_protect)
+            for (const std::string& x : ev.leftovers(lam)) std::cerr << "evacuation leftover: " << x << "\n";
+          impl.reset();
+          if (zone_protect) typing_zone->drop_protected();
+          else typing_zone.reset();
+        }
+      };
       if constexpr (ty::config::flambda) {
         // Optcompile.flambda: -Oclassic's settings; Translmod.
         // transl_implementation_flambda, -drawlambda, Simplif.
@@ -793,6 +834,7 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
           // Asmgen.compile_implementation: Compilenv.require_global on the
           // required globals, the middle end (Flambda_middle_end): closure
           // conversion so far
+          hand_over_from_typing(prog, lam);
           for (ty::Ident::t id : prog.required_globals) ty::compilenv::require_global(id);
           ty::format::Formatter dump;
           std::string stopped_at = "the back end";
@@ -822,43 +864,7 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
       lap("lambda", tp);
       if (!cf::should_stop_after(cf::Pass::Lambda)) {
         ty::cmx_format::UnitInfos& cu = ty::compilenv::current_unit();
-        // Compilenv.save_unit_info's Env.imports (): the back end reads no
-        // .cmi, so the list is complete here.  The current unit's entry
-        // holds its modname string (ui_name's) -- unless -cmi-file named
-        // the interface (Unit_info.Artifact.from_filename makes a fresh
-        // modname, which Env.read_signature added), as Emitcode's
-        cu.ui_imports_cmi.clear();
-        for (auto& [name, crc] : ty::env::imports()) {
-          std::string_view n = name == cu.ui_name && !cf::cmi_file ? cu.ui_name : ty::env::import_name(name);
-          cu.ui_imports_cmi.push_back({n.data() ? n : ty::zstr(name), crc});
-        }
-        // the typing zone dropped: the Lambda program's references into it,
-        // Translmod's primitive declarations, the unit's symbol strings and
-        // the file names copied out first
-        in_typing_zone.reset();
-        if (typing_zone) {
-          ty::evacuate::Evacuator ev(*typing_zone);
-          prog.module_ident = ev.ident(prog.module_ident);
-          ty::lambda::IdentSet globals;
-          for (ty::Ident::t id : prog.required_globals) globals.insert(ev.ident(id));
-          prog.required_globals = std::move(globals);
-          prog.code = lam;
-          ev.lambda(lam);
-          for (const ty::PrimitiveDescription*& p : ty::translmod::primitive_declarations) p = ev.prim_desc(p);
-          cu.ui_name = ev.str(cu.ui_name);
-          cu.ui_symbol = ev.str(cu.ui_symbol);
-          for (std::string_view& d : cu.ui_defines) d = ev.str(d);
-          if (cu.ui_for_pack) cu.ui_for_pack = ev.str(*cu.ui_for_pack);
-          for (auto& [n, crc] : cu.ui_imports_cmi) n = ev.str(n);
-          ty::Fname::relocate(
-              *typing_zone,
-              [](void* e, std::string_view s) { return static_cast<ty::evacuate::Evacuator*>(e)->str(s); }, &ev);
-          if (zone_protect)
-            for (const std::string& x : ev.leftovers(lam)) std::cerr << "evacuation leftover: " << x << "\n";
-          impl.reset();
-          if (zone_protect) typing_zone->drop_protected();
-          else typing_zone.reset();
-        }
+        hand_over_from_typing(prog, lam);
         // Asmgen.compile_implementation: Compilenv.require_global on the
         // required globals, the middle end (Closure_middle_end)
         for (ty::Ident::t id : prog.required_globals) ty::compilenv::require_global(id);

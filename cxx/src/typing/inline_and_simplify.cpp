@@ -7,12 +7,20 @@
 // order, almost always called "r".  (inline_and_simplify.ml)
 #include "cppcaml/typing/inline_and_simplify.hpp"
 
+#include <algorithm>
+#include <cstdlib>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include "cppcaml/typing/clflags.hpp"
 #include "cppcaml/typing/compilenv.hpp"
 #include "cppcaml/typing/config.hpp"
 #include "cppcaml/typing/effect_analysis.hpp"
+#include "cppcaml/typing/flambda_evacuate.hpp"
 #include "cppcaml/typing/flambda_utils.hpp"
 #include "cppcaml/typing/import_approx.hpp"
 #include "cppcaml/typing/inline_and_simplify_aux.hpp"
@@ -225,6 +233,229 @@ void prerr_inlining_impossible(const debuginfo::t& dbg, const char* msg) {
                           warnings::Warning::with_s(warnings::Warning::K::Inlining_impossible, msg));
 }
 
+// ---- the nursery ------------------------------------------------------------
+// The pass allocates in a young zone of its own.  At a few points -- between
+// the program's definitions, and between the functions of a set of closures
+// bound at toplevel -- what is live is known: the roots the frames on the
+// stack register (Nursery::Roots).  There, once the young zone has grown
+// enough, the roots are copied into the pass's zone (the old one: what is
+// in it never points into the young one) and the young zone is dropped: what
+// the OCaml GC reclaims during the pass.  Approximations' lazy values are
+// forced as they are copied (their computations create no variables:
+// forcing them early changes nothing but when the work is done).
+// CPPCAML_FLAMBDA_EVACUATE=always promotes at every point, =never not at
+// all; with CPPCAML_ZONE_PROTECT the dropped zones' storage is made
+// inaccessible.
+class Promoter : public flambda_evacuate::Evacuator {
+ public:
+  using Evacuator::Evacuator;
+
+  A::t approx(A::t a) {
+    return memo(a, [&](const A::Approx& x) {
+      A::Approx c = x;
+      id(x.var);
+      if (x.symbol) id(x.symbol->sym);
+      const A::Descr& d = x.descr;
+      A::Descr& cd = c.descr;
+      switch (d.kind) {
+        case A::DK::Value_block: cd.fields = slice(d.fields, [&](A::t f) { return approx(f); }); break;
+        case A::DK::Value_set_of_closures: cd.set = value_set_of_closures(d.set); break;
+        case A::DK::Value_closure:
+          cd.closure.set_of_closures = approx(d.closure.set_of_closures);
+          id(d.closure.closure_id);
+          break;
+        case A::DK::Value_string:
+          if (d.str.contents) cd.str.contents = str(*d.str.contents);
+          break;
+        case A::DK::Value_float_array:
+          cd.float_array.contents = slice(d.float_array.contents, [&](A::t f) { return approx(f); });
+          break;
+        case A::DK::Value_unknown:
+          if (d.unknown.unresolved) unresolved(d.unknown.value);
+          break;
+        case A::DK::Value_extern: id(d.ex); break;
+        case A::DK::Value_symbol: id(d.sym); break;
+        case A::DK::Value_unresolved: unresolved(d.unresolved); break;
+        case A::DK::Value_int: case A::DK::Value_char: case A::DK::Value_float: case A::DK::Value_boxed_int:
+        case A::DK::Value_bottom: break;
+      }
+      return make<A::Approx>(c);
+    });
+  }
+  void unresolved(const A::UnresolvedValue& u) {
+    id(u.set_of_closures_id);
+    id(u.sym);
+  }
+  const A::FunctionBody* function_body(const A::FunctionBody* b) {
+    return memo(b, [&](const A::FunctionBody& x) {
+      A::FunctionBody c = x;
+      c.free_variables = set(x.free_variables);
+      c.free_symbols = set(x.free_symbols);
+      dbg(x.dbg);
+      c.body = expr(x.body);
+      return make<A::FunctionBody>(c);
+    });
+  }
+  const A::FunctionDeclarations* approx_fun_decls(const A::FunctionDeclarations* d) {
+    return memo(d, [&](const A::FunctionDeclarations& x) {
+      A::FunctionDeclarations c = x;
+      id(x.set_of_closures_id);
+      id(x.set_of_closures_origin);
+      c.funs = map(x.funs, [&](const A::FunctionDeclaration* f) {
+        return memo(f, [&](const A::FunctionDeclaration& y) {
+          A::FunctionDeclaration fc = y;
+          id(y.closure_origin);
+          fc.params = slice(y.params, [&](const Parameter& q) { return Parameter{id(q.var)}; });
+          fc.function_body = function_body(y.function_body);
+          return make<A::FunctionDeclaration>(fc);
+        });
+      });
+      return make<A::FunctionDeclarations>(c);
+    });
+  }
+  template <class T, class F>
+  A::Lazy<T> lazy(const A::Lazy<T>& l, F copy) {
+    if (l.is_null()) return l;
+    return A::Lazy<T>::from_val(copy(l.force()));
+  }
+  freshening::project_var::T project_var(const freshening::project_var::T& f) {
+    auto ident = [&](variable::t v) { return id(v); };
+    return {map(f.vars_within_closure, ident), map(f.closure_id, ident)};
+  }
+  const A::ValueSetOfClosures* value_set_of_closures(const A::ValueSetOfClosures* s) {
+    return memo(s, [&](const A::ValueSetOfClosures& x) {
+      A::ValueSetOfClosures c = x;
+      c.function_decls = approx_fun_decls(x.function_decls);
+      c.bound_vars = map(x.bound_vars, [&](A::t a) { return approx(a); });
+      c.free_vars = spec_map(x.free_vars);
+      c.invariant_params = lazy(x.invariant_params, [&](const variable::Map<variable::Set>& m) {
+        return map(m, [&](const variable::Set& vs) { return set(vs); });
+      });
+      c.recursive = lazy(x.recursive, [&](const variable::Set& vs) { return set(vs); });
+      c.size = lazy(x.size, [&](const variable::Map<std::optional<long>>& m) {
+        return map(m, [](std::optional<long> n) { return n; });
+      });
+      c.specialised_args = spec_map(x.specialised_args);
+      c.freshening = project_var(x.freshening);
+      c.direct_call_surrogates = map(x.direct_call_surrogates, [&](variable::t v) { return id(v); });
+      return make<A::ValueSetOfClosures>(c);
+    });
+  }
+
+  freshening::T freshening(const freshening::T& f) {
+    auto ident = [&](variable::t v) { return id(v); };
+    auto vars = [&](Slice<variable::t> vs) { return slice(vs, ident); };
+    return {memo(f.active, [&](const freshening::Tbl& x) {
+      freshening::Tbl c = x;
+      c.sb_var = map(x.sb_var, ident);
+      c.sb_mutable_var = map(x.sb_mutable_var, ident);
+      c.sb_exn = map(x.sb_exn, [](long n) { return n; });
+      c.back_var = map(x.back_var, vars);
+      c.back_mutable_var = map(x.back_mutable_var, vars);
+      return make<freshening::Tbl>(c);
+    })};
+  }
+  E env(const E& e) {
+    auto approxs = [&](A::t a) { return approx(a); };
+    auto plain = [](long n) { return n; };
+    E c = e;
+    c.approx = map(e.approx, [&](const E::ScopedApprox& sa) { return E::ScopedApprox{sa.scope, approx(sa.approx)}; });
+    c.approx_mutable = map(e.approx_mutable, approxs);
+    c.approx_sym = map(e.approx_sym, approxs);
+    c.projections = map(e.projections, [&](variable::t v) { return id(v); });
+    c.current_functions = set(e.current_functions);
+    c.freshening_ = freshening(e.freshening_);
+    c.unroll_counts = map(e.unroll_counts, plain);
+    c.inlining_counts = map(e.inlining_counts, plain);
+    c.inlined_stub = set(e.inlined_stub);
+    c.actively_unrolling_ = map(e.actively_unrolling_, plain);
+    if (e.inlining_stats_closure_stack) leak("an inlining report's closure stack");
+    dbg(e.inlined_debuginfo);
+    return c;
+  }
+  R result(const R& r) {
+    R c = r;
+    c.approx = approx(r.approx);
+    c.used_static_exceptions = set(r.used_static_exceptions);
+    return c;
+  }
+  inline_and_simplify_aux::PreparedSetOfClosures prepared(const inline_and_simplify_aux::PreparedSetOfClosures& p) {
+    inline_and_simplify_aux::PreparedSetOfClosures c = p;
+    c.free_vars = map(p.free_vars, [&](const freshening::SpecApprox& sa) {
+      return freshening::SpecApprox{spec(sa.spec), approx(sa.approx)};
+    });
+    c.specialised_args = spec_map(p.specialised_args);
+    c.function_decls = fun_decls(p.function_decls);
+    c.parameter_approximations = map(p.parameter_approximations, [&](A::t a) { return approx(a); });
+    c.internal_value_set_of_closures = value_set_of_closures(p.internal_value_set_of_closures);
+    c.set_of_closures_env = env(p.set_of_closures_env);
+    return c;
+  }
+};
+
+class Nursery {
+ public:
+  using Root = std::function<void(Promoter&)>;
+  // the roots of a frame, registered while it lives
+  class Roots {
+   public:
+    Roots(Nursery& n, Root root) : n_(n), root_(std::move(root)) { n_.roots_.push_back(&root_); }
+    ~Roots() { n_.roots_.pop_back(); }
+    Roots(const Roots&) = delete;
+    Roots& operator=(const Roots&) = delete;
+
+   private:
+    Nursery& n_;
+    Root root_;
+  };
+
+  explicit Nursery(bool always) : always_(always), protect_(std::getenv("CPPCAML_ZONE_PROTECT") != nullptr) {
+    young_ = fresh();
+    in_young_.emplace(*young_);
+  }
+  ~Nursery() {
+    in_young_.reset();
+    drop();
+  }
+  Nursery(const Nursery&) = delete;
+  Nursery& operator=(const Nursery&) = delete;
+
+  // a point where every pointer into the young zone that is used later is
+  // in a root
+  void point() {
+    if (always_ || young_->bytes() >= (std::size_t{16} << 20)) promote();
+  }
+  void promote() {
+    in_young_.reset();
+    {
+      std::vector<const Zone*> dying{young_.get()};
+      Promoter p(dying);
+      for (const Root* r : roots_) (*r)(p);
+    }
+    drop();
+    young_ = fresh();
+    in_young_.emplace(*young_);
+  }
+
+ private:
+  std::unique_ptr<Zone> fresh() {
+    auto z = std::make_unique<Zone>(protect_);
+    transient_zones().push_back(z.get());
+    return z;
+  }
+  void drop() {
+    auto& tz = transient_zones();
+    tz.erase(std::remove(tz.begin(), tz.end(), young_.get()), tz.end());
+    if (protect_) young_->drop_protected();
+    young_.reset();
+  }
+
+  bool always_, protect_;
+  std::unique_ptr<Zone> young_;
+  std::optional<ZoneScope> in_young_;
+  std::vector<const Root*> roots_;
+};
+
 struct Simplifier {
   ExprResult simplify(const E& env, const R& r, t tree);
   NamedResult simplify_named(const E& env, const R& r, named tree);
@@ -258,6 +489,11 @@ struct Simplifier {
   std::tuple<Slice<t>, std::vector<A::t>, R> simplify_list(const E& env, const R& r, Slice<t> l);
   std::pair<const FunctionDeclaration*, variable::Map<SpecialisedTo>> duplicate_function(
       const E& env, const SetOfClosures* set_of_closures, variable::t fun_var, variable::t new_fun_var);
+
+  Nursery* nursery = nullptr;  // (null: none)
+  // the next set of closures simplified is bound at toplevel (its
+  // functions' simplifications are separated by nursery points)
+  bool toplevel_set_of_closures = false;
 
   inlining_decision::Simplify simplify_fn() {
     return [this](const E& env, const R& r, t e) { return simplify(env, r, e); };
@@ -427,16 +663,29 @@ std::tuple<const SetOfClosures*, R, freshening::project_var::T> Simplifier::simp
   E env = original_env.increase_closure_depth();
   inline_and_simplify_aux::PreparedSetOfClosures prep =
       inline_and_simplify_aux::prepare_to_simplify_set_of_closures(env, set_of_closures, function_decls0, true, nullptr);
-  const FunctionDeclarations* function_decls = prep.function_decls;
   variable::Map<const FunctionDeclaration*> funs;
   variable::Set used_params;
   R r = r0;
-  function_decls->funs.iter([&](variable::t fun_var, const FunctionDeclaration* function_decl) {
+  bool points = std::exchange(toplevel_set_of_closures, false) && nursery;
+  std::optional<Nursery::Roots> roots;
+  if (points)
+    roots.emplace(*nursery, [&](Promoter& pr) {
+      prep = pr.prepared(prep);
+      funs = pr.map(funs, [&](const FunctionDeclaration* d) { return pr.fun_decl(d); });
+      used_params = pr.set(used_params);
+      r = pr.result(r);
+    });
+  // (Map.iter: in key order; the declarations looked up again after a
+  // nursery point)
+  std::vector<variable::t> fun_vars;
+  prep.function_decls->funs.iter([&](variable::t fun_var, const FunctionDeclaration*) { fun_vars.push_back(fun_var); });
+  for (variable::t fun_var : fun_vars) {
+    const FunctionDeclaration* function_decl = *prep.function_decls->funs.find_opt(fun_var);
     E closure_env = inline_and_simplify_aux::prepare_to_simplify_closure(
         function_decl, prep.free_vars, prep.specialised_args, prep.parameter_approximations, prep.set_of_closures_env);
     E body_env = closure_env.enter_closure(fun_var, inlining_decision::should_inline_inside_declaration(function_decl),
                                            function_decl->dbg);
-    if (!body_env.inside_set_of_closures_declaration(function_decls->set_of_closures_origin))
+    if (!body_env.inside_set_of_closures_declaration(prep.function_decls->set_of_closures_origin))
       misc::fatal_error("Inline_and_simplify.simplify_set_of_closures");  // (assert)
     auto [body, r2] = simplify(body_env, r, function_decl->body);
     r = r2;
@@ -446,7 +695,9 @@ std::tuple<const SetOfClosures*, R, freshening::project_var::T> Simplifier::simp
     variable::Set used_params2 = flambda::used_params(fd);
     funs = funs.add(fun_var, fd);
     used_params = variable::Set::union_(used_params, used_params2);
-  });
+    if (points) nursery->point();
+  }
+  const FunctionDeclarations* function_decls = prep.function_decls;
   const FunctionDeclarations* function_decls2 = update_function_declarations(function_decls, funs);
   auto invariant_params = A::Lazy<variable::Map<variable::Set>>::of_fun(
       [function_decls2] { return invariant_params::invariant_params_in_recursion(function_decls2); });
@@ -1190,6 +1441,7 @@ CdvResult simplify_constant_defining_value(Simplifier& s, const E& env, const R&
         fatal([&](Formatter& f) {
           fprintf(f, "Set of closures bound by [Let_symbol] is not closed: %a", pr(print_set_of_closures, c->set));
         });
+      s.toplevel_set_of_closures = true;
       auto [soc, r2, fr] = s.simplify_set_of_closures(env, r, c->set);
       ConstantDefiningValue v{K::Set_of_closures};
       v.set = soc;
@@ -1236,6 +1488,21 @@ std::pair<program_body, R> simplify_program_body(Simplifier& s, E env, R r, prog
     t expr = nullptr;
   };
   std::vector<Node> nodes;
+  auto bindings = [](Promoter& pr, std::vector<SymbolBinding>& bs) {
+    for (SymbolBinding& b : bs) b.def = pr.cdv(b.def);
+  };
+  std::optional<Nursery::Roots> roots;
+  if (s.nursery)
+    roots.emplace(*s.nursery, [&](Promoter& pr) {
+      env = pr.env(env);
+      r = pr.result(r);
+      for (Node& n : nodes) {
+        bindings(pr, n.defs);
+        n.def = pr.cdv(n.def);
+        n.fields = pr.slice(n.fields, [&](t f) { return pr.expr(f); });
+        n.expr = pr.expr(n.expr);
+      }
+    });
   program_body p = program;
   for (; p->kind != ProgramBody::Kind::End; p = p->body) {
     Node n{p, {}, nullptr, {}, nullptr};
@@ -1245,8 +1512,16 @@ std::pair<program_body, R> simplify_program_body(Simplifier& s, E env, R r, prog
         for (const SymbolBinding& b : p->defs)
           (b.def->kind == ConstantDefiningValue::Kind::Set_of_closures ? set_of_closures_defs : other_defs).push_back(b);
         std::vector<SymbolBinding> all(p->defs.begin(), p->defs.end());
-        auto process_defs = [&](const E& lookup_env, E building_env, const std::vector<SymbolBinding>& defs) {
+        auto process_defs = [&](const E& lookup_env0, E building_env, const std::vector<SymbolBinding>& defs) {
+          E lookup_env = lookup_env0;
           std::vector<SymbolBinding> out;  // (consed: reversed below)
+          std::optional<Nursery::Roots> roots;
+          if (s.nursery)
+            roots.emplace(*s.nursery, [&](Promoter& pr) {
+              lookup_env = pr.env(lookup_env);
+              building_env = pr.env(building_env);
+              bindings(pr, out);
+            });
           for (const SymbolBinding& b : defs) {
             CdvResult cr = simplify_constant_defining_value(s, lookup_env, r, b.sym, b.def);
             r = cr.r;
@@ -1291,6 +1566,7 @@ std::pair<program_body, R> simplify_program_body(Simplifier& s, E env, R r, prog
       case ProgramBody::Kind::End: break;
     }
     nodes.push_back(std::move(n));
+    if (s.nursery) s.nursery->point();
   }
   program_body body = end(p->sym);
   for (std::size_t k = nodes.size(); k-- > 0;) {
@@ -1339,8 +1615,12 @@ Program run(bool never_inline, const std::string& prefixname, long round, Format
   R r = R::create();
   bool report = clflags::inlining_report;
   if (never_inline) clflags::inlining_report = false;
+  std::optional<Nursery> nursery;
+  const char* ev = std::getenv("CPPCAML_FLAMBDA_EVACUATE");
+  if (!ev || std::string_view(ev) != "never") nursery.emplace(ev && std::string_view(ev) == "always");
   E initial_env = add_predef_exns_to_environment(E::create(never_inline, round, &ppf_dump));
   Simplifier s;
+  if (nursery) s.nursery = &*nursery;
   auto [result0, r2] = simplify_program(s, initial_env, r, program);
   Program result = flambda_utils::introduce_needed_import_symbols(result0);
   if (!r2.used_static_exceptions.is_empty())
@@ -1352,6 +1632,11 @@ Program run(bool never_inline, const std::string& prefixname, long round, Format
     });
   if (clflags::inlining_report) inlining_stats::save_then_forget_decisions(prefixname + "." + std::to_string(round));
   clflags::inlining_report = report;
+  if (nursery) {
+    // the result out of the young zone
+    Nursery::Roots root(*nursery, [&](Promoter& pr) { result = pr.program(result); });
+    nursery->promote();
+  }
   return result;
 }
 
