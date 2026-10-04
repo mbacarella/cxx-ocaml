@@ -134,6 +134,9 @@ void reset(const std::optional<std::string>& packname0, std::string_view name) {
     // export_infos_table (and imported_sets_of_closures_table)
     flambda_state() = FlambdaState{};
     import_approx::clear_imported_sets_of_closures_table();
+    // (the unit outlives the typing zone current here: in the permanent
+    // zone, its ident and linkage name with it)
+    ZoneScope in_permanent(permanent_zone());
     compilation_unit::t c =
         compilation_unit::create(Ident::create_persistent(name), current_unit_linkage_name());
     compilation_unit::set_current(c);

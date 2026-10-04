@@ -36,6 +36,7 @@ class Lazy {
   // (the value is computed in the cell's zone: a cell of an approximation
   // in a longer-lived zone than the current one -- an import's -- must not
   // hold what the current zone allocates)
+  bool is_null() const { return !cell_; }  // (a default-constructed one)
   const T& force() const {
     if (!cell_->forced) {
       ZoneScope in_owner(*cell_->owner);

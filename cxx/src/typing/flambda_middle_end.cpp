@@ -58,12 +58,12 @@ class PassZones {
   PassZones& operator=(const PassZones&) = delete;
 
   // after a pass: its program copied out when the pass zone has grown past
-  // twice the program's (and 64 MiB): the copying costs at most half of
+  // twice the program's (and 32 MiB): the copying costs at most half of
   // what the passes allocate
   Program after_pass(const Program& p) {
     if (never_) return p;
     std::size_t live = program_ ? program_->bytes() : 0;
-    if (!always_ && pass_->bytes() < std::max<std::size_t>(std::size_t{64} << 20, 2 * live)) return p;
+    if (!always_ && pass_->bytes() < std::max<std::size_t>(std::size_t{32} << 20, 2 * live)) return p;
     std::unique_ptr<Zone> next = fresh();
     Program copy;
     {
