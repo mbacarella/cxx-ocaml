@@ -12,6 +12,7 @@
 
 #include "cppcaml/typing/clflags.hpp"
 #include "cppcaml/typing/closure_offsets.hpp"
+#include "cppcaml/typing/cmm_helpers.hpp"
 #include "cppcaml/typing/compilenv.hpp"
 #include "cppcaml/typing/flambda_utils.hpp"
 #include "cppcaml/typing/initialize_symbol_to_let_symbol.hpp"
@@ -45,6 +46,7 @@ struct T {
   ForOneOrMoreUnits current_unit;
   ForOneOrMoreUnits imported_units;
   format::Formatter* ppf_dump;
+  symbol::Map<const UStructuredConstant*> constants_for_instrumentation;
 };
 
 bool in_current_unit(variable::t v) {
@@ -77,16 +79,39 @@ bool is_function_constant(const T& t, variable::t closure_id) {
   });
 }
 
-// Instrumentation of closure and field accesses (-clambda-checks): not
-// ported
-ulambda check_closure(ulambda ulam) {
-  if (clflags::clambda_checks) misc::fatal_error("-clambda-checks (Flambda_to_clambda.check_closure) is not ported");
-  return ulam;
+// Instrumentation of closure and field accesses to try to catch compiler
+// bugs (-clambda-checks): a check primitive given the access and a
+// constant string, the named expression printed
+UConstant instrumentation_constant(T& t, F::named named_opt) {
+  std::string str = "<none>";
+  if (named_opt) {
+    format::Formatter f;
+    F::print_named(f, named_opt);
+    f.print_flush();  // (Format.asprintf)
+    str = f.contents();
+  }
+  std::string_view sym = compilenv::new_const_symbol();
+  symbol::t sym2 = symbol::of_global_linkage(compilation_unit::get_current_exn(), sym);
+  UStructuredConstant u{UStructuredConstant::Kind::Uconst_string};
+  u.s = zstr(str);
+  t.constants_for_instrumentation = t.constants_for_instrumentation.add(sym2, make<UStructuredConstant>(u));
+  return uconst_ref(sym, nullptr);
 }
-ulambda check_field(ulambda ulam) {
-  if (clflags::clambda_checks) misc::fatal_error("-clambda-checks (Flambda_to_clambda.check_field) is not ported");
-  return ulam;
+ulambda check_closure(T& t, ulambda ulam, F::named named) {
+  if (!clflags::clambda_checks) return ulam;
+  Primitive p = prim(Primitive::K::Pccall);
+  p.ccall = cmm_helpers::primitive_simple(OCAML_LIT("caml_check_value_is_closure"), 2, false);
+  UConstant c = instrumentation_constant(t, named);
+  return uprim(p, slice(std::vector<ulambda>{ulam, uconst(c)}), debuginfo::none());
 }
+ulambda check_field(T& t, ulambda ulam, long pos, F::named named_opt) {
+  if (!clflags::clambda_checks) return ulam;
+  Primitive p = prim(Primitive::K::Pccall);
+  p.ccall = cmm_helpers::primitive_simple(OCAML_LIT("caml_check_field_access"), 3, false);
+  UConstant c = instrumentation_constant(t, named_opt);
+  return uprim(p, slice(std::vector<ulambda>{ulam, uconst(uconst_int(pos)), uconst(c)}), debuginfo::none());
+}
+F::named var_named(variable::t v) { return F::n_expr(F::var(v)); }
 
 struct Env {
   variable::Map<ulambda> subst;
@@ -234,7 +259,7 @@ ulambda Converter::to_clambda(const Env& env, F::t flam) {
       if (a->call_kind.direct) return to_clambda_direct_apply(a->func, a->args, a->call_kind.direct, a->dbg, env);
       ulambda callee = subst_var(env, a->func);
       Slice<ulambda> args = subst_vars(env, a->args);
-      return ugeneric_apply(check_closure(callee), args, a->dbg);
+      return ugeneric_apply(check_closure(t, callee, var_named(a->func)), args, a->dbg);
     }
     case EK::Switch: {
       auto* sw = F::as<F::Switch>(flam);
@@ -351,12 +376,14 @@ ulambda Converter::to_clambda_named(const Env& env, variable::t var, F::named n)
       // particular for the compilation of "let rec").
       const projection::ProjectClosure& pc = F::as<F::NProject_closure>(n)->p;
       long ofs = get_fun_offset(t, pc.closure_id);
-      return check_closure(build_uoffset(check_closure(subst_var(env, pc.set_of_closures)), ofs));
+      ulambda inner = check_closure(t, subst_var(env, pc.set_of_closures), var_named(pc.set_of_closures));
+      return check_closure(t, build_uoffset(inner, ofs), n);
     }
     case NK::Move_within_set_of_closures: {
       const projection::MoveWithinSetOfClosures& m = F::as<F::NMove_within_set_of_closures>(n)->m;
       long ofs = get_fun_offset(t, m.move_to) - get_fun_offset(t, m.start_from);
-      return check_closure(build_uoffset(check_closure(subst_var(env, m.closure)), ofs));
+      ulambda inner = check_closure(t, subst_var(env, m.closure), var_named(m.closure));
+      return check_closure(t, build_uoffset(inner, ofs), n);
     }
     case NK::Project_var: {
       const projection::ProjectVar& pv = F::as<F::NProject_var>(n)->p;
@@ -364,16 +391,18 @@ ulambda Converter::to_clambda_named(const Env& env, variable::t var, F::named n)
       long fun_offset = get_fun_offset(t, pv.closure_id);
       long var_offset = get_fv_offset(t, pv.var);
       long pos = var_offset - fun_offset;
-      return uprim(field_prim(pos), slice(std::vector<ulambda>{check_field(check_closure(ulam))}), debuginfo::none());
+      ulambda checked = check_field(t, check_closure(t, ulam, var_named(pv.closure)), pos, n);
+      return uprim(field_prim(pos), slice(std::vector<ulambda>{checked}), debuginfo::none());
     }
     case NK::Prim: {
       auto* p = F::as<F::NPrim>(n);
       using K = Primitive::K;
       if (p->prim->kind == K::Pfield && p->args.size() == 1)
-        return uprim(*p->prim, slice(std::vector<ulambda>{check_field(subst_var(env, p->args[0]))}), p->dbg);
+        return uprim(*p->prim, slice(std::vector<ulambda>{check_field(t, subst_var(env, p->args[0]), p->prim->n, nullptr)}),
+                     p->dbg);
       if (p->prim->kind == K::Psetfield && p->args.size() == 2) {
         ulambda v = subst_var(env, p->args[1]);
-        ulambda b = check_field(subst_var(env, p->args[0]));
+        ulambda b = check_field(t, subst_var(env, p->args[0]), p->prim->n, nullptr);
         return uprim(*p->prim, slice(std::vector<ulambda>{b, v}), p->dbg);
       }
       return uprim(*p->prim, subst_vars(env, p->args), p->dbg);
@@ -526,7 +555,7 @@ Result convert(format::Formatter& ppf_dump, const F::Program& program, const exp
   imported_units.fun_offset_table = imported->offset_fun;
   imported_units.fv_offset_table = imported->offset_fv;
   imported_units.constant_closures = imported->constant_closures;
-  T t{current_unit, imported_units, &ppf_dump};
+  T t{current_unit, imported_units, &ppf_dump, {}};
   Converter cv{t};
 
   // to_clambda_program: each element's code before the rest's
@@ -620,6 +649,12 @@ Result convert(format::Formatter& ppf_dump, const F::Program& program, const exp
   Result r;
   r.expr = expr;
   r.preallocated_blocks = std::move(preallocated_blocks);
+  // Symbol.Map.disjoint_union structured_constants t.constants_for_instrumentation
+  constants = symbol::Map<const UStructuredConstant*>::union_(
+      [](symbol::t, const UStructuredConstant*, const UStructuredConstant*) -> std::optional<const UStructuredConstant*> {
+        misc::fatal_error("Flambda_to_clambda: Map.disjoint_union");
+      },
+      constants, t.constants_for_instrumentation);
   constants.iter([&](symbol::t s, const UStructuredConstant* c) { r.structured_constants.emplace_back(s, c); });
   r.exported = export_info::t_of_transient(exported_transient, current_unit.fun_offset_table,
                                            current_unit.fv_offset_table, imported_units.fun_offset_table,
