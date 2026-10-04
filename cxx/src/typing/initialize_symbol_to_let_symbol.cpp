@@ -13,23 +13,6 @@ using namespace flambda;
 
 namespace {
 
-std::optional<BlockField> constant_field(t expr) {
-  auto* l = as<Let>(expr);
-  if (!l) return std::nullopt;
-  auto* v = as<Var>(l->body);
-  if (!v) return std::nullopt;
-  if (auto* c = as<NConst>(l->defining_expr)) {
-    // This must be true since var is the only variable in scope
-    if (!variable::equal(l->var, v->var)) misc::fatal_error("Initialize_symbol_to_let_symbol.constant_field");
-    return BlockField{nullptr, c->c};
-  }
-  if (auto* s = as<NSymbol>(l->defining_expr)) {
-    if (!variable::equal(l->var, v->var)) misc::fatal_error("Initialize_symbol_to_let_symbol.constant_field");
-    return BlockField{s->sym, {}};
-  }
-  return std::nullopt;
-}
-
 program_body loop(program_body program) {
   std::vector<program_body> nodes;
   program_body p = program;
@@ -70,6 +53,23 @@ program_body loop(program_body program) {
 }
 
 }  // namespace
+
+std::optional<BlockField> constant_field(t expr) {
+  auto* l = as<Let>(expr);
+  if (!l) return std::nullopt;
+  auto* v = as<Var>(l->body);
+  if (!v) return std::nullopt;
+  if (auto* c = as<NConst>(l->defining_expr)) {
+    // This must be true since var is the only variable in scope
+    if (!variable::equal(l->var, v->var)) misc::fatal_error("Initialize_symbol_to_let_symbol.constant_field");
+    return BlockField{nullptr, c->c};
+  }
+  if (auto* s = as<NSymbol>(l->defining_expr)) {
+    if (!variable::equal(l->var, v->var)) misc::fatal_error("Initialize_symbol_to_let_symbol.constant_field");
+    return BlockField{s->sym, {}};
+  }
+  return std::nullopt;
+}
 
 Program run(const Program& program) { return Program{program.imported_symbols, loop(program.program_body)}; }
 

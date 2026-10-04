@@ -815,52 +815,27 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
           else typing_zone.reset();
         }
       };
-      if constexpr (ty::config::flambda) {
-        // Optcompile.flambda: -Oclassic's settings; Translmod.
-        // transl_implementation_flambda, -drawlambda, Simplif.
-        // simplify_lambda, -dlambda; the back end (Flambda_middle_end)
-        // unless -stop-after lambda
-        if (cf::classic_inlining) {
-          cf::default_simplify_rounds = 1;
-          cf::use_inlining_arguments_set(cf::classic_arguments);
-          cf::unbox_free_vars_of_closures = false;
-          cf::unbox_specialised_args = false;
-        }
-        static ty::Zone lambda_nodes;
-        ty::lambda::set_node_zone(&lambda_nodes);
-        ty::lambda::Program prog = ty::translmod::transl_implementation_flambda(umod, impl->structure, impl->coercion);
-        if (cf::dump_rawlambda) ppf_dump.out() << ty::printlambda::dump(prog.code);
-        ty::lambda::lambda lam = ty::simplif::simplify_lambda(prog.code);
-        if (cf::dump_lambda) ppf_dump.out() << ty::printlambda::dump(lam);
-        ppf_dump.out().flush();
-        lap("lambda", tp);
-        if (!cf::should_stop_after(cf::Pass::Lambda)) {
-          // Asmgen.compile_implementation: Compilenv.require_global on the
-          // required globals, the middle end (Flambda_middle_end): closure
-          // conversion so far
-          hand_over_from_typing(prog, lam);
-          for (ty::Ident::t id : prog.required_globals) ty::compilenv::require_global(id);
-          ty::format::Formatter dump;
-          std::string stopped_at = "the back end";
-          try {
-            ty::flambda_middle_end::lambda_to_flambda(dump, prog.main_module_block_size, prog.module_ident, lam);
-          } catch (const ty::flambda_middle_end::NotPorted& e) {
-            stopped_at = e.what();
-          }
-          lap("flambda", tp);
-          ppf_dump.out() << dump.contents();
-          ppf_dump.out().flush();
-          std::cerr << CPPCAML_SELF ": the flambda middle end (" << stopped_at << ") is not ported yet\n";
-          return 2;
-        }
-        return finish();
-      }
-      cf::use_inlining_arguments_set(cf::classic_arguments);
-      // Lambda's nodes in a zone of their own, dropped once Closure has
-      // turned them into Clambda
+      // Lambda's nodes in a zone of their own, dropped once the middle end
+      // has turned them into Clambda
       static ty::Zone lambda_nodes;
       ty::lambda::set_node_zone(&lambda_nodes);
-      ty::lambda::Program prog = ty::translmod::transl_store_implementation(umod, impl->structure, impl->coercion);
+      auto translate = [&]() -> ty::lambda::Program {
+        if constexpr (ty::config::flambda) {
+          // Optcompile.flambda: -Oclassic's settings; Translmod.
+          // transl_implementation_flambda
+          if (cf::classic_inlining) {
+            cf::default_simplify_rounds = 1;
+            cf::use_inlining_arguments_set(cf::classic_arguments);
+            cf::unbox_free_vars_of_closures = false;
+            cf::unbox_specialised_args = false;
+          }
+          return ty::translmod::transl_implementation_flambda(umod, impl->structure, impl->coercion);
+        } else {
+          cf::use_inlining_arguments_set(cf::classic_arguments);
+          return ty::translmod::transl_store_implementation(umod, impl->structure, impl->coercion);
+        }
+      };
+      ty::lambda::Program prog = translate();
       if (cf::dump_rawlambda) ppf_dump.out() << ty::printlambda::dump(prog.code);
       ty::lambda::lambda lam = ty::simplif::simplify_lambda(prog.code);
       if (cf::dump_lambda) ppf_dump.out() << ty::printlambda::dump(lam);
@@ -870,10 +845,14 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
         ty::cmx_format::UnitInfos& cu = ty::compilenv::current_unit();
         hand_over_from_typing(prog, lam);
         // Asmgen.compile_implementation: Compilenv.require_global on the
-        // required globals, the middle end (Closure_middle_end)
+        // required globals, the middle end (Flambda_middle_end or
+        // Closure_middle_end)
         for (ty::Ident::t id : prog.required_globals) ty::compilenv::require_global(id);
         ty::format::Formatter dump;
-        ty::closure_middle_end::WithConstants clambda = ty::closure_middle_end::lambda_to_clambda(dump, prog, lam);
+        ty::closure_middle_end::WithConstants clambda = [&] {
+          if constexpr (ty::config::flambda) return ty::flambda_middle_end::lambda_to_clambda(dump, prog, lam);
+          else return ty::closure_middle_end::lambda_to_clambda(dump, prog, lam);
+        }();
         ty::lambda::set_node_zone(nullptr);
         lambda_nodes.clear();
         lap("clambda", tp);

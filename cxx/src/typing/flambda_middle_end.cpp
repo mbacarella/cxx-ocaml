@@ -13,6 +13,11 @@
 #include <vector>
 
 #include "cppcaml/typing/clflags.hpp"
+#include "cppcaml/typing/un_anf.hpp"
+#include "cppcaml/typing/printclambda.hpp"
+#include "cppcaml/typing/flambda_to_clambda.hpp"
+#include "cppcaml/typing/compilenv.hpp"
+#include "cppcaml/typing/build_export_info.hpp"
 #include "cppcaml/typing/closure_conversion.hpp"
 #include "cppcaml/typing/flambda_evacuate.hpp"
 #include "cppcaml/typing/initialize_symbol_to_let_symbol.hpp"
@@ -206,6 +211,28 @@ flambda::Program lambda_to_flambda(format::Formatter& ppf_dump, long size, Ident
   if (clflags::dump_flambda)
     fprintf(ppf_dump, "End of middle end:@ %a@.", [&](format::Formatter& f) { flambda::print_program(f, flam); });
   return zones.finish(flam);
+}
+
+closure_middle_end::WithConstants lambda_to_clambda(format::Formatter& ppf_dump, const lambda::Program& program,
+                                                    lambda::lambda module_initializer) {
+  Program flam = lambda_to_flambda(ppf_dump, program.main_module_block_size, program.module_ident, module_initializer);
+  export_info::Transient exported = build_export_info::build_transient(flam);
+  flambda_to_clambda::Result r = flambda_to_clambda::convert(ppf_dump, flam, exported);
+  // flambda_raw_clambda_dump_if
+  if (clflags::dump_rawclambda) {
+    fprintf(ppf_dump, "@.clambda (before Un_anf):@.");
+    printclambda::clambda(ppf_dump, r.expr);
+    for (const auto& [sym, cst] : r.structured_constants)
+      fprintf(ppf_dump, "%a:@ %a@.", [&](format::Formatter& f) { symbol::print(f, sym); },
+              [&](format::Formatter& f) { printclambda::print_structured_constant(f, cst); });
+  }
+  if (clflags::dump_cmm) fprintf(ppf_dump, "@.cmm:@.");
+  compilenv::set_export_info(r.exported);
+  clambda::ulambda code = un_anf::apply(compilenv::current_unit_symbol(), ppf_dump, r.expr);
+  std::vector<clambda::PreallocatedConstant> constants;
+  for (const auto& [sym, cst] : r.structured_constants)
+    constants.push_back(clambda::PreallocatedConstant{symbol::label(sym), true, cst, nullptr});
+  return {code, std::move(r.preallocated_blocks), std::move(constants)};
 }
 
 }  // namespace cppcaml::typing::flambda_middle_end

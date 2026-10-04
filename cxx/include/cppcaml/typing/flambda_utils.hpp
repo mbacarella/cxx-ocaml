@@ -1,4 +1,4 @@
-// Port of middle_end/flambda/flambda_utils.ml (all but Switch_storer).
+// Port of middle_end/flambda/flambda_utils.ml.
 #pragma once
 
 #include <optional>
@@ -81,5 +81,18 @@ struct SpecialisedToSameAs {
 variable::Map<std::vector<SpecialisedToSameAs>> parameters_specialised_to_the_same_variable(
     const flambda::FunctionDeclarations* function_decls,
     const variable::Map<flambda::SpecialisedTo>& specialised_args);
+
+// Switch_storer = Switch.Store (...): the stored branches' key is the
+// term itself where it is comparable (only variables, lets of symbols /
+// constants / primitives / expressions, static raises); two keys are the
+// same when compare_key finds them equal up to the renaming of the
+// variables they bind.  (Switch_storer itself: switch.hpp's
+// Store<SwitchStorerPolicy>.)
+struct SwitchStorerPolicy {
+  using t = flambda::t;
+  using key = flambda::t;
+  static std::optional<key> make_key(const t& expr);
+  static bool same_key(const key& a, const key& b);
+};
 
 }  // namespace cppcaml::typing::flambda_utils
