@@ -239,41 +239,34 @@ stock compilers' (only .cmt sharing differs).  `parse_dir_parity.sh`
 compares parse trees over any source tree (the switch's package sources
 found parser divergences the testsuite had not).
 
-Flambda (in progress, branch `cxx-flambda`, a tree configured with
-`--enable-flambda`): c++ocamlopt applies Optcompile.flambda's settings and
-Translmod.transl_implementation_flambda, then the flambda middle end
-(`flambda_middle_end.cpp`), which runs its passes up to the first one not
-ported yet.  Ported: the term language (`flambda.cpp`, with
-Allocated_const, Parameter and Projection; the identifiers in
-`flambda_ids.cpp`, the stdlib's Map/Set trees in `ocaml_map.hpp`, the
-Tbl modules as `hashtbl.hpp`'s OCaml Hashtbl), Flambda_iterators,
-Flambda_utils, Internal_variable_names, Closure_conversion, Lift_code,
-Inconstant_idents, Alias_analysis, Lift_constants (with utils'
-Strongly_connected_components), Share_constants,
-Remove_unused_program_constructs, Lift_let_to_initialize_symbol,
-Remove_unused_closure_vars, Effect_analysis, Inlining_cost,
-Simple_value_approx, Export_info with the .cmx's flambda export info
-(decoded: `c++cmxinfo` prints it as ocamlobjinfo does, 336/336 of the
-tree's .cmx), Import_approx, Compilenv's flambda half, and
-Inline_and_simplify (with Inline_and_simplify_aux, Inlining_decision,
-Inlining_transforms, Inlining_stats -- the decisions, not the
-`-inlining-report` printer --, Freshening, Simplify_primitives and
-Simplify_boxed_integer_ops, Invariant_params, Extract_projections,
-Augment_specialised_args, Unbox_closures, Unbox_free_vars_of_closures,
-Unbox_specialised_args, Remove_free_vars_equal_to_args and
-Remove_unused_arguments), Ref_to_variables and
-Initialize_symbol_to_let_symbol: the whole middle end (Flambda_invariants
-and the duplicate-warning reporter aside).
-`NATIVE=1 DUMP=drawflambda lambda_port_parity.sh` compares closure
-conversion; `DUMP=dflambda-verbose` the program before each pass (the
-port's dump, which stops at the first pass not ported, against the same
-prefix of ocamlopt's): through "End of middle end", 6553/6553 probes (also
-`-Oclassic`, `-O2`, `-g -O3`, `-unsafe`), 787/787 testsuite files and
-272/272 compiler sources (both also at `-O3`).  Inline_and_simplify runs
-at the round number before the loop's increment (0, 1, 2 under `-O3`;
-the dumps print 1, 2, 3): `-O3`'s per-round thresholds depend on it.  The
-passes create variables and set-of-closures ids in ocamlopt's evaluation
-order and its tables' iteration orders: the stamps are in the dumps.
+Flambda (branch `cxx-flambda`, a tree configured with `--enable-flambda`):
+c++ocamlopt applies Optcompile.flambda's settings and
+Translmod.transl_implementation_flambda, then the flambda middle end and
+back end: closure conversion, every pass of every round
+(`flambda_middle_end.cpp`), Build_export_info, Flambda_to_clambda and
+Un_anf, then Cmmgen and emit as for Closure, and the .cmx with its
+Export_info.  The passes run in transient zones: the program they leave
+is copied out (`flambda_evacuate.cpp`) and the zone dropped, and
+Inline_and_simplify promotes what is live between the program's
+definitions (a nursery), as the OCaml GC reclaims the rest.  Identifiers,
+debuginfo lists, import caches are in the permanent zone.  The .cmx is
+written with ocamlopt's sharing: the port's objects are ocamlopt's (Map
+and Set nodes included); a block the port keeps as a struct carries its
+identity (Export_info approximations, consts), and the literal blocks of
+an OCaml source file are one per file and value (FLAMBDA_INT_LITERAL,
+CLAMBDA_PRIM_LITERAL, OCAML_LIT ...).  Not ported: Flambda_invariants,
+-inlining-report, -clambda-checks, the flambda -pack.
+
+Gates (NATIVE=1, lambda_port_parity.sh): DUMP=drawflambda,
+dflambda-verbose (the program before each pass), drawclambda, dclambda,
+dcmm, S, o and cmx -- 6553/6553 probes at default, -Oclassic, -O2,
+-g -O3 and -unsafe, 787/787 testsuite files and 272/272 compiler sources
+(also at -O3), but for two .cmx whose .cmi CRC differs (private row
+types: their .cmo differ too).  CPPCAML_FLAMBDA_EVACUATE=always with
+CPPCAML_ZONE_PROTECT evacuates at every point and faults on a dangling
+use.  Variables, symbols, export ids and backend idents are created in
+ocamlopt's order (OCaml evaluates a constructor's arguments right to
+left): their stamps are in the dumps and the .cmx.
 
 ## Oracles and gates
 
