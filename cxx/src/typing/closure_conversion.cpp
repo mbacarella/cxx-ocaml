@@ -100,7 +100,7 @@ FunctionDecl function_decl_create(Ident::t let_rec_ident, variable::t closure_bo
                                   const L::ScopedLocation& loc) {
   // (the record's fields right to left: Lambda.free_variables before the
   // fresh ident -- neither has an effect on the other)
-  if (!let_rec_ident) let_rec_ident = Ident::create_local("unnamed_function");
+  if (!let_rec_ident) let_rec_ident = Ident::create_local(OCAML_LIT("unnamed_function"));
   FunctionDecl d{let_rec_ident, closure_bound_var, kind, {}, body, L::free_variables(body), attr, loc};
   for (const L::Param& p : params) d.params.push_back(p.id);
   return d;
@@ -555,25 +555,33 @@ F::t Closer::close_prim(const Env& env, const L::Lprim* x) {
     symbol::t exn_symbol = compilenv::symbol_for_global_prime(predef::idents().division_by_zero);
     debuginfo::t dbg = debuginfo::from_location(x->loc);
     named zero_const;
-    if (lp.kind == PK::Pdivint || lp.kind == PK::Pmodint) zero_const = F::n_const(F::const_int(0));
-    else if (lp.bi == BoxedInteger::Pint32) zero_const = F::n_allocated_const(allocated_const::int32(0));
-    else if (lp.bi == BoxedInteger::Pint64) zero_const = F::n_allocated_const(allocated_const::int64(0));
-    else zero_const = F::n_allocated_const(allocated_const::nativeint(0));
+    if (lp.kind == PK::Pdivint || lp.kind == PK::Pmodint) zero_const = FLAMBDA_NAMED_INT_LITERAL(0);
+    else if (lp.bi == BoxedInteger::Pint32)
+      zero_const = F::n_allocated_const_literal(__FILE__, [] { return allocated_const::int32(0); }, "Int32 0l");
+    else if (lp.bi == BoxedInteger::Pint64)
+      zero_const = F::n_allocated_const_literal(__FILE__, [] { return allocated_const::int64(0); }, "Int64 0L");
+    else zero_const = F::n_allocated_const_literal(__FILE__, [] { return allocated_const::nativeint(0); }, "Nativeint 0n");
     clambda::Primitive prim = cl_prim(lp.kind == PK::Pdivint   ? CK::Pdivint
                                       : lp.kind == PK::Pmodint ? CK::Pmodint
                                       : lp.kind == PK::Pdivbint ? CK::Pdivbint
                                                                 : CK::Pmodbint);
     prim.safe = L::IsSafe::Unsafe;
     prim.bi = lp.bi;
+    // ([Pdivint Unsafe], [Pmodint Unsafe] and [Pintcomp Ceq] are literals
+    // of closure_conversion.ml)
+    if (lp.kind == PK::Pdivint) prim = CLAMBDA_PRIM_LITERAL(prim, "Pdivint Unsafe");
+    else if (lp.kind == PK::Pmodint) prim = CLAMBDA_PRIM_LITERAL(prim, "Pmodint Unsafe");
     clambda::Primitive comparison = cl_prim(lp.kind == PK::Pdivint || lp.kind == PK::Pmodint ? CK::Pintcomp : CK::Pbintcomp);
     comparison.icmp = L::IntegerComparison::Ceq;
     if (comparison.kind == CK::Pbintcomp) comparison.bi = lp.bi;
+    else comparison = CLAMBDA_PRIM_LITERAL(comparison, "Pintcomp Ceq");
     t.imported_symbols = t.imported_symbols.add(exn_symbol);
     // The nested create_lets' arguments right to left: the else branch's
     // name_expr (result) before the then branch's (dummy).
     F::t result = name_expr(F::n_prim(prim, slice(std::vector<variable::t>{numerator, denominator}), dbg), Names::result);
     clambda::Primitive raise = cl_prim(CK::Praise);
     raise.raise = L::RaiseKind::Raise_regular;
+    raise = CLAMBDA_PRIM_LITERAL(raise, "Praise Raise_regular");
     F::t dummy = name_expr(F::n_prim(raise, slice(std::vector<variable::t>{exn}), dbg), Names::dummy);
     F::t ite = F::if_then_else(is_zero, dummy, result);
     F::t e = F::create_let(is_zero, F::n_prim(comparison, slice(std::vector<variable::t>{zero, denominator}), dbg), ite);
@@ -589,7 +597,7 @@ F::t Closer::close_prim(const Env& env, const L::Lprim* x) {
     F::t arg2 = close(env, x->args[1]);
     variable::t const_true = variable::create(Names::const_true);
     variable::t cond = variable::create(Names::cond_sequor);
-    return F::create_let(const_true, F::n_const(F::const_int(1)),
+    return F::create_let(const_true, FLAMBDA_NAMED_INT_LITERAL(1),
                          F::create_let(cond, F::n_expr(arg1), F::if_then_else(cond, F::var(const_true), arg2)));
   }
   if (lp.kind == PK::Psequand) {
@@ -597,7 +605,7 @@ F::t Closer::close_prim(const Env& env, const L::Lprim* x) {
     F::t arg2 = close(env, x->args[1]);
     variable::t const_false = variable::create(Names::const_false);
     variable::t cond = variable::create(Names::const_sequand);
-    return F::create_let(const_false, F::n_const(F::const_int(0)),
+    return F::create_let(const_false, FLAMBDA_NAMED_INT_LITERAL(0),
                          F::create_let(cond, F::n_expr(arg1), F::if_then_else(cond, arg2, F::var(const_false))));
   }
   if ((lp.kind == PK::Pbytes_to_string || lp.kind == PK::Pbytes_of_string) && x->args.size() == 1)
@@ -605,7 +613,7 @@ F::t Closer::close_prim(const Env& env, const L::Lprim* x) {
   if (lp.kind == PK::Pignore && x->args.size() == 1) {
     variable::t var = variable::create(Names::ignore);
     named defining_expr = close_let_bound_expression(var, env, x->args[0]);
-    return F::create_let(var, defining_expr, name_expr(F::n_const(F::const_int(0)), Names::unit));
+    return F::create_let(var, defining_expr, name_expr(FLAMBDA_NAMED_INT_LITERAL(0), Names::unit));
   }
   if (lp.kind == PK::Praise && x->args.size() == 1) {
     variable::t arg_var = variable::create(Names::raise_arg);
@@ -620,7 +628,7 @@ F::t Closer::close_prim(const Env& env, const L::Lprim* x) {
   if (lp.kind == PK::Pctconst && x->args.size() == 1) {
     L::lambda arg = x->args[0];
     auto cst = [&](const L::StructuredConstant* c) {
-      return close(env, L::llet(L::LetKind::Strict, L::ValueKind::gen(), Ident::create_local("dummy"), arg, L::lconst(c)));
+      return close(env, L::llet(L::LetKind::Strict, L::ValueKind::gen(), Ident::create_local(OCAML_LIT("dummy")), arg, L::lconst(c)));
     };
     auto const_bool = [](bool b) { return L::const_int(b ? 1 : 0); };
     using CT = L::CompileTimeConstant;
@@ -766,6 +774,7 @@ F::Program lambda_to_flambda(Ident::t module_ident, long size, L::lambda lam) {
     f0.n = 0;
     f0.ptr = L::ImmediateOrPointer::Pointer;
     f0.mut = MutableFlag::Mutable;
+    f0 = CLAMBDA_PRIM_LITERAL(f0, "Pfield (0, Pointer, Mutable)");
     clambda::Primitive fpos = f0;
     fpos.n = pos;
     fpos.id = clambda::fresh_uconstant_id();

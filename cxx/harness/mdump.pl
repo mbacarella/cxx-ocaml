@@ -10,17 +10,19 @@
 # --skip N    offset of the intext magic (12 for a .cmi, past "Caml1999I0NN")
 # --count N   decode N consecutive values (a .cmi holds header, crcs, flags)
 # --expand    follow CODE_SHARED back-references instead of printing #n
+# --ids       print each object's number at its first occurrence (@n=)
 # --norm-ids  print every integer < -1 as `id` (Subst.newpersty counts down
 #             from -1, so type_expr ids are exactly the negative ints)
 use strict; use warnings; no warnings "recursion";
 
-my ($path, $skip, $count, $expand, $normids) = (undef, 12, 1, 0, 0);
+my ($path, $skip, $count, $expand, $normids, $ids) = (undef, 12, 1, 0, 0, 0);
 my @a = @ARGV;
 while (@a) { my $x = shift @a;
   if    ($x eq '--skip')     { $skip = shift @a }
   elsif ($x eq '--count')    { $count = shift @a }
   elsif ($x eq '--expand')   { $expand = 1 }
   elsif ($x eq '--norm-ids') { $normids = 1 }
+  elsif ($x eq '--ids')      { $ids = 1 }
   else { $path = $x } }
 die "usage: mdump.pl FILE\n" unless defined $path;
 
@@ -37,9 +39,9 @@ sub i64 { my $v = unpack('q>', substr($B, $P, 8)); $P += 8; $v }
 sub raw { my $n = shift; my $v = substr($B, $P, $n); $P += $n; $v }
 
 sub mkstr { my $n = shift; my $i = scalar @objs; push @objs, undef;
-            my $v = ['str', raw($n)]; $objs[$i] = $v; $v }
+            my $v = ['str', raw($n), $i]; $objs[$i] = $v; $v }
 sub mkblk { my ($tag, $size) = @_; my $i = scalar @objs;
-            my $v = ['blk', $tag, []]; push @objs, $v;
+            my $v = ['blk', $tag, [], $i]; push @objs, $v;
             push @{$v->[2]}, val() for 1 .. $size; $v }
 
 sub val {
@@ -70,6 +72,12 @@ sub val {
     my $body = '';
     if ($c == 0x18) { my $s32 = u32(); i64(); $body = raw($s32) }
     $v->[1] = $name; $v->[2] = unpack('H*', $body); $v }
+  elsif ($c == 0x19) {                        # CODE_CUSTOM_FIXED
+    my $v = ['custom', '', '']; push @objs, $v;
+    my $e = index($B, "\0", $P);
+    my $name = substr($B, $P, $e - $P); $P = $e + 1;
+    my $n = $name eq '_i' ? 4 : $name eq '_j' ? 8 : (u8() == 1 ? 4 : 8);
+    $v->[1] = $name; $v->[2] = unpack('H*', raw($n)); $v }
   else { die sprintf("unhandled code %02x at %d\n", $c, $P - 1) }
 }
 
@@ -80,7 +88,7 @@ sub render {
   my $k = $v->[0];
   if ($k eq 'int') { my $n = $v->[1];
     push @$out, $pad . (($normids && $n < -1) ? 'id' : $n) }
-  elsif ($k eq 'str')    { push @$out, $pad . '"' . $v->[1] . '"' }
+  elsif ($k eq 'str')    { push @$out, $pad . ($ids ? "\@$v->[2]=" : '') . '"' . $v->[1] . '"' }
   elsif ($k eq 'dbl')    { push @$out, $pad . $v->[1] }
   elsif ($k eq 'custom') { push @$out, $pad . "custom($v->[1],$v->[2])" }
   elsif ($k eq 'shared') {
@@ -91,7 +99,7 @@ sub render {
   elsif ($k eq 'blk') {
     if ($seen{$v}) { push @$out, $pad . '<cycle>'; return }
     $seen{$v} = 1;
-    push @$out, $pad . '(t' . $v->[1];
+    push @$out, $pad . ($ids ? "\@$v->[3]=" : '') . '(t' . $v->[1];
     render($_, $ind + 1, $out) for @{$v->[2]};
     push @$out, $pad . ')';
     delete $seen{$v} }

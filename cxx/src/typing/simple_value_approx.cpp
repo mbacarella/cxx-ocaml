@@ -221,9 +221,10 @@ lambda::ValueKind augment_kind_with_approx(t a, const lambda::ValueKind& kind) {
     case DK::Value_int: return lambda::ValueKind::intval();
     case DK::Value_boxed_int:
       switch (a->descr.bi) {
-        case BoxedInt::Int32: return lambda::ValueKind::boxedint(BoxedInteger::Pint32);
-        case BoxedInt::Int64: return lambda::ValueKind::boxedint(BoxedInteger::Pint64);
-        case BoxedInt::Nativeint: return lambda::ValueKind::boxedint(BoxedInteger::Pnativeint);
+        // (literals of simple_value_approx.ml: its own static blocks)
+        case BoxedInt::Int32: return lambda::ValueKind::boxedint_literal(__FILE__, BoxedInteger::Pint32);
+        case BoxedInt::Int64: return lambda::ValueKind::boxedint_literal(__FILE__, BoxedInteger::Pint64);
+        case BoxedInt::Nativeint: return lambda::ValueKind::boxedint_literal(__FILE__, BoxedInteger::Pnativeint);
       }
       return kind;
     default: return kind;

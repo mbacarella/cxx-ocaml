@@ -17,6 +17,9 @@ struct Approx {
   enum class Kind : unsigned char { Value_unknown, Value_id, Value_symbol } kind = Kind::Value_unknown;
   export_id::t id = nullptr;
   symbol::t sym = nullptr;
+  // the block's identity: one per construction, kept by copies (the .cmx
+  // writer shares the block as ocamlopt's values are shared)
+  std::uint64_t obj = next_value_identity();
 };
 
 struct ValueString {

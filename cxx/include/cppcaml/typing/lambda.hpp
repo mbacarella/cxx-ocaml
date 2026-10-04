@@ -105,6 +105,14 @@ struct ValueKind {
   static ValueKind intval() { return {Kind::Pintval}; }
   static ValueKind floatval() { return {Kind::Pfloatval}; }
   static ValueKind boxedint(BoxedInteger b) { return {Kind::Pboxedintval, b}; }
+  // a fresh block identity (one read back from a .cmx)
+  static std::uint32_t fresh_origin() {
+    static std::uint32_t next = 0;
+    return ++next;
+  }
+  // the literal [Pboxedintval b] of an OCaml source file other than
+  // Typeopt: one block per file and kind
+  static ValueKind boxedint_literal(const char* unit, BoxedInteger b);
 };
 bool equal_value_kind(const ValueKind& a, const ValueKind& b);
 bool equal_boxed_integer(BoxedInteger a, BoxedInteger b);

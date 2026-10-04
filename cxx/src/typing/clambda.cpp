@@ -1,6 +1,9 @@
 // Port of middle_end/clambda.ml and the backend half of lambda/debuginfo.ml.
 #include "cppcaml/typing/clambda.hpp"
 
+#include <map>
+#include <string>
+
 #include <unordered_map>
 
 #include <cstring>
@@ -124,6 +127,14 @@ std::string to_string(const t& dbg) {
 }  // namespace debuginfo
 
 namespace clambda {
+
+Primitive prim_literal(const char* unit, Primitive p, std::string_view key) {
+  static std::map<std::pair<std::string, std::string>, unsigned long> literals;
+  auto [it, fresh] = literals.try_emplace({unit, std::string(key)}, 0);
+  if (fresh) it->second = fresh_uconstant_id();
+  p.id = it->second;
+  return p;
+}
 
 unsigned long fresh_uconstant_id() {
   static unsigned long n = 0;

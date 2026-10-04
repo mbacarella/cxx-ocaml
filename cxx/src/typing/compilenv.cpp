@@ -248,7 +248,8 @@ compilation_unit::t unit_for_global(Ident::t id) {
 compilation_unit::t predefined_exception_compilation_unit() {
   static compilation_unit::t c = [] {
     ZoneScope in_permanent(permanent_zone());
-    return compilation_unit::create(Ident::create_persistent("__dummy__"), std::string_view("__dummy__"));
+    // (one string: ocamlopt merges the unit's equal literals)
+    return compilation_unit::create(Ident::create_persistent(OCAML_LIT("__dummy__")), OCAML_LIT("__dummy__"));
   }();
   return c;
 }

@@ -124,10 +124,15 @@ struct Env {
     tables->closure_table = tables->closure_table.add(closure_id, export_id);
     return export_id;
   }
+  // (the literal [Value_int 0]: one block, which every unit description
+  // shares)
   export_id::t new_unit_descr() const {
-    Descr d{DK::Value_int};
-    d.n = 0;
-    return new_descr(mk(d));
+    static const Descr* unit_descr = [] {
+      Descr d{DK::Value_int};
+      d.n = 0;
+      return permanent_zone().make<Descr>(d);
+    }();
+    return new_descr(unit_descr);
   }
   Env add_approx(variable::t v, const Approx& approx) const {
     if (var.mem(v))
