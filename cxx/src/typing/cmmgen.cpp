@@ -5,6 +5,7 @@
 // arg2)] translates arg2 first.  Translation has effects (fresh variables,
 // raise counts, constant symbols, lifted functions), so the port evaluates
 // in that order; "right to left" marks the places.
+#include "cppcaml/typing/config.hpp"
 #include "cppcaml/typing/cmmgen.hpp"
 
 #include <algorithm>
@@ -1366,7 +1367,10 @@ std::vector<Phrase> compunit(const closure_middle_end::WithConstants& c) {
   entry->fun_body = init_code;
   // This function is often large and run only once.  Compilation time
   // matter more than runtime.  See MPR#7630
-  entry->fun_codegen_options = slice(std::vector<CodegenOption>{CodegenOption::Reduce_code_size});
+  if constexpr (config::flambda)
+    entry->fun_codegen_options = slice(std::vector<CodegenOption>{CodegenOption::Reduce_code_size, CodegenOption::No_CSE});
+  else
+    entry->fun_codegen_options = slice(std::vector<CodegenOption>{CodegenOption::Reduce_code_size});
   entry->fun_poll = L::PollAttribute::Default_poll;
   Phrase p1;
   p1.fn = entry;
