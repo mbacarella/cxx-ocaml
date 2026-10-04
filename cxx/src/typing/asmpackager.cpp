@@ -112,7 +112,7 @@ void make_package_object(std::ostream& ppf_dump, const std::vector<PackMember>& 
   try {
     asmgen::compile_unit(asmgen::asm_filename(prefixname), cf::keep_asm_file, prefixname + config::ext_obj, [&] {
       closure_middle_end::WithConstants clambda = [&] {
-        if constexpr (config::flambda) return flambda_middle_end::lambda_to_clambda(dump, program, code);
+        if constexpr (config::flambda) return flambda_middle_end::lambda_to_clambda(dump, prefixname, program, code);
         else return closure_middle_end::lambda_to_clambda(dump, program, code);
       }();
       return asmgen::end_gen_implementation(dump, clambda);

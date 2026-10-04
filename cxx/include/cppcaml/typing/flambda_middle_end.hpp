@@ -19,13 +19,15 @@ struct NotPorted : std::runtime_error {
 
 // lambda_to_flambda ~ppf_dump ~prefixname ~backend ~size ~module_ident
 //   ~module_initializer (the -d dumps on ppf_dump)
-flambda::Program lambda_to_flambda(format::Formatter& ppf_dump, long size, Ident::t module_ident,
+flambda::Program lambda_to_flambda(format::Formatter& ppf_dump, const std::string& prefixname, long size,
+                                   Ident::t module_ident,
                                    lambda::lambda module_initializer);
 
 // lambda_to_clambda ~backend ~prefixname ~ppf_dump program: the middle end,
 // Build_export_info, Flambda_to_clambda (-drawclambda), the export info
 // recorded (Compilenv.set_export_info), Un_anf (-dclambda)
-closure_middle_end::WithConstants lambda_to_clambda(format::Formatter& ppf_dump, const lambda::Program& program,
+closure_middle_end::WithConstants lambda_to_clambda(format::Formatter& ppf_dump, const std::string& prefixname,
+                                                    const lambda::Program& program,
                                                     lambda::lambda module_initializer);
 
 }  // namespace cppcaml::typing::flambda_middle_end

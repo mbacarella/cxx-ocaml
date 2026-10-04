@@ -121,7 +121,8 @@ class PassZones {
 };
 }  // namespace
 
-flambda::Program lambda_to_flambda(format::Formatter& ppf_dump, long size, Ident::t module_ident,
+flambda::Program lambda_to_flambda(format::Formatter& ppf_dump, const std::string& prefixname, long size,
+                                   Ident::t module_ident,
                                    lambda::lambda module_initializer) {
   // (the warning reporter that drops duplicate warnings and
   // Flambda_invariants' checks: not ported yet)
@@ -158,13 +159,11 @@ flambda::Program lambda_to_flambda(format::Formatter& ppf_dump, long size, Ident
   // the round Inline_and_simplify runs at: 0 in fast_mode, else the round
   // number before the loop's [incr] (the dumps print it after)
   long round = 0;
-  // (prefixname only names the -inlining-report files, which are not
-  // ported)
   Pass inline_and_simplify = [&](const Program& p) {
-    return inline_and_simplify::run(false, "", round, ppf_dump, p);
+    return inline_and_simplify::run(false, prefixname, round, ppf_dump, p);
   };
   Pass inline_and_simplify_noinline = [&](const Program& p) {
-    return inline_and_simplify::run(true, "", round, ppf_dump, p);
+    return inline_and_simplify::run(true, prefixname, round, ppf_dump, p);
   };
   Pass not_ported = nullptr;
   if (clflags::classic_inlining) {
@@ -213,9 +212,11 @@ flambda::Program lambda_to_flambda(format::Formatter& ppf_dump, long size, Ident
   return zones.finish(flam);
 }
 
-closure_middle_end::WithConstants lambda_to_clambda(format::Formatter& ppf_dump, const lambda::Program& program,
+closure_middle_end::WithConstants lambda_to_clambda(format::Formatter& ppf_dump, const std::string& prefixname,
+                                                    const lambda::Program& program,
                                                     lambda::lambda module_initializer) {
-  Program flam = lambda_to_flambda(ppf_dump, program.main_module_block_size, program.module_ident, module_initializer);
+  Program flam =
+      lambda_to_flambda(ppf_dump, prefixname, program.main_module_block_size, program.module_ident, module_initializer);
   export_info::Transient exported = build_export_info::build_transient(flam);
   flambda_to_clambda::Result r = flambda_to_clambda::convert(ppf_dump, flam, exported);
   // flambda_raw_clambda_dump_if

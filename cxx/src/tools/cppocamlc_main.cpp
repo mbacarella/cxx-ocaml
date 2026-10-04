@@ -846,7 +846,7 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
         for (ty::Ident::t id : prog.required_globals) ty::compilenv::require_global(id);
         ty::format::Formatter dump;
         ty::closure_middle_end::WithConstants clambda = [&] {
-          if constexpr (ty::config::flambda) return ty::flambda_middle_end::lambda_to_clambda(dump, prog, lam);
+          if constexpr (ty::config::flambda) return ty::flambda_middle_end::lambda_to_clambda(dump, remove_extension(cmo_out), prog, lam);
           else return ty::closure_middle_end::lambda_to_clambda(dump, prog, lam);
         }();
         ty::lambda::set_node_zone(nullptr);
