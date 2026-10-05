@@ -133,6 +133,7 @@ static const tt::ModuleType* transl_modtype_aux(env::t env, const pt::ModuleType
         }
         t_arg = tt::FunctorParameter{false, id, f->param.name, arg};
         ty_arg.is_unit = false;
+        ty_arg.named_obj = fresh_identity();
         ty_arg.id = id;
         ty_arg.some_obj = id ? fresh_identity() : nullptr;
         t_arg.some_obj = ty_arg.some_obj;  // Named (id, ...), Types.Named (id, ...): one `Some id`

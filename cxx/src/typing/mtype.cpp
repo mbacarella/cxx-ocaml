@@ -50,6 +50,7 @@ const lz::Modtype* strengthen_lazy(bool aliasable, env::t env, const lz::Modtype
     }
     auto* r = make<lz::Modtype>(MK::MtyL_functor);
     r->param.is_unit = false;
+    r->param.named_obj = fresh_identity();
     r->param.id = param;
     r->param.some_obj = fresh_identity();  // Named (Some param, arg): a new block
     r->param.mty = mty->param.mty;
@@ -294,6 +295,7 @@ static std::pair<ModulePresence, const ModuleType*> nondep_mty_with_presence(env
       const ModuleType* res = nondep_mty(res_env, va, ids, mty->res);
       const ModuleType* arg = nondep_mty(env, var_inv, ids, mty->param.mty);
       auto* r = make<ModuleType>(*mty);
+      r->param.named_obj = fresh_identity();
       r->param.mty = arg;
       r->res = res;
       return {pres, r};
