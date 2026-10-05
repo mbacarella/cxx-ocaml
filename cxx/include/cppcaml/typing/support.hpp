@@ -251,6 +251,13 @@ struct OValue {
   // record, with its identity Location::obj): the writers make it that
   // record's one value
   const Location* loc_rec = nullptr;
+  // a block Ast_mapper.default_mapper keeps (does not rebuild): an
+  // integer / char / float constant's pconst_desc, an argument label --
+  // the .cmt's Tast_mapper copy of a payload shares it
+  bool mapper_kept = false;
+  // an expression / pattern / core type record: its loc_stack field
+  // (field 2), which Ast_helper's mk (the mapper's copy) leaves []
+  bool has_loc_stack = false;
   // a Location.t block of a whole parsetree being written (Pparse.write_ast):
   // the location itself, which the writer gives the value it gives the
   // same location of a typed tree (by value, or by its record's identity)

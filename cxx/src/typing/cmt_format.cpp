@@ -249,13 +249,16 @@ class TreeWriter {
   V payload(const OValue* x) {
     if (x->kind != OValue::Kind::Block) return w_.ovalue(x);
     if (is_position(x)) return w_.ovalue(x);
+    if (x->mapper_kept) return w_.ovalue(x);  // (the default mapper keeps it)
     // a location: the parsetree's record, which Types' copy of the
     // attribute (the same parsetree value) writes too
     if (x->tag == 0 && x->fields.size() == 3 && is_position(x->fields[0]) && is_position(x->fields[1]) &&
         x->fields[2]->kind == OValue::Kind::Int)
       return w_.ovalue(x);
     std::vector<V> fs;
-    for (const OValue* f : x->fields) fs.push_back(payload(f));
+    for (std::size_t k = 0; k < x->fields.size(); ++k)
+      // (Ast_helper's mk: pexp/ppat/ptyp_loc_stack = [])
+      fs.push_back(x->has_loc_stack && k == 2 ? w_.i(0) : payload(x->fields[k]));
     return o::vblock(static_cast<int>(x->tag), fs);
   }
   // Tast_mapper.attribute: { attr_name = map_loc; attr_payload; attr_loc }
