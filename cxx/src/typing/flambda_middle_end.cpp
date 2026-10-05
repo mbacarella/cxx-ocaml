@@ -5,6 +5,8 @@
 #include "cppcaml/typing/flambda_middle_end.hpp"
 
 #include <algorithm>
+#include <set>
+#include <tuple>
 #include <cstdlib>
 #include <functional>
 #include <memory>
@@ -20,6 +22,9 @@
 #include "cppcaml/typing/build_export_info.hpp"
 #include "cppcaml/typing/closure_conversion.hpp"
 #include "cppcaml/typing/flambda_evacuate.hpp"
+#include "cppcaml/typing/flambda_invariants.hpp"
+#include "cppcaml/typing/location.hpp"
+#include "cppcaml/typing/misc.hpp"
 #include "cppcaml/typing/initialize_symbol_to_let_symbol.hpp"
 #include "cppcaml/typing/inline_and_simplify.hpp"
 #include "cppcaml/typing/lift_code.hpp"
@@ -124,14 +129,48 @@ class PassZones {
 flambda::Program lambda_to_flambda(format::Formatter& ppf_dump, const std::string& prefixname, long size,
                                    Ident::t module_ident,
                                    lambda::lambda module_initializer) {
-  // (the warning reporter that drops duplicate warnings and
-  // Flambda_invariants' checks: not ported yet)
+  // The warning reporter drops the duplicates: a warning (loc, w) reported
+  // once (Misc.protect_refs: the previous reporter back on the way out)
+  struct RestoreReporter {
+    location::WarningReporter saved = location::warning_reporter();
+    ~RestoreReporter() { location::warning_reporter() = saved; }
+  } restore;
+  {
+    using Key = std::tuple<std::string, long, long, long, std::string, long, long, long, bool, int, std::string>;
+    auto warning_set = std::make_shared<std::set<Key>>();
+    location::WarningReporter previous = restore.saved;
+    location::warning_reporter() = [warning_set, previous](const Location& loc,
+                                                           const warnings::Warning& w) -> std::optional<location::Report> {
+      // (Stdlib.compare on Location.t * Warnings.t: the flambda passes'
+      // warnings carry at most their string)
+      Key elt{std::string(loc.loc_start.pos_fname.view()), loc.loc_start.pos_lnum, loc.loc_start.pos_bol,
+              loc.loc_start.pos_cnum, std::string(loc.loc_end.pos_fname.view()), loc.loc_end.pos_lnum,
+              loc.loc_end.pos_bol, loc.loc_end.pos_cnum, loc.loc_ghost, static_cast<int>(w.k), w.s};
+      if (warning_set->count(elt)) return std::nullopt;
+      warning_set->insert(elt);
+      return previous(loc, w);
+    };
+  }
   long pass_number = 0;
   long round_number = 0;
   Program flam = closure_conversion::lambda_to_flambda(module_ident, size, module_initializer);
   if (clflags::dump_rawflambda)
     fprintf(ppf_dump, "After closure conversion:@ %a@.",
             [&](format::Formatter& f) { flambda::print_program(f, flam); });
+  // check: Flambda_invariants.check_exn, a failure fatal
+  auto check = [&](const Program& p) {
+    if (!clflags::flambda_invariant_checks) return;
+    try {
+      flambda_invariants::check_exn(p);
+    } catch (const flambda_invariants::Failed& e) {
+      format::Formatter f;
+      fprintf(f, "After Flambda pass %d, round %d:@.%s:@.%a", pass_number, round_number, e.what,
+              [&](format::Formatter& g) { flambda::print_program(g, p); });
+      f.print_flush();
+      misc::fatal_error(f.contents());
+    }
+  };
+  check(flam);
   PassZones zones;
   // flam +-+ (name, pass); a null pass is not ported yet
   auto step = [&](const Program& flam, const char* name, Pass pass) -> Program {
@@ -143,7 +182,9 @@ flambda::Program lambda_to_flambda(format::Formatter& ppf_dump, const std::strin
       fprintf(ppf_dump, "\n@?");
     }
     if (!pass) throw NotPorted(name);
-    return zones.after_pass(pass(flam));
+    Program r = zones.after_pass(pass(flam));
+    check(r);
+    return r;
   };
   Pass lift_lets = lift_code::lift_lets;
   Pass lift_constants = lift_constants::lift_constants;

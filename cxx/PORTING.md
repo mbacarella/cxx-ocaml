@@ -256,7 +256,7 @@ identity (Export_info approximations, consts), and the literal blocks of
 an OCaml source file are one per file and value (FLAMBDA_INT_LITERAL,
 CLAMBDA_PRIM_LITERAL, OCAML_LIT ...).  -pack and -inlining-report (its
 .inlining.org files: inlining_report_parity.sh) are ported; not ported:
-Flambda_invariants (a checker that changes no output); -clambda-checks is ported.
+-clambda-checks and -dflambda-invariants (Flambda_invariants after every pass) are ported.
 
 Gates (NATIVE=1, lambda_port_parity.sh): DUMP=drawflambda,
 dflambda-verbose (the program before each pass), drawclambda, dclambda,

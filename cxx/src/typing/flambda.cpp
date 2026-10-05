@@ -1219,5 +1219,8 @@ bool equal_specialised_to(const SpecialisedTo& a, const SpecialisedTo& b) {
   return projection::equal(a.projection, b.projection);
 }
 
+void print_function_declaration_pub(Formatter& ppf, variable::t var, const FunctionDeclaration* f) {
+  print_function_declaration(ppf, var, f);
+}
 }  // namespace flambda
 }  // namespace cppcaml::typing
