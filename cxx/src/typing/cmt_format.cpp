@@ -3297,7 +3297,8 @@ void save_cmt(const std::string& filename, std::string_view modname, const std::
   std::vector<V> imps;
   for (auto& [name, crc] : imports) {
     // the unit's own name: the one Unit_info string (save_cmi's add_import)
-    V n = name == modname ? w.unit_name(modname) : w.str(env::import_name(name));
+    // (-cmi-file: Unit_info.Artifact.from_filename's own modname string)
+    V n = name == modname && !clflags::cmi_file ? w.unit_name(modname) : w.str(env::import_name(name));
     imps.push_back(o::vblock(0, {n, crc ? w.some(o::vstr(*crc)) : w.none()}));
   }
   V initial = tw.env(initial_env);

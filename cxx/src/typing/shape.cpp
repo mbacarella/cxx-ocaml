@@ -59,6 +59,7 @@ t strip_head_aliases(t s) {
 }
 
 std::pair<Ident::t, t> fresh_var(const Uid& uid, std::string_view name) {
+  if (!name.data()) name = OCAML_LIT("shape-var");  // one static string
   Ident::t v = Ident::create_local(name);
   Shape* s = mk(&uid, Shape::Kind::Var);
   s->var = v;

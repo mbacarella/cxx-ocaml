@@ -65,7 +65,8 @@ struct Shape {
 };
 
 t strip_head_aliases(t s);
-std::pair<Ident::t, t> fresh_var(const Uid& uid, std::string_view name = "shape-var");
+// (name: shape.ml's `?(name="shape-var")` literal when unset)
+std::pair<Ident::t, t> fresh_var(const Uid& uid, std::string_view name = {});
 Ident::t for_unnamed_functor_param();
 t var(const Uid& uid, Ident::t id);
 t abs(const Uid* uid, Ident::t var, t body);
