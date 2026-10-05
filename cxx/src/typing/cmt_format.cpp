@@ -458,7 +458,8 @@ class TreeWriter {
         return o::vblock(1, {t1, t2});
       }
       case K::Texp_poly: return o::vblock(2, {opt(e.cty != nullptr, [&] { return typ(e.cty); })});
-      case K::Texp_newtype: return o::vblock(3, {w_.str(e.name)});
+      // (Tast_mapper keeps `Texp_newtype _ as d -> d`: one block per extra)
+      case K::Texp_newtype: return w_.shared_by(&e, [&] { return o::vblock(3, {w_.str(e.name)}); });
     }
     return w_.i(0);
   }
@@ -570,7 +571,9 @@ class TreeWriter {
         auto* x = tt::as<tt::Texp_ident>(d);
         return o::vblock(0, {w_.path(x->path), lid_loc(x->lid), w_.value_desc(x->vd)});
       }
-      case K::Texp_constant: return o::vblock(1, {constant(tt::as<tt::Texp_constant>(d)->c)});
+      // (Tast_mapper keeps `Texp_constant _ as d -> d`: one block per desc)
+      case K::Texp_constant:
+        return w_.shared_by(d, [&] { return o::vblock(1, {constant(tt::as<tt::Texp_constant>(d)->c)}); });
       case K::Texp_let: {
         auto* x = tt::as<tt::Texp_let>(d);
         V vbs = value_bindings(x->vbs);
@@ -757,7 +760,11 @@ class TreeWriter {
   V typ(const tt::CoreType* c) {
     V l = loc(c->ctyp_loc);
     V en = env(c->ctyp_env);
-    V desc = typ_desc(c->ctyp_desc);
+    // Tast_mapper rebuilds every ctyp_desc but `Ttyp_var _ as d -> d`: that
+    // one block per desc (a record reached twice, or copied, keeps it)
+    V desc = c->ctyp_desc->kind == tt::CoreTypeDesc::Kind::Ttyp_var
+                 ? w_.shared_by(c->ctyp_desc, [&] { return typ_desc(c->ctyp_desc); })
+                 : typ_desc(c->ctyp_desc);
     V attrs = attributes(c->ctyp_attributes);
     return o::vblock(0, {desc, w_.ty(c->ctyp_type), en, l, attrs});
   }

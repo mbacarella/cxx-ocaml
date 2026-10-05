@@ -21,6 +21,9 @@ std::map<std::pair<const void*, std::size_t>, typing::Attributes> g_types_attrib
 // the docstrings' ds_loc records by span: Lexer.comments () lists each
 // docstring's comment with that same location record
 std::map<std::pair<long, long>, Location> g_docstring_locs;
+// ... and their ds_body strings: a docstring attached twice (docs_attr for
+// the item before and the item after it) is one body and one location
+std::map<std::pair<long, long>, std::string_view> g_docstring_bodies;
 // a line directive's file name: one string per directive file for the unit
 // (the parsetree's positions and Lexer.comments () share the lexbuf's)
 std::vector<std::string_view> g_zdirfiles;
@@ -369,11 +372,15 @@ struct Conv {
     auto* e = const_cast<Expression*>(ev->exp);
     auto* c = as<Pexp_constant>(e->pexp_desc);
     if (!c || c->c.pconst_desc.kind != ConstantDesc::Kind::Pconst_string) return;
+    std::pair<long, long> span{item->pstr_loc.loc_start.pos_cnum, item->pstr_loc.loc_end.pos_cnum};
+    auto [it, fresh] = g_docstring_locs.try_emplace(span, item->pstr_loc);
+    if (!fresh) const_cast<StructureItem*>(item)->pstr_loc = it->second;
     e->pexp_loc = item->pstr_loc;
     auto* cm = const_cast<Pexp_constant*>(c);
     cm->c.pconst_loc = item->pstr_loc;
     cm->c.pconst_desc.str_loc = item->pstr_loc;
-    g_docstring_locs.try_emplace({item->pstr_loc.loc_start.pos_cnum, item->pstr_loc.loc_end.pos_cnum}, item->pstr_loc);
+    auto [bt, bfresh] = g_docstring_bodies.try_emplace(span, cm->c.pconst_desc.s);
+    if (!bfresh) cm->c.pconst_desc.s = bt->second;
   }
   Payload ext_payload(const ast::ExtPayload& e) const {
     Payload p{};
@@ -1090,7 +1097,9 @@ struct Conv {
             } else if constexpr (std::is_same_v<T, ast::Pctf_constraint>) {
               d = make<Pctf_constraint>(Pctf_constraint{{K::Pctf_constraint}, core_type(*v.t1), core_type(*v.t2)});
             } else if constexpr (std::is_same_v<T, ast::Pctf_attribute>) {
-              d = make<Pctf_attribute>(Pctf_attribute{{K::Pctf_attribute}, item_attribute(v.name, v.payload, l, v.name_loc)});
+              // mkcf / mkctf's location and Attr.mk's: two records
+              d = make<Pctf_attribute>(
+                  Pctf_attribute{{K::Pctf_attribute}, item_attribute(v.name, v.payload, loc(f.loc), v.name_loc)});
             } else if constexpr (std::is_same_v<T, ast::Pctf_extension>) {
               d = make<Pctf_extension>(Pctf_extension{{K::Pctf_extension}, extension(v.name, v.payload)});
             }
@@ -1166,7 +1175,9 @@ struct Conv {
             } else if constexpr (std::is_same_v<T, ast::Pcf_initializer>) {
               d = make<Pcf_initializer>(Pcf_initializer{{K::Pcf_initializer}, expression(*v.e)});
             } else if constexpr (std::is_same_v<T, ast::Pcf_attribute>) {
-              d = make<Pcf_attribute>(Pcf_attribute{{K::Pcf_attribute}, item_attribute(v.name, v.payload, l, v.name_loc)});
+              // mkcf / mkctf's location and Attr.mk's: two records
+              d = make<Pcf_attribute>(
+                  Pcf_attribute{{K::Pcf_attribute}, item_attribute(v.name, v.payload, loc(f.loc), v.name_loc)});
             } else if constexpr (std::is_same_v<T, ast::Pcf_extension>) {
               d = make<Pcf_extension>(Pcf_extension{{K::Pcf_extension}, extension(v.name, v.payload)});
             }
@@ -1439,6 +1450,7 @@ struct Conv {
 Structure of_ast(const ast::Structure& s, std::string_view fname,
                  const std::vector<std::string>& dirfiles) {
   g_docstring_locs.clear();
+  g_docstring_bodies.clear();
   g_zdirfiles.clear();
   Conv c{zborrow(fname), dirfiles};
   return c.structure(s);
@@ -1447,6 +1459,7 @@ Structure of_ast(const ast::Structure& s, std::string_view fname,
 Signature of_ast_signature(const ast::Signature& s, std::string_view fname,
                            const std::vector<std::string>& dirfiles) {
   g_docstring_locs.clear();
+  g_docstring_bodies.clear();
   g_zdirfiles.clear();
   Conv c{zborrow(fname), dirfiles};
   return c.signature(s);
@@ -1462,6 +1475,7 @@ std::vector<std::pair<std::string_view, Location>> comments_of_ast(const std::ve
     out.emplace_back(zone().str(x.text), it != g_docstring_locs.end() ? it->second : c.loc(x.loc));
   }
   g_docstring_locs.clear();
+  g_docstring_bodies.clear();
   return out;
 }
 

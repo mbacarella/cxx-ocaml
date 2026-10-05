@@ -308,7 +308,7 @@ void add_dummy_method(env::t env, long scope, ClassSignature* sign) {
   if (field_kind_repr(sign->csig_dummy_method) != FieldKindView::Fabsent)
     throw std::logic_error("Ctype.add_dummy_method");
   MethodRow r = filter_method_row(env, dummy_method, PrivateFlag::Private, sign->csig_self_row);
-  unify(env, r.field, new_scoped_ty(scope, ttuple({})));
+  unify(env, r.field, new_scoped_ty(scope, ttuple_nil()));
   sign->csig_dummy_method = r.kind;
   sign->csig_self_row = r.row;
 }

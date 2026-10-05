@@ -199,9 +199,18 @@ TypeExpr* newmono_package(const Package* pty, std::optional<long> level) {
 TypeExpr* none() {
   static TypeExpr* n = [] {
     ZoneScope perm(permanent_zone());
-    return newty(ttuple({}));
+    return newty(ttuple_nil());
   }();
   return n;
+}
+// ctype.ml's `Ttuple []` (none's, add_dummy_method's): a structured
+// constant, which ocamlopt emits once for the unit -- one desc
+const TypeDesc* ttuple_nil() {
+  static const TypeDesc* d = [] {
+    ZoneScope perm(permanent_zone());
+    return ttuple({});
+  }();
+  return d;
 }
 
 // ---- Pattern_env ------------------------------------------------------------------

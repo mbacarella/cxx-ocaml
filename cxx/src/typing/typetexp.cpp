@@ -12,6 +12,9 @@
 #include "cppcaml/typing/typing_recovery.hpp"
 
 namespace cppcaml::typing::typetexp {
+// the parser's `Some []` constant (a Ptyp_variant `[< ..]`'s present tags):
+// one block, which the .cmt writer shares
+static const char some_nil_obj = 0;
 
 using namespace types;
 using namespace btype;
@@ -714,7 +717,10 @@ static const tt::CoreType* transl_type_aux(env::t env, const RowContext& row_con
       more_slot->contents = more;
       TypeExpr* ty = ctype::newty(tvariant(make_row(more)));
       return ctyp(make<tt::Ttyp_variant>(tt::Ttyp_variant{{TK::Ttyp_variant}, slice(tfields), v->closed,
-                                                          v->has_labels, v->labels, &v->labels}),
+                                                          v->has_labels, v->labels,
+                                                          // parser.mly's `[< ..]` is a static `Some []`
+                                                          v->labels.empty() ? static_cast<const void*>(&some_nil_obj)
+                                                                            : &v->labels}),
                   ty);
     }
     case PK::Ptyp_poly: {
