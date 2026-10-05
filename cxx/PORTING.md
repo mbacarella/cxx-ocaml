@@ -292,7 +292,7 @@ run two builds while a chain runs; cap memory (`ulimit -v`).  Results as of the
 | `exec_parity.sh` | testsuite programs' output | 734/734 |
 | `ppx_parity.sh` | `-ppx` and binary-AST inputs | 14 + 14 same errors |
 | `typing_parse_parity.sh` | Parsetree dumps (compiler-libs vs port) | 2040/2040 |
-| `dune_parity.sh` | dune builds, artifact by artifact | 0 DIFF (73 .cmt sharing) |
+| `dune_parity.sh` | dune builds, artifact by artifact (`STAGE=` staged from this tree) | 3437/3437 |
 | `effid.sh` | the compiler's .cmo, compiled by c++ocamlc | 140/140 bytes |
 | `ddc.sh` + `stdlib_ddc.sh` | diverse double-compiling (`cxx/DDC.md`) | PASS: 271 .cmo + 355 .cmi (bytecode and native compiler sources) |
 | `testsuite_delta.sh` | ocamltest with c++ocamlc as ocamlc | the delta (below) |
