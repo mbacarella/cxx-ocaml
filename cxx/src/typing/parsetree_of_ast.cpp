@@ -278,12 +278,22 @@ struct Conv {
   // equal constants)
   // parser.mly's array_function: `Ldot (Lident "Array" | "String", "get" |
   // "set")`, the names its literals (a ghost ident: only the desugaring)
+  // (and the bigarrays': `Ldot (Ldot (Lident "Bigarray", "Array1" | ..), ..)`)
   static Longident::t array_function(Longident::t l) {
-    if (l->kind != Longident::Kind::Ldot || l->l1->kind != Longident::Kind::Lident) return l;
-    std::string_view m = l->l1->s;
-    if (m != "Array" && m != "String") return l;
-    std::string_view f = l->s == "get" || l->s == "set" ? ocaml_literal("parsing/parser.mly", l->s) : l->s;
-    return Longident::ldot(Longident::lident(ocaml_literal("parsing/parser.mly", m)), l->l1_loc(), f, l->s_loc());
+    if (l->kind != Longident::Kind::Ldot) return l;
+    auto lit = [](std::string_view x) { return ocaml_literal("parsing/parser.mly", x); };
+    // "unsafe_" ^ opname under -unsafe: a fresh string
+    std::string_view f = l->s == "get" || l->s == "set" ? lit(l->s) : l->s;
+    const Longident* p = l->l1;
+    if (p->kind == Longident::Kind::Lident) {
+      if (p->s != "Array" && p->s != "String") return l;
+      return Longident::ldot(Longident::lident(lit(p->s)), l->l1_loc(), f, l->s_loc());
+    }
+    if (p->kind != Longident::Kind::Ldot || p->l1->kind != Longident::Kind::Lident || p->l1->s != "Bigarray" ||
+        (p->s != "Array1" && p->s != "Array2" && p->s != "Array3" && p->s != "Genarray"))
+      return l;
+    Longident::t m = Longident::ldot(Longident::lident(lit(p->l1->s)), p->l1_loc(), lit(p->s), p->s_loc());
+    return Longident::ldot(m, l->l1_loc(), f, l->s_loc());
   }
   static std::string_view name(std::string_view s) {
     static const std::string_view lits[] = {"()", "[]", "::", "false", "true", "+", "+.", "+=", "-", "-.", "*",

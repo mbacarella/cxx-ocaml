@@ -277,7 +277,7 @@ static MethodRow filter_method_row(env::t env, std::string_view name, PrivateFla
     MethodPrivacy mp;
     if (priv == PrivateFlag::Private) {
       kind = field_private();
-      mp = MethodPrivacy{true, kind};
+      mp = MethodPrivacy{true, kind, fresh_identity()};
     } else {
       kind = field_public();
     }
@@ -289,7 +289,7 @@ static MethodRow filter_method_row(env::t env, std::string_view name, PrivateFla
     if (f->label == name) {
       MethodPrivacy mp;
       if (priv == PrivateFlag::Public) unify_kind(f->kind_, field_public());
-      else mp = MethodPrivacy{true, f->kind_};
+      else mp = MethodPrivacy{true, f->kind_, fresh_identity()};
       return {mp, f->ty, f->rest};
     }
     long level = get_level(ty);
@@ -301,7 +301,7 @@ static MethodRow filter_method_row(env::t env, std::string_view name, PrivateFla
     if (name == dummy_method) throw FilterMethodRowFailed{};
     if (priv == PrivateFlag::Public) throw FilterMethodRowFailed{};
     long level = get_level(ty);
-    return {MethodPrivacy{true, field_absent()}, newvar2(level), ty};
+    return {MethodPrivacy{true, field_absent(), fresh_identity()}, newvar2(level), ty};
   }
   throw FilterMethodRowFailed{};
 }

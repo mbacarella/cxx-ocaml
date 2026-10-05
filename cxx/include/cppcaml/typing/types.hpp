@@ -378,6 +378,10 @@ struct VarEntry {  // (mutable_flag * virtual_flag * type_expr)
 struct MethodPrivacy {  // Mpublic | Mprivate of field_kind
   bool is_private = false;
   FieldKind* kind = nullptr;
+  // the `Mprivate kind` block's identity: fresh where Ctype builds one
+  // (filter_method_row, in 5.5.1), kept by the copies of a meths
+  // entry (Subst, add_method's `priv'`); nullptr: one block per kind
+  const void* obj = nullptr;
 };
 struct MethEntry {  // (method_privacy * virtual_flag * type_expr)
   MethodPrivacy priv;
@@ -441,6 +445,10 @@ struct ValueKind {
   StrMap<Ident::t>* meths = nullptr;
   StrMap<Ident::t> vars{};                        // Val_self
   std::string_view cl_num;                        // Val_self / Val_anc
+  // the Val_ivar / Val_self / Val_anc block's identity: fresh where Typeclass
+  // builds one, kept by a value description's copies (Typecore.type_ident's
+  // `{desc with val_type = ..}`); nullptr: a fresh block at each write
+  const void* obj = nullptr;
 };
 
 struct ValueDescription {
