@@ -511,7 +511,8 @@ static const tt::Pattern* type_pat_aux(TypePatState& tps, PC category,
       x.cty = sc.cty;
       tt::Pattern* q = make<tt::Pattern>(*p);
       q->pat_type = sc.ty;
-      q->pat_extra = cons_extra(tt::PatExtraItem{x, loc, sp->ppat_attributes}, p->pat_extra);
+      // (`Ppat_constraint(sp, sty)` shadows sp: the constrained pattern's attributes)
+      q->pat_extra = cons_extra(tt::PatExtraItem{x, loc, c->pat->ppat_attributes}, p->pat_extra);
       return q;
     }
     case SK::Ppat_type: {

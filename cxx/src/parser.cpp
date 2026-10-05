@@ -4521,10 +4521,19 @@ class Parser {
           me = ModuleExpr{Pmod_apply{box(std::move(me)), box(std::move(arg))}, span(symstart, ae)};
           continue;
         }
+        // paren_module_expr: `(me : mt)` / `(me)`
         ModuleExpr arg = parse_module_expr();
-        const Token& c = cur(); expect(Kind::RPAREN, ")");
+        if (cur().kind == Kind::COLON) {
+          advance();
+          ModuleType mt = parse_module_type();
+          const Token& c = cur(); expect_closing(Kind::RPAREN, ")", lp, "(");
+          arg = ModuleExpr{Pmod_constraint{box(std::move(arg)), box(std::move(mt))},
+                           span(position(lp.start), position(c.end))};
+        } else {
+          expect_closing(Kind::RPAREN, ")", lp, "(");
+        }
         me = ModuleExpr{Pmod_apply{box(std::move(me)), box(std::move(arg))},
-                        span(symstart, position(c.end))};
+                        span(symstart, position(tokens_[idx_ - 1].end))};
       } else if (cur().kind == Kind::LBRACKETAT) {  // me [@attr]  -> pmod_attributes
         advance();
         me.attrs.push_back(parse_attribute_body());

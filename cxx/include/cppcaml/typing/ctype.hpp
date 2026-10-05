@@ -229,6 +229,8 @@ TypeExpr* newconstr(Path::t path, Slice<TypeExpr*> tyl);
 TypeExpr* newmono(TypeExpr* ty);
 TypeExpr* newmono_package(const Package* pty, std::optional<long> level = std::nullopt);
 TypeExpr* none();
+// ctype.ml's `Ttuple []` constant (none's desc, add_dummy_method's)
+const TypeDesc* ttuple_nil();
 
 // ---- Pattern_env ----------------------------------------------------------------
 struct PatternEnv {

@@ -315,7 +315,7 @@ ClassSignature* new_class_signature() {
 
 void add_dummy_method(env::t env, long scope, ClassSignature* sign) {
   MethodRow r = filter_method_row(env, dummy_method, PrivateFlag::Private, sign->csig_self_row);
-  unify(env, r.field, new_scoped_ty(scope, ttuple({})));
+  unify(env, r.field, new_scoped_ty(scope, ttuple_nil()));
   sign->csig_self_row = r.row;
 }
 
