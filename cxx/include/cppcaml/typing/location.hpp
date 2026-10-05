@@ -126,8 +126,13 @@ format::Formatter& err_formatter();
 void err_flush();
 
 // ---- warnings and alerts (the default reporters) ----
-// report_warning loc w / report_alert loc a: None when inactive
+// report_warning loc w (!warning_reporter loc w) / report_alert loc a:
+// None when inactive
 std::optional<Report> report_warning(const Location& loc, const warnings::Warning& w);
+// Location.warning_reporter (a ref) and default_warning_reporter
+using WarningReporter = std::function<std::optional<Report>(const Location&, const warnings::Warning&)>;
+WarningReporter& warning_reporter();
+std::optional<Report> default_warning_reporter(const Location& loc, const warnings::Warning& w);
 std::optional<Report> report_alert(const Location& loc, const warnings::Alert& a);
 // print_warning loc ppf w / prerr_warning loc w (on formatter_for_warnings,
 // Format.err_formatter)

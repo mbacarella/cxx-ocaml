@@ -634,8 +634,15 @@ std::optional<Report> reporting(const Location& loc, const std::optional<warning
 }
 }  // namespace
 
-std::optional<Report> report_warning(const Location& loc, const warnings::Warning& w) {
+std::optional<Report> default_warning_reporter(const Location& loc, const warnings::Warning& w) {
   return reporting(loc, warnings::report(w), ReportKind::Report_warning, ReportKind::Report_warning_as_error);
+}
+WarningReporter& warning_reporter() {
+  static WarningReporter r = default_warning_reporter;
+  return r;
+}
+std::optional<Report> report_warning(const Location& loc, const warnings::Warning& w) {
+  return warning_reporter()(loc, w);
 }
 std::optional<Report> report_alert(const Location& loc, const warnings::Alert& a) {
   return reporting(loc, warnings::report_alert(a), ReportKind::Report_alert, ReportKind::Report_alert_as_error);

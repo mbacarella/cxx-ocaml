@@ -123,6 +123,7 @@ let () =
       bool "flambda" Config.flambda;
       bool "with_cmm_invariants" Config.with_cmm_invariants;
       bool "with_codegen_invariants" Config.with_codegen_invariants;
+      bool "with_flambda_invariants" Config.with_flambda_invariants;
       bool "function_sections" Config.function_sections;
       bool "afl_instrument" Config.afl_instrument;
       str "architecture" Config.architecture;

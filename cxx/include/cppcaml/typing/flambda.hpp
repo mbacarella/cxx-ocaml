@@ -453,6 +453,8 @@ void print(format::Formatter& ppf, t flam);  // "%a@." lam
 void print_expr(format::Formatter& ppf, t flam);  // lam
 void print_named(format::Formatter& ppf, named n);
 void print_set_of_closures(format::Formatter& ppf, const SetOfClosures* set);
+// print_function_declaration ppf (var, decl)
+void print_function_declaration_pub(format::Formatter& ppf, variable::t var, const FunctionDeclaration* f);
 void print_function_declarations(format::Formatter& ppf, const FunctionDeclarations* fd);
 void print_specialised_to(format::Formatter& ppf, const SpecialisedTo& s);
 void print_constant_defining_value(format::Formatter& ppf, constant_defining_value c);
