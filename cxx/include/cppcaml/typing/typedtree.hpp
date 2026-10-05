@@ -403,6 +403,10 @@ TT_CTOR(CoreTypeDesc, Ttyp_variant)
   ClosedFlag closed;
   bool has_labels;
   Slice<std::string_view> labels;
+  // the parsetree's `Some labels` block, which Typetexp keeps: one per
+  // Ptyp_variant (the parser shares a let-binding's constraint between its
+  // pattern and its expression)
+  const void* labels_obj = nullptr;
 TT_END
 TT_CTOR(CoreTypeDesc, Ttyp_poly) Slice<std::string_view> vars; const CoreType* ty; TT_END
 TT_CTOR(CoreTypeDesc, Ttyp_package) const PackageType* pack; TT_END

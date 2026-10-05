@@ -26,6 +26,11 @@ Zone* g_types_zone = nullptr;
 ZoneScope::ZoneScope(Zone& z) : saved(g_zone) { g_zone = &z; }
 ZoneScope::~ZoneScope() { g_zone = saved; }
 const void* fresh_identity() { return zone().alloc(1, 1); }
+std::unordered_map<const void*, SliceTail>& slice_tails() {
+  static std::unordered_map<const void*, SliceTail> m;
+  return m;
+}
+SliceTailNote::~SliceTailNote() { slice_tails().erase(p); }
 std::vector<const Zone*>& transient_zones() {
   static std::vector<const Zone*> v;
   return v;
@@ -638,7 +643,10 @@ Slice<RowFieldEntry> row_fields(const RowDesc* row, Zone* in) {
   if (row->row_fields.empty()) return rest;  // [] @ l == l
   std::vector<RowFieldEntry> out(row->row_fields.begin(), row->row_fields.end());
   out.insert(out.end(), rest.begin(), rest.end());
-  return slice_in(in ? *in : zone(), out);
+  Zone& z = in ? *in : zone();
+  Slice<RowFieldEntry> r = slice_in(z, out);
+  note_slice_tail(z, r, rest);  // `@` shares its second list
+  return r;
 }
 
 static const RowDesc* row_repr_no_fields(const RowDesc* row) {

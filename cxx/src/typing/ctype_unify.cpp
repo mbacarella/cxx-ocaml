@@ -1676,9 +1676,13 @@ struct RowScope {
   RowScope& operator=(const RowScope&) = delete;
 };
 // a list that becomes part of a type: out of the scratch zone
+// (a concatenation's tail, row_fields' `@`, stays shared)
 Slice<RowFieldEntry> lasting(Slice<RowFieldEntry> l) {
   if (l.empty() || !g_row_zone->owns(reinterpret_cast<const char*>(l.begin()))) return l;
-  return slice(std::vector<RowFieldEntry>(l.begin(), l.end()));
+  Slice<RowFieldEntry> tail = slice_tail(l);
+  Slice<RowFieldEntry> r = slice(std::vector<RowFieldEntry>(l.begin(), l.end()));
+  if (!tail.empty()) note_slice_tail(zone(), r, lasting(tail));
+  return r;
 }
 }  // namespace
 

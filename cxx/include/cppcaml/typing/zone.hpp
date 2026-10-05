@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <unordered_map>
 #include <memory>
 #include <new>
 #include <string_view>
@@ -452,6 +453,34 @@ Slice<T> slice_in(Zone& z, const std::vector<T>& v) {
   T* p = static_cast<T*>(z.alloc(sizeof(T) * v.size(), alignof(T)));
   std::uninitialized_copy(v.begin(), v.end(), p);
   return {p, v.size()};
+}
+// `l1 @ l2` shares l2's cells, which one Slice cannot: the concatenation's
+// storage records its tail here (until its zone drops the storage), and the
+// .cmi / .cmt writer links the prefix's last cell to the tail's list.
+struct SliceTail {
+  std::size_t n;  // the concatenation's length
+  const void* tail_p;
+  std::size_t tail_n;
+};
+std::unordered_map<const void*, SliceTail>& slice_tails();
+struct SliceTailNote {
+  const void* p;
+  ~SliceTailNote();
+};
+template <class T>
+void note_slice_tail(Zone& z, Slice<T> whole, Slice<T> tail) {
+  if (tail.empty() || whole.n <= tail.n) return;
+  slice_tails()[whole.p] = {whole.n, tail.p, tail.n};
+  z.make<SliceTailNote>(static_cast<const void*>(whole.p));
+}
+// the tail [whole] shares, if recorded
+template <class T>
+Slice<T> slice_tail(Slice<T> whole) {
+  auto& m = slice_tails();
+  if (m.empty() || whole.empty()) return {};
+  auto it = m.find(whole.p);
+  if (it == m.end() || it->second.n != whole.n) return {};
+  return {static_cast<const T*>(it->second.tail_p), it->second.tail_n};
 }
 // a Slice is already the list: the same list (its identity kept)
 template <class T>

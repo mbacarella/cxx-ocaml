@@ -85,13 +85,16 @@ class Writer {
     if (auto it = lists_.find(key); it != lists_.end()) return it->second;
     // the cells registered before the elements are written: an element may
     // reach its own list again (Marshal's sharing of cyclic values)
+    Slice<T> tail = slice_tail(l);  // the cells past the prefix: the tail's list
+    std::size_t n = l.size() - tail.size();
     std::vector<V> cells;
-    for (std::size_t k = 0; k < l.size(); ++k) cells.push_back(o::vblock(0, {}));
+    for (std::size_t k = 0; k < n; ++k) cells.push_back(o::vblock(0, {}));
     lists_[key] = cells[0];
-    for (std::size_t k = 0; k < l.size(); ++k) {
+    for (std::size_t k = 0; k < n; ++k) {
       V h = elt(l[k]);
-      cells[k]->fields = {h, k + 1 < l.size() ? cells[k + 1] : i(0)};
+      cells[k]->fields = {h, k + 1 < n ? cells[k + 1] : tail.empty() ? i(0) : V{}};
     }
+    if (!tail.empty()) cells[n - 1]->fields[1] = list(tail, elt);
     return cells[0];
   }
   V opt_str(const OptStr& x) {
