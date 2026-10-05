@@ -1087,7 +1087,7 @@ static void normalize_type_rec(TypeMark& mark, TypeExpr* ty) {
     auto* c = as<Tconstr>(get_desc(tm));  // PR#7348
     if (!c || c->path->kind != Path::Kind::Pdot) throw std::logic_error("Ctype.normalize_type_rec");
     std::string_view i = c->path->s;
-    std::string_view i2 = i.substr(0, i.size() - 4);
+    std::string_view i2 = zone().str(i.substr(0, i.size() - 4));  // String.sub: a fresh string
     set_type_desc(ty, tconstr(Path::pdot(c->path->p1, i2), c->args, make<MemoRef>(mnil())));
   } else {
     const TypeDesc* d = get_desc(ty);
