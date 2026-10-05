@@ -121,6 +121,14 @@ V locs(LocationStack s) {
 V strloc(const StrLoc& s) { return B(0, {S(s.txt), loc(s.loc)}); }
 V optstr(const OptStr& o) { return o.some ? some(S(o.v)) : none(); }
 V optstrloc(const OptStrLoc& s) { return B(0, {optstr(s.txt), loc(s.loc)}); }
+V with_loc_stack(V v) {
+  const_cast<OValue*>(v)->has_loc_stack = true;
+  return v;
+}
+V kept(V v) {
+  const_cast<OValue*>(v)->mapper_kept = true;
+  return v;
+}
 V lident(Longident::t l) {
   switch (l->kind) {
     case Longident::Kind::Lident: return B(0, {S(l->s)});
@@ -135,8 +143,8 @@ V lidloc(const LidLoc& l) { return B(0, {lident(l.txt), loc(l.loc)}); }
 V arg_label(const ArgLabel& l) {
   switch (l.kind) {
     case ArgLabel::Kind::Nolabel: return I(0);
-    case ArgLabel::Kind::Labelled: return B(0, {S(l.name)});
-    case ArgLabel::Kind::Optional: return B(1, {S(l.name)});
+    case ArgLabel::Kind::Labelled: return kept(B(0, {S(l.name)}));
+    case ArgLabel::Kind::Optional: return kept(B(1, {S(l.name)}));
   }
   return I(0);
 }
@@ -152,9 +160,16 @@ V constant(const Constant& c) {
   switch (d.kind) {
     case ConstantDesc::Kind::Pconst_integer: desc = B(0, {S(d.s), char_opt(d.has_suffix, d.suffix)}); break;
     case ConstantDesc::Kind::Pconst_char: desc = B(1, {I(static_cast<unsigned char>(d.c))}); break;
-    case ConstantDesc::Kind::Pconst_string: desc = B(2, {S(d.s), loc(d.str_loc), optstr(d.delim)}); break;
+    case ConstantDesc::Kind::Pconst_string: {
+      // (the mapper rebuilds the constructor, keeping quotation_delimiter)
+      V delim = optstr(d.delim);
+      if (delim->kind == OValue::Kind::Block) kept(delim);
+      desc = B(2, {S(d.s), loc(d.str_loc), delim});
+      break;
+    }
     case ConstantDesc::Kind::Pconst_float: desc = B(3, {S(d.s), char_opt(d.has_suffix, d.suffix)}); break;
   }
+  if (d.kind != ConstantDesc::Kind::Pconst_string) const_cast<OValue*>(desc)->mapper_kept = true;
   return B(0, {desc, loc(c.pconst_loc)});
 }
 
@@ -267,7 +282,7 @@ V core_type_desc(const CoreTypeDesc* d) {
   return I(0);
 }
 V core_type(const CoreType* t) {
-  return B(0, {core_type_desc(t->ptyp_desc), loc(t->ptyp_loc), locs(t->ptyp_loc_stack), attrs(t->ptyp_attributes)});
+  return with_loc_stack(B(0, {core_type_desc(t->ptyp_desc), loc(t->ptyp_loc), locs(t->ptyp_loc_stack), attrs(t->ptyp_attributes)}));
 }
 
 V patterns(Slice<const Pattern*> l) {
@@ -340,7 +355,7 @@ V pattern_desc(const PatternDesc* d) {
   return I(0);
 }
 V pattern(const Pattern* p) {
-  return B(0, {pattern_desc(p->ppat_desc), loc(p->ppat_loc), locs(p->ppat_loc_stack), attrs(p->ppat_attributes)});
+  return with_loc_stack(B(0, {pattern_desc(p->ppat_desc), loc(p->ppat_loc), locs(p->ppat_loc_stack), attrs(p->ppat_attributes)}));
 }
 
 V opt_exp(const Expression* e) { return e ? some(expression(e)) : none(); }
@@ -498,7 +513,7 @@ V expression_desc(const ExpressionDesc* d) {
   return I(0);
 }
 V expression(const Expression* e) {
-  return B(0, {expression_desc(e->pexp_desc), loc(e->pexp_loc), locs(e->pexp_loc_stack), attrs(e->pexp_attributes)});
+  return with_loc_stack(B(0, {expression_desc(e->pexp_desc), loc(e->pexp_loc), locs(e->pexp_loc_stack), attrs(e->pexp_attributes)}));
 }
 
 V value_binding(const ValueBinding* vb) {
