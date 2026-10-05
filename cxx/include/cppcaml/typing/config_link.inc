@@ -43,6 +43,7 @@ inline const std::string cmt_magic_number = "Caml1999T037";
 inline constexpr bool flambda = false;
 inline constexpr bool with_cmm_invariants = false;
 inline constexpr bool with_codegen_invariants = true;
+inline constexpr bool with_flambda_invariants = false;
 inline constexpr bool function_sections = true;
 inline constexpr bool afl_instrument = false;
 inline const std::string architecture = "amd64";
