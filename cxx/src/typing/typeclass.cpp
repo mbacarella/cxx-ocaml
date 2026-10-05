@@ -505,6 +505,7 @@ std::pair<Ident::t, env::t> enter_ancestor_met(const Location& loc, std::string_
                                                StrMap<Ident::t>* meths, std::string_view cl_num, TypeExpr* ty,
                                                Attributes attrs, env::t met_env) {
   ValueKind kind{ValueKind::Kind::Val_anc};
+  kind.obj = fresh_identity();
   kind.sign = sign;
   kind.meths = meths;
   kind.cl_num = cl_num;
@@ -519,6 +520,7 @@ env::t add_self_met(const Location& loc, Ident::t id, ClassSignature* sign, bool
                     TypeExpr* ty, Attributes attrs, env::t met_env) {
   warnings::Warning::K wk = as_var ? warnings::Warning::K::Unused_var : warnings::Warning::K::Unused_var_strict;
   ValueKind kind{ValueKind::Kind::Val_self};
+  kind.obj = fresh_identity();
   kind.sign = sign;
   kind.self_virtual = self_virtual;
   kind.meths = meths;
@@ -533,6 +535,7 @@ env::t add_instance_var_met(const Location& loc, std::string_view label, Ident::
   const VarEntry* v = sign->csig_vars.find_opt(label);
   if (!v) throw std::logic_error("add_instance_var_met");
   ValueKind kind{ValueKind::Kind::Val_ivar};
+  kind.obj = fresh_identity();
   kind.ivar_mut = v->mut;
   kind.ivar_name = cl_num;
   auto* desc = make<ValueDescription>(v->ty, kind, loc, attrs, uid::mk(env::get_current_unit()));
@@ -1291,6 +1294,7 @@ const tt::ClassExpr* class_expr_aux(std::string_view cl_num, Final final, env::t
                                pt::LidLoc{Longident::lident(ident::name(id)), location::none()}, vd}),
             location::none(), Slice<tt::ExpExtraItem>{}, ty, val_env2, tt::Attributes{});
         ValueKind kind{ValueKind::Kind::Val_ivar};
+        kind.obj = fresh_identity();
         kind.ivar_mut = MutableFlag::Immutable;
         kind.ivar_name = cl_num;
         auto* desc = make<ValueDescription>(expr->exp_type, kind, vd->val_loc, Attributes{}, vd->val_uid);

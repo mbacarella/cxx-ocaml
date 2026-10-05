@@ -727,6 +727,7 @@ class Reader {
       if (!is_int(pv)) {
         p.is_private = true;
         p.kind = field_kind(f(pv, 0));
+        p.obj = block_identity(pv);
       }
       VirtualFlag vi = virtual_flag(f(x, 1));
       return MethEntry{p, vi, ty(f(x, 2))};
@@ -801,6 +802,7 @@ class Reader {
         k.kind = ValueKind::Kind::Val_ivar;
         k.ivar_mut = mutable_flag(f(id, 0));
         k.ivar_name = str(f(id, 1));
+        k.obj = block_identity(id);
         break;
       case 2: k.kind = ValueKind::Kind::Val_self; break;
       default: k.kind = ValueKind::Kind::Val_anc; break;

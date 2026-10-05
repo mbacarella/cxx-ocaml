@@ -37,6 +37,7 @@ ClassArgPatternResult type_class_arg_pattern(std::string_view cl_num, env::t val
     auto* d1 = make<ValueDescription>(v.pv_type, ValueKind{}, v.pv_loc, pt::types_attributes(v.pv_attributes), val_uid);
     val_env = env::add_value(v.pv_id, d1, val_env);
     ValueKind ivar{ValueKind::Kind::Val_ivar};
+    ivar.obj = fresh_identity();
     ivar.ivar_mut = MutableFlag::Immutable;
     ivar.ivar_name = zborrow(cl_num);
     auto* d2 = make<ValueDescription>(v.pv_type, ivar, v.pv_loc, pt::types_attributes(v.pv_attributes), val_uid);

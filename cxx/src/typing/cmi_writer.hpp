@@ -606,16 +606,17 @@ class Writer {
                 return o::vblock(0, {mutable_flag(e.mut), virtual_flag(e.virt), ty(e.ty)});
               }),
               strmap<MethEntry>(c->csig_meths.root(), [&](const MethEntry& e) {
-                // Mprivate k is made once per method and copied by
-                // reference (Subst keeps a meths entry's privacy): one value
-                // per field kind
+                // Mprivate k is made by add_method / reveal_private_methods
+                // and copied by reference (Subst keeps a meths entry's
+                // privacy): one value per identity
                 V p = i(0);
                 if (e.priv.is_private) {
-                  if (auto it = mprivate_.find(e.priv.kind); it != mprivate_.end()) {
+                  const void* key = e.priv.obj ? e.priv.obj : e.priv.kind;
+                  if (auto it = mprivate_.find(key); it != mprivate_.end()) {
                     p = it->second;
                   } else {
                     p = o::vblock(0, {field_kind(e.priv.kind)});
-                    mprivate_[e.priv.kind] = p;
+                    mprivate_[key] = p;
                   }
                 }
                 return o::vblock(0, {p, virtual_flag(e.virt), ty(e.ty)});
@@ -672,9 +673,10 @@ class Writer {
         val_prims_[p] = v;
         return v;
       }
-      case ValueKind::Kind::Val_ivar: return o::vblock(1, {mutable_flag(k.ivar_mut), str(k.ivar_name)});
+      case ValueKind::Kind::Val_ivar:
+        return shared_by(k.obj, [&] { return o::vblock(1, {mutable_flag(k.ivar_mut), str(k.ivar_name)}); });
       // (never in a signature: a debug event's Env summary)
-      case ValueKind::Kind::Val_self: {
+      case ValueKind::Kind::Val_self: return shared_by(k.obj, [&] {
         // the self_meths value: typeclass builds one per class
         // (self_var_kind) for every Val_self of it -- one per k.meths
         V meths;
@@ -689,9 +691,10 @@ class Writer {
           self_meths_[k.meths] = meths;
         }
         return o::vblock(2, {class_sig(k.sign), meths, ident_map(k.vars), str(k.cl_num)});
-      }
-      case ValueKind::Kind::Val_anc:
+      });
+      case ValueKind::Kind::Val_anc: return shared_by(k.obj, [&] {
         return o::vblock(3, {class_sig(k.sign), ident_map(*k.meths), str(k.cl_num)});
+      });
     }
     return i(0);
   }

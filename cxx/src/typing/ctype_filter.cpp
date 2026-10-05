@@ -352,7 +352,7 @@ void add_method(env::t env, std::string_view label, PrivateFlag priv, VirtualFla
     } catch (const FilterMethodRowFailed&) {
       throw AddMethodFailed(true);
     }
-    priv2 = priv == PrivateFlag::Public ? MethodPrivacy{} : MethodPrivacy{true, r.kind};
+    priv2 = priv == PrivateFlag::Public ? MethodPrivacy{} : MethodPrivacy{true, r.kind, fresh_identity()};
     try {
       unify(env, ty, r.field);
     } catch (const Unify& u) {
@@ -495,7 +495,7 @@ void reveal_private_methods(env::t env, ClassSignature* sign) {
       throw std::logic_error("Ctype.reveal_private_methods");
     MethodRow r = filter_method_row(env, lab, PrivateFlag::Private, row);
     unify(env, e.ty, r.field);
-    meths = meths.add(lab, MethEntry{MethodPrivacy{true, r.kind}, e.virt, e.ty});
+    meths = meths.add(lab, MethEntry{MethodPrivacy{true, r.kind, fresh_identity()}, e.virt, e.ty});
     row = r.row;
   });
   sign->csig_meths = meths;
