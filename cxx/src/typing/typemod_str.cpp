@@ -463,6 +463,7 @@ static Typed type_module_aux(bool alias, bool strengthen, bool funct_body, Path:
         }
         t_arg = tt::FunctorParameter{false, id, f->param.name, mty};
         ty_arg.is_unit = false;
+        ty_arg.named_obj = fresh_identity();
         ty_arg.id = id;
         ty_arg.some_obj = id ? fresh_identity() : nullptr;
         t_arg.some_obj = ty_arg.some_obj;  // Named (id, ...), Types.Named (id, ...): one `Some id`

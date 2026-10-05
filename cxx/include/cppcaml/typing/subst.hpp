@@ -120,6 +120,7 @@ struct FunctorParameter {
   bool is_unit = true;
   Ident::t id = nullptr;  // nullptr = None
   const void* some_obj = nullptr;  // as types.hpp's FunctorParameter
+  const void* named_obj = nullptr;
   const Modtype* mty = nullptr;
 };
 

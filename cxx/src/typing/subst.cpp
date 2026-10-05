@@ -771,6 +771,7 @@ const Modtype* of_modtype(const ModuleType* m) {
         // MtyL_functor (Named (id, lazy_modtype arg), lazy_modtype res): right to left
         r->res = of_modtype(m->res);
         r->param.is_unit = false;
+        r->param.named_obj = fresh_identity();
         r->param.id = m->param.id;
         r->param.some_obj = m->param.some_obj;
         r->param.mty = of_modtype(m->param.mty);
@@ -850,11 +851,13 @@ const Modtype* modtype(Scoping sc, subst::t s, const Modtype* m) {
         // MtyL_functor (Named (None, f arg), f res): right to left
         r->res = modtype(sc, s, m->res);
         r->param.is_unit = false;
+        r->param.named_obj = fresh_identity();
         r->param.mty = modtype(sc, s, m->param.mty);
       } else {
         Ident::t id2 = ident::rename(m->param.id);
         r->res = modtype(sc, add_module(m->param.id, Path::pident(id2), s), m->res);
         r->param.is_unit = false;
+        r->param.named_obj = fresh_identity();
         r->param.id = id2;
         r->param.some_obj = fresh_identity();
         r->param.mty = modtype(sc, s, m->param.mty);
@@ -902,6 +905,7 @@ const ModuleType* force_modtype(const Modtype* m) {
       // `let param = .. in Mty_functor (param, force_modtype res)`
       if (!m->param.is_unit) {
         r->param.is_unit = false;
+        r->param.named_obj = fresh_identity();
         r->param.id = m->param.id;
         r->param.some_obj = m->param.some_obj;
         r->param.mty = force_modtype(m->param.mty);

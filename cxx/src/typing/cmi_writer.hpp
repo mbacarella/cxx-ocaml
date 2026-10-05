@@ -705,9 +705,12 @@ class Writer {
         case MK::Mty_functor: {
           V param = mt->param.is_unit
                         ? i(0)
-                        : o::vblock(0, {mt->param.id ? some_shared(mt->param.some_obj, [&] { return ident(mt->param.id); })
-                                                     : none(),
-                                        module_type(mt->param.mty)});
+                        : shared_by(mt->param.named_obj, [&] {
+                            return o::vblock(0, {mt->param.id ? some_shared(mt->param.some_obj,
+                                                                            [&] { return ident(mt->param.id); })
+                                                              : none(),
+                                                 module_type(mt->param.mty)});
+                          });
           return {param, module_type(mt->res)};
         }
         case MK::Mty_alias: return {path(mt->path)};

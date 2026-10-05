@@ -796,6 +796,7 @@ class Reader {
         std::size_t p = f(id, 0);
         if (!is_int(p)) {
           mt->param.is_unit = false;
+          mt->param.named_obj = block_identity(p);
           mt->param.id = opt_ptr(f(p, 0), [&](std::size_t x) { return ident(x); });
           if (!is_int(f(p, 0))) {  // one identity per marshaled `Some` block
             mt->param.some_obj = some_obj_.get_or(f(p, 0), new_identity);

@@ -1948,6 +1948,7 @@ static ComponentsResult components_of_module_maker(ComponentsMaker cm) {
       auto* f = make<FunctorComponents>();
       if (!mty->param.is_unit) {
         f->fcomp_arg.is_unit = false;
+        f->fcomp_arg.named_obj = fresh_identity();
         f->fcomp_arg.id = mty->param.id;
         f->fcomp_arg.some_obj = mty->param.some_obj;
         f->fcomp_arg.mty = lz::force_modtype(lz::modtype(scoping, sub, mty->param.mty));

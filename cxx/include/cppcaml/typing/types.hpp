@@ -468,6 +468,10 @@ struct FunctorParameter {  // Unit | Named of Ident.t option * module_type
   // one (Typemod, Mtype.strengthen, Subst's renaming), kept where it passes
   // the option on (Subst.Lazy, nondep); nullptr = none recorded
   const void* some_obj = nullptr;
+  // the `Named` block's own identity: fresh where the compiler builds one,
+  // kept where it passes the parameter on (Mtype.make_aliases_absent's
+  // `Mty_functor (arg, res)`); nullptr = a fresh block at each write
+  const void* named_obj = nullptr;
   const ModuleType* mty = nullptr;
 };
 

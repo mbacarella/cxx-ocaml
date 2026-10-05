@@ -889,6 +889,7 @@ static const ModuleType* approx_modtype_(env::t env, const pt::ModuleType* smty)
       if (!f->param.is_unit) {
         const ModuleType* arg = approx_modtype_(env, f->param.mty);
         param.is_unit = false;
+        param.named_obj = fresh_identity();
         param.mty = arg;
         if (f->param.name.txt.some) {
           const ModuleType* rarg = mtype::scrape_for_functor_arg(env, arg);
