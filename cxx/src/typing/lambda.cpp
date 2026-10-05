@@ -1029,7 +1029,12 @@ lambda make_atomic_loc(const ScopedLocation& loc, lambda arg, lambda field) {
   Primitive p = prim(PK::Pmakeblock);
   p.n = 0;
   p.mut = MutableFlag::Immutable;
-  p.shape = BlockShape{true, slice(std::vector<ValueKind>{ValueKind::gen(), ValueKind::intval()})};
+  // `Some [Pgenval; Pintval]`: a structured constant of lambda.ml, one block
+  static const Slice<ValueKind> kinds = [] {
+    ZoneScope perm(permanent_zone());
+    return slice(std::vector<ValueKind>{ValueKind::gen(), ValueKind::intval()});
+  }();
+  p.shape = BlockShape{true, kinds};
   return lprim(p, slice(std::vector<lambda>{arg, field}), loc);
 }
 

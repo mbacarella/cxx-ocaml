@@ -2316,7 +2316,7 @@ class CmxWriter {
         // makes from another, as Lift_constants', share its shape)
         auto shape = [&] { return w.some(w.list(p.shape.kinds, [&](const lambda::ValueKind& k) { return vk(k); })); };
         V sh = !p.shape.some                            ? w.none()
-               : config::flambda && !p.shape.kinds.empty() ? memo_shape(p.shape.kinds.p, shape)
+               : !p.shape.kinds.empty() ? memo_shape(p.shape.kinds.p, shape)
                                                            : shape();
         return o::vblock(tag, {I(p.n), w.mutable_flag(p.mut), sh});
       }
