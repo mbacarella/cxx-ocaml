@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <algorithm>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <memory>
 #include <fstream>
@@ -3301,14 +3302,27 @@ void save_cmt(const std::string& filename, std::string_view modname, const std::
   }
   // Load_path.get_paths (): the include directories are the command line's
   // strings (Clflags.include_dirs), "" the current directory
+  // (a directory given twice is two strings: each entry takes the next
+  // -I / -H argument of its spelling, in order)
+  std::map<std::string, std::deque<V>> include_args, hidden_args;
+  for (std::size_t k = 1; k + 1 < g_argv.size(); ++k) {
+    if (g_argv[k] == "-I") include_args[g_argv[k + 1]].push_back(args[k + 1]);
+    else if (g_argv[k] == "-H") hidden_args[g_argv[k + 1]].push_back(args[k + 1]);
+  }
   std::vector<V> visible, hidden;
   auto [vis, hid] = load_path::get_paths();
-  auto dir = [&](const std::string& d) {
+  auto dir = [&](const std::string& d, std::map<std::string, std::deque<V>>& occurrences) {
+    if (!d.empty())
+      if (auto it = occurrences.find(d); it != occurrences.end() && !it->second.empty()) {
+        V v = it->second.front();
+        it->second.pop_front();
+        return v;
+      }
     if (auto it = arg_strs.find(d); it != arg_strs.end() && !d.empty()) return it->second;
     return w.str(zborrow(d));
   };
-  for (const std::string& d : vis) visible.push_back(dir(d));
-  for (const std::string& d : hid) hidden.push_back(dir(d));
+  for (const std::string& d : vis) visible.push_back(dir(d, include_args));
+  for (const std::string& d : hid) hidden.push_back(dir(d, hidden_args));
   V loadpath = o::vblock(0, {o::vlist(visible), o::vlist(hidden)});
   char cwd[4096];
   std::string builddir = getcwd(cwd, sizeof cwd) ? std::string(cwd) : std::string(".");
