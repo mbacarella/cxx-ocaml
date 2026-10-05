@@ -195,11 +195,8 @@ c++ocamlopt writes the `.s` (with `-S`) and assembles the `.o` with `as`.
 
 The .cmx writer is ported (`cmi_format.cpp`'s `write_unit_info`:
 Compilenv.save_unit_info's output_value with ocamlopt's sharing):
-`DUMP=cmx` -- 6548/6550 probes (the 2 known .cmi gaps' crcs; also `-g`),
-208/208 compiler sources (and `-g`), 786/787 testsuite files (the other
-is `privrowsabate_ok`, whose .cmi differs: a private-row functor
-parameter's `X.term` paths share their name string in the port, not in
-ocamlc).  Sharing follows ocamlopt's heap: values ocamlopt allocates
+`DUMP=cmx` -- 6553/6553 probes (also `-g`), 208/208 compiler sources
+(and `-g`), 787/787 testsuite files.  Sharing follows ocamlopt's heap: values ocamlopt allocates
 statically (the literals of an inlining-built compiler, such as
 primitive.ml's `""` native name, Pignore's `0`, `Pphyscomp`'s comparisons)
 are singletons, constants and primitives carry identity tokens, and
@@ -214,8 +211,8 @@ the marshaled `caml_globals_map` -- and the C link) and Asmlibrarian
 ported.  `native_link_parity.sh` compares the kept startup assembly
 (`-dstartup`), a `-d` dump of the link and the executable's bytes:
 6531/6531 linkable probes (`-dcmm`), and with `MODE=onestep` (compile and
-link in one run) 6529 + the 2 known .cmi gaps (`-dlinear`, and `-g`),
-696/697 testsuite files (`privrowsabate_ok`, above).
+link in one run) 6531/6531 (`-dlinear`, and `-g`), 697/697 testsuite
+files.
 `native_link_scenarios.sh`: libraries (`-a`, `-linkall`, C options),
 `-output-obj`, `-output-complete-obj`, `-shared` (Asmlink.link_shared,
 the marshaled plugin header), `-pack` (Asmpackager, with
@@ -284,8 +281,9 @@ run two builds while a chain runs; cap memory (`ulimit -v`).  Results as of the
 | `error_parity_multi.sh` | missing/stale .cmi, inconsistent assumptions, -pack | 9/9 |
 | `warning_parity.sh` | stderr + exit, `warning_probes/` (default, `W="-w +a"`) | 66/66 |
 | `intf_parity.sh ERR=1` | `-i` (stdout, stderr, exit) on `stamp_probes/` | 6554/6554 |
-| `lambda_port_parity.sh DUMP=cmo` | .cmo bytes (and `FLAGS=-g`) on probes | 6548 + 2 known |
-| `cmi_port_parity.sh` | compiler .mli / `--standalone` probes | 146/146, 6552 + 2 known |
+| `lambda_port_parity.sh DUMP=cmo` | .cmo bytes (and `FLAGS=-g`) on probes | 6553/6553 |
+| `cmi_port_parity.sh` | compiler .mli / `--standalone` probes | 146/146, 6557/6557 |
+| `cmt_parity.sh` | .cmt bytes: probes, testsuite | 6557/6557, 1816/1816 |
 | `cmt_parity.sh --stdlib / --compiler` | .cmt bytes | 72/72, 146/146 |
 | `stdlib_cmo_parity.sh` | the stdlib built as its Makefile does (and `G=-g`) | 72/72 |
 | `pack_parity.sh` | -pack scenarios (and `BIN_ANNOT=1`) | 24/24 |
@@ -312,10 +310,6 @@ typing-recovery tests (`-typing-recovery` is merlin's), the refused options
 (`-annot`, `-dtypedtree`, `-dsource`, `-depend`, `-compat-32`) and the
 menhir error points.
 
-- Two stamp probes' .cmi (and so their .cmo crc): `xpay_b7` (an attribute
-  payload's positions shared differently) and `xrp_d34` (a class probe where
-  the port creates 46 more type nodes: a `Tlink` target keeps its creation
-  id through saving).
 - Three syntax errors that menhir's LALR automaton detects at another point
   than the recursive-descent parser (generated-parse-errors, a singleton
   labeled tuple type, arrow_ambiguity): accepted, `error_parity.sh`'s KNOWN
