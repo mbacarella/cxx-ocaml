@@ -714,7 +714,7 @@ static const tt::CoreType* transl_type_aux(env::t env, const RowContext& row_con
       more_slot->contents = more;
       TypeExpr* ty = ctype::newty(tvariant(make_row(more)));
       return ctyp(make<tt::Ttyp_variant>(tt::Ttyp_variant{{TK::Ttyp_variant}, slice(tfields), v->closed,
-                                                          v->has_labels, v->labels}),
+                                                          v->has_labels, v->labels, &v->labels}),
                   ty);
     }
     case PK::Ptyp_poly: {

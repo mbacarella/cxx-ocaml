@@ -841,7 +841,10 @@ class TreeWriter {
         auto* x = tt::as<tt::Ttyp_variant>(d);
         std::vector<V> xs;
         for (const tt::RowField* r : x->fields) xs.push_back(row_field(r));
-        V labels = x->has_labels ? w_.some(w_.list(x->labels, [&](std::string_view s) { return w_.str(s); })) : w_.none();
+        V labels = x->has_labels ? w_.shared_by(x->labels_obj, [&] {
+          return w_.some(w_.list(x->labels, [&](std::string_view s) { return w_.str(s); }));
+        })
+                                 : w_.none();
         return o::vblock(7, {o::vlist(xs), flag(static_cast<long>(x->closed)), labels});
       }
       case K::Ttyp_poly: {
