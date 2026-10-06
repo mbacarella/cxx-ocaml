@@ -23,7 +23,7 @@ struct Var {
   const char* value;
 };
 const Var kVars[] = {
-#include "config_table.inc"
+#include <config_table.inc>  // (the generated one: cxx/Makefile -I$(GEN))
 };
 
 const char* table_value(const char* name) {

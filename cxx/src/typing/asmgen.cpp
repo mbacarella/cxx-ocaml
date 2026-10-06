@@ -219,8 +219,8 @@ std::string end_gen_implementation(format::Formatter& dump, const closure_middle
 }
 
 std::string asm_filename(const std::string& output_prefix) {
-  if (cf::keep_asm_file) return output_prefix + ".s";
-  return filename::temp_file("camlasm", ".s");
+  if (cf::keep_asm_file) return output_prefix + config::ext_asm;
+  return filename::temp_file("camlasm", config::ext_asm);
 }
 
 }  // namespace cppcaml::typing::asmgen

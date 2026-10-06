@@ -1,7 +1,7 @@
 // Port of utils/config.mli, the part the driver reads: the configuration
-// variables ocamlc was built with (config_table.inc, generated from
-// ocamlc's Config by cxx/harness/gen_driver_tables.sh) and the standard
-// library directory.
+// variables ocamlc was built with (config_table.inc, generated from the
+// configured tree by cxx/src/tools/gen_config.cpp when cxx/Makefile
+// builds) and the standard library directory.
 //
 // Config.standard_library_default is the configured install directory, as
 // ocamlc's (a linked program records it); when that directory holds no
@@ -32,14 +32,10 @@ std::string configured_standard_library_default();
 const std::string& resolved_bindir();
 // Config.interface_suffix (-intf-suffix)
 extern std::string interface_suffix;
-inline const char* default_executable_name = "a.out";
-inline const char* ext_obj = ".o";
-inline const char* ext_lib = ".a";
-inline const char* ext_dll = ".so";
 
-// ---- the values Bytelink / Symtable / Dll / Ccomp / Misc.RuntimeID read
-// (config_link.inc, generated from ocamlc's Config by
-// cxx/harness/gen_driver_tables.sh)
+// ---- the values Bytelink / Symtable / Dll / Ccomp / Misc.RuntimeID read,
+// and the file names (config_link.inc, generated from the configured tree
+// by cxx/src/tools/gen_config.cpp)
 #include "cppcaml/typing/config_link.inc"
 
 // Config.target_bindir (config.common.ml: "." is the compiler's own directory)
