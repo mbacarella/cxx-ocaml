@@ -423,7 +423,7 @@ class Nursery {
   // a point where every pointer into the young zone that is used later is
   // in a root
   void point() {
-    if (always_ || young_->bytes() >= (std::size_t{16} << 20)) promote();
+    if (always_ || young_->bytes() >= (std::size_t{8} << 20)) promote();
   }
   void promote() {
     in_young_.reset();
