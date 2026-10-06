@@ -115,6 +115,48 @@ class FlatMemo {
   SlotTable& t_;
   std::unordered_map<std::size_t, V> over_;
 };
+// A Reader memo with unordered_map's interface (find / end / ->second,
+// emplace, operator[], size) in the slot table: one slot per marshal node,
+// no allocation per entry.  (Values too big for a slot keep a map.)
+template <class V, std::uint8_t K>
+class SlotMap {
+ public:
+  explicit SlotMap(SlotTable& t) : m_(t) {}
+  struct It {
+    bool ok;
+    V second;
+    const It* operator->() const { return this; }
+    bool operator==(const It& o) const { return ok == o.ok; }
+    bool operator!=(const It& o) const { return ok != o.ok; }
+  };
+  It find(std::size_t id) const {
+    V v{};
+    bool ok = m_.get(id, v);
+    return {ok, v};
+  }
+  It end() const { return {false, V{}}; }
+  void emplace(std::size_t id, const V& v) {
+    V old{};
+    if (!m_.get(id, old)) ++n_;
+    m_.put(id, v);
+  }
+  struct Ref {
+    SlotMap& m;
+    std::size_t id;
+    Ref& operator=(const V& v) {
+      m.emplace(id, v);
+      return *this;
+    }
+  };
+  Ref operator[](std::size_t id) { return {*this, id}; }
+  std::size_t size() const { return n_; }
+
+ private:
+  FlatMemo<V, K> m_;
+  std::size_t n_ = 0;
+};
+template <class V>
+inline constexpr bool slot_fits = sizeof(V) <= 16 && std::is_trivially_copyable_v<V>;
 struct ListMemo {
   const void* p;
   std::size_t n;
@@ -913,7 +955,10 @@ class Reader {
 
  private:
   const cmi_marshal::Graph& g_;
+ protected:
   SlotTable slots_;
+
+ private:
   FlatMemo<TypeExpr*, 1> ty_{slots_};
   FlatMemo<const TypeDesc*, 2> desc_{slots_};
   FlatMemo<Commutable*, 3> commu_{slots_};
@@ -1966,16 +2011,16 @@ class CmxReader : public Reader {
         f(id, 7), [&](std::size_t x) { return fl_unit_id(x); }, [&](std::size_t x) { return fl_var_set(x); });
     return make<export_info::T>(t);
   }
-  std::unordered_map<std::size_t, const void*> fl_nodes_;
-  std::unordered_map<std::size_t, const void*> fl_objs_;  // the other objects (one per marshaled block)
-  std::unordered_map<std::size_t, compilation_unit::t> fl_cu_;
-  std::unordered_map<std::size_t, variable::t> fl_var_;
-  std::unordered_map<std::size_t, symbol::t> fl_sym_;
-  std::unordered_map<std::size_t, unit_id::t> fl_uid_;
-  std::unordered_map<std::size_t, flambda::t> fl_expr_;
-  std::unordered_map<std::size_t, flambda::named> fl_named_;
-  std::unordered_map<std::size_t, const flambda::SetOfClosures*> fl_soc_;
-  std::unordered_map<std::size_t, const export_info::ValueSetOfClosures*> fl_eiset_;
+  SlotMap<const void*, 26> fl_nodes_{slots_};
+  SlotMap<const void*, 27> fl_objs_{slots_};  // the other objects (one per marshaled block)
+  SlotMap<compilation_unit::t, 28> fl_cu_{slots_};
+  SlotMap<variable::t, 29> fl_var_{slots_};
+  SlotMap<symbol::t, 30> fl_sym_{slots_};
+  SlotMap<unit_id::t, 31> fl_uid_{slots_};
+  SlotMap<flambda::t, 32> fl_expr_{slots_};
+  SlotMap<flambda::named, 33> fl_named_{slots_};
+  SlotMap<const flambda::SetOfClosures*, 34> fl_soc_{slots_};
+  SlotMap<const export_info::ValueSetOfClosures*, 35> fl_eiset_{slots_};
 
   cmx_format::UnitInfos* unit_infos(std::size_t id) {
     auto* ui = make<cmx_format::UnitInfos>();
@@ -2004,13 +2049,13 @@ class CmxReader : public Reader {
   }
 
  private:
-  std::unordered_map<std::size_t, debuginfo::scopes> scopes_;
-  std::unordered_map<std::size_t, const UStructuredConstant*> sc_;
-  std::unordered_map<std::size_t, const UFunction*> fun_;
-  std::unordered_map<std::size_t, ulambda> ul_;
-  std::unordered_map<std::size_t, FunctionDescription*> fd_;
-  std::unordered_map<std::size_t, const ValueApproximation*> ap_;
-  std::unordered_map<std::size_t, const PrimitiveDescription*> pd_;
+  SlotMap<debuginfo::scopes, 36> scopes_{slots_};
+  SlotMap<const UStructuredConstant*, 37> sc_{slots_};
+  SlotMap<const UFunction*, 38> fun_{slots_};
+  SlotMap<ulambda, 39> ul_{slots_};
+  SlotMap<FunctionDescription*, 40> fd_{slots_};
+  SlotMap<const ValueApproximation*, 41> ap_{slots_};
+  SlotMap<const PrimitiveDescription*, 42> pd_{slots_};
 };
 
 }  // namespace
