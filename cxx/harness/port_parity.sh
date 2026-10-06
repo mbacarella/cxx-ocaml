@@ -8,7 +8,8 @@
 # Usage: port_parity.sh [file.ml ...]   (JOBS= overridable)
 #   no args: cxx/harness/stamp_probes, cxx/harness/false_accept, stdlib
 set -u
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 cd "$ROOT" || exit 1
 JOBS="${JOBS:-8}"
@@ -34,10 +35,10 @@ if [ "${1:-}" == "--worker" ]; then
 fi
 
 if [ $# -gt 0 ]; then files=("$@")
-else mapfile -t files < <(ls cxx/harness/stamp_probes/*.ml cxx/harness/false_accept/*.ml stdlib/*.ml | sort -u)
+else lines_into files < <(ls cxx/harness/stamp_probes/*.ml cxx/harness/false_accept/*.ml stdlib/*.ml | sort -u)
 fi
-ulimit -v 8000000
-res=$(printf '%s\n' "${files[@]}" | xargs -P "$JOBS" -I{} bash "$SELF" --worker {} | sort -k2)
+vm_limit 8000000
+res=$(printf '%s\n' ${files[@]+"${files[@]}"} | xargs -P "$JOBS" -I{} bash "$SELF" --worker {} | sort -k2)
 printf '%s\n' "$res" > /tmp/.port_parity_results
 printf '%s\n' "$res" | awk '
   {f[$1]++} / UNPORTED/{u++} / INTERNAL/{i++}

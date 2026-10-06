@@ -7,7 +7,8 @@
 # Usage: valid_reject.sh        (CPP=, JOBS=, CPP_TIMEOUT= overridable; HOOKENV=
 #                                prefixes the checker)
 set -u
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 cd "$(dirname "$SELF")/../.." || exit 1
 CPP="${CPP:-./cxx/harness/port_check.sh}"
 JOBS="${JOBS:-8}"

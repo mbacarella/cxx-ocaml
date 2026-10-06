@@ -12,7 +12,8 @@
 #   no args: cxx/harness/warning_probes
 #   SAME (stderr + rc identical) / DIFF / QUIET (both print nothing, rc 0)
 set -u
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 cd "$ROOT" || exit 1
 JOBS="${JOBS:-8}"
@@ -50,9 +51,9 @@ fi
 
 rm -rf "$OUT"; mkdir -p "$OUT"
 if [ $# -gt 0 ]; then files=("$@")
-else mapfile -t files < <(ls cxx/harness/warning_probes/*.ml 2>/dev/null); fi
-ulimit -v 8000000
-res=$(printf '%s\n' "${files[@]}" | xargs -P "$JOBS" -I{} bash "$SELF" --worker {} | sort -k2)
+else lines_into files < <(ls cxx/harness/warning_probes/*.ml 2>/dev/null); fi
+vm_limit 8000000
+res=$(printf '%s\n' ${files[@]+"${files[@]}"} | xargs -P "$JOBS" -I{} bash "$SELF" --worker {} | sort -k2)
 printf '%s\n' "$res" > /tmp/.warning_parity_results
 printf '%s\n' "$res" | awk '{f[$1]++} END{ printf "files %d: SAME %d  DIFF %d  QUIET %d\n", NR, f["SAME"], f["DIFF"], f["QUIET"] }'
 echo "per-file results: /tmp/.warning_parity_results (stderr+rc in $OUT: <file>.o ocamlc, <file>.c port)"

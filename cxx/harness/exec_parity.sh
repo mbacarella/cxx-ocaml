@@ -12,7 +12,8 @@
 #
 # Usage: exec_parity.sh [N]      (JOBS=, CPP_TIMEOUT=, CACHE=, CPP= overridable)
 set -u
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 cd "$(dirname "$SELF")/../.." || exit 1
 ROOT=$PWD
 CPP="${CPP:-$ROOT/cxx/build-release/c++ocamlc}"
@@ -63,9 +64,9 @@ if [ "${1:-}" == "--worker" ]; then
 fi
 
 LIMIT="${1:-0}"
-mapfile -t files < <(find testsuite/tests -name '*.ml' | sort)
+lines_into files < <(find testsuite/tests -name '*.ml' | sort)
 [ "$LIMIT" -gt 0 ] 2>/dev/null && files=("${files[@]:0:$LIMIT}")
-res=$(printf '%s\n' "${files[@]}" | xargs -P "$JOBS" -I{} bash "$SELF" --worker {})
+res=$(printf '%s\n' ${files[@]+"${files[@]}"} | xargs -P "$JOBS" -I{} bash "$SELF" --worker {})
 printf '%s\n' "$res" | awk '
   $1=="M"{m++} $1=="DIFF"{d++} $1=="CPPERR"{e++} $1=="TIMEOUT"{t++} $1=="SKIP"{s++}
   END{

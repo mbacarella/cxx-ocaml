@@ -14,7 +14,8 @@
 #   SAME-BYTES / SAME-GRAPH (graph equal, bytes differ) / DIFF / CFAIL
 #   (/ OFAIL: ocamlc rejects the file too)
 set -u
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 cd "$ROOT" || exit 1
 JOBS="${JOBS:-8}"
@@ -75,9 +76,9 @@ fi
 if [ "${1:-}" == "--standalone" ]; then
   shift
   rm -rf "$OUT"; mkdir -p "$OUT"
-  if [ $# -gt 0 ]; then files=("$@"); else mapfile -t files < <(ls cxx/harness/stamp_probes/*.ml); fi
-  ulimit -v 8000000
-  res=$(printf '%s\n' "${files[@]}" | xargs -P "$JOBS" -I{} bash "$SELF" --sa-worker {} | sort -k2)
+  if [ $# -gt 0 ]; then files=("$@"); else lines_into files < <(ls cxx/harness/stamp_probes/*.ml); fi
+  vm_limit 8000000
+  res=$(printf '%s\n' ${files[@]+"${files[@]}"} | xargs -P "$JOBS" -I{} bash "$SELF" --sa-worker {} | sort -k2)
   printf '%s\n' "$res" > /tmp/.cmi_port_parity_results
   printf '%s\n' "$res" | awk '{f[$1]++} END{ printf "files %d: SAME-BYTES %d  SAME-GRAPH %d  DIFF %d  CFAIL %d  OFAIL %d\n", NR, f["SAME-BYTES"], f["SAME-GRAPH"], f["DIFF"], f["CFAIL"], f["OFAIL"] }'
   echo "per-file results: /tmp/.cmi_port_parity_results (dumps in $OUT)"
@@ -87,10 +88,10 @@ fi
 [ -f "$REF/main.cmo" ] || { echo "no $REF (run cxx/harness/effid.sh first)" >&2; exit 1; }
 rm -rf "$OUT"; mkdir -p "$OUT"
 if [ $# -gt 0 ]; then files=("$@")
-else mapfile -t files < <(cd "$REF" && { ls *.mli; for m in *.ml; do [ -f "${m}i" ] || echo "$m"; done; } | sort)
+else lines_into files < <(cd "$REF" && { ls *.mli; for m in *.ml; do [ -f "${m}i" ] || echo "$m"; done; } | sort)
 fi
-ulimit -v 8000000
-res=$(printf '%s\n' "${files[@]}" | xargs -P "$JOBS" -I{} bash "$SELF" --worker {} | sort -k2)
+vm_limit 8000000
+res=$(printf '%s\n' ${files[@]+"${files[@]}"} | xargs -P "$JOBS" -I{} bash "$SELF" --worker {} | sort -k2)
 printf '%s\n' "$res" > /tmp/.cmi_port_parity_results
 printf '%s\n' "$res" | awk '{f[$1]++} END{ printf "units %d: SAME-BYTES %d  SAME-GRAPH %d  DIFF %d  CFAIL %d\n", NR, f["SAME-BYTES"], f["SAME-GRAPH"], f["DIFF"], f["CFAIL"] }'
 echo "per-file results: /tmp/.cmi_port_parity_results (dumps in $OUT)"

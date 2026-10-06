@@ -36,7 +36,8 @@
 #          first compiler-output line), /tmp/.testsuite_regressions (sorted test list).
 set -u
 export LC_ALL=C
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 cd "$(dirname "$SELF")/../.." || exit 1
 ROOT=$PWD
 source cxx/harness/_require_fresh.sh; require_fresh c++ocamlc
@@ -92,7 +93,7 @@ run_suite() {  # label srcdir
   local label=$1 srcdir=$2 out="$WORK/$1"
   rm -rf "$out"; mkdir -p "$out/logs" "$out/work"
   ( cd testsuite && OCAMLSRCDIR="$srcdir" "$OT" -find-test-dirs tests ) > "$out/dirs.txt"
-  echo "== $label: $(wc -l < "$out/dirs.txt") test dirs, $JOBS at a time =="
+  echo "== $label: $(($(wc -l < "$out/dirs.txt"))) test dirs, $JOBS at a time =="
   export OT out srcdir
   xargs -P "$JOBS" -I{} bash -c '
     d=$1; log="$out/logs/$(echo "$d" | tr "/" "%").log"
@@ -180,7 +181,7 @@ echo "  real ocamlc passes:            $base_pass tests"
 echo "  c++ocamlc passes:              $both_pass"
 echo "  exe-bytes-only failures:       $exe_only   (compile, run, output all correct)"
 echo "  behaviourally passing:         $((both_pass + exe_only)) / $base_pass"
-echo "  regressions (real pass, c++ fail): $(wc -l < "$WORK/regressed.txt")   reverse: $(wc -l < "$WORK/reverse.txt")"
+echo "  regressions (real pass, c++ fail): $(($(wc -l < "$WORK/regressed.txt")))   reverse: $(($(wc -l < "$WORK/reverse.txt")))"
 echo "--- regression buckets ---"
 cut -f1 "$WORK/regressions.tsv" | sort | uniq -c | sort -rn
 echo "  details: $WORK/regressions.tsv   reverse: $WORK/reverse.txt"

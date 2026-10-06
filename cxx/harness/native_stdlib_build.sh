@@ -11,14 +11,15 @@
 #
 # Usage: native_stdlib_build.sh   (WD= a scratch directory; KEEP=1 keeps it)
 set -u
-ROOT="$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd -P)"
+. "$ROOT/cxx/harness/portable.sh"
 CPP="${CPP:-$ROOT/cxx/build-release/c++ocamlopt}"
 REF="$ROOT/ocamlopt.opt"
 WD="${WD:-$(mktemp -d)}"; mkdir -p "$WD"
 KEEP="${KEEP:-0}"
 trap '[ "$KEEP" = 1 ] || rm -rf "$WD"' EXIT
 echo "WD=$WD"
-ulimit -v 16000000
+vm_limit 16000000
 OTHERLIBS="${OTHERLIBS:-unix str runtime_events systhreads}"
 
 build() {  # build <compiler> <outdir>
@@ -56,7 +57,7 @@ build() {  # build <compiler> <outdir>
 # dynlink's commands, as make would run them after its sources changed
 ( cd "$ROOT" && make -n V=1 -W otherlibs/dynlink/dynlink_config.mli -W otherlibs/dynlink/dynlink_types.mli \
     otherlibs/dynlink/dynlink.cmxa 2>/dev/null | grep '^\./ocaml' ) > "$WD/dyncmds"
-echo "dynlink commands: $(wc -l < "$WD/dyncmds")"
+echo "dynlink commands: $(($(wc -l < "$WD/dyncmds")))"
 build "$REF" ref || { echo "the reference build failed"; exit 1; }
 build "$CPP" port || exit 1
 cd "$WD/ref" || exit 1

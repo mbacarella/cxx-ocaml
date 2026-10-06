@@ -11,7 +11,8 @@
 #                                        compiler cmis in /tmp/effid_ref
 #        DIRS=a:b CMIS="x.cmi .." typing_env_parity.sh
 set -u
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 cd "$ROOT" || exit 1
 BIN=/tmp/typing_cmi_parity/bin

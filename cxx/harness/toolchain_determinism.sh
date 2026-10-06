@@ -22,7 +22,8 @@
 #
 # Usage: bash cxx/harness/toolchain_determinism.sh
 set -u
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 cd "$(dirname "$SELF")/../.." || exit 1
 ROOT=$PWD
 source cxx/harness/_require_fresh.sh; require_fresh c++ocamlc
@@ -33,14 +34,19 @@ die() { echo "FATAL: $*" >&2; exit 1; }
 
 # 1. Toolchain B build (incremental).
 mkdir -p "cxx/$ALT_BUILD"
-env -i PATH=/usr/bin:/bin HOME="$HOME" make -C cxx -j"$(nproc)" O="$ALT_BUILD" CXX="$CXX_B" MIMALLOC=no \
+env -i PATH=/usr/bin:/bin HOME="$HOME" make -C cxx -j"$(ncpus)" O="$ALT_BUILD" CXX="$CXX_B" MIMALLOC=no \
   c++ocamlc >"cxx/$ALT_BUILD/make.log" 2>&1 \
   || { grep -E 'error' "cxx/$ALT_BUILD/make.log" | head -5 >&2; die "toolchain B build failed"; }
 B=$ROOT/cxx/$ALT_BUILD/c++ocamlc
 # Environment-independent check (ldd would resolve against the CURRENT shell's
 # libraries): a link with the system's tools carries no RUNPATH.
-readelf -d "$B" 2>/dev/null | grep -qE 'RPATH|RUNPATH' \
-  && die "$B carries an RPATH/RUNPATH -- linked with a non-system toolchain?"
+if [ "$(uname -s)" = Darwin ]; then
+  otool -l "$B" 2>/dev/null | grep -q LC_RPATH \
+    && die "$B carries an LC_RPATH -- linked with a non-system toolchain?"
+else
+  readelf -d "$B" 2>/dev/null | grep -qE 'RPATH|RUNPATH' \
+    && die "$B carries an RPATH/RUNPATH -- linked with a non-system toolchain?"
+fi
 
 # 2. The DDC corpus (the compiler's own sources), compiled by both.
 extract_cl() { awk '

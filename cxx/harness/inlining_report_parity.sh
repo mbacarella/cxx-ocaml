@@ -8,12 +8,13 @@
 #   e.g. -O3 for three rounds)  no args: cxx/harness/stamp_probes
 #   SAME / DIFF / CFAIL (the port failed) / OFAIL (ocamlopt.opt failed)
 set -u
-ROOT="$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd -P)"
+. "$ROOT/cxx/harness/portable.sh"
 JOBS="${JOBS:-8}"
 FLAGS="${FLAGS:-}"
 OUT=/tmp/inlining_report_parity
 rm -rf "${OUT:?}"; mkdir -p "$OUT"
-ulimit -v 8000000
+vm_limit 8000000
 one() {
   f="$1"; key=$(echo "$f" | tr '/' '_'); b=$(basename "$f" .ml)
   for who in o c; do

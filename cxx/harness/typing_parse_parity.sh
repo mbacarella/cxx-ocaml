@@ -8,7 +8,8 @@
 # Usage: typing_parse_parity.sh [file.ml ...]   (JOBS= overridable)
 #   no args: testsuite/tests, stdlib and the compiler's own sources
 set -u
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 cd "$ROOT" || exit 1
 JOBS="${JOBS:-8}"
@@ -36,12 +37,12 @@ if ! [ -f "$DUMP_ML" ] || ! [ "$DUMP_ML" -nt "$src" ]; then
     -o "$DUMP_ML" || { echo "FATAL: typing_dump build failed" >&2; exit 1; }
 fi
 if [ $# -gt 0 ]; then files=("$@")
-else mapfile -t files < <( (find testsuite/tests -name '*.ml'; ls stdlib/*.ml \
+else lines_into files < <( (find testsuite/tests -name '*.ml'; ls stdlib/*.ml \
     utils/*.ml parsing/*.ml typing/*.ml lambda/*.ml bytecomp/*.ml driver/*.ml \
     file_formats/*.ml) | sort -u)
 fi
-ulimit -v 8000000
-res=$(printf '%s\n' "${files[@]}" | xargs -P "$JOBS" -I{} bash "$SELF" --worker {})
+vm_limit 8000000
+res=$(printf '%s\n' ${files[@]+"${files[@]}"} | xargs -P "$JOBS" -I{} bash "$SELF" --worker {})
 printf '%s\n' "$res" | sort -k2 > /tmp/.typing_parse_parity_results
 printf '%s\n' "$res" | awk '
   {n[$1]++; t++}

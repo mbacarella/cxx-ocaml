@@ -10,7 +10,8 @@
 # Usage: typing_typexp_parity.sh [file.mli ...]   (JOBS= overridable)
 #   no args: stdlib, the compiler's interfaces and testsuite/tests
 set -u
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 cd "$ROOT" || exit 1
 JOBS="${JOBS:-8}"
@@ -25,10 +26,10 @@ modname() {  # the cmi to open for an interface ("-": none)
   b=$(basename "$f" .mli)
   case "$f" in
     stdlib/stdlib.mli) echo Stdlib ;;
-    stdlib/camlinternal*) echo "${b^}" ;;
-    stdlib/*) echo "Stdlib__${b^}" ;;
+    stdlib/camlinternal*) echo "$(capitalize "$b")" ;;
+    stdlib/*) echo "Stdlib__$(capitalize "$b")" ;;
     testsuite/*) echo - ;;
-    *) if [ -f "$REF/$b.cmi" ]; then echo "${b^}"; else echo -; fi ;;
+    *) if [ -f "$REF/$b.cmi" ]; then echo "$(capitalize "$b")"; else echo -; fi ;;
   esac
 }
 
@@ -69,12 +70,12 @@ fi
 [ -d $REF ] || { echo "no $REF: run cxx/harness/effid.sh first" >&2; exit 1; }
 rm -rf /tmp/typing_typexp_parity
 if [ $# -gt 0 ]; then files=("$@")
-else mapfile -t files < <( (ls stdlib/*.mli utils/*.mli parsing/*.mli typing/*.mli \
+else lines_into files < <( (ls stdlib/*.mli utils/*.mli parsing/*.mli typing/*.mli \
     lambda/*.mli bytecomp/*.mli driver/*.mli file_formats/*.mli; \
     find testsuite/tests -name '*.mli') | sort -u)
 fi
-ulimit -v 8000000
-res=$(printf '%s\n' "${files[@]}" | xargs -P "$JOBS" -I{} bash "$SELF" --worker {})
+vm_limit 8000000
+res=$(printf '%s\n' ${files[@]+"${files[@]}"} | xargs -P "$JOBS" -I{} bash "$SELF" --worker {})
 printf '%s\n' "$res" | sort > /tmp/.typing_typexp_parity_results
 printf '%s\n' "$res" | awk '
   $1=="SAME"||$1=="DIFF"||$1=="UNSUP" {n[$1]++; v++; next}

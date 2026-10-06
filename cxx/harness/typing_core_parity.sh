@@ -16,7 +16,8 @@
 # Usage: typing_core_parity.sh [file.ml ...]   (JOBS=, MODE= overridable)
 #   no args: cxx/harness/core_probes, stdlib and testsuite/tests
 set -u
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 cd "$ROOT" || exit 1
 JOBS="${JOBS:-8}"
@@ -32,7 +33,7 @@ if [ "${1:-}" == "--worker" ]; then
   W=/tmp/typing_${MODE}_parity; mkdir -p $W
   k=$(echo "$f" | tr '/' '_')
   runtime/ocamlrun "$DUMP_ML" $MODE $DIRS "$f" > $W/$k.o 2>/dev/null; orc=$?
-  ( ulimit -s unlimited; "$CPP" $MODE $DIRS "$f" > $W/$k.c 2>/dev/null ); crc=$?
+  ( ulimit -s unlimited 2>/dev/null || ulimit -s hard; "$CPP" $MODE $DIRS "$f" > $W/$k.c 2>/dev/null ); crc=$?
   if [ "$MODE" = core ]; then n=$(grep -c '^val \|^eval ' $W/$k.o)
   else n=$(grep -c '^  Sig_' $W/$k.o); fi
   if [ $orc -ne 0 ] && [ $crc -ne 0 ]; then printf 'BOTHFAIL %s\n' "$f"
@@ -56,11 +57,11 @@ if ! [ -f "$DUMP_ML" ] || ! [ "$DUMP_ML" -nt "$src" ]; then
 fi
 rm -rf /tmp/typing_${MODE}_parity
 if [ $# -gt 0 ]; then files=("$@")
-else mapfile -t files < <( (ls cxx/harness/core_probes/*.ml stdlib/*.ml; \
+else lines_into files < <( (ls cxx/harness/core_probes/*.ml stdlib/*.ml; \
     find testsuite/tests -name '*.ml') | sort -u)
 fi
-ulimit -v 8000000
-res=$(printf '%s\n' "${files[@]}" | xargs -P "$JOBS" -I{} bash "$SELF" --worker {})
+vm_limit 8000000
+res=$(printf '%s\n' ${files[@]+"${files[@]}"} | xargs -P "$JOBS" -I{} bash "$SELF" --worker {})
 printf '%s\n' "$res" | sort > /tmp/.typing_${MODE}_parity_results
 printf '%s\n' "$res" | awk '
   {f[$1]++; if (NF>=3) it[$1]+=$3}

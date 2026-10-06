@@ -4,7 +4,8 @@
 # dir (-g records it) against the built stdlib's .cmi; compare the .cmo bytes.  G=-g adds -g.
 # W= the warning flags (default -w -a); with W set, the compilers' stderr
 # (warnings) is compared too: LOGDIFF when only it differs.
-SELF="$(readlink -f "$0")"; ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"; ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
+. "$(dirname "$SELF")/portable.sh"
 CPP="${CPP:-$ROOT/cxx/build-release/c++ocamlc}"
 OUT=${OUT:-/tmp/stdlib_cmo}
 rm -rf "$OUT"; mkdir -p "$OUT"
@@ -37,6 +38,6 @@ worker() {
   rm -rf "${w:?}"
 }
 export -f worker; export ROOT CPP OUT COMP W; export AWK=awk
-ulimit -v 8000000
+vm_limit 8000000
 ls *.ml | xargs -P 12 -I{} bash -c 'worker {}' | sort -k2 > "$OUT/results"
 awk '{f[$1]++} END{printf "SAME %d DIFF %d LOGDIFF %d CFAIL %d OFAIL %d SKIP %d\n", f["SAME"],f["DIFF"],f["LOGDIFF"],f["CFAIL"],f["OFAIL"],f["SKIP"]}' "$OUT/results"

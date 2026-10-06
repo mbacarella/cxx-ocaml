@@ -22,7 +22,8 @@
 #   no args: cxx/harness/stamp_probes
 #   SAME / DIFF / CFAIL (the port failed or produced nothing) / OFAIL
 set -u
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 cd "$ROOT" || exit 1
 JOBS="${JOBS:-8}"
@@ -76,10 +77,10 @@ if [ "${1:-}" == "--worker" ]; then
   if [ "$DUMP" = cmo ]; then cp "$w/x/${b%.ml}.cmo" "$OUT/$key.c" 2>/dev/null || crc=1; fi
   if [ "$DUMP" = S ]; then cp "$w/x/${b%.ml}.s" "$OUT/$key.c" 2>/dev/null || crc=1; fi
   if [ "$DUMP" = cmx ] || [ "$DUMP" = o ]; then cp "$w/x/${b%.ml}.$DUMP" "$OUT/$key.c" 2>/dev/null || crc=1; fi
-  [ "$CLAMBDA" = 1 ] && sed -i -e '/: the native back end (.*) is not supported yet$/d' \
-    -e '/: the flambda middle end (.*) is not ported yet$/d' "$OUT/$key.c"
+  [ "$CLAMBDA" = 1 ] && sed -i.orig -e '/: the native back end (.*) is not supported yet$/d' \
+    -e '/: the flambda middle end (.*) is not ported yet$/d' "$OUT/$key.c" && rm -f "$OUT/$key.c.orig"
   if [ "$DUMP" = dflambda-verbose ]; then  # the port's dump: a prefix of ocamlopt's
-    head -c "$(stat -c %s "$OUT/$key.c")" "$OUT/$key.o" > "$OUT/$key.o.prefix"
+    head -c "$(file_size "$OUT/$key.c")" "$OUT/$key.o" > "$OUT/$key.o.prefix"
     mv "$OUT/$key.o.prefix" "$OUT/$key.o"
   fi
   rm -rf "${w:?}"
@@ -91,9 +92,9 @@ if [ "${1:-}" == "--worker" ]; then
 fi
 
 rm -rf "$OUT"; mkdir -p "$OUT"
-if [ $# -gt 0 ]; then files=("$@"); else mapfile -t files < <(ls cxx/harness/stamp_probes/*.ml); fi
-ulimit -v 8000000
-res=$(printf '%s\n' "${files[@]}" | xargs -P "$JOBS" -I{} bash "$SELF" --worker {} | sort -k2)
+if [ $# -gt 0 ]; then files=("$@"); else lines_into files < <(ls cxx/harness/stamp_probes/*.ml); fi
+vm_limit 8000000
+res=$(printf '%s\n' ${files[@]+"${files[@]}"} | xargs -P "$JOBS" -I{} bash "$SELF" --worker {} | sort -k2)
 printf '%s\n' "$res" > /tmp/.lambda_port_parity_results
 printf '%s\n' "$res" | awk '{f[$1]++} END{ printf "files %d: SAME %d  DIFF %d  CFAIL %d  OFAIL %d\n", NR, f["SAME"], f["DIFF"], f["CFAIL"], f["OFAIL"] }'
 echo "per-file results: /tmp/.lambda_port_parity_results (dumps in $OUT: <file>.o ocamlc, <file>.c port)"

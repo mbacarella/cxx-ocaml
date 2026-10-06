@@ -4,7 +4,8 @@
 # SET being unchanged against the hooked (reverted) binary -- compare
 # `sort`ed outputs, the scan runs in parallel.
 #   BIN=<compiler> OUT=<file> bash cxx/harness/crash.sh
-R="$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)"
+R="$(cd "$(dirname "$0")/../.." && pwd -P)"
+. "$R/cxx/harness/portable.sh"
 BIN=${BIN:?}; OUT=${OUT:?}; : > "$OUT"
 scan() { local f=$1 d rc; d=$(mktemp -d)
   cp "$f" "$d/m.ml" 2>/dev/null || { rm -rf "$d"; return; }
@@ -13,4 +14,4 @@ scan() { local f=$1 d rc; d=$(mktemp -d)
   rm -rf "$d"; }
 export -f scan; export R BIN OUT
 ls $R/testsuite/tests/*/*.ml | xargs -P 16 -I{} bash -c 'scan "$@"' _ {} 2>/dev/null
-echo "crashing=$(wc -l < "$OUT")"
+echo "crashing=$(($(wc -l < "$OUT")))"

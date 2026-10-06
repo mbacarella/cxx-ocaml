@@ -5,7 +5,8 @@
 # the last command's stderr and exit code, ocamlc.opt vs c++ocamlc, byte
 # for byte.  Each scenario runs in a fresh scratch directory per compiler.
 set -u
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 R="$(cd "$(dirname "$SELF")/../.." && pwd)"
 CPP="${CPP:-$R/cxx/build-release/c++ocamlc}"
 same=0; diff_=0

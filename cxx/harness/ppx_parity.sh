@@ -24,7 +24,8 @@
 #   SAME / DIFF (<what differs>) / BOTHFAIL (neither compiled: an error
 #   report, compared) -- a DIFF lists the artifacts that differ
 set -u
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 cd "$ROOT" || exit 1
 JOBS="${JOBS:-8}"
@@ -85,13 +86,13 @@ if [ "${1:-}" == "--worker" ]; then
         # src: the source itself, no rewriter (the baseline of the two others)
         if [ "$mode" = ppx ]; then pp=(-ppx "$ppx"); else pp=(); fi
         if [ -f "$base.mli" ]; then
-          timeout 120 "$w/bin/ocamlc" -nostdlib -I "$OROOT/stdlib" $W -bin-annot $FLAGS "${pp[@]}" -c "$base.mli" || exit $?
+          timeout 120 "$w/bin/ocamlc" -nostdlib -I "$OROOT/stdlib" $W -bin-annot $FLAGS ${pp[@]+"${pp[@]}"} -c "$base.mli" || exit $?
         fi
-        timeout 120 "$w/bin/ocamlc" -nostdlib -I "$OROOT/stdlib" $W -bin-annot $FLAGS "${pp[@]}" -c "$b"
+        timeout 120 "$w/bin/ocamlc" -nostdlib -I "$OROOT/stdlib" $W -bin-annot $FLAGS ${pp[@]+"${pp[@]}"} -c "$b"
       fi
     ) > "$OUT/$key.$side.out" 2> "$OUT/$key.$side.err"
     echo $? > "$OUT/$key.$side.rc"
-    sed -E -i 's/camlppx[0-9a-f]{6}/camlppxXXXXXX/g' "$OUT/$key.$side.err"
+    sed -E -i.orig 's/camlppx[0-9a-f]{6}/camlppxXXXXXX/g' "$OUT/$key.$side.err" && rm -f "$OUT/$key.$side.err.orig"
     for a in "$w"/x/*.cmo "$w"/x/*.cmi "$w"/x/*.cmt "$w"/x/*.cmti; do
       [ -f "$a" ] || continue
       cp "$a" "$OUT/$key.$side.$(basename "$a")"
@@ -136,21 +137,21 @@ if [ $# -gt 0 ]; then
   # a directory argument: its .ml files (testsuite-like trees: recursively)
   files=()
   for a in "$@"; do
-    if [ -d "$a" ]; then mapfile -t -O "${#files[@]}" files < <(find "$a" -name '*.ml' | sort); else files+=("$a"); fi
+    if [ -d "$a" ]; then lines_append files < <(find "$a" -name '*.ml' | sort); else files+=("$a"); fi
   done
-  for f in "${files[@]}"; do for m in "${modes[@]}"; do jobs+=("$m $MAP $f"); done; done
+  for f in ${files[@]+"${files[@]}"}; do for m in ${modes[@]+"${modes[@]}"}; do jobs+=("$m $MAP $f"); done; done
 else
   for f in cxx/harness/ppx/tests/*.ml; do
     map=$(basename "$f"); map=${map%%_*}
-    for m in "${modes[@]}"; do
+    for m in ${modes[@]+"${modes[@]}"}; do
       # a misbehaving rewriter is a -ppx matter only
       case "$m:$map" in ast:fail|ast:notfound|ast:nooutput|ast:junk) continue ;; esac
       jobs+=("$m $map $f")
     done
   done
 fi
-ulimit -v 8000000
-res=$(printf '%s\n' "${jobs[@]}" | xargs -P "$JOBS" -L 1 bash "$SELF" --worker | sort -k4)
+vm_limit 8000000
+res=$(printf '%s\n' ${jobs[@]+"${jobs[@]}"} | xargs -P "$JOBS" -L 1 bash "$SELF" --worker | sort -k4)
 printf '%s\n' "$res" > /tmp/.ppx_parity_results
 printf '%s\n' "$res" | grep -v '^SAME\|^BOTHFAIL\|^SHARING'
 printf '%s\n' "$res" | awk '{f[$1]++} END{ printf "units %d: SAME %d  SHARING %d  BOTHFAIL %d  DIFF %d\n", NR, f["SAME"], f["SHARING"], f["BOTHFAIL"], f["DIFF"] }'

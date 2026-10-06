@@ -7,7 +7,8 @@
 # Usage: parse_dir_parity.sh DIR...   (JOBS=)
 #   SAME / DIFF / CFAIL (only the port fails) / OFAIL (only compiler-libs) / BOTHFAIL
 set -u
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 DUMP_ML=/tmp/typing_cmi_parity/bin/typing_dump
 CPP=${CPP:-$ROOT/cxx/build-release/c++typing-dump}
@@ -24,7 +25,7 @@ if [ "${1:-}" == "--worker" ]; then
   else echo "DIFF $f"; fi
   exit 0
 fi
-ulimit -v 8000000
+vm_limit 8000000
 res=$(find "$@" -name '*.ml' | sort | xargs -P "${JOBS:-12}" -I{} bash "$SELF" --worker {} | sort -k2)
 printf '%s\n' "$res" > /tmp/.parse_dir_parity_results
 printf '%s\n' "$res" | awk '{f[$1]++} END{ printf "files %d: SAME %d  DIFF %d  CFAIL %d  OFAIL %d  BOTHFAIL %d\n", NR, f["SAME"], f["DIFF"], f["CFAIL"], f["OFAIL"], f["BOTHFAIL"] }'

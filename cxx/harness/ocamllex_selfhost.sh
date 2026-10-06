@@ -10,7 +10,8 @@
 # stresses GC.  A green run means c++ocamlc + the all-ours stdlib reproduce the
 # reference compiler's tool, end to end.
 set -u
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 cd "$(dirname "$SELF")/../.." || exit 1
 ROOT=$PWD
 CPP=$ROOT/cxx/build/c++ocamlc

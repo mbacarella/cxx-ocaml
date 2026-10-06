@@ -24,11 +24,12 @@
 #     cxx/harness/exec_parity.sh
 # Environment: DIR=, CXX= (the C++ compiler, default g++).
 set -euo pipefail
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 DIR="${DIR:-/tmp/ocaml-zstd}"
 CXX_COMPILER="${CXX:-g++}"
-ulimit -v 16000000
+vm_limit 16000000
 
 if [ ! -x "$DIR/ocamlc.opt" ]; then
   git -C "$ROOT" worktree add --detach "$DIR" HEAD
