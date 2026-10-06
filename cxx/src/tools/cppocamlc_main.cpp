@@ -99,6 +99,9 @@ namespace fs = std::filesystem;
 // malloc_trim.
 extern "C" void mi_collect(bool force) __attribute__((weak));
 extern "C" int malloc_trim(size_t pad) __attribute__((weak));
+namespace cppcaml {
+void allocator_purge_immediately();  // allocator.cpp
+}
 static void release_free_memory() {
   if (mi_collect) mi_collect(true);
   else if (malloc_trim) malloc_trim(0);
@@ -1449,6 +1452,7 @@ int run_main_big_stack(int argc, char** argv) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  cppcaml::allocator_purge_immediately();
   cppcaml::typing::typemod::report_lexer_error_hook = report_lexer_error;
   // Every .cmo/.cmi/executable is written through a local, RAII std::ofstream
   // that has already flushed and closed by the time run_main returns; the only
