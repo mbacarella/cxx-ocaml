@@ -1,7 +1,10 @@
 (* Emit c++ocamlc's driver tables from ocamlc's own compiler-libs values:
    Main_args.Make_bytecomp_options's option list (keys, Arg kinds, Symbol
-   choices, docs, in ocamlc's order) and Make_optcomp_options' (ocamlopt's), Config.print_config's variables, and
-   Warnings.descriptions (for -warn-help).  See gen_driver_tables.sh. *)
+   choices, docs, in ocamlc's order) and Make_optcomp_options' (ocamlopt's),
+   and Warnings.descriptions (for -warn-help).  See gen_driver_tables.sh.
+   [config] and [linkconfig] print Config as ocamlc evaluates it, the
+   configuration cxx/src/tools/gen_config.cpp derives from configure's
+   output: cxx/harness/config_parity.sh compares the two. *)
 module O = Main_args.Make_bytecomp_options (Main_args.Default.Main)
 module Opt = Main_args.Make_optcomp_options (Main_args.Default.Optmain)
 
@@ -31,10 +34,17 @@ let () =
   | [| _; ("options" | "optoptions" as which) |] ->
       List.iter (fun (k, spec, doc) ->
         let syms = match spec with Arg.Symbol (l, _) -> l | _ -> [] in
-        Printf.printf "    {\"%s\", K::%s, {%s}, \"%s\"},\n" (esc k) (kind spec)
+        (* main_args.ml's mk_function_sections documents the option by
+           Config.function_sections: the committed table holds both, for
+           every configuration *)
+        let doc =
+          if k = "-function-sections" then
+            "config::function_sections ? \" Generate each function in a separate section if target supports it\" : \" (option not available)\""
+          else "\"" ^ esc doc ^ "\"" in
+        Printf.printf "    {\"%s\", K::%s, {%s}, %s},\n" (esc k) (kind spec)
           (String.concat ", "
              (List.map (fun s -> "\"" ^ esc s ^ "\"") syms))
-          (esc doc))
+          doc)
         (if which = "options" then O.list else Opt.list)
   | [| _; "config" |] ->
       let file = Filename.temp_file "config" "" in

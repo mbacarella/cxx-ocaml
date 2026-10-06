@@ -83,8 +83,13 @@ the .cmt and the `-g` debug events.  `cmi_image.{hpp,cpp}` caches a decoded
 ## The driver
 
 c++ocamlc's command line is ocamlc's: `driver/main_args.ml`'s bytecode
-option table, `Config.print_config` and `Warnings.descriptions` are
-generated from ocamlc's own modules by `cxx/harness/gen_driver_tables.sh`;
+option table and `Warnings.descriptions` are generated from ocamlc's own
+modules by `cxx/harness/gen_driver_tables.sh` (the same for every
+configuration: committed); the configuration -- Config's values,
+`Config.print_config`'s variables -- is generated per tree by cxx/Makefile
+from `./configure`'s output (`cxx/src/tools/gen_config.cpp`, into the build
+directory), which `cxx/harness/config_parity.sh` checks against Config as
+the tree's ocamlc evaluates it;
 the actions are ported in `typing/main_args.cpp`, stdlib Arg in `arg.cpp`,
 Compenv (deferred actions, output prefixes, OCAMLPARAM, the configuration
 file) in `compenv.cpp`, Maindriver's sequence in `tools/cppocamlc_main.cpp`.
@@ -118,7 +123,7 @@ Ast_mapper's context and Ast_invariants.
 **Compressed Marshal (zstd).**  An OCaml configured with zstd writes the
 .cmi header, .cmt and the .cmo debug/hint sections with
 `Compression.output_value`; c++ocamlc does the same when its installation's
-runtime has zstd (`gen_driver_tables.sh` asks; `CPPCAML_ZSTD` links libzstd,
+runtime has zstd (configure's `HAS_ZSTD`; `CPPCAML_ZSTD` links libzstd,
 which must be the installation's version or the compressed bytes differ).
 It reads compressed values whatever its configuration.
 `cxx/harness/zstd_reference.sh` builds a zstd-configured reference.
@@ -388,7 +393,8 @@ upstream, then ports every commit that touches `parsing/`, `typing/`,
   `/tmp/cmt_parity_tools`, `/tmp/effid_ref`, `/tmp/exec_oracle_cache`,
   `/tmp/dune_parity_stage`, ...);
 - regenerate the tables: `gen_driver_tables.sh` writes its .inc files in
-  place; `gen_builtin_prims.sh` prints to stdout (redirect it to
+  place (and `config_parity.sh` checks gen_config against a changed
+  `utils/config.common.ml`); `gen_builtin_prims.sh` prints to stdout (redirect it to
   `include/cppcaml/builtin_prims.hpp`);
 - follow the Makefile's `COMPILERLIBS` in `ocamlc_bootstrap.sh`'s module
   lists (DDC, effid);

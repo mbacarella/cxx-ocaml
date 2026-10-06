@@ -25,7 +25,7 @@
     {"-for-pack", K::String, {}, "<ident>  Generate code that can later be `packed' with\n     ocamlopt -pack -o <ident>.cmx"},
     {"-g", K::Unit, {}, " Record debugging information for exception backtrace"},
     {"-no-g", K::Unit, {}, " Do not record debugging information (default)"},
-    {"-function-sections", K::Unit, {}, " Generate each function in a separate section if target supports it"},
+    {"-function-sections", K::Unit, {}, config::function_sections ? " Generate each function in a separate section if target supports it" : " (option not available)"},
     {"-stop-after", K::Symbol, {"parsing", "typing", "lambda", "scheduling", "emit"}, " Stop after the given compilation pass."},
     {"-save-ir-after", K::Symbol, {"scheduling"}, " Save intermediate representation after the given compilation pass(may be specified more than once)."},
     {"-i", K::Unit, {}, " Print inferred interface"},

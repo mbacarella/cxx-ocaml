@@ -414,7 +414,7 @@ void link(std::ostream& ppf_dump, const std::vector<std::string>& objfiles0, con
   std::vector<std::string> opts = g_lib_ccopts;  // put user's opts first
   opts.insert(opts.end(), cf::all_ccopts.begin(), cf::all_ccopts.end());
   cf::all_ccopts = std::move(opts);
-  std::string startup = cf::keep_startup_file ? output_name + ".startup" + ".s" : filename::temp_file("camlstartup", ".s");
+  std::string startup = cf::keep_startup_file ? output_name + ".startup" + config::ext_asm : filename::temp_file("camlstartup", config::ext_asm);
   std::string startup_obj = filename::temp_file("camlstartup", config::ext_obj);
   format::Formatter dump;
   try {
@@ -460,7 +460,7 @@ void link_shared(std::ostream& ppf_dump, const std::vector<std::string>& objfile
   for (auto it = obj_infos.rbegin(); it != obj_infos.rend(); ++it)
     if (auto o = object_file_name_of_file(*it)) objs.push_back(*o);
   objs.insert(objs.end(), cf::ccobjs.rbegin(), cf::ccobjs.rend());
-  std::string startup = cf::keep_startup_file ? output_name + ".startup" + ".s" : filename::temp_file("camlstartup", ".s");
+  std::string startup = cf::keep_startup_file ? output_name + ".startup" + config::ext_asm : filename::temp_file("camlstartup", config::ext_asm);
   std::string startup_obj = output_name + ".startup" + config::ext_obj;
   std::vector<std::pair<const UnitInfos*, std::string>> units;
   for (const ToLink& u : units_tolink) units.emplace_back(u.info, u.crc);

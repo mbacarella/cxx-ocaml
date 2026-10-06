@@ -43,27 +43,24 @@ Requirements, besides OCaml's own: `g++` 13 or newer (`CXX` selects
 another C++23 compiler, clang++ 18 or newer works too) and -- when OCaml is
 built with zstd, the default -- libzstd's development files
 (`ocaml-option-cxx.opam` lists them as depexts).  It builds with GNU make,
-like OCaml (`cxx/Makefile`).  The native compiler is needed (not
-`ocaml-option-bytecode-only`): c++ocamlc's configuration is read from the
-installed OCaml by a native program.  c++ocamlc links the mimalloc
-allocator, vendored in `cxx/vendor/mimalloc`, statically.
+like OCaml (`cxx/Makefile`), which derives c++ocamlc's configuration --
+the values ocamlc's Config holds -- from the tree's `./configure` output
+(`cxx/src/tools/gen_config.cpp`; no OCaml compiler is involved).  c++ocamlc
+links the mimalloc allocator, vendored in `cxx/vendor/mimalloc`,
+statically.
 
 macOS (verified on Apple Silicon; nothing in it is arm64-specific): the
 Xcode command line tools are enough -- Apple clang (`g++` is clang there;
 `-std=c++2b` where clang predates `c++23`), the system's make and shell --
 plus libzstd when OCaml is built with it.  On Apple Silicon c++ocamlopt
 serves the switch too (the arm64 back end); on an Intel Mac the stock
-ocamlopt stays.  In a source tree configured by hand,
-`cxx/harness/gen_driver_tables.sh` regenerates c++ocamlc's configuration
-tables (checked in for amd64 Linux) for it before `make -C cxx`.
+ocamlopt stays.
 
 What the build does (`cxx/opam/build-cxx.sh`, in `ocaml-variants`' build
 stage): it installs the tree into a stage (`make install
 DESTDIR=`: the installation is `--with-relative-libdir`, so the stage
-resolves its standard library as the real one will); generates
-c++ocamlc's driver tables (Config, the option list, warning descriptions)
-from the staged OCaml (`cxx/harness/gen_driver_tables.sh INSTALL=`);
-builds c++ocamlc and c++ocamlopt, linking the very libzstd file the
+resolves its standard library as the real one will); builds c++ocamlc
+and c++ocamlopt (their configuration the tree's), linking the very libzstd file the
 runtime loads (the same compressor code, hence the same compressed bytes);
 checks in the stage that `-config` is identical to the stock compilers',
 that a program compiles and runs, and that c++ocamlopt's `.cmx`, `.o` and

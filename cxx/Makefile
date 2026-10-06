@@ -44,6 +44,8 @@ OPTFLAGS ?= -g
 else
 $(error MODE is release or debug, not $(MODE))
 endif
+# the configured tree's generated sources (the configuration)
+GEN := $(O)/generated
 
 # V=1: the commands themselves (as OCaml's Makefile.common)
 V ?= 0
@@ -52,6 +54,7 @@ V_CXX = @$(info $(SPACE)  CXX $@)
 V_AR = @$(info $(SPACE)  AR $@)
 V_LINK = @$(info $(SPACE)  LINK $@)
 V_CC = @$(info $(SPACE)  CC $@)
+V_GEN = @$(info $(SPACE)  GEN $(GEN))
 endif
 SPACE :=
 
@@ -101,7 +104,7 @@ CXX_STD := $(shell $(CXX) -std=c++23 -x c++ -fsyntax-only /dev/null >/dev/null 2
   && echo c++23 || echo c++2b)
 ALL_CXXFLAGS := -std=$(CXX_STD) $(OPTFLAGS) \
   -Wall -Wextra -Wpedantic -Wno-unused-parameter \
-  -Iinclude $(DEFINES) $(ZSTD_CFLAGS) $(CPPFLAGS) $(CXXFLAGS)
+  -I$(GEN) -Iinclude $(DEFINES) $(ZSTD_CFLAGS) $(CPPFLAGS) $(CXXFLAGS)
 # The typing/ port initializes aggregates partially on purpose (an OCaml
 # constructor's unused fields stay defaulted).
 PARTIAL_INIT := -Wno-missing-field-initializers
@@ -126,11 +129,24 @@ $(shell mkdir -p $(O) && \
   (cmp -s $(O)/flags.new $(FLAGS_STAMP) || mv $(O)/flags.new $(FLAGS_STAMP)); \
   rm -f $(O)/flags.new)
 
+# ---- the configuration ------------------------------------------------------
+# Config's values (config_table.inc, cppcaml/typing/config_link.inc), from
+# what ./configure wrote in the tree (and VERSION) -- per tree, so not under
+# version control.  gen_config rewrites a file only when it changes.
+CONFIG_INPUTS := ../utils/config.generated.ml ../utils/config.common.ml ../VERSION \
+  ../Makefile.build_config ../runtime/caml/s.h ../runtime/caml/m.h
+$(O)/gen_config: src/tools/gen_config.cpp $(FLAGS_STAMP)
+	$(V_CXX)$(CXX) -std=$(CXX_STD) -O1 $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) $< -o $@
+$(GEN)/stamp: $(O)/gen_config $(CONFIG_INPUTS)
+	@for f in $(CONFIG_INPUTS); do [ -f "$$f" ] || \
+	  { echo "cxx/Makefile: $$f is missing: configure the tree first (./configure)" >&2; exit 1; }; done
+	$(V_GEN)$(O)/gen_config .. $(GEN) && touch $@
+
 # ---- objects ----------------------------------------------------------------
 CORE_SRCS := $(wildcard src/*.cpp src/typing/*.cpp src/typing/$(BACKEND)/*.cpp)
 CORE_OBJS := $(CORE_SRCS:%.cpp=$(O)/%.o)
 
-$(O)/%.o: %.cpp $(FLAGS_STAMP)
+$(O)/%.o: %.cpp $(FLAGS_STAMP) | $(GEN)/stamp
 	@mkdir -p $(@D)
 	$(V_CXX)$(CXX) $(ALL_CXXFLAGS) $(EXTRA_CXXFLAGS) -MMD -MP -c $< -o $@
 
@@ -138,7 +154,7 @@ $(O)/src/typing/%.o $(O)/src/typing/$(BACKEND)/%.o $(O)/src/tools/typing_dump_ma
   EXTRA_CXXFLAGS := $(PARTIAL_INIT)
 
 # c++ocamlopt: c++ocamlc's driver as Optmaindriver / Optcompile
-$(O)/src/tools/cppocamlopt_main.o: src/tools/cppocamlc_main.cpp $(FLAGS_STAMP)
+$(O)/src/tools/cppocamlopt_main.o: src/tools/cppocamlc_main.cpp $(FLAGS_STAMP) | $(GEN)/stamp
 	@mkdir -p $(@D)
 	$(V_CXX)$(CXX) $(ALL_CXXFLAGS) -DCPPCAML_OCAMLOPT=1 -MMD -MP -c $< -o $@
 

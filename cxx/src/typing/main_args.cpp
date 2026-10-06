@@ -421,7 +421,8 @@ std::map<std::string, arg::Spec> optactions() {
   a["-afl-inst-ratio"] = int_([](long n) { cf::afl_inst_ratio = n; });
   a["-afl-instrument"] = set(cf::afl_instrument);
   a["-function-sections"] = unit([] {
-    if (!config::function_sections) throw std::logic_error("Main_args._function_sections: assert false");
+    // (mk_function_sections: configured without it, the option's action)
+    if (!config::function_sections) throw arg::Bad("OCaml has been configured without support for -function-sections");
     compenv::first_ccopts.insert(compenv::first_ccopts.begin(), "-ffunction-sections");
     cf::function_sections = true;
   });

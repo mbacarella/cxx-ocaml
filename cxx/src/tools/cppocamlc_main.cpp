@@ -882,7 +882,7 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
         // -S, else a temporary file), assembled into the object file
         std::string prefix = remove_extension(cmo_out);
         try {
-          ty::asmgen::compile_unit(ty::asmgen::asm_filename(prefix), cf::keep_asm_file, prefix + ".o",
+          ty::asmgen::compile_unit(ty::asmgen::asm_filename(prefix), cf::keep_asm_file, prefix + ty::config::ext_obj,
                                    [&] { return ty::asmgen::end_gen_implementation(dump, clambda); });
         } catch (const ty::polling::PollError& e) {
           // Location.error_of_printer_file Polling.report_error
