@@ -20,11 +20,16 @@
 #               (c++ocamlc then serves only installations without it).
 #   ZSTD_CFLAGS zstd.h's -I; default configure's (the -I options of
 #               Makefile.build_config's OC_CPPFLAGS)
+#   ARCH        the native back end's target: configure's (Makefile.config),
+#               as OCaml builds one back end; amd64 for any it lacks
 
 -include Makefile.local
 # (configure's choice, as the runtime's)
 ZSTD_LIBS ?= $(shell sed -n 's/^ZSTD_LIBS=//p' ../Makefile.config 2>/dev/null)
 ZSTD_CFLAGS ?= $(filter -I%,$(shell sed -n 's/^OC_CPPFLAGS = //p' ../Makefile.build_config 2>/dev/null))
+ARCH ?= $(shell sed -n 's/^ARCH=//p' ../Makefile.config 2>/dev/null)
+# the ported back ends: src/typing/<arch>/ (asmcomp/<arch>/)
+BACKEND := $(if $(filter arm64,$(ARCH)),arm64,amd64)
 
 CXX ?= g++
 AR ?= ar
@@ -89,7 +94,7 @@ endif
 endif
 
 # ---- flags ------------------------------------------------------------------
-DEFINES := $(if $(ZSTD_LIBS),-DCPPCAML_HAVE_ZSTD=1) \
+DEFINES := -DCPPCAML_ARCH_$(BACKEND)=1 $(if $(ZSTD_LIBS),-DCPPCAML_HAVE_ZSTD=1) \
   $(if $(MIMALLOC_O),-DCPPCAML_HAVE_MIMALLOC=1 -Ivendor/mimalloc/include)
 # C++23; -std=c++2b where the compiler predates the name (Apple clang < 16)
 CXX_STD := $(shell $(CXX) -std=c++23 -x c++ -fsyntax-only /dev/null >/dev/null 2>&1 \
@@ -122,14 +127,14 @@ $(shell mkdir -p $(O) && \
   rm -f $(O)/flags.new)
 
 # ---- objects ----------------------------------------------------------------
-CORE_SRCS := $(wildcard src/*.cpp src/typing/*.cpp)
+CORE_SRCS := $(wildcard src/*.cpp src/typing/*.cpp src/typing/$(BACKEND)/*.cpp)
 CORE_OBJS := $(CORE_SRCS:%.cpp=$(O)/%.o)
 
 $(O)/%.o: %.cpp $(FLAGS_STAMP)
 	@mkdir -p $(@D)
 	$(V_CXX)$(CXX) $(ALL_CXXFLAGS) $(EXTRA_CXXFLAGS) -MMD -MP -c $< -o $@
 
-$(O)/src/typing/%.o $(O)/src/tools/typing_dump_main.o: \
+$(O)/src/typing/%.o $(O)/src/typing/$(BACKEND)/%.o $(O)/src/tools/typing_dump_main.o: \
   EXTRA_CXXFLAGS := $(PARTIAL_INIT)
 
 # c++ocamlopt: c++ocamlc's driver as Optmaindriver / Optcompile
@@ -162,4 +167,4 @@ $(O)/c++typing-dump: $(O)/src/tools/typing_dump_main.o $(CORE)
 	$(LINK)
 
 -include $(wildcard $(O)/*.d $(O)/src/*.d $(O)/src/typing/*.d \
-  $(O)/src/tools/*.d)
+  $(O)/src/typing/$(BACKEND)/*.d $(O)/src/tools/*.d)

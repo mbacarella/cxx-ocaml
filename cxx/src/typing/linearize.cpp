@@ -1,6 +1,7 @@
 // Ports of asmcomp/linear.ml, linearize.ml, printlinear.ml and
 // stackframegen.ml + amd64/stackframe.ml.  See linear.hpp.
 #include "cppcaml/typing/linear.hpp"
+#include "stackframegen.hpp"
 
 #include <functional>
 #include <stdexcept>
@@ -325,42 +326,21 @@ Instr linear(const ExitInfo& exit_info, mach::Instr i, Instr n, bool contains_ca
   return n;
 }
 
-// ---- Stackframe (amd64) ----
+// ---- Stackframe ----
 struct Analysis {
   bool contains_nontail_calls;
   bool frame_required;
   long extra_stack_used;
 };
 
-bool is_call(const mach::Instruction& i) {
-  using IO = mach::IntegerOperation;
-  switch (i.desc) {
-    case IK::Iop:
-      switch (i.op->k) {
-        case MK::Icall_ind:
-        case MK::Icall_imm:
-        case MK::Iextcall:
-        case MK::Ialloc:
-        case MK::Ipoll: return true;
-        // (amd64) caml_ml_array_bound_error
-        case MK::Iintop:
-        case MK::Iintop_imm: return i.op->intop.op == IO::Icheckbound;
-        default: return false;
-      }
-    case IK::Iraise: return i.raise != lambda::RaiseKind::Raise_notrace;
-    case IK::Itrywith: return true;
-    default: return false;
-  }
-}
-
 Analysis analyze(const mach::Fundecl& f) {
-  constexpr long trap_handler_size = 16;
+  using stackframegen::trap_handler_size;
   bool contains_nontail_calls = false, contains_calls = false;
   long extra_space = 0;
   std::function<void(long, mach::Instr)> an = [&](long sp, mach::Instr i) {
     for (;;) {
       if (sp > extra_space) extra_space = sp;
-      contains_calls = contains_calls || is_call(*i);
+      contains_calls = contains_calls || stackframegen::is_call(*i);
       switch (i->desc) {
         case IK::Iend:
         case IK::Ireturn:
@@ -391,8 +371,7 @@ Analysis analyze(const mach::Fundecl& f) {
     }
   };
   an(0, f.fun_body);
-  // Config.with_frame_pointers = false
-  bool frame_required = contains_calls || f.fun_num_stack_slots[0] > 0 || f.fun_num_stack_slots[1] > 0;
+  bool frame_required = stackframegen::frame_required(f, contains_calls);
   return {contains_nontail_calls, frame_required, extra_space};
 }
 
@@ -501,3 +480,40 @@ void print_fundecl(Formatter& ppf, const Fundecl& f) {
 }
 
 }  // namespace cppcaml::typing::linear
+
+namespace cppcaml::typing::stackframegen {
+
+using IK = mach::Instruction::K;
+using MK = mach::Operation::K;
+
+// Determine if an instruction performs a call that requires the return
+// address to be saved in the stack frame, and a stack frame to be
+// allocated.  For exception-raising constructs, we get better stack
+// backtraces by treating them as non-tail calls.
+bool is_call_generic(const mach::Instruction& i) {
+  using IO = mach::IntegerOperation;
+  switch (i.desc) {
+    case IK::Iop:
+      switch (i.op->k) {
+        case MK::Icall_ind:
+        case MK::Icall_imm:
+        case MK::Iextcall:
+        case MK::Ialloc:   // caml_alloc*, caml_garbage_collection (incl. polls)
+        case MK::Ipoll: return true;
+        case MK::Iintop:  // caml_ml_array_bound_error
+        case MK::Iintop_imm: return i.op->intop.op == IO::Icheckbound && clflags::debug;
+        default: return false;
+      }
+    case IK::Iraise: return i.raise != lambda::RaiseKind::Raise_notrace;  // caml_stash_backtrace
+    case IK::Itrywith: return true;
+    default: return false;
+  }
+}
+
+// Determine if a function requires a stack frame to be allocated: it
+// contains calls, or it allocates variables on the stack
+bool frame_required_generic(const mach::Fundecl& f, bool contains_calls) {
+  return contains_calls || f.fun_num_stack_slots[0] > 0 || f.fun_num_stack_slots[1] > 0;
+}
+
+}  // namespace cppcaml::typing::stackframegen

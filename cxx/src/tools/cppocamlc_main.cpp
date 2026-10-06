@@ -55,6 +55,7 @@
 #include "cppcaml/typing/mach_passes.hpp"
 #include "cppcaml/typing/linear.hpp"
 #include "cppcaml/typing/emit.hpp"
+#include "cppcaml/typing/arch_options.hpp"
 #include "cppcaml/typing/asmgen.hpp"
 #include "cppcaml/typing/evacuate.hpp"
 #include "cppcaml/typing/asmlibrarian.hpp"
@@ -1139,12 +1140,10 @@ static int run_main(int argc, char** argv) {
   // Optmaindriver.main: native_code := true, before the arguments
   if (kNative) cf::native_code = true;
   if (kNative) {
-    // the native back end ported: amd64 on Linux, as this configuration's
-    // Config says (the code generator reads these values as constants)
-    static const std::pair<const char*, const char*> supported[] = {
-        {"architecture", "amd64"}, {"system", "linux"},
-        {"with_frame_pointers", "false"}, {"asm_cfi_supported", "true"}, {"tsan", "false"}};
-    for (auto& [k, v] : supported) {
+    // the configurations the target's back end is ported for, as this
+    // configuration's Config says (the code generator reads these values as
+    // constants)
+    for (auto& [k, v] : ty::arch::supported_configuration()) {
       std::optional<std::string> x = ty::config::config_var(k);
       if (!x || *x != v) {
         std::cerr << CPPCAML_SELF ": this OCaml's configuration is not supported (" << k << ": "
@@ -1156,14 +1155,8 @@ static int run_main(int argc, char** argv) {
   const bool prof = std::getenv("CPPCAML_PROFILE") != nullptr;
   std::vector<std::string> args(argv, argv + argc);
   if (kNative) {
-    // Arch.command_line_options (amd64's) @ Options.list
-    ty::arg::Option fpic{"-fPIC", ty::arg::Spec{}, " Generate position-independent machine code (default)"};
-    fpic.spec.k = ty::arg::Spec::K::Unit;
-    fpic.spec.unit = [] { cf::pic_code = true; };
-    ty::arg::Option fnopic{"-fno-PIC", ty::arg::Spec{}, " Generate position-dependent machine code"};
-    fnopic.spec.k = ty::arg::Spec::K::Unit;
-    fnopic.spec.unit = [] { cf::pic_code = false; };
-    ce::add_arguments({fpic, fnopic});
+    // Arch.command_line_options @ Options.list
+    ce::add_arguments(ty::arch::command_line_options());
     ce::add_arguments(ty::main_args::optcomp_options());
   } else {
     ce::add_arguments(ty::main_args::bytecomp_options());
