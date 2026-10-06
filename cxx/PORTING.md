@@ -335,6 +335,17 @@ ocamlc.opt's time; peak RSS 1.5-2.7x.  The release build must link mimalloc
 (vendored in `cxx/vendor/mimalloc`, on unless `MIMALLOC=no`): glibc's malloc
 costs ~25%.
 
+Native (`NATIVE=1`, flambda tree), 2026-10-05: c++ocamlopt against
+ocamlopt.opt -- time 0.58x (startup), 0.68x (small), 0.82x (compiler),
+0.76x (stdlib), 0.91x (link); peak RSS summed over the units 0.75x
+(small), 0.92x (compiler), 0.79x (stdlib).  The units still above
+ocamlopt (10 of 416 compiler units over 1.15x, the corpus maxima
+parser.ml 293 / 209 MB and camlinternalFormat.ml 77 / 57 MB) peak at the
+end of translation, with the typing zone whole: its parse tree and the
+instances unification threw away, which OCaml's GC reclaims during typing.
+mimalloc purges freed memory at once (`allocator.cpp`; its 1 s default kept
+the .cmx readers' scratch resident).
+
 ## Following trunk
 
 The port tracks upstream trunk (the next release, 5.6).  A catch-up merges
