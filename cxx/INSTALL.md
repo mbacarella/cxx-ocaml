@@ -13,9 +13,10 @@ repository also builds c++ocamlc and c++ocamlopt and installs them as
 point at them), keeping the stock compilers as `bin/ocamlc.stock` and
 `bin/ocamlopt.stock`.  Every package installed in the switch afterwards is
 compiled by the C++ port, to bytecode and to native code; the other tools
-(ocamldep, the toplevel, ...) are the stock ones.  c++ocamlopt's back end
-is the non-flambda amd64 one on Linux: for any other configuration the
-stock ocamlopt stays (with a warning in the build log).
+(ocamldep, the toplevel, ...) are the stock ones.  c++ocamlopt's back ends
+are the non-flambda amd64 one on Linux and the arm64 one on macOS: for any
+other configuration the stock ocamlopt stays (with a warning in the build
+log).
 
 ```sh
 opam switch create cxx-5.5 --empty
@@ -50,11 +51,11 @@ allocator, vendored in `cxx/vendor/mimalloc`, statically.
 macOS (verified on Apple Silicon; nothing in it is arm64-specific): the
 Xcode command line tools are enough -- Apple clang (`g++` is clang there;
 `-std=c++2b` where clang predates `c++23`), the system's make and shell --
-plus libzstd when OCaml is built with it.  c++ocamlc serves a macOS switch; c++ocamlopt does not yet (its
-back end is amd64 Linux's), so the switch keeps the stock ocamlopt.  In a
-source tree configured by hand, `cxx/harness/gen_driver_tables.sh`
-regenerates c++ocamlc's configuration tables (checked in for amd64 Linux)
-for it before `make -C cxx`.
+plus libzstd when OCaml is built with it.  On Apple Silicon c++ocamlopt
+serves the switch too (the arm64 back end); on an Intel Mac the stock
+ocamlopt stays.  In a source tree configured by hand,
+`cxx/harness/gen_driver_tables.sh` regenerates c++ocamlc's configuration
+tables (checked in for amd64 Linux) for it before `make -C cxx`.
 
 What the build does (`cxx/opam/build-cxx.sh`, in `ocaml-variants`' build
 stage): it installs the tree into a stage (`make install

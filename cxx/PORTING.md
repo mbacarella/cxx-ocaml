@@ -230,6 +230,32 @@ ocamloptcomp.cmxa, the link) once with ocamlopt.opt and once with
 c++ocamlopt: all 845 artifacts (.cmx, .o, .cmi, .cmxa, .a) and the
 ocamlopt.opt executable are byte-identical.
 
+The back ends.  As asmcomp/ is laid out, the machine-dependent modules are
+one directory per target, src/typing/<arch>/ (arch, proc, selection, cse,
+reload, stackframe, emit), built for the target configure chose
+(cxx/Makefile's ARCH, one per build as OCaml's; amd64 when it lacks a
+port).  The generic code calls them where OCaml's does: Selectgen's
+selector (selectgen.hpp) has OCaml's virtual methods, which the target's
+selector overrides; CSEgen's, Reloadgen's and Stackframegen's overridden
+methods are hooks (mach_passes_arch.hpp, stackframegen.hpp) deferring to
+the generic ones as super; Arch and Proc are the targets' headers and
+files behind mach.hpp's interface.  The amd64 back end's split was checked
+by c++ocamlopt configured for amd64 Linux on another machine, before and
+after: -dcmm, -dsel, -dreload, -dlinear and the .s of the 6557 probes (and
+with -g -unsafe -inline 200) identical, 26220/26220 files.
+
+arm64 (macOS; asmcomp/arm64/, and Branch_relaxation, Emitaux's text
+printing in emitaux.cpp): against the tree's ocamlopt.opt on an Apple
+Silicon Mac, DUMP=dcmm, dsel, dcse, dlive, dspill, dsplit, dinterf,
+dprefer, dalloc, dreload, dlinear (FLAGS="-stop-after scheduling") --
+6553/6553 probes each; DUMP=S (and -g, -unsafe -inline 200), o, cmx (and
+-g) -- 6553/6553 (the other 4 probes ocamlopt.opt rejects);
+native_link_parity 6534/6534 linkable probes; native_link_scenarios
+31/31; native_stdlib_build 559/559; native_self_build 832/832 artifacts,
+ocamlopt.opt byte-identical.  macOS's Config: Compilenv's '$' symbol
+separator, the '_' symbol prefix, the L labels, Mach-O sections, int32
+C arguments in 4-byte stack slots (Proc, Selection's Imove32).
+
 The opam switch (`cxx/INSTALL.md`) installs c++ocamlopt as `ocamlopt`:
 dune, 30 packages and mpg123 build, and every artifact is identical to the
 stock compilers' (only .cmt sharing differs).  `parse_dir_parity.sh`
@@ -327,7 +353,8 @@ menhir error points.
   rewriter sees, not the compiled output.
 - Not ported: typing recovery (`-typing-recovery`), the
   `-bin-annot-occurrences` index, Printast / Pprintast / Printtyped as
-  printers (hence the refused `-d*` options), the native back end.
+  printers (hence the refused `-d*` options); the native back ends other
+  than amd64 Linux's and arm64 macOS's.
 
 ## Performance
 

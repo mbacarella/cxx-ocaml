@@ -137,6 +137,13 @@ long num_registers();
 
 }  // namespace reg
 
+namespace mach {
+struct AllocDbginfo {  // (before Arch: arm64's Ialloc_far carries it)
+  long alloc_words;
+  debuginfo::t alloc_dbg;
+};
+}  // namespace mach
+
 }  // namespace cppcaml::typing
 
 #include "cppcaml/typing/arch.hpp"
@@ -169,10 +176,6 @@ struct Test {
   lambda::FloatComparison fcmp = lambda::FloatComparison::CFeq;
 };
 
-struct AllocDbginfo {
-  long alloc_words;
-  debuginfo::t alloc_dbg;
-};
 
 struct Operation {
   enum class K : std::uint8_t {
@@ -195,7 +198,7 @@ struct Operation {
   std::vector<AllocDbginfo> dbginfo;                     // Ialloc
   IntOp intop{IntegerOperation::Iadd};                   // Iintop / Iintop_imm
   lambda::FloatComparison fcmp = lambda::FloatComparison::CFeq;  // Icompf
-  arch::SpecificOperation spec{arch::SpecificOperation::K::Ilea};  // Ispecific
+  arch::SpecificOperation spec{};  // Ispecific (value-initialized: the first one)
   std::optional<long> return_label;                                // Ipoll
 };
 inline Operation mop(Operation::K k) { return Operation{k}; }

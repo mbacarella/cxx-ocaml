@@ -19,7 +19,7 @@
 #        `-config` identical to the stock compilers', a program compiled and
 #        run; c++ocamlopt's .cmx, .o and executable identical to the stock
 #        ocamlopt's (c++ocamlopt is installed only for the configurations
-#        its back end supports: non-flambda amd64 Linux);
+#        its back ends support: non-flambda amd64 Linux, arm64 macOS);
 #     4. ocaml-variants.install rewritten so that opam installs c++ocamlc as
 #        bin/ocamlc.opt (bin/ocamlc points at it) and the stock compiler as
 #        bin/ocamlc.stock; likewise c++ocamlopt as bin/ocamlopt.opt, the
@@ -77,13 +77,24 @@ do_build() {
   # 2. c++ocamlc for this installation
   INSTALL="$sp" "$root/cxx/harness/gen_driver_tables.sh"
   zstd_args=$(make_zstd_args "$sbin") || exit 1
-  # the native back end: non-flambda amd64 on Linux
+  # the native back ends: non-flambda amd64 on Linux, arm64 on macOS
+  arch=$("$sbin/ocamlopt.opt" -config-var architecture 2>/dev/null || true)
+  case "$arch" in
+    amd64) want_system=linux ;;
+    arm64) want_system=macosx ;;
+    *) want_system= ;;
+  esac
   native=1
-  for kv in architecture=amd64 system=linux flambda=false with_frame_pointers=false \
+  if [ -z "$want_system" ]; then
+    say "warning: architecture is $arch: c++ocamlopt supports only amd64 and arm64; keeping the stock ocamlopt"
+    native=0
+  fi
+  for kv in system=$want_system flambda=false with_frame_pointers=false \
             asm_cfi_supported=true tsan=false; do
+    [ $native = 1 ] || break
     v=$("$sbin/ocamlopt.opt" -config-var "${kv%%=*}" 2>/dev/null || true)
     if [ "$v" != "${kv#*=}" ]; then
-      say "warning: ${kv%%=*} is $v: c++ocamlopt supports only ${kv#*=}; keeping the stock ocamlopt"
+      say "warning: ${kv%%=*} is $v: c++ocamlopt on $arch supports only ${kv#*=}; keeping the stock ocamlopt"
       native=0
     fi
   done

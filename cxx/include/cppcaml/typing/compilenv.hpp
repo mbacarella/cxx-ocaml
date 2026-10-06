@@ -4,6 +4,8 @@
 // structured constants.
 #pragma once
 
+#include "cppcaml/typing/config.hpp"
+
 #include <optional>
 #include <string>
 #include <string_view>
@@ -31,8 +33,12 @@ struct Error : std::runtime_error {
 std::string error_message(const Error& e);
 void report_error_doc(format_doc::Formatter& ppf, const Error& e);
 
-// symbol_separator (not MSVC)
-inline constexpr char symbol_separator = '.';
+inline bool linuxlike_mangling() {
+  const std::string& s = config::system;
+  return !(s == "macosx" || s == "mingw" || s == "mingw64" || s == "cygwin" || s == "win32" || s == "win64");
+}
+inline char symbol_separator() { return linuxlike_mangling() ? '.' : '$'; }
+inline const char* escape_prefix() { return linuxlike_mangling() ? "$" : "$$"; }
 cmx_format::UnitInfos& current_unit();
 void reset(const std::optional<std::string>& packname, std::string_view name);
 std::string_view current_unit_name();

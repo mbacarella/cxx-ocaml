@@ -50,7 +50,8 @@ fi
 CLAMBDA=0
 case "$DUMP" in dflambda-verbose|drawflambda|dclambda|drawclambda|dcmm|dsel|dcombine|dcse|dlive|dspill|dsplit|dinterf|dprefer|dalloc|dreload|dlinear|S) CLAMBDA=1; STOP=""; OSTOP="" ;; esac
 export DUMP FLAGS STOP DFLAG NATIVE REFC OSTOP CLAMBDA
-OUT=/tmp/lambda_port_parity
+OUT=${OUT:-/tmp/lambda_port_parity}  # (another OUT= for a concurrent run)
+RESULTS=$(dirname "$OUT")/.$(basename "$OUT")_results
 
 if [ "${1:-}" == "--worker" ]; then
   f="$2"; b=$(basename "$f"); key=$(echo "$f" | tr '/' '_')
@@ -95,6 +96,6 @@ rm -rf "$OUT"; mkdir -p "$OUT"
 if [ $# -gt 0 ]; then files=("$@"); else lines_into files < <(ls cxx/harness/stamp_probes/*.ml); fi
 vm_limit 8000000
 res=$(printf '%s\n' ${files[@]+"${files[@]}"} | xargs -P "$JOBS" -I{} bash "$SELF" --worker {} | sort -k2)
-printf '%s\n' "$res" > /tmp/.lambda_port_parity_results
+printf '%s\n' "$res" > "$RESULTS"
 printf '%s\n' "$res" | awk '{f[$1]++} END{ printf "files %d: SAME %d  DIFF %d  CFAIL %d  OFAIL %d\n", NR, f["SAME"], f["DIFF"], f["CFAIL"], f["OFAIL"] }'
-echo "per-file results: /tmp/.lambda_port_parity_results (dumps in $OUT: <file>.o ocamlc, <file>.c port)"
+echo "per-file results: $RESULTS (dumps in $OUT: <file>.o ocamlc, <file>.c port)"
