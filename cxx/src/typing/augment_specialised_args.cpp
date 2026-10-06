@@ -214,7 +214,7 @@ struct Processed {
           for (const FunDefs& fd : fun_vars_and_definitions)
             for (const Definition& definition : fd.second) acc = acc.new_specialised_arg(fd.first, group, definition);
           bool some_function_has_too_many_args = acc.functions.exists([](variable::t, const ForOneFunction& f) {
-            return f.total_number_of_args > inline_and_simplify_aux::max_sensible_number_of_arguments;
+            return f.total_number_of_args > inline_and_simplify_aux::max_sensible_number_of_arguments();
           });
           return some_function_has_too_many_args ? original_t : acc;  // (drop this group)
         },

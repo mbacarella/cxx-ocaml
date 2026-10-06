@@ -8,14 +8,15 @@
 #include "cppcaml/typing/freshening.hpp"
 #include "cppcaml/typing/inlining_cost.hpp"
 #include "cppcaml/typing/inlining_stats.hpp"
+#include "cppcaml/typing/mach.hpp"
 #include "cppcaml/typing/simple_value_approx.hpp"
 
 namespace cppcaml::typing::inline_and_simplify_aux {
 
 namespace A = simple_value_approx;
 
-// Backend_intf.S for amd64: Proc.max_arguments_for_tailcalls - 1
-inline constexpr long max_sensible_number_of_arguments = 10 + 64 - 1;
+// Backend_intf.S: Proc.max_arguments_for_tailcalls - 1
+inline long max_sensible_number_of_arguments() { return proc::max_arguments_for_tailcalls - 1; }
 
 struct ProjCmp {
   int operator()(projection::t a, projection::t b) const { return projection::compare(a, b); }

@@ -1,7 +1,7 @@
-// Ports of asmcomp/reg.ml, asmcomp/mach.ml, asmcomp/amd64/arch.ml (the
-// operations) and asmcomp/amd64/proc.ml: pseudo-registers, the Mach
-// pseudo-instructions Selection produces, and the amd64 register and
-// calling conventions.
+// Ports of asmcomp/reg.ml, asmcomp/mach.ml and the interface of the
+// target's Proc (asmcomp/proc.mli): pseudo-registers, the Mach
+// pseudo-instructions Selection produces, and the register and calling
+// conventions (src/typing/<arch>/proc.cpp).
 #pragma once
 
 #include <algorithm>
@@ -137,32 +137,11 @@ long num_registers();
 
 }  // namespace reg
 
-// ---- Arch (amd64) ------------------------------------------------------------------------------
-namespace arch {
+}  // namespace cppcaml::typing
 
-struct AddressingMode {
-  enum class K : std::uint8_t { Ibased, Iindexed, Iindexed2, Iscaled, Iindexed2scaled } k;
-  std::string_view sym;  // Ibased
-  long scale = 0;        // Iscaled / Iindexed2scaled
-  long displ = 0;
-};
-inline AddressingMode iindexed(long n) { return {AddressingMode::K::Iindexed, {}, 0, n}; }
-AddressingMode offset_addressing(const AddressingMode& addr, long delta);
-inline AddressingMode identity_addressing() { return iindexed(0); }
+#include "cppcaml/typing/arch.hpp"
 
-enum class FloatOperation : std::uint8_t { Ifloatadd, Ifloatsub, Ifloatmul, Ifloatdiv };
-struct SpecificOperation {
-  enum class K : std::uint8_t {
-    Ilea, Istore_int, Ioffset_loc, Ifloatarithmem, Ibswap, Iclz, Ictz, Isqrtf, Ifloatsqrtf, Isextend32, Izextend32
-  } k;
-  AddressingMode addr{};
-  std::int64_t n = 0;  // Istore_int's constant, Ioffset_loc's delta, Ibswap's width
-  bool is_assign = false;
-  FloatOperation fop = FloatOperation::Ifloatadd;
-};
-bool operation_is_pure(const SpecificOperation& op);
-
-}  // namespace arch
+namespace cppcaml::typing {
 
 // ---- Mach --------------------------------------------------------------------------------------
 namespace mach {
@@ -296,7 +275,8 @@ void init();
 long register_class(const Reg* r);
 extern long num_available_registers[num_register_classes];
 extern const long first_available_register[num_register_classes];
-constexpr bool rotate_registers = false;
+extern const bool rotate_registers;
+extern const long max_arguments_for_tailcalls;
 Regs destroyed_at_oper(const mach::Instruction& i);
 Regs destroyed_at_raise();
 std::vector<long> max_register_pressure(const mach::Operation& op);

@@ -6,6 +6,7 @@
 // OCaml's order: a record update [{i with desc = ..; next = ..}] and a
 // constructor evaluate their fields right to left.
 #include "cppcaml/typing/mach_passes.hpp"
+#include "mach_passes_arch.hpp"
 
 #include <algorithm>
 #include <functional>
@@ -165,26 +166,55 @@ mach::Fundecl comballoc(const mach::Fundecl& f) {
   return r;
 }
 
+namespace csegen {
+
+OpClass class_of_operation_generic(const mach::Operation& op) {
+  switch (op.k) {
+    case MK::Iconst_int:
+    case MK::Iconst_float:
+    case MK::Iconst_symbol: return OpClass::Op_pure;
+    case MK::Istackoffset: return OpClass::Op_other;
+    case MK::Iload:
+      if (op.is_atomic) return OpClass::Op_store_assign;
+      return op.mut == MutableFlag::Mutable ? OpClass::Op_load_mutable : OpClass::Op_load_immutable;
+    case MK::Istore: return op.is_assign ? OpClass::Op_store_assign : OpClass::Op_store_init;
+    case MK::Iatomic_fetch_add: return OpClass::Op_store_assign;  // atomic read-modify-write
+    case MK::Iintop:
+    case MK::Iintop_imm: return op.intop.op == IO::Icheckbound ? OpClass::Op_checkbound : OpClass::Op_pure;
+    case MK::Icompf:
+    case MK::Inegf:
+    case MK::Iabsf:
+    case MK::Iaddf:
+    case MK::Isubf:
+    case MK::Imulf:
+    case MK::Idivf:
+    case MK::Ifloatofint:
+    case MK::Iintoffloat: return OpClass::Op_pure;
+    case MK::Ispecific: return OpClass::Op_other;
+    case MK::Idls_get: return OpClass::Op_load_mutable;
+    case MK::Ireturn_addr: return OpClass::Op_load_immutable;
+    default: throw std::runtime_error("CSEgen.class_of_operation");
+  }
+}
+
+bool is_cheap_operation_generic(const mach::Operation& op) { return op.k == MK::Iconst_int; }
+
+}  // namespace csegen
+
 // ---- CSE: common subexpression elimination by value numbering over extended basic blocks ----
 namespace {
 
-enum class OpClass { Op_pure, Op_checkbound, Op_load_immutable, Op_load_mutable, Op_store_init, Op_store_assign, Op_other };
+using csegen::OpClass;
 
 // A total order on operations consistent with OCaml's structural equality
 // (Rhs_map's Stdlib.compare: only equal keys matter to lookups)
 int cmp_long(long a, long b) { return a < b ? -1 : a > b ? 1 : 0; }
-int compare_addr(const arch::AddressingMode& a, const arch::AddressingMode& b) {
-  if (int c = cmp_long(static_cast<long>(a.k), static_cast<long>(b.k))) return c;
-  if (int c = a.sym.compare(b.sym)) return c;
-  if (int c = cmp_long(a.scale, b.scale)) return c;
-  return cmp_long(a.displ, b.displ);
-}
 int compare_operation(const mach::Operation& a, const mach::Operation& b) {
   if (int c = cmp_long(static_cast<long>(a.k), static_cast<long>(b.k))) return c;
   if (int c = cmp_long(a.n, b.n)) return c;
   if (int c = a.func.compare(b.func)) return c;
   if (int c = cmp_long(static_cast<long>(a.chunk), static_cast<long>(b.chunk))) return c;
-  if (int c = compare_addr(a.addr, b.addr)) return c;
+  if (int c = arch::compare_addressing(a.addr, b.addr)) return c;
   if (int c = cmp_long(static_cast<long>(a.mut), static_cast<long>(b.mut))) return c;
   if (int c = cmp_long(a.is_atomic, b.is_atomic)) return c;
   if (int c = cmp_long(a.is_assign, b.is_assign)) return c;
@@ -192,11 +222,7 @@ int compare_operation(const mach::Operation& a, const mach::Operation& b) {
   if (int c = cmp_long(a.intop.cmp.is_signed, b.intop.cmp.is_signed)) return c;
   if (int c = cmp_long(static_cast<long>(a.intop.cmp.c), static_cast<long>(b.intop.cmp.c))) return c;
   if (int c = cmp_long(static_cast<long>(a.fcmp), static_cast<long>(b.fcmp))) return c;
-  if (int c = cmp_long(static_cast<long>(a.spec.k), static_cast<long>(b.spec.k))) return c;
-  if (int c = compare_addr(a.spec.addr, b.spec.addr)) return c;
-  if (int c = cmp_long(a.spec.n, b.spec.n)) return c;
-  if (int c = cmp_long(a.spec.is_assign, b.spec.is_assign)) return c;
-  return cmp_long(static_cast<long>(a.spec.fop), static_cast<long>(b.spec.fop));
+  return arch::compare_specific_operation(a.spec, b.spec);
 }
 using Rhs = std::pair<mach::Operation, std::vector<long>>;
 struct RhsCmp {
@@ -322,50 +348,6 @@ Instr insert_move(const Regs& srcs, const Regs& dsts, Instr i) {
   return i1;
 }
 
-OpClass class_of_operation(const mach::Operation& op) {
-  using SK = arch::SpecificOperation::K;
-  switch (op.k) {
-    case MK::Iconst_int:
-    case MK::Iconst_float:
-    case MK::Iconst_symbol: return OpClass::Op_pure;
-    case MK::Istackoffset: return OpClass::Op_other;
-    case MK::Iload:
-      if (op.is_atomic) return OpClass::Op_store_assign;
-      return op.mut == MutableFlag::Mutable ? OpClass::Op_load_mutable : OpClass::Op_load_immutable;
-    case MK::Istore: return op.is_assign ? OpClass::Op_store_assign : OpClass::Op_store_init;
-    case MK::Iatomic_fetch_add: return OpClass::Op_store_assign;  // atomic read-modify-write
-    case MK::Iintop:
-    case MK::Iintop_imm: return op.intop.op == IO::Icheckbound ? OpClass::Op_checkbound : OpClass::Op_pure;
-    case MK::Icompf:
-    case MK::Inegf:
-    case MK::Iabsf:
-    case MK::Iaddf:
-    case MK::Isubf:
-    case MK::Imulf:
-    case MK::Idivf:
-    case MK::Ifloatofint:
-    case MK::Iintoffloat: return OpClass::Op_pure;
-    case MK::Ispecific:
-      // (amd64)
-      switch (op.spec.k) {
-        case SK::Ilea:
-        case SK::Isextend32:
-        case SK::Izextend32:
-        case SK::Iclz:
-        case SK::Ictz: return OpClass::Op_pure;
-        case SK::Istore_int: return op.spec.is_assign ? OpClass::Op_store_assign : OpClass::Op_store_init;
-        case SK::Ioffset_loc: return OpClass::Op_store_assign;
-        case SK::Ifloatarithmem:
-        case SK::Ifloatsqrtf: return OpClass::Op_load_mutable;
-        default: return OpClass::Op_other;  // Ibswap, Isqrtf: super -> Op_other
-      }
-    case MK::Idls_get: return OpClass::Op_load_mutable;
-    case MK::Ireturn_addr: return OpClass::Op_load_immutable;
-    default: fatal("CSEgen.class_of_operation");
-  }
-}
-
-bool is_cheap_operation(const mach::Operation& op) { return op.k == MK::Iconst_int; }
 
 Instr cse_i(const Numbering& n, Instr i);
 
@@ -409,7 +391,7 @@ Instr cse_i(const Numbering& n, Instr i) {
         }
         default: break;
       }
-      OpClass c = class_of_operation(op);
+      OpClass c = csegen::class_of_operation(op);
       if (c == OpClass::Op_pure || c == OpClass::Op_checkbound || c == OpClass::Op_load_immutable ||
           c == OpClass::Op_load_mutable) {
         auto [n1, varg] = valnum_regs(n, i->arg);
@@ -419,7 +401,7 @@ Instr cse_i(const Numbering& n, Instr i) {
           // This operation was computed earlier.  Are there registers that
           // hold the results computed earlier?
           std::optional<Regs> res = find_regs_containing(n1, *vres);
-          if (res && !is_cheap_operation(op)) {
+          if (res && !csegen::is_cheap_operation(op)) {
             // We can replace res <- op args with r <- move res, provided res
             // are stable (non-volatile) registers.
             Numbering n3 = set_known_regs(n1, i->res, *vres);
@@ -1545,6 +1527,7 @@ std::vector<long> coloring_allocate_registers() {
     // Found a register?
     if (best_reg >= 0) {
       reg->loc = {LK::Reg, first_reg + best_reg};
+      if (proc::rotate_registers) start_register[cl] = start + 1 >= num_regs ? 0 : start + 1;
     } else {
       // Sorry, we must put the pseudoreg in a stack location
       long nslots = num_stack_slots[cl];
@@ -1764,7 +1747,7 @@ void remove_expired_ranges(const IntervalSet& s, long pos) {
   for (Interval* i : s) remove_expired_ranges(i, pos);
 }
 
-bool same_loc(const reg::Location& a, const reg::Location& b);  // Reload's
+using reloadgen::same_loc;  // Reload's
 
 struct Linscan {
   ClassIntervals active[proc::num_register_classes];
@@ -1913,10 +1896,8 @@ std::vector<long> linscan_allocate_registers(const interval::Result& intervals) 
 // ---- Reload: insert load/stores for pseudoregs that got assigned to stack locations ----------
 namespace {
 
-bool stackp(const Reg* r) {
-  return r->loc.k == LK::Local || r->loc.k == LK::Incoming || r->loc.k == LK::Outgoing || r->loc.k == LK::Domainstate;
-}
-bool same_loc(const reg::Location& a, const reg::Location& b) { return a.k == b.k && a.n == b.n; }
+using reloadgen::same_loc;
+using reloadgen::stackp;
 
 Instr insert_move_r(Reg* src, Reg* dst, Instr next) {
   if (same_loc(src->loc, dst->loc)) return next;
@@ -1928,10 +1909,10 @@ Instr insert_moves_r(const Regs& src, const Regs& dst, Instr next) {
   return next;
 }
 
-struct Reloader {
+struct Reloader final : reloadgen::Self {
   bool redo_regalloc = false;
 
-  Reg* makereg(Reg* r) {
+  Reg* makereg(Reg* r) override {
     if (r->loc.k == LK::Unknown) fatal("Reload.makereg");
     if (r->loc.k == LK::Reg) return r;
     redo_regalloc = true;
@@ -1940,7 +1921,7 @@ struct Reloader {
     newr->spill_cost = 100000;
     return newr;
   }
-  Regs makeregs(const Regs& rv) {
+  Regs makeregs(const Regs& rv) override {
     Regs nv;
     for (Reg* r : rv) nv.push_back(makereg(r));
     return nv;
@@ -1953,7 +1934,7 @@ struct Reloader {
 
   // reload_generic: all arguments and results in hardware registers,
   // except for moves
-  std::pair<Regs, Regs> reload_operation_generic(const mach::Operation& op, const Regs& arg, const Regs& res) {
+  std::pair<Regs, Regs> reload_operation_generic(const mach::Operation& op, const Regs& arg, const Regs& res) override {
     if (op.k == MK::Imove || op.k == MK::Ireload || op.k == MK::Ispill) {
       if (stackp(arg[0]) && stackp(res[0]) && !same_loc(arg[0]->loc, res[0]->loc)) return {{makereg(arg[0])}, res};
       return {arg, res};
@@ -1965,96 +1946,12 @@ struct Reloader {
     return {a, r};
   }
 
-  // amd64's reload_operation
-  std::pair<Regs, Regs> reload_operation(const mach::Operation& op, const Regs& arg, const Regs& res) {
-    switch (op.k) {
-      case MK::Iintop:
-        switch (op.intop.op) {
-          case IO::Iadd:
-          case IO::Isub:
-          case IO::Iand:
-          case IO::Ior:
-          case IO::Ixor:
-          case IO::Icheckbound:
-            // One of the two arguments can reside in the stack, but not both
-            if (stackp(arg[0]) && stackp(arg[1])) return {{arg[0], makereg(arg[1])}, res};
-            return {arg, res};
-          case IO::Icomp: {
-            // The result must be a register (PR#11803)
-            Regs res2 = makeregs(res);
-            if (stackp(arg[0]) && stackp(arg[1])) return {{arg[0], makereg(arg[1])}, res2};
-            return {arg, res2};
-          }
-          case IO::Imul:
-            // First argument (= result) must be in register, second arg can
-            // reside in the stack
-            if (stackp(arg[0])) {
-              Reg* r = makereg(arg[0]);
-              return {{r, arg[1]}, {r}};
-            }
-            return {arg, res};
-          default:  // Imulh, Idiv, Imod, Ilsl, Ilsr, Iasr
-            return {arg, res};
-        }
-      case MK::Iintop_imm:
-        if (op.intop.op == IO::Iadd && !same_loc(arg[0]->loc, res[0]->loc))
-          // This add will be turned into a lea; args and results must be in
-          // registers
-          return reload_operation_generic(op, arg, res);
-        if (op.intop.op == IO::Imul) {
-          // The result (= the argument) must be a register (#10626)
-          if (stackp(arg[0])) {
-            Reg* r = makereg(arg[0]);
-            return {{r}, {r}};
-          }
-          return {arg, res};
-        }
-        if (op.intop.op == IO::Icomp) return {arg, makeregs(res)};  // The result must be in a register (PR#11803)
-        return {arg, res};
-      case MK::Iaddf:
-      case MK::Isubf:
-      case MK::Imulf:
-      case MK::Idivf:
-        if (stackp(arg[0])) {
-          Reg* r = makereg(arg[0]);
-          return {{r, arg[1]}, {r}};
-        }
-        return {arg, res};
-      case MK::Ifloatofint:
-      case MK::Iintoffloat:
-        // Result must be in register, but argument can be on stack
-        return {arg, stackp(res[0]) ? Regs{makereg(res[0])} : res};
-      case MK::Iconst_int:
-        if (op.n <= 0x7FFFFFFFLL && op.n >= -0x80000000LL) return {arg, res};
-        return reload_operation_generic(op, arg, res);
-      case MK::Iconst_symbol:
-        if (clflags::pic_code || clflags::dlcode) return reload_operation_generic(op, arg, res);
-        return {arg, res};
-      default:  // Other operations: all args and results in registers
-        return reload_operation_generic(op, arg, res);
-    }
-  }
+  Regs reload_test_generic(const Test&, const Regs& arg) override { return makeregs(arg); }
 
-  Regs reload_test(const Test& tst, const Regs& arg) {
-    using FC = lambda::FloatComparison;
-    switch (tst.k) {
-      case Test::K::Iinttest:
-        // One of the two arguments can reside on stack
-        if (stackp(arg[0]) && stackp(arg[1])) return {makereg(arg[0]), arg[1]};
-        return arg;
-      case Test::K::Ifloattest:
-        if (tst.fcmp == FC::CFlt || tst.fcmp == FC::CFnlt || tst.fcmp == FC::CFle || tst.fcmp == FC::CFnle) {
-          // Cf. emit.mlp: we swap arguments in this case.  First argument
-          // can be on stack, second must be in register
-          if (stackp(arg[1])) return {arg[0], makereg(arg[1])};
-          return arg;
-        }
-        // Second argument can be on stack, first must be in register
-        if (stackp(arg[0])) return {makereg(arg[0]), arg[1]};
-        return arg;
-      default: return arg;  // The argument(s) can be either in register or on stack
-    }
+  std::pair<Regs, Regs> reload_operation(const mach::Operation& op, const Regs& arg, const Regs& res) {
+    return reloadgen::reload_operation(*this, op, arg, res);
   }
+  Regs reload_test(const Test& tst, const Regs& arg) { return reloadgen::reload_test(*this, tst, arg); }
 
   Instr reload(Instr i) {
     switch (i->desc) {

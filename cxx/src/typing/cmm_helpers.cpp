@@ -14,6 +14,7 @@
 #include <variant>
 
 #include "cppcaml/typing/clflags.hpp"
+#include "cppcaml/typing/mach.hpp"
 #include "cppcaml/typing/compilenv.hpp"
 #include "cppcaml/typing/switch.hpp"
 
@@ -605,8 +606,7 @@ expression safe_divmod_bi(DivOp mkop, L::IsSafe is_safe, const std::function<exp
   return bind("divisor", c2, [&](expression c2) {
     return bind("dividend", c1, [&](expression c1) {
       expression c = mkop(c1, c2, is_safe, dbg);
-      // Arch.division_crashes_on_overflow
-      if (bi != BoxedInteger::Pint32 && !is_different_from(-1, c2))
+      if (arch::division_crashes_on_overflow && bi != BoxedInteger::Pint32 && !is_different_from(-1, c2))
         return cifthenelse(cop(ccmpi(IC::Cne), {c2, cconst_int(-1, dbg)}, dbg), dbg, c, dbg, mkm1(c1, dbg), dbg);
       return c;
     });
