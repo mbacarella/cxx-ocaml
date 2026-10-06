@@ -25,7 +25,8 @@
 #               OC_COMMON_COMPFLAGS, in ocamldep -sort order, each compiler
 #               against the .cmi it wrote itself
 set -u
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 cd "$ROOT" || exit 1
 JOBS="${JOBS:-8}"
@@ -116,7 +117,7 @@ if [ ! -x "$TOOLS/cmtdump" ] || [ "$SELF" -nt "$TOOLS/cmtdump" ] || [ "$ROOT/cxx
       "$ROOT/compilerlibs/ocamlcommon.cma" cmtdump.ml -o cmtdump ) || { echo "cmt_parity.sh: cannot build cmtdump" >&2; exit 2; }
 fi
 export -f judge; export AWK=awk
-ulimit -v 8000000
+vm_limit 8000000
 
 if [ "${1:-}" == "--stdlib" ]; then
   res=$(cd stdlib && ls *.ml | xargs -P "$JOBS" -I{} bash "$SELF" --stdlib-worker {} | sort -k2)
@@ -140,11 +141,11 @@ elif [ "${1:-}" == "--compiler" ]; then
     for f in "$w"/x/*.cmt "$w"/x/*.cmti; do [ -f "$f" ] || continue
       b=$(basename "$f"); cp "$f" "$OUT/compiler_${b%.*}.$side.${b##*.}"; done
   done
-  res=$(for f in $ORDER; do case "$f" in *.ml) echo "compiler_${f%.ml} $f" ;; *.mli) [ -f "$w/src/${f%.mli}.ml" ] || echo "compiler_${f%.mli} $f" ;; esac; done |
+  res=$(for f in $ORDER; do case "$f" in (*.ml) echo "compiler_${f%.ml} $f" ;; (*.mli) [ -f "$w/src/${f%.mli}.ml" ] || echo "compiler_${f%.mli} $f" ;; esac; done |
         while read -r key f; do judge "$key" "$f"; done | sort -k2)
 else
-  if [ $# -gt 0 ]; then files=("$@"); else mapfile -t files < <(ls cxx/harness/stamp_probes/*.ml); fi
-  res=$(printf '%s\n' "${files[@]}" | xargs -P "$JOBS" -I{} bash "$SELF" --worker {} | sort -k2)
+  if [ $# -gt 0 ]; then files=("$@"); else lines_into files < <(ls cxx/harness/stamp_probes/*.ml); fi
+  res=$(printf '%s\n' ${files[@]+"${files[@]}"} | xargs -P "$JOBS" -I{} bash "$SELF" --worker {} | sort -k2)
 fi
 printf '%s\n' "$res" > /tmp/.cmt_parity_results
 printf '%s\n' "$res" | awk '{f[$1]++} END{ printf "files %d: SAME %d  SHARING %d  DIFF %d  CFAIL %d  OFAIL %d\n", NR, f["SAME"], f["SHARING"], f["DIFF"], f["CFAIL"], f["OFAIL"] }'

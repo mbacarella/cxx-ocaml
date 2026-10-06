@@ -6,7 +6,8 @@
 # included) compared byte for byte.  V=1 shows the output diffs.
 # Usage: native_link_scenarios.sh
 set -u
-B="$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)"
+B="$(cd "$(dirname "$0")/../.." && pwd -P)"
+. "$B/cxx/harness/portable.sh"
 REF="$B/ocamlopt.opt -nostdlib -I $B/stdlib"
 CPP="${CPP:-$B/cxx/build-release/c++ocamlopt} -I $B/stdlib"
 W=$(mktemp -d)
@@ -24,7 +25,7 @@ scen() {
     setup
     if [ $who = o ]; then C="$REF"; else C="$CPP"; fi
     ( eval "$cmds" ) > out 2>&1; echo "rc=$?" >> out
-    sed -i "s|$W/x|W|g" out
+    sed -i.orig "s|$W/x|W|g" out && rm -f out.orig
     rm -rf $W/$who; mv $W/x $W/$who
   done
   local d=""

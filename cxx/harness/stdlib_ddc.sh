@@ -29,7 +29,8 @@
 set -u
 set -o pipefail
 
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 cd "$(dirname "$SELF")/../.." || exit 1
 ROOT=$PWD
 RUN=$ROOT/runtime/ocamlrun

@@ -18,7 +18,8 @@
 # Usage: link_parity.sh [case ...]   (ROOT= the built tree, CPP=, REF=)
 #   SAME / DIFF / NONDET-OK / SKIP per case; outputs in /tmp/link_parity
 set -u
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 ROOT="${ROOT:-$(cd "$(dirname "$SELF")/../.." && pwd)}"
 REF="${REF:-$ROOT/ocamlc.opt}"
 CPP="${CPP:-$ROOT/cxx/build-release/c++ocamlc}"
@@ -28,7 +29,7 @@ OUT=/tmp/link_parity
 rm -rf "$OUT"; mkdir -p "$OUT"
 W=$(mktemp -d)
 trap 'rm -rf "${W:?}"' EXIT
-ulimit -v 16000000
+vm_limit 16000000
 export OCAMLLIB="$ROOT/stdlib"
 
 results=()
@@ -87,12 +88,12 @@ both() {
   shift
   local side C f
   for side in o c; do
-    for f in "${outs[@]}"; do rm -rf "$f"; done
+    for f in ${outs[@]+"${outs[@]}"}; do rm -rf "$f"; done
     if [ $side = o ]; then C="$REF"; else C="$CPP"; fi
     mkdir -p "$OUT/$name/$side"
     "$C" "$@" >"$OUT/$name/$side/stdout" 2>"$OUT/$name/$side/stderr"
     echo $? > "$OUT/$name/$side/rc"
-    for f in "${outs[@]}"; do [ -e "$f" ] && cp -r "$f" "$OUT/$name/$side/"; done
+    for f in ${outs[@]+"${outs[@]}"}; do [ -e "$f" ] && cp -r "$f" "$OUT/$name/$side/"; done
   done
 }
 
@@ -124,15 +125,15 @@ nondet() {
   local outs=() a
   for a in "$@"; do [ "$a" = "--" ] && break; outs+=("$a"); done
   shift $(( ${#outs[@]} + 1 ))
-  both "$name" "${outs[@]}" -- "$@"
+  both "$name" ${outs[@]+"${outs[@]}"} -- "$@"
   # ocamlc.opt again
   local f
-  for f in "${outs[@]}"; do rm -rf "$f"; done
+  for f in ${outs[@]+"${outs[@]}"}; do rm -rf "$f"; done
   mkdir -p "$OUT/$name/o2"
   "$REF" "$@" >/dev/null 2>&1
-  for f in "${outs[@]}"; do [ -e "$f" ] && cp -r "$f" "$OUT/$name/o2/"; done
+  for f in ${outs[@]+"${outs[@]}"}; do [ -e "$f" ] && cp -r "$f" "$OUT/$name/o2/"; done
   local det=1
-  for f in "${outs[@]}"; do
+  for f in ${outs[@]+"${outs[@]}"}; do
     if [ -e "$OUT/$name/o/$f" ] && ! cmp -s "$OUT/$name/o/$f" "$OUT/$name/o2/$f"; then det=0; fi
   done
   rm -rf "$OUT/$name/o2"
@@ -317,5 +318,5 @@ custom_stub camlprimc output_c output_obj output_complete_obj output_complete_ex
 make_runtime custom_unix cfile_only cfile_o lib_stub_dll"
 if [ $# -gt 0 ]; then cases="$*"; else cases="$ALL"; fi
 for c in $cases; do "c_$c"; done
-printf '%s\n' "${results[@]}" | tee "$OUT/results"
-printf '%s\n' "${results[@]}" | awk '{f[$1]++} END{printf "cases %d: SAME %d  NONDET-OK %d  DIFF %d  SKIP %d\n", NR, f["SAME"], f["NONDET-OK"], f["DIFF"], f["SKIP"]}'
+printf '%s\n' ${results[@]+"${results[@]}"} | tee "$OUT/results"
+printf '%s\n' ${results[@]+"${results[@]}"} | awk '{f[$1]++} END{printf "cases %d: SAME %d  NONDET-OK %d  DIFF %d  SKIP %d\n", NR, f["SAME"], f["NONDET-OK"], f["DIFF"], f["SKIP"]}'

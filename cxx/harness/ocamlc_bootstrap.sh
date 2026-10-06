@@ -8,7 +8,8 @@
 # c++ocamlc is a C++ program and cannot literally compile itself; the achievable
 # bootstrap is: c++ocamlc + all-ours stdlib  --->  a working OCaml `ocamlc`.
 set -u
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 cd "$(dirname "$SELF")/../.." || exit 1
 ROOT=$PWD
 source cxx/harness/_require_fresh.sh; require_fresh c++ocamlc

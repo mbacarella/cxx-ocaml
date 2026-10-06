@@ -11,7 +11,8 @@
 #
 # KNOWN differences (counted apart): none left (KNOWN_CASES below).
 set -u
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 ROOT="${ROOT:-$(cd "$(dirname "$SELF")/../.." && pwd)}"
 CPP="${CPP:-$ROOT/cxx/build-release/c++ocamlc}"
 T=$(mktemp -d)
@@ -86,9 +87,11 @@ run() {
         esac
       done ) > "$T/out/$side.files"
   done
-  # the external preprocessor's temporary file names are random
-  sed -i -e 's|/tmp/ocamlpp[A-Za-z0-9]*|/tmp/ocamlppXXXXXX|g' -e 's|/tmp/camlppx[A-Za-z0-9]*|/tmp/camlppxXXXXXX|g' \
+  # the external preprocessor's temporary file names are random (in
+  # $TMPDIR: macOS's ends in a slash)
+  sed -i.orig -e 's|/ocamlpp[A-Za-z0-9]*|/ocamlppXXXXXX|g' -e 's|/camlppx[A-Za-z0-9]*|/camlppxXXXXXX|g' \
     "$T/out/o.stderr" "$T/out/c.stderr"
+  rm -f "$T/out/o.stderr.orig" "$T/out/c.stderr.orig"
   local ok=1 k
   for k in stdout stderr rc files; do
     cmp -s "$T/out/o.$k" "$T/out/c.$k" || ok=0

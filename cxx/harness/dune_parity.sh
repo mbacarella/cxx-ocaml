@@ -31,7 +31,8 @@
 #   TARGETS=                       override the dune targets for every project
 #   OUT=/tmp/dune_parity           per-project artifacts and reports
 set -u
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 cd "$ROOT" || exit 1
 CPP="${CPP:-$ROOT/cxx/build-release/c++ocamlc}"
@@ -50,7 +51,7 @@ if [ ! -x "$PFX/bin/ocamlc.opt" ] || [ ! -f "$STAGE/stock_ocamlc.opt" ]; then
 fi
 WORK=/tmp/dune_parity_work   # the one build directory both runs use
 mkdir -p "$OUT"
-ulimit -v 16000000
+vm_limit 16000000
 # the structural .cmt dumper (shared with cmt_parity.sh)
 TOOLS="${TOOLS:-/tmp/cmt_parity_tools}"  # built with this tree's ocamlc.opt
 if [ ! -x "$TOOLS/cmtdump" ] || [ "$ROOT/cxx/harness/cmt/cmtdump.ml" -nt "$TOOLS/cmtdump" ]; then
@@ -69,7 +70,7 @@ cmt_contents_equal() {  # <file-a> <file-b>
 
 projects=()
 if [ $# -gt 0 ]; then
-  for p in "$@"; do projects+=("$(readlink -f "$p")"); done
+  for p in "$@"; do projects+=("$(cd "$p" && pwd -P)"); done
 else
   for p in "$ROOT"/cxx/harness/dune_projects/*/; do projects+=("${p%/}"); done
   for r in $REAL; do [ -d "$REAL_SRC/$r" ] && projects+=("$REAL_SRC/$r"); done
@@ -98,12 +99,12 @@ build() {  # <project> <side> <targets...>
 
 total_same=0; total_sharing=0; total_nondet=0; total_diff=0; total_missing=0
 printf '%-28s %6s %8s %7s %6s %8s  %s\n' project same sharing nondet diff missing dune >&2
-for p in "${projects[@]}"; do
+for p in ${projects[@]+"${projects[@]}"}; do
   name=$(basename "$p")
   case "$p" in "$ROOT"/cxx/harness/dune_projects/*) t=(@default) ;; *) t=(@install) ;; esac
   [ -n "${TARGETS:-}" ] && read -r -a t <<< "$TARGETS"
-  install_compiler "$STAGE/stock_ocamlc.opt"; build "$p" ref "${t[@]}"
-  install_compiler "$CPP"; build "$p" cpp "${t[@]}"
+  install_compiler "$STAGE/stock_ocamlc.opt"; build "$p" ref ${t[@]+"${t[@]}"}
+  install_compiler "$CPP"; build "$p" cpp ${t[@]+"${t[@]}"}
   install_compiler "$STAGE/stock_ocamlc.opt"
   same=0; sharing=0; nondet=0; diff=0; missing=0
   : > "$OUT/$name.report"
@@ -118,8 +119,8 @@ for p in "${projects[@]}"; do
     done < <(cd "$OUT/$name/ref" && find . -type f ! -name '*.log' | sort)
   fi
   if [ ${#others[@]} -gt 0 ]; then  # does ocamlc.opt reproduce these itself?
-    install_compiler "$STAGE/stock_ocamlc.opt"; build "$p" ref2 "${t[@]}"
-    for f in "${others[@]}"; do
+    install_compiler "$STAGE/stock_ocamlc.opt"; build "$p" ref2 ${t[@]+"${t[@]}"}
+    for f in ${others[@]+"${others[@]}"}; do
       if [ -e "$OUT/$name/ref2/$f" ] && ! cmp -s "$OUT/$name/ref/$f" "$OUT/$name/ref2/$f"; then
         nondet=$((nondet + 1)); echo "NONDET $f" >> "$OUT/$name.report"
       else diff=$((diff + 1)); echo "DIFF $f" >> "$OUT/$name.report"; fi

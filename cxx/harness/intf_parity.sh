@@ -11,7 +11,8 @@
 #   SAME / DIFF / CFAIL (c++ocamlc failed where ocamlc did not) / CACCEPT
 #   (the reverse) / OFAIL (both failed)
 set -u
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 cd "$ROOT" || exit 1
 JOBS="${JOBS:-8}"
@@ -40,9 +41,9 @@ if [ "${1:-}" == "--worker" ]; then
 fi
 
 rm -rf "$OUT"; mkdir -p "$OUT"
-if [ $# -gt 0 ]; then files=("$@"); else mapfile -t files < <(ls cxx/harness/stamp_probes/*.ml); fi
-ulimit -v 8000000
-res=$(printf '%s\n' "${files[@]}" | xargs -P "$JOBS" -I{} bash "$SELF" --worker {} | sort -k2)
+if [ $# -gt 0 ]; then files=("$@"); else lines_into files < <(ls cxx/harness/stamp_probes/*.ml); fi
+vm_limit 8000000
+res=$(printf '%s\n' ${files[@]+"${files[@]}"} | xargs -P "$JOBS" -I{} bash "$SELF" --worker {} | sort -k2)
 printf '%s\n' "$res" > /tmp/.intf_parity_results
 printf '%s\n' "$res" | awk '{f[$1]++} END{ printf "files %d: SAME %d  DIFF %d  CFAIL %d  CACCEPT %d  OFAIL %d\n", NR, f["SAME"], f["DIFF"], f["CFAIL"], f["CACCEPT"], f["OFAIL"] }'
 echo "per-file results: /tmp/.intf_parity_results (outputs in $OUT: <file>.o ocamlc, <file>.c port)"

@@ -33,18 +33,30 @@ die() { say "error: $*"; exit 1; }
 
 zstd_libs() { sed -n 's/^ZSTD_LIBS=//p' "$root/Makefile.config"; }
 
+# the shared libzstd an executable loads (ldd; macOS: otool -L), its file
+# with every symbolic link resolved (readlink -f), a shared library's suffix
+libzstd_of() {
+  if [ "$(uname -s)" = Darwin ]; then
+    otool -L "$1" 2>/dev/null | sed -n 's|^[[:space:]]*\([^ ]*libzstd[^ ]*\) (.*|\1|p' | head -1
+  else
+    ldd "$1" 2>/dev/null | sed -n 's/.*libzstd[^ ]* => \([^ ]*\).*/\1/p' | head -1
+  fi
+}
+resolve() { perl -MCwd=abs_path -e 'print abs_path($ARGV[0])' "$1"; }
+if [ "$(uname -s)" = Darwin ]; then so_ext=dylib; else so_ext=so; fi
+
 make_zstd_args() {  # <staged bin dir>
   if [ -n "$(zstd_libs)" ]; then
     # the very libzstd the installation's runtime loads (same compressor
     # code, hence the same bytes), and zstd.h where the C compiler that
     # built the runtime finds it
-    so=$(ldd "$1/ocamlrun" 2>/dev/null | sed -n 's/.*libzstd[^ ]* => \([^ ]*\).*/\1/p' | head -1)
-    [ -n "$so" ] && [ -e "$so" ] || so=$("${CC:-cc}" -print-file-name=libzstd.so)
+    so=$(libzstd_of "$1/ocamlrun")
+    [ -n "$so" ] && [ -e "$so" ] || so=$("${CC:-cc}" -print-file-name=libzstd.$so_ext)
     inc=$(printf '#include <zstd.h>\n' | "${CC:-cc}" -E -x c - 2>/dev/null |
           sed -n 's|^# [0-9]* "\(.*\)/zstd\.h".*|\1|p' | head -1)
     [ -n "$inc" ] && [ -f "$inc/zstd.h" ] || die "this OCaml compresses with zstd but zstd.h was not found (install libzstd's development files)"
     [ -e "$so" ] || die "this OCaml compresses with zstd but its shared libzstd was not found"
-    echo "ZSTD_CFLAGS=-I$inc ZSTD_LIBS=$(readlink -f "$so")"
+    echo "ZSTD_CFLAGS=-I$inc ZSTD_LIBS=$(resolve "$so")"
   else
     echo "ZSTD_LIBS="
   fi
@@ -81,10 +93,10 @@ do_build() {
   make -C "$root/cxx" -j "$jobs" O=_opam_build CXX="$CXX" $zstd_args $targets
   new="$build/c++ocamlc"
   # 3. the checks, in the stage
-  if [ -n "$(zstd_libs)" ] && command -v ldd >/dev/null; then
-    zr=$(ldd "$sbin/ocamlrun" 2>/dev/null | sed -n 's/.*libzstd[^ ]* => \([^ ]*\).*/\1/p')
-    zc=$(ldd "$new" 2>/dev/null | sed -n 's/.*libzstd[^ ]* => \([^ ]*\).*/\1/p')
-    if [ -n "$zr" ] && [ "$(readlink -f "$zr")" != "$(readlink -f "$zc")" ]; then
+  if [ -n "$(zstd_libs)" ] && { command -v ldd || command -v otool; } >/dev/null; then
+    zr=$(libzstd_of "$sbin/ocamlrun")
+    zc=$(libzstd_of "$new")
+    if [ -n "$zr" ] && [ "$(resolve "$zr")" != "$(resolve "$zc")" ]; then
       die "libzstd mismatch: the runtime loads $zr, c++ocamlc $zc (compressed artifacts would differ)"
     fi
   fi
@@ -133,13 +145,13 @@ do_build() {
   inst="$root/ocaml-variants.install"
   [ -f "$inst" ] || die "no ocaml-variants.install (make INSTALL_MODE=opam install must run first)"
   grep -q '^  "ocamlc.opt"$' "$inst" || die "ocaml-variants.install has no bin entry for ocamlc.opt"
-  sed -i 's|^  "ocamlc.opt"$|  "cxx/_opam_build/c++ocamlc" {"ocamlc.opt"}\
-  "ocamlc.opt" {"ocamlc.stock"}|' "$inst"
+  sed 's|^  "ocamlc.opt"$|  "cxx/_opam_build/c++ocamlc" {"ocamlc.opt"}\
+  "ocamlc.opt" {"ocamlc.stock"}|' "$inst" > "$inst.new" && mv "$inst.new" "$inst"
   say "c++ocamlc will be installed as bin/ocamlc.opt (the stock compiler as bin/ocamlc.stock)"
   if [ $native = 1 ]; then
     grep -q '^  "ocamlopt.opt"$' "$inst" || die "ocaml-variants.install has no bin entry for ocamlopt.opt"
-    sed -i 's|^  "ocamlopt.opt"$|  "cxx/_opam_build/c++ocamlopt" {"ocamlopt.opt"}\
-  "ocamlopt.opt" {"ocamlopt.stock"}|' "$inst"
+    sed 's|^  "ocamlopt.opt"$|  "cxx/_opam_build/c++ocamlopt" {"ocamlopt.opt"}\
+  "ocamlopt.opt" {"ocamlopt.stock"}|' "$inst" > "$inst.new" && mv "$inst.new" "$inst"
     say "c++ocamlopt will be installed as bin/ocamlopt.opt (the stock compiler as bin/ocamlopt.stock)"
   fi
 }

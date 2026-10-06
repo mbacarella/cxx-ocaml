@@ -29,11 +29,14 @@
 #   BASELINE=<file>   a previous summary.tsv: print the ratio change
 #   MAXRATIO=<x>      exit 1 when a corpus's total time ratio (c++ / ref)
 #                     exceeds x (e.g. MAXRATIO=1.0: "not slower")
-# Timing is wall clock ($EPOCHREALTIME) around the process, including
-# /usr/bin/time's fork (the same for both).  Don't run it beside a build or
-# another harness: it measures, it doesn't isolate.
+# Timing is wall clock ($EPOCHREALTIME; without it, bash < 5, perl's
+# Time::HiRes) around the process, including /usr/bin/time's fork (the same
+# for both).  The peak RSS: GNU time's %M, else BSD time's -l (macOS).
+# Don't run it beside a build or another harness: it measures, it doesn't
+# isolate.
 set -u
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 cd "$ROOT" || exit 1
 NATIVE="${NATIVE:-}"
@@ -54,16 +57,18 @@ PHASES="${PHASES:-}"
 BASELINE="${BASELINE:-}"
 MAXRATIO="${MAXRATIO:-}"
 TIME=/usr/bin/time
-[ -x "$TIME" ] || { echo "bench.sh: needs $TIME (GNU time) for the peak RSS" >&2; exit 2; }
+[ -x "$TIME" ] || { echo "bench.sh: needs $TIME for the peak RSS" >&2; exit 2; }
+if "$TIME" -f %M -o /dev/null true 2>/dev/null; then GNU_TIME=1; else GNU_TIME=; fi
 if [ $# -gt 0 ]; then corpora=("$@"); elif [ -n "${NATIVE:-}" ]; then corpora=(startup small compiler stdlib link); else corpora=(startup small compiler stdlib); fi
 rm -rf "$OUT"; mkdir -p "$OUT"
 W=$(mktemp -d)
 trap 'rm -rf "${W:?}"' EXIT
-ulimit -v 16000000
+vm_limit 16000000
 
 # one timed run: prints "<ms> <rss_kb> <rc>"
 run1() {
   local dir="$1"; shift
+  if [ -z "${EPOCHREALTIME:-}" ]; then run1_perl "$dir" "$@"; return; fi
   local t0 t1 rc
   t0=$EPOCHREALTIME
   ( cd "$dir" && "$TIME" -f %M -o "$W/rss" "$@" ) >/dev/null 2>&1
@@ -71,6 +76,25 @@ run1() {
   t1=$EPOCHREALTIME
   awk -v a="$t0" -v b="$t1" -v r="$(tail -1 "$W/rss" 2>/dev/null || echo 0)" -v c="$rc" \
     'BEGIN { printf "%.3f %d %d\n", (b - a) * 1000, r, c }'
+}
+# the same, timed by perl; BSD time -l reports the peak RSS in bytes, on its
+# stderr, which the command's own stderr must not reach (hence the sh -c
+# exec: the measured process is the command's)
+run1_perl() {
+  local dir="$1"; shift
+  local -a cmd
+  if [ -n "$GNU_TIME" ]; then cmd=("$TIME" -f %M -o "$W/rss" "$@")
+  else cmd=("$TIME" -l sh -c 'exec "$@" 2>/dev/null' sh "$@"); fi
+  ( cd "$dir" && perl -MTime::HiRes=time -e '
+      open(my $res, ">&", \*STDOUT) or die; open(STDOUT, ">", "/dev/null") or die;
+      my $t0 = time; my $st = system { $ARGV[0] } @ARGV; my $t1 = time;
+      printf $res "%.3f %d\n", ($t1 - $t0) * 1000, $st == -1 ? 127 : $st & 127 ? 128 + ($st & 127) : $st >> 8;
+    ' "${cmd[@]}" 2>"$W/time.err" >"$W/run1" ) </dev/null
+  local ms rc rss
+  read -r ms rc < "$W/run1"
+  if [ -n "$GNU_TIME" ]; then rss=$(tail -1 "$W/rss" 2>/dev/null || echo 0)
+  else rss=$(awk '/maximum resident set size/ { printf "%d", $1 / 1024 }' "$W/time.err"); fi
+  echo "$ms ${rss:-0} $rc"
 }
 
 median() { sort -n | awk '{ v[NR] = $1 } END { if (NR == 0) print 0; else print v[int((NR + 1) / 2)] }'; }
@@ -87,8 +111,8 @@ bench_unit() {
     ct+=("$ms"); [ "$rss" -gt "$cr" ] && cr=$rss; crc=$rc
   done
   local rm cm
-  rm=$(printf '%s\n' "${rt[@]}" | median)
-  cm=$(printf '%s\n' "${ct[@]}" | median)
+  rm=$(printf '%s\n' ${rt[@]+"${rt[@]}"} | median)
+  cm=$(printf '%s\n' ${ct[@]+"${ct[@]}"} | median)
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$rm" "$cm" "$rr" "$cr" "$rrc" "$crc" >> "$OUT/$corpus.tsv"
   if [ -n "$PHASES" ]; then
     ( cd "$cdir" && CPPCAML_PROFILE=1 "$CPP" -I "$ROOT/stdlib" "$@" ) 2>&1 >/dev/null |
@@ -186,7 +210,7 @@ corpus_stdlib() {
 }
 
 export AWK=awk
-for c in "${corpora[@]}"; do
+for c in ${corpora[@]+"${corpora[@]}"}; do
   case "$c" in
     startup|small|compiler|stdlib|link) ;;
     *) echo "bench.sh: unknown corpus $c" >&2; exit 2 ;;
@@ -201,7 +225,7 @@ done
 # relative to ocamlc.opt (among units taking >= 5 ms there)
 printf 'corpus\tunits\tref_ms\tcpp_ms\tratio\tgeomean\tref_rss_max_kb\tcpp_rss_max_kb\n' > "$OUT/summary.tsv"
 status=0
-for c in "${corpora[@]}"; do
+for c in ${corpora[@]+"${corpora[@]}"}; do
   awk -F'\t' -v c="$c" 'NR > 1 && $6 == 0 && $7 == 0 {
       n++; r += $2; p += $3; if ($2 > 0 && $3 > 0) { lg += log($3 / $2); m++ }
       if ($4 > rr) rr = $4; if ($5 > cr) cr = $5 }
@@ -210,7 +234,7 @@ for c in "${corpora[@]}"; do
 done
 echo
 column -t -s $'\t' "$OUT/summary.tsv"
-for c in "${corpora[@]}"; do
+for c in ${corpora[@]+"${corpora[@]}"}; do
   bad=$(awk -F'\t' 'NR > 1 && $6 != $7' "$OUT/$c.tsv" | wc -l)
   [ "$bad" -gt 0 ] && echo "$c: $bad unit(s) where the compilers' exit codes differ (not counted)"
   echo "$c: slowest relative to $(basename "$REF"):"

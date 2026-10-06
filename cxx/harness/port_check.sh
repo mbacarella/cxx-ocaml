@@ -7,7 +7,8 @@
 set -u
 [ "${1:-}" == "--check" ] && shift
 f="$1"
-ROOT="$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd -P)"
+. "$ROOT/cxx/harness/portable.sh"
 w=$(mktemp -d)
 trap 'rm -rf "$w"' EXIT
 cp "$f" "$w/"

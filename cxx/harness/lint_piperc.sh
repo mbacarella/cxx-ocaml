@@ -12,7 +12,8 @@
 # This guard flags any harness that pipes a command and then reads `$?`/`rc=$?`
 # WITHOUT a `set -o pipefail` in the file.  Exit 1 on any finding.
 set -u
-cd "$(dirname "$(readlink -f "$0")")" || exit 1
+cd "$(dirname "$0")" || exit 1
+. ./portable.sh
 
 rc=0
 for f in ./*.sh; do

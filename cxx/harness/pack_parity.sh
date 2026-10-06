@@ -12,7 +12,8 @@
 #   SAME / DIFF / CFAIL (c++ocamlc failed) / OFAIL (ocamlc.opt failed)
 #   per scenario and pass; outputs are kept in /tmp/pack_parity/<scenario>.
 set -u
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 CPP="${CPP:-$ROOT/cxx/build-release/c++ocamlc}"
 OCAMLC="$ROOT/ocamlc.opt"
@@ -190,7 +191,7 @@ run_one() {  # scenario pass dir member-compiler packer
 
 rm -rf "$OUT"; mkdir -p "$OUT"
 [ $# -gt 0 ] && ALL="$*"
-ulimit -v 8000000
+vm_limit 8000000
 for sc in $ALL; do
   for pass in full packer; do
     o="$OUT/$sc/$pass/o"; c="$OUT/$sc/$pass/c"

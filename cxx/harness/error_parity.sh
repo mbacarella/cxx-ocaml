@@ -25,7 +25,8 @@ testsuite/tests/parse-errors/singleton_labeled_tuple_type.ml
 testsuite/tests/parsing/arrow_ambiguity.ml
 testsuite/tests/typing-misc/conjunctive_types.ml"
 set -u
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 cd "$ROOT" || exit 1
 JOBS="${JOBS:-8}"
@@ -65,9 +66,9 @@ fi
 
 rm -rf "$OUT"; mkdir -p "$OUT"
 if [ $# -gt 0 ]; then files=("$@")
-else mapfile -t files < <(ls cxx/harness/false_accept/*.ml cxx/harness/error_probes/*.ml 2>/dev/null); fi
-ulimit -v 8000000
-res=$(printf '%s\n' "${files[@]}" | xargs -P "$JOBS" -I{} bash "$SELF" --worker {} | sort -k2)
+else lines_into files < <(ls cxx/harness/false_accept/*.ml cxx/harness/error_probes/*.ml 2>/dev/null); fi
+vm_limit 8000000
+res=$(printf '%s\n' ${files[@]+"${files[@]}"} | xargs -P "$JOBS" -I{} bash "$SELF" --worker {} | sort -k2)
 printf '%s\n' "$res" > /tmp/.error_parity_results
 printf '%s\n' "$res" | awk '{f[$1]++} END{ printf "files %d: SAME %d  DIFF %d  KNOWN %d  FACCEPT %d  FREJECT %d  OK %d\n", NR, f["SAME"], f["DIFF"], f["KNOWN"], f["FACCEPT"], f["FREJECT"], f["OK"] }'
 echo "per-file results: /tmp/.error_parity_results (stderr+rc in $OUT: <file>.o ocamlc, <file>.c port)"

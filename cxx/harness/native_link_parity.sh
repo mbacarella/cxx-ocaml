@@ -14,7 +14,8 @@
 #   no args: cxx/harness/stamp_probes
 #   SAME / DIFF (startup|exe|dump) / CFAIL (the port failed) / OFAIL
 set -u
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 cd "$ROOT" || exit 1
 JOBS="${JOBS:-8}"
@@ -66,9 +67,9 @@ if [ "${1:-}" == "--worker" ]; then
 fi
 
 rm -rf "$OUT"; mkdir -p "$OUT"
-if [ $# -gt 0 ]; then files=("$@"); else mapfile -t files < <(ls cxx/harness/stamp_probes/*.ml); fi
-ulimit -v 8000000
-res=$(printf '%s\n' "${files[@]}" | xargs -P "$JOBS" -I{} bash "$SELF" --worker {} | sort -k2)
+if [ $# -gt 0 ]; then files=("$@"); else lines_into files < <(ls cxx/harness/stamp_probes/*.ml); fi
+vm_limit 8000000
+res=$(printf '%s\n' ${files[@]+"${files[@]}"} | xargs -P "$JOBS" -I{} bash "$SELF" --worker {} | sort -k2)
 printf '%s\n' "$res" > /tmp/.native_link_parity_results
 printf '%s\n' "$res" | awk '{k=$1; sub(/\(.*/, "", k); f[k]++} END{ printf "files %d: SAME %d  DIFF %d  CFAIL %d  OFAIL %d\n", NR, f["SAME"], f["DIFF"], f["CFAIL"], f["OFAIL"] }'
 echo "per-file results: /tmp/.native_link_parity_results (in $OUT: <file>.startup.o / .c, <file>.dump.o / .c)"

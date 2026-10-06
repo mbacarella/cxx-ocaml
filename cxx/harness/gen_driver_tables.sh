@@ -17,7 +17,8 @@
 # configured --with-relative-libdir keeps it relative -- that one value
 # (standard_library_relative) is taken from the installed ocamlc itself.
 set -eu
-R="$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)"
+R="$(cd "$(dirname "$0")/../.." && pwd -P)"
+. "$R/cxx/harness/portable.sh"
 T=$(mktemp -d)
 trap 'rm -rf "${T:?}"' EXIT
 cp "$R/cxx/harness/gen_driver_tables.ml" "$T/"

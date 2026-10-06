@@ -7,7 +7,8 @@
 # Usage: typing_cmi_parity.sh [file.cmi ...]   (JOBS= overridable)
 #   no args: every .cmi under the repo (excluding _build/ and testsuite/)
 set -u
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 cd "$ROOT" || exit 1
 JOBS="${JOBS:-8}"
@@ -37,10 +38,10 @@ fi
 
 build_oracle
 if [ $# -gt 0 ]; then files=("$@")
-else mapfile -t files < <(find . -name '*.cmi' -not -path './_build/*' \
+else lines_into files < <(find . -name '*.cmi' -not -path './_build/*' \
                            -not -path './testsuite/*' | sort)
 fi
-res=$(printf '%s\n' "${files[@]}" | xargs -P "$JOBS" -I{} bash "$SELF" --worker {})
+res=$(printf '%s\n' ${files[@]+"${files[@]}"} | xargs -P "$JOBS" -I{} bash "$SELF" --worker {})
 printf '%s\n' "$res" | sort -k2 > /tmp/.typing_cmi_parity_results
 printf '%s\n' "$res" | awk '
   {n[$1]++; t++}

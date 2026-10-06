@@ -12,7 +12,8 @@
 #
 # Usage: native_self_build.sh   (WD= a scratch directory; KEEP=1 keeps it)
 set -u
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 cd "$ROOT" || exit 1
 CPP="${CPP:-$ROOT/cxx/build-release/c++ocamlopt}"
@@ -21,11 +22,11 @@ WD="${WD:-$(mktemp -d)}"; mkdir -p "$WD"
 KEEP="${KEEP:-0}"
 trap '[ "$KEEP" = 1 ] || rm -rf "$WD"' EXIT
 echo "WD=$WD"
-ulimit -v 16000000
+vm_limit 16000000
 
 # the commands, as make would run them after utils/misc.ml changed
 make -n V=1 -W utils/misc.ml ocamlopt.opt 2>/dev/null | grep '^\./boot/ocamlrun \./ocamlopt ' > "$WD/cmds" || exit 1
-echo "commands: $(wc -l < "$WD/cmds")"
+echo "commands: $(($(wc -l < "$WD/cmds")))"
 DIRS="utils parsing typing bytecomp file_formats lambda middle_end asmcomp driver toplevel tools"
 
 build() {  # build <compiler> <outdir>

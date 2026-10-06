@@ -6,7 +6,8 @@
 #
 # Usage: bash cxx/harness/gen_builtin_prims.sh > cxx/include/cppcaml/builtin_prims.hpp
 set -u
-R="$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)"
+R="$(cd "$(dirname "$0")/../.." && pwd -P)"
+. "$R/cxx/harness/portable.sh"
 sed '/kBuiltinPrimitives\[\] = {/q' "$R/cxx/include/cppcaml/builtin_prims.hpp"
 sed 's/.*/    "&",/' "$R/runtime/primitives"
 printf '};\n\n}  // namespace cppcaml::link\n'

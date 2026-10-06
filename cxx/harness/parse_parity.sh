@@ -3,10 +3,11 @@
 # Needs the built tree (./ocamlc.opt). Usage: parse_parity.sh [N]
 set -u
 cd "$(dirname "$0")/../.." || exit 1
+. cxx/harness/portable.sh
 
 CPP=./cxx/build/c++parse
 LIMIT="${1:-0}"
-mapfile -t files < <(find testsuite/tests -name '*.ml' | sort)
+lines_into files < <(find testsuite/tests -name '*.ml' | sort)
 [ "$LIMIT" -gt 0 ] 2>/dev/null && files=("${files[@]:0:$LIMIT}")
 
 # Strip any warning preamble (e.g. bad-module-name on odd filenames) the oracle
@@ -17,7 +18,7 @@ oracle() { ./ocamlc.opt -nostdlib -I stdlib -stop-after parsing -dparsetree "$1"
 
 total=0 match=0 cpp_err=0
 both_err=0  # files the oracle ALSO rejects (no parsetree) — correctly unparseable
-for f in "${files[@]}"; do
+for f in ${files[@]+"${files[@]}"}; do
   total=$((total + 1))
   o=$(oracle "$f")
   c=$("$CPP" "$f" 2>/dev/null)
@@ -30,5 +31,5 @@ for f in "${files[@]}"; do
   fi
 done
 parseable=$((total - both_err))
-echo "files: $total   parsetree-identical: $match ($(awk "BEGIN{printf \"%.1f\",100*$match/$total}")%)   (c++ parse-errored on $cpp_err; $both_err of those the oracle also rejects)"
-echo "over oracle-parseable files ($parseable): $(awk "BEGIN{printf \"%.1f\",100*$match/$parseable}")%"
+echo "files: $total   parsetree-identical: $match ($(pct "$match" "$total")%)   (c++ parse-errored on $cpp_err; $both_err of those the oracle also rejects)"
+echo "over oracle-parseable files ($parseable): $(pct "$match" "$parseable")%"

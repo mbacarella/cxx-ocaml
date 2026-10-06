@@ -13,7 +13,8 @@
 # Usage: typing_ctype_parity.sh     stdlib + the compiler cmis in /tmp/effid_ref
 #        DIRS=a:b CMIS="x.cmi .." JOBS=n typing_ctype_parity.sh
 set -u
-SELF="$(readlink -f "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+. "$(dirname "$SELF")/portable.sh"
 ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 cd "$ROOT" || exit 1
 BIN=/tmp/typing_cmi_parity/bin
@@ -58,12 +59,16 @@ for k, v in enumerate(vals):
 with open(w + '/ops.txt', 'w') as f:
     f.write('\n'.join(ops) + '\n')
 PY
-split -n l/$((JOBS * 4)) -d -a 3 $W/ops.txt $W/chunk.
-ulimit -v 8000000
+# (split -n l/N: N chunks of whole lines, chunk.000 ...)
+awk -v n=$((JOBS * 4)) -v p="$W/chunk." -v total="$(wc -l < "$W/ops.txt")" '
+  BEGIN { per = int((total + n - 1) / n); if (per < 1) per = 1 }
+  { f = sprintf("%s%03d", p, int((NR - 1) / per)); if (f != cur) { if (cur != "") close(cur); cur = f }; print > f }' "$W/ops.txt"
+vm_limit 8000000
 # shellcheck disable=SC2016
+# (the chunk as $1: BSD xargs caps an argument -I substitutes into at 255 bytes)
 ls $W/chunk.* | xargs -P "$JOBS" -I{} sh -c '
-  runtime/ocamlrun '"$DUMP_ML"' ctype '"$DIRS"' {} > {}.ocaml 2> {}.ocaml.err
-  '"$CPP"' ctype '"$DIRS"' {} > {}.cpp 2> {}.cpp.err || echo "c++ failed on {}" >&2'
+  runtime/ocamlrun '"$DUMP_ML"' ctype '"$DIRS"' "$1" > "$1.ocaml" 2> "$1.ocaml.err"
+  '"$CPP"' ctype '"$DIRS"' "$1" > "$1.cpp" 2> "$1.cpp.err" || echo "c++ failed on $1" >&2' sh {}
 python3 - "$W" <<'PY'
 import sys, glob
 w = sys.argv[1]

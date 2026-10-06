@@ -1,0 +1,23 @@
+#!/usr/bin/perl
+# timeout SECS CMD...: coreutils' timeout for the systems without it (macOS):
+# CMD's status, 128+N if a signal N killed it, 124 if it ran out of time
+# (SIGTERM'd).  On PATH through cxx/harness/portable.sh.
+use strict;
+use warnings;
+die "usage: timeout SECS COMMAND...\n" unless @ARGV >= 2 && $ARGV[0] =~ /^\d+$/;
+my $secs = shift @ARGV;
+my $pid = fork;
+die "timeout: fork: $!\n" unless defined $pid;
+if ($pid == 0) {
+  { no warnings 'exec'; exec { $ARGV[0] } @ARGV }
+  print STDERR "timeout: failed to run command '$ARGV[0]': $!\n";
+  exit($!{ENOENT} ? 127 : 126);
+}
+my $timed_out = 0;
+$SIG{ALRM} = sub { $timed_out = 1; kill 'TERM', $pid };
+alarm $secs;
+while (waitpid($pid, 0) == -1) { last unless $!{EINTR} }
+my $st = $?;
+alarm 0;
+exit 124 if $timed_out;
+exit($st & 127 ? 128 + ($st & 127) : $st >> 8);
