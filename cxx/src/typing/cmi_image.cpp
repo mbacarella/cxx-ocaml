@@ -1,12 +1,19 @@
 // .cmi images: see cmi_image.hpp.
 #include "cppcaml/typing/cmi_image.hpp"
 
-#include <elf.h>
 #include <fcntl.h>
-#include <link.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#else
+#include <elf.h>
+#include <link.h>
+#endif
 
 #include <algorithm>
 #include <cerrno>
@@ -18,6 +25,8 @@
 #include <fstream>
 #include <string>
 #include <vector>
+
+#include "cppcaml/os.hpp"
 
 namespace cppcaml::typing::cmi_image {
 
@@ -35,12 +44,20 @@ constexpr std::uintptr_t kSlotsBase = 0x610000000000ULL;
 constexpr std::uintptr_t kSlotsEnd = 0x700000000000ULL;
 constexpr std::size_t kSlotSize = std::size_t{64} << 20;  // an image's maximum size
 constexpr std::uint64_t kNumSlots = (kSlotsEnd - kSlotsBase) / kSlotSize;
+#if defined(__APPLE__)
+constexpr std::size_t kPage = 16384;  // arm64's (a multiple of x86_64's)
+#else
 constexpr std::size_t kPage = 4096;
+#endif
 
 std::size_t round_up(std::size_t n, std::size_t a) { return (n + a - 1) & ~(a - 1); }
 
 // mmap exactly at [addr] or fail (MAP_FIXED_NOREPLACE; an older kernel ignoring
-// the flag places the mapping elsewhere, which is undone here)
+// the flag places the mapping elsewhere, which is undone here -- as is
+// macOS's, which has no such flag but takes a free address as given)
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0
+#endif
 void* map_at(std::uintptr_t addr, std::size_t len, int prot, int flags, int fd, off_t off) {
   void* want = reinterpret_cast<void*>(addr);
   void* p = ::mmap(want, len, prot, flags | MAP_FIXED_NOREPLACE, fd, off);
@@ -90,11 +107,29 @@ std::uint64_t hash_bytes(const void* data, std::size_t n, std::uint64_t h = 0x24
   return mix(mix(h, w), n);
 }
 
-// ---- this build's identity: its GNU build-id, else the executable's stat ----
+// ---- this build's identity: its GNU build-id (Mach-O: its LC_UUID), else the
+// executable's stat ----
 struct BuildId {
   unsigned char bytes[40] = {};
   std::uint32_t len = 0;
 };
+#if defined(__APPLE__)
+void find_uuid(BuildId& id) {
+  const auto* mh = reinterpret_cast<const mach_header_64*>(_dyld_get_image_header(0));
+  if (!mh || mh->magic != MH_MAGIC_64) return;
+  const char* p = reinterpret_cast<const char*>(mh + 1);
+  for (std::uint32_t i = 0; i < mh->ncmds; ++i) {
+    const auto* lc = reinterpret_cast<const load_command*>(p);
+    if (lc->cmd == LC_UUID) {
+      const auto* u = reinterpret_cast<const uuid_command*>(lc);
+      std::memcpy(id.bytes, u->uuid, sizeof u->uuid);
+      id.len = sizeof u->uuid;
+      return;
+    }
+    p += lc->cmdsize;
+  }
+}
+#else
 int find_build_id(struct dl_phdr_info* info, std::size_t, void* data) {
   auto* id = static_cast<BuildId*>(data);
   if (info->dlpi_name && info->dlpi_name[0]) return 0;  // the main program only
@@ -118,16 +153,21 @@ int find_build_id(struct dl_phdr_info* info, std::size_t, void* data) {
   }
   return 1;
 }
+#endif
 const BuildId& build_id() {
   static BuildId id = [] {
     BuildId b;
+#if defined(__APPLE__)
+    find_uuid(b);
+#else
     dl_iterate_phdr(find_build_id, &b);
+#endif
     if (b.len == 0) {  // no build-id note: the executable file's identity
       struct stat st{};
-      if (::stat("/proc/self/exe", &st) == 0) {
+      if (::stat(os::self_exe().c_str(), &st) == 0) {
         std::uint64_t w[5] = {static_cast<std::uint64_t>(st.st_dev), static_cast<std::uint64_t>(st.st_ino),
-                              static_cast<std::uint64_t>(st.st_size), static_cast<std::uint64_t>(st.st_mtim.tv_sec),
-                              static_cast<std::uint64_t>(st.st_mtim.tv_nsec)};
+                              static_cast<std::uint64_t>(st.st_size), static_cast<std::uint64_t>(os::mtime(st).tv_sec),
+                              static_cast<std::uint64_t>(os::mtime(st).tv_nsec)};
         std::memcpy(b.bytes, w, sizeof w);
         b.len = sizeof w;
       }
@@ -188,8 +228,8 @@ bool key_of(const std::string& filename, Key& k) {
   struct stat st{};
   if (::stat(filename.c_str(), &st) != 0) return false;
   k = Key{static_cast<std::uint64_t>(st.st_dev), static_cast<std::uint64_t>(st.st_ino),
-          static_cast<std::uint64_t>(st.st_size), st.st_mtim.tv_sec, st.st_mtim.tv_nsec,
-          st.st_ctim.tv_sec, st.st_ctim.tv_nsec};
+          static_cast<std::uint64_t>(st.st_size), os::mtime(st).tv_sec, os::mtime(st).tv_nsec,
+          os::ctime(st).tv_sec, os::ctime(st).tv_nsec};
   return true;
 }
 std::uint64_t key_hash(const Key& k) {
@@ -406,12 +446,26 @@ namespace {
 std::size_t outside_looking_words(const char* base, std::size_t used) {
   std::vector<std::pair<std::uint64_t, std::uint64_t>> maps;
   {
+#if defined(__APPLE__)
+    mach_vm_address_t a = 0;
+    mach_vm_size_t sz = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object;
+    while (::mach_vm_region(mach_task_self(), &a, &sz, VM_REGION_BASIC_INFO_64,
+                            reinterpret_cast<vm_region_info_t>(&info), &count, &object) == KERN_SUCCESS) {
+      maps.push_back({a, a + sz});
+      a += sz;
+      count = VM_REGION_BASIC_INFO_COUNT_64;
+    }
+#else
     std::ifstream in("/proc/self/maps");
     std::string line;
     while (std::getline(in, line)) {
       unsigned long long a = 0, b = 0;
       if (std::sscanf(line.c_str(), "%llx-%llx", &a, &b) == 2) maps.push_back({a, b});
     }
+#endif
     std::sort(maps.begin(), maps.end());
   }
   std::uint64_t lo = reinterpret_cast<std::uint64_t>(base), hi = lo + used;

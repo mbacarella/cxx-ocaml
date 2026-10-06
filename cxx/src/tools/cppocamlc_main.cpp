@@ -16,11 +16,18 @@
 // effect c++ocamlc does not implement is refused, when that effect would
 // take place, with "option -X is not supported yet" (cxx/PORTING.md,
 // "Driver options").
+#if defined(__APPLE__)
+#include <pthread.h>
+#else
 #include <ucontext.h>
+#endif
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
 
 #include <cctype>
 #include <chrono>
@@ -38,6 +45,7 @@
 #include <string>
 #include <vector>
 
+#include "cppcaml/os.hpp"
 #include "cppcaml/parser.hpp"
 #include "cppcaml/lexer.hpp"
 #include "cppcaml/typing/closure.hpp"
@@ -57,6 +65,7 @@
 #include "cppcaml/typing/compilenv.hpp"
 #include "cppcaml/typing/flambda_middle_end.hpp"
 #include "cppcaml/typing/misc.hpp"
+#include "cppcaml/typing/filename.hpp"
 #include "cppcaml/typing/pparse.hpp"
 #include "cppcaml/typing/builtin_attributes.hpp"
 #include "cppcaml/typing/clflags.hpp"
@@ -96,15 +105,19 @@ namespace fs = std::filesystem;
 // tokens, freed before typing, would otherwise stay resident for the whole
 // compilation (the zones grow in blocks of their own).  mimalloc's
 // mi_collect when it is linked in (weak: absent otherwise), else glibc's
-// malloc_trim.
+// malloc_trim (macOS: nothing).
 extern "C" void mi_collect(bool force) __attribute__((weak));
+#if defined(__GLIBC__)
 extern "C" int malloc_trim(size_t pad) __attribute__((weak));
+#endif
 namespace cppcaml {
 void allocator_purge_immediately();  // allocator.cpp
 }
 static void release_free_memory() {
   if (mi_collect) mi_collect(true);
+#if defined(__GLIBC__)
   else if (malloc_trim) malloc_trim(0);
+#endif
 }
 
 // The same driver builds c++ocamlc (Maindriver, Compile) and, with
@@ -203,14 +216,13 @@ static bool read_source(const std::string& path, std::string& text) {
   std::string tmp;
   namespace cf = cppcaml::typing::clflags;
   if (cf::preprocessor) {
-    char tmpl[] = "/tmp/ocamlppXXXXXX";
-    int fd = ::mkstemp(tmpl);
-    if (fd < 0) {
+    // Filename.temp_file "ocamlpp" ""
+    try {
+      tmp = cppcaml::typing::filename::temp_file("ocamlpp", "");
+    } catch (const std::runtime_error&) {
       std::cerr << CPPCAML_SELF ": cannot create a temporary file\n";
       return false;
     }
-    ::close(fd);
-    tmp = tmpl;
     std::string comm = *cf::preprocessor + " " + filename_quote(path) + " > " + tmp;
     // Ccomp.command: -verbose echoes the command line
     if (cf::verbose) {
@@ -666,11 +678,19 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
       // (shared: file-backed pages -- the executable, mapped .cmi images --
       // which the page cache shares between compilers)
       long pages = 0, resident = 0, shared = 0;
+      long ps = ::sysconf(_SC_PAGESIZE);
+#if defined(__APPLE__)
+      // (Mach reports no shared count: all of it private)
+      mach_task_basic_info_data_t ti;
+      mach_msg_type_number_t n = MACH_TASK_BASIC_INFO_COUNT;
+      if (::task_info(mach_task_self(), MACH_TASK_BASIC_INFO, reinterpret_cast<task_info_t>(&ti), &n) == KERN_SUCCESS)
+        resident = static_cast<long>(ti.resident_size / static_cast<std::uint64_t>(ps));
+#else
       if (std::FILE* f = std::fopen("/proc/self/statm", "r")) {
         if (std::fscanf(f, "%ld %ld %ld", &pages, &resident, &shared) != 3) resident = shared = 0;
         std::fclose(f);
       }
-      long ps = ::sysconf(_SC_PAGESIZE);
+#endif
       std::cerr << "  mem after " << what << ": rss " << resident * ps / (1 << 20) << " MB (private "
                 << (resident - shared) * ps / (1 << 20) << " MB, shared " << shared * ps / (1 << 20) << " MB), zones "
                 << cppcaml::typing::Zone::block_bytes() / (1 << 20) << " MB\n";
@@ -1073,8 +1093,8 @@ static int compile_mli(const std::string& in_path, const std::string& cmi_out) {
 static std::string default_standard_library(const std::string& configured) {
   std::error_code ec;
   if (fs::exists(fs::path(configured) / "stdlib.cmi", ec)) return configured;
-  fs::path exe = fs::read_symlink("/proc/self/exe", ec);
-  if (!ec) {
+  fs::path exe = fs::weakly_canonical(cppcaml::os::self_exe(), ec);
+  if (!ec && !exe.empty()) {
     fs::path cand = exe.parent_path().parent_path().parent_path() / "stdlib";
     if (fs::exists(cand / "stdlib.cmi")) return cand.string();
   }
@@ -1397,6 +1417,27 @@ struct MainArgs {
   int rc;
 };
 MainArgs g_args;
+
+// the SIGSEGV handler runs on an alternate stack (the big one is full); one
+// per thread
+void install_altstack() {
+  static char altstack[64 * 1024];
+  stack_t ss{};
+  ss.ss_sp = altstack;
+  ss.ss_size = sizeof altstack;
+  ::sigaltstack(&ss, nullptr);
+}
+
+#if defined(__APPLE__)
+// macOS's makecontext writes every page of the stack it is given (a
+// gigabyte of page faults, a third of a small unit's compile): the work
+// goes to a thread on the reserved stack instead
+void* big_stack_thread(void*) {
+  install_altstack();
+  g_args.rc = run_main(g_args.argc, g_args.argv);
+  return nullptr;
+}
+#else
 // The main thread switches to the big stack (ucontext) rather than handing
 // the work to a second thread: a thread's creation and join cost two trips
 // through the scheduler, measurable on a small unit's compile.
@@ -1406,6 +1447,7 @@ void big_stack_entry() {
   g_args.rc = run_main(g_args.argc, g_args.argv);
   // returning resumes g_main_ctx (uc_link)
 }
+#endif
 
 // run_main on a kStackSize stack; falls back to the normal stack when the
 // reservation fails (e.g. a tight ulimit -v)
@@ -1428,20 +1470,29 @@ int run_main_big_stack(int argc, char** argv) {
   struct sigaction sa{};
   sa.sa_sigaction = on_segv;
   sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
-  ::sigemptyset(&sa.sa_mask);
+  sigemptyset(&sa.sa_mask);  // (a macro on macOS)
   ::sigaction(SIGSEGV, &sa, nullptr);
-  // the SIGSEGV handler runs on an alternate stack (the big one is full)
-  static char altstack[64 * 1024];
-  stack_t ss{};
-  ss.ss_sp = altstack;
-  ss.ss_size = sizeof altstack;
-  ::sigaltstack(&ss, nullptr);
+#if defined(__APPLE__)
+  ::sigaction(SIGBUS, &sa, nullptr);  // macOS's signal for a guard-page fault
+#endif
+#if defined(__APPLE__)
+  pthread_attr_t attr;
+  pthread_t t;
+  if (::pthread_attr_init(&attr) != 0) return run_main(argc, argv);
+  bool started = ::pthread_attr_setstack(&attr, g_guard_hi, kStackSize) == 0 &&
+                 ::pthread_create(&t, &attr, big_stack_thread, nullptr) == 0;
+  ::pthread_attr_destroy(&attr);
+  if (!started) return run_main(argc, argv);
+  ::pthread_join(t, nullptr);
+#else
+  install_altstack();
   if (::getcontext(&g_big_ctx) != 0) return run_main(argc, argv);
   g_big_ctx.uc_stack.ss_sp = g_guard_hi;
   g_big_ctx.uc_stack.ss_size = kStackSize;
   g_big_ctx.uc_link = &g_main_ctx;
   ::makecontext(&g_big_ctx, big_stack_entry, 0);
   if (::swapcontext(&g_main_ctx, &g_big_ctx) != 0) return run_main(argc, argv);
+#endif
   return g_args.rc;
 }
 }  // namespace

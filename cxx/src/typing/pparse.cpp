@@ -19,6 +19,7 @@
 
 #include "cppcaml/marshal.hpp"
 #include "cppcaml/typing/arg.hpp"
+#include "cppcaml/typing/filename.hpp"
 #include "cppcaml/typing/ast_invariants.hpp"
 #include "cppcaml/typing/clflags.hpp"
 #include "cppcaml/typing/cmi_format.hpp"
@@ -48,15 +49,14 @@ std::string quote(const std::string& s) {
   return r + "'";
 }
 
-// Filename.temp_file prefix "": a fresh file in $TMPDIR (else /tmp)
+// Filename.temp_file prefix "": a fresh file in Filename.temp_dir_name
 std::string temp_file(const std::string& prefix) {
-  const char* t = std::getenv("TMPDIR");
-  std::string dir = t && *t ? t : "/tmp";
+  std::string dir = filename::get_temp_dir_name();
   static std::mt19937 rng{std::random_device{}()};
   for (int counter = 0;; ++counter) {
     char hex[16];
     std::snprintf(hex, sizeof hex, "%06x", static_cast<unsigned>(rng() & 0xFFFFFF));
-    std::string name = dir + "/" + prefix + hex;
+    std::string name = filename::concat(dir, prefix + hex);
     int fd = ::open(name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
     if (fd >= 0) {
       ::close(fd);

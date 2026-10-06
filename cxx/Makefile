@@ -18,11 +18,13 @@
 #               compressed marshaled output is byte-identical only with the
 #               libzstd the OCaml runtime itself uses.  Empty: without zstd
 #               (c++ocamlc then serves only installations without it).
-#   ZSTD_CFLAGS zstd.h's -I, when it is not on the default path
+#   ZSTD_CFLAGS zstd.h's -I; default configure's (the -I options of
+#               Makefile.build_config's OC_CPPFLAGS)
 
 -include Makefile.local
 # (configure's choice, as the runtime's)
 ZSTD_LIBS ?= $(shell sed -n 's/^ZSTD_LIBS=//p' ../Makefile.config 2>/dev/null)
+ZSTD_CFLAGS ?= $(filter -I%,$(shell sed -n 's/^OC_CPPFLAGS = //p' ../Makefile.build_config 2>/dev/null))
 
 CXX ?= g++
 AR ?= ar
@@ -79,12 +81,20 @@ MIMALLOC_CFLAGS := -O3 -DNDEBUG -std=gnu11 -fPIC -fvisibility=hidden \
   -ftls-model=initial-exec -fno-builtin-malloc \
   -DMI_BUILD_RELEASE -DMI_MALLOC_OVERRIDE -DMI_DEFAULT_ARENA_EAGER_COMMIT=0 \
   -Ivendor/mimalloc/include
+ifeq "$(shell uname -s)" "Darwin"
+# macOS: libSystem and libc++ allocate through the default malloc zone, not
+# the executable's malloc -- mimalloc becomes that zone
+MIMALLOC_CFLAGS += -DMI_OSX_ZONE=1
+endif
 endif
 
 # ---- flags ------------------------------------------------------------------
 DEFINES := $(if $(ZSTD_LIBS),-DCPPCAML_HAVE_ZSTD=1) \
   $(if $(MIMALLOC_O),-DCPPCAML_HAVE_MIMALLOC=1 -Ivendor/mimalloc/include)
-ALL_CXXFLAGS := -std=c++23 $(OPTFLAGS) \
+# C++23; -std=c++2b where the compiler predates the name (Apple clang < 16)
+CXX_STD := $(shell $(CXX) -std=c++23 -x c++ -fsyntax-only /dev/null >/dev/null 2>&1 \
+  && echo c++23 || echo c++2b)
+ALL_CXXFLAGS := -std=$(CXX_STD) $(OPTFLAGS) \
   -Wall -Wextra -Wpedantic -Wno-unused-parameter \
   -Iinclude $(DEFINES) $(ZSTD_CFLAGS) $(CPPFLAGS) $(CXXFLAGS)
 # The typing/ port initializes aggregates partially on purpose (an OCaml
@@ -94,8 +104,14 @@ LIBS := $(MIMALLOC_O) $(ZSTD_LIBS)
 # A compiler process is short-lived and started once per unit: linking the
 # C++ runtime in saves the dynamic loader's symbol resolution and makes the
 # binary self-contained; its GNU build-id keys the .cmi image cache
-# (cmi_image.hpp).
+# (cmi_image.hpp).  (macOS: libc++ is the system's, and ld64 writes the
+# LC_UUID the cache keys on unasked; a weak reference may stay undefined --
+# mi_collect without mimalloc -- only when named.)
+ifeq "$(shell uname -s)" "Darwin"
+COMPILER_LDFLAGS := -Wl,-U,_mi_collect
+else
 COMPILER_LDFLAGS := -static-libstdc++ -static-libgcc -Wl,--build-id=sha1
+endif
 
 # a changed flag rebuilds everything (the stamp is rewritten only then)
 FLAGS_STAMP := $(O)/flags
