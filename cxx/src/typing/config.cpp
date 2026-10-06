@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <iostream>
 
+#include "cppcaml/os.hpp"
+
 // an installation whose runtime has zstd writes compressed .cmi / .cmt / debug
 // and hint sections (Compression.output_value): c++ocamlc must be able to
 #ifndef CPPCAML_HAVE_ZSTD
@@ -29,12 +31,10 @@ const char* table_value(const char* name) {
     if (std::string(x.name) == name) return x.value;
   return nullptr;
 }
-// dirname of Sys.executable_name (the resolved /proc/self/exe)
+// dirname of Sys.executable_name (caml_executable_name)
 std::string exe_dir() {
-  char buf[4096];
-  ssize_t n = ::readlink("/proc/self/exe", buf, sizeof buf - 1);
-  if (n <= 0) return ".";
-  std::string exe(buf, static_cast<std::size_t>(n));
+  std::string exe = os::self_exe();
+  if (exe.empty()) return ".";
   std::size_t slash = exe.rfind('/');
   return slash == std::string::npos ? "." : slash == 0 ? "/" : exe.substr(0, slash);
 }

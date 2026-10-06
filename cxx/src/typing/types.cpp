@@ -25,9 +25,12 @@ void set_zone(Zone* z) { g_zone = z; }
 ZoneScope::ZoneScope(Zone& z) : saved(g_zone) { g_zone = &z; }
 ZoneScope::~ZoneScope() { g_zone = saved; }
 const void* fresh_identity() { return zone().alloc(1, 1); }
+// never destroyed: the zones' SliceTailNotes erase from it as they die, the
+// default zone's at exit -- after a destroyed map, statics dying in the
+// reverse of their construction order
 std::unordered_map<const void*, SliceTail>& slice_tails() {
-  static std::unordered_map<const void*, SliceTail> m;
-  return m;
+  static auto* m = new std::unordered_map<const void*, SliceTail>;
+  return *m;
 }
 SliceTailNote::~SliceTailNote() { slice_tails().erase(p); }
 std::vector<const Zone*>& transient_zones() {
@@ -67,7 +70,11 @@ char* Zone::huge_block(std::size_t sz, bool advise) {
   if (p > base) ::munmap(base, p - base);
   char* end = base + sz + huge;
   if (end > p + sz) ::munmap(p + sz, end - (p + sz));
+#ifdef MADV_HUGEPAGE
   if (advise) ::madvise(p, sz, MADV_HUGEPAGE);
+#else
+  (void)advise;  // (no transparent huge pages: macOS)
+#endif
   return p;
 }
 void Fname::relocate(const Zone& dying, std::string_view (*copy_of)(void*, std::string_view), void* ctx) {

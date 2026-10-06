@@ -29,6 +29,15 @@ like OCaml (`cxx/Makefile`).  The native compiler is needed (not
 installed OCaml by a native program.  c++ocamlc links the mimalloc
 allocator, vendored in `cxx/vendor/mimalloc`, statically.
 
+macOS (verified on Apple Silicon; nothing in it is arm64-specific): the
+Xcode command line tools are enough -- Apple clang (`g++` is clang there;
+`-std=c++2b` where clang predates `c++23`), the system's make and shell --
+plus libzstd when OCaml is built with it.  c++ocamlc serves a macOS switch; c++ocamlopt does not yet (its
+back end is amd64 Linux's), so the switch keeps the stock ocamlopt.  In a
+source tree configured by hand, `cxx/harness/gen_driver_tables.sh`
+regenerates c++ocamlc's configuration tables (checked in for amd64 Linux)
+for it before `make -C cxx`.
+
 What the build does (`cxx/opam/build-cxx.sh`, in `ocaml-variants`' build
 stage): it installs the tree into a stage (`make install
 DESTDIR=`: the installation is `--with-relative-libdir`, so the stage

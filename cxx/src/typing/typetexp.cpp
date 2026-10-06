@@ -477,8 +477,10 @@ static const tt::CoreType* transl_type_aux(env::t env, const RowContext& row_con
       auto* c = as<pt::Ptyp_constr>(sd);
       auto [path, decl] = env::lookup_type(true, c->lid.loc, c->lid.txt, env);
       std::vector<const pt::CoreType*> stl(c->args.begin(), c->args.end());
-      if (stl.size() == 1 && stl[0]->ptyp_desc->kind == PK::Ptyp_any && decl->type_arity > 1)
-        stl.assign(decl->type_params.size(), stl[0]);
+      if (stl.size() == 1 && stl[0]->ptyp_desc->kind == PK::Ptyp_any && decl->type_arity > 1) {
+        const pt::CoreType* any = stl[0];  // (assign's value may not refer into stl)
+        stl.assign(decl->type_params.size(), any);
+      }
       if (static_cast<long>(stl.size()) != decl->type_arity) {
         Error e = err(styp->ptyp_loc, env, EK::Type_arity_mismatch);
         e.lid = c->lid.txt;

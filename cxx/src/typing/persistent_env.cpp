@@ -15,6 +15,7 @@
 #include <ctime>
 #include <filesystem>
 
+#include "cppcaml/os.hpp"
 #include "cppcaml/typing/utf8_lexeme.hpp"
 
 namespace cppcaml::typing {
@@ -75,10 +76,10 @@ Header header_of(const struct stat& st, std::uint64_t count) {
   return Header{kMagic,
                 static_cast<std::uint64_t>(st.st_dev),
                 static_cast<std::uint64_t>(st.st_ino),
-                static_cast<std::uint64_t>(st.st_mtim.tv_sec),
-                static_cast<std::uint64_t>(st.st_mtim.tv_nsec),
-                static_cast<std::uint64_t>(st.st_ctim.tv_sec),
-                static_cast<std::uint64_t>(st.st_ctim.tv_nsec),
+                static_cast<std::uint64_t>(os::mtime(st).tv_sec),
+                static_cast<std::uint64_t>(os::mtime(st).tv_nsec),
+                static_cast<std::uint64_t>(os::ctime(st).tv_sec),
+                static_cast<std::uint64_t>(os::ctime(st).tv_nsec),
                 count};
 }
 bool load(const struct stat& st, std::vector<std::string>& files) {
@@ -115,7 +116,7 @@ void record(const struct stat& st, const std::vector<std::string>& files) {
   struct timespec now;
   ::clock_gettime(CLOCK_REALTIME, &now);
   auto settled = [&](const struct timespec& t) { return t.tv_sec + 2 < now.tv_sec; };
-  if (!settled(st.st_mtim) || !settled(st.st_ctim)) return;
+  if (!settled(os::mtime(st)) || !settled(os::ctime(st))) return;
   std::string buf(sizeof(Header), '\0');
   Header h = header_of(st, files.size());
   std::memcpy(buf.data(), &h, sizeof h);
@@ -152,8 +153,8 @@ static Dir dir_create(bool hidden, const std::string& path) {
     // changed it meanwhile
     struct stat after;
     if (cacheable && ::stat(p, &after) == 0 && after.st_ino == st.st_ino && after.st_dev == st.st_dev &&
-        after.st_mtim.tv_sec == st.st_mtim.tv_sec && after.st_mtim.tv_nsec == st.st_mtim.tv_nsec &&
-        after.st_ctim.tv_sec == st.st_ctim.tv_sec && after.st_ctim.tv_nsec == st.st_ctim.tv_nsec)
+        os::mtime(after).tv_sec == os::mtime(st).tv_sec && os::mtime(after).tv_nsec == os::mtime(st).tv_nsec &&
+        os::ctime(after).tv_sec == os::ctime(st).tv_sec && os::ctime(after).tv_nsec == os::ctime(st).tv_nsec)
       dir_cache::record(st, d.files);
   }
   return d;
