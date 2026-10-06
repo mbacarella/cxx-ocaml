@@ -90,7 +90,7 @@ UnitInfos& current_unit() {
 
 std::string concat_symbol(std::string_view unitname, std::string_view id) {
   std::string s(unitname);
-  s += symbol_separator;
+  s += symbol_separator();
   s += id;
   return s;
 }
@@ -108,7 +108,7 @@ void reset(const std::optional<std::string>& packname0, std::string_view name) {
   std::optional<std::string> packname;
   if (packname0) {
     std::string p = *packname0;
-    std::replace(p.begin(), p.end(), '.', symbol_separator);
+    std::replace(p.begin(), p.end(), '.', symbol_separator());
     packname = p;
   }
   global_infos_table().clear();

@@ -15,6 +15,11 @@
 # and sort the same on every system
 export LC_ALL=C
 
+# deterministic archives: Apple's ar and ranlib record the members' and
+# the symbol table's times unless ZERO_AR_DATE is set (GNU ar's default is
+# deterministic), and two builds compared byte for byte would differ by them
+[ "$(uname -s)" = Darwin ] && export ZERO_AR_DATE=1
+
 # timeout SECS CMD...: coreutils' -- where the system has none, bin/timeout
 # (perl), on PATH so that `env`, `xargs` and `sh -c` find it too
 if ! command -v timeout >/dev/null 2>&1; then

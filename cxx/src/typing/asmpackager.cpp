@@ -62,7 +62,7 @@ PackMember read_member_info(const std::string& pack_path, const std::string& fil
   if (filename::check_suffix(file, ".cmi")) return m;
   auto [info, crc] = cmx_format::read_unit_info(file);
   if (info->ui_name != m.pm_name) fail(Error::Kind::Illegal_renaming, m.pm_name, file, std::string(info->ui_name));
-  std::string expected_symbol = std::string(compilenv::current_unit().ui_symbol) + compilenv::symbol_separator + std::string(info->ui_name);
+  std::string expected_symbol = std::string(compilenv::current_unit().ui_symbol) + compilenv::symbol_separator() + std::string(info->ui_name);
   if (info->ui_symbol != expected_symbol) fail(Error::Kind::Wrong_for_pack, file, pack_path);
   asmlink::check_consistency(file, *info, crc);
   compilenv::cache_unit_info(info);
