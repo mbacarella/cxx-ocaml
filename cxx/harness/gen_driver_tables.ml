@@ -91,6 +91,7 @@ let () =
       str "c_compiler" Config.c_compiler;
       str "c_output_obj" Config.c_output_obj;
       bool "c_has_debug_prefix_map" Config.c_has_debug_prefix_map;
+      bool "as_has_debug_prefix_map" Config.as_has_debug_prefix_map;
       str "bytecode_cflags" Config.bytecode_cflags;
       str "bytecode_cppflags" Config.bytecode_cppflags;
       str "native_cflags" Config.native_cflags;

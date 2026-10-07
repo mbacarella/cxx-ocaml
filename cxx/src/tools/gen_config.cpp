@@ -417,6 +417,7 @@ int main(int argc, char** argv) {
   str("c_compiler", S("c_compiler"));
   str("c_output_obj", S("c_output_obj"));
   boo("c_has_debug_prefix_map", B("c_has_debug_prefix_map"));
+  boo("as_has_debug_prefix_map", B("as_has_debug_prefix_map"));
   str("bytecode_cflags", S("bytecode_cflags"));
   str("bytecode_cppflags", S("bytecode_cppflags"));
   str("native_cflags", S("native_cflags"));
