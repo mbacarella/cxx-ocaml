@@ -29,6 +29,7 @@
 #include <mach/mach.h>
 #endif
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -1143,11 +1144,13 @@ static int run_main(int argc, char** argv) {
     // the configurations the target's back end is ported for, as this
     // configuration's Config says (the code generator reads these values as
     // constants)
-    for (auto& [k, v] : ty::arch::supported_configuration()) {
+    for (auto& [k, vs] : ty::arch::supported_configuration()) {
       std::optional<std::string> x = ty::config::config_var(k);
-      if (!x || *x != v) {
+      if (!x || std::find(vs.begin(), vs.end(), *x) == vs.end()) {
         std::cerr << CPPCAML_SELF ": this OCaml's configuration is not supported (" << k << ": "
-                  << (x ? *x : "?") << ", only " << v << ")\n";
+                  << (x ? *x : "?") << ", only ";
+        for (size_t i = 0; i < vs.size(); i++) std::cerr << (i == 0 ? "" : " or ") << vs[i];
+        std::cerr << ")\n";
         return 2;
       }
     }

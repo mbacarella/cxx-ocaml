@@ -249,17 +249,20 @@ by c++ocamlopt configured for amd64 Linux on another machine, before and
 after: -dcmm, -dsel, -dreload, -dlinear and the .s of the 6557 probes (and
 with -g -unsafe -inline 200) identical, 26220/26220 files.
 
-arm64 (macOS; asmcomp/arm64/, and Branch_relaxation, Emitaux's text
-printing in emitaux.cpp): against the tree's ocamlopt.opt on an Apple
-Silicon Mac, DUMP=dcmm, dsel, dcse, dlive, dspill, dsplit, dinterf,
-dprefer, dalloc, dreload, dlinear (FLAGS="-stop-after scheduling") --
-6553/6553 probes each; DUMP=S (and -g, -unsafe -inline 200), o, cmx (and
--g) -- 6553/6553 (the other 4 probes ocamlopt.opt rejects);
-native_link_parity 6534/6534 linkable probes; native_link_scenarios
-31/31; native_stdlib_build 559/559; native_self_build 832/832 artifacts,
-ocamlopt.opt byte-identical.  macOS's Config: Compilenv's '$' symbol
-separator, the '_' symbol prefix, the L labels, Mach-O sections, int32
-C arguments in 4-byte stack slots (Proc, Selection's Imove32).
+arm64 (macOS and Linux; asmcomp/arm64/, and Branch_relaxation, Emitaux's
+text printing in emitaux.cpp): against the tree's ocamlopt.opt on an Apple
+Silicon Mac and on Linux (Graviton3, Ubuntu 24.04), on each: DUMP=dcmm,
+dsel, dcse, dlive, dspill, dsplit, dinterf, dprefer, dalloc, dreload,
+dlinear (FLAGS="-stop-after scheduling") -- 6553/6553 probes each; DUMP=S
+(and -g, -unsafe -inline 200), o, cmx (and -g) -- 6553/6553 (the other 4
+probes ocamlopt.opt rejects); native_link_parity 6534/6534 linkable
+probes; native_link_scenarios 31/31; native_stdlib_build 559/559;
+native_self_build 832/832 artifacts, ocamlopt.opt byte-identical.  On
+Linux the bytecode DDC passes too (271 .cmo + 355 .cmi).  macOS's Config:
+Compilenv's '$' symbol separator, the '_' symbol prefix, the L labels,
+Mach-O sections, int32 C arguments in 4-byte stack slots (Proc,
+Selection's Imove32); Linux's: the .L labels, ELF sections, 8-byte stack
+slots, symbols addressed directly (Selection's use_direct_addressing).
 
 The opam switch (`cxx/INSTALL.md`) installs c++ocamlopt as `ocamlopt`:
 dune, 30 packages and mpg123 build, and every artifact is identical to the
@@ -359,7 +362,7 @@ menhir error points.
 - Not ported: typing recovery (`-typing-recovery`), the
   `-bin-annot-occurrences` index, Printast / Pprintast / Printtyped as
   printers (hence the refused `-d*` options); the native back ends other
-  than amd64 Linux's and arm64 macOS's.
+  than amd64 Linux's and arm64 macOS's and Linux's.
 
 ## Performance
 

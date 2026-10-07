@@ -14,9 +14,9 @@ point at them), keeping the stock compilers as `bin/ocamlc.stock` and
 `bin/ocamlopt.stock`.  Every package installed in the switch afterwards is
 compiled by the C++ port, to bytecode and to native code; the other tools
 (ocamldep, the toplevel, ...) are the stock ones.  c++ocamlopt's back ends
-are the non-flambda amd64 one on Linux and the arm64 one on macOS: for any
-other configuration the stock ocamlopt stays (with a warning in the build
-log).
+are the non-flambda amd64 one on Linux and the arm64 one on macOS and
+Linux: for any other configuration the stock ocamlopt stays (with a
+warning in the build log).
 
 ```sh
 opam switch create cxx-5.5 --empty
