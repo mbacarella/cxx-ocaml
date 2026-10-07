@@ -55,7 +55,6 @@ t of_primitive(const lambda::Primitive& p) {
     case K::Plsrint: return plsrint;
     case K::Pasrint: return pasrint;
     case K::Pintcomp: return pintcomp;
-    case K::Pphyscomp: return pphyscomp;
     case K::Pcompare_ints: return pcompare_ints;
     case K::Pcompare_floats: return pcompare_floats;
     case K::Pcompare_bints: return pcompare_bints;
@@ -88,7 +87,6 @@ t of_primitive(const lambda::Primitive& p) {
     case K::Pctconst: return pctconst;
     case K::Pisint: return pisint;
     case K::Pisout: return pisout;
-    case K::Pcheckbound: return pcheckbound;
     case K::Pbintofint: return pbintofint;
     case K::Pintofbint: return pintofbint;
     case K::Pcvtbint: return pcvtbint;
@@ -128,7 +126,6 @@ t of_primitive(const lambda::Primitive& p) {
     case K::Pint_as_pointer: return pint_as_pointer;
     case K::Popaque: return popaque;
     case K::Patomic_load: return patomic_load;
-    case K::Patomic_fetch_add: return patomic_fetch_add;
     case K::Prunstack: return prunstack;
     case K::Pperform: return pperform;
     case K::Presume: return presume;
@@ -174,7 +171,6 @@ t of_primitive_arg(const lambda::Primitive& p) {
     case K::Plsrint: return plsrint_arg;
     case K::Pasrint: return pasrint_arg;
     case K::Pintcomp: return pintcomp_arg;
-    case K::Pphyscomp: return pphyscomp_arg;
     case K::Pcompare_ints: return pcompare_ints_arg;
     case K::Pcompare_floats: return pcompare_floats_arg;
     case K::Pcompare_bints: return pcompare_bints_arg;
@@ -207,7 +203,6 @@ t of_primitive_arg(const lambda::Primitive& p) {
     case K::Pctconst: return pctconst_arg;
     case K::Pisint: return pisint_arg;
     case K::Pisout: return pisout_arg;
-    case K::Pcheckbound: return pcheckbound_arg;
     case K::Pbintofint: return pbintofint_arg;
     case K::Pintofbint: return pintofbint_arg;
     case K::Pcvtbint: return pcvtbint_arg;
@@ -247,7 +242,6 @@ t of_primitive_arg(const lambda::Primitive& p) {
     case K::Pint_as_pointer: return pint_as_pointer_arg;
     case K::Popaque: return popaque_arg;
     case K::Patomic_load: return patomic_load_arg;
-    case K::Patomic_fetch_add: return patomic_fetch_add_arg;
     case K::Prunstack: return prunstack_arg;
     case K::Pperform: return pperform_arg;
     case K::Presume: return presume_arg;
