@@ -51,7 +51,10 @@ make_zstd_args() {  # <staged bin dir>
     # built the runtime finds it
     so=$(libzstd_of "$1/ocamlrun")
     [ -n "$so" ] && [ -e "$so" ] || so=$("${CC:-cc}" -print-file-name=libzstd.$so_ext)
-    inc=$(printf '#include <zstd.h>\n' | "${CC:-cc}" -E -x c - 2>/dev/null |
+    # (with configure's -I options: pkg-config's, a Homebrew zstd's say)
+    cppflags=$(sed -n 's/^OC_CPPFLAGS = //p' "$root/Makefile.build_config" | tr ' ' '\n' | grep '^-I' | tr '\n' ' ')
+    # shellcheck disable=SC2086
+    inc=$(printf '#include <zstd.h>\n' | "${CC:-cc}" $cppflags -E -x c - 2>/dev/null |
           sed -n 's|^# [0-9]* "\(.*\)/zstd\.h".*|\1|p' | head -1)
     [ -n "$inc" ] && [ -f "$inc/zstd.h" ] || die "this OCaml compresses with zstd but zstd.h was not found (install libzstd's development files)"
     [ -e "$so" ] || die "this OCaml compresses with zstd but its shared libzstd was not found"
