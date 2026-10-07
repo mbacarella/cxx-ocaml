@@ -31,6 +31,7 @@ namespace mp = mach_passes;
 // String.concat " " (Misc.debug_prefix_map_flags ()) (Config.as_has_debug_prefix_map)
 std::string debug_prefix_map_flags() {
   std::vector<std::string> flags;
+  if (!config::as_has_debug_prefix_map) return "";
   if (const build_path_prefix_map::Map* map = misc::get_build_path_prefix_map())
     for (const auto& elem : *map)
       if (elem) flags.push_back("--debug-prefix-map " + filename::quote(elem->source) + "=" + filename::quote(elem->target));
