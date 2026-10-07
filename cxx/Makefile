@@ -2,7 +2,7 @@
 #
 #   make -C cxx            the release build, in cxx/build-release/
 #   make -C cxx debug      the debug build, in cxx/build/
-#   make -C cxx <tool>     one tool of the release build (c++ocamlc, ...);
+#   make -C cxx <tool>...  some tools of the release build (c++ocamlc, ...);
 #                          MODE=debug for the debug build's
 #   make -C cxx clean      both builds removed
 #
@@ -66,10 +66,9 @@ release:
 	@$(MAKE) --no-print-directory MODE=release tools
 debug:
 	@$(MAKE) --no-print-directory MODE=debug tools
-$(TOOLS):
-	@$(MAKE) --no-print-directory TOOL=$@ one
-.PHONY: one
-one: $(O)/$(TOOL)
+# (in this make, not one recursive make per tool: two tools asked at once,
+# `make -j c++ocamlc c++ocamlopt`, share the objects and the library)
+$(TOOLS): %: $(O)/%
 	@:
 tools: $(addprefix $(O)/,$(TOOLS))
 	@:
