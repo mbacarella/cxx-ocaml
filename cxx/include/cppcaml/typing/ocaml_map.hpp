@@ -4,7 +4,8 @@
 // Exactly: the same AVL trees (the same shapes, hence the same orders where
 // a shape shows), the same physical-equality shortcuts (`add` of an equal
 // binding returns the map itself; union / filter / remove return an input
-// unchanged when nothing changed), and the callbacks called in the order
+// unchanged when nothing changed; Set's union / inter / diff have none of
+// them in 5.5.1), and the callbacks called in the order
 // ocamlopt's code calls them -- left to right for iter / fold / map / mapi /
 // filter / filter_map / partition, but for merge and union the order the
 // argument evaluation of map.ml's expressions gives (right to left).  A
@@ -606,43 +607,33 @@ class OSet {
     const Node* rr = remove_(x, t->r);
     return rr == t->r ? t : bal(t->l, t->v, rr);
   }
+  // 5.5.1's set.ml: union / inter / diff rebuild through join and concat
+  // (trunk's keep an input when nothing changed); a constructor's arguments
+  // are evaluated right to left
   static const Node* union__(const Node* s1, const Node* s2) {
-    if (s1 == s2) return s1;
     if (!s1) return s2;
     if (!s2) return s1;
     if (s1->h >= s2->h) {
       if (s2->h == 1) return add_(s2->v, s1);
       Split s = split(s1->v, s2);
-      const Node* ll = union__(s1->l, s.l);
       const Node* rr = union__(s1->r, s.r);
-      if (ll == s1->l && rr == s1->r) return s1;
+      const Node* ll = union__(s1->l, s.l);
       return join(ll, s1->v, rr);
     }
     if (s1->h == 1) return add_(s1->v, s2);
     Split s = split(s2->v, s1);
-    const Node* ll = union__(s.l, s2->l);
     const Node* rr = union__(s.r, s2->r);
-    if (ll == s2->l && rr == s2->r) return s2;
+    const Node* ll = union__(s.l, s2->l);
     return join(ll, s2->v, rr);
   }
   static const Node* inter_(const Node* s1, const Node* s2) {
-    if (s1 == s2) return s1;
     if (!s1 || !s2) return nullptr;
     Split s = split(s1->v, s2);
-    if (!s.present) {
-      // concat (inter l1 l2) (inter r1 r2): arguments right to left
-      const Node* rr = inter_(s1->r, s.r);
-      const Node* ll = inter_(s1->l, s.l);
-      return concat(ll, rr);
-    }
-    const Node* ll = inter_(s1->l, s.l);
     const Node* rr = inter_(s1->r, s.r);
-    if (ll == s1->l && rr == s1->r) return s1;
-    if (ll == s.l && rr == s.r) return s2;
-    return join(ll, s1->v, rr);
+    const Node* ll = inter_(s1->l, s.l);
+    return s.present ? join(ll, s1->v, rr) : concat(ll, rr);
   }
   static const Node* diff_(const Node* s1, const Node* s2) {
-    if (s1 == s2) return nullptr;
     if (!s1) return nullptr;
     if (!s2) return s1;
     Split s = split(s1->v, s2);
