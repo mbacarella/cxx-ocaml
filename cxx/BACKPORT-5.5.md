@@ -41,7 +41,7 @@ Lines = changed lines in the upstream diff.
 - [x] parsing/lexer.mll (65)
 - [-] parsing/pprintast.ml (55)
 - [x] driver/compile_common.ml (54)
-- [-] asmcomp/arm64/arch.ml (52)
+- [x] asmcomp/arm64/arch.ml (52)
 - [x] parsing/unit_info.ml (47)
 - [x] lambda/translmod.ml (46)
 - [x] bytecomp/bytepackager.ml (45)
@@ -51,7 +51,7 @@ Lines = changed lines in the upstream diff.
 - [x] parsing/printast.ml (36)
 - [x] bytecomp/instruct.ml (36)
 - [-] asmcomp/s390x/selection.ml (36)
-- [-] middle_end/flambda/inlining_decision.ml (35)
+- [x] middle_end/flambda/inlining_decision.ml (35)
 - [x] typing/errortrace.ml (33)
 - [x] asmcomp/emitaux.ml (33)
 - [x] typing/typedtree.ml (32)
@@ -60,7 +60,7 @@ Lines = changed lines in the upstream diff.
 - [-] asmcomp/riscv/proc.ml (30)
 - [-] typing/printtyped.ml (29)
 - [x] parsing/ast_helper.ml (27)
-- [-] asmcomp/arm64/selection.ml (27)
+- [x] asmcomp/arm64/selection.ml (27)
 - [-] asmcomp/riscv/selection.ml (26)
 - [x] asmcomp/asmlink.ml (25)
 - [x] typing/primitive.ml (23)
@@ -76,14 +76,14 @@ Lines = changed lines in the upstream diff.
 - [x] typing/includecore.ml (18)
 - [-] typing/gprinttyp.ml (18)
 - [-] parsing/depend.ml (18)
-- [-] middle_end/flambda/inline_and_simplify_aux.ml (17)
+- [x] middle_end/flambda/inline_and_simplify_aux.ml (17)
 - [x] lambda/lambda.ml (17)
 - [-] asmcomp/power/arch.ml (17)
 - [x] bytecomp/printinstr.ml (16)
 - [x] typing/typedecl_separability.ml (15)
 - [x] typing/predef.ml (13)
 - [x] driver/main_args.ml (13)
-- [-] middle_end/internal_variable_names.ml (12)
+- [x] middle_end/internal_variable_names.ml (12)
 - [x] asmcomp/x86_proc.ml (12)
 - [x] typing/includemod.ml (11)
 - [x] lambda/printlambda.ml (10)
@@ -108,7 +108,7 @@ Lines = changed lines in the upstream diff.
 - [-] asmcomp/x86_masm.ml (5)
 - [x] asmcomp/x86_gas.ml (5)
 - [x] asmcomp/x86_dsl.ml (5)
-- [-] asmcomp/arm64/proc.ml (5)
+- [x] asmcomp/arm64/proc.ml (5)
 - [x] utils/load_path.ml (4)
 - [x] middle_end/convert_primitives.ml (4)
 - [x] lambda/translclass.ml (4)
@@ -157,3 +157,16 @@ Notes (open items noticed while porting):
   stays (5.5.1 lexes it the same).
 - parse tree / binary AST: value_description with pval_prim, no
   Psig_primitive / Pstr_val; typed tree: val_prim, c_cont Ident option.
+- the flambda, arm64 and macOS work (cxx-trunk 2026-10-03..07): flambda's
+  stub inlining without trunk's recursion guard; arm64 without the
+  -flrcpc2 / -fstore-release options, Iroundf / Iclz / Ictz / fma /
+  Iatomic_fetch_add, with 5.5.1's assignment stores (stlr on macOS, dmb
+  ishld; str elsewhere); emit_string_literal without the '??' guard
+  (asmcomp/arm64/emit.mlp, asmcomp/emitaux.ml); amd64 without Iclz / Ictz /
+  Iatomic_fetch_add; Internal_variable_names without Pphyscomp /
+  Pcheckbound / Patomic_fetch_add; -config without reserved_header_bits.
+- stdlib/set.ml: the port's Set (ocaml_map.hpp) has 5.5.1's union / inter /
+  diff, without trunk's physical-equality shortcuts: flambda marshals the
+  trees into the .cmx.
+- known: 25 probe .cmt and otherlibs' dynlink_config.cmt differ from
+  ocamlc.opt's in sharing only (the decoded values are equal); trunk has none.
