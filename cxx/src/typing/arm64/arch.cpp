@@ -13,29 +13,8 @@ using format::pr;
 using printmach::reg;
 using reg::Regs;
 
-bool store_release = config::model != "arm64_barrier";
-bool lrcpc2 = config::model == "lrcpc2";
-
 // Machine-specific command-line options
-std::vector<arg::Option> command_line_options() {
-  auto unit = [](const char* key, const char* doc, void (*f)()) {
-    arg::Option o{key, arg::Spec{}, doc};
-    o.spec.k = arg::Spec::K::Unit;
-    o.spec.unit = f;
-    return o;
-  };
-  return {unit("-flrcpc2",
-               " Use FEAT_LRCPC2 store-release with unscaled offset (stlur) for assignment stores (requires an "
-               "Armv8.4+ assembler)",
-               [] { lrcpc2 = true; }),
-          unit("-fno-lrcpc2", " Do not use FEAT_LRCPC2 stlur", [] { lrcpc2 = false; }),
-          unit("-fbarrier-store",
-               " Use a dmb ishld; str barrier instead of a store-release for assignment stores (faster on some old "
-               "cores)",
-               [] { store_release = false; }),
-          unit("-fstore-release", " Use a store-release (stlr/stlur) for assignment stores (default)",
-               [] { store_release = true; })};
-}
+std::vector<arg::Option> command_line_options() { return {}; }
 
 // arm64 on macOS and Linux (no frame pointers, CFI)
 const std::vector<std::pair<const char*, std::vector<const char*>>>& supported_configuration() {
@@ -135,7 +114,6 @@ int compare_specific_operation(const SpecificOperation& a, const SpecificOperati
   if (int c = cmp_long(static_cast<long>(a.k), static_cast<long>(b.k))) return c;
   if (int c = cmp_long(a.n, b.n)) return c;
   if (int c = cmp_long(static_cast<long>(a.arith), static_cast<long>(b.arith))) return c;
-  if (int c = cmp_long(static_cast<long>(a.rounding), static_cast<long>(b.rounding))) return c;
   if (int c = cmp_long(a.return_label.has_value(), b.return_label.has_value())) return c;
   if (int c = cmp_long(a.return_label.value_or(0), b.return_label.value_or(0))) return c;
   if (int c = cmp_long(a.bytes, b.bytes)) return c;
@@ -187,16 +165,6 @@ void print_specific_operation(Formatter& ppf, const SpecificOperation& op, const
       fprintf(ppf, "(-f %a) +f (%a *f %a)", pr(reg, arg[0]), pr(reg, arg[1]), pr(reg, arg[2]));
       return;
     case K::Isqrtf: fprintf(ppf, "sqrtf %a", pr(reg, arg[0])); return;
-    case K::Iclz: fprintf(ppf, "clz %a", pr(reg, arg[0])); return;
-    case K::Ictz: fprintf(ppf, "ctz %a", pr(reg, arg[0])); return;
-    case K::Iroundf: {
-      const char* name = op.rounding == FloatRounding::Rnearest_away ? "roundf"
-                         : op.rounding == FloatRounding::Rtoward_zero ? "truncf"
-                         : op.rounding == FloatRounding::Rtoward_pos  ? "ceilf"
-                                                                      : "floorf";
-      fprintf(ppf, "%s %a", name, pr(reg, arg[0]));
-      return;
-    }
     case K::Ibswap: fprintf(ppf, "bswap%i %a", op.n, pr(reg, arg[0])); return;
     case K::Imove32: fprintf(ppf, "move32 %a", pr(reg, arg[0])); return;
     case K::Isignext: fprintf(ppf, "signext%i %a", op.n, pr(reg, arg[0])); return;

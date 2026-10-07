@@ -7,7 +7,6 @@ namespace cppcaml::typing::selection {
 
 namespace {
 
-using RK = A::FloatRounding;
 using AO = A::ArithOperation;
 
 bool is_offset(Chunk chunk, long n) {
@@ -40,10 +39,8 @@ bool is_immediate_signed(long n) {
 // If you update [inline_ops], you may need to update [is_simple_expr] and/or
 // [effects_of], below.
 bool is_inline_op(std::string_view fn) {
-  return fn == "sqrt" || fn == "caml_bswap16_direct" || fn == "caml_fma" || fn == "caml_int32_direct_bswap" ||
-         fn == "caml_int64_direct_bswap" || fn == "caml_nativeint_direct_bswap" || fn == "caml_round" ||
-         fn == "caml_trunc" || fn == "ceil" || fn == "floor" || fn == "caml_int_clz_direct" ||
-         fn == "caml_int_ctz_direct";
+  return fn == "sqrt" || fn == "caml_bswap16_direct" || fn == "caml_int32_direct_bswap" ||
+         fn == "caml_int64_direct_bswap" || fn == "caml_nativeint_direct_bswap";
 }
 
 bool use_direct_addressing(std::string_view) { return !clflags::dlcode && !A::macosx(); }
@@ -71,10 +68,6 @@ bool shift_by(expression e, OK k, expression& arg, long& n) {
 const Cop* is_op(expression e, OK k) {
   auto* c = as<Cop>(e);
   return c && c->op.kind == k ? c : nullptr;
-}
-bool is_extcall(const cmm::Operation& op, std::string_view name, std::initializer_list<Exttype> ty_args) {
-  return op.name == name && !op.alloc &&
-         std::equal(op.ty_args.begin(), op.ty_args.end(), ty_args.begin(), ty_args.end());
 }
 
 class Arm64Selector final : public Selector {
@@ -142,11 +135,6 @@ class Arm64Selector final : public Selector {
   static mach::Operation spec_n(SK k, long n) {
     mach::Operation o = specific(k);
     o.spec.n = n;
-    return o;
-  }
-  static mach::Operation roundf(RK r) {
-    mach::Operation o = specific(SK::Iroundf);
-    o.spec.rounding = r;
     return o;
   }
 
@@ -256,28 +244,13 @@ class Arm64Selector final : public Selector {
         break;
       case OK::Cextcall: {
         std::string_view fn = op.name;
-        using X = Exttype;
         // Recognize floating-point square root
         if (fn == "sqrt") return {specific(SK::Isqrtf), vec(args)};
-        // Only the unboxed [Float.fma] passes floats in registers, hence the
-        // argument types.
-        if (is_extcall(op, "caml_fma", {X::XFloat, X::XFloat, X::XFloat})) {
-          if (args.size() == 3) return {specific(SK::Imuladdf), {args[2], args[0], args[1]}};
-          break;
-        }
-        // Only the unboxed rounding externals pass their argument in a
-        // register, hence the argument type.
-        if (is_extcall(op, "caml_round", {X::XFloat})) return {roundf(RK::Rnearest_away), vec(args)};
-        if (is_extcall(op, "caml_trunc", {X::XFloat})) return {roundf(RK::Rtoward_zero), vec(args)};
-        if (is_extcall(op, "ceil", {X::XFloat})) return {roundf(RK::Rtoward_pos), vec(args)};
-        if (is_extcall(op, "floor", {X::XFloat})) return {roundf(RK::Rtoward_neg), vec(args)};
         // Recognize bswap instructions
         if (fn == "caml_bswap16_direct") return {spec_n(SK::Ibswap, 16), vec(args)};
         if (fn == "caml_int32_direct_bswap") return {spec_n(SK::Ibswap, 32), vec(args)};
         if (fn == "caml_int64_direct_bswap" || fn == "caml_nativeint_direct_bswap")
           return {spec_n(SK::Ibswap, 64), vec(args)};
-        if (fn == "caml_int_clz_direct") return {specific(SK::Iclz), vec(args)};
-        if (fn == "caml_int_ctz_direct") return {specific(SK::Ictz), vec(args)};
         break;
       }
       default: break;

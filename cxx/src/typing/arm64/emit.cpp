@@ -46,7 +46,6 @@ Reg* reg_domain_state_ptr() { return proc::phys_reg(25); }  // x28
 Reg* reg_trap_ptr() { return proc::phys_reg(23); }          // x26
 Reg* reg_alloc_ptr() { return proc::phys_reg(24); }         // x27
 Reg* reg_tmp1() { return proc::phys_reg(26); }              // x16
-Reg* reg_tmp2() { return proc::phys_reg(27); }              // x17
 Reg* reg_x8() { return proc::phys_reg(8); }                 // x8
 Reg* reg_stack_arg_begin() { return proc::phys_reg(17); }   // x20
 Reg* reg_stack_arg_end() { return proc::phys_reg(18); }     // x21
@@ -436,20 +435,10 @@ struct Size {
   }
 
   static long store_pre_size(const mach::Operation& op) {
-    // Matches the emission below.  With a store-release (the default: stlr,
-    // or stlur under -flrcpc2) an Iindexed assignment word store needs no
-    // prefix (stlur / stlr [base]) or just an add (stlr with a nonzero
-    // offset).  The -fbarrier-store path keeps the [dmb ishld; str] barrier.
     if (!((op.chunk == Chunk::Word_int || op.chunk == Chunk::Word_val) && op.is_assign)) return 0;
-    long n = op.addr.displ;
-    if (op.addr.k == AK::Iindexed) {
-      if (arch::store_release && arch::lrcpc2 && n >= -256 && n <= 255) return 0;  // stlur, no addr calc
-      if (arch::store_release && n == 0) return 0;                               // stlr [base]
-      if (arch::store_release) return addsub_size(n);                             // add; stlr
-    } else if (arch::store_release) {
-      return 1;  // add :lo12: ; stlr
-    }
-    return 1;  // dmb ishld barrier
+    if (!arch::macosx()) return 1;  // Barrier instruction
+    if (op.addr.k != AK::Iindexed) return 0;
+    return op.addr.displ == 0 ? 0 : addsub_size(op.addr.displ);  // Compute dest address
   }
 
   static long instr_size(const linear::Fundecl& f, const linear::Instruction& i) {
@@ -535,7 +524,6 @@ struct Size {
       case MK::Idivf: return 1;
       case MK::Iopaque: return 0;
       case MK::Idls_get: return 1;
-      case MK::Iatomic_fetch_add: return 5;
       case MK::Ireturn_addr: return 1;
       case MK::Ispecific:
         switch (op.spec.k) {
@@ -545,8 +533,7 @@ struct Size {
           case SK::Icheckbound_imm_far: return 3;
           case SK::Ishiftcheckbound: return 2;
           case SK::Ishiftcheckbound_far: return 3;
-          case SK::Isqrtf:
-          case SK::Iroundf: return 1;
+          case SK::Isqrtf: return 1;
           case SK::Inegmulf: return 1;
           case SK::Imuladdf:
           case SK::Inegmuladdf:
@@ -556,8 +543,6 @@ struct Size {
           case SK::Imuladd:
           case SK::Imulsub: return 1;
           case SK::Ibswap: return op.spec.n == 16 ? 2 : 1;
-          case SK::Iclz: return 1;
-          case SK::Ictz: return 3;
           case SK::Imove32: return 1;
           case SK::Isignext: return 1;
         }
@@ -698,41 +683,17 @@ const char* name_for_float_comparison(lambda::FloatComparison c) {
 
 // Output a release store [stlr] of register [src] at address [base + addr].
 // Since [stlr] does not support addressing modes, we compute [base + addr]
-// explicitly.  We can also use [stlur] if supported to avoid the [base +
-// addr] computation in some case.
+// explicitly.
 void emit_stlr(const Reg* src, const Reg* base, const arch::AddressingMode& addr) {
-  long ofs = addr.displ;
-  if (addr.k == AK::Iindexed) {
-    if (arch::lrcpc2 && ofs >= -256 && ofs <= 255) {
-      // FEAT_LRCPC2: store-release with an unscaled immediate offset, so no
-      // separate address computation is needed.
-      emit("\tstlur\t", R(src), ", [", R(base), ", #", I(ofs), "]\n");
-    } else if (ofs == 0) {
-      emit("\tstlr\t", R(src), ", [", R(base), "]\n");
-    } else {
-      emit_addimm(reg_tmp1(), base, ofs);
-      emit("\tstlr\t", R(src), ", [", R(reg_tmp1()), "]\n");
-    }
-    return;
+  if (!arch::macosx()) fatal("Emit.emit_stlr");
+  // Ibased is not emitted under macOS
+  if (addr.k != AK::Iindexed) fatal("Emit.emit_stlr");
+  const Reg* dest_reg = base;
+  if (addr.displ != 0) {
+    emit_addimm(reg_tmp1(), base, addr.displ);
+    dest_reg = reg_tmp1();
   }
-  if (clflags::dlcode) fatal("Emit.emit_stlr");  // see selection.ml
-  // [base] contains the high bits of [s + ofs], produced by [adrp]
-  emit("\tadd\t", R(reg_tmp1()), ", ", R(base), ", #:lo12:", emit_symbol_offset(addr.sym, ofs), "\n");
-  emit("\tstlr\t", R(src), ", [", R(reg_tmp1()), "]\n");
-}
-
-// Output a store of register [src] at address [base + addr], including a
-// load->store barrier, as required by the multicore memory model for a
-// non-initializing store to a mutable field or array element: by default a
-// store-release [stlr] (or [stlur] under -flrcpc2), with -fbarrier-store
-// [dmb ishld; str].
-void emit_store_word_with_barrier(const Reg* src, const Reg* base, const arch::AddressingMode& addr) {
-  if (arch::store_release) {
-    emit_stlr(src, base, addr);
-  } else {
-    emit("\tdmb\tishld\n");
-    emit("\tstr\t", R(src), ", ", emit_addressing(addr, base), "\n");
-  }
+  emit("\tstlr\t", R(src), ", [", R(dest_reg), "]\n");
 }
 
 bool same_loc(const Reg* a, const Reg* b) { return a->loc.k == b->loc.k && a->loc.n == b->loc.n; }
@@ -995,13 +956,18 @@ void emit_instr(Env& env, const linear::Instruction& i) {
         case Chunk::Sixtyfour: emit("\tstr\t", R(src), ", ", emit_addressing(op.addr, base), "\n"); return;
         case Chunk::Word_int:
         case Chunk::Word_val:
-          if (op.is_assign)
-            // Non-initializing store to a mutable field or array element.
-            // Needs a load->store barrier for the multicore memory model.
-            emit_store_word_with_barrier(src, base, op.addr);
-          else
-            // Initializing store.  No barrier needed
+          if (op.is_assign && arch::macosx()) {
+            // Release store for assignments on macOS. See
+            // https://github.com/ocaml/ocaml/issues/13262.
+            emit_stlr(src, base, op.addr);
+          } else if (op.is_assign) {
+            // Memory model barrier for assignments.
+            emit("\tdmb\tishld\n");
             emit("\tstr\t", R(src), ", ", emit_addressing(op.addr, base), "\n");
+          } else {
+            // Initializing store
+            emit("\tstr\t", R(src), ", ", emit_addressing(op.addr, base), "\n");
+          }
           return;
         case Chunk::Double: emit("\tstr\t", R(src), ", ", emit_addressing(op.addr, base), "\n"); return;
       }
@@ -1068,19 +1034,6 @@ void emit_instr(Env& env, const linear::Instruction& i) {
       emit("\tldr\t", res0(), ", [", R(reg_domain_state_ptr()), ", ", I(offset), "]\n");
       return;
     }
-    case MK::Iatomic_fetch_add: {
-      // LL/SC loop, works on baseline ARMv8.0 (no LSE required).  reg_tmp1 =
-      // sum (data), reg_tmp2 = stlxr status (must differ per ARM spec).
-      // Trailing dmb ishst is the atomic-store release barrier from #10972.
-      long lbl = cmm::new_label();
-      emit(L(lbl), ":\n");
-      emit("\tldaxr\t", res0(), ", [", arg(0), "]\n");
-      emit("\tadd\t", R(reg_tmp1()), ", ", res0(), ", ", arg(1), "\n");
-      emit("\tstlxr\t", W(reg_tmp2()), ", ", R(reg_tmp1()), ", [", arg(0), "]\n");
-      emit("\tcbnz\t", W(reg_tmp2()), ", ", L(lbl), "\n");
-      emit("\tdmb\tishst\n");
-      return;
-    }
     case MK::Ireturn_addr: {
       long n = frame_size(env);
       if (env.f->fun_frame_required) emit("\tldr\t", res0(), ", [sp, #", I(n - 8), "]\n");
@@ -1138,15 +1091,6 @@ void emit_instr(Env& env, const linear::Instruction& i) {
       return;
     }
     case SK::Isqrtf: emit("\tfsqrt\t", res0(), ", ", arg(0), "\n"); return;
-    case SK::Iroundf: {
-      using RK = arch::FloatRounding;
-      const char* instr = s.rounding == RK::Rnearest_away ? "frinta"
-                          : s.rounding == RK::Rtoward_zero ? "frintz"
-                          : s.rounding == RK::Rtoward_pos  ? "frintp"
-                                                           : "frintm";
-      emit("\t", instr, "\t", res0(), ", ", arg(0), "\n");
-      return;
-    }
     case SK::Inegmulf: emit("\tfnmul\t", res0(), ", ", arg(0), ", ", arg(1), "\n"); return;
     case SK::Imuladdf:
     case SK::Inegmuladdf:
@@ -1168,17 +1112,6 @@ void emit_instr(Env& env, const linear::Instruction& i) {
     case SK::Imuladd:
     case SK::Imulsub:
       emit("\t", s.k == SK::Imuladd ? "madd" : "msub", "\t", res0(), ", ", arg(0), ", ", arg(1), ", ", arg(2), "\n");
-      return;
-    case SK::Iclz:
-      // The tag bit keeps the count over Sys.int_size bits and away from 0
-      emit("\tclz\t", res0(), ", ", arg(0), "\n");
-      return;
-    case SK::Ictz:
-      // Bit 63 is a copy of bit 62, so setting it only changes the answer
-      // for 0, where it gives Sys.int_size
-      emit("\torr\t", res0(), ", ", arg(0), ", #0x8000000000000000\n");
-      emit("\trbit\t", res0(), ", ", res0(), "\n");
-      emit("\tclz\t", res0(), ", ", res0(), "\n");
       return;
     case SK::Ibswap:
       switch (s.n) {
@@ -1334,9 +1267,6 @@ void begin_assembly() {
   output.clear();
   reset_debug_info();
   emit("\t.file\t\"\"\n");  // PR#7037
-  // [stlur] (enabled by -flrcpc2) needs an Armv8.4 assembler; macOS's
-  // assembler already accepts it.
-  if (arch::lrcpc2 && !arch::macosx()) emit("\t.arch\tarmv8.4-a\n");
   std::string_view lbl_begin = compilenv::make_symbol(std::string_view("data_begin"));
   emit("\t.data\n");
   emit("\t.globl\t", emitaux::symbol(lbl_begin), "\n");
@@ -1348,7 +1278,7 @@ void begin_assembly() {
   // we need to pad here to avoid collision for the unwind test between the
   // code_begin symbol and the first function.  (See also #4690) Alignment is
   // needed to avoid linker warnings for shared_startup__code_{begin,end}.
-  if (arch::macosx() || arch::freebsd()) {
+  if (arch::macosx()) {
     emit("\tnop\n");
     emit("\t.align\t3\n");
   }

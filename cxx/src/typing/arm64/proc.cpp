@@ -196,7 +196,6 @@ Regs destroyed_at_oper(const mach::Instruction& i) {
     case K::Istore:
       if (op.chunk == cmm::MemoryChunk::Single) return regs_of({107});
       return {};
-    case K::Iatomic_fetch_add: return regs_of({26, 27});  // x16=sum, x17=stlxr status in LL/SC loop
     default: return {};
   }
 }
@@ -226,7 +225,6 @@ std::vector<long> max_register_pressure(const mach::Operation& op) {
     case K::Istore:
       if (op.chunk == cmm::MemoryChunk::Single) return {23, 31};
       return {23, 32};
-    case K::Iatomic_fetch_add: return {21, 32};  // x16+x17 used as scratch
     default: return {23, 32};
   }
 }
