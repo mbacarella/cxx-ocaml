@@ -386,10 +386,7 @@ int main(int argc, char** argv) {
   pb("native_dynlink", B("native_dynlink"));
   pb("naked_pointers", false);
   pb("with_codegen_invariants", B("with_codegen_invariants"));
-  {
-    auto it = g.find("reserved_header_bits");
-    pi("reserved_header_bits", it == g.end() ? 0 : std::get<long>(it->second.v));
-  }
+  // (5.5.1's configuration_variables has no reserved_header_bits)
   for (const char* m : {"exec_magic_number", "cmi_magic_number", "cmo_magic_number", "cma_magic_number",
                         "cmx_magic_number", "cmxa_magic_number", "ast_impl_magic_number", "ast_intf_magic_number",
                         "cmxs_magic_number", "cmt_magic_number", "linear_magic_number"})
