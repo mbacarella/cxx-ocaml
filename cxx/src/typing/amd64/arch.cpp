@@ -117,12 +117,13 @@ std::vector<arg::Option> command_line_options() {
 }
 
 // amd64 on Linux (Unix, no frame pointers, CFI)
-const std::vector<std::pair<const char*, const char*>>& supported_configuration() {
-  static const std::vector<std::pair<const char*, const char*>> v = {{"architecture", "amd64"},
-                                                                     {"system", "linux"},
-                                                                     {"with_frame_pointers", "false"},
-                                                                     {"asm_cfi_supported", "true"},
-                                                                     {"tsan", "false"}};
+const std::vector<std::pair<const char*, std::vector<const char*>>>& supported_configuration() {
+  static const std::vector<std::pair<const char*, std::vector<const char*>>> v = {
+      {"architecture", {"amd64"}},
+      {"system", {"linux"}},
+      {"with_frame_pointers", {"false"}},
+      {"asm_cfi_supported", {"true"}},
+      {"tsan", {"false"}}};
   return v;
 }
 

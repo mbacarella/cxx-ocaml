@@ -37,13 +37,14 @@ std::vector<arg::Option> command_line_options() {
                [] { store_release = true; })};
 }
 
-// arm64 on macOS (no frame pointers, CFI)
-const std::vector<std::pair<const char*, const char*>>& supported_configuration() {
-  static const std::vector<std::pair<const char*, const char*>> v = {{"architecture", "arm64"},
-                                                                     {"system", "macosx"},
-                                                                     {"with_frame_pointers", "false"},
-                                                                     {"asm_cfi_supported", "true"},
-                                                                     {"tsan", "false"}};
+// arm64 on macOS and Linux (no frame pointers, CFI)
+const std::vector<std::pair<const char*, std::vector<const char*>>>& supported_configuration() {
+  static const std::vector<std::pair<const char*, std::vector<const char*>>> v = {
+      {"architecture", {"arm64"}},
+      {"system", {"macosx", "linux"}},
+      {"with_frame_pointers", {"false"}},
+      {"asm_cfi_supported", {"true"}},
+      {"tsan", {"false"}}};
   return v;
 }
 
