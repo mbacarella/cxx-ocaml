@@ -367,7 +367,6 @@ class Promoter : public flambda_evacuate::Evacuator {
     c.freshening_ = freshening(e.freshening_);
     c.unroll_counts = map(e.unroll_counts, plain);
     c.inlining_counts = map(e.inlining_counts, plain);
-    c.inlined_stub = set(e.inlined_stub);
     c.actively_unrolling_ = map(e.actively_unrolling_, plain);
     if (e.inlining_stats_closure_stack) leak("an inlining report's closure stack");
     dbg(e.inlined_debuginfo);

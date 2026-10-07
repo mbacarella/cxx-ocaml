@@ -271,7 +271,6 @@ Env Env::inside_unrolled_function(set_of_closures_id::t origin) const {
   long unroll_count = c ? *c : arg_helper::get(round_, clflags::inline_max_unroll);
   Env e = *this;
   e.unroll_counts = unroll_counts.add(origin, unroll_count - 1);
-  e.inlined_stub = {};
   return e;
 }
 
@@ -286,15 +285,6 @@ Env Env::inside_inlined_function(variable::t id) const {
   long inlining_count = c ? *c : std::max(1L, arg_helper::get(round_, clflags::inline_max_unroll));
   Env e = *this;
   e.inlining_counts = inlining_counts.add(id, inlining_count - 1);
-  // inlining_stubs prevents recursive stub inlining.  But as soon as we
-  // inline another kind of function, we can reactivate stub inlining.
-  e.inlined_stub = {};
-  return e;
-}
-
-Env Env::inside_inlined_stub_function(set_of_closures_id::t id) const {
-  Env e = *this;
-  e.inlined_stub = inlined_stub.add(id);
   return e;
 }
 

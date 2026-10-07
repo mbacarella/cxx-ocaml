@@ -325,11 +325,7 @@ std::pair<t, Result> for_call_site(const Env& env0, const Result& r, const A::Fu
   Result original_r = r.seen_direct_application().set_approx(A::value_unknown(A::other()));
   if (!function_decl->function_body) return {original, original_r};
   if (function_decl->function_body->stub) {
-    if (!env0.stub_inlining_allowed(function_decls->set_of_closures_origin))
-      // It is extremely uncommon for stub inlining to be disallowed, but in
-      // that case we want to prevent any kind of inlining.
-      return {original, original_r};
-    Env env = env0.inside_inlined_stub_function(function_decls->set_of_closures_origin);
+    const Env& env = env0;
     variable::Set fun_vars = function_decls->funs.keys();
     const A::FunctionBody* function_body = get_function_body(function_decl);
     auto [body, r2] = inlining_transforms::inline_by_copying_function_body(

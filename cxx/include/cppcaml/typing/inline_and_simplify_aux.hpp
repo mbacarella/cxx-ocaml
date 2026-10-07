@@ -46,9 +46,6 @@ struct Env {
   bool never_inline_outside_closures = false;
   set_of_closures_id::Map<long> unroll_counts;  // Set_of_closures_origin.Map
   variable::Map<long> inlining_counts;          // Closure_origin.Map
-  // Set of stubs in the current inlining stack.  It is cleared as soon as
-  // non-stub inlining occur
-  set_of_closures_id::Set inlined_stub;
   set_of_closures_id::Map<long> actively_unrolling_;
   long closure_depth = 0;
   inlining_stats::ClosureStack inlining_stats_closure_stack = nullptr;
@@ -104,9 +101,7 @@ struct Env {
   bool unrolling_allowed(set_of_closures_id::t origin) const;
   Env inside_unrolled_function(set_of_closures_id::t origin) const;
   bool inlining_allowed(variable::t id) const;
-  bool stub_inlining_allowed(set_of_closures_id::t id) const { return !inlined_stub.mem(id); }
   Env inside_inlined_function(variable::t id) const;
-  Env inside_inlined_stub_function(set_of_closures_id::t id) const;
   long inlining_level() const { return inlining_level_; }
   const freshening::T& freshening() const { return freshening_; }
   bool never_inline() const { return never_inline_ || never_inline_outside_closures; }
