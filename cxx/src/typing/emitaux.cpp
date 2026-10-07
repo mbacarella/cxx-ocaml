@@ -55,8 +55,6 @@ void emit_symbol(std::string_view s) { output += symbol(s); }
 void emit_string_literal(std::string_view s) {
   bool last_was_escape = false;
   emit_string("\"");
-  // Avoid producing '??' to avoid assembler warnings about trigraphs
-  bool last_was_question_mark = false;
   auto octal = [](char c) {
     char b[8];
     std::snprintf(b, sizeof b, "\\%o", static_cast<unsigned char>(c));
@@ -66,14 +64,13 @@ void emit_string_literal(std::string_view s) {
     if (c >= '0' && c <= '9') {
       if (last_was_escape) octal(c);
       else output += c;
-    } else if (c >= ' ' && c <= '~' && c != '"' && c != '\\' && (c != '?' || !last_was_question_mark)) {
+    } else if (c >= ' ' && c <= '~' && c != '"' && c != '\\') {
       output += c;
       last_was_escape = false;
     } else {
       octal(c);
       last_was_escape = true;
     }
-    last_was_question_mark = c == '?';
   }
   emit_string("\"");
 }
@@ -419,14 +416,6 @@ void cfi_def_cfa_register(long reg) {
   if (!is_cfi_enabled()) return;
   emit_string("\t.cfi_def_cfa_register ");
   emit_int(reg);
-  emit_string("\n");
-}
-void cfi_val_offset(long reg, long offset) {
-  if (!is_cfi_enabled()) return;
-  emit_string("\t.cfi_escape 0x14, ");  // DW_CFA_val_offset (0x14)
-  emit_int(reg);
-  emit_string(", ");
-  emit_int(offset);
   emit_string("\n");
 }
 

@@ -82,7 +82,6 @@ void cfi_adjust_cfa_offset(long n);
 void cfi_def_cfa_offset(long n);
 void cfi_offset(long reg, long offset);
 void cfi_def_cfa_register(long reg);
-void cfi_val_offset(long reg, long offset);
 
 // Emit debug information
 void reset_debug_info();
