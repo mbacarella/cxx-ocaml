@@ -561,13 +561,9 @@ class Parser {
         }
         return mk_construct(ctorid, std::nullopt, cloc);
       }
-      if (operator_name(peek(1)) && peek(2).kind == Kind::RPAREN) {  // M.(op) -> "M.op"
-        advance();  // (
-        auto op = operator_name(cur()); advance();
-        const Token& c = cur(); advance();  // )
-        Longident qual{Ldot{std::make_shared<Longident>(pr.lid.txt), *op, pr.lid.loc,
-                            span(position(lp.start), position(c.end))}};
-        Location l = span(openStart, position(c.end));
+      if (auto op = try_paren_operator()) {  // M.(op) -> "M.op" (an index operator `M.( .%{} )` too)
+        Longident qual{Ldot{std::make_shared<Longident>(pr.lid.txt), op->txt, pr.lid.loc, op->loc}};
+        Location l = span(openStart, op->loc.end);
         return E({Pexp_ident{LongidentLoc{std::move(qual), l}}, l});
       }
       advance();  // (
@@ -4165,9 +4161,8 @@ class Parser {
       if (nm.kind != Kind::LIDENT && nm.kind != Kind::LPAREN)
         throw ParseError("expected value name", nm.start);
       StringLoc vname;
-      if (nm.kind == Kind::LPAREN && operator_name(peek(1)) && peek(2).kind == Kind::RPAREN) {
-        advance(); auto op = operator_name(cur()); advance(); const Token& c = cur(); advance();
-        vname = StringLoc{*op, span(position(nm.start), position(c.end))};
+      if (auto op = try_paren_operator()) {  // ( op ), an index operator `( .%{} )` too
+        vname = std::move(*op);
       } else { advance(); vname = StringLoc{nm.text, tokloc(nm)}; }
       expect(Kind::COLON, ":");
       CoreTypeBox ty = parse_poly_type(false);
