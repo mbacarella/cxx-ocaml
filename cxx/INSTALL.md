@@ -83,10 +83,11 @@ c++ocamlc keeps pre-decoded images of the `.cmi` files it reads in
 `CPPCAML_CMI_CACHE=<dir>` moves it, `CPPCAML_CMI_CACHE_VERIFY=1` checks
 each image's bytes (a few percent slower).
 
-On amd64 Linux, c++ocamlopt makes its object files in process instead of
-running `as` (the same bytes as GNU as 2.42's; any binutils' `as` accepts
-the same text).  `CPPCAML_ASSEMBLER=system` runs `as` as ocamlopt does;
-`CPPCAML_ASSEMBLER=check` runs both and fails when they differ.
+On amd64 Linux, `CPPCAML_ASSEMBLER=internal` makes c++ocamlopt build its
+object files in process instead of running `as` (the same bytes as GNU as
+2.42's; another binutils' `as` may lay them out differently), a few
+percent faster; `CPPCAML_ASSEMBLER=check` runs both and fails when they
+differ.  By default it runs `as`, as ocamlopt does.
 
 Packages: 5.5.1 is a released version, so opam's released packages
 (ppxlib included) are the ones to use; nothing needs pinning.
