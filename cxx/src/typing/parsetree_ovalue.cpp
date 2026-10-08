@@ -91,7 +91,21 @@ V loc_block(const Location& l, V a, V b) {
 // Writing a whole parsetree (Pparse.write_ast): every location is written
 // as the writer writes the same location of a typed tree (loc_val)
 bool whole_ast = false;
+// Location.none: location.ml's one global record, which mknoloc / ghost
+// opens (`M.[]`'s Pstr_open, builtin_arraylike_name's components) all hold
+bool is_none(const Position& p) {
+  return p.pos_lnum == 0 && p.pos_bol == 0 && p.pos_cnum == -1 && p.pos_fname == "_none_";
+}
 V loc(const Location& l) {
+  if (l.loc_ghost && !same_record(l) && is_none(l.loc_start) && is_none(l.loc_end)) {
+    static V none_v = nullptr;
+    if (!none_v) {
+      ZoneScope perm(permanent_zone());
+      V p = B(0, {S(l.loc_start.pos_fname), I(0), I(0), I(-1)});
+      none_v = B(0, {p, p, boolean(true)});
+    }
+    return none_v;
+  }
   if (whole_ast && !same_record(l)) {
     V r = B(0, {position(l.loc_start), position(l.loc_end), boolean(l.loc_ghost)});
     const_cast<OValue*>(r)->loc_val = make<Location>(l);
@@ -130,6 +144,17 @@ V kept(V v) {
   return v;
 }
 V lident(Longident::t l) {
+  // one block (the .cmi keeps the parsetree's; Ast_mapper.map_lid, the .cmt's
+  // copy, rebuilds an Lident: not kept)
+  if (Longident::is_parser_constant(l)) {
+    static std::vector<std::pair<Longident::t, V>> consts;
+    for (auto& [c, v] : consts)
+      if (c == l) return v;
+    ZoneScope perm(permanent_zone());
+    V v = B(0, {S(l->s)});
+    consts.emplace_back(l, v);
+    return v;
+  }
   switch (l->kind) {
     case Longident::Kind::Lident: return B(0, {S(l->s)});
     case Longident::Kind::Ldot:
