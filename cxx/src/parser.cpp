@@ -321,16 +321,15 @@ class Parser {
     size_t startKey = firstStart != static_cast<size_t>(-1) ? firstStart : structBegin;
     size_t endKey = idx_ > 0 ? tokens_[idx_ - 1].end : structBegin;  // last consumed token end
     Structure items;
+    // parser.mly's extra_text: an empty `struct … end` is `text post @ text
+    // post_extras` at its end position (the previous token's end)
+    if (body.empty() && cur().kind != Kind::TEOF) {
+      emit_text(items, docs_.post, endKey);
+      emit_text(items, docs_.post_extra, endKey);
+      return items;
+    }
     emit_text(items, docs_.pre_extra, startKey);  // extra_str leading text
     for (auto& it : body) items.push_back(std::move(it));
-    // a doc on the closing token of an empty `struct (** doc *) end` is floating
-    // text (ocaml.text), keyed at the closing token — pre (no blank line) or
-    // pre_extra/floating (blank line); a trailing doc at EOF is dropped by extra_str.
-    if (body.empty() && cur().kind != Kind::TEOF) {
-      emit_text(items, docs_.pre_extra, cur().start);  // leading floating doc(s) first…
-      emit_text(items, docs_.floating, cur().start);
-      emit_text(items, docs_.pre, cur().start);        // …then a trailing one on the closing token
-    }
     emit_text(items, docs_.post_extra, endKey);  // extra_str trailing text
     return items;
   }
@@ -4115,11 +4114,15 @@ class Parser {
     size_t startKey = firstStart != static_cast<size_t>(-1) ? firstStart : sigBegin;
     size_t endKey = idx_ > 0 ? tokens_[idx_ - 1].end : sigBegin;
     Signature items;
+    // parser.mly's extra_text: an empty `sig … end` is `text post @ text
+    // post_extras` at its end position (the previous token's end)
+    if (body.empty() && cur().kind != Kind::TEOF) {
+      emit_text_sig(items, docs_.post, endKey);
+      emit_text_sig(items, docs_.post_extra, endKey);
+      return items;
+    }
     emit_text_sig(items, docs_.pre_extra, startKey);
     for (auto& it : body) items.push_back(std::move(it));
-    // a pre-doc on the closing token (e.g. empty `sig (** doc *) end`) attaches to
-    // no item, so it is floating text (ocaml.text), not ocaml.doc.
-    if (body.empty() && cur().kind != Kind::TEOF) emit_text_sig(items, docs_.pre, cur().start);
     emit_text_sig(items, docs_.post_extra, endKey);
     return items;
   }
