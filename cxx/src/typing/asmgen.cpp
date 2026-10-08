@@ -47,21 +47,23 @@ std::string debug_prefix_map_flags() {
   return r;
 }
 
-// The assembler: GNU as's object made in process (x86_assembler, byte for
-// byte as 2.42's), or Config.asm run on the .s file.  CPPCAML_ASSEMBLER:
-// "system" always runs Config.asm; "check" makes both and fails when they
-// differ.  The in-process one serves Config.asm = as on amd64 Linux, and
-// leaves to it any text it does not handle.
+// The assembler: Config.asm run on the .s file, as ocamlopt does, unless
+// CPPCAML_ASSEMBLER asks for the in-process one (x86_assembler: GNU as's
+// object, byte for byte as 2.42's): "internal" uses it, "check" makes both
+// and fails when they differ.  It serves Config.asm = as on amd64 Linux,
+// and leaves to as any text it does not handle.
 enum class AsMode { Internal, System, Check };
 AsMode as_mode() {
 #if CPPCAML_ARCH_amd64
   static const AsMode mode = [] {
     const char* e = std::getenv("CPPCAML_ASSEMBLER");
-    if (e && std::strcmp(e, "system") == 0) return AsMode::System;
+    AsMode m = !e ? AsMode::System
+               : std::strcmp(e, "internal") == 0 ? AsMode::Internal
+               : std::strcmp(e, "check") == 0    ? AsMode::Check
+                                                 : AsMode::System;
     if (config::config_var("asm").value_or("") != "as" || config::config_var("system").value_or("") != "linux")
       return AsMode::System;
-    if (e && std::strcmp(e, "check") == 0) return AsMode::Check;
-    return AsMode::Internal;
+    return m;
   }();
   return mode;
 #else
