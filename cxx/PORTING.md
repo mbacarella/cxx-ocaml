@@ -196,7 +196,28 @@ and debug info, the X86 DSL and GAS printer; `hashtbl.hpp`'s
 `-unsafe -inline 200`, `-compact`, `-g -O3`, `-nodynlink`,
 `-function-sections`), 208/208 compiler sources (and `-g`), 787/787
 testsuite files (and `-g`); `-dlinear` now matches without `-stop-after`.
-c++ocamlopt writes the `.s` (with `-S`) and assembles the `.o` with `as`.
+c++ocamlopt writes the `.s` with `-S`, and on amd64 Linux (Config.asm =
+`as`) makes the `.o` in process: `x86_assembler.cpp` turns the emitter's
+text into the object GNU as 2.42 makes of it, byte for byte -- a port of
+the parts of gas and BFD that text reaches: the frags and their relaxation
+(write.c), the instruction encodings ocamlopt's emitter uses (tc-i386.c's
+choices: the short forms, the multi-byte NOPs, `last_insn_normal`), the
+fixups and their reduction to section symbols, the `.L` labels kept off the
+symbol chain until a relocation keeps them, `.eh_frame` from the `.cfi_*`
+directives (dw2gencfi.c), the DWARF 3 `.debug_line` / `_info` / `_abbrev` /
+`_aranges` / `_str` / `_ranges` from `.file` / `.loc` (dwarf2dbg.c, with
+`--debug-prefix-map` and the `DW_AT_comp_dir` of libiberty's getpwd), and
+the ELF writer's section, symbol and string-table order (elf-strtab.c's
+suffix merging).  Text outside that subset (`Unsupported`) goes to `as`.
+`CPPCAML_ASSEMBLER=system` always runs `as`; `CPPCAML_ASSEMBLER=check`
+runs both and fails on a difference (the gates below pass in that mode with
+no difference and nothing left to `as`).  `c++as` is the assembler as a
+command, and `as_parity.sh` compares it with `as` on ocamlopt.opt's `-S`
+output: 6556/6556 probes (and `-g`, `-g -function-sections`, `-unsafe
+-inline 200`); the testsuite's 932 natively compilable files (and `-g`,
+`-function-sections -g`) through `CPPCAML_ASSEMBLER=check`.  Another
+binutils may lay its object out differently; c++ocamlopt's is still a
+valid object, and `CPPCAML_ASSEMBLER=system` gives that `as`'s.
 
 The .cmx writer is ported (`cmi_format.cpp`'s `write_unit_info`:
 Compilenv.save_unit_info's output_value with ocamlopt's sharing):
@@ -334,6 +355,7 @@ header the pitfalls to avoid in a new harness.  Results as of the
 | `effid.sh` | the compiler's .cmo, compiled by c++ocamlc | 140/140 bytes |
 | `ddc.sh` + `stdlib_ddc.sh` | diverse double-compiling (`cxx/DDC.md`) | PASS: 271 .cmo + 355 .cmi (bytecode and native compiler sources) |
 | `testsuite_delta.sh` | ocamltest with c++ocamlc as ocamlc | the delta (below) |
+| `as_parity.sh` | `as` vs `c++as` objects on ocamlopt.opt's `-S` (and `FLAGS=-g`, `-function-sections`) | 6556/6556 |
 
 Also: `false_accept.sh` / `valid_reject.sh` (through `port_check.sh`),
 `typing_cmi_parity.sh` / `typing_env_parity.sh` / `typing_ctype_parity.sh` /
@@ -384,6 +406,11 @@ end of translation, with the typing zone whole: its parse tree and the
 instances unification threw away, which OCaml's GC reclaims during typing.
 mimalloc purges freed memory at once (`allocator.cpp`; its 1 s default kept
 the .cmx readers' scratch resident).
+
+The in-process assembler, 2026-10-08: the compiler's own native build
+(the 263 commands of `native_self_build.sh`, run one after the other) takes
+15.4 s with ocamlopt.opt, 12.2 s with c++ocamlopt running `as` (1.7 s of
+it in `as`), 10.4-10.7 s with c++ocamlopt assembling in process.
 
 ## Following trunk
 

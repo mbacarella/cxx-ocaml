@@ -2,9 +2,16 @@
 #include "cppcaml/typing/asmgen.hpp"
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
+#include <iterator>
 #include <set>
 #include <stdexcept>
+
+#if CPPCAML_ARCH_amd64
+#include "cppcaml/typing/amd64/x86_assembler.hpp"
+#endif
 
 #include "cppcaml/typing/ccomp.hpp"
 #include "cppcaml/typing/clflags.hpp"
@@ -38,6 +45,49 @@ std::string debug_prefix_map_flags() {
   std::string r;
   for (std::size_t i = 0; i < flags.size(); ++i) r += (i ? " " : "") + flags[i];
   return r;
+}
+
+// The assembler: GNU as's object made in process (x86_assembler, byte for
+// byte as 2.42's), or Config.asm run on the .s file.  CPPCAML_ASSEMBLER:
+// "system" always runs Config.asm; "check" makes both and fails when they
+// differ.  The in-process one serves Config.asm = as on amd64 Linux, and
+// leaves to it any text it does not handle.
+enum class AsMode { Internal, System, Check };
+AsMode as_mode() {
+#if CPPCAML_ARCH_amd64
+  static const AsMode mode = [] {
+    const char* e = std::getenv("CPPCAML_ASSEMBLER");
+    if (e && std::strcmp(e, "system") == 0) return AsMode::System;
+    if (config::config_var("asm").value_or("") != "as" || config::config_var("system").value_or("") != "linux")
+      return AsMode::System;
+    if (e && std::strcmp(e, "check") == 0) return AsMode::Check;
+    return AsMode::Internal;
+  }();
+  return mode;
+#else
+  return AsMode::System;
+#endif
+}
+
+// the --debug-prefix-map pairs of debug_prefix_map_flags
+std::vector<std::pair<std::string, std::string>> debug_prefix_map_pairs() {
+  std::vector<std::pair<std::string, std::string>> r;
+  if (!config::as_has_debug_prefix_map) return r;
+  if (const build_path_prefix_map::Map* map = misc::get_build_path_prefix_map())
+    for (const auto& elem : *map)
+      if (elem) r.emplace_back(elem->source, elem->target);
+  return r;
+}
+
+std::string read_file(const std::string& path) {
+  std::ifstream is(path, std::ios::binary);
+  return std::string((std::istreambuf_iterator<char>(is)), std::istreambuf_iterator<char>());
+}
+
+void write_file(const std::string& path, const void* data, std::size_t n) {
+  std::ofstream os(path, std::ios::binary);
+  os.write(static_cast<const char*>(data), static_cast<std::streamsize>(n));
+  if (!os) throw std::runtime_error("cannot write " + path);
 }
 
 void dump_if(format::Formatter& dump, bool flag, const char* message, const mach::Fundecl& fd) {
@@ -185,15 +235,53 @@ void compile_unit(const std::string& asm_filename, bool keep_asm, const std::str
       remove_asm_file();
       throw;
     }
-    if (create_asm) {
-      std::ofstream os(asm_filename, std::ios::binary);
-      os << text;
-    }
+    AsMode mode = should_emit() ? as_mode() : AsMode::System;
+    // (the .s file is not needed by the in-process assembler)
+    bool asm_written = false;
+    auto write_asm = [&] {
+      if (create_asm && !asm_written) {
+        std::ofstream os(asm_filename, std::ios::binary);
+        os << text;
+        asm_written = true;
+      }
+    };
+    if (mode != AsMode::Internal || keep_asm) write_asm();
     if (should_emit()) {
       // Proc.assemble_file (X86_proc.assemble_file)
-      int rc = ccomp::command(*config::config_var("asm") + " " + debug_prefix_map_flags() + " -o " +
-                              filename::quote(obj_filename) + " " + filename::quote(asm_filename));
-      if (rc != 0) throw Error{asm_filename};
+      auto system_as = [&](const std::string& obj) {
+        write_asm();
+        int rc = ccomp::command(*config::config_var("asm") + " " + debug_prefix_map_flags() + " -o " +
+                                filename::quote(obj) + " " + filename::quote(asm_filename));
+        if (rc != 0) throw Error{asm_filename};
+      };
+      bool done = false;
+#if CPPCAML_ARCH_amd64
+      if (mode != AsMode::System) {
+        try {
+          std::vector<std::uint8_t> obj = x86_assembler::assemble(text, debug_prefix_map_pairs());
+          if (mode == AsMode::Check) {
+            std::string gas_obj = obj_filename + ".gas.o";
+            system_as(gas_obj);
+            std::string ref = read_file(gas_obj);
+            if (ref.size() != obj.size() || std::memcmp(ref.data(), obj.data(), obj.size()) != 0) {
+              std::string ours = obj_filename + ".cppas.o", kept = obj_filename + ".cppas.s";
+              write_file(ours, obj.data(), obj.size());
+              write_file(kept, text.data(), text.size());
+              std::fprintf(stderr, "CPPCAML_ASSEMBLER=check: %s differs from as's %s (source %s)\n", ours.c_str(),
+                           gas_obj.c_str(), kept.c_str());
+              throw Error{asm_filename};
+            }
+            std::remove(gas_obj.c_str());
+          }
+          write_file(obj_filename, obj.data(), obj.size());
+          done = true;
+        } catch (const x86_assembler::Unsupported& e) {
+          if (mode == AsMode::Check)
+            std::fprintf(stderr, "CPPCAML_ASSEMBLER=check: %s: left to as: %s\n", obj_filename.c_str(), e.what());
+        }
+      }
+#endif
+      if (!done) system_as(obj_filename);
     }
     remove_asm_file();
   } catch (...) {

@@ -51,7 +51,9 @@ scen not-object 'C=$C; echo junk > j.cmx; $C -o m.exe j.cmx'
 scen onestep-multi 'C=$C; $C -dstartup -o m.exe a.ml b.ml main.ml && ./m.exe'
 scen onestep-g 'C=$C; $C -g -dstartup -o m.exe a.ml b.ml main.ml && ./m.exe'
 scen default-aout 'C=$C; $C a.ml b.ml main.ml && ./a.out'
-scen verbose 'C=$C; $C -c a.ml b.ml main.ml && $C -verbose -o m.exe a.cmx b.cmx main.cmx 2>&1 | sed -E "s/camlstartup[a-f0-9]+/camlstartupX/g"'
+# (-verbose shows the commands run: CPPCAML_ASSEMBLER=system, so c++ocamlopt runs
+# as, as ocamlopt.opt does, instead of assembling in process)
+scen verbose 'C=$C; $C -c a.ml b.ml main.ml && CPPCAML_ASSEMBLER=system $C -verbose -o m.exe a.cmx b.cmx main.cmx 2>&1 | sed -E "s/camlstartup[a-f0-9]+/camlstartupX/g"'
 scen shared 'C=$C; $C -c a.ml b.ml && $C -shared -dstartup -o ab.cmxs a.cmx b.cmx'
 scen shared-lib 'C=$C; $C -c a.ml b.ml && $C -a -o ab.cmxa a.cmx b.cmx -cclib -lm && $C -shared -linkall -o ab.cmxs ab.cmxa'
 scen shared-onestep 'C=$C; $C -shared -dstartup -o ab.cmxs a.ml b.ml'

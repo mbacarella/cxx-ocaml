@@ -59,6 +59,10 @@ endif
 SPACE :=
 
 TOOLS := c++ocamlc c++ocamlopt c++lex c++parse c++cmxinfo c++typing-dump
+# the in-process assembler as a command (amd64: the oracle is GNU as)
+ifeq "$(BACKEND)" "amd64"
+TOOLS += c++as
+endif
 
 .PHONY: all release debug clean tools $(TOOLS)
 all: release
@@ -179,6 +183,8 @@ $(O)/c++parse: $(O)/src/tools/cppparse_main.o $(CORE)
 $(O)/c++cmxinfo: $(O)/src/tools/cmxinfo_main.o $(CORE)
 	$(LINK)
 $(O)/c++typing-dump: $(O)/src/tools/typing_dump_main.o $(CORE)
+	$(LINK)
+$(O)/c++as: $(O)/src/tools/cppas_main.o $(CORE)
 	$(LINK)
 
 -include $(wildcard $(O)/*.d $(O)/src/*.d $(O)/src/typing/*.d \
