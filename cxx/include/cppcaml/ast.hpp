@@ -99,7 +99,10 @@ using Attributes = std::vector<Attribute>;
 // (they are immutable and routinely passed by value into several AST nodes).
 struct Longident;
 using LongidentBox = std::shared_ptr<Longident>;
-struct Lident { std::string name; };
+// [parser_constant]: parser.mly's literal `Lident "…"` (mkexp_cons's "::",
+// mktailexp's "[]", `begin end`'s "()", M.() / M.[]): a structured constant,
+// one block for the whole parser (Longident::parser_constant)
+struct Lident { std::string name; bool parser_constant = false; };
 // The inner component locations (Longident.t's `t loc` / `string loc`,
 // parser.mly `ldot` / `lapply`); zero-initialized = not recorded.
 struct Ldot { LongidentBox prefix; std::string name; Location prefix_loc{}; Location name_loc{}; };

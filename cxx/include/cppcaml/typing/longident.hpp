@@ -36,6 +36,11 @@ struct Longident {
   static t lident(std::string_view s);
   static t ldot(t prefix, const Location& prefix_loc, std::string_view s, const Location& s_loc);
   static t lapply(t f, const Location& f_loc, t a, const Location& a_loc);
+  // parser.mly's literal `Lident "::"` / "[]" / "()" / "Array" / "String" /
+  // "Bigarray": structured constants, which ocamlopt merges within the unit,
+  // so one object each for the whole program (Marshal shares it)
+  static t parser_constant(std::string_view s);
+  static bool is_parser_constant(t l);
 };
 
 namespace longident {

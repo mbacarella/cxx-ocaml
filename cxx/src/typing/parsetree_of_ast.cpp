@@ -290,12 +290,13 @@ struct Conv {
     const Longident* p = l->l1;
     if (p->kind == Longident::Kind::Lident) {
       if (p->s != "Array" && p->s != "String") return l;
-      return Longident::ldot(Longident::lident(lit(p->s)), l->l1_loc(), f, l->s_loc());
+      // builtin_arraylike_name's prefix: the literal `Lident "Array"` / "String"
+      return Longident::ldot(Longident::parser_constant(p->s), l->l1_loc(), f, l->s_loc());
     }
     if (p->kind != Longident::Kind::Ldot || p->l1->kind != Longident::Kind::Lident || p->l1->s != "Bigarray" ||
         (p->s != "Array1" && p->s != "Array2" && p->s != "Array3" && p->s != "Genarray"))
       return l;
-    Longident::t m = Longident::ldot(Longident::lident(lit(p->l1->s)), p->l1_loc(), lit(p->s), p->s_loc());
+    Longident::t m = Longident::ldot(Longident::parser_constant("Bigarray"), p->l1_loc(), lit(p->s), p->s_loc());
     return Longident::ldot(m, l->l1_loc(), f, l->s_loc());
   }
   static std::string_view name(std::string_view s) {
@@ -310,7 +311,8 @@ struct Conv {
     return s;
   }
   Longident::t lid(const ast::Longident& l) const {
-    if (auto* i = std::get_if<ast::Lident>(&l.v)) return Longident::lident(name(i->name));
+    if (auto* i = std::get_if<ast::Lident>(&l.v))
+      return i->parser_constant ? Longident::parser_constant(i->name) : Longident::lident(name(i->name));
     if (auto* d = std::get_if<ast::Ldot>(&l.v))
       return Longident::ldot(lid(*d->prefix), inner(d->prefix_loc), name(d->name), inner(d->name_loc));
     auto& a = std::get<ast::Lapply>(l.v);

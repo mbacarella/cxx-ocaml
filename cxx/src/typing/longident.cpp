@@ -2,12 +2,34 @@
 #include "cppcaml/typing/longident.hpp"
 
 #include <new>
+#include <vector>
+
+#include "cppcaml/typing/zone.hpp"
 
 namespace cppcaml::typing {
 
 using K = Longident::Kind;
 
 Longident::t Longident::lident(std::string_view s) { return make<Longident>(K::Lident, zborrow(s)); }
+namespace {
+std::vector<Longident::t>& parser_constants() {
+  static std::vector<Longident::t> v;
+  return v;
+}
+}  // namespace
+Longident::t Longident::parser_constant(std::string_view s) {
+  for (t l : parser_constants())
+    if (l->s == s) return l;
+  ZoneScope perm(permanent_zone());
+  t l = make<Longident>(K::Lident, ocaml_literal("parsing/parser.mly", s));
+  parser_constants().push_back(l);
+  return l;
+}
+bool Longident::is_parser_constant(t l) {
+  for (t c : parser_constants())
+    if (c == l) return true;
+  return false;
+}
 Longident::t Longident::ldot(t prefix, const Location& prefix_loc, std::string_view s,
                              const Location& s_loc) {
   Location* locs = static_cast<Location*>(zone().alloc(2 * sizeof(Location), alignof(Location)));

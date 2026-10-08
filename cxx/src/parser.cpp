@@ -472,6 +472,8 @@ class Parser {
 
   // ---- expressions ----
   LongidentLoc lid0(std::string name, Location l) { return LongidentLoc{{Lident{std::move(name)}}, l}; }
+  // parser.mly's literal `Lident "…"` (a structured constant: ast::Lident)
+  LongidentLoc lid_const(std::string name, Location l) { return LongidentLoc{{Lident{std::move(name), true}}, l}; }
   ExprBox mk_construct(LongidentLoc cl, std::optional<ExprBox> arg, Location l) {
     return E({Pexp_construct{.id = cl, .arg = std::move(arg)}, l});
   }
@@ -480,14 +482,14 @@ class Parser {
   // [e1; ...; en] desugars right-assoc to (::) chains (mktailexp). The cons/tuple
   // nodes are ghost; only the outermost expression carries the real bracket span.
   ExprBox build_expr_list(std::vector<ExprBox>& elems, Position lb, Position rbS, Position rbE) {
-    ExprBox acc = mk_construct(lid0("[]", gloc(rbS, rbE)), std::nullopt, gloc(rbS, rbE));
+    ExprBox acc = mk_construct(lid_const("[]", gloc(rbS, rbE)), std::nullopt, gloc(rbS, rbE));
     for (int i = static_cast<int>(elems.size()) - 1; i >= 0; --i) {
       Position es = elems[i]->loc.start;
       Location gl = gloc(es, rbE);
       std::vector<ExprBox> tup;
       tup.push_back(std::move(elems[i]));
       tup.push_back(std::move(acc));
-      acc = mk_construct(lid0("::", gl), E({Pexp_tuple{std::move(tup)}, gl}), gl);
+      acc = mk_construct(lid_const("::", gl), E({Pexp_tuple{std::move(tup)}, gl}), gl);
     }
     acc->loc = Location{lb, rbE, false};  // outermost: real bracket span
     return acc;
@@ -570,7 +572,7 @@ class Parser {
       ExprBox inner;
       if (cur().kind == Kind::RPAREN) {  // M.()
         Location ul = span(position(lp.start), position(cur().end));
-        inner = mk_construct(lid0("()", ul), std::nullopt, ul);
+        inner = mk_construct(lid_const("()", ul), std::nullopt, ul);
       } else {
         inner = parse_expr();
       }
@@ -578,6 +580,9 @@ class Parser {
       return make_local_open(pr.lid, std::move(inner), span(openStart, position(c.end)));
     }
     ExprBox inner = parse_atom();  // M.[…] / M.{…} / M.[|…|]
+    if (auto* c = std::get_if<Pexp_construct>(&inner->desc);  // M.[]: mkrhs(LBRACKET RBRACKET {Lident "[]"})
+        c && !c->arg && std::holds_alternative<Lident>(c->id.txt.v) && std::get<Lident>(c->id.txt.v).name == "[]")
+      std::get<Lident>(c->id.txt.v).parser_constant = true;
     Position end = inner->loc.end;
     return make_local_open(pr.lid, std::move(inner), span(openStart, end));
   }
@@ -799,9 +804,9 @@ class Parser {
           if (is_atom_start(cur().kind)) {  // `(::) arg`  -> constructor application
             ExprBox arg = parse_atom_postfix();
             Position ae = arg->loc.end;
-            return mk_construct(lid0("::", cloc), std::move(arg), span(position(t.start), ae));
+            return mk_construct(lid_const("::", cloc), std::move(arg), span(position(t.start), ae));
           }
-          return mk_construct(lid0("::", cloc), std::nullopt, cloc);
+          return mk_construct(lid_const("::", cloc), std::nullopt, cloc);
         }
         if (cur().kind == Kind::MODULE) {  // (module ME [: S [with type …]])  first-class module
           advance();
@@ -933,7 +938,7 @@ class Parser {
         if (cur().kind == Kind::END) {  // `begin end` -> unit, spanning begin..end
           const Token& c = cur(); advance();
           Location l = span(position(t.start), position(c.end));
-          ExprBox u = mk_construct(lid0("()", l), std::nullopt, l);
+          ExprBox u = mk_construct(lid_const("()", l), std::nullopt, l);
           for (auto& a : battrs) u->attrs.push_back(std::move(a));
           return wrap_ext(std::move(u), std::move(ext));
         }
@@ -1276,7 +1281,7 @@ class Parser {
         tup.push_back(std::move(left));
         tup.push_back(std::move(right));
         ExprBox tuple = E({Pexp_tuple{std::move(tup)}, gl});
-        left = mk_construct(lid0("::", tokloc(optok)), std::move(tuple), Location{ls, re, false});
+        left = mk_construct(lid_const("::", tokloc(optok)), std::move(tuple), Location{ls, re, false});
         continue;
       }
       auto op = infix_op(cur());
@@ -2410,7 +2415,7 @@ class Parser {
     tup.push_back(box(std::move(p)));
     tup.push_back(box(std::move(r)));
     Pattern tuple{Ppat_tuple{std::move(tup), ClosedFlag::Closed}, gl};
-    return Pattern{Ppat_construct{.id = lid0("::", tokloc(optok)), .arg = box(std::move(tuple))},
+    return Pattern{Ppat_construct{.id = lid_const("::", tokloc(optok)), .arg = box(std::move(tuple))},
                    Location{ls, re, false}};
   }
   // `KEYWORD%ext p` pattern -> Ppat_extension(ext, PPat(ghost p-with-attrs)).
@@ -2476,8 +2481,10 @@ class Parser {
         // like `M.()`; non-empty `M.[a;…]` keeps the list's own loc.
         if (auto* c = std::get_if<Ppat_construct>(&inner.desc);
             c && !c->arg && std::holds_alternative<Lident>(c->id.txt.v) &&
-            std::get<Lident>(c->id.txt.v).name == "[]")
+            std::get<Lident>(c->id.txt.v).name == "[]") {
           inner.loc = span(cl.loc.start, end);
+          std::get<Lident>(c->id.txt.v).parser_constant = true;  // mkrhs(LBRACKET RBRACKET {Lident "[]"})
+        }
         return Pattern{Ppat_open{cl, box(std::move(inner))}, span(cl.loc.start, end)};
       }
       return pat_constr_rest(std::move(cl));
@@ -2485,7 +2492,7 @@ class Parser {
     if (cur().kind == Kind::LPAREN && peek(1).kind == Kind::COLONCOLON && peek(2).kind == Kind::RPAREN) {
       const Token& lp = cur(); advance(); advance();  // ( ::
       const Token& rp = cur(); advance();  // )
-      return pat_constr_rest(lid0("::", span(position(lp.start), position(rp.end))));  // (::) -> Lident "::"
+      return pat_constr_rest(lid_const("::", span(position(lp.start), position(rp.end))));  // (::) -> Lident "::"
     }
     return parse_simple_pattern();
   }
@@ -2515,10 +2522,10 @@ class Parser {
   // M.()  -> unit pattern whose node loc spans the whole `M.()` but whose `()`
   // name loc is just the parens (menhir $sloc quirk on the local-open rule).
   Pattern ppat_unit_open(Location node_loc, Location name_loc) {
-    return Pattern{Ppat_construct{.id = LongidentLoc{.txt = {Lident{"()"}}, .loc = name_loc}, .arg = std::nullopt}, node_loc};
+    return Pattern{Ppat_construct{.id = lid_const("()", name_loc), .arg = std::nullopt}, node_loc};
   }
   Pattern build_pat_list(std::vector<Pattern>& elems, Position lb, Position rbS, Position rbE) {
-    Pattern acc = ppat_construct0("[]", gloc(rbS, rbE));
+    Pattern acc{Ppat_construct{.id = lid_const("[]", gloc(rbS, rbE)), .arg = std::nullopt}, gloc(rbS, rbE)};
     for (int i = static_cast<int>(elems.size()) - 1; i >= 0; --i) {
       Position es = elems[i].loc.start;
       Location gl = gloc(es, rbE);
@@ -2526,7 +2533,7 @@ class Parser {
       tup.push_back(box(std::move(elems[i])));
       tup.push_back(box(std::move(acc)));
       Pattern tuple{Ppat_tuple{std::move(tup), ClosedFlag::Closed}, gl};
-      acc = Pattern{Ppat_construct{.id = lid0("::", gl), .arg = box(std::move(tuple))}, gl};
+      acc = Pattern{Ppat_construct{.id = lid_const("::", gl), .arg = box(std::move(tuple))}, gl};
     }
     acc.loc = Location{lb, rbE, false};
     return acc;
@@ -2596,7 +2603,7 @@ class Parser {
         if (cur().kind == Kind::COLONCOLON && peek(1).kind == Kind::RPAREN) {  // (::) -> Lident "::"
           advance();
           const Token& c = cur(); advance();
-          return ppat_construct0("::", span(position(t.start), position(c.end)));
+          return Pattern{Ppat_construct{.id = lid_const("::", span(position(t.start), position(c.end))), .arg = std::nullopt}, span(position(t.start), position(c.end))};
         }
         if (cur().kind == Kind::MODULE) {  // (module M [: S])
           advance();
