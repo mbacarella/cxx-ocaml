@@ -76,10 +76,10 @@ void widen(const Context& c) {
   type_variables = c.tv;
 }
 
-// throws env::NotFound if the variable is not in scope
+// nullptr (Not_found) if the variable is not in scope
 static TypeExpr* lookup_global_type_variable(std::string_view name) {
   const auto* p = type_variables.find_opt(name);
-  if (!p) throw env::NotFound{};
+  if (!p) return nullptr;
   *p->second = false;
   return p->first;
 }
@@ -175,7 +175,7 @@ static void associate(const std::vector<TyOptRef*>& row_context, PendingUnivar* 
       p->associated.insert(p->associated.begin(), x);
 }
 
-// throws env::NotFound if the variable is not in scope
+// nullptr (Not_found) if the variable is not in scope
 static TypeExpr* lookup_local(const std::vector<TyOptRef*>& row_context, std::string_view name) {
   for (auto& [n, p] : univars)
     if (n == name) {
@@ -183,7 +183,7 @@ static TypeExpr* lookup_local(const std::vector<TyOptRef*>& row_context, std::st
       return p->univar;
     }
   const UsedVar* u = used_variables.find_opt(name);
-  if (!u) throw env::NotFound{};
+  if (!u) return nullptr;
   *u->unused = false;
   // This call to instance might be redundant (see typetexp.ml).
   return ctype::instance(u->ty);
@@ -258,10 +258,8 @@ static std::function<void()> globalize_used_variables(const Policy& policy, env:
       btype::backtrack(snap);
       return;
     }
-    TypeExpr* global_var;
-    try {
-      global_var = lookup_global_type_variable(name);
-    } catch (const env::NotFound&) {
+    TypeExpr* global_var = lookup_global_type_variable(name);
+    if (!global_var) {
       if (policy.extensibility == Extensibility::Fixed && is_Tvar(u.ty)) {
         Error er = err(u.loc, env, EK::Unbound_type_variable);
         er.name = tyvar_of_name(name);
@@ -424,10 +422,8 @@ static const tt::CoreType* transl_type_aux(env::t env, const RowContext& row_con
     case PK::Ptyp_var: {
       std::string_view name = as<pt::Ptyp_var>(sd)->name;
       check_tyvar_name(env, styp->ptyp_loc, name);
-      TypeExpr* ty;
-      try {
-        ty = ty_var_env::lookup_local(row_context, name);
-      } catch (const env::NotFound&) {
+      TypeExpr* ty = ty_var_env::lookup_local(row_context, name);
+      if (!ty) {
         TypeExpr* v = ty_var_env::new_var(policy, OptStr::of(name));
         ty_var_env::remember_used(name, v, styp->ptyp_loc);
         ty = v;
@@ -554,6 +550,7 @@ static const tt::CoreType* transl_type_aux(env::t env, const RowContext& row_con
       try {
         check_tyvar_name(env, alias.loc, alias.txt);
         TypeExpr* t = ty_var_env::lookup_local(row_context, alias.txt);
+        if (!t) throw env::NotFound{};
         const tt::CoreType* ty = transl_type(env, policy, true, row_context, a->ty);
         try {
           ctype::unify_var(env, t, ty->ctyp_type);
