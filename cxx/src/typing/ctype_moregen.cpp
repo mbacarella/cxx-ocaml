@@ -509,163 +509,214 @@ TypeExpr* expand_head_rigid(env::t env, TypeExpr* ty) {
 
 using Subst = std::vector<std::pair<TypeExpr*, TypeExpr*>>;  // head first
 
-static void eqtype_subst(TypePairs& type_pairs, Subst& subst, TypeExpr* t1, TypeExpr* t2) {
+// Ctype's Equality_trace travels as a return value here: [false] means
+// raised, with the trace in [fail].  A C++ throw costs microseconds, is
+// re-thrown at every level to cons its diff, and Typedecl_variance's
+// is_equal fails thousands of times on a large GADT.  The shared helpers
+// that raise (and their callbacks) still throw, caught by eq_guard.
+static bool eq_fail(et::TypeTrace& fail, et::TypeTrace tr) {
+  fail = std::move(tr);
+  return false;
+}
+static bool eq_cons(et::TypeTrace& fail, et::Elt<TypeExpr*> e) {
+  fail = cons(std::move(e), std::move(fail));
+  return false;
+}
+template <class F>
+static bool eq_guard(et::TypeTrace& fail, F&& body) {
+  try {
+    body();
+    return true;
+  } catch (EqualityTrace& e) {
+    return eq_fail(fail, std::move(e.trace));
+  }
+}
+static bool eq_labels_eq(et::TypeTrace& fail, const ArgLabel& l1, const ArgLabel& l2) {
+  return compatible_labels(false, l1, l2) ||
+         eq_guard(fail, [&] { eq_labels(TraceExn::Equality, false, l1, l2); });
+}
+
+static bool eqtype_subst(TypePairs& type_pairs, Subst& subst, TypeExpr* t1, TypeExpr* t2,
+                         et::TypeTrace& fail) {
   for (auto& [t, tp] : subst) {
     bool found1 = eq_type(t1, t);
     bool found2 = eq_type(t2, tp);
-    if (found1 && found2) return;
-    if (found1 || found2) raise_unexplained_for(TraceExn::Equality);
+    if (found1 && found2) return true;
+    if (found1 || found2) return eq_fail(fail, {});
   }
   subst.insert(subst.begin(), {t1, t2});
   type_pairs.add(t1, t2);
+  return true;
 }
 
-static void eqtype_rec(bool rename, TypePairs& tp, Subst& subst, env::t env, TypeExpr* t1,
-                       TypeExpr* t2);
-static void eqtype_list_same_length_rec(bool rename, TypePairs& tp, Subst& subst, env::t env,
-                                        Slice<TypeExpr*> tl1, Slice<TypeExpr*> tl2) {
+static bool eqtype_rec(bool rename, TypePairs& tp, Subst& subst, env::t env, TypeExpr* t1,
+                       TypeExpr* t2, et::TypeTrace& fail);
+static bool eqtype_list_same_length_rec(bool rename, TypePairs& tp, Subst& subst, env::t env,
+                                        Slice<TypeExpr*> tl1, Slice<TypeExpr*> tl2,
+                                        et::TypeTrace& fail) {
   if (tl1.size() != tl2.size()) throw std::invalid_argument("List.iter2");
-  for (std::size_t k = 0; k < tl1.size(); ++k) eqtype_rec(rename, tp, subst, env, tl1[k], tl2[k]);
+  for (std::size_t k = 0; k < tl1.size(); ++k)
+    if (!eqtype_rec(rename, tp, subst, env, tl1[k], tl2[k], fail)) return false;
+  return true;
 }
-static void eqtype_labeled_list(bool rename, TypePairs& tp, Subst& subst, env::t env,
-                                Slice<LabeledTy> l1, Slice<LabeledTy> l2);
-static void eqtype_package(bool rename, TypePairs& tp, Subst& subst, env::t env, long lvl1,
-                           const Package* pack1, long lvl2, const Package* pack2);
-static void eqtype_fields(bool rename, TypePairs& tp, Subst& subst, env::t env, TypeExpr* ty1,
-                          TypeExpr* ty2);
-static void eqtype_row(bool rename, TypePairs& tp, Subst& subst, env::t env, const RowDesc* row1,
-                       const RowDesc* row2);
+static bool eqtype_labeled_list(bool rename, TypePairs& tp, Subst& subst, env::t env,
+                                Slice<LabeledTy> l1, Slice<LabeledTy> l2, et::TypeTrace& fail);
+static bool eqtype_package(bool rename, TypePairs& tp, Subst& subst, env::t env, long lvl1,
+                           const Package* pack1, long lvl2, const Package* pack2,
+                           et::TypeTrace& fail);
+static bool eqtype_fields(bool rename, TypePairs& tp, Subst& subst, env::t env, TypeExpr* ty1,
+                          TypeExpr* ty2, et::TypeTrace& fail);
+static bool eqtype_row(bool rename, TypePairs& tp, Subst& subst, env::t env, const RowDesc* row1,
+                       const RowDesc* row2, et::TypeTrace& fail);
 
-static void eqtype_rec(bool rename, TypePairs& type_pairs, Subst& subst, env::t env, TypeExpr* t1,
-                       TypeExpr* t2) {
+// eqtype_rec's body, inside ctype.ml's [try ... with Equality_trace trace -> ...]
+static bool eqtype_rec_body(bool rename, TypePairs& type_pairs, Subst& subst, env::t env,
+                            TypeExpr* t1, TypeExpr* t2, et::TypeTrace& fail) {
+  auto check_phys_eq = [&](TypeExpr* a, TypeExpr* b) { return !rename && eq_type(a, b); };
+  auto rec = [&](env::t e, TypeExpr* a, TypeExpr* b) {
+    return eqtype_rec(rename, type_pairs, subst, e, a, b, fail);
+  };
+  // for the callbacks of the helpers that raise
+  auto rec_raise = [&](env::t e, TypeExpr* a, TypeExpr* b) {
+    if (!rec(e, a, b)) throw EqualityTrace{std::move(fail)};
+  };
+  const TypeDesc* d1 = get_desc(t1);
+  const TypeDesc* d2 = get_desc(t2);
+  auto* c1 = as<Tconstr>(d1);
+  auto* c2 = as<Tconstr>(d2);
+  if (d1->kind == DK::Tvar && d2->kind == DK::Tvar && rename)
+    return eqtype_subst(type_pairs, subst, t1, t2, fail);
+  if (c1 && c2 && c1->args.empty() && c2->args.empty() &&
+      env::path_equiv(env, c1->path, c2->path))
+    return true;
+  TypeExpr* t1p = expand_head_rigid(env, t1);
+  TypeExpr* t2p = expand_head_rigid(env, t2);
+  // Expansion may have changed the representative of the types...
+  if (check_phys_eq(t1p, t2p)) return true;
+  if (type_pairs.mem(t1p, t2p)) return true;
+  type_pairs.add(t1p, t2p);
+  const TypeDesc* e1 = get_desc(t1p);
+  const TypeDesc* e2 = get_desc(t2p);
+  auto* a1 = as<Tarrow>(e1);
+  auto* a2 = as<Tarrow>(e2);
+  auto* f1 = as<Tfunctor>(e1);
+  auto* f2 = as<Tfunctor>(e2);
+  auto* k1 = as<Tconstr>(e1);
+  auto* k2 = as<Tconstr>(e2);
+  if (e1->kind == DK::Tvar && e2->kind == DK::Tvar && rename) {
+    return eqtype_subst(type_pairs, subst, t1p, t2p, fail);
+  } else if (a1 && a2) {
+    return eq_labels_eq(fail, a1->label, a2->label) && rec(env, a1->t1, a2->t1) &&
+           rec(env, a1->t2, a2->t2);
+  } else if (f1 && f2) {
+    if (!eq_labels_eq(fail, f1->label, f2->label)) return false;
+    if (!eqtype_package(rename, type_pairs, subst, env, get_level(t1p), f1->pack, get_level(t2p),
+                        f2->pack, fail))
+      return false;
+    const ModuleType* mty1 = modtype_of_package(env, location::none(), f1->pack);
+    const ModuleType* mty2 = modtype_of_package(env, location::none(), f2->pack);
+    return eq_guard(fail, [&] {
+      enter_functor_with_mtys_for(TraceExn::Equality, env, f1->id, mty1, t1p, f2->id, mty2, t2p,
+                                  [&](env::t new_env) { rec_raise(new_env, f1->body, f2->body); });
+    });
+  } else if (f1 && a2) {
+    if (!eq_labels_eq(fail, f1->label, a2->label)) return false;
+    TypeExpr* tt1 = newmono_package(f1->pack);
+    if (!rec(env, tt1, a2->t1)) return false;
+    const ModuleType* mty = modtype_of_package(env, location::none(), f1->pack);
+    env::t env2 =
+        env::add_module(Ident::of_unscoped(f1->id), ModulePresence::Mp_present, mty, env);
+    if (!eq_guard(fail, [&] { identifier_escape_for(TraceExn::Equality, env2, {f1->id}, f1->body); }))
+      return false;
+    return rec(env, f1->body, a2->t2);
+  } else if (a1 && f2) {
+    if (!eq_labels_eq(fail, a1->label, f2->label)) return false;
+    TypeExpr* tt2 = newmono_package(f2->pack);
+    if (!rec(env, a1->t1, tt2)) return false;
+    const ModuleType* mty = modtype_of_package(env, location::none(), f2->pack);
+    env::t env2 =
+        env::add_module(Ident::of_unscoped(f2->id), ModulePresence::Mp_present, mty, env);
+    if (!eq_guard(fail, [&] { identifier_escape_for(TraceExn::Equality, env2, {f2->id}, f2->body); }))
+      return false;
+    return rec(env, a1->t2, f2->body);
+  } else if (e1->kind == DK::Ttuple && e2->kind == DK::Ttuple) {
+    return eqtype_labeled_list(rename, type_pairs, subst, env, as<Ttuple>(e1)->elems,
+                               as<Ttuple>(e2)->elems, fail);
+  } else if (k1 && k2 && env::path_equiv(env, k1->path, k2->path)) {
+    return eqtype_list_same_length_rec(rename, type_pairs, subst, env, k1->args, k2->args, fail);
+  } else if (e1->kind == DK::Tpackage && e2->kind == DK::Tpackage) {
+    return eqtype_package(rename, type_pairs, subst, env, get_level(t1p), as<Tpackage>(e1)->pack,
+                          get_level(t2p), as<Tpackage>(e2)->pack, fail);
+  } else if (e1->kind == DK::Tnil && k2) {
+    return eq_fail(fail, {abstract_row(et::Position::Second)});
+  } else if (k1 && e2->kind == DK::Tnil) {
+    return eq_fail(fail, {abstract_row(et::Position::First)});
+  } else if (e1->kind == DK::Tvariant && e2->kind == DK::Tvariant) {
+    return eqtype_row(rename, type_pairs, subst, env, as<Tvariant>(e1)->row,
+                      as<Tvariant>(e2)->row, fail);
+  } else if (e1->kind == DK::Tobject && e2->kind == DK::Tobject) {
+    return eqtype_fields(rename, type_pairs, subst, env, as<Tobject>(e1)->fields,
+                         as<Tobject>(e2)->fields, fail);
+  } else if (e1->kind == DK::Tfield && e2->kind == DK::Tfield) {  // Actually unused
+    return eqtype_fields(rename, type_pairs, subst, env, t1p, t2p, fail);
+  } else if (e1->kind == DK::Tnil && e2->kind == DK::Tnil) {
+    return true;
+  } else if (e1->kind == DK::Tpoly && e2->kind == DK::Tpoly) {
+    auto* p1 = as<Tpoly>(e1);
+    auto* p2 = as<Tpoly>(e2);
+    if (p1->vars.empty() && p2->vars.empty()) return rec(env, p1->body, p2->body);
+    return eq_guard(fail, [&] {
+      enter_poly_for(TraceExn::Equality, env, p1->body, p1->vars, p2->body, p2->vars,
+                     [&](TypeExpr* a, TypeExpr* b) { rec_raise(env, a, b); });
+    });
+  } else if (e1->kind == DK::Tunivar && e2->kind == DK::Tunivar) {
+    return eq_guard(fail, [&] { unify_univar_for(TraceExn::Equality, t1p, t2p, univar_pairs); });
+  } else {
+    return eq_fail(fail, {});
+  }
+}
+
+static bool eqtype_rec(bool rename, TypePairs& type_pairs, Subst& subst, env::t env, TypeExpr* t1,
+                       TypeExpr* t2, et::TypeTrace& fail) {
   // Checking for physical equality of type representatives when [rename]
   // is true would be incorrect (see ctype.ml).
-  auto check_phys_eq = [&](TypeExpr* a, TypeExpr* b) { return !rename && eq_type(a, b); };
-  if (check_phys_eq(t1, t2)) return;
-  auto rec = [&](env::t e, TypeExpr* a, TypeExpr* b) {
-    eqtype_rec(rename, type_pairs, subst, e, a, b);
-  };
-  try {
-    const TypeDesc* d1 = get_desc(t1);
-    const TypeDesc* d2 = get_desc(t2);
-    auto* c1 = as<Tconstr>(d1);
-    auto* c2 = as<Tconstr>(d2);
-    if (d1->kind == DK::Tvar && d2->kind == DK::Tvar && rename) {
-      eqtype_subst(type_pairs, subst, t1, t2);
-      return;
-    }
-    if (c1 && c2 && c1->args.empty() && c2->args.empty() &&
-        env::path_equiv(env, c1->path, c2->path))
-      return;
-    TypeExpr* t1p = expand_head_rigid(env, t1);
-    TypeExpr* t2p = expand_head_rigid(env, t2);
-    // Expansion may have changed the representative of the types...
-    if (check_phys_eq(t1p, t2p)) return;
-    if (type_pairs.mem(t1p, t2p)) return;
-    type_pairs.add(t1p, t2p);
-    const TypeDesc* e1 = get_desc(t1p);
-    const TypeDesc* e2 = get_desc(t2p);
-    auto* a1 = as<Tarrow>(e1);
-    auto* a2 = as<Tarrow>(e2);
-    auto* f1 = as<Tfunctor>(e1);
-    auto* f2 = as<Tfunctor>(e2);
-    auto* k1 = as<Tconstr>(e1);
-    auto* k2 = as<Tconstr>(e2);
-    if (e1->kind == DK::Tvar && e2->kind == DK::Tvar && rename) {
-      eqtype_subst(type_pairs, subst, t1p, t2p);
-    } else if (a1 && a2) {
-      eq_labels(TraceExn::Equality, false, a1->label, a2->label);
-      rec(env, a1->t1, a2->t1);
-      rec(env, a1->t2, a2->t2);
-    } else if (f1 && f2) {
-      eq_labels(TraceExn::Equality, false, f1->label, f2->label);
-      eqtype_package(rename, type_pairs, subst, env, get_level(t1p), f1->pack, get_level(t2p),
-                     f2->pack);
-      const ModuleType* mty1 = modtype_of_package(env, location::none(), f1->pack);
-      const ModuleType* mty2 = modtype_of_package(env, location::none(), f2->pack);
-      enter_functor_with_mtys_for(TraceExn::Equality, env, f1->id, mty1, t1p, f2->id, mty2, t2p,
-                                  [&](env::t new_env) { rec(new_env, f1->body, f2->body); });
-    } else if (f1 && a2) {
-      eq_labels(TraceExn::Equality, false, f1->label, a2->label);
-      TypeExpr* tt1 = newmono_package(f1->pack);
-      rec(env, tt1, a2->t1);
-      const ModuleType* mty = modtype_of_package(env, location::none(), f1->pack);
-      env::t env2 =
-          env::add_module(Ident::of_unscoped(f1->id), ModulePresence::Mp_present, mty, env);
-      identifier_escape_for(TraceExn::Equality, env2, {f1->id}, f1->body);
-      rec(env, f1->body, a2->t2);
-    } else if (a1 && f2) {
-      eq_labels(TraceExn::Equality, false, a1->label, f2->label);
-      TypeExpr* tt2 = newmono_package(f2->pack);
-      rec(env, a1->t1, tt2);
-      const ModuleType* mty = modtype_of_package(env, location::none(), f2->pack);
-      env::t env2 =
-          env::add_module(Ident::of_unscoped(f2->id), ModulePresence::Mp_present, mty, env);
-      identifier_escape_for(TraceExn::Equality, env2, {f2->id}, f2->body);
-      rec(env, a1->t2, f2->body);
-    } else if (e1->kind == DK::Ttuple && e2->kind == DK::Ttuple) {
-      eqtype_labeled_list(rename, type_pairs, subst, env, as<Ttuple>(e1)->elems,
-                          as<Ttuple>(e2)->elems);
-    } else if (k1 && k2 && env::path_equiv(env, k1->path, k2->path)) {
-      eqtype_list_same_length_rec(rename, type_pairs, subst, env, k1->args, k2->args);
-    } else if (e1->kind == DK::Tpackage && e2->kind == DK::Tpackage) {
-      eqtype_package(rename, type_pairs, subst, env, get_level(t1p), as<Tpackage>(e1)->pack,
-                     get_level(t2p), as<Tpackage>(e2)->pack);
-    } else if (e1->kind == DK::Tnil && k2) {
-      raise_for(TraceExn::Equality, abstract_row(et::Position::Second));
-    } else if (k1 && e2->kind == DK::Tnil) {
-      raise_for(TraceExn::Equality, abstract_row(et::Position::First));
-    } else if (e1->kind == DK::Tvariant && e2->kind == DK::Tvariant) {
-      eqtype_row(rename, type_pairs, subst, env, as<Tvariant>(e1)->row, as<Tvariant>(e2)->row);
-    } else if (e1->kind == DK::Tobject && e2->kind == DK::Tobject) {
-      eqtype_fields(rename, type_pairs, subst, env, as<Tobject>(e1)->fields,
-                    as<Tobject>(e2)->fields);
-    } else if (e1->kind == DK::Tfield && e2->kind == DK::Tfield) {  // Actually unused
-      eqtype_fields(rename, type_pairs, subst, env, t1p, t2p);
-    } else if (e1->kind == DK::Tnil && e2->kind == DK::Tnil) {
-    } else if (e1->kind == DK::Tpoly && e2->kind == DK::Tpoly) {
-      auto* p1 = as<Tpoly>(e1);
-      auto* p2 = as<Tpoly>(e2);
-      if (p1->vars.empty() && p2->vars.empty())
-        rec(env, p1->body, p2->body);
-      else
-        enter_poly_for(TraceExn::Equality, env, p1->body, p1->vars, p2->body, p2->vars,
-                       [&](TypeExpr* a, TypeExpr* b) { rec(env, a, b); });
-    } else if (e1->kind == DK::Tunivar && e2->kind == DK::Tunivar) {
-      unify_univar_for(TraceExn::Equality, t1p, t2p, univar_pairs);
-    } else {
-      raise_unexplained_for(TraceExn::Equality);
-    }
-  } catch (EqualityTrace& e) {
-    raise_trace_for(TraceExn::Equality, cons(diff_elt(t1, t2), std::move(e.trace)));
-  }
+  if (!rename && eq_type(t1, t2)) return true;
+  if (eqtype_rec_body(rename, type_pairs, subst, env, t1, t2, fail)) return true;
+  return eq_cons(fail, diff_elt(t1, t2));
 }
 
-static void eqtype_labeled_list(bool rename, TypePairs& tp, Subst& subst, env::t env,
-                                Slice<LabeledTy> l1, Slice<LabeledTy> l2) {
-  if (l1.size() != l2.size()) raise_unexplained_for(TraceExn::Equality);
+static bool eqtype_labeled_list(bool rename, TypePairs& tp, Subst& subst, env::t env,
+                                Slice<LabeledTy> l1, Slice<LabeledTy> l2, et::TypeTrace& fail) {
+  if (l1.size() != l2.size()) return eq_fail(fail, {});
   for (std::size_t k = 0; k < l1.size(); ++k) {
-    if (!(l1[k].label == l2[k].label)) raise_unexplained_for(TraceExn::Equality);
-    eqtype_rec(rename, tp, subst, env, l1[k].ty, l2[k].ty);
+    if (!(l1[k].label == l2[k].label)) return eq_fail(fail, {});
+    if (!eqtype_rec(rename, tp, subst, env, l1[k].ty, l2[k].ty, fail)) return false;
   }
+  return true;
 }
 
-static void eqtype_package(bool rename, TypePairs& tp, Subst& subst, env::t env, long lvl1,
-                           const Package* pack1, long lvl2, const Package* pack2) {
+static bool eqtype_package(bool rename, TypePairs& tp, Subst& subst, env::t env, long lvl1,
+                           const Package* pack1, long lvl2, const Package* pack2,
+                           et::TypeTrace& fail) {
   PackageSubtypeResult r;
-  try {
-    r = compare_package(
-        env,
-        [&](Slice<TypeExpr*> a, Slice<TypeExpr*> b) {
-          // eqtype_list: the lengths checked first
-          if (a.size() != b.size()) raise_unexplained_for(TraceExn::Equality);
-          eqtype_list_same_length_rec(rename, tp, subst, env, a, b);
-        },
-        lvl1, pack1, lvl2, pack2);
-  } catch (const env::NotFound&) {
-    raise_unexplained_for(TraceExn::Equality);
-  }
-  if (!r.ok) raise_for(TraceExn::Equality, first_class_module(r.err));
+  if (!eq_guard(fail, [&] {
+        try {
+          r = compare_package(
+              env,
+              [&](Slice<TypeExpr*> a, Slice<TypeExpr*> b) {
+                // eqtype_list: the lengths checked first
+                if (a.size() != b.size()) raise_unexplained_for(TraceExn::Equality);
+                if (!eqtype_list_same_length_rec(rename, tp, subst, env, a, b, fail))
+                  throw EqualityTrace{std::move(fail)};
+              },
+              lvl1, pack1, lvl2, pack2);
+        } catch (const env::NotFound&) {
+          raise_unexplained_for(TraceExn::Equality);
+        }
+      }))
+    return false;
+  if (!r.ok) return eq_fail(fail, {first_class_module(r.err)});
+  return true;
 }
 
 static void eqtype_kind(FieldKind* k1, FieldKind* k2) {
@@ -677,56 +728,51 @@ static void eqtype_kind(FieldKind* k1, FieldKind* k2) {
   raise_unexplained_for(TraceExn::Unify);
 }
 
-static void eqtype_fields(bool rename, TypePairs& tp, Subst& subst, env::t env, TypeExpr* ty1,
-                          TypeExpr* ty2) {
+static bool eqtype_fields(bool rename, TypePairs& tp, Subst& subst, env::t env, TypeExpr* ty1,
+                          TypeExpr* ty2, et::TypeTrace& fail) {
   auto [fields1, rest1] = flatten_fields(ty1);
   auto [fields2, rest2] = flatten_fields(ty2);
   // First check if same row => already equal
   bool same_row = (!rename && eq_type(rest1, rest2)) || tp.mem(rest1, rest2);
-  if (same_row) return;
+  if (same_row) return true;
   // Try expansion, needed when called from Includecore.type_manifest
-  if (auto* o = as<Tobject>(get_desc(expand_head_rigid(env, rest2)))) {
-    eqtype_fields(rename, tp, subst, env, ty1, o->fields);
-    return;
-  }
+  if (auto* o = as<Tobject>(get_desc(expand_head_rigid(env, rest2))))
+    return eqtype_fields(rename, tp, subst, env, ty1, o->fields, fail);
   AssociatedFields af = associate_fields(fields1, fields2);
-  eqtype_rec(rename, tp, subst, env, rest1, rest2);
+  if (!eqtype_rec(rename, tp, subst, env, rest1, rest2, fail)) return false;
   if (!af.miss1.empty())
-    raise_for(TraceExn::Equality, missing_field(et::Position::Second, af.miss1[0].name));
+    return eq_fail(fail, {missing_field(et::Position::Second, af.miss1[0].name)});
   if (!af.miss2.empty())
-    raise_for(TraceExn::Equality, missing_field(et::Position::First, af.miss2[0].name));
+    return eq_fail(fail, {missing_field(et::Position::First, af.miss2[0].name)});
   for (auto& p : af.pairs) {
     eqtype_kind(p.k1, p.k2);
-    try {
-      eqtype_rec(rename, tp, subst, env, p.t1, p.t2);
-    } catch (EqualityTrace& e) {
-      raise_trace_for(TraceExn::Equality,
-                      cons(incompatible_fields(p.name, p.t1, p.t2), std::move(e.trace)));
-    }
+    if (!eqtype_rec(rename, tp, subst, env, p.t1, p.t2, fail))
+      return eq_cons(fail, incompatible_fields(p.name, p.t1, p.t2));
   }
+  return true;
 }
 
-static void eqtype_row(bool rename, TypePairs& tp, Subst& subst, env::t env, const RowDesc* row1,
-                       const RowDesc* row2) {
+static bool eqtype_row(bool rename, TypePairs& tp, Subst& subst, env::t env, const RowDesc* row1,
+                       const RowDesc* row2, et::TypeTrace& fail) {
   // Try expansion, needed when called from Includecore.type_manifest
-  if (auto* v = as<Tvariant>(get_desc(expand_head_rigid(env, row_more(row2))))) {
-    eqtype_row(rename, tp, subst, env, row1, v->row);
-    return;
-  }
+  if (auto* v = as<Tvariant>(get_desc(expand_head_rigid(env, row_more(row2)))))
+    return eqtype_row(rename, tp, subst, env, row1, v->row, fail);
   MergedRowFields m = merge_row_fields(row_fields(row1), row_fields(row2));
   bool closed1 = row_closed(row1), closed2 = row_closed(row2);
   if (closed1 != closed2)
-    raise_for(TraceExn::Equality,
-              openness(closed2 ? et::Position::First : et::Position::Second));
+    return eq_fail(fail, {openness(closed2 ? et::Position::First : et::Position::Second)});
   if (!closed1) {
-    if (!m.r1.empty()) raise_for(TraceExn::Equality, no_tags(et::Position::Second, m.r1));
-    if (!m.r2.empty()) raise_for(TraceExn::Equality, no_tags(et::Position::First, m.r2));
+    if (!m.r1.empty()) return eq_fail(fail, {no_tags(et::Position::Second, m.r1)});
+    if (!m.r2.empty()) return eq_fail(fail, {no_tags(et::Position::First, m.r2)});
   }
   if (auto r1 = filter_row_fields(false, m.r1); !r1.empty())
-    raise_for(TraceExn::Equality, no_tags(et::Position::Second, r1));
+    return eq_fail(fail, {no_tags(et::Position::Second, r1)});
   if (auto r2 = filter_row_fields(false, m.r2); !r2.empty())
-    raise_for(TraceExn::Equality, no_tags(et::Position::First, r2));
-  if (!static_row(row1)) eqtype_rec(rename, tp, subst, env, row_more(row1), row_more(row2));
+    return eq_fail(fail, {no_tags(et::Position::First, r2)});
+  if (!static_row(row1) &&
+      !eqtype_rec(rename, tp, subst, env, row_more(row1), row_more(row2), fail))
+    return false;
+  auto rec = [&](TypeExpr* a, TypeExpr* b) { return eqtype_rec(rename, tp, subst, env, a, b, fail); };
   for (auto& pr : m.pairs) {
     std::string_view l = pr.label;
     const RowField* f1 = pr.f1;
@@ -734,17 +780,11 @@ static void eqtype_row(bool rename, TypePairs& tp, Subst& subst, env::t env, con
     if (f1 == f2) continue;
     RowFieldView v1 = row_field_repr(f1);
     RowFieldView v2 = row_field_repr(f2);
-    auto with_tag = [&](auto&& body) {
-      try {
-        body();
-      } catch (EqualityTrace& e) {
-        raise_trace_for(TraceExn::Equality, cons(incompatible_types_for(l), std::move(e.trace)));
-      }
-    };
+    auto with_tag = [&](bool ok) { return ok || eq_cons(fail, incompatible_types_for(l)); };
     bool both_either = v1.kind == RK::Reither && v2.kind == RK::Reither;
     if (v1.kind == RK::Rpresent && v2.kind == RK::Rpresent && v1.present && v2.present) {
       // Both matching [Rpresent]s
-      with_tag([&] { eqtype_rec(rename, tp, subst, env, v1.present, v2.present); });
+      if (!with_tag(rec(v1.present, v2.present))) return false;
     } else if (v1.kind == RK::Rpresent && v2.kind == RK::Rpresent && !v1.present &&
                !v2.present) {
     } else if (both_either && v1.arg_types.empty() && v2.arg_types.empty() &&
@@ -752,61 +792,72 @@ static void eqtype_row(bool rename, TypePairs& tp, Subst& subst, env::t env, con
       // Both matching [Reither]s
     } else if (both_either && !v1.arg_types.empty() && !v2.arg_types.empty() &&
                v1.constant == v2.constant) {
-      with_tag([&] {
+      auto body = [&] {
         TypeExpr* t1 = v1.arg_types[0];
         TypeExpr* t2 = v2.arg_types[0];
-        eqtype_rec(rename, tp, subst, env, t1, t2);
+        if (!rec(t1, t2)) return false;
         std::size_t n1 = v1.arg_types.size() - 1, n2 = v2.arg_types.size() - 1;
         if (n1 == n2) {
           // if same length allow different types (meaning?)
           for (std::size_t k = 0; k < n1; ++k)
-            eqtype_rec(rename, tp, subst, env, v1.arg_types[k + 1], v2.arg_types[k + 1]);
+            if (!rec(v1.arg_types[k + 1], v2.arg_types[k + 1])) return false;
         } else {
           // otherwise everything must be equal
           for (std::size_t k = 1; k < v2.arg_types.size(); ++k)
-            eqtype_rec(rename, tp, subst, env, t1, v2.arg_types[k]);
+            if (!rec(t1, v2.arg_types[k])) return false;
           for (std::size_t k = 1; k < v1.arg_types.size(); ++k)
-            eqtype_rec(rename, tp, subst, env, v1.arg_types[k], t2);
+            if (!rec(v1.arg_types[k], t2)) return false;
         }
-      });
+        return true;
+      };
+      if (!with_tag(body())) return false;
     } else if (v1.kind == RK::Rabsent && v2.kind == RK::Rabsent) {
     } else if ((v1.kind == RK::Rpresent && v2.kind == RK::Rpresent) || both_either) {
       // Mismatched constructor arguments
-      raise_for(TraceExn::Equality, incompatible_types_for(l));
+      return eq_fail(fail, {incompatible_types_for(l)});
     } else if (v1.kind == RK::Reither && v2.kind == RK::Rpresent) {
       // Mismatched presence
-      raise_for(TraceExn::Equality, presence_not_guaranteed_for(et::Position::First, l));
+      return eq_fail(fail, {presence_not_guaranteed_for(et::Position::First, l)});
     } else if (v1.kind == RK::Rpresent && v2.kind == RK::Reither) {
-      raise_for(TraceExn::Equality, presence_not_guaranteed_for(et::Position::Second, l));
+      return eq_fail(fail, {presence_not_guaranteed_for(et::Position::Second, l)});
     } else if (v1.kind == RK::Rabsent) {
       // Missing tags
-      raise_for(TraceExn::Equality, no_tags(et::Position::First, {{l, f2}}));
+      return eq_fail(fail, {no_tags(et::Position::First, {{l, f2}})});
     } else {
-      raise_for(TraceExn::Equality, no_tags(et::Position::Second, {{l, f1}}));
+      return eq_fail(fail, {no_tags(et::Position::Second, {{l, f1}})});
     }
   }
+  return true;
 }
 
 // Must empty univar_pairs first
-static void eqtype_list_same_length(bool rename, TypePairs& tp, Subst& subst, env::t env,
-                                    Slice<TypeExpr*> tl1, Slice<TypeExpr*> tl2) {
+static bool eqtype_list_same_length(bool rename, TypePairs& tp, Subst& subst, env::t env,
+                                    Slice<TypeExpr*> tl1, Slice<TypeExpr*> tl2,
+                                    et::TypeTrace& fail) {
+  bool ok = false;
   with_univar_pairs({}, [&] {
     Snapshot snap = btype::snapshot();
     struct Always {
       Snapshot s;
       ~Always() { btype::backtrack(s); }
     } always{snap};
-    eqtype_list_same_length_rec(rename, tp, subst, env, tl1, tl2);
+    ok = eqtype_list_same_length_rec(rename, tp, subst, env, tl1, tl2, fail);
   });
+  return ok;
 }
 
 void eqtype(bool rename, TypePairs& type_pairs, Subst& subst, env::t env, TypeExpr* t1,
             TypeExpr* t2) {
-  eqtype_list_same_length(rename, type_pairs, subst, env, slice({t1}), slice({t2}));
+  et::TypeTrace fail;
+  if (!eqtype_list_same_length(rename, type_pairs, subst, env, slice({t1}), slice({t2}), fail))
+    raise_trace_for(TraceExn::Equality, std::move(fail));
 }
 
-// Two modes: with or without renaming of variables
-void equal(env::t env, bool rename, Slice<TypeExpr*> tyl1, Slice<TypeExpr*> tyl2) {
+// Two modes: with or without renaming of variables.  The error of
+// [Equality], or none.
+static std::optional<et::EqualityError> equal_error(env::t env, bool rename,
+                                                    Slice<TypeExpr*> tyl1,
+                                                    Slice<TypeExpr*> tyl2) {
   if (tyl1.size() != tyl2.size()) raise_unexplained_for(TraceExn::Equality);
   bool all_eq = true;
   for (std::size_t k = 0; k < tyl1.size(); ++k)
@@ -814,23 +865,21 @@ void equal(env::t env, bool rename, Slice<TypeExpr*> tyl1, Slice<TypeExpr*> tyl2
       all_eq = false;
       break;
     }
-  if (all_eq) return;
+  if (all_eq) return std::nullopt;
   Subst subst;
   TypePairs tp;
-  try {
-    eqtype_list_same_length(rename, tp, subst, env, tyl1, tyl2);
-  } catch (EqualityTrace& e) {
-    throw Equality(expand_to_equality_error(env, e.trace, subst));
-  }
+  et::TypeTrace fail;
+  if (eqtype_list_same_length(rename, tp, subst, env, tyl1, tyl2, fail)) return std::nullopt;
+  return expand_to_equality_error(env, fail, subst);
 }
 
+void equal(env::t env, bool rename, Slice<TypeExpr*> tyl1, Slice<TypeExpr*> tyl2) {
+  if (auto err = equal_error(env, rename, tyl1, tyl2)) throw Equality(std::move(*err));
+}
+
+// The error is still built (expand_trace may expand, as ctype.ml's does).
 bool is_equal(env::t env, bool rename, Slice<TypeExpr*> tyl1, Slice<TypeExpr*> tyl2) {
-  try {
-    equal(env, rename, tyl1, tyl2);
-    return true;
-  } catch (const Equality&) {
-    return false;
-  }
+  return !equal_error(env, rename, tyl1, tyl2);
 }
 
 void equal_private(env::t env, Slice<TypeExpr*> params1, TypeExpr* ty1, Slice<TypeExpr*> params2,
