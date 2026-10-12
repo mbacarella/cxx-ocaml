@@ -188,7 +188,9 @@ def main():
     ap.add_argument('--ill', action='store_true')
     ap.add_argument('--out', default='fuzz-min')
     a = ap.parse_args()
-    dirs = list(a.dirs) + [from_seed(a.out, s, a.level, a.ill) for s in a.seed]
+    a.out = os.path.abspath(a.out)  # the compilers run inside work dirs
+    dirs = [os.path.abspath(d) for d in a.dirs] + \
+        [from_seed(a.out, s, a.level, a.ill) for s in a.seed]
     for d in dirs:
         minimize(d, a.max_tests)
 

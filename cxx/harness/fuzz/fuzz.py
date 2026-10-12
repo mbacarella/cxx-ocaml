@@ -23,7 +23,7 @@ paths agree, and every output the port claims identical is compared:
             stderr, exit); the .s, .cmx and .o bytes; link and run: output
   fl        the flambda tree (FLAMBDA_ROOT, default ~/code/c++caml-mono-fuzz):
             stock ocamlopt.opt vs c++ocamlopt at the seed's flambda flags
-            (-O3 by default), -dflambda + .s + run
+            (-O3 by default), -dflambda, -inlining-report, .s + run
   wp        whole-program mode there (CPPCAML_WP=1 c++ocamlopt -O3): run
             output against stock bytecode's
 
@@ -35,7 +35,9 @@ finding's info line and a regress header carry them as they are.
 
 A stock bytecode / stock native / stock flambda run disagreement is a
 generator problem (unspecified behaviour), reported as UNSPEC, not as a
-port finding.  Findings go to DIR/findings/SEED-LEVEL/ with the program,
+port finding.  A well-typed program (stock -i accepts it) that a stock
+compiler then fails on (a fatal error) is an upstream candidate: noted
+stock-fails:LEVEL, the program and stock's output in DIR/stockfail/SEED.  Findings go to DIR/findings/SEED-LEVEL/ with the program,
 the marked program (minimize.py) and both sides' outputs.
 
 Environment: ROOT (the closure tree, default this checkout), CPPC/CPPOPT
@@ -172,6 +174,10 @@ def compare_levels(wd, levels, wflags=(), stop_at_first=False):
 
     def check(level, res, artifacts=()):
         st, pt = res['stock'], res['port']
+        if stock_ok and rc_of(st[0]) not in (0, None) and level != 'i':
+            # stock accepted the program (-i) but fails here: an
+            # upstream candidate when the program is well typed
+            out['sf:' + level] = st[0]
         if st[0] != pt[0]:
             findings.append((level, st[0], pt[0]))
         for a in artifacts:
@@ -190,6 +196,7 @@ def compare_levels(wd, levels, wflags=(), stop_at_first=False):
 
     stock_ok = None
     if 'i' not in levels and 'bc' not in levels:
+        stock_ok = True
         # whatever the levels, a program stock rejects stops here
         r = run([os.path.join(ROOT, 'ocamlc.opt'), '-nostdlib', '-I',
                  os.path.join(ROOT, 'stdlib')] + W + ['-i', 'fz.ml'], wd, COMPILE_TIMEOUT)
@@ -240,9 +247,10 @@ def compare_levels(wd, levels, wflags=(), stop_at_first=False):
     if stop_at_first and findings:
         return findings, notes, out
     if 'fl' in levels and os.path.isdir(FL):
-        arts = ('fz.s', 'fz.cmx', 'fz.o')
+        arts = ('fz.s', 'fz.cmx', 'fz.o') + tuple(
+            'fz.%d.inlining.org' % k for k in range(3))  # (one per round)
         res = both('fl', lambda s: [s.opt] + s.flags + W + FW + [
-            '-c', '-S', '-dflambda', 'fz.ml'], arts)
+            '-c', '-S', '-dflambda', '-inlining-report', 'fz.ml'], arts)
         check('fl', res, arts)
         res = both('fl', lambda s: [s.opt] + s.flags + W + FW + ['fz.ml', '-o', 'fz.fl'],
                    ('fz.fl',), run_exe=lambda s: ['./fz.fl'])
@@ -496,10 +504,12 @@ def wp_flags(W):
     return [f for f in W if f != '-unboxed-types']
 
 
+# (typing flags that change representations, such as -unboxed-types, are
+# common ones: given to one back end only they make its output differ)
 NAT_FLAGS = [[], ['-linscan'], ['-inline', '0'], ['-inline', '100', '-unsafe'],
              ['-no-float-const-prop'], ['-function-sections'], ['-compact'],
              ['-no-insn-sched', '-nodynlink'], ['-afl-instrument'], ['-g'],
-             ['-unboxed-types', '-linscan'], []]
+             ['-linscan', '-g'], []]
 FL_FLAGS = [['-O3'], ['-O2'], ['-Oclassic'], ['-O3', '-unbox-closures'],
             ['-O3', '-remove-unused-arguments', '-inline-max-unroll', '3'],
             ['-O3', '-no-float-const-prop'], ['-O3', '-linscan', '-unsafe'],
@@ -590,6 +600,17 @@ def one(seed, levels, outdir, ill, mf=False):
         r = run([os.path.join(ROOT, 'ocamlc.opt'), '-nostdlib', '-I',
                  os.path.join(ROOT, 'stdlib')] + split_flags(W)[0] + ['-i', 'fz.ml'], wd, COMPILE_TIMEOUT)
         findings.append(('gen:stock-rejects', r, b''))
+    sf = [k for k in out if k.startswith('sf:')]
+    if sf and not ill:
+        notes.append('stock-fails:' + ','.join(k[3:] for k in sf))
+        fd = os.path.join(outdir, 'stockfail', str(seed))
+        os.makedirs(fd, exist_ok=True)
+        shutil.copy(os.path.join(wd, 'fz.ml'), fd)
+        for k in sf:
+            with open(os.path.join(fd, k[3:]), 'wb') as f:
+                f.write(out.pop(k))
+        with open(os.path.join(fd, 'info'), 'w') as f:
+            f.write('seed %d flags %s\n' % (seed, ' '.join(W)))
     timeouts = [k for k, v in out.items() if v == b'TIMEOUT']
     if timeouts:
         notes.append('timeout:' + ','.join(timeouts))
@@ -636,7 +657,7 @@ def main():
     build_cmtdump(a.out)
     seeds = range(a.start, a.start + a.count)
     stats = {'programs': 0, 'clean': 0, 'finding': 0, 'stock-rejects': 0,
-             'unspec': 0, 'timeout': 0}
+             'unspec': 0, 'timeout': 0, 'stock-fails': 0}
     log = open(os.path.join(a.out, 'log'), 'a')
     with cf.ProcessPoolExecutor(a.jobs) as ex:
         futs = [ex.submit(one, s, levels, a.out, a.ill, a.mf) for s in seeds]
@@ -647,6 +668,8 @@ def main():
                 stats['stock-rejects'] += 1
             if any(n.startswith('UNSPEC') for n in notes):
                 stats['unspec'] += 1
+            if any(n.startswith('stock-fails') for n in notes):
+                stats['stock-fails'] += 1
             if any(n.startswith('timeout') or n == 'wp-timeout' for n in notes):
                 stats['timeout'] += 1
             if findings:
