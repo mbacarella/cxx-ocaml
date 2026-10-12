@@ -87,7 +87,9 @@ approx of closure={ descr=bottom var=p/198 symbol=<no symbol> }
 Fatal error: exception Misc.Fatal_error
 ```
 
-Default flambda (-O1) compiles it.  The anonymous function in the dead
+Fails at -O2 and -O3 in every flambda release tested: 4.14.3, 5.0.0,
+5.1.1, 5.2.1, 5.3.0, 5.4.1, 5.5.1 (each built from its tag with
+--enable-flambda) and trunk.  Default flambda (-O1) compiles it.  The anonymous function in the dead
 branch keeps a projection of `a` from a closure whose approximation is
 bottom, and `simplify_project_var` treats that as an invariant
 violation instead of dead code.  The regression copy is
