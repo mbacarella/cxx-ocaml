@@ -283,10 +283,14 @@ def compare_mf(wd, levels, wflags=()):
     findings, notes, out = [], [], {}
     W = list(wflags)
     order = []
+    mlionly = []
     with open(os.path.join(wd, 'order')) as f:
         for line in f:
             parts = line.split()
-            order.append((parts[0], len(parts) > 1))
+            if parts[1:] == ['mlionly']:
+                mlionly.append(parts[0])
+            else:
+                order.append((parts[0], len(parts) > 1))
     sources = set(os.listdir(wd))
     bindir = os.path.join(wd, '.bin')
     os.makedirs(bindir, exist_ok=True)
@@ -309,6 +313,10 @@ def compare_mf(wd, levels, wflags=()):
         """[(cmd, run?)] and the artifacts to compare."""
         st, arts = [], []
         names = [u for u, _ in order]
+        for u in mlionly:  # interface-only units: their .cmi (and .cmti)
+            comp = s.byte if level != 'mfl' else s.opt
+            st.append(([comp] + s.flags + W + ['-c', '-bin-annot', u + '.mli'], False))
+            arts += [u + '.cmi', u + '.cmti']
         if level == 'mbyte':
             for u, mli in order:
                 st.append(([s.byte] + s.flags + W + ['-i', u + '.ml'], False))
@@ -408,6 +416,9 @@ def compare_mf(wd, levels, wflags=()):
         if sr:
             out[level] = sr
     ref = out.get('mbyte', [None])[0]
+    if any(o == b'TIMEOUT' for v in out.values() for o in v):
+        notes.append('timeout:run')
+        ref = None
     for k in ('mnat', 'mpack', 'mlib', 'mfl'):
         for o in out.get(k, []):
             # a packed unit's exceptions print as Pk.U.E
@@ -417,8 +428,9 @@ def compare_mf(wd, levels, wflags=()):
     if 'mwp' in levels and os.path.isdir(FL) and ref is not None:
         r = run([os.path.join(FL, 'cxx/build-release/c++ocamlopt'), '-nostdlib', '-I',
                  os.path.join(FL, 'stdlib'), '-I', os.path.join(FL, 'runtime')] + W +
-                ['-O3'] + sum([[u + '.mli', u + '.ml'] if m else [u + '.ml']
-                               for u, m in order], []) + ['-o', 'mf.wp'],
+                ['-O3'] + [u + '.mli' for u in mlionly] +
+                sum([[u + '.mli', u + '.ml'] if m else [u + '.ml']
+                     for u, m in order], []) + ['-o', 'mf.wp'],
                 wd, COMPILE_TIMEOUT * 3, env={'CPPCAML_WP': '1', 'TMPDIR': wd})
         if rc_of(r) != 0:
             findings.append(('mwp:build', b'', r))
@@ -462,13 +474,21 @@ def build_cmtdump(outdir):
 
 
 def flags_for(seed):
-    r = seed % 7
+    r = seed % 11
     if r == 3:
         return ['-w', '+a']
     if r == 5:
         return ['-principal']
     if r == 6:
         return ['-w', '+a-4-9-40-41-42-44-45', '-strict-sequence']
+    if r == 7:
+        return ['-short-paths']
+    if r == 8:
+        return ['-g']
+    if r == 9:
+        return ['-opaque']
+    if r == 10:
+        return ['-no-alias-deps', '-w', '+a']
     return []
 
 

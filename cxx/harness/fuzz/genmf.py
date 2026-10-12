@@ -14,7 +14,8 @@ an earlier unit through a manifest `type t = U.t = ...`).  The stock
 compiler is the tree's ocamlc.opt (ROOT, as in fuzz.py).
 
 DIR/order lists the units in link order, one per line, a unit with an
-interface followed by " mli".
+interface followed by " mli", an interface-only unit (sigs.mli, module
+types and a type, no implementation) by " mlionly".
 """
 import os
 import random
@@ -196,6 +197,19 @@ def build(seed, wd, ill=False):
         if j == 0:
             units.append(('absu', absu))
     units[-1] = (units[-1][0], units[-1][1] + absu_use)
+    sigs = r.random() < 0.5
+    if sigs:
+        # an interface-only unit: module types, used through its .cmi alone
+        k = r.randint(0, 99)
+        with open(os.path.join(wd, 'sigs.mli'), 'w') as f:
+            f.write('module type SX = sig type t val v : t val show : t -> string end\n'
+                    "type 'a pair = { l : 'a; r : 'a }\n"
+                    'module type SP = sig include SX val p : t pair end\n')
+        stock(['-c', 'sigs.mli'], wd)
+        units[-1] = (units[-1][0], units[-1][1] +
+                     'module Sx : Sigs.SP = struct type t = int let v = %d '
+                     'let show = string_of_int let p = { Sigs.l = v; r = v + 1 } end\n'
+                     'let () = print_endline ("sx=" ^ Sx.show Sx.v ^ Sx.show Sx.p.Sigs.r)\n' % k)
     for n, src in units:
         with open(os.path.join(wd, n + '.ml'), 'w') as f:
             f.write(src)
@@ -284,6 +298,8 @@ def build(seed, wd, ill=False):
         if f.endswith(('.cmi', '.cmo', '.cmt', '.cmti')):
             os.unlink(os.path.join(wd, f))
     with open(os.path.join(wd, 'order'), 'w') as f:
+        if sigs:
+            f.write('sigs mlionly\n')
         for n in names:
             f.write(n + (' mli' if has_mli[n] else '') + '\n')
     return names, has_mli

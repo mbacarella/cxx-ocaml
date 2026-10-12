@@ -1925,6 +1925,67 @@ let gint_only : int gexp -> int = function
             out.append('let fcnt (n : int) : int = ((new ocnt n)#next#next)#get')
             self.env.append(Var('fcnt', arrow(INT, INT), cost=4))
 
+    def body_expr(self, t, env):
+        """A generated expression of type t that cannot raise."""
+        self.cost = 0
+        self.mult = 1
+        try:
+            e = self.gen(t, env, self.r.randint(1, 4))
+        except Budget:
+            e = E(self.const(t) or '(assert false)')
+        dflt = self.const(t)
+        if dflt is None:
+            return e.code
+        return '(try %s with ex -> print_endline ("exn " ^ Printexc.to_string ex); %s)' % (
+            e.code, dflt)
+
+    def decl_modules3(self, out, i):
+        """A module with a random signature (types of values drawn at
+        random, manifest or abstract t), used directly, through a
+        first-class module and its unpacking, a local open, `let open`,
+        and `include struct` / `open struct` items."""
+        r = self.r2
+        name = 'Rk%d' % i
+        tt = self.rand_type(1, allow_arrow=False)
+        at = self.rand_type(2, allow_arrow=False)
+        abstract = r.random() < 0.5
+        sig_t = 'type t' if abstract else 'type t = %s' % self.tstr(tt)
+        x = self.fresh('mx')
+        v0 = self.body_expr(at, self.env)
+        mk = self.body_expr(tt, self.env)
+        f0 = self.body_expr(INT, self.env + [Var(x, at)])
+        sig = ('sig %s val rv : %s val rfn : %s -> int val rmk : unit -> t '
+               'val rsh : t -> string end' % (sig_t, self.tstr(at), self.tstr(at)))
+        out.append('module type %sS = %s' % (name, sig))
+        out.append('module %s : %sS = struct\n  type t = %s\n  let rv = %s\n'
+                   '  let rfn (%s : %s) = %s\n  let rmk () = %s\n  let rsh (z : t) = %s z\nend'
+                   % (name, name, self.tstr(tt), v0, x, self.tstr(at), f0, mk, self.show(tt)))
+        k = r.random()
+        n0 = '%s_f0' % name.lower()
+        if k < 0.3:
+            out.append('let %s = %s.(rfn rv)' % (n0, name))
+        elif k < 0.6:
+            out.append('let %spk = (module %s : %sS)' % (name.lower(), name, name))
+            out.append('let %s = let module R = (val %spk) in R.rfn R.rv' % (n0, name.lower()))
+        else:
+            out.append('let %s = let open %s in rfn rv' % (n0, name))
+        out.append('let () = print_endline ("%s=" ^ string_of_int %s ^ %s.rsh (%s.rmk ()))'
+                   % (n0, n0, name, name))
+        self.env.append(Var(n0, INT))
+        self.env.append(Var('%s.rv' % name, at))
+        self.env.append(Var('%s.rfn' % name, arrow(at, INT), cost=self.cost + 1))
+        if r.random() < 0.4:
+            iv = 'inc%d' % i
+            t = self.rand_type(1, allow_arrow=False)
+            e = self.body_expr(t, self.env)
+            if r.random() < 0.5:
+                out.append('include struct let %s : %s = %s end' % (iv, self.tstr(t), e))
+            else:
+                out.append('open struct let hid%d = %s end\nlet %s : %s = hid%d'
+                           % (i, e, iv, self.tstr(t), i))
+            out.append('let () = print_endline ("%s=" ^ %s %s)' % (iv, self.show(t), iv))
+            self.env.append(Var(iv, t))
+
     def decl_fun(self, out, i):
         name = 'f%d' % i
         params = []
@@ -2034,7 +2095,11 @@ let gint_only : int gexp -> int = function
             self.ill_at = self.r.randint(1, 300)
         nitems = self.r.randint(6, 18)
         fi = vi = 0
+        mi = 0
         for _ in range(nitems):
+            if self.r2.random() < 0.12:
+                self.decl_modules3(out, mi)
+                mi += 1
             k = self.r.random()
             if k < 0.35:
                 self.decl_fun(out, fi)
