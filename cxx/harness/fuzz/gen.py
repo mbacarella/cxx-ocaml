@@ -154,7 +154,7 @@ let show_array f a = "[|" ^ String.concat "; " (Array.to_list (Array.map f a)) ^
 let show_option f = function None -> "None" | Some x -> "Some(" ^ f x ^ ")"
 let show_string s = "\"" ^ String.escaped s ^ "\""
 let show_char c = "'" ^ Char.escaped c ^ "'"
-let show_float f = Printf.sprintf "%h" f
+let show_float f = if Float.is_nan f then "nan" else Printf.sprintf "%h" f  (* (a NaN's sign follows operand order) *)
 let show_ref f r = "ref(" ^ f !r ^ ")"
 let show_lazy f l = "lazy(" ^ f (Lazy.force l) ^ ")"
 let show_fun _ = "<fun>"
@@ -945,7 +945,7 @@ class Gen:
             return self.bi_pat(k), []
         if k == 'lazy' and self.r3.random() < 0.6:
             p, b = self.gen_pat(t[1], d - 1)
-            return '(lazy %s)' % p, b
+            return '(lazy (%s))' % p, b
         if k == 'tuple' and len(t[1]) == 2 and t[1][0] == t[1][1] and \
                 t[1][0] in (INT, CHAR, BOOL, STRING) and self.r3.random() < 0.3:
             # an or-pattern binding the same variable on both sides
@@ -2488,7 +2488,7 @@ let gint_only : int gexp -> int = function
         self.bi = r.random() < 0.5
         for name, p in (('prims', 0.3), ('flt', 0.35), ('switch', 0.45), ('gadt3', 0.35),
                         ('pv3', 0.35), ('lbl3', 0.35), ('eff3', 0.3), ('ext3', 0.3),
-                        ('big3', 0.35), ('bi3', 0.3)):
+                        ('big3', 0.35), ('bi3', 0.3), ('misc3', 0.4)):
             if r.random() < p:
                 getattr(self, 'decl3_' + name)(out)
 
@@ -2973,6 +2973,43 @@ type ext3 += X3c of string''' % (k1, k2))
                    % (' '.join(lets), ' '.join(fvs[:1]), ' '.join(fvs[1:]), clo, code,
                       ' '.join('(n + %d)' % i for i in range(m))))
         self.env.append(Var('f3big', arrow(INT, STRING), cost=8))
+
+    def decl3_misc3(self, out):
+        """Rarely exercised transformations and attributes: Tmc, recursive
+        values, binding operators, labeled tuples, [@local], [@specialise],
+        [@unrolled], [@tailcall], [@@immediate], local [@warning]."""
+        r = self.r3
+        k1, k2, k3 = r.randint(1, 9), r.randint(0, 5), r.randint(2, 6)
+        out.append('''let[@tail_mod_cons] rec tmc_map f = function [] -> [] | x :: l -> f x :: tmc_map f l
+let[@tail_mod_cons] rec tmc_app l1 l2 = match l1 with
+  | [] -> l2
+  | x :: l -> if x mod %d = 0 then x :: x :: (tmc_app [@tailcall]) l l2 else x :: tmc_app l l2
+let rec cyc3 = %d :: 2 :: cyc3
+type rr3 = { rv : int; rn : unit -> int }
+let rec rrec = { rv = %d; rn = fun () -> rrec.rv * 2 }
+let rec lz3a = lazy (1 + Lazy.force lz3b) and lz3b = lazy %d
+let rec fev3 = fun n -> if n <= 0 then true else fod3 (n - 1) and fod3 = fun n -> n > 0 && fev3 (n - 1)
+type imm3 = I0 | I1 | I2 [@@immediate]
+let ( let* ) o f = match o with None -> None | Some x -> f x
+let ( and* ) a b = match a, b with Some x, Some y -> Some (x, y) | _ -> None
+let ( let+ ) o f = Option.map f o
+let[@specialise] spec3 (f : int -> int) l = List.fold_left (fun a x -> a + f x) 0 l
+let rec unr3 n acc = if n <= 0 then acc else (unr3 [@unrolled %d]) (n - 1) (acc + n)''' % (k1, k2, k3, k1, k3))
+        out.append('''let f3misc (n : int) : string =
+  let[@local] loc3 x = x * %d + n in
+  let a = tmc_map (fun x -> x * n) [1; 2; 3] in
+  let b = tmc_app a [n; n + 1] in
+  let c = match cyc3 with a :: b :: c :: d :: _ -> [a; b; c; d] | _ -> [] in
+  let o = let* x = Some n and* y = (if n > 0 then Some 1 else None) in let+ z = Some (x + y) in z * 2 in
+  let lt = (~x:n, ~y:(string_of_int n), 3) in
+  let (~x, ~y, _) = lt in
+  let im = match n land 3 with 0 -> I0 | 1 -> I1 | _ -> I2 in
+  let[@warning "-26"] unused = n in
+  show_list string_of_int (a @ b @ c) ^ "|" ^ show_option string_of_int o ^ "|" ^ string_of_int (x + loc3 x + loc3 (x + 1))
+  ^ y ^ "|" ^ string_of_int (rrec.rn () + Lazy.force lz3a) ^ string_of_bool (fev3 (n land 15))
+  ^ "|" ^ string_of_int (spec3 succ a + spec3 (fun v -> v * v) b + unr3 (n land 31) 0)
+  ^ (match im with I0 -> "i0" | I1 -> "i1" | I2 -> "i2")''' % r.randint(1, 7))
+        self.env.append(Var('f3misc', arrow(INT, STRING), cost=8))
 
     def decl3_bi3(self, out):
         r = self.r3

@@ -256,10 +256,10 @@ def compare_levels(wd, levels, wflags=(), stop_at_first=False):
                    ('fz.fl',), run_exe=lambda s: ['./fz.fl'])
         check('flexe', res, ('fz.fl',))
         out['fl'] = res['stock'][2]
-    if 'wp' in levels and os.path.isdir(FL):
+    if 'wp' in levels and os.path.isdir(FL) and wp_ok(W):
         rm([os.path.join(wd, 'fz.wp')])
         r = run([os.path.join(FL, 'cxx/build-release/c++ocamlopt'), '-nostdlib', '-I',
-                 os.path.join(FL, 'stdlib'), '-I', os.path.join(FL, 'runtime')] + wp_flags(W) +
+                 os.path.join(FL, 'stdlib'), '-I', os.path.join(FL, 'runtime')] + W +
                 ['-O3', 'fz.ml', '-o', 'fz.wp'], wd, COMPILE_TIMEOUT * 3,
                 env={'CPPCAML_WP': '1', 'TMPDIR': wd})
         if rc_of(r) != 0:
@@ -440,9 +440,9 @@ def compare_mf(wd, levels, wflags=()):
             if ref is not None and o.replace(b'Pk.', b'') != ref:
                 notes.append('UNSPEC-%s' % k)
                 break
-    if 'mwp' in levels and os.path.isdir(FL) and ref is not None:
+    if 'mwp' in levels and os.path.isdir(FL) and ref is not None and wp_ok(W):
         r = run([os.path.join(FL, 'cxx/build-release/c++ocamlopt'), '-nostdlib', '-I',
-                 os.path.join(FL, 'stdlib'), '-I', os.path.join(FL, 'runtime')] + wp_flags(W) +
+                 os.path.join(FL, 'stdlib'), '-I', os.path.join(FL, 'runtime')] + W +
                 ['-O3'] + [u + '.mli' for u in mlionly] +
                 sum([[u + '.mli', u + '.ml'] if m else [u + '.ml']
                      for u, m in order], []) + ['-o', 'mf.wp'],
@@ -498,10 +498,12 @@ def split_flags(wflags):
     return W, NW, FW
 
 
-def wp_flags(W):
+def wp_ok(W):
     """Whole-program mode compiles the stdlib's sources with the program's
-    flags: -unboxed-types would make them miss their own interfaces."""
-    return [f for f in W if f != '-unboxed-types']
+    flags: -unboxed-types would make them miss their own interfaces (and
+    without it the program's representations differ from the reference's:
+    Hashtbl.hash of a one-field record), so no whole-program run then."""
+    return '-unboxed-types' not in W
 
 
 # (typing flags that change representations, such as -unboxed-types, are
