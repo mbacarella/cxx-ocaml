@@ -29,11 +29,7 @@ using F::NK;
 
 namespace {
 
-[[noreturn]] void fatal(const std::function<void(format::Formatter&)>& msg) {
-  format::Formatter f;
-  msg(f);
-  misc::fatal_error(f.contents());
-}
+[[noreturn]] void fatal(const std::function<void(format::Formatter&)>& msg) { misc::fatal_errorf(msg); }
 
 struct ForOneOrMoreUnits {
   variable::Map<long> fun_offset_table;  // Closure_id.Map

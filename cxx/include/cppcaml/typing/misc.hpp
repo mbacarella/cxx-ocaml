@@ -13,6 +13,10 @@
 #include "cppcaml/typing/build_path_prefix_map.hpp"
 #include "cppcaml/typing/format_doc.hpp"
 
+namespace cppcaml::typing::format {
+class Formatter;
+}
+
 namespace cppcaml::typing::misc {
 
 namespace fd = format_doc;
@@ -80,6 +84,9 @@ struct FatalError {};
 // printed; c++ocamlopt's native back end collects them in a formatter, which
 // the driver writes out from here.
 extern std::function<void()> flush_before_fatal;
+// fatal_errorf: ">> Fatal error: ", the message and "@." laid out by one
+// formatter (the message's breaks count the prefix's 16 columns)
+[[noreturn]] void fatal_errorf(const std::function<void(format::Formatter&)>& msg);
 
 // get_build_path_prefix_map (): BUILD_PATH_PREFIX_MAP, decoded once (an
 // invalid value is a fatal error)

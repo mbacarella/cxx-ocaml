@@ -14,11 +14,7 @@ using format::fprintf;
 namespace F = flambda;
 
 namespace {
-[[noreturn]] void fatal(const std::function<void(Formatter&)>& msg) {
-  Formatter f;
-  msg(f);
-  misc::fatal_error(f.contents());
-}
+[[noreturn]] void fatal(const std::function<void(Formatter&)>& msg) { misc::fatal_errorf(msg); }
 }  // namespace
 
 Env Env::create(bool never_inline, long round, Formatter* ppf_dump) {
