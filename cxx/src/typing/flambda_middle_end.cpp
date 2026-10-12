@@ -23,6 +23,8 @@
 #include "cppcaml/typing/closure_conversion.hpp"
 #include "cppcaml/typing/flambda_evacuate.hpp"
 #include "cppcaml/typing/flambda_invariants.hpp"
+#include "cppcaml/typing/flambda_iterators.hpp"
+#include "cppcaml/typing/warnings.hpp"
 #include "cppcaml/typing/location.hpp"
 #include "cppcaml/typing/misc.hpp"
 #include "cppcaml/typing/initialize_symbol_to_let_symbol.hpp"
@@ -247,7 +249,24 @@ flambda::Program lambda_to_flambda(format::Formatter& ppf_dump, const std::strin
   flam = step(flam, "Lift_constants", lift_constants);
   flam = step(flam, "Share_constants", share_constants);
   flam = step(flam, "Remove_unused_program_constructs", remove_unused_program_constructs);
-  // (the unused [@inlined] / [@unrolled] warnings)
+  // Check that there aren't any unused "always inline" attributes.
+  flambda_iterators::iter_apply_on_program(flam, [](const flambda::Apply* apply) {
+    using IK = lambda::InlineAttribute::Kind;
+    const char* msg = nullptr;
+    switch (apply->inline_.kind) {
+      case IK::Default_inline: case IK::Never_inline: case IK::Hint_inline: return;
+      case IK::Always_inline:
+        msg = "[@inlined] attribute was not used on this function application (the optimizer did not know what "
+              "function was being applied)";
+        break;
+      case IK::Unroll:
+        msg = "[@unrolled] attribute was not used on this function application (the optimizer did not know what "
+              "function was being applied)";
+        break;
+    }
+    location::prerr_warning(debuginfo::to_location(apply->dbg),
+                            warnings::Warning::with_s(warnings::Warning::K::Inlining_impossible, msg));
+  });
   if (clflags::dump_flambda)
     fprintf(ppf_dump, "End of middle end:@ %a@.", [&](format::Formatter& f) { flambda::print_program(f, flam); });
   return zones.finish(flam);
