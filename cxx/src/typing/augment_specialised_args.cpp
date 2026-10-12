@@ -32,11 +32,7 @@ struct DefCmp {
 using DefSet = OSet<Definition, DefCmp>;
 using ProjMap = OMap<projection::t, variable::t, inline_and_simplify_aux::ProjCmp>;
 
-[[noreturn]] void fatal(const std::function<void(Formatter&)>& msg) {
-  Formatter f;
-  msg(f);
-  misc::fatal_error(f.contents());
-}
+[[noreturn]] void fatal(const std::function<void(Formatter&)>& msg) { misc::fatal_errorf(msg); }
 
 Slice<Definition> cons(const Definition& d, Slice<Definition> l) {
   std::vector<Definition> v;

@@ -51,11 +51,7 @@ namespace {
 
 constexpr long size_int = 8;  // Backend.size_int (amd64)
 
-[[noreturn]] void fatal(const std::function<void(Formatter&)>& msg) {
-  Formatter f;
-  msg(f);
-  misc::fatal_error(f.contents());
-}
+[[noreturn]] void fatal(const std::function<void(Formatter&)>& msg) { misc::fatal_errorf(msg); }
 
 R ret(const R& r, A::t a) { return r.set_approx(a); }
 

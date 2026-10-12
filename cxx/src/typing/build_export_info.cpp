@@ -33,11 +33,7 @@ Approx value_symbol(symbol::t s) { return {AK::Value_symbol, nullptr, s}; }
 
 const Descr* mk(const Descr& d) { return make<Descr>(d); }
 
-[[noreturn]] void fatal(const std::function<void(format::Formatter&)>& msg) {
-  format::Formatter f;
-  msg(f);
-  misc::fatal_error(f.contents());
-}
+[[noreturn]] void fatal(const std::function<void(format::Formatter&)>& msg) { misc::fatal_errorf(msg); }
 
 // Env.Global: [ex_table] and [closure_table] are shared (OCaml's refs)
 struct Tables {

@@ -879,13 +879,19 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
         struct ResetFlush {
           ~ResetFlush() { cppcaml::typing::misc::flush_before_fatal = nullptr; }
         } reset_flush;
-        ty::closure_middle_end::WithConstants clambda = [&] {
-          if constexpr (ty::config::flambda) return ty::flambda_middle_end::lambda_to_clambda(dump, remove_extension(cmo_out), prog, lam);
-          else return ty::closure_middle_end::lambda_to_clambda(dump, prog, lam);
-        }();
-        ty::lambda::set_node_zone(nullptr);
-        lambda_nodes.clear();
-        lap("clambda", tp);
+        // the middle end runs inside compile_unit's generator, as in
+        // Asmgen.compile_implementation: the assembly file is opened first, so
+        // a middle-end failure leaves it empty (kept under -S)
+        auto middle_end = [&] {
+          ty::closure_middle_end::WithConstants clambda = [&] {
+            if constexpr (ty::config::flambda) return ty::flambda_middle_end::lambda_to_clambda(dump, remove_extension(cmo_out), prog, lam);
+            else return ty::closure_middle_end::lambda_to_clambda(dump, prog, lam);
+          }();
+          ty::lambda::set_node_zone(nullptr);
+          lambda_nodes.clear();
+          lap("clambda", tp);
+          return clambda;
+        };
         // Asmgen.compile_unit: end_gen_implementation (Cmmgen.compunit,
         // compile_phrases with the -d dumps, then the references to the
         // external primitives' symbols) into the assembly file (kept with
@@ -893,7 +899,7 @@ static int compile_ml_(const std::string& in_path, const std::string& cmo_out, b
         std::string prefix = remove_extension(cmo_out);
         try {
           ty::asmgen::compile_unit(ty::asmgen::asm_filename(prefix), cf::keep_asm_file, prefix + ty::config::ext_obj,
-                                   [&] { return ty::asmgen::end_gen_implementation(dump, clambda); });
+                                   [&] { return ty::asmgen::end_gen_implementation(dump, middle_end()); });
         } catch (const ty::polling::PollError& e) {
           // Location.error_of_printer_file Polling.report_error
           ppf_dump.out() << dump.contents();

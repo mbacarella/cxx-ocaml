@@ -46,11 +46,7 @@ struct EffectDef {
 using InitializeSymbolTbl = symbol::Tbl<InitSym>;
 using EffectTbl = symbol::Tbl<EffectDef>;
 
-[[noreturn]] void fatal(const std::function<void(Formatter&)>& msg) {
-  Formatter f;
-  msg(f);
-  misc::fatal_error(f.contents());
-}
+[[noreturn]] void fatal(const std::function<void(Formatter&)>& msg) { misc::fatal_errorf(msg); }
 
 // CR-someday mshinwell: move to Flambda_utils
 variable::t tail_variable(t e) {

@@ -10,6 +10,7 @@
 #include "cppcaml/typing/clflags.hpp"
 
 #include "cppcaml/typing/config.hpp"
+#include "cppcaml/typing/format.hpp"
 #include "cppcaml/typing/filename.hpp"
 
 #include <filesystem>
@@ -169,6 +170,18 @@ void print_manual_hint(fd::Formatter& ppf, const std::vector<long>& section) {
 }
 
 std::function<void()> flush_before_fatal;
+
+void fatal_errorf(const std::function<void(format::Formatter&)>& msg) {
+  format::Formatter f;
+  format::fprintf(f, ">> Fatal error: ");
+  msg(f);
+  format::fprintf(f, "@.");
+  if (flush_before_fatal) flush_before_fatal();
+  std::cout.flush();
+  std::cerr << f.contents();
+  std::cerr.flush();
+  throw FatalError{};
+}
 
 void fatal_error(const std::string& msg) {
   // Format.kfprintf ... Format.err_formatter ("@?>> Fatal error: " ^^ fmt ^^ "@.")
