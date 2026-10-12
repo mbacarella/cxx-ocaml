@@ -13,6 +13,7 @@
 #include <set>
 #include <stdexcept>
 
+#include "cppcaml/typing/afl_instrument.hpp"
 #include "cppcaml/typing/clflags.hpp"
 #include "cppcaml/typing/cmm_helpers.hpp"
 #include "cppcaml/typing/compilenv.hpp"
@@ -1284,6 +1285,7 @@ expression transl_switch(const Dbg& dbg, const Env& env, expression arg, Slice<l
 Phrase transl_function(const CL::UFunction* f) {
   Env env = create_env(f->env);
   expression cmm_body = transl(env, f->body);
+  if (clflags::afl_instrument) cmm_body = afl_instrument::instrument_function(cmm_body, f->dbg);
   auto* fd = make<Fundecl>();
   fd->fun_name = f->label;
   fd->fun_args = slice(catch_params(f->params));
@@ -1368,6 +1370,8 @@ std::vector<Phrase> compunit(const closure_middle_end::WithConstants& c) {
   if (!cmmgen_state::no_more_functions()) fatal("Cmmgen.compunit");
   cmmgen_state::set_structured_constants(c.constants);
   expression init_code = transl(Env{}, c.code);
+  if (clflags::afl_instrument)
+    init_code = afl_instrument::instrument_initialiser(init_code, [] { return debuginfo::none(); });
   auto* entry = make<Fundecl>();
   entry->fun_name = compilenv::make_symbol(std::string_view("entry"));
   entry->fun_body = init_code;

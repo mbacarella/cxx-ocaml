@@ -38,8 +38,7 @@ using debuginfo::scopes;
 using RBK = tt::RecursiveBindingKind;
 using translobj::oo_prim;
 
-// Clflags.afl_instrument (native only; not in the port's Clflags)
-constexpr bool afl_instrument = false;
+using clflags::afl_instrument;
 
 namespace {
 
