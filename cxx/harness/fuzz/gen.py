@@ -187,6 +187,7 @@ class Budget(Exception):
 class Gen:
     def __init__(self, seed, ill=False):
         self.r = random.Random(seed)
+        self.r2 = random.Random(seed * 7919 + 17)  # second-round features
         self.n = 0
         self.records = {}     # name -> [(field, ty, mutable)]
         self.variants = {}    # name -> [(ctor, [arg tys])]
@@ -1231,7 +1232,10 @@ class Gen:
             return self.binop(FLOAT, ['+.', '-.', '*.', '/.', '**'], env, d)
         if r < 0.38:
             if self.chance(0.3):  # `-` folds into a float literal
-                return E('(%s %s)' % (self.pick(['-', '+', '-.']), self.float_lit().strip('()').lstrip('-')))
+                lit = self.float_lit().strip('()').lstrip('-')
+                # `-`/`+` make a float only of a literal: `- nan` is int negation
+                ops = ['-', '+', '-.'] if lit[:1].isdigit() else ['-.', '+.']
+                return E('(%s %s)' % (self.pick(ops), lit))
             a = self.gen(FLOAT, env, d - 1)
             return E('(%s %s)' % (self.pick(['-.', '+.']), a.code), a.eff)
         if r < 0.45:
@@ -1801,6 +1805,126 @@ let gint_only : int gexp -> int = function
                        '  method extra = st * 2\nend' % self.r.randint(2, 5))
             self.classes_sub.append(('c1', 'c0'))
 
+    # ---------- module system and objects (second round) ----------
+    def decl_functors2(self, out):
+        """Signature include, `with type` / `with module` constraints,
+        destructive substitution, applicative functor paths."""
+        r = self.r2
+        if not self.mods or r.random() < 0.3:
+            return
+        m = r.choice(self.mods)
+        k = r.randint(1, 9)
+        out.append('module type S2 = sig include S val extra : t -> int end')
+        out.append('module MkS2 (X : S) : S2 with type t = X.t = struct include X '
+                   'let extra x = X.get x + %d end' % k)
+        out.append('module P1 = MkS2 (%s)' % m)
+        if r.random() < 0.7:
+            # an applicative path: MkS2(m).t is P1.t
+            out.append('type ap = MkS2(%s).t' % m)
+            out.append('let fap (x : ap) : P1.t = x')
+            out.append('let fp1 (n : int) : string = P1.show (fap (P1.make n)) ^ string_of_int '
+                       '(P1.extra (P1.combine (P1.make n) (P1.make (n + %d))))' % r.randint(0, 5))
+        else:
+            out.append('let fp1 (n : int) : string = P1.show (P1.make n) ^ string_of_int '
+                       '(P1.extra (P1.make n))')
+        self.env.append(Var('fp1', arrow(INT, STRING), cost=4))
+        if r.random() < 0.7:
+            op = r.choice(['+', '-', 'lxor', 'land', 'lor'])
+            out.append('module type SD = S with type t := int')
+            out.append('module D1 : SD = struct let make n = n %s %d let get t = t '
+                       'let combine a b = a %s b let show = string_of_int end'
+                       % ('+', r.randint(0, 9), op))
+            out.append('let fd1 (a : int) (b : int) : int = D1.get (D1.combine (D1.make a) (D1.make b))')
+            self.env.append(Var('fd1', arrow(INT, arrow(INT, INT)), cost=3))
+        if r.random() < 0.6:
+            m2 = r.choice(self.mods)
+            out.append('module type WM = sig module Inner : S val tag : string end')
+            out.append('module type WM2 = WM with module Inner = %s' % m2)
+            out.append('module W2 : WM2 = struct module Inner = %s let tag = "%s" end'
+                       % (m2, r.choice(['w', 'wm', 'inner'])))
+            out.append('module WithMod (Y : WM) = struct let g n = Y.tag ^ Y.Inner.show '
+                       '(Y.Inner.make n) end')
+            out.append('let fw (n : int) : string = let module R = WithMod (W2) in '
+                       'R.g n ^ string_of_int (W2.Inner.get (%s.make n))' % m2)
+            self.env.append(Var('fw', arrow(INT, STRING), cost=4))
+        if r.random() < 0.4:
+            out.append('module type SI = sig type t val v : t val show : t -> string end')
+            out.append('module Twice (A : S) (B : S with type t = A.t) : SI with type t = A.t '
+                       '= struct type t = A.t let v = B.combine (A.make %d) (A.make %d) '
+                       'let show = A.show end' % (r.randint(0, 20), r.randint(0, 20)))
+            out.append('module T2 = Twice (%s) (%s)' % (m, m))
+            out.append('let ftw : string = T2.show T2.v')
+            self.env.append(Var('ftw', STRING))
+
+    def decl_recmods(self, out):
+        r = self.r2
+        if r.random() < 0.6:
+            return
+        if r.random() < 0.6:
+            k1, k2, k3 = r.randint(1, 9), r.randint(1, 5), r.randint(0, 3)
+            out.append(
+                'module rec RA : sig\n'
+                '  type t = Leaf of int | Node of RB.t list\n'
+                '  val sum : t -> int\n  val mk : int -> t\nend = struct\n'
+                '  type t = Leaf of int | Node of RB.t list\n'
+                '  let sum = function Leaf n -> n\n'
+                '    | Node l -> List.fold_left (fun a b -> a + RB.total b) 0 l\n'
+                '  let mk n = if n <= %d then Leaf (n + %d) else Node [RB.mk (n - 1); RB.mk (n - 2)]\n'
+                'end\n'
+                'and RB : sig\n  type t = { w : int; kids : RA.t }\n'
+                '  val total : t -> int\n  val mk : int -> t\nend = struct\n'
+                '  type t = { w : int; kids : RA.t }\n'
+                '  let total r = r.w * %d + RA.sum r.kids\n'
+                '  let mk n = { w = n; kids = RA.mk (n - 1) }\nend' % (k3, k1, k2))
+            out.append('let frec (n : int) : int = RA.sum (RA.mk (n land 7))')
+            self.env.append(Var('frec', arrow(INT, INT), cost=40))
+        else:
+            k = r.randint(0, 15)
+            out.append(
+                'module rec Ev : sig val f : int -> bool val lz : int Lazy.t end = struct\n'
+                '  let f n = n = 0 || Od.f (n - 1)\n'
+                '  let lz = lazy (if Od.f %d then 1 else 2)\nend\n'
+                'and Od : sig val f : int -> bool end = struct\n'
+                '  let f n = n <> 0 && Ev.f (n - 1)\nend' % k)
+            out.append('let fevn (n : int) : bool = Ev.f (n land 15) && Lazy.force Ev.lz > 0')
+            self.env.append(Var('fevn', arrow(INT, BOOL), cost=20))
+
+    def decl_objects2(self, out):
+        r = self.r2
+        if r.random() < 0.5:
+            return
+        k = r.randint(1, 4)
+        out.append('class virtual oshape (k : int) = object (self)\n'
+                   '  method virtual area : int\n'
+                   '  method private scale x = x * k\n'
+                   '  method describe = "shape:" ^ string_of_int (self#scale self#area)\n'
+                   'end')
+        out.append('class osq s = object\n  inherit oshape %d\n  val side = s\n'
+                   '  method area = side * side\nend' % k)
+        out.append('class osq2 s = object\n  inherit osq s as super\n'
+                   '  method! area = super#area + %d\n'
+                   '  method! describe = "sq2/" ^ super#describe\n'
+                   '  method id : \'a. \'a -> \'a = fun x -> x\nend' % r.randint(0, 3))
+        out.append('let odescribe (l : < describe : string; .. > list) =\n'
+                   '  String.concat "," (List.map (fun o -> o#describe) l)')
+        out.append('let fobj (n : int) : string = odescribe [ (new osq n :> oshape); '
+                   '(new osq2 (n + 1) :> oshape) ] ^ string_of_int ((new osq2 n)#id n)')
+        self.env.append(Var('fobj', arrow(INT, STRING), cost=6))
+        if r.random() < 0.7:
+            out.append('let oimm n = object\n  val mutable c = n\n'
+                       '  method incr = c <- c + %d; c\n  method get = c\n'
+                       '  method copy = {< c = c * 2 >}\nend' % r.randint(1, 3))
+            out.append('let oget (o : < get : int; .. >) = o#get')
+            out.append('let fimm (n : int) : int = let o = oimm n in let a = o#incr in '
+                       'let b = (o#copy)#incr in a + b + oget o')
+            self.env.append(Var('fimm', arrow(INT, INT), cost=6))
+        if r.random() < 0.4:
+            out.append('class type ocounter = object method get : int method next : ocounter end')
+            out.append('class ocnt (n : int) : ocounter = object (_ : #ocounter)\n'
+                       '  method get = n\n  method next = new ocnt (n + 1)\nend')
+            out.append('let fcnt (n : int) : int = ((new ocnt n)#next#next)#get')
+            self.env.append(Var('fcnt', arrow(INT, INT), cost=4))
+
     def decl_fun(self, out, i):
         name = 'f%d' % i
         params = []
@@ -1903,6 +2027,9 @@ let gint_only : int gexp -> int = function
         self.decl_modules(out)
         self.decl_gadt(out)
         self.decl_classes(out)
+        self.decl_functors2(out)
+        self.decl_recmods(out)
+        self.decl_objects2(out)
         if self.ill:
             self.ill_at = self.r.randint(1, 300)
         nitems = self.r.randint(6, 18)
@@ -1940,6 +2067,7 @@ let gint_only : int gexp -> int = function
                    '^ " ga=" ^ show_array string_of_int ga ^ " gb=" ^ show_string (Buffer.contents gb))')
         out.append('let () = print_endline ("gh=" ^ show_list (fun (k, v) -> string_of_int k ^ ":" ^ v) '
                    '(List.sort compare (Hashtbl.fold (fun k v acc -> (k, v) :: acc) gh [])))')
+        self.items = out  # toplevel items, for genmf.py's split into units
         return '\n'.join(out) + '\n'
 
 

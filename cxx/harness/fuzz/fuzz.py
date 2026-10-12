@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Differential fuzzing of the port against stock OCaml, at every level.
 
-    fuzz.py [--start S] [--count N] [--jobs J] [--ill] [--levels L,...]
+    fuzz.py [--start S] [--count N] [--jobs J] [--ill] [--mf] [--levels L,...]
             [--out DIR]
+
+--mf: multi-file programs (genmf.py: units with interfaces, linked,
+packed and archived), levels mbyte/mnat/mpack/mlib/mfl/mwp (compare_mf);
+with --ill, one unchecked interface edit (signature-matching errors).
 
 For each seed, gen.py writes a random well-typed program (--ill: one
 ill-typed expression).  The program is compiled by the tree's stock
@@ -178,6 +182,13 @@ def compare_levels(wd, levels, wflags=(), stop_at_first=False):
                 findings.append(('%s:run' % level, st[2] or b'', pt[2] or b''))
 
     stock_ok = None
+    if 'i' not in levels and 'bc' not in levels:
+        # whatever the levels, a program stock rejects stops here
+        r = run([os.path.join(ROOT, 'ocamlc.opt'), '-nostdlib', '-I',
+                 os.path.join(ROOT, 'stdlib')] + W + ['-i', 'fz.ml'], wd, COMPILE_TIMEOUT)
+        if rc_of(r) != 0:
+            notes.append('stock-rejects')
+            return findings, notes, out
     if 'i' in levels:
         res = both('i', lambda s: [s.byte] + s.flags + W + ['-i', 'fz.ml'])
         check('i', res)
@@ -254,6 +265,172 @@ def compare_levels(wd, levels, wflags=(), stop_at_first=False):
     return findings, notes, out
 
 
+MF_LEVELS = ['mbyte', 'mnat', 'mpack', 'mlib', 'mfl', 'mwp']
+
+
+def compare_mf(wd, levels, wflags=()):
+    """The multi-file program in wd (genmf.py: DIR/order) at `levels`:
+      mbyte  per unit, in order: -i, then -c -bin-annot of the .mli and the
+             .ml; every .cmi/.cmo/.cmt/.cmti; link, executable bytes, run
+      mnat   per unit -c -S: .cmx/.o/.s; link, executable, run
+      mfl    the same with the flambda tree (FLAMBDA_ROOT) at -O3
+      mpack  -for-pack Pk units, -pack into pk.cmo / pk.cmx (+ .cmi, .o),
+             link the pack alone, run (bytecode and native)
+      mlib   -a into lib.cma / lib.cmxa (+ .a), link with -linkall, run
+      mwp    whole-program mode (CPPCAML_WP=1) over all units: run output
+             against stock bytecode's
+    -> (findings, notes, outputs) as compare_levels."""
+    findings, notes, out = [], [], {}
+    W = list(wflags)
+    order = []
+    with open(os.path.join(wd, 'order')) as f:
+        for line in f:
+            parts = line.split()
+            order.append((parts[0], len(parts) > 1))
+    sources = set(os.listdir(wd))
+    bindir = os.path.join(wd, '.bin')
+    os.makedirs(bindir, exist_ok=True)
+
+    def clean():
+        for f in os.listdir(wd):
+            if f not in sources and f != '.bin':
+                rm([os.path.join(wd, f)])
+
+    def link_side(s):
+        for name, target in (('ocamlc', s.byte), ('ocamlopt', s.opt)):
+            lnk = os.path.join(bindir, name)
+            rm([lnk])
+            if target:
+                os.symlink(target, lnk)
+        return Side(s.name, os.path.join(bindir, 'ocamlc'),
+                    os.path.join(bindir, 'ocamlopt'), s.flags)
+
+    def steps_for(level, s):
+        """[(cmd, run?)] and the artifacts to compare."""
+        st, arts = [], []
+        names = [u for u, _ in order]
+        if level == 'mbyte':
+            for u, mli in order:
+                st.append(([s.byte] + s.flags + W + ['-i', u + '.ml'], False))
+                if mli:
+                    st.append(([s.byte] + s.flags + W + ['-c', '-bin-annot', u + '.mli'], False))
+                    arts.append(u + '.cmti')
+                st.append(([s.byte] + s.flags + W + ['-c', '-bin-annot', u + '.ml'], False))
+                arts += [u + '.cmi', u + '.cmo', u + '.cmt']
+            st.append(([s.byte] + s.flags + W + [u + '.cmo' for u in names] +
+                       ['-o', 'mf.byte'], False))
+            st.append(([os.path.join(ROOT, 'runtime/ocamlrun'), './mf.byte'], True))
+            arts.append('mf.byte')
+        elif level in ('mnat', 'mfl'):
+            O = ['-O3'] if level == 'mfl' else []
+            for u, mli in order:
+                if mli:
+                    st.append(([s.opt] + s.flags + W + O + ['-c', u + '.mli'], False))
+                st.append(([s.opt] + s.flags + W + O + ['-c', '-S', u + '.ml'], False))
+                arts += [u + '.cmi', u + '.cmx', u + '.o', u + '.s']
+            st.append(([s.opt] + s.flags + W + O + [u + '.cmx' for u in names] +
+                       ['-o', 'mf.nat'], False))
+            st.append((['./mf.nat'], True))
+            arts.append('mf.nat')
+        elif level == 'mpack':
+            for comp, ext in ((s.byte, '.cmo'), (s.opt, '.cmx')):
+                for u, mli in order:
+                    if mli:
+                        st.append(([comp] + s.flags + W + ['-c', u + '.mli'], False))
+                    st.append(([comp] + s.flags + W + ['-for-pack', 'Pk', '-c', u + '.ml'],
+                               False))
+                    arts.append(u + ext)
+                st.append(([comp] + s.flags + W + ['-pack', '-o', 'pk' + ext] +
+                           [u + ext for u in names], False))
+                exe = 'pk.byte' if ext == '.cmo' else 'pk.nat'
+                st.append(([comp] + s.flags + W + ['pk' + ext, '-o', exe], False))
+                st.append(((([os.path.join(ROOT, 'runtime/ocamlrun')] if ext == '.cmo' else [])
+                            + ['./' + exe]), True))
+                arts += ['pk' + ext, 'pk.cmi', exe]
+            arts += ['pk.o']
+        elif level == 'mlib':
+            for comp, ext, lib in ((s.byte, '.cmo', 'lib.cma'), (s.opt, '.cmx', 'lib.cmxa')):
+                for u, mli in order:
+                    if mli:
+                        st.append(([comp] + s.flags + W + ['-c', u + '.mli'], False))
+                    st.append(([comp] + s.flags + W + ['-c', u + '.ml'], False))
+                st.append(([comp] + s.flags + W + ['-a', '-o', lib] +
+                           [u + ext for u in names], False))
+                exe = 'lib.byte' if ext == '.cmo' else 'lib.nat'
+                st.append(([comp] + s.flags + W + ['-linkall', lib, '-o', exe], False))
+                st.append(((([os.path.join(ROOT, 'runtime/ocamlrun')] if ext == '.cmo' else [])
+                            + ['./' + exe]), True))
+                arts += [lib, exe]
+            arts += ['lib.a']
+        return st, list(dict.fromkeys(arts))
+
+    def run_side(level, s):
+        st, arts = steps_for(level, s)
+        log = []
+        runs = []
+        for cmd, is_run in st:
+            r = run(cmd, wd, RUN_TIMEOUT if is_run else COMPILE_TIMEOUT)
+            if is_run:
+                runs.append(r)
+            else:
+                log.append(r)
+            if not is_run and rc_of(r) != 0 and '-i' not in cmd:
+                break
+        a = {x: readb(os.path.join(wd, x)) for x in arts}
+        clean()
+        return b'\n'.join(log), a, runs
+
+    clean()
+    for level in levels:
+        if level == 'mwp':
+            continue
+        if level == 'mfl' and not os.path.isdir(FL):
+            continue
+        res = {}
+        for s in (fl_sides() if level == 'mfl' else sides()):
+            res[s.name] = run_side(level, link_side(s))
+        (sl, sa, sr), (pl, pa, pr) = res['stock'], res['port']
+        if sl != pl:
+            findings.append((level, sl, pl))
+        for x in sa:
+            if sa[x] != pa[x]:
+                if x.endswith(('.cmt', '.cmti')):
+                    ds, dp = cmtdump(wd, sa[x]), cmtdump(wd, pa[x])
+                    rm([os.path.join(wd, 'dump.cmt')])
+                    if ds == dp:
+                        notes.append('cmt-sharing')
+                        continue
+                    findings.append(('%s:%s' % (level, x), ds, dp))
+                    continue
+                findings.append(('%s:%s' % (level, x), sa[x], pa[x]))
+        if sr != pr:
+            findings.append(('%s:run' % level, b'\n'.join(sr), b'\n'.join(pr)))
+        if sr:
+            out[level] = sr
+    ref = out.get('mbyte', [None])[0]
+    for k in ('mnat', 'mpack', 'mlib', 'mfl'):
+        for o in out.get(k, []):
+            # a packed unit's exceptions print as Pk.U.E
+            if ref is not None and o.replace(b'Pk.', b'') != ref:
+                notes.append('UNSPEC-%s' % k)
+                break
+    if 'mwp' in levels and os.path.isdir(FL) and ref is not None:
+        r = run([os.path.join(FL, 'cxx/build-release/c++ocamlopt'), '-nostdlib', '-I',
+                 os.path.join(FL, 'stdlib'), '-I', os.path.join(FL, 'runtime')] + W +
+                ['-O3'] + sum([[u + '.mli', u + '.ml'] if m else [u + '.ml']
+                               for u, m in order], []) + ['-o', 'mf.wp'],
+                wd, COMPILE_TIMEOUT * 3, env={'CPPCAML_WP': '1', 'TMPDIR': wd})
+        if rc_of(r) != 0:
+            findings.append(('mwp:build', b'', r))
+        else:
+            o = run(['./mf.wp'], wd, RUN_TIMEOUT)
+            out['mwp'] = [o]
+            if o != ref and not any(n.startswith('UNSPEC') for n in notes):
+                findings.append(('mwp:run', ref, o))
+        clean()
+    return findings, notes, {k: v[0] for k, v in out.items()}
+
+
 CMTDUMP = None
 
 
@@ -295,9 +472,40 @@ def flags_for(seed):
     return []
 
 
-def one(seed, levels, outdir, ill):
+def one_mf(seed, levels, outdir, ill=False):
+    import genmf
+    wd = os.path.join(outdir, 'work', str(seed))
+    shutil.rmtree(wd, ignore_errors=True)
+    os.makedirs(wd)
+    W = flags_for(seed)
+    try:
+        genmf.build(seed, wd, ill)
+    except Exception as ex:
+        return seed, [('gen', b'', repr(ex).encode())], [], ' '.join(W)
+    try:
+        findings, notes, out = compare_mf(wd, levels, W)
+    except Exception as ex:  # harness error: report, keep going
+        return seed, [('harness', b'', repr(ex).encode())], [], ' '.join(W)
+    if findings:
+        for level, a, b in findings:
+            fd = os.path.join(outdir, 'findings', '%d-%s' % (seed, level.replace(':', '_')))
+            shutil.rmtree(fd, ignore_errors=True)
+            shutil.copytree(wd, fd, ignore=shutil.ignore_patterns('.bin'))
+            with open(os.path.join(fd, 'stock'), 'wb') as f:
+                f.write(a)
+            with open(os.path.join(fd, 'port'), 'wb') as f:
+                f.write(b)
+            with open(os.path.join(fd, 'info'), 'w') as f:
+                f.write('seed %d level %s mf flags %s\n' % (seed, level, ' '.join(W)))
+    shutil.rmtree(wd, ignore_errors=True)
+    return seed, findings, notes, ' '.join(W)
+
+
+def one(seed, levels, outdir, ill, mf=False):
     global CMTDUMP
     CMTDUMP = os.environ.get('FUZZ_CMTDUMP')
+    if mf:
+        return one_mf(seed, levels, outdir, ill)
     wd = os.path.join(outdir, 'work', str(seed))
     os.makedirs(wd, exist_ok=True)
     g = gen.Gen(seed, ill)
@@ -311,6 +519,11 @@ def one(seed, levels, outdir, ill):
         findings, notes, out = compare_levels(wd, levels, W)
     except Exception as ex:  # harness error: report, keep going
         return seed, [('harness', b'', repr(ex).encode())], [], ''
+    if 'stock-rejects' in notes and not ill:
+        # well-typed mode: stock rejecting the program is a generator bug
+        r = run([os.path.join(ROOT, 'ocamlc.opt'), '-nostdlib', '-I',
+                 os.path.join(ROOT, 'stdlib')] + W + ['-i', 'fz.ml'], wd, COMPILE_TIMEOUT)
+        findings.append(('gen:stock-rejects', r, b''))
     timeouts = [k for k, v in out.items() if v == b'TIMEOUT']
     if timeouts:
         notes.append('timeout:' + ','.join(timeouts))
@@ -345,12 +558,13 @@ def main():
     ap.add_argument('--count', type=int, default=100)
     ap.add_argument('--jobs', type=int, default=6)
     ap.add_argument('--ill', action='store_true')
-    ap.add_argument('--levels', default=','.join(ALL_LEVELS))
+    ap.add_argument('--mf', action='store_true', help='multi-file programs (genmf.py)')
+    ap.add_argument('--levels', default=None)
     ap.add_argument('--out', default='fuzz-out')
     a = ap.parse_args()
-    levels = a.levels.split(',')
+    levels = (a.levels or ','.join(MF_LEVELS if a.mf else ALL_LEVELS)).split(',')
     if a.ill:
-        levels = [l for l in levels if l in ('i', 'bc', 'nat')]
+        levels = [l for l in levels if l in ('i', 'bc', 'nat', 'mbyte')]
     os.makedirs(a.out, exist_ok=True)
     build_cmtdump(a.out)
     seeds = range(a.start, a.start + a.count)
@@ -358,7 +572,7 @@ def main():
              'unspec': 0, 'timeout': 0}
     log = open(os.path.join(a.out, 'log'), 'a')
     with cf.ProcessPoolExecutor(a.jobs) as ex:
-        futs = [ex.submit(one, s, levels, a.out, a.ill) for s in seeds]
+        futs = [ex.submit(one, s, levels, a.out, a.ill, a.mf) for s in seeds]
         for fu in cf.as_completed(futs):
             seed, findings, notes, W = fu.result()
             stats['programs'] += 1
