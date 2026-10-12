@@ -25,6 +25,10 @@ ExprBox E(Expression e) { return std::make_unique<Expression>(std::move(e)); }
 struct OpInfo { int prec; bool right; std::string name; };
 
 // OCaml infix operator precedence/associativity (higher = binds tighter).
+// LBRACKETAT's place among infix_op's precedences: above INFIXOP1 (5),
+// below `::` (6) -- see attach_expr_attrs
+constexpr int kLbracketatPrec = 5;
+
 std::optional<OpInfo> infix_op(const Token& t) {
   switch (t.kind) {
     // `:=` and `<-` bind looser than `,` (tuple) — handled in parse_assign, not here.
@@ -170,6 +174,7 @@ class Parser {
     return true;
   }
   void undo_docs(size_t mark) {
+    last_attr_node_ = nullptr;
     while (ds_journal_.size() > mark) {
       const DocUndo& u = ds_journal_.back();
       if (u.text) text_emitted_.erase(u.id);
@@ -556,7 +561,7 @@ class Parser {
         Location cloc = span(openStart, position(c.end));
         LongidentLoc ctorid{std::move(qual), cloc};
         if (is_atom_start(cur().kind)) {  // `M.(::) arg`  -> constructor application
-          ExprBox arg = parse_atom_postfix();
+          ExprBox arg = postfix_field(parse_atom());  // (a trailing [@attr] is the application's)
           Position ae = arg->loc.end;
           return mk_construct(ctorid, std::move(arg), span(openStart, ae));
         }
@@ -701,8 +706,24 @@ class Parser {
     }
     return E({Pexp_apply{std::move(fn), std::move(args)}, Location{objStart, end, false}});
   }
-  ExprBox postfix_field(ExprBox e) {
+  // simple_expr's postfixes: field and index accesses (DOT, the tightest),
+  // then `e1 #op e2` (HASHOP, left-associative, its right operand a
+  // simple_expr with its accesses) and method calls `e#m` (HASH)
+  ExprBox postfix_field(ExprBox e, bool dots_only = false) {
     for (;;) {
+      if (!dots_only && cur().kind == Kind::HASHOP) {
+        const Token& optok = cur();
+        advance();
+        ExprBox right = postfix_field(parse_atom(), true);
+        Location opl = tokloc(optok);
+        ExprBox fn = E({Pexp_ident{LongidentLoc{{Lident{optok.text}}, opl}}, opl});
+        Location l = span(e->loc.start, right->loc.end);
+        std::vector<std::pair<ArgLabel, ExprBox>> args;
+        args.emplace_back(Nolabel{}, std::move(e));
+        args.emplace_back(Nolabel{}, std::move(right));
+        e = E({Pexp_apply{std::move(fn), std::move(args)}, l});
+        continue;
+      }
       if (is_qualified_index_op()) {  // e.M.op[i;j] — module-qualified index op (before field)
         advance();  // .
         std::vector<std::string> mods{cur().text};
@@ -739,12 +760,12 @@ class Parser {
         e = bigarray_get(std::move(e), std::move(idxs), position(c.end));
       } else if (cur().kind == Kind::DOTOP) {  // e.op(i) / e.op[i] / e.op{i;j} index-op get
         e = parse_dotop_index(std::move(e), {});
-      } else if (cur().kind == Kind::HASH && peek(1).kind == Kind::LIDENT) {
+      } else if (!dots_only && cur().kind == Kind::HASH && peek(1).kind == Kind::LIDENT) {
         advance();  // #
         const Token& m = cur(); advance();
         Location l = span(e->loc.start, position(m.end));
         e = E({Pexp_send{std::move(e), StringLoc{m.text, tokloc(m)}}, l});
-      } else if (cur().kind == Kind::HASH) {
+      } else if (!dots_only && cur().kind == Kind::HASH) {
         // `simple_expr HASH label`: the `#` shifted, an error on the token after it
         const Token& nt = peek(1);
         ParseError err("syntax error", nt.start);
@@ -801,7 +822,7 @@ class Parser {
           const Token& c = cur(); advance();  // )
           Location cloc = span(position(t.start), position(c.end));
           if (is_atom_start(cur().kind)) {  // `(::) arg`  -> constructor application
-            ExprBox arg = parse_atom_postfix();
+            ExprBox arg = postfix_field(parse_atom());  // (a trailing [@attr] is the application's)
             Position ae = arg->loc.end;
             return mk_construct(lid_const("::", cloc), std::move(arg), span(position(t.start), ae));
           }
@@ -1016,11 +1037,54 @@ class Parser {
   }
 
   ExprBox attach_expr_attrs(ExprBox e) {  // e [@attr] …  -> pexp_attributes
+    std::size_t n = 0;
     while (cur().kind == Kind::LBRACKETAT) {
       advance();
       e->attrs.push_back(parse_attribute_body());
+      ++n;
+    }
+    if (n > 0) {
+      last_attr_node_ = e.get();
+      last_attr_n_ = n;
+      last_attr_idx_ = idx_;
     }
     return e;
+  }
+  // `expr attribute` (parser.mly) has LBRACKETAT's precedence, below `::`,
+  // the arithmetic operators, the unary signs and the constructor, lazy and
+  // assert applications: after `a + b`, `-x`, `Some x` the reduction comes
+  // first and a following `[@attr]` belongs to the whole expression, while
+  // after `a = b`, `a @ b`, `a, b`, `a := b` it is shifted onto the right
+  // operand (whose own location stays put, the whole one's ends at `]`).
+  // The operands' parse attaches a trailing `[@attr]` to the innermost
+  // expression; these move it up.  last_attr_*: the attributes the last
+  // attach_expr_attrs call attached, still trailing while idx_ has not moved.
+  Expression* last_attr_node_ = nullptr;
+  std::size_t last_attr_n_ = 0, last_attr_idx_ = 0;
+  bool trailing_attrs() const { return last_attr_node_ && last_attr_idx_ == idx_; }
+  Attributes take_trailing_attrs() {
+    Attributes out;
+    if (!trailing_attrs()) return out;
+    Attributes& a = last_attr_node_->attrs;
+    std::size_t n = std::min(last_attr_n_, a.size());
+    out.assign(std::make_move_iterator(a.end() - static_cast<std::ptrdiff_t>(n)), std::make_move_iterator(a.end()));
+    a.erase(a.end() - static_cast<std::ptrdiff_t>(n), a.end());
+    last_attr_node_ = nullptr;
+    return out;
+  }
+  ExprBox put_trailing_attrs(ExprBox e, Attributes attrs) {
+    if (attrs.empty()) return e;
+    std::size_t n = attrs.size();
+    for (Attribute& a : attrs) e->attrs.push_back(std::move(a));
+    last_attr_node_ = e.get();
+    last_attr_n_ = n;
+    last_attr_idx_ = idx_;
+    return e;
+  }
+  // the end of a loose operator's expression: its right operand's, or the
+  // `]` of an attribute shifted onto that operand
+  Position loose_end(const ExprBox& right) {
+    return trailing_attrs() ? position(tokens_[idx_ - 1].end) : right->loc.end;
   }
   ExprBox parse_atom_postfix() {
     return attach_expr_attrs(postfix_field(parse_atom()));
@@ -1087,17 +1151,18 @@ class Parser {
     if (cur().kind == Kind::ASSERT) {
       const Token& t = cur(); advance();
       std::optional<ExtName> ext = take_ext(); Attributes attrs = take_attrs();  // assert%ext[@attr]
-      ExprBox arg = parse_atom_postfix();
+      ExprBox arg = postfix_field(parse_atom());
       Position ae = arg->loc.end;
       Location kw = span(position(t.start), ae);  // the `assert …` span (survives paren reloc)
-      return wrap_ext(E({Pexp_assert{std::move(arg), kw}, kw}), std::move(ext), std::move(attrs));
+      return attach_expr_attrs(wrap_ext(E({Pexp_assert{std::move(arg), kw}, kw}), std::move(ext), std::move(attrs)));
     }
     if (cur().kind == Kind::LAZY) {
       const Token& t = cur(); advance();
       std::optional<ExtName> ext = take_ext(); Attributes attrs = take_attrs();  // lazy%ext[@attr]
-      ExprBox arg = parse_atom_postfix();
+      ExprBox arg = postfix_field(parse_atom());
       Position ae = arg->loc.end;
-      return wrap_ext(E({Pexp_lazy{std::move(arg)}, span(position(t.start), ae)}), std::move(ext), std::move(attrs));
+      return attach_expr_attrs(
+          wrap_ext(E({Pexp_lazy{std::move(arg)}, span(position(t.start), ae)}), std::move(ext), std::move(attrs)));
     }
     // constructor application  Constr arg  -> Pexp_construct (not Pexp_apply)
     if (cur().kind == Kind::UIDENT) {
@@ -1105,10 +1170,10 @@ class Parser {
       if (auto lo = try_local_open(pr))
         return collect_app(attach_expr_attrs(postfix_field(std::move(*lo))));
       if (pr.final_upper) {
-        if (is_atom_start(cur().kind)) {
-          ExprBox arg = parse_atom_postfix();
+        if (is_atom_start(cur().kind)) {  // `Constr simple_expr`: an expr, not applied further
+          ExprBox arg = postfix_field(parse_atom());
           Location l = span(pr.lid.loc.start, arg->loc.end);
-          return collect_app(mk_construct(pr.lid, std::move(arg), l));
+          return attach_expr_attrs(mk_construct(pr.lid, std::move(arg), l));
         }
         return collect_app(attach_expr_attrs(mk_construct(pr.lid, std::nullopt, pr.lid.loc)));
       }
@@ -1120,19 +1185,19 @@ class Parser {
       advance();
       LongidentLoc cl = lid0(t.kind == Kind::TRUE ? "true" : "false", tokloc(t));
       if (is_atom_start(cur().kind)) {  // `true arg` -> Pexp_construct(_, Some arg), not Pexp_apply
-        ExprBox arg = parse_atom_postfix();
+        ExprBox arg = postfix_field(parse_atom());
         Location l = span(cl.loc.start, arg->loc.end);
-        return collect_app(mk_construct(cl, std::move(arg), l));
+        return attach_expr_attrs(mk_construct(cl, std::move(arg), l));
       }
       return collect_app(mk_construct(cl, std::nullopt, cl.loc));
     }
     if (cur().kind == Kind::BACKQUOTE) {  // polymorphic variant  `Tag [arg]
       const Token& t = cur(); advance();
       const Token& tag = cur(); advance();
-      if (is_atom_start(cur().kind)) {
-        ExprBox arg = parse_atom_postfix();
+      if (is_atom_start(cur().kind)) {  // `` `Tag simple_expr ``: an expr, not applied further
+        ExprBox arg = postfix_field(parse_atom());
         Location l = span(position(t.start), arg->loc.end);
-        return collect_app(E({Pexp_variant{tag.text, std::move(arg)}, l}));
+        return attach_expr_attrs(E({Pexp_variant{tag.text, std::move(arg)}, l}));
       }
       return collect_app(
           E({Pexp_variant{tag.text, std::nullopt}, span(position(t.start), position(tag.end))}));
@@ -1152,39 +1217,53 @@ class Parser {
     // and is a full expression — delegate to parse_expr_no_seq.
     switch (t.kind) {
       case Kind::MATCH: case Kind::FUNCTION: case Kind::FUN:
-      case Kind::TRY: case Kind::IF: case Kind::LET: case Kind::LETOP:
-        return parse_expr_no_seq_core();
+      case Kind::TRY: case Kind::IF: case Kind::LET: case Kind::LETOP: {
+        ExprBox e = parse_expr_no_seq_core();
+        last_attr_node_ = nullptr;
+        return e;
+      }
       default: break;
     }
-    // Unary sign: subtractive {- -.} and additive {+ +.}.  Folds literals into a
-    // (possibly signed) constant per mkuminus/mkuplus; otherwise applies ~op.
+    // Unary sign: subtractive {- -.} and additive {+ +.}, applied to an
+    // application-level operand (`-1 2` is `~-(1 2)`).  mkuminus / mkuplus
+    // fold an operand that is a constant without attributes (`-1`, `- 1`,
+    // `-(1)`) into a (possibly signed) constant; otherwise ~op applies.
     if (t.kind == Kind::MINUS || t.kind == Kind::MINUSDOT ||
         t.kind == Kind::PLUS  || t.kind == Kind::PLUSDOT) {
       bool sub = (t.kind == Kind::MINUS || t.kind == Kind::MINUSDOT);
       bool dot = (t.kind == Kind::MINUSDOT || t.kind == Kind::PLUSDOT);
       const char* name = t.kind == Kind::MINUS ? "-" : t.kind == Kind::MINUSDOT ? "-."
                        : t.kind == Kind::PLUS  ? "+" : "+.";
-      Kind nk = peek(1).kind;
-      // fold: subtractive folds `- INT` and `{- -.} FLOAT`; additive folds
-      // `+ INT` and `{+ +.} FLOAT`.  `-.`/`+.` of an INT does NOT fold.
-      bool fold = (nk == Kind::INT && !dot) || nk == Kind::FLOAT;
-      if (fold) {
-        advance();
-        const Token& lit = cur(); advance();
-        Location cl = span(position(t.start), position(lit.end));
-        std::string txt = sub ? ("-" + lit.text) : lit.text;
-        Constant c = (lit.kind == Kind::INT)
-                         ? Constant{Pconst_integer{txt, lit.modifier}, cl}
-                         : Constant{Pconst_float{txt, lit.modifier}, cl};
-        return E({Pexp_constant{std::move(c)}, cl});
-      }
+      Location oploc = tokloc(t);
+      Position st = position(t.start);
       advance();
-      ExprBox arg = parse_app();
-      Position ae = arg->loc.end;
-      ExprBox fn = ident_expr(std::string("~") + name, tokloc(t));
+      // `expr %prec prec_unary_minus`: an application, or signed again
+      bool signed_again = cur().kind == Kind::MINUS || cur().kind == Kind::MINUSDOT ||
+                          cur().kind == Kind::PLUS || cur().kind == Kind::PLUSDOT;
+      ExprBox arg = signed_again ? parse_unary() : parse_app();
+      Location sloc = span(st, arg->loc.end);
+      Attributes trailing = take_trailing_attrs();
+      ExprBox r = [&]() -> ExprBox {
+      if (auto* c = std::get_if<Pexp_constant>(&arg->desc); c && arg->attrs.empty()) {
+        // `-.`/`+.` of an integer does not fold
+        auto neg_string = [](const std::string& f) {
+          return !f.empty() && f[0] == '-' ? f.substr(1) : "-" + f;
+        };
+        if (auto* i = std::get_if<Pconst_integer>(&c->c.desc); i && !dot) {
+          Pconst_integer v{sub ? neg_string(i->value) : i->value, i->suffix};
+          return E({Pexp_constant{Constant{std::move(v), sloc}}, sloc});
+        }
+        if (auto* f = std::get_if<Pconst_float>(&c->c.desc)) {
+          Pconst_float v{sub ? neg_string(f->value) : f->value, f->suffix};
+          return E({Pexp_constant{Constant{std::move(v), sloc}}, sloc});
+        }
+      }
+      ExprBox fn = ident_expr(std::string("~") + name, oploc);
       std::vector<std::pair<ArgLabel, ExprBox>> args;
       args.emplace_back(Nolabel{}, std::move(arg));
-      return E({Pexp_apply{std::move(fn), std::move(args)}, span(position(t.start), ae)});
+      return E({Pexp_apply{std::move(fn), std::move(args)}, sloc});
+      }();
+      return put_trailing_attrs(std::move(r), std::move(trailing));
     }
     return parse_app();
   }
@@ -1250,7 +1329,7 @@ class Parser {
     if (cur().kind == Kind::LESSMINUS) {
       advance();
       ExprBox right = parse_assign();
-      Location l = span(left->loc.start, right->loc.end);
+      Location l = span(left->loc.start, loose_end(right));
       return make_assignment(std::move(left), std::move(right), l);
     }
     if (cur().kind == Kind::COLONEQUAL) {
@@ -1258,7 +1337,7 @@ class Parser {
       ExprBox right = parse_assign();
       Location opl = tokloc(op);
       ExprBox fn = E({Pexp_ident{LongidentLoc{{Lident{":="}}, opl}}, opl});
-      Location l = span(left->loc.start, right->loc.end);
+      Location l = span(left->loc.start, loose_end(right));
       std::vector<std::pair<ArgLabel, ExprBox>> args;
       args.emplace_back(Nolabel{}, std::move(left));
       args.emplace_back(Nolabel{}, std::move(right));
@@ -1269,11 +1348,15 @@ class Parser {
   ExprBox parse_binop(int min_prec) {
     ExprBox left = parse_unary();
     for (;;) {
+      // the right operand of a tight operator ends at a trailing [@attr]:
+      // `a :: b [@x] :: c` is `((a :: b)[@x]) :: c`
+      if (min_prec > kLbracketatPrec && trailing_attrs()) break;
       // cons '::' is right-assoc at level 6 and builds a construct, not an apply.
       if (cur().kind == Kind::COLONCOLON && 6 >= min_prec) {
         const Token& optok = cur();
         advance();
         ExprBox right = parse_binop(6);
+        Attributes trailing = take_trailing_attrs();
         Position ls = left->loc.start, re = right->loc.end;
         Location gl = gloc(ls, re);
         std::vector<ExprBox> tup;
@@ -1281,6 +1364,7 @@ class Parser {
         tup.push_back(std::move(right));
         ExprBox tuple = E({Pexp_tuple{std::move(tup)}, gl});
         left = mk_construct(lid_const("::", tokloc(optok)), std::move(tuple), Location{ls, re, false});
+        left = put_trailing_attrs(std::move(left), std::move(trailing));
         continue;
       }
       auto op = infix_op(cur());
@@ -1288,13 +1372,16 @@ class Parser {
       const Token& optok = cur();
       advance();
       ExprBox right = parse_binop(op->right ? op->prec : op->prec + 1);
+      bool tight = op->prec > kLbracketatPrec;
+      Attributes trailing = tight ? take_trailing_attrs() : Attributes{};
       Location opl = tokloc(optok);
       ExprBox fn = E({Pexp_ident{LongidentLoc{{Lident{op->name}}, opl}}, opl});
-      Location l = span(left->loc.start, right->loc.end);
+      Location l = span(left->loc.start, tight ? right->loc.end : loose_end(right));
       std::vector<std::pair<ArgLabel, ExprBox>> args;
       args.emplace_back(Nolabel{}, std::move(left));
       args.emplace_back(Nolabel{}, std::move(right));
       left = E({Pexp_apply{std::move(fn), std::move(args)}, l});
+      left = put_trailing_attrs(std::move(left), std::move(trailing));
     }
     return left;
   }
@@ -1365,7 +1452,7 @@ class Parser {
     // menhir inlining quirk: a leading `~(x:t)` element's loc-end becomes the end
     // of the base-case reduction (i.e. the second element's end).
     if (firstPunned && elems.size() >= 2) elems[0]->loc.end = elems[1]->loc.end;
-    Location l = span(s, elems.back()->loc.end);
+    Location l = span(s, loose_end(elems.back()));
     bool labeled = false; for (auto& x : labels) if (x) labeled = true;
     if (!labeled) { labels.clear(); puns.clear(); }  // ordinary tuple: keep labels empty (printer emits None)
     ExprBox tup = E({Pexp_tuple{std::move(elems), std::move(labels), std::move(puns)}, l});
