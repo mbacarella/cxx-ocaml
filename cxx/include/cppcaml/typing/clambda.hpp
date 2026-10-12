@@ -142,6 +142,10 @@ struct UStructuredConstant {
   Kind kind;
   double f = 0;                    // Uconst_float
   std::int64_t i = 0;              // Uconst_int32 / int64 / nativeint
+  // the boxed integer's identity when it is a Lambda constant's (its typed
+  // constant's box: lambda.hpp), so the .cmx shares it as ocamlopt's heap
+  // does (a test tree on boxed constants uses one constant twice)
+  const void* box = nullptr;
   long tag = 0;                    // Uconst_block
   Slice<UConstant> fields;         // Uconst_block; Uconst_closure's free values
   Slice<double> floats;            // Uconst_float_array

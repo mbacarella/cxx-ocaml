@@ -121,10 +121,11 @@ const UStructuredConstant* sc_float(double f) {
   c->f = f;
   return c;
 }
-const UStructuredConstant* sc_boxed(SCK k, std::int64_t i) {
+const UStructuredConstant* sc_boxed(SCK k, std::int64_t i, const void* box = nullptr) {
   auto* c = make<UStructuredConstant>();
   c->kind = k;
   c->i = i;
+  c->box = box;
   return c;
 }
 const UStructuredConstant* sc_block(long tag, const std::vector<UConstant>& fields) {
@@ -1222,9 +1223,9 @@ UConstant transl_const(const L::StructuredConstant* cst) {
     }
     case CK::Const_immstring: return str(sc_string(cst->s));
     case CK::Const_float: return str(sc_float(float_of_string(cst->s)));
-    case CK::Const_int32: return str(sc_boxed(SCK::Uconst_int32, cst->boxed));
-    case CK::Const_int64: return str(sc_boxed(SCK::Uconst_int64, cst->boxed));
-    case CK::Const_nativeint: return str(sc_boxed(SCK::Uconst_nativeint, cst->boxed));
+    case CK::Const_int32: return str(sc_boxed(SCK::Uconst_int32, cst->boxed, cst->box));
+    case CK::Const_int64: return str(sc_boxed(SCK::Uconst_int64, cst->boxed, cst->box));
+    case CK::Const_nativeint: return str(sc_boxed(SCK::Uconst_nativeint, cst->boxed, cst->box));
   }
   fatal_error("Closure.transl_const");
 }

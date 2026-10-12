@@ -1313,6 +1313,7 @@ class CmxReader : public Reader {
     return c;
   }
   std::unordered_map<std::size_t, UConstant> uc_;
+  std::unordered_map<std::size_t, const void*> box_;
   const UStructuredConstant* structured(std::size_t id) {
     if (auto it = sc_.find(id); it != sc_.end()) return it->second;
     auto* c = make<UStructuredConstant>();
@@ -1323,7 +1324,14 @@ class CmxReader : public Reader {
       case K::Uconst_float: c->f = dbl(f(id, 0)); break;
       case K::Uconst_int32:
       case K::Uconst_int64:
-      case K::Uconst_nativeint: c->i = ival(f(id, 0)); break;
+      case K::Uconst_nativeint: {
+        c->i = ival(f(id, 0));
+        // the box's identity: one per marshaled block (the writer shares it)
+        auto [it, fresh] = box_.try_emplace(f(id, 0), nullptr);
+        if (fresh) it->second = new char;
+        c->box = it->second;
+        break;
+      }
       case K::Uconst_block:
         c->tag = ival(f(id, 0));
         c->fields = list<UConstant>(f(id, 1), [&](std::size_t x) { return uconstant(x); });
@@ -2246,15 +2254,22 @@ class CmxWriter {
     return o::vcustom2(raw, 4, 8);
   }
 
+  // a Lambda constant's boxed integer is one object however many
+  // structured constants Closure makes of it
+  V boxed_shared(char k, const UStructuredConstant* c) {
+    if (!c->box) return boxed(k, c->i);
+    return memo(c->box, [&] { return boxed(k, c->i); });
+  }
+
   V structured(const UStructuredConstant* c) {
     using K = UStructuredConstant::Kind;
     return memo(c, [&]() -> V {
       int tag = static_cast<int>(c->kind);
       switch (c->kind) {
         case K::Uconst_float: return o::vblock(tag, {o::vdbl(c->f)});
-        case K::Uconst_int32: return o::vblock(tag, {boxed('i', c->i)});
-        case K::Uconst_int64: return o::vblock(tag, {boxed('j', c->i)});
-        case K::Uconst_nativeint: return o::vblock(tag, {boxed('n', c->i)});
+        case K::Uconst_int32: return o::vblock(tag, {boxed_shared('i', c)});
+        case K::Uconst_int64: return o::vblock(tag, {boxed_shared('j', c)});
+        case K::Uconst_nativeint: return o::vblock(tag, {boxed_shared('n', c)});
         case K::Uconst_block:
           return o::vblock(tag, {w.i(c->tag), w.list(c->fields, [&](const UConstant& u) { return uconstant(u); })});
         case K::Uconst_float_array:
