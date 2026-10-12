@@ -22,7 +22,11 @@ Warning 26 [unused-var]: unused variable x.
 Fatal error: exception Misc.Fatal_error
 ```
 
-Closure (non-flambda) compiler only; flambda compiles it.  The unused
+Native code, non-flambda `ocamlopt` only (opam 5.0.0, 5.1.1, 5.2.1,
+5.3.0, 5.5.1 all fail, with or without -g/-O3/-inline 0).  Bytecode never
+reaches instruction selection, so `ocamlc`, the `ocaml` toplevel, utop
+and the js_of_ocaml playgrounds all accept it; flambda switches and
+OxCaml compile it too.  The unused
 `ref` becomes a `Clet_mut` around `b`, which ends up as an argument of
 the `Some _` allocation; selecting that allocation calls `size_expr`
 (`asmcomp/selectgen.ml`) on its arguments, and `size_expr` handles `Clet` and `Csequence` but
