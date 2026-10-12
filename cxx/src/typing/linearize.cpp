@@ -7,6 +7,7 @@
 #include <stdexcept>
 
 #include "cppcaml/typing/clflags.hpp"
+#include "cppcaml/typing/misc.hpp"
 
 namespace cppcaml::typing::linear {
 
@@ -16,7 +17,10 @@ using IK = mach::Instruction::K;
 using mach::Test;
 
 namespace {
-[[noreturn]] void fatal(const std::string& s) { throw std::runtime_error(s); }
+// Misc.fatal_error: ">> Fatal error: " on stderr, then the uncaught
+// Misc.Fatal_error (exit 2).  (The few sites that are `assert false`
+// upstream come here too: same exit, another message.)
+[[noreturn]] void fatal(const std::string& s) { misc::fatal_error(s); }
 }  // namespace
 
 bool has_fallthrough(const Instruction& i) {

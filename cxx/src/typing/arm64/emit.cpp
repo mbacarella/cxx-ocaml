@@ -15,6 +15,7 @@
 #include "cppcaml/typing/clflags.hpp"
 #include "cppcaml/typing/compilenv.hpp"
 #include "cppcaml/typing/config.hpp"
+#include "cppcaml/typing/misc.hpp"
 
 namespace cppcaml::typing::emit {
 
@@ -33,7 +34,10 @@ using reg::Reg;
 using reg::Regs;
 using Env = PerFunctionEnv;
 
-[[noreturn]] void fatal(const std::string& s) { throw std::runtime_error(s); }
+// Misc.fatal_error: ">> Fatal error: " on stderr, then the uncaught
+// Misc.Fatal_error (exit 2).  (The few sites that are `assert false`
+// upstream come here too: same exit, another message.)
+[[noreturn]] void fatal(const std::string& s) { misc::fatal_error(s); }
 
 template <class... A>
 void emit(const A&... a) {

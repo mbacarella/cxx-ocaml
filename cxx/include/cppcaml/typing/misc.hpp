@@ -4,6 +4,7 @@
 // the manual references.
 #pragma once
 
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -74,6 +75,11 @@ void print_manual_hint(fd::Formatter& ppf, const std::vector<long>& section);
 // exception handler ("Fatal error: exception Misc.Fatal_error", exit 2)
 struct FatalError {};
 [[noreturn]] void fatal_error(const std::string& msg);
+// fatal_errorf's "@?": what the -d dumps have printed so far reaches its
+// output before the message.  ocamlopt's dumps go to ppf_dump as they are
+// printed; c++ocamlopt's native back end collects them in a formatter, which
+// the driver writes out from here.
+extern std::function<void()> flush_before_fatal;
 
 // get_build_path_prefix_map (): BUILD_PATH_PREFIX_MAP, decoded once (an
 // invalid value is a fatal error)

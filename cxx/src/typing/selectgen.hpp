@@ -14,6 +14,7 @@
 #include "cppcaml/typing/clflags.hpp"
 #include "cppcaml/typing/location.hpp"
 #include "cppcaml/typing/selection.hpp"
+#include "cppcaml/typing/misc.hpp"
 
 namespace cppcaml::typing::selection {
 
@@ -31,7 +32,10 @@ namespace A = arch;
 using AK = A::AddressingMode::K;
 using SK = A::SpecificOperation::K;
 
-[[noreturn]] inline void fatal(const std::string& s) { throw std::runtime_error(s); }
+// Misc.fatal_error: ">> Fatal error: " on stderr, then the uncaught
+// Misc.Fatal_error (exit 2).  (The few sites that are `assert false`
+// upstream come here too: same exit, another message.)
+[[noreturn]] inline void fatal(const std::string& s) { misc::fatal_error(s); }
 
 constexpr long size_addr = 8, size_int = 8, size_float = 8;
 

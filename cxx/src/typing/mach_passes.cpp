@@ -16,6 +16,7 @@
 
 #include "cppcaml/flat_map.hpp"
 #include "cppcaml/typing/clflags.hpp"
+#include "cppcaml/typing/misc.hpp"
 
 namespace cppcaml::typing::mach_passes {
 
@@ -30,7 +31,10 @@ using MC = cmm::MachtypeComponent;
 
 namespace {
 
-[[noreturn]] void fatal(const std::string& s) { throw std::runtime_error(s); }
+// Misc.fatal_error: ">> Fatal error: " on stderr, then the uncaught
+// Misc.Fatal_error (exit 2).  (The few sites that are `assert false`
+// upstream come here too: same exit, another message.)
+[[noreturn]] void fatal(const std::string& s) { misc::fatal_error(s); }
 
 struct RegCmp {
   int operator()(const Reg* a, const Reg* b) const {

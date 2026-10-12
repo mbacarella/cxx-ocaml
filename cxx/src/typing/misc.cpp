@@ -168,8 +168,11 @@ void print_manual_hint(fd::Formatter& ppf, const std::vector<long>& section) {
               [&](fd::Formatter& f) { print_manual_section(f, section); });
 }
 
+std::function<void()> flush_before_fatal;
+
 void fatal_error(const std::string& msg) {
   // Format.kfprintf ... Format.err_formatter ("@?>> Fatal error: " ^^ fmt ^^ "@.")
+  if (flush_before_fatal) flush_before_fatal();
   std::cout.flush();
   std::cerr << ">> Fatal error: " << msg << std::endl;
   throw FatalError{};

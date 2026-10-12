@@ -16,6 +16,7 @@
 #include "cppcaml/typing/clflags.hpp"
 #include "cppcaml/typing/cmm_helpers.hpp"
 #include "cppcaml/typing/compilenv.hpp"
+#include "cppcaml/typing/misc.hpp"
 
 namespace cppcaml::typing::cmmgen {
 
@@ -32,7 +33,10 @@ namespace CL = clambda;
 
 namespace {
 
-[[noreturn]] void fatal(const std::string& s) { throw std::runtime_error(s); }
+// Misc.fatal_error: ">> Fatal error: " on stderr, then the uncaught
+// Misc.Fatal_error (exit 2).  (The few sites that are `assert false`
+// upstream come here too: same exit, another message.)
+[[noreturn]] void fatal(const std::string& s) { misc::fatal_error(s); }
 
 struct IdentCmp {
   int operator()(Ident::t a, Ident::t b) const { return ident::compare(a, b); }
