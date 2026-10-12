@@ -1,6 +1,6 @@
 # Upstream OCaml bugs found by the port's differential fuzzer
 
-Found 2026-10-11 by `cxx/harness/fuzz/` (random well-typed programs,
+Found 2026-10-11 (bugs 1-3) and 2026-10-12 (bug 4, round 3) by `cxx/harness/fuzz/` (random well-typed programs,
 compiled by stock and by the port, compared at every level and run under
 bytecode, closure, flambda and whole-program mode).  c++ocamlc /
 c++ocamlopt reproduce each of them exactly, because stock is the
@@ -97,3 +97,38 @@ branch keeps a projection of `a` from a closure whose approximation is
 bottom, and `simplify_project_var` treats that as an invariant
 violation instead of dead code.  The regression copy is
 `cxx/harness/fuzz/regress/flambda_fatal_format.ml`.
+
+## 4. `ocamlopt`: `x asr 63` / `x lsr 63`, untagged, shifts by 64
+
+```ocaml
+let[@inline never] f x = Int64.of_int (x asr 63)
+let[@inline never] g x = Int64.of_int (x lsr 63)
+let () = Printf.printf "%Ld %Ld\n" (f (-4608)) (g (-1))
+```
+
+| | bytecode | ocamlopt (closure, flambda at any -O) |
+|---|---|---|
+| `f (-4608)` | -1 | **-9215** |
+| `g (-1)` | 0 | **-1** |
+
+A shift by 63 is in range (only `n < 0 || n > Sys.int_size` is
+unspecified).  Native code returns the argument's tagged representation
+(`2x+1`).  The tagged shift is `(x >>s 63) lor 1`, and untagging it for
+`Int64.of_int`, `float_of_int`, an unboxed context, etc. goes through
+`Cmm_helpers.untag_int` (`asmcomp/cmm_helpers.ml`, before that cmmgen.ml):
+
+```ocaml
+  | Cop(Cor, [Cop(Casr, [c; Cconst_int (n, _)], _); Cconst_int (1, _)], _)
+    when n > 0 && n < size_int * 8 ->
+      Cop(Casr, [c; Cconst_int (n+1, dbg)], dbg)
+```
+
+(and the same for `Clsr`).  With n = 63 the result is a shift by 64
+(`-dcmm`: `(>>s x 64)`), which amd64's `sar`/`shr` mask to a shift by 0.
+Fix: `n < size_int * 8 - 1`.  The guard dates from 1999 (cmmgen.ml); every
+release reproduces it: opam 5.0.0, 5.1.1, 5.2.1, 5.3.0, 5.5.1, flambda
+4.14.3 and 5.4.1 builds, trunk.  (On arm64 a `#64` shift immediate is not
+encodable: probably an assembler error there instead, not checked.)
+Found as a stock bytecode-vs-native disagreement (fuzz seed 8328:
+`Int64.of_int (x lsr (0x7fff land 63))`).  The regression copy is
+`cxx/harness/fuzz/regress/untag_shift64.ml`.
