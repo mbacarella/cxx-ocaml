@@ -1167,17 +1167,17 @@ class Parser {
     if (cur().kind == Kind::UIDENT) {
       PathResult pr = parse_dotted_path();
       if (auto lo = try_local_open(pr))
-        return collect_app(attach_expr_attrs(postfix_field(std::move(*lo))));
+        return collect_app(postfix_field(std::move(*lo)));
       if (pr.final_upper) {
         if (is_atom_start(cur().kind)) {  // `Constr simple_expr`: an expr, not applied further
           ExprBox arg = postfix_field(parse_atom());
           Location l = span(pr.lid.loc.start, arg->loc.end);
           return attach_expr_attrs(mk_construct(pr.lid, std::move(arg), l));
         }
-        return collect_app(attach_expr_attrs(mk_construct(pr.lid, std::nullopt, pr.lid.loc)));
+        return collect_app(mk_construct(pr.lid, std::nullopt, pr.lid.loc));
       }
       Location l = pr.lid.loc;
-      return collect_app(attach_expr_attrs(postfix_field(E({Pexp_ident{.id = std::move(pr.lid)}, l}))));
+      return collect_app(postfix_field(E({Pexp_ident{.id = std::move(pr.lid)}, l})));
     }
     if (cur().kind == Kind::TRUE || cur().kind == Kind::FALSE) {
       const Token& t = cur();
@@ -1201,7 +1201,9 @@ class Parser {
       return collect_app(
           E({Pexp_variant{tag.text, std::nullopt}, span(position(t.start), position(tag.end))}));
     }
-    return collect_app(parse_atom_postfix());
+    // (a [@attr] after the head would end the expression: collect_app
+    // attaches it after the arguments, a mid-application one is an error)
+    return collect_app(postfix_field(parse_atom()));
   }
 
   ExprBox parse_unary() {
@@ -1681,6 +1683,12 @@ class Parser {
           return wrap_ext(std::move(e), ext);
         };
         std::vector<FunctionParam> params;
+        if (cur().kind == Kind::MINUSGREATER || cur().kind == Kind::COLON) {
+          // `fun -> e`: a function takes a parameter (the error on the token)
+          ParseError e("syntax error", cur().start);
+          e.end = cur().end;
+          throw e;
+        }
         while (cur().kind != Kind::MINUSGREATER && cur().kind != Kind::COLON)
           parse_params_into(params);
         std::optional<FunctionConstraint> fconstr;  // `fun p.. : atomic_type -> e`
