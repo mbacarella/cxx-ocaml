@@ -22,9 +22,16 @@ paths agree, and every output the port claims identical is compared:
   nat       ocamlopt -c -S -drawclambda -dclambda -dcmm -dlinear (stdout,
             stderr, exit); the .s, .cmx and .o bytes; link and run: output
   fl        the flambda tree (FLAMBDA_ROOT, default ~/code/c++caml-mono-fuzz):
-            stock ocamlopt.opt -O3 vs c++ocamlopt -O3, -dflambda + .s + run
+            stock ocamlopt.opt vs c++ocamlopt at the seed's flambda flags
+            (-O3 by default), -dflambda + .s + run
   wp        whole-program mode there (CPPCAML_WP=1 c++ocamlopt -O3): run
             output against stock bytecode's
+
+Flags (flags_for): common ones by seed % 11 (-unsafe, -unboxed-types,
+-principal, -g, ...) and each back end's own by seed // 11, written as
+`nat:F` (closure ocamlopt only: -linscan, -inline, -compact, ...) and
+`fl:F` (flambda: -O2/-O3/-Oclassic, -unbox-closures, ...) tokens, so a
+finding's info line and a regress header carry them as they are.
 
 A stock bytecode / stock native / stock flambda run disagreement is a
 generator problem (unspecified behaviour), reported as UNSPEC, not as a
@@ -132,7 +139,7 @@ def compare_levels(wd, levels, wflags=(), stop_at_first=False):
     findings = []
     notes = []
     out = {}
-    W = list(wflags)
+    W, NW, FW = split_flags(wflags)
 
     bindir = os.path.join(wd, '.bin')
     os.makedirs(bindir, exist_ok=True)
@@ -224,9 +231,9 @@ def compare_levels(wd, levels, wflags=(), stop_at_first=False):
     if 'nat' in levels:
         arts = ('fz.s', 'fz.cmx', 'fz.o')
         res = both('nat', lambda s: [s.opt] + s.flags + W + [
-            '-c', '-S', '-drawclambda', '-dclambda', '-dcmm', '-dlinear', 'fz.ml'], arts)
+            '-c', '-S', '-drawclambda', '-dclambda', '-dcmm', '-dlinear', 'fz.ml'] + NW, arts)
         check('nat', res, arts)
-        res = both('natexe', lambda s: [s.opt] + s.flags + W + ['fz.ml', '-o', 'fz.nat'],
+        res = both('natexe', lambda s: [s.opt] + s.flags + W + NW + ['fz.ml', '-o', 'fz.nat'],
                    ('fz.nat',), run_exe=lambda s: ['./fz.nat'])
         check('natexe', res, ('fz.nat',))
         out['nat'] = res['stock'][2]
@@ -234,17 +241,17 @@ def compare_levels(wd, levels, wflags=(), stop_at_first=False):
         return findings, notes, out
     if 'fl' in levels and os.path.isdir(FL):
         arts = ('fz.s', 'fz.cmx', 'fz.o')
-        res = both('fl', lambda s: [s.opt] + s.flags + W + [
-            '-O3', '-c', '-S', '-dflambda', 'fz.ml'], arts)
+        res = both('fl', lambda s: [s.opt] + s.flags + W + FW + [
+            '-c', '-S', '-dflambda', 'fz.ml'], arts)
         check('fl', res, arts)
-        res = both('fl', lambda s: [s.opt] + s.flags + W + ['-O3', 'fz.ml', '-o', 'fz.fl'],
+        res = both('fl', lambda s: [s.opt] + s.flags + W + FW + ['fz.ml', '-o', 'fz.fl'],
                    ('fz.fl',), run_exe=lambda s: ['./fz.fl'])
         check('flexe', res, ('fz.fl',))
         out['fl'] = res['stock'][2]
     if 'wp' in levels and os.path.isdir(FL):
         rm([os.path.join(wd, 'fz.wp')])
         r = run([os.path.join(FL, 'cxx/build-release/c++ocamlopt'), '-nostdlib', '-I',
-                 os.path.join(FL, 'stdlib'), '-I', os.path.join(FL, 'runtime')] + W +
+                 os.path.join(FL, 'stdlib'), '-I', os.path.join(FL, 'runtime')] + wp_flags(W) +
                 ['-O3', 'fz.ml', '-o', 'fz.wp'], wd, COMPILE_TIMEOUT * 3,
                 env={'CPPCAML_WP': '1', 'TMPDIR': wd})
         if rc_of(r) != 0:
@@ -281,7 +288,7 @@ def compare_mf(wd, levels, wflags=()):
              against stock bytecode's
     -> (findings, notes, outputs) as compare_levels."""
     findings, notes, out = [], [], {}
-    W = list(wflags)
+    W = split_flags(wflags)[0]
     order = []
     mlionly = []
     with open(os.path.join(wd, 'order')) as f:
@@ -427,7 +434,7 @@ def compare_mf(wd, levels, wflags=()):
                 break
     if 'mwp' in levels and os.path.isdir(FL) and ref is not None:
         r = run([os.path.join(FL, 'cxx/build-release/c++ocamlopt'), '-nostdlib', '-I',
-                 os.path.join(FL, 'stdlib'), '-I', os.path.join(FL, 'runtime')] + W +
+                 os.path.join(FL, 'stdlib'), '-I', os.path.join(FL, 'runtime')] + wp_flags(W) +
                 ['-O3'] + [u + '.mli' for u in mlionly] +
                 sum([[u + '.mli', u + '.ml'] if m else [u + '.ml']
                      for u, m in order], []) + ['-o', 'mf.wp'],
@@ -473,8 +480,47 @@ def build_cmtdump(outdir):
     os.environ['FUZZ_CMTDUMP'] = exe
 
 
+def split_flags(wflags):
+    """-> (flags for every compiler, ocamlopt-only flags, flambda flags):
+    a `nat:F` token is F for the closure ocamlopt only, `fl:F` for the
+    flambda one only (default -O3)."""
+    W = [f for f in wflags if not f.startswith(('nat:', 'fl:'))]
+    NW = [f[4:] for f in wflags if f.startswith('nat:')]
+    FW = [f[3:] for f in wflags if f.startswith('fl:')] or ['-O3']
+    return W, NW, FW
+
+
+def wp_flags(W):
+    """Whole-program mode compiles the stdlib's sources with the program's
+    flags: -unboxed-types would make them miss their own interfaces."""
+    return [f for f in W if f != '-unboxed-types']
+
+
+NAT_FLAGS = [[], ['-linscan'], ['-inline', '0'], ['-inline', '100', '-unsafe'],
+             ['-no-float-const-prop'], ['-function-sections'], ['-compact'],
+             ['-no-insn-sched', '-nodynlink'], ['-afl-instrument'], ['-g'],
+             ['-unboxed-types', '-linscan'], []]
+FL_FLAGS = [['-O3'], ['-O2'], ['-Oclassic'], ['-O3', '-unbox-closures'],
+            ['-O3', '-remove-unused-arguments', '-inline-max-unroll', '3'],
+            ['-O3', '-no-float-const-prop'], ['-O3', '-linscan', '-unsafe'],
+            ['-O2', '-inline', '300', '-inline-max-depth', '3'], ['-O3', '-g'], ['-O3']]
+
+
 def flags_for(seed):
+    """The common flags (by seed % 11), then the back ends' own
+    (`nat:`/`fl:` tokens, by seed // 11)."""
+    k = seed // 11
+    extra = ['nat:' + f for f in NAT_FLAGS[k % len(NAT_FLAGS)]] + \
+        ['fl:' + f for f in FL_FLAGS[(k // len(NAT_FLAGS)) % len(FL_FLAGS)]]
+    return common_flags_for(seed) + extra
+
+
+def common_flags_for(seed):
     r = seed % 11
+    if r == 1:
+        return ['-unboxed-types']
+    if r == 4:
+        return ['-unsafe']
     if r == 3:
         return ['-w', '+a']
     if r == 5:
@@ -542,7 +588,7 @@ def one(seed, levels, outdir, ill, mf=False):
     if 'stock-rejects' in notes and not ill:
         # well-typed mode: stock rejecting the program is a generator bug
         r = run([os.path.join(ROOT, 'ocamlc.opt'), '-nostdlib', '-I',
-                 os.path.join(ROOT, 'stdlib')] + W + ['-i', 'fz.ml'], wd, COMPILE_TIMEOUT)
+                 os.path.join(ROOT, 'stdlib')] + split_flags(W)[0] + ['-i', 'fz.ml'], wd, COMPILE_TIMEOUT)
         findings.append(('gen:stock-rejects', r, b''))
     timeouts = [k for k, v in out.items() if v == b'TIMEOUT']
     if timeouts:
@@ -582,6 +628,7 @@ def main():
     ap.add_argument('--levels', default=None)
     ap.add_argument('--out', default='fuzz-out')
     a = ap.parse_args()
+    a.out = os.path.abspath(a.out)  # the compilers run inside work dirs
     levels = (a.levels or ','.join(MF_LEVELS if a.mf else ALL_LEVELS)).split(',')
     if a.ill:
         levels = [l for l in levels if l in ('i', 'bc', 'nat', 'mbyte')]

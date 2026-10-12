@@ -29,6 +29,12 @@ FLOAT = ('float',)
 CHAR = ('char',)
 UNIT = ('unit',)
 BASE = [INT, BOOL, STRING, FLOAT, CHAR]
+INT32 = ('int32',)
+INT64 = ('int64',)
+NATIVEINT = ('nativeint',)
+# boxed integer types: module, literal suffix, bits - 1
+BOXED = {'int32': ('Int32', 'l', 31), 'int64': ('Int64', 'L', 63),
+         'nativeint': ('Nativeint', 'n', 63)}
 
 
 def arrow(a, b, lbl=''):
@@ -139,6 +145,8 @@ PRELUDE_POLYS = [
     Poly('pbox', arrow(TV[0], ('box', TV[0]))),
     Poly('punbox', arrow(TV[0], arrow(('box', TV[0]), TV[0]))),
     Poly('Lazy.force', arrow(('lazy', TV[0]), TV[0]), True),
+    Poly('pget', arrow(('array', TV[0]), arrow(INT, TV[0]))),
+    Poly('pset', arrow(('array', TV[0]), arrow(INT, arrow(TV[0], ('array', TV[0]))))),
 ]
 
 PRELUDE = r'''let show_list f l = "[" ^ String.concat "; " (List.map f l) ^ "]"
@@ -175,6 +183,8 @@ let gs = ref ""
 let ga = Array.make 8 0
 let gh : (int, string) Hashtbl.t = Hashtbl.create 16
 let gb = Buffer.create 64
+let pget a i = a.((i land max_int) mod Array.length a)
+let pset a i x = a.((i land max_int) mod Array.length a) <- x; a
 '''
 
 MARK_OPEN, MARK_MID, MARK_CLOSE = '\x01', '\x02', '\x03'
@@ -188,6 +198,8 @@ class Gen:
     def __init__(self, seed, ill=False):
         self.r = random.Random(seed)
         self.r2 = random.Random(seed * 7919 + 17)  # second-round features
+        self.r3 = random.Random(seed * 104729 + 31)  # third-round features
+        self.bi = self.r3.random() < 0.5  # boxed integer types in use
         self.n = 0
         self.records = {}     # name -> [(field, ty, mutable)]
         self.variants = {}    # name -> [(ctor, [arg tys])]
@@ -220,7 +232,7 @@ class Gen:
 
     def tstr(self, t):
         k = t[0]
-        if k in ('int', 'bool', 'string', 'float', 'char', 'unit'):
+        if k in ('int', 'bool', 'string', 'float', 'char', 'unit') or k in BOXED:
             return k
         if k in ('list', 'option', 'ref', 'array', 'lazy', 'box'):
             return '(%s) %s' % (self.tstr(t[1]), k if k != 'lazy' else 'Lazy.t')
@@ -286,7 +298,7 @@ class Gen:
     def rand_type(self, d=2, allow_arrow=True):
         r = self.r.random()
         if d <= 0 or r < 0.35:
-            return self.pick(BASE)
+            return self.base_type()
         opts = ['list', 'option', 'tuple', 'decl', 'decl', 'array', 'ref', 'box']
         if allow_arrow:
             opts += ['arrow']
@@ -318,6 +330,11 @@ class Gen:
             return self.pick(decls)
         return self.pick(BASE)
 
+    def base_type(self):
+        if self.bi and self.r3.random() < 0.12:
+            return self.r3.choice([INT32, INT64, NATIVEINT])
+        return self.pick(BASE)
+
     def gadt_type(self, d):
         if d <= 0 or self.chance(0.6):
             return self.pick([INT, BOOL, STRING])
@@ -340,6 +357,8 @@ class Gen:
             return "'a'"
         if k == 'unit':
             return '()'
+        if k in BOXED:
+            return '0' + BOXED[k][1]
         if k == 'list':
             return '[]'
         if k == 'option':
@@ -497,6 +516,8 @@ class Gen:
                   'char': 'show_char', 'unit': 'show_unit'}
         if k in simple:
             return simple[k]
+        if k in BOXED:
+            return BOXED[k][0] + '.to_string'
         if k in ('list', 'option', 'array', 'ref', 'lazy', 'box'):
             return '(show_%s %s)' % (k, self.show(t[1]))
         if k == 'tuple':
@@ -639,8 +660,12 @@ class Gen:
         exprs = [a[2] for a in args]
         prefixes = [a[1] for a in args]
 
+        fn = v.name
+        if self.r3.random() < 0.05:
+            fn = '(%s [@inlined%s])' % (fn, self.r3.choice(['', ' never', ' always', ' hint']))
+
         def build(cs):
-            return '(%s %s)' % (v.name, ' '.join(
+            return '(%s %s)' % (fn, ' '.join(
                 '%s(%s)' % (p, c) if p else '(%s)' % c
                 for p, c in zip(prefixes, cs)))
         e = self.combine(exprs, build)
@@ -672,8 +697,8 @@ class Gen:
                 p.name, ' '.join('(%s)' % c for c in cs)))
             if p.calls_args and any(a.ceff for a in args):
                 e.eff = True
-            if p.name == 'Lazy.force':
-                e.eff = True
+            if p.name in ('Lazy.force', 'pget', 'pset'):
+                e.eff = True  # (forcing, reading or writing mutable state)
             if any(subst(pt, s)[0] == 'arrow' for pt in params) and \
                     any(a.ceff for a in args):
                 e.ceff = True
@@ -703,6 +728,8 @@ class Gen:
             return E(self.char_lit())
         if k == 'unit':
             return E('()')
+        if k in BOXED:
+            return E(self.bi_lit(k))
         c = self.const(t)
         if c is not None and t[0] not in ('arrow', 'tuple', 'rec', 'var', 'pv'):
             return E(c)
@@ -711,6 +738,10 @@ class Gen:
     def gen1(self, t, env, d):
         if d <= 0:
             return self.leaf(t, env)
+        if self.r3.random() < 0.05:
+            e = self.r3_expr(t, env, d)
+            if e:
+                return e
         r = self.r.random()
         # generic forms, any type
         if r < 0.12:
@@ -908,6 +939,20 @@ class Gen:
             if self.chance(0.3):
                 return '(%s | %s)' % (self.int_pat(), self.int_pat()), []
             return self.int_pat(), []
+        if k in BOXED:
+            if self.r3.random() < 0.3:
+                return '(%s | %s)' % (self.bi_pat(k), self.bi_pat(k)), []
+            return self.bi_pat(k), []
+        if k == 'lazy' and self.r3.random() < 0.6:
+            p, b = self.gen_pat(t[1], d - 1)
+            return '(lazy %s)' % p, b
+        if k == 'tuple' and len(t[1]) == 2 and t[1][0] == t[1][1] and \
+                t[1][0] in (INT, CHAR, BOOL, STRING) and self.r3.random() < 0.3:
+            # an or-pattern binding the same variable on both sides
+            v = self.fresh('ov')
+            lit = {INT: self.int_pat, CHAR: self.char_lit, STRING: self.string_lit,
+                   BOOL: lambda: self.pick(['true', 'false'])}[t[1][0]]
+            return '((%s, %s) | (%s, %s))' % (v, lit(), lit(), v), [(v, t[1][0])]
         if k == 'char':
             if self.chance(0.4):
                 a, b = sorted([self.r.randint(32, 126), self.r.randint(32, 126)])
@@ -1016,6 +1061,8 @@ class Gen:
         return self.combine([a, b], lambda cs: '(%s %s %s)' % (cs[0], op, cs[1]))
 
     def ty_int(self, t, env, d):
+        if self.r3.random() < 0.08:
+            return self.r3_int(env, d)
         r = self.r.random()
         if r < 0.3:
             return self.binop(INT, ['+', '-', '*', 'land', 'lor', 'lxor'], env, d)
@@ -1125,6 +1172,8 @@ class Gen:
         return E(self.int_lit())
 
     def ty_bool(self, t, env, d):
+        if self.r3.random() < 0.06:
+            return self.r3_bool(env, d)
         r = self.r.random()
         if r < 0.35:
             ct = self.rand_type(1, False)
@@ -1158,6 +1207,8 @@ class Gen:
         return E(self.pick(['true', 'false']))
 
     def ty_string(self, t, env, d):
+        if self.r3.random() < 0.1:
+            return self.r3_string(env, d)
         r = self.r.random()
         if r < 0.25:
             return self.binop(STRING, ['^'], env, d, '(cap (%s %s %s))')
@@ -1220,13 +1271,18 @@ class Gen:
                                   ('%-6s', STRING), ('%c', CHAR), ('%C', CHAR),
                                   ('%B', BOOL), ('%b', BOOL), ('%.3f', FLOAT),
                                   ('%g', FLOAT), ('%e', FLOAT), ('%h', FLOAT),
-                                  ('%F', FLOAT), ('%08.2f', FLOAT), ('%+d', INT)])
+                                  ('%F', FLOAT), ('%08.2f', FLOAT), ('%+d', INT)] +
+                                 ([('%ld', INT32), ('%Lx', INT64), ('%nd', NATIVEINT),
+                                   ('%lu', INT32), ('%+Ld', INT64), ('%nX', NATIVEINT)]
+                                  if self.bi else []))
             fmt.append(spec)
             specs.append(self.gen(ty, env, d - 1))
         return self.combine(specs, lambda cs: '(Printf.sprintf "%s"%s)' % (
             ''.join(fmt), ''.join(' (%s)' % c for c in cs)))
 
     def ty_float(self, t, env, d):
+        if self.r3.random() < 0.06:
+            return self.r3_float(env, d)
         r = self.r.random()
         if r < 0.35:
             return self.binop(FLOAT, ['+.', '-.', '*.', '/.', '**'], env, d)
@@ -1258,6 +1314,8 @@ class Gen:
         return E(self.float_lit())
 
     def ty_char(self, t, env, d):
+        if self.r3.random() < 0.12:
+            return self.r3_char(env, d)
         r = self.r.random()
         if r < 0.3:
             a = self.gen(INT, env, d - 1)
@@ -2091,6 +2149,7 @@ let gint_only : int gexp -> int = function
         self.decl_functors2(out)
         self.decl_recmods(out)
         self.decl_objects2(out)
+        self.decl_round3(out)
         if self.ill:
             self.ill_at = self.r.randint(1, 300)
         nitems = self.r.randint(6, 18)
@@ -2134,6 +2193,799 @@ let gint_only : int gexp -> int = function
                    '(List.sort compare (Hashtbl.fold (fun k v acc -> (k, v) :: acc) gh [])))')
         self.items = out  # toplevel items, for genmf.py's split into units
         return '\n'.join(out) + '\n'
+
+    # ---------- third round: boxed integers, bytes, switches, GADTs,
+    # polymorphic variant rows, optional-argument erasure, effects,
+    # extensible variants, big arities, externals ----------
+    def bi_lit(self, k):
+        m, suf, bits = BOXED[k]
+        r = self.r.random()
+        if r < 0.55:
+            v = self.r.randint(-5, 300)
+        elif r < 0.72:
+            return self.pick(['%s.max_int', '%s.min_int', '%s.zero', '%s.one',
+                              '%s.minus_one']) % m
+        elif r < 0.8:
+            # hexadecimal literals wrap: 0xffffffffl is -1l
+            return self.pick(['0x%x%s' % ((1 << (bits + 1)) - 1, suf),
+                              '0x%x%s' % (1 << bits, suf), '0o17%s' % suf,
+                              '0b101%s' % suf, '1_000%s' % suf])
+        elif r < 0.88:
+            v = self.pick([-(1 << bits), (1 << bits) - 1, 1 << (bits - 1), 0xff, 0x7fff])
+        else:
+            v = self.r.randint(-(1 << bits), (1 << bits) - 1)
+        s = '%d%s' % (v, suf)
+        return s if v >= 0 else '(%s)' % s
+
+    def bi_pat(self, k):
+        while True:
+            l = self.bi_lit(k)
+            if not l[0].isalpha():
+                return l
+
+    def ty_boxed(self, t, env, d):
+        k = t[0]
+        m, suf, bits = BOXED[k]
+        r = self.r.random()
+        if r < 0.3:
+            op = self.pick(['add', 'sub', 'mul', 'logand', 'logor', 'logxor', 'min', 'max'])
+            return self.combine([self.gen(t, env, d - 1), self.gen(t, env, d - 1)],
+                                lambda cs: '(%s.%s %s %s)' % (m, op, cs[0], cs[1]))
+        if r < 0.38:
+            op = self.pick(['div', 'rem', 'unsigned_div', 'unsigned_rem'])
+            return self.combine([self.gen(t, env, d - 1), self.gen(t, env, d - 1)],
+                                lambda cs: '(%s.%s %s (let y = %s in if %s.equal y %s.zero '
+                                'then 7%s else y))' % (m, op, cs[0], cs[1], m, m, suf))
+        if r < 0.46:
+            op = self.pick(['shift_left', 'shift_right', 'shift_right_logical'])
+            return self.combine([self.gen(t, env, d - 1), self.gen(INT, env, d - 1)],
+                                lambda cs: '(%s.%s %s ((%s) land %d))' % (m, op, cs[0], cs[1], bits))
+        if r < 0.54:
+            a = self.gen(t, env, d - 1)
+            return E('(%s.%s %s)' % (m, self.pick(['neg', 'succ', 'pred', 'abs', 'lognot']),
+                                     a.code), a.eff)
+        if r < 0.62:
+            a = self.gen(INT, env, d - 1)
+            return E('(%s.of_int %s)' % (m, a.code), a.eff)
+        if r < 0.7:
+            conv = {'int32': [('Int64.to_int32', INT64), ('Nativeint.to_int32', NATIVEINT),
+                              ('Int32.bits_of_float', FLOAT), ('Int32.of_float', None)],
+                    'int64': [('Int64.of_int32', INT32), ('Int64.of_nativeint', NATIVEINT),
+                              ('Int64.bits_of_float', FLOAT), ('Int64.of_float', None)],
+                    'nativeint': [('Nativeint.of_int32', INT32), ('Int64.to_nativeint', INT64),
+                                  ('Nativeint.of_float', None)]}[k]
+            f, st = self.pick(conv)
+            if st is None:
+                # of_float only of floats that fit
+                a = self.gen(FLOAT, env, d - 1)
+                return E('(let f = %s in if Float.is_finite f && Float.abs f < 1e9 then %s f '
+                         'else %s.zero)' % (a.code, f, m), a.eff)
+            a = self.gen(st, env, d - 1)
+            return E('(%s %s)' % (f, a.code), a.eff)
+        if r < 0.76 and k != 'nativeint':
+            w = '32' if k == 'int32' else '64'
+            c = self.gen(CHAR, env, d - 1)
+            i = self.gen(INT, env, d - 1)
+            x = self.gen(t, env, d - 1)
+            j = self.gen(INT, env, d - 1)
+            se, ge = self.pick(['le', 'be', 'ne']), self.pick(['le', 'be', 'ne'])
+            if se == 'ne' or ge == 'ne':
+                se = ge = 'ne'
+            e = self.combine([c, i, x, j], lambda cs: (
+                '(let b = Bytes.make 16 %s in Bytes.set_int%s_%s b ((%s) land 7) %s; '
+                'Bytes.get_int%s_%s b ((%s) land 7))' % (cs[0], w, se, cs[1], cs[2], w, ge, cs[3])))
+            return e
+        if r < 0.8:
+            s = self.pick(['"0x7f"', '"-12"', '"0b101"', '"0o777"', '"1_000"', '"-0"',
+                           '"0u4294967295"' if k == 'int32' else '"0u18446744073709551615"'])
+            return E('(%s.of_string %s)' % (m, s))
+        return E(self.bi_lit(k))
+
+    def ty_int32(self, t, env, d):
+        return self.ty_boxed(t, env, d)
+
+    def ty_int64(self, t, env, d):
+        return self.ty_boxed(t, env, d)
+
+    def ty_nativeint(self, t, env, d):
+        return self.ty_boxed(t, env, d)
+
+    def r3_int(self, env, d):
+        """Third-round int forms, or None."""
+        c = self.r3.random()
+        if c < 0.3 and self.bi:
+            bt = self.pick([INT32, INT64, NATIVEINT])
+            m = BOXED[bt[0]][0]
+            if self.chance(0.5):
+                a = self.gen(bt, env, d - 1)
+                return E('(%s.to_int %s)' % (m, a.code), a.eff)
+            f = self.pick(['compare', 'unsigned_compare'])
+            return self.combine([self.gen(bt, env, d - 1), self.gen(bt, env, d - 1)],
+                                lambda cs: '(%s.%s %s %s)' % (m, f, cs[0], cs[1]))
+        if c < 0.5:
+            s = self.gen(STRING, env, d - 1)
+            ch = self.gen(CHAR, env, d - 1)
+            return self.combine([s, ch], lambda cs: '(match String.index_opt %s %s with Some i -> i '
+                                '| None -> -1)' % tuple(cs))
+        if c < 0.7:
+            i = self.gen(INT, env, d - 1)
+            f = self.pick(['get_uint16_le', 'get_uint16_be', 'get_int16_le', 'get_int16_ne',
+                           'get_uint8', 'get_int8'])
+            return E('(String.%s "ab\\255\\128cdef\\000" ((%s) land 3))' % (f, i.code), i.eff)
+        if c < 0.85:
+            s = self.gen(STRING, env, d - 1)
+            return E('(let s = %s in let h = ref 0 in String.iteri (fun i c -> h := !h * 31 + i + '
+                     'Char.code c) s; !h)' % s.code, s.eff)
+        a = self.gen(INT, env, d - 1)
+        b = self.gen(INT, env, d - 1)
+        f = self.pick(['Int.min', 'Int.max', 'Int.logxor', 'Int.shift_left'])
+        if f == 'Int.shift_left':
+            return self.combine([a, b], lambda cs: '(Int.shift_left %s ((%s) land 63))' % tuple(cs))
+        return self.combine([a, b], lambda cs: '(%s %s %s)' % (f, cs[0], cs[1]))
+
+    def r3_string(self, env, d):
+        c = self.r3.random()
+        a = self.gen(STRING, env, d - 1)
+        if c < 0.18:
+            i = self.gen(INT, env, d - 1)
+            ch = self.gen(CHAR, env, d - 1)
+            return self.combine([a, i, ch], lambda cs: (
+                '(let b = Bytes.of_string %s in let n = Bytes.length b in if n > 0 then '
+                'Bytes.set b (((%s) land max_int) mod n) %s; Bytes.to_string b)' % tuple(cs)))
+        if c < 0.32:
+            n = self.gen(INT, env, d - 1)
+            ch = self.gen(CHAR, env, d - 1)
+            return self.combine([a, n, ch], lambda cs: (
+                '(let s = %s in let b = Bytes.make (1 + ((%s) land 7)) %s in Bytes.blit_string s 0 '
+                'b 0 (min (String.length s) (Bytes.length b)); Bytes.to_string b)' % tuple(cs)))
+        if c < 0.42:
+            n = self.gen(INT, env, d - 1)
+            return self.combine([a, n], lambda cs: (
+                '(let s = %s in String.init ((%s) land 7) (fun i -> if s = "" then \'-\' else '
+                's.[i mod String.length s]))' % tuple(cs)))
+        if c < 0.52:
+            return E('(let s = %s in String.sub s (String.length s / 2) (String.length s - '
+                     'String.length s / 2))' % a.code, a.eff)
+        if c < 0.62:
+            b = self.gen(STRING, env, d - 1)
+            return self.combine([a, b], lambda cs: '(Bytes.to_string (Bytes.cat (Bytes.of_string '
+                                '%s) (Bytes.of_string %s)))' % tuple(cs))
+        if c < 0.72:
+            f = self.pick(['Char.uppercase_ascii', 'Char.lowercase_ascii',
+                           '(fun c -> Char.chr ((Char.code c + 1) land 255))'])
+            return E('(Bytes.unsafe_to_string (Bytes.map %s (Bytes.of_string %s)))' % (f, a.code),
+                     a.eff)
+        if c < 0.8:
+            return E('(let s = %s in String.concat "" (List.rev (List.init (String.length s) '
+                     '(fun i -> String.make 1 (String.unsafe_get s i)))))' % a.code, a.eff)
+        if c < 0.88 and self.bi:
+            bt = self.pick([INT32, INT64, NATIVEINT])
+            x = self.gen(bt, env, d - 1)
+            sp = {'int32': 'l', 'int64': 'L', 'nativeint': 'n'}[bt[0]]
+            f = self.pick(['d', 'x', 'u', 'X', 'i', 'o'])
+            return E('(Printf.sprintf "%%%s%s/%%s" %s %s)' % (sp, f, x.code, a.code),
+                     a.eff or x.eff)
+        return E('(let s = %s in let b = Buffer.create 8 in String.iter (fun c -> '
+                 'Buffer.add_char b c; Buffer.add_char b c) s; cap (Buffer.contents b))' % a.code,
+                 a.eff)
+
+    def r3_char(self, env, d):
+        c = self.r3.random()
+        s = self.gen(STRING, env, d - 1)
+        i = self.gen(INT, env, d - 1)
+        if c < 0.5:
+            return self.combine([s, i], lambda cs: (
+                '(let s = %s in if s = "" then \'q\' else s.[((%s) land max_int) mod '
+                'String.length s])' % tuple(cs)))
+        if c < 0.75:
+            return E('(String.unsafe_get "abc\\255defg" ((%s) land 7))' % i.code, i.eff)
+        return self.combine([s, i], lambda cs: (
+            '(let b = Bytes.of_string (%s ^ "xyz") in Bytes.get b (((%s) land max_int) mod '
+            'Bytes.length b))' % tuple(cs)))
+
+    def r3_bool(self, env, d):
+        c = self.r3.random()
+        a = self.gen(STRING, env, d - 1)
+        if c < 0.3:
+            b = self.gen(STRING, env, d - 1)
+            f = self.pick(['String.equal', '(fun a b -> String.starts_with ~prefix:a b)',
+                           '(fun a b -> String.ends_with ~suffix:b a)'])
+            return self.combine([a, b], lambda cs: '(%s %s %s)' % (f, cs[0], cs[1]))
+        if c < 0.6:
+            ch = self.gen(CHAR, env, d - 1)
+            return self.combine([a, ch], lambda cs: '(String.contains %s %s)' % tuple(cs))
+        if self.bi:
+            bt = self.pick([INT32, INT64, NATIVEINT])
+            m = BOXED[bt[0]][0]
+            return self.combine([self.gen(bt, env, d - 1), self.gen(bt, env, d - 1)],
+                                lambda cs: '(%s.equal %s %s)' % (m, cs[0], cs[1]))
+        return E('(String.exists (fun c -> c = \'a\') %s)' % a.code, a.eff)
+
+    def r3_float(self, env, d):
+        if self.bi and self.r3.random() < 0.5:
+            bt = self.pick([INT32, INT64, NATIVEINT])
+            a = self.gen(bt, env, d - 1)
+            return E('(%s.to_float %s)' % (BOXED[bt[0]][0], a.code), a.eff)
+        if self.r3.random() < 0.5:
+            a = self.gen(INT64, env, d - 1) if self.bi else None
+            if a is not None:
+                return E('(Int64.float_of_bits %s)' % a.code, a.eff)
+        a = self.gen(FLOAT, env, d - 1)
+        b = self.gen(FLOAT, env, d - 1)
+        f = self.pick(['Float.fma', 'Float.ldexp_', 'Float.of_int_trunc'])
+        if f == 'Float.fma':
+            c = self.gen(FLOAT, env, d - 1)
+            return self.combine([a, b, c], lambda cs: '(Float.fma %s %s %s)' % tuple(cs))
+        if f == 'Float.ldexp_':
+            i = self.gen(INT, env, d - 1)
+            return self.combine([a, i], lambda cs: '(Float.ldexp %s ((%s) land 31))' % tuple(cs))
+        return self.combine([a, b], lambda cs: '(Float.min_num %s %s)' % tuple(cs))
+
+    def r3_expr(self, t, env, d):
+        """Third-round generic forms, any type; None to fall through."""
+        c = self.r3.random()
+        if c < 0.2:
+            b = self.gen(t, env, d - 1)
+            return E('(Sys.opaque_identity %s)' % b.code, b.eff, b.ceff)
+        if c < 0.35:
+            b = self.gen(t, env, d - 1)
+            return E('((fun (type a) (x : a) : a -> x) %s)' % b.code, b.eff, b.ceff)
+        if c < 0.55:
+            # a local function with optional arguments, erased by the full
+            # application (or passed explicitly)
+            f = self.fresh('of')
+            o = self.fresh('o')
+            x, y = self.fresh('ox'), self.fresh('oy')
+            a = self.gen(t, env, d - 1)
+            b = self.gen(t, env, d - 1)
+            dflt = self.pick(['true', 'false'])
+            k = self.r3.random()
+            if k < 0.4:
+                call = '%s %s %s' % (f, '(%s)', '(%s)')
+            elif k < 0.6:
+                call = '%s ~%s:%s %s %s' % (f, o, self.pick(['true', 'false']), '(%s)', '(%s)')
+            elif k < 0.8:
+                call = '%s %s ?%s:(%s) %s' % (f, '(%s)', o, self.pick(['None', 'Some true',
+                                                                     'Some false']), '(%s)')
+            else:
+                call = '(%s %s) %s' % (f, '(%s)', '(%s)')
+            e = self.combine([a, b], lambda cs: '(let %s ?(%s = %s) (%s : %s) (%s : %s) = if %s then '
+                             '%s else %s in %s)' % (f, o, dflt, x, self.tstr(t), y, self.tstr(t), o,
+                                                    x, y, call % (cs[0], cs[1])))
+            e.ceff = a.ceff or b.ceff
+            return e
+        if c < 0.68:
+            cnd = self.gen(BOOL, env, d - 1)
+            a = self.gen(t, env, d - 1)
+            b = self.gen(t, env, d - 1)
+            return E('(try assert %s; %s with Assert_failure (_, l, _) -> ignore l; %s)'
+                     % (cnd.code, a.code, b.code), True, a.ceff or b.ceff)
+        if c < 0.8:
+            lt = self.rand_type(1, False)
+            a = self.gen(lt, env, d - 1)
+            v = self.fresh('lzv')
+            b = self.gen(t, env + [Var(v, lt)], d - 1)
+            if self.chance(0.5):
+                return E('(let (lazy %s) = lazy %s in %s)' % (v, a.code, b.code), True, b.ceff)
+            return E('(match lazy %s with lazy %s -> %s)' % (a.code, v, b.code), True, b.ceff)
+        if c < 0.9 and self.exns:
+            # match with an exception case and a guarded value case
+            st = self.rand_type(1, False)
+            s = self.gen(st, env, d - 1)
+            v = self.fresh('mv')
+            g = self.gen(BOOL, env + [Var(v, st)], 0)
+            a = self.gen(t, env + [Var(v, st)], d - 1)
+            b = self.gen(t, env, d - 1)
+            ex, args = self.pick(self.exns)
+            pat = ex if not args else '%s %s' % (ex, '(' + ', '.join('_' for _ in args) + ')')
+            h = self.gen(t, env, d - 1)
+            return E('(match %s with %s when %s -> %s | _ -> %s | exception %s -> %s)'
+                     % (s.code, v, g.code, a.code, b.code, pat, h.code), True, True)
+        return None
+
+    def decl_round3(self, out):
+        r = self.r3
+        self.bi = r.random() < 0.5
+        for name, p in (('prims', 0.3), ('flt', 0.35), ('switch', 0.45), ('gadt3', 0.35),
+                        ('pv3', 0.35), ('lbl3', 0.35), ('eff3', 0.3), ('ext3', 0.3),
+                        ('big3', 0.35), ('bi3', 0.3)):
+            if r.random() < p:
+                getattr(self, 'decl3_' + name)(out)
+
+    def decl3_prims(self, out):
+        r = self.r3
+        out.append('external fz_id : \'a -> \'a = "%identity"\n'
+                   'external fz_sqrt : float -> float = "caml_sqrt_float" "sqrt" '
+                   '[@@unboxed] [@@noalloc]\n'
+                   'external fz_ldexp : (float [@unboxed]) -> (int [@untagged]) -> '
+                   '(float [@unboxed]) = "caml_ldexp_float" "caml_ldexp_float_unboxed" [@@noalloc]\n'
+                   'external fz_bswap16 : int -> int = "%bswap16"\n'
+                   'external fz_bswap32 : int32 -> int32 = "%bswap_int32"\n'
+                   'external fz_bswap64 : int64 -> int64 = "%bswap_int64"\n'
+                   'external fz_revapply : \'a -> (\'a -> \'b) -> \'b = "%revapply"\n'
+                   'external fz_lsl : int -> int -> int = "%lslint"\n'
+                   'external fz_strlen : string -> int = "%string_length"\n'
+                   'external fz_foi : int -> float = "%floatofint"\n'
+                   'external fz_ignore : \'a -> unit = "%ignore"')
+        k = r.randint(0, 15)
+        out.append('let f3prim (n : int) : string =\n'
+                   '  Printf.sprintf "%%h %%h %%d %%ld %%Ld %%d %%d %%h" (fz_sqrt (fz_foi (n land max_int)))\n'
+                   '    (fz_ldexp 1.5 ((n + %d) land 15)) (fz_bswap16 (n land 0xffff))\n'
+                   '    (fz_bswap32 (Int32.of_int n)) (fz_bswap64 (fz_id (Int64.of_int n)))\n'
+                   '    (fz_revapply n succ) (fz_lsl n %d + fz_strlen "abc") (fz_foi n)' % (k, k & 7))
+        self.env.append(Var('f3prim', arrow(INT, STRING), cost=3))
+        self.env.append(Var('fz_sqrt', arrow(FLOAT, FLOAT)))
+        self.env.append(Var('fz_bswap16', arrow(INT, INT)))
+
+    def decl3_flt(self, out):
+        r = self.r3
+        muts = [r.random() < 0.6 for _ in range(3)]
+        self.records['fr3'] = [('xa', FLOAT, True), ('xb', FLOAT, muts[1]), ('xc', FLOAT, muts[2])]
+        out.append('type fr3 = { mutable xa : float; %sxb : float; %sxc : float }' % (
+            'mutable ' if muts[1] else '', 'mutable ' if muts[2] else ''))
+        out.append('let show_fr3 (r : fr3) = "{" ^ show_float r.xa ^ ";" ^ show_float r.xb ^ ";" ^ '
+                   'show_float r.xc ^ "}"')
+        if r.random() < 0.5:
+            self.records['ub3'] = [('ubv', FLOAT, False)]
+            out.append('type ub3 = { ubv : float } [@@unboxed]')
+            out.append('let show_ub3 (r : ub3) = "{ubv=" ^ show_float r.ubv ^ "}"')
+        if r.random() < 0.5:
+            self.variants['ui3'] = [('UI', [INT])]
+            out.append('type ui3 = UI of int [@@unboxed]')
+            out.append('let show_ui3 (UI n : ui3) = "UI(" ^ string_of_int n ^ ")"')
+        c = [self.float_lit() for _ in range(4)]
+        out.append('let fr3_step (r : fr3) (k : float) : fr3 =\n'
+                   '  r.xa <- r.xa *. k +. r.xb; { r with xb = Float.max r.xc r.xa -. k }')
+        out.append('let f3flt (n : int) : float =\n'
+                   '  let acc = ref %s in\n'
+                   '  let r = { xa = float_of_int n; xb = %s; xc = %s } in\n'
+                   '  for i = 0 to n land 7 do\n'
+                   '    acc := !acc +. float_of_int i *. %s;\n'
+                   '    let r2 = fr3_step r !acc in acc := !acc -. r2.xb\n'
+                   '  done;\n'
+                   '  let a = Array.make 4 !acc in a.(n land 3) <- r.xc;\n'
+                   '  let fa = Float.Array.make 3 r.xa in Float.Array.set fa (n land 1) !acc;\n'
+                   '  Array.fold_left (+.) 0. a +. r.xa +. Float.Array.get fa 0 +. pget a n' % tuple(c))
+        self.env.append(Var('f3flt', arrow(INT, FLOAT), cost=4))
+        self.env.append(Var('fr3_step', arrow(('rec', 'fr3'), arrow(FLOAT, ('rec', 'fr3'))), True))
+
+    def decl3_switch(self, out):
+        r = self.r3
+        parts = []
+        # a big variant: jump tables on constant constructors and on tags
+        n = r.randint(8, 60)
+        ctors = []
+        for i in range(n):
+            a = r.choice([None, None, INT, STRING, FLOAT, INT])
+            ctors.append(('K%d' % i, a))
+        out.append('type bv = ' + ' | '.join(c if a is None else '%s of %s' % (c, self.tstr(a))
+                                             for c, a in ctors))
+        mk = {None: '%s', INT: '%s (n * 3)', STRING: '%s (string_of_int n)',
+              FLOAT: '%s (float_of_int n /. 4.)'}
+        out.append('let bv_of_int (n : int) : bv = match (n land max_int) mod %d with %s | _ -> %s'
+                   % (n, ' | '.join('%d -> %s' % (i, mk[a] % c) for i, (c, a) in enumerate(ctors)),
+                      ctors[0][0] if ctors[0][1] is None else mk[ctors[0][1]] % ctors[0][0]))
+        arms = []
+        rest = list(ctors)
+        r.shuffle(rest)
+        covered = 0
+        while rest:
+            c, a = rest.pop()
+            if r.random() < 0.15:
+                continue  # left to the default arm
+            same = [x for x in rest if x[1] == a][:r.randint(0, 3)]
+            for x in same:
+                rest.remove(x)
+            grp = [(c, a)] + same
+            covered += len(grp)
+            v = 'x' if a is not None else ''
+            pat = ' | '.join(('%s %s' % (g, v)).strip() for g, _ in grp)
+            k = r.randint(0, 50)
+            body = {None: '%d' % k, INT: 'x + %d' % k, STRING: 'String.length x + %d' % k,
+                    FLOAT: '(if x > %d. then %d else %d)' % (k, k, k + 1)}[a]
+            arms.append('(%s) -> %s' % (pat, body))
+        if covered < n:
+            arms.append('_ -> -1')
+        out.append('let bv_score : bv -> int = function ' + ' | '.join(arms))
+        parts.append('string_of_int (bv_score (bv_of_int n)) ^ string_of_int (bv_score (bv_of_int (n + %d)))'
+                     % r.randint(1, 40))
+        # an int switch, dense or sparse
+        if r.random() < 0.5:
+            lo = r.randint(-3, 3)
+            vals = sorted(set(lo + i for i in range(r.randint(3, 30)) if r.random() < 0.85))
+        else:
+            vals = sorted(set(r.choice([r.randint(-1000, 100000), r.randint(-5, 5),
+                                        r.randint(-(1 << 40), 1 << 40)])
+                              for _ in range(r.randint(2, 20))))
+        if not vals:
+            vals = [0]
+        iarms = self.sw_arms(['%d' % v if v >= 0 else '(%d)' % v for v in vals],
+                             lambda k: 'n + %d' % k)
+        out.append('let isw (n : int) : int = match n with %s | _ -> %d' % (iarms, r.randint(-9, 9)))
+        ins = ' '.join('%s;' % ('%d' % v if v >= 0 else '(%d)' % v) for v in vals[:12])
+        parts.append('show_list string_of_int (List.map isw [%s n; n + 1; max_int; min_int])' % ins)
+        # a char switch with ranges
+        cpats = []
+        for _ in range(r.randint(2, 10)):
+            if r.random() < 0.4:
+                a, b = sorted([r.randint(0, 255), r.randint(0, 255)])
+                cpats.append("'%s'..'%s'" % (self.esc_char(chr(a)), self.esc_char(chr(b))))
+            else:
+                cpats.append("'%s'" % self.esc_char(chr(r.randint(0, 255))))
+        out.append('let csw (c : char) : int = match c with %s | _ -> -1'
+                   % self.sw_arms(cpats, lambda k: 'Char.code c + %d' % k))
+        parts.append('show_list string_of_int (List.map csw (List.init 12 (fun i -> Char.chr ((n * 7 + i * %d) land 255))))'
+                     % r.randint(1, 60))
+        # a string switch: shared prefixes, lengths around word sizes
+        strs = set()
+        alpha = r.choice(['ab', 'abc', 'xyz01', 'a'])
+        for _ in range(r.randint(2, 18)):
+            ln = r.choice([0, 1, 3, 7, 8, 9, 15, 16, 17, 24])
+            strs.add(''.join(r.choice(alpha) for _ in range(ln)))
+        strs = sorted(strs)
+        out.append('let ssw (s : string) : int = match s with %s | _ -> -1'
+                   % self.sw_arms(['"%s"' % s for s in strs], lambda k: 'String.length s * %d' % k))
+        probes = strs + [s[:-1] for s in strs if s] + [s + alpha[0] for s in strs[:3]]
+        parts.append('show_list string_of_int (List.map ssw [%s string_of_int n])'
+                     % ' '.join('"%s";' % s for s in probes))
+        # a float switch
+        fl = sorted(set(r.choice(['0.', '(-0.)', '1.5', '1e10', '(-2.25)', '0.1', '3.', '0x1p-3',
+                                  '1e-300', '(-1e300)', '7.']) for _ in range(r.randint(1, 6))))
+        out.append('let fsw (f : float) : int = match f with %s | _ -> -1'
+                   % self.sw_arms(fl, lambda k: '%d' % k))
+        parts.append('show_list string_of_int (List.map fsw [%s float_of_int n; nan; 1.5 +. 0.])'
+                     % ' '.join('%s;' % x for x in fl))
+        out.append('let f3sw (n : int) : string =\n  ' + ' ^ "|" ^\n  '.join(parts))
+        self.env.append(Var('f3sw', arrow(INT, STRING), cost=12))
+        self.env.append(Var('isw', arrow(INT, INT)))
+        self.env.append(Var('ssw', arrow(STRING, INT)))
+        self.env.append(Var('csw', arrow(CHAR, INT)))
+        self.variants['bv'] = [(c, [] if a is None else [a]) for c, a in ctors]
+        out.append('let show_bv (x : bv) = match x with ' + ' | '.join(
+            '%s -> "%s"' % (c, c) if a is None else '%s a -> "%s(" ^ %s a ^ ")"' % (c, c, self.show(a))
+            for c, a in ctors))
+
+    def sw_arms(self, pats, body):
+        """Match arms over pats, sometimes grouping several into an
+        or-pattern (shared actions)."""
+        r = self.r3
+        pats = list(pats)
+        arms = []
+        while pats:
+            k = r.randint(1, 3) if r.random() < 0.3 else 1
+            grp, pats = pats[:k], pats[k:]
+            arms.append('%s -> %s' % (' | '.join(grp), body(r.randint(0, 99))))
+        return ' | '.join(arms)
+
+    def tw_rand(self, d):
+        r = self.r3
+        k = r.random()
+        if d <= 0 or k < 0.4:
+            return r.choice([(INT, 'TInt'), (STRING, 'TStr'), (FLOAT, 'TFlt')])
+        if k < 0.6:
+            t, w = self.tw_rand(d - 1)
+            return ('list', t), 'TList (%s)' % w
+        if k < 0.8:
+            t, w = self.tw_rand(d - 1)
+            return ('option', t), 'TOpt (%s)' % w
+        (a, wa), (b, wb) = self.tw_rand(d - 1), self.tw_rand(d - 1)
+        return ('tuple', (a, b)), 'TPair (%s, %s)' % (wa, wb)
+
+    def decl3_gadt3(self, out):
+        r = self.r3
+        out.append('''type _ tw = TInt : int tw | TStr : string tw | TFlt : float tw
+  | TList : 'a tw -> 'a list tw | TPair : 'a tw * 'b tw -> ('a * 'b) tw | TOpt : 'a tw -> 'a option tw
+type (_, _) teq = Refl : ('a, 'a) teq
+type dyn = Dyn : 'a tw * 'a -> dyn
+let rec tw_eq : type a b. a tw -> b tw -> (a, b) teq option = fun a b ->
+  match a, b with
+  | TInt, TInt -> Some Refl
+  | TStr, TStr -> Some Refl
+  | TFlt, TFlt -> Some Refl
+  | TList a, TList b -> (match tw_eq a b with Some Refl -> Some Refl | None -> None)
+  | TPair (a1, a2), TPair (b1, b2) ->
+    (match tw_eq a1 b1, tw_eq a2 b2 with Some Refl, Some Refl -> Some Refl | _ -> None)
+  | TOpt a, TOpt b -> (match tw_eq a b with Some Refl -> Some Refl | None -> None)
+  | _ -> None
+let rec tw_show : type a. a tw -> a -> string = fun t x ->
+  match t with
+  | TInt -> string_of_int x
+  | TStr -> show_string x
+  | TFlt -> show_float x
+  | TList t -> show_list (tw_show t) x
+  | TPair (a, b) -> let (x1, x2) = x in "(" ^ tw_show a x1 ^ "," ^ tw_show b x2 ^ ")"
+  | TOpt t -> show_option (tw_show t) x
+let dyn_get : type a. a tw -> dyn -> a option = fun t (Dyn (t', v)) ->
+  match tw_eq t' t with Some Refl -> Some v | None -> None
+let dyn_show (Dyn (t, v)) = tw_show t v
+type shw = Shw : { v : 'a; sh : 'a -> string; tag : int } -> shw
+type ir3 = Ir of { mutable ia : int; ib : string } | Ir0
+let ir_bump = function Ir r -> r.ia <- r.ia + String.length r.ib; r.ia | Ir0 -> 0
+type 'a nest = NNil | NCons of 'a * ('a * 'a) nest
+let rec nlen : 'a. 'a nest -> int = function NNil -> 0 | NCons (_, r) -> 1 + nlen r
+let rec nsum : 'a. ('a -> int) -> 'a nest -> int = fun f -> function
+  | NNil -> 0 | NCons (x, r) -> f x + nsum (fun (a, b) -> f a + f b) r
+let rec nmk : 'a. int -> 'a -> 'a nest = fun n x -> if n <= 0 then NNil else NCons (x, nmk (n - 1) (x, x))
+type _ num = NI : int -> int num | NF : float -> float num | NS : string -> string num
+let nadd : type a. a num -> a num -> a num = fun a b ->
+  match a, b with NI x, NI y -> NI (x + y) | NF x, NF y -> NF (x *. y) | NS x, NS y -> NS (x ^ y)
+let nshow : type a. a num -> string = function
+  | NI n -> string_of_int n | NF f -> show_float f | NS s -> show_string s
+module type ORD3 = sig type t val cmp : t -> t -> int val bot : t end
+let sort3 (type a) (module O : ORD3 with type t = a) (l : a list) : a list = List.sort O.cmp (O.bot :: l)''')
+        dy = []
+        for _ in range(r.randint(2, 5)):
+            t, w = self.tw_rand(2)
+            dy.append((t, w, self.body_expr(t, self.env)))
+        out.append('let dyns = [%s]' % '; '.join('Dyn (%s, %s)' % (w, v) for _, w, v in dy))
+        qt, qw, _ = r.choice(dy) if r.random() < 0.7 else (self.tw_rand(1) + (None,))
+        st, sw = self.tw_rand(1)
+        sv = self.body_expr(st, self.env)
+        k = r.randint(0, 9)
+        out.append('let shws = [Shw { v = %s; sh = %s; tag = %d }; Shw { v = (%s : %s); sh = (fun x -> '
+                   '%s x); tag = %d }]' % (sv, '(tw_show (%s))' % sw, k, self.body_expr(INT, self.env),
+                                         'int', 'string_of_int', k + 1))
+        cmp = r.choice(['compare a b', 'compare b a', 'compare (a mod 3) (b mod 3)'])
+        out.append('let f3gadt (n : int) : string =\n'
+                   '  let d = List.nth dyns ((n land max_int) mod %d) in\n'
+                   '  dyn_show d ^ "|" ^ (match dyn_get (%s) d with Some x -> %s x | None -> "none")\n'
+                   '  ^ "|" ^ String.concat "," (List.map (fun (Shw { v; sh; tag }) -> sh v ^ string_of_int tag) shws)\n'
+                   '  ^ "|" ^ (let i = (if n land 1 = 0 then Ir { ia = n; ib = "%s" } else Ir0) in '
+                   'string_of_int (ir_bump i + ir_bump i))\n'
+                   '  ^ "|" ^ string_of_int (nsum (fun x -> x) (nmk ((n land max_int) mod 4) n) + nlen (nmk %d "s"))\n'
+                   '  ^ "|" ^ nshow (nadd (NI n) (NI (%d))) ^ nshow (nadd (NF (float_of_int n)) (NF %s)) ^ '
+                   'nshow (nadd (NS "a") (NS (string_of_int n)))\n'
+                   '  ^ "|" ^ show_list string_of_int (sort3 (module struct type t = int let cmp a b = %s '
+                   'let bot = %d end) [n; n * 3 mod 7; -n])\n'
+                   '  ^ show_list show_string (sort3 (module struct type t = string let cmp = compare '
+                   'let bot = "m" end) [string_of_int n; "a"; "zz"])'
+                   % (len(dy), qw, self.show(qt), r.choice(['ab', '', 'xyz']), r.randint(0, 4),
+                      r.randint(-9, 9), self.float_lit(), cmp, r.randint(-5, 5)))
+        self.env.append(Var('f3gadt', arrow(INT, STRING), cost=10))
+
+    def decl3_pv3(self, out):
+        r = self.r3
+        pool = ['Aa', 'Bb', 'Cc', 'Red', 'Green', 'Blue', 'T1', 'T2', 'Foo', 'Bar', 'Baz', 'Qux',
+                'Zz', 'Lst', 'Num', 'Str', 'Pair', 'Nil', 'X9', 'Yy', 'Abcdefghij', 'U']
+        tags = [(tg, r.choice([None, None, INT, STRING, ('tuple', (INT, BOOL)), FLOAT]))
+                for tg in r.sample(pool, r.randint(3, 16))]
+
+        def ty(tags):
+            return '[ %s ]' % ' | '.join('`%s' % tg if a is None else '`%s of %s' % (tg, self.tstr(a))
+                                        for tg, a in tags)
+
+        def mk(tg, a):
+            if a is None:
+                return '`%s' % tg
+            if a == INT:
+                return '`%s (n * 5)' % tg
+            if a == STRING:
+                return '`%s (string_of_int n)' % tg
+            if a == FLOAT:
+                return '`%s (float_of_int n /. 8.)' % tg
+            return '`%s (n, n land 1 = 0)' % tg
+        out.append('type pt3 = %s' % ty(tags))
+        nsub = r.randint(1, min(3, len(tags)))
+        sub = tags[:nsub]
+        out.append('type pt3s = %s' % ty(sub))
+        out.append('let pt3_of_int (n : int) : pt3 = match (n land max_int) mod %d with %s | _ -> %s'
+                   % (len(tags), ' | '.join('%d -> %s' % (i, mk(tg, a)) for i, (tg, a) in enumerate(tags)),
+                      mk(*tags[-1])))
+        out.append('let pt3_sub (n : int) : pt3s = match (n land max_int) mod %d with %s | _ -> %s'
+                   % (nsub, ' | '.join('%d -> %s' % (i, mk(tg, a)) for i, (tg, a) in enumerate(sub)),
+                      mk(*sub[0])))
+        arms = []
+        rest = list(tags)
+        r.shuffle(rest)
+        partial = False
+        while rest:
+            tg, a = rest.pop()
+            if r.random() < 0.15:
+                partial = True
+                continue
+            same = [x for x in rest if x[1] == a][:r.randint(0, 2)]
+            for x in same:
+                rest.remove(x)
+            grp = [(tg, a)] + same
+            v = '' if a is None else ' x'
+            pat = '(%s)' % ' | '.join('`%s%s' % (g, v) for g, _ in grp)
+            k = r.randint(0, 30)
+            if a is None:
+                body = '%d' % k
+            elif a == INT:
+                body = 'x + %d' % k
+            elif a == STRING:
+                body = 'String.length x * %d' % k
+            elif a == FLOAT:
+                body = '(if x > 3. then %d else %d)' % (k, -k)
+            else:
+                body = '(let (p, q) = x in if q then p else %d)' % k
+            arms.append('%s -> %s' % (pat, body))
+        if partial or r.random() < 0.2:
+            arms.append('_ -> -7')
+        out.append('let pt3_score (x : pt3) : int = match x with ' + ' | '.join(arms))
+        out.append('let pt3_classify (x : pt3) : int = match x with #pt3s as y -> 2 * pt3_score (y :> pt3) '
+                   '| other -> pt3_score other')
+        t0, a0 = tags[0]
+        if a0 is None:
+            oarm = '`%s -> 1' % t0
+        elif a0 == INT:
+            oarm = '`%s n -> n' % t0
+        elif a0 == STRING:
+            oarm = '`%s s -> String.length s' % t0
+        elif a0 == FLOAT:
+            oarm = '`%s f -> (if f < 0. then 1 else 2)' % t0
+        else:
+            oarm = '`%s (p, _) -> p' % t0
+        out.append('let pv_open = function %s | `Zzz s -> String.length s | _ -> -1' % oarm)
+        extra = ('Wq', None)
+        closed = sub + [extra]
+        carms = ' | '.join('`%s%s -> %d' % (tg, '' if a is None else ' _', i) for i, (tg, a) in enumerate(closed))
+        out.append('let pv_closed (x : [< %s ]) = match x with %s' % (ty(closed)[2:-2], carms))
+        out.append('let f3pv (n : int) : string =\n'
+                   '  Printf.sprintf "%%d/%%d/%%d/%%d/%%d/%%d" (pt3_score (pt3_of_int n)) (pt3_classify (pt3_of_int (n + %d)))\n'
+                   '    (pt3_classify (pt3_sub n :> pt3)) (pv_open (%s) + pv_open (`Zzz "abc") + pv_open `Nope)\n'
+                   '    (pv_closed (pt3_sub n)) (pv_closed `Wq)'
+                   % (r.randint(1, 20), mk(t0, a0)))
+        self.env.append(Var('f3pv', arrow(INT, STRING), cost=6))
+        self.pvs['pt3'] = tags
+        self.pvs['pt3s'] = sub
+        out.append('let show_pt3 (x : pt3) = match x with %s' % ' | '.join(
+            '`%s -> "`%s"' % (tg, tg) if a is None else '`%s a -> "`%s(" ^ %s a ^ ")"' % (tg, tg, self.show(a))
+            for tg, a in tags))
+        out.append('let show_pt3s (x : pt3s) = show_pt3 (x :> pt3)')
+        self.pv_sub['pt3s'] = 'pt3'
+
+    def decl3_lbl3(self, out):
+        r = self.r3
+        a0, p0, k0 = r.randint(-3, 9), r.randint(0, 9), r.randint(0, 9)
+        out.append('let f3o ?(a = %d) ?b ~c d = a * 3 + (match b with None -> 7 | Some x -> x * 5) '
+                   '+ c * 11 + d' % a0)
+        out.append('let f3od ?(p = %d) ?(q = p * 2 + 1) (r : int) = p + q * r' % p0)
+        out.append('let f3u ?(k = %d) () = k * 2' % k0)
+        out.append('let f3mk ?(s = 1) x = fun ?(t = 2) y -> s * 1000 + x * 100 + t * 10 + y')
+        out.append('let f3hof (g : int -> int) = g 1 + g 2')
+        calls = ['f3o n ~c:2', 'f3o ~b:3 ~c:4 n', 'f3o ?b:None ~c:n 1', 'g 5', 'g ~b:n 6',
+                 'h ~c:1 2', 'f3od n', 'f3od ~q:n 3', 'f3od ?p:(Some n) 2', 'f3u ()', 'f3u ~k:n ()',
+                 'f3mk n 3', '(f3mk ~s:n 1) ~t:n 2', 'f3mk n ~t:3 4', 'f3hof (f3o ~c:n)',
+                 'f3hof (f3od ~p:2)', 'f3hof (f3mk n)', 'f3o ~c:(f3u ()) (f3od ?q:(Some n) 1)',
+                 'f3o ~a:n ~c:n ~b:n n', 'List.fold_left (+) 0 (List.map (f3o ~c:n ~a:1) [1; 2])',
+                 '(let k = f3o ?a:(if n > 0 then Some n else None) in k ~c:0 1)']
+        sel = r.sample(calls, r.randint(4, len(calls)))
+        out.append('let f3lbl (n : int) : string =\n'
+                   '  let g = f3o ~c:n in\n  let h = f3o ~a:2 in\n'
+                   '  String.concat "," (List.map string_of_int [%s])' % '; '.join(sel))
+        self.env.append(Var('f3lbl', arrow(INT, STRING), cost=6))
+
+    def decl3_eff3(self, out):
+        r = self.r3
+        lim, mul = r.randint(0, 20), r.randint(1, 5)
+        out.append('type _ Effect.t += E3ask : int -> int Effect.t | E3tell : string -> unit Effect.t')
+        out.append('exception E3stop of int')
+        out.append('''let e3run (f : unit -> int) : string =
+  let log = Buffer.create 16 in
+  Effect.Deep.match_with f ()
+    { Effect.Deep.retc = (fun x -> Buffer.contents log ^ "=" ^ string_of_int x);
+      exnc = (fun e -> Buffer.contents log ^ "!" ^ Printexc.to_string e);
+      effc = (fun (type a) (e : a Effect.t) ->
+        match e with
+        | E3ask k -> Some (fun (c : (a, _) Effect.Deep.continuation) ->
+            if k > %d then Effect.Deep.discontinue c (E3stop k) else Effect.Deep.continue c (k * %d + 1))
+        | E3tell s -> Some (fun (c : (a, _) Effect.Deep.continuation) ->
+            if Buffer.length log < 100 then Buffer.add_string log s; Effect.Deep.continue c ())
+        | _ -> None) }''' % (lim, mul))
+        out.append('''let e3direct (n : int) : int =
+  match (let a = Effect.perform (E3ask n) in Effect.perform (E3tell "d"); a + 1) with
+  | v -> v * 2
+  | effect E3ask k, c -> Effect.Deep.continue c (k + %d)
+  | effect E3tell _, c -> Effect.Deep.continue c ()
+  | exception E3stop k -> -k''' % r.randint(0, 9))
+        out.append('''let f3eff (n : int) : string =
+  e3run (fun () -> let acc = ref 0 in
+    for i = 0 to n land %d do
+      acc := !acc + Effect.perform (E3ask (i + (n land 15)));
+      Effect.perform (E3tell (string_of_int !acc))
+    done; !acc)
+  ^ "|" ^ string_of_int (e3direct n)
+  ^ "|" ^ (match Effect.Deep.try_with (fun () -> Effect.perform (E3ask 1) + %d) ()
+       { Effect.Deep.effc = fun (type a) (e : a Effect.t) -> match e with
+         | E3ask k -> Some (fun (c : (a, _) Effect.Deep.continuation) -> Effect.Deep.continue c (k + n))
+         | _ -> None } with v -> string_of_int v | exception E3stop k -> "stop" ^ string_of_int k)''' %
+                   (r.choice([1, 3, 7]), r.randint(0, 9)))
+        self.env.append(Var('f3eff', arrow(INT, STRING), cost=10))
+        self.env.append(Var('e3direct', arrow(INT, INT), cost=3))
+
+    def decl3_ext3(self, out):
+        r = self.r3
+        k1, k2 = r.randint(-2, 10), r.randint(-2, 10)
+        out.append('type ext3 = ..')
+        out.append('type ext3 += X3a of int | X3b')
+        out.append('''module MkX3 (P : sig val k : int end) = struct
+  exception Boom3 of int
+  type ext3 += X3f of int
+  let mk n = if n > P.k then raise (Boom3 n) else X3f (n * P.k)
+end
+module X3m1 = MkX3 (struct let k = %d end)
+module X3m2 = MkX3 (struct let k = %d end)
+module type X3S = module type of X3m1
+module X3m3 : X3S = X3m1
+type ext3 += X3c of string''' % (k1, k2))
+        out.append('let show_ext3 = function X3a n -> "a" ^ string_of_int n | X3b -> "b" '
+                   '| X3m1.X3f n -> "f1:" ^ string_of_int n | X3m2.X3f n -> "f2:" ^ string_of_int n '
+                   '| X3c s -> s | _ -> "other"')
+        out.append('''let f3ext (n : int) : string =
+  let one m = try show_ext3 (m n) with X3m1.Boom3 k -> "boom1:" ^ string_of_int k
+    | X3m2.Boom3 k -> "boom2:" ^ string_of_int k in
+  String.concat "," [one X3m1.mk; one X3m2.mk; one X3m3.mk;
+    show_ext3 (if n land 1 = 0 then X3a n else X3c "c"); show_ext3 X3b;
+    Printexc.to_string (X3m2.Boom3 n); string_of_bool (X3m3.X3f 1 = X3m1.X3f 1)]''')
+        self.env.append(Var('f3ext', arrow(INT, STRING), cost=4))
+        self.exns.append(('X3m1.Boom3', [INT]))
+
+    def decl3_big3(self, out):
+        r = self.r3
+        n = r.randint(5, 16)
+        tys = [r.choice([INT, INT, FLOAT, STRING, INT]) for _ in range(n)]
+        ps = ['b%d' % i for i in range(n)]
+        isum = ' + '.join('%s * %d' % (p, 2 * i + 1) for i, (p, t) in enumerate(zip(ps, tys)) if t == INT) or '0'
+        fsum = ' +. '.join('%s *. %s' % (p, self.float_lit()) for p, t in zip(ps, tys) if t == FLOAT) or '0.'
+        ssum = ' ^ '.join(p for p, t in zip(ps, tys) if t == STRING) or '""'
+        over = r.random() < 0.3
+        out.append('let f3bigf %s : %s =\n  let i = %s and f = %s and s = %s in\n  %s'
+                   % (' '.join('(%s : %s)' % (p, self.tstr(t)) for p, t in zip(ps, tys)),
+                      'int -> string' if over else 'string',
+                      isum, fsum, ssum,
+                      '(fun k -> Printf.sprintf "%d/%h/%s/%d" i f (cap s) k)' if over else
+                      'Printf.sprintf "%d/%h/%s" i f (cap s)'))
+
+        def arg(t, j):
+            return {('int',): 'n + %d' % j, ('float',): '(float_of_int n *. 0.%d)' % (j + 1),
+                    ('string',): '"s%d"' % j}[t]
+        args = [arg(t, j) for j, t in enumerate(tys)]
+        cuts = sorted(r.sample(range(1, n), r.randint(0, min(3, n - 1))))
+        segs = []
+        prev = 0
+        for c in cuts + [n]:
+            segs.append(args[prev:c])
+            prev = c
+        code = 'f3bigf %s' % ' '.join('(%s)' % a for a in segs[0])
+        lets = []
+        for i, sg in enumerate(segs[1:]):
+            v = 'pp%d' % i
+            lets.append('let %s = %s in' % (v, code))
+            code = '%s %s' % (v, ' '.join('(%s)' % a for a in sg))
+        if over:
+            code = '(%s) n' % code
+        m = r.randint(6, 14)
+        lp = ['l%d' % i for i in range(m)]
+        out.append('let rec f3loop (k : int) %s : int =\n  if k <= 0 then %s\n  else f3loop (k - 1) %s'
+                   % (' '.join('(%s : int)' % p for p in lp),
+                      ' + '.join('%s * %d' % (p, i + 1) for i, p in enumerate(lp)),
+                      ' '.join(lp[1:] + ['(%s + k)' % lp[0]])))
+        nfv = r.randint(3, 12)
+        fvs = ['let w%d = n * %d + %d in' % (i, i + 1, r.randint(0, 9)) for i in range(nfv)]
+        clo = ' + '.join('w%d * %d' % (i, r.randint(1, 5)) for i in range(nfv))
+        out.append('let f3big (n : int) : string =\n  %s\n  %s\n  %s\n'
+                   '  let rec ev x = if x <= 0 then w0 else od (x - 1) + 1 and od x = if x <= 0 then -w1 else ev (x - 1) * 2 in\n'
+                   '  let g x = x + %s in\n'
+                   '  %s ^ "|" ^ string_of_int (f3loop (n land 15) %s) ^ "|" ^ '
+                   'string_of_int (List.fold_left (fun a b -> a + g b) (ev (n land 15)) [1; 2; 3])'
+                   % (' '.join(lets), ' '.join(fvs[:1]), ' '.join(fvs[1:]), clo, code,
+                      ' '.join('(n + %d)' % i for i in range(m))))
+        self.env.append(Var('f3big', arrow(INT, STRING), cost=8))
+
+    def decl3_bi3(self, out):
+        r = self.r3
+        out.append('''let f3bi (n : int) : string =
+  let a = ref (Int64.of_int n) and b = ref %s and c = ref (Nativeint.of_int n) in
+  for i = 1 to (n land 15) + 1 do
+    a := Int64.(add (mul !a %s) (of_int i));
+    b := Int32.(logxor (shift_left !b %d) (of_int i));
+    c := Nativeint.(sub (shift_right !c 1) (of_int (i * %d)))
+  done;
+  Printf.sprintf "%%Ld %%ld %%nx %%Lu %%lu" !a !b !c (Int64.div !a (Int64.of_int ((n land 7) + 1))) (Int32.rem !b 7l)'''
+                   % (self.bi_lit('int32'), self.bi_lit('int64'), r.randint(0, 31), r.randint(1, 9)))
+        self.env.append(Var('f3bi', arrow(INT, STRING), cost=4))
 
 
 def enclosed(code):
