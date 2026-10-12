@@ -70,8 +70,11 @@ let () = ignore (f false)
 ```
 
 What it needs (each checked by removing it): `f` must be used (no
-`let ()` line: compiles); the exception must carry an argument
-(`raise Exit` or `failwith ""`: compiles); the dead `if true then raise
+`let ()` line: compiles); the raised value must be an exception
+constructor applied to an argument right at the raise (`raise (E 0)`,
+`raise (Failure "")`, `raise_notrace (E 0)` fail; `raise Exit`, `raise
+Not_found`, a constant `exception E` raised, a prebuilt `let e = E 0 ..
+raise e`, `failwith ""` and `assert false` compile); the dead `if true then raise
 .. else ..` (raising directly in the `else`, or `if false`: compiles);
 and a recursive higher-order callee such as `List.exists` or a local
 `let rec exists` (a non-recursive `let app g = g 0`: compiles).  The
