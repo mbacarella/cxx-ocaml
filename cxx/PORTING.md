@@ -357,6 +357,7 @@ header the pitfalls to avoid in a new harness.  Results as of the
 | `ddc.sh` + `stdlib_ddc.sh` | diverse double-compiling (`cxx/DDC.md`) | PASS: 271 .cmo + 355 .cmi (bytecode and native compiler sources) |
 | `testsuite_delta.sh` | ocamltest with c++ocamlc as ocamlc | the delta (below) |
 | `as_parity.sh` | `as` vs `c++as` objects on ocamlopt.opt's `-S` (and `FLAGS=-g`, `-function-sections`) | 6556/6556 |
+| `fuzz/fuzz.py` | random programs (`fuzz/gen.py`; `--ill`: one type or syntax error): `-i`, the `-d` dumps, .cmi/.cmo/.cmt/.s/.cmx/.o bytes, executables and their output; with a flambda tree, `-O3` and whole-program runs | 2000 + 1000 `--ill` (2026-10-11), the port bugs found fixed; `fuzz/regress.py` |
 
 Also: `false_accept.sh` / `valid_reject.sh` (through `port_check.sh`),
 `typing_cmi_parity.sh` / `typing_env_parity.sh` / `typing_ctype_parity.sh` /
