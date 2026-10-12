@@ -2866,7 +2866,7 @@ let sort3 (type a) (module O : ORD3 with type t = a) (l : a list) : a list = Lis
   let log = Buffer.create 16 in
   Effect.Deep.match_with f ()
     { Effect.Deep.retc = (fun x -> Buffer.contents log ^ "=" ^ string_of_int x);
-      exnc = (fun e -> Buffer.contents log ^ "!" ^ Printexc.to_string e);
+      exnc = (fun e -> Buffer.contents log ^ "!" ^ (match e with E3stop k -> "stop" ^ string_of_int k | _ -> "exn"));
       effc = (fun (type a) (e : a Effect.t) ->
         match e with
         | E3ask k -> Some (fun (c : (a, _) Effect.Deep.continuation) ->
@@ -2918,7 +2918,7 @@ type ext3 += X3c of string''' % (k1, k2))
     | X3m2.Boom3 k -> "boom2:" ^ string_of_int k in
   String.concat "," [one X3m1.mk; one X3m2.mk; one X3m3.mk;
     show_ext3 (if n land 1 = 0 then X3a n else X3c "c"); show_ext3 X3b;
-    Printexc.to_string (X3m2.Boom3 n); string_of_bool (X3m3.X3f 1 = X3m1.X3f 1)]''')
+    (match X3m2.Boom3 n with X3m1.Boom3 _ -> "same" | X3m2.Boom3 k -> "b2:" ^ string_of_int k | _ -> "?"); string_of_bool (X3m3.X3f 1 = X3m1.X3f 1)]''')
         self.env.append(Var('f3ext', arrow(INT, STRING), cost=4))
         self.exns.append(('X3m1.Boom3', [INT]))
 
