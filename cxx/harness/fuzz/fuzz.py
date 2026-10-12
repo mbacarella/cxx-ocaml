@@ -51,6 +51,7 @@ ALL_LEVELS = ['i', 'bc', 'bcg', 'byte', 'nat', 'fl', 'wp']
 MAXOUT = 2_000_000
 
 sys.path.insert(0, HERE)
+sys.dont_write_bytecode = True  # (no __pycache__ in the tree)
 import gen  # noqa: E402
 
 

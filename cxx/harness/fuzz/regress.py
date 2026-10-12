@@ -14,6 +14,7 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+sys.dont_write_bytecode = True  # (no __pycache__ in the tree)
 import fuzz  # noqa: E402
 
 

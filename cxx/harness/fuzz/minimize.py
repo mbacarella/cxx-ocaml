@@ -21,6 +21,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+sys.dont_write_bytecode = True  # (no __pycache__ in the tree)
 import fuzz  # noqa: E402
 import gen  # noqa: E402
 
@@ -101,6 +102,10 @@ class Pred:
         findings, notes, out = fuzz.compare_levels(
             self.wd, LEVELS.get(self.base, [self.base]), self.flags)
         if any(n.startswith('UNSPEC') for n in notes):
+            return False
+        # a whole-program finding stays one about a program stock compiles
+        # and runs (a type error would fail the whole-program build too)
+        if self.base == 'wp' and out.get('byte') in (None, b'TIMEOUT'):
             return False
         return any(l == self.level for l, _, _ in findings)
 
