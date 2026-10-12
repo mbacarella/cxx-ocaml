@@ -65,17 +65,26 @@ in a 5000-program run were this.
 ```ocaml
 exception E of int
 let f (a : bool) =
-  (Sys.opaque_identity "" = "") ||
   List.exists (if a then (fun _ -> a) else if true then raise (E 0) else (fun _ -> false)) []
-let () = print_endline (try string_of_bool (f false) with _ -> "exn")
+let () = ignore (f false)
 ```
 
+What it needs (each checked by removing it): `f` must be used (no
+`let ()` line: compiles); the exception must carry an argument
+(`raise Exit` or `failwith ""`: compiles); the dead `if true then raise
+.. else ..` (raising directly in the `else`, or `if false`: compiles);
+and a recursive higher-order callee such as `List.exists` or a local
+`let rec exists` (a non-recursive `let app g = g 0`: compiles).  The
+list may be empty or not.
+
 ```
-$ ocamlopt -O3 s3.ml
+$ ocamlopt -O3 -c s3.ml
 >> Fatal error: [Project_var] from a value with wrong approximation:
-(project_var a/47 from anon_fn[s3.ml:4,25--37]/45=p/254)
-closure=p/254
-approx of closure={ descr=bottom var=p/254 symbol=<no symbol> }
+(project_var a/38 from anon_fn[s3.ml:2,42--54]/36=p/198)
+closure=p/198
+approx of closure={ descr=bottom var=p/198 symbol=<no symbol> }
+
+Fatal error: exception Misc.Fatal_error
 ```
 
 Default flambda (-O1) compiles it.  The anonymous function in the dead
