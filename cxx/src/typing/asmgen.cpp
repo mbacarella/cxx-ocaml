@@ -234,6 +234,9 @@ void compile_unit(const std::string& asm_filename, bool keep_asm, const std::str
     try {
       text = gen();
     } catch (...) {
+      // ocamlopt opened (truncated) the assembly file before generating the
+      // code into memory: a failure leaves it empty, kept under -S
+      if (create_asm && keep_asm) std::ofstream(asm_filename, std::ios::binary | std::ios::trunc);
       remove_asm_file();
       throw;
     }

@@ -17,6 +17,7 @@
 #include "cppcaml/typing/mach.hpp"
 #include "cppcaml/typing/compilenv.hpp"
 #include "cppcaml/typing/switch.hpp"
+#include "cppcaml/typing/misc.hpp"
 
 namespace cppcaml::typing::cmmgen_state {
 
@@ -89,7 +90,10 @@ namespace L = lambda;
 
 namespace {
 
-[[noreturn]] void fatal(const std::string& s) { throw std::runtime_error(s); }
+// Misc.fatal_error: ">> Fatal error: " on stderr, then the uncaught
+// Misc.Fatal_error (exit 2).  (The few sites that are `assert false`
+// upstream come here too: same exit, another message.)
+[[noreturn]] void fatal(const std::string& s) { misc::fatal_error(s); }
 
 // ---- OCaml's 63-bit int arithmetic -----------------------------------------------------------
 constexpr long max_int = (1L << 62) - 1;

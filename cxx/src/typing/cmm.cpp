@@ -1,5 +1,6 @@
 // Port of asmcomp/cmm.ml.  See cmm.hpp.
 #include "cppcaml/typing/cmm.hpp"
+#include "cppcaml/typing/misc.hpp"
 
 #include <stdexcept>
 #include <string>
@@ -14,7 +15,10 @@ Machtype one(MC c) {  // (the typ_* singletons: permanent, whatever zone is curr
   *p = c;
   return Machtype{p, 1};
 }
-[[noreturn]] void fatal(const std::string& s) { throw std::runtime_error(s); }
+// Misc.fatal_error: ">> Fatal error: " on stderr, then the uncaught
+// Misc.Fatal_error (exit 2).  (The few sites that are `assert false`
+// upstream come here too: same exit, another message.)
+[[noreturn]] void fatal(const std::string& s) { misc::fatal_error(s); }
 }  // namespace
 
 Machtype typ_void() { return {}; }
