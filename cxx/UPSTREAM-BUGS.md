@@ -114,7 +114,8 @@ let () = Printf.printf "%Ld %Ld\n" (f (-4608)) (g (-1))
 A shift by 63 is in range (only `n < 0 || n > Sys.int_size` is
 unspecified).  Native code returns the argument's tagged representation
 (`2x+1`).  The tagged shift is `(x >>s 63) lor 1`, and untagging it for
-`Int64.of_int`, `float_of_int`, an unboxed context, etc. goes through
+`Int64.of_int`, `float_of_int`, `mod` and `/` (`(h lsr 63) mod 2` is 1
+natively for any h: fuzz seed 12575), etc. goes through
 `Cmm_helpers.untag_int` (`asmcomp/cmm_helpers.ml`, before that cmmgen.ml):
 
 ```ocaml
