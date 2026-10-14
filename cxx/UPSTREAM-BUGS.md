@@ -5,6 +5,8 @@ compiled by stock and by the port, compared at every level and run under
 bytecode, closure, flambda and whole-program mode).  c++ocamlc /
 c++ocamlopt reproduce each of them exactly, because stock is the
 reference.  Not yet checked against the upstream issue tracker.
+Bug 5 was not found by the fuzzer: it was reported upstream
+(2026-10-14) and is recorded here because the port reproduces it.
 
 Reproduced on this tree's trunk (cfb30145d9, 5.6.0+dev); bug 1 also on
 the 5.3.0 and 5.5.1 releases (the fuzzer saw it on 5.0 to 5.5.1).
@@ -133,3 +135,69 @@ encodable: probably an assembler error there instead, not checked.)
 Found as a stock bytecode-vs-native disagreement (fuzz seed 8328:
 `Int64.of_int (x lsr (0x7fff land 63))`).  The regression copy is
 `cxx/harness/fuzz/regress/untag_shift64.ml`.
+
+## 5. `ocamlopt`: array indexing constants wrap (ocaml/ocaml#15160)
+
+```ocaml
+let[@inline never] get (a : int array) = a.(0x1000_0000_0000_0001)
+let () = print_int (get [| 10; 11; 12; 13 |])
+```
+
+| | bytecode | ocamlopt (closure, flambda), c++ocamlopt, whole-program |
+|---|---|---|
+| checked `a.(2^60 + 1)`, 4 elements | `Invalid_argument` | **11** (reads `a.(1)`) |
+| checked `a.(2^54 + 1)` (#15162's test) | `Invalid_argument` | **segfault** |
+| `Array.unsafe_get a (i - 2^60)`, `i = 2^60 + 1` | 11 | **segfault** |
+| `Array1.unsafe_get` on chars at `Int64.to_int (Int64.add min_int 5L)` | `'f'` | **segfault** |
+
+Reported upstream as #15160 (Stefan Muenzel, 2026-10-14; found with
+SMT validation of `Cmm_helpers`); fixes proposed in #15161
+(`array_indexing`) and #15162 (`make_checkbound`).  Three constants in
+`asmcomp/cmm_helpers.ml` are computed with the compiler's 63-bit `int`
+and wrap:
+
+- `make_checkbound` folds `checkbound (hdr >>u 9) m` (m the tagged
+  constant index) into `checkbound hdr (m lsl 9 + 511)`; its guard
+  `(m lsl n) > n` misses a wrap.  For an index i in roughly [2^53,
+  2^61) `m lsl 9` wraps to a small positive number and the check passes
+  for any array long enough (i = 2^54 + 1: `checkbound hdr 2047`, then a
+  load 2^57 bytes away: segfault; i = 2^60 + 1: `i lsl 3` in the
+  constant case of `array_indexing` wraps too, to 8, and a *checked*
+  access silently reads `a.(1)`).  Below 2^52 (`m lsl 9` wraps
+  negative: the guard fails) and at `max_int`, `min_int`, `-1` it raises
+  as it should.  #15162: `&& Misc.no_overflow_lsl m n`.
+- `array_indexing`, `Caddi [c; n]` case: the constant `(n-1) lsl
+  (log2size - 1)` wraps (by 2^63) although `c + n` is a small index:
+  `i - k` for k = 2^59 + 1, 2^60 or `i + 2^60` (8-byte elements; not
+  k = 2^59 - 1, `max_int - 1`, `i + min_int`), k = 2^60 (4-byte).  Only
+  unchecked accesses (`unsafe_get`/`unsafe_set`, unsafe bigarray reads):
+  a checked access let-binds the index first.  The address is off by
+  2^63: segfault.  #15161: `when Misc.no_overflow_lsl (n - 1) (log2size
+  - 1)`, else the generic case.
+- `array_indexing`, `Caddi [Clsl [c; 1]; 1]` case with log2size = 0 (1-byte
+  bigarray elements): the address uses `c` but the index is `untag (tag
+  c)`, whose bit 63 is c's bit 62; for an `Int64.to_int` result whose
+  bits 63 and 62 differ the address is off by 2^63, under
+  `Array1.unsafe_get` only (the checked `Array1.get` is fine).  #15161:
+  `when log2size > 0`.  Bytes and strings do not go through
+  `array_indexing` and are fine.
+
+Every release reproduces it: opam 5.0.0, 5.3.0, 5.5.1 and this tree's
+trunk.  The port copies the arithmetic (`cxx/src/typing/cmm_helpers.cpp`,
+`array_indexing` and `make_checkbound`, with `ilsl` emulating the 63-bit
+wrap): c++ocamlopt on cxx-trunk (and the cxx-5.5 opam switch on the
+`a.(2^60 + 1)` case), and cxx-mono normally and
+in whole-program mode (`CPPCAML_WP=1`, with or without
+`CPPCAML_WP_BOUNDS=0`, validated or not), behave exactly as stock on
+#15161/#15162's three tests (each segfaults at its first case) and on 54
+adversarial accesses (indices near `max_int`, `min_int`, `max_int / 8`,
+2^52..2^61, negative constants, int/float arrays, Bytes, strings,
+int8/16/32 and float64 bigarrays).  The whole-program bounds pass does not
+change any of it: it reasons on the Cmm's own checks (a folded `hdr <=u
+512 m + 511` becomes `m <u L`, which keeps the wrapped m), so it removes
+exactly the checks stock's code passes, wrapped or not; with the fixes
+applied it agrees with bytecode on all 54.  The regression copy is
+`cxx/harness/fuzz/regress/array_index_overflow.ml` (the non-crashing
+`a.(2^60 + 1)` run, the crashing forms only compiled, their `-dcmm` compared).
+The port-side equivalent of #15161 + #15162 (not applied: stock is the
+reference) changes no assembly of `stdlib/{array,bytes,string,bigarray,float,buffer,hashtbl,format,scanf,camlinternalFormat}.ml`.
