@@ -120,6 +120,12 @@ bool equal_boxed_integer(BoxedInteger a, BoxedInteger b);
 struct BlockShape {
   bool some = false;
   Slice<ValueKind> kinds;
+  // the identity of the list's last cell when lists share it: Translcore's
+  // [x; Pintval] of an atomic location ends in the literal [Pintval], one
+  // static cell in ocamlopt that every such shape shares (and Marshal keeps
+  // shared in the .cmx); for a shape read back from a .cmx, one identity
+  // per marshaled cell.  nullptr: a cell of its own.
+  const void* last_cell = nullptr;
 };
 
 struct Primitive {

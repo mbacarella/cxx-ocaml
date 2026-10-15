@@ -102,6 +102,7 @@ Result primitive(const clambda::Primitive& p, Slice<variable::t> args, const std
     clambda::Primitive mb = p;
     mb.shape.some = true;
     mb.shape.kinds = slice(shape);
+    mb.shape.last_cell = nullptr;  // List.map2: fresh cells
     mb.id = clambda::fresh_uconstant_id();
     return {flambda::n_prim(mb, args, dbg), A::value_block(tg, slice(approxs)), C::benefit::zero()};
   }

@@ -1408,6 +1408,7 @@ class CmxReader : public Reader {
     return p;
   }
   std::unordered_map<std::size_t, Primitive> pr_;
+  std::unordered_map<std::size_t, const void*> last_cell_;
   Primitive primitive_(std::size_t id) {
     using K = Primitive::K;
     Primitive p{prim_kind(true, tag(id))};
@@ -1421,6 +1422,14 @@ class CmxReader : public Reader {
         if (!is_int(sh)) {
           p.shape.some = true;
           p.shape.kinds = list<lambda::ValueKind>(f(sh, 0), [&](std::size_t x) { return vk(x); });
+          // the last cell's identity, which other shapes may share (BlockShape)
+          std::size_t c = f(sh, 0);
+          if (!is_int(c)) {
+            while (!is_int(f(c, 1))) c = f(c, 1);
+            auto [it, fresh] = last_cell_.try_emplace(c, nullptr);
+            if (fresh) it->second = new char;
+            p.shape.last_cell = it->second;
+          }
         }
         break;
       }
@@ -2317,6 +2326,7 @@ class CmxWriter {
     return v;
   }
   std::unordered_map<const void*, V> shapes_;
+  std::unordered_map<const void*, V> last_cells_;
   V primitive_(const Primitive& p) {
     using K = Primitive::K;
     // numbering: constant and non-constant constructors apart, in declaration order
@@ -2350,7 +2360,16 @@ class CmxWriter {
       case K::Pmakeblock: {
         // (flambda: one [Some shape] per list -- the primitives a pass
         // makes from another, as Lift_constants', share its shape)
-        auto shape = [&] { return w.some(w.list(p.shape.kinds, [&](const lambda::ValueKind& k) { return vk(k); })); };
+        auto shape = [&] {
+          const auto& ks = p.shape.kinds;
+          if (!p.shape.last_cell) return w.some(w.list(ks, [&](const lambda::ValueKind& k) { return vk(k); }));
+          // a last cell other shapes share (BlockShape::last_cell)
+          V& last = last_cells_[p.shape.last_cell];
+          if (!last) last = o::vblock(0, {vk(ks[ks.size() - 1]), w.i(0)});
+          V l = last;
+          for (std::size_t k = ks.size() - 1; k-- > 0;) l = o::vblock(0, {vk(ks[k]), l});
+          return w.some(l);
+        };
         V sh = !p.shape.some                            ? w.none()
                : !p.shape.kinds.empty() ? memo_shape(p.shape.kinds.p, shape)
                                                            : shape();
