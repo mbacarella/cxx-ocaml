@@ -429,8 +429,11 @@ static const tt::TTypeDeclaration* transl_declaration(env::t env, const pt::Type
       if (unbox) {
         rep.kind = RecordRepresentation::Kind::Record_unboxed;
         rep.unboxed_inlined = false;
-        static const char record_unboxed_false = 0;  // a static structured constant
-        rep.obj = &record_unboxed_false;
+        // a static structured constant of typedecl.ml, the block {tag 0; 0}
+        // that ocamlopt shares with the unit's other constants of that
+        // shape: `Type_abstract Definition` (TYPE_ABSTRACT_LIT, as
+        // Typedecl_ext's `Unboxed_integer Pnativeint`)
+        rep.obj = TYPE_ABSTRACT_LIT(Definition);
       } else {
         bool all_float = true;
         for (auto* l : lbls2) all_float = all_float && is_float(env, l->ld_type) && l->ld_atomic == AtomicFlag::Nonatomic;
