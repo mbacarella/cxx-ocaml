@@ -155,6 +155,16 @@ const PrimitiveDescription* simple(std::string_view name, long arity, bool alloc
       PrimitiveDescription{zstr(name), arity, alloc, empty_native_name(), slice(reprs), NativeRepr{}});
 }
 
+// Primitive.simple ~name:"..." evaluated where it is used: a fresh
+// description at each call whose name is the source's one string literal
+// (a .cmx's Marshal shares the name, not the description)
+const PrimitiveDescription* simple_at_use(const char* literal, long arity, bool alloc) {
+  ZoneScope perm(permanent_zone());
+  std::vector<NativeRepr> reprs(static_cast<std::size_t>(arity));
+  return make<PrimitiveDescription>(
+      PrimitiveDescription{std::string_view(literal), arity, alloc, empty_native_name(), slice(reprs), NativeRepr{}});
+}
+
 const Primitive& prim_fresh_oo_id() {
   static const Primitive p = pccall(simple("caml_fresh_oo_id", 1, false));
   return p;
@@ -559,7 +569,7 @@ lam_t transl_exp0(bool in_new_scope, scopes sc, const tt::Expression* e) {
       auto* x = static_cast<const tt::Texp_setfield*>(d);
       const LabelDescription* lbl = x->label;
       if (lbl->lbl_atomic == AtomicFlag::Atomic) {
-        static const PrimitiveDescription* prim = simple("caml_atomic_exchange_field", 3, false);
+        const PrimitiveDescription* prim = simple_at_use("caml_atomic_exchange_field", 3, false);
         auto [arg, lbll] = transl_atomic_loc(sc, x->exp, lbl);
         lam_t newval = transl_exp_(sc, x->value);
         ScopedLocation loc = of_location(sc, e->exp_loc);
