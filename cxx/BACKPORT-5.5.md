@@ -10,6 +10,11 @@ as cxx-trunk's (cxx/PORTING.md).
 Shared fixes go to cxx-trunk first and are cherry-picked here, so the two
 branches' cxx/ differ only by the backport.
 
+5.5.2 (merged 2026-10-24) changed two ported files: lambda/matching.ml
+(#15185, `as_interval_canfail`'s fail state covers up to `high`) and
+asmcomp/mach.ml (#15045, atomic loads are not pure: trunk's own, so the
+port's `Iload` case is restored); the oracle is now 5.5.2's.
+
 Status: [ ] to do, [x] done, [-] no C++ counterpart / no effect.
 Lines = changed lines in the upstream diff.
 

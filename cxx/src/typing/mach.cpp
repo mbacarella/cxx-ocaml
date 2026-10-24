@@ -274,6 +274,7 @@ bool operation_is_pure(const Operation& op) {
     case K::Iintop:
     case K::Iintop_imm: return op.intop.op != IntegerOperation::Icheckbound;
     case K::Ispecific: return arch::operation_is_pure(op.spec);
+    case K::Iload: return !op.is_atomic;
     default: return true;
   }
 }

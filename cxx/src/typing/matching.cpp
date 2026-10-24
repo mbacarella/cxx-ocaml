@@ -2410,7 +2410,6 @@ std::pair<SwCases, std::shared_ptr<StoreExp>> as_interval_canfail(lam fail, long
     if (index == 0) {
       st = St::Fail;
       cur_low = low;
-      cur_high = i;
     } else {
       if (low < i) r.push_back({low, isub(i, 1), 0});
       st = St::Nofail;
@@ -2439,7 +2438,6 @@ std::pair<SwCases, std::shared_ptr<StoreExp>> as_interval_canfail(lam fail, long
           r.push_back({cur_low, isub(i, 1), cur_act});
           st = St::Fail;
           cur_low = i;
-          cur_high = i;
           ++k;
         } else {
           r.push_back({cur_low, isub(i, 1), cur_act});
@@ -2450,10 +2448,9 @@ std::pair<SwCases, std::shared_ptr<StoreExp>> as_interval_canfail(lam fail, long
         }
       } else if (act_index == 0) {
         r.push_back({cur_low, cur_high, cur_act});
-        // fail_rec (cur_high + 1) (cur_high + 1) all: [all] again
+        // fail_rec (cur_high + 1) all: [all] again
         st = St::Fail;
         cur_low = iadd(cur_high, 1);
-        cur_high = cur_low;
       } else {
         r.push_back({cur_low, cur_high, cur_act});
         r.push_back({iadd(cur_high, 1), isub(i, 1), 0});
@@ -2464,15 +2461,14 @@ std::pair<SwCases, std::shared_ptr<StoreExp>> as_interval_canfail(lam fail, long
       }
     } else {
       if (k == l.size()) {
-        r.push_back({cur_low, cur_high, 0});
+        // [cur_low; high] goes to [fail] (#15185: not [cur_low; last key])
+        r.push_back({cur_low, high, 0});
         break;
       }
       auto [i, act_i] = l[k];
       long index = do_store(act_i);
       ++k;
-      if (index == 0) {
-        cur_high = i;
-      } else {
+      if (index != 0) {
         r.push_back({cur_low, isub(i, 1), 0});
         st = St::Nofail;
         cur_low = i;
