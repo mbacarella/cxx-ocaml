@@ -1,3 +1,48 @@
+OCaml 5.5.2
+-----------
+
+### Bug fixes:
+
+- #15045: Atomic loads whose results are unused should not be removed
+  during dead-code elimination.
+  (Xavier Clerc, review by Steven Dolan and KC Sivaramakrishnan)
+
+- #15067, #15071: Fix detection of functions available in the future on macOS.
+  (Antonin Décimo, review by Nicolás Ojeda Bär and Damien Doligez)
+
+- #15112, OSEC-2026-22: `Unix.map_file`: protect against overflow
+  when computing the data size.
+  (Xavier Leroy and Nicolás Ojeda Bär, review by Nicolás Ojeda Bär
+  and Edwin Török)
+
+- #15113, OSEC-2026-21: `Str.string_partial_match`: make sure captured groups
+  are valid.
+  (Xavier Leroy, review by Nicolás Ojeda Bär and Edwin Török)
+
+- #15115, OSEC-2026-23: Fix multiple issues in demarshaling
+  (`Marshal.from_{channel,string,bytes}`)
+  (Xavier Leroy, review by Nicolás Ojeda Bär)
+
+- #15133, OSEC 2026-24: Multiple issues in command quoting on Windows
+  (Xavier Leroy and Nicolás Ojeda Bär, review by Nicolás Ojeda Bär)
+
+- #15119, OSEC-2026-25: Harden decoding of runtime events messages from
+  ring buffers.
+  (Sadiq Jaffer, report by Hannes Mehnert, review by Olivier Nicole and
+  Edwin Török)
+
+- #15177, OSEC-2026-26: Maintain custom events cache integrity.
+  (Sadiq Jaffer, report by Hannes Mehnert, review by Edwin Török)
+
+- #15043, #15076: runtime events library, fix an infinite loop when a user
+  event is larger than half the ring buffer.
+  (Tim McGilchrist, review by Sadiq Jaffer)
+
+- #15185, #15187: fix a pattern-matching miscompilation on certain
+  combinations of immediate ranges and redundant patterns
+  (Gabriel Scherer, report by Alperer Keleş,
+   review by Vincent Laviron and Florian Angeletti)
+
 OCaml 5.5.1 (4 September 2026)
 ------------------------------
 
@@ -61,8 +106,8 @@ OCaml 5.5.1 (4 September 2026)
   artefacts) as well as the debug info packed into str.a and unix.a.
   (Bernhard M. Wiedemann, review by David Allsopp and Stefan Muenzel)
 
-- #15019: `Marshal.from_{string,bytes}`: guard against overflow in
-  the computation of the total data length.
+- #15019, #15030, OSEC-2026-18: `Marshal.from_{string,bytes}`: guard against
+  overflow in the computation of the total data length.
   (Xavier Leroy, report by Akshay Singh, review by Nicolás Ojeda Bär
   and Antonin Décimo)
 
